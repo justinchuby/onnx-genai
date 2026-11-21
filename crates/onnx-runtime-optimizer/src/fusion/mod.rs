@@ -313,9 +313,35 @@ impl FusionPattern {
         let bias = final_add.input_values().find(|&v| v != scaled)?;
         let var = variance.outputs[0]?;
         let eps = add_eps.input_values().find(|&v| v != var)?;
-        let epsilon = read_scalar_f32(graph, eps)?;
-        let axis = reduce_single_axis(graph, mean)?;
-        if reduce_single_axis(graph, variance)? != axis {
+        let diff = sub.outputs.first().copied().flatten()?;
+        let exponent = graph.node(nodes[2]).inputs.get(1).copied().flatten()?;
+        if read_scalar_const_f32(graph, exponent, diff) != Some(2.0) {
+            return None;
+        }
+        let epsilon = read_scalar_const_f32(graph, eps, var)?;
+        // LayerNormalization reduces a suffix, whereas ReduceMean can reduce
+        // arbitrary axes. Its affine tensors must span that same suffix.
+        let input_shape = graph.value(x).tensor_shape()?;
+        let axis = reduce_suffix_axis(graph, mean, input_shape.len())?;
+        if reduce_suffix_axis(graph, variance, input_shape.len())? != axis {
+            return None;
+        }
+        let start = usize::try_from(i64::try_from(input_shape.len()).ok()? + axis).ok()?;
+        let normalized_shape = &input_shape[start..];
+        let matches_affine = |value| {
+            graph.value(value).tensor_shape().is_some_and(|shape| {
+                // Leading singleton dimensions do not change the flattened
+                // coefficients, but must not expand the operand's rank.
+                shape.len() <= input_shape.len()
+                    && shape
+                        .iter()
+                        .skip_while(|dim| dim.as_static() == Some(1))
+                        .eq(normalized_shape
+                            .iter()
+                            .skip_while(|dim| dim.as_static() == Some(1)))
+            })
+        };
+        if !matches_affine(scale) || !matches_affine(bias) {
             return None;
         }
         let attributes = HashMap::from([
@@ -365,40 +391,42 @@ impl FusionPattern {
         }
         let erf_out = graph.node(nodes[0]).outputs[0]?;
         let one = add.input_values().find(|&v| v != erf_out)?;
-        if !approx(read_scalar_const_f32(graph, one)?, 1.0) {
+        if !approx(read_scalar_const_f32(graph, one, erf_out)?, 1.0) {
             return None;
         }
         Some((vec![Some(x)], HashMap::new()))
     }
 }
 
-fn reduce_single_axis(graph: &Graph, node: &Node) -> Option<i64> {
-    if node
-        .attr("keepdims")
-        .and_then(Attribute::as_int)
-        .is_some_and(|keepdims| keepdims != 1)
-    {
-        return None;
+fn reduce_suffix_axis(graph: &Graph, node: &Node, rank: usize) -> Option<i64> {
+    match node.attr("keepdims") {
+        None | Some(Attribute::Int(1)) => {}
+        _ => return None,
     }
-    let axes = if let Some(axes) = node.attr("axes").and_then(Attribute::as_ints) {
-        axes.to_vec()
+    let mut axes = if let Some(attribute) = node.attr("axes") {
+        attribute.as_ints()?.to_vec()
     } else {
         read_i64_vector(graph, node.inputs.get(1).copied().flatten()?)?
     };
-    let [axis] = axes.as_slice() else { return None };
-    Some(*axis)
-}
-
-fn read_scalar_f32(graph: &Graph, value: ValueId) -> Option<f32> {
-    if !graph.is_constant_initializer(value) {
+    if axes.is_empty() {
         return None;
     }
-    match graph.initializers.get(&value)? {
-        WeightRef::Inline(t) if t.dtype == DataType::Float32 && t.data.len() >= 4 => {
-            Some(f32::from_le_bytes(t.data[0..4].try_into().ok()?))
+    let rank = i64::try_from(rank).ok()?;
+    for axis in &mut axes {
+        if *axis < -rank || *axis >= rank {
+            return None;
         }
-        _ => None,
+        if *axis < 0 {
+            *axis += rank;
+        }
     }
+    axes.sort_unstable();
+    let count = i64::try_from(axes.len()).ok()?;
+    let start = rank.checked_sub(count)?;
+    if !axes.iter().copied().eq(start..rank) {
+        return None;
+    }
+    Some(-count)
 }
 
 fn read_i64_vector(graph: &Graph, value: ValueId) -> Option<Vec<i64>> {
@@ -435,19 +463,24 @@ fn i64_axes_from_tensor(tensor: &TensorData) -> Option<Vec<i64>> {
         .collect()
 }
 
-fn read_scalar_const_f32(graph: &Graph, value: ValueId) -> Option<f32> {
+/// Read one immutable f32 coefficient whose broadcast cannot expand the
+/// operand's rank. Unknown-rank operands require an actual rank-zero scalar.
+fn read_scalar_const_f32(graph: &Graph, value: ValueId, operand: ValueId) -> Option<f32> {
     if !graph.is_constant_initializer(value) {
         return None;
     }
-    match graph.initializers.get(&value)? {
-        WeightRef::Inline(t) if t.dtype == DataType::Float32 => {
-            if t.dims.iter().product::<usize>() != 1 || t.data.len() < 4 {
-                return None;
-            }
-            Some(f32::from_le_bytes(t.data[0..4].try_into().ok()?))
-        }
-        _ => None,
+    let WeightRef::Inline(tensor) = graph.initializers.get(&value)? else {
+        return None;
+    };
+    if tensor.dtype != DataType::Float32
+        || tensor.checked_numel() != Some(1)
+        || tensor.data.len() != size_of::<f32>()
+        || (!tensor.dims.is_empty()
+            && tensor.dims.len() > graph.value(operand).tensor_shape()?.len())
+    {
+        return None;
     }
+    Some(f32::from_le_bytes(tensor.data.as_slice().try_into().ok()?))
 }
 
 fn is_last2_swap_perm(perm: &[i64]) -> bool {

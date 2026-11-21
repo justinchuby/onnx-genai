@@ -50,7 +50,7 @@ pub struct CpuExecutionProvider {
     /// allocator a caller writes serves both backends instead of having to be
     /// written twice. Defaults to `HostAllocator`, which is the `std::alloc`
     /// code this EP used to inline.
-    memory: std::sync::Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
+    memory: std::sync::Arc<dyn onnx_runtime_memory_api::DeviceAllocator>,
 }
 
 impl std::fmt::Debug for CpuExecutionProvider {
@@ -97,7 +97,7 @@ impl Default for CpuExecutionProvider {
 /// that made the allocation. Scoping the cache to the EP therefore loses no
 /// reuse, and it bounds retention by the session's life instead of the
 /// process's.
-fn default_cpu_memory() -> std::sync::Arc<dyn onnx_runtime_memory_governor::DeviceAllocator> {
+fn default_cpu_memory() -> std::sync::Arc<dyn onnx_runtime_memory_api::DeviceAllocator> {
     std::sync::Arc::new(onnx_runtime_memory_governor::LargeAllocCache::default())
 }
 
@@ -156,7 +156,7 @@ impl CpuExecutionProvider {
     /// depend on: an allocator is written once, not once per backend.
     pub fn with_memory(
         mut self,
-        memory: std::sync::Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
+        memory: std::sync::Arc<dyn onnx_runtime_memory_api::DeviceAllocator>,
     ) -> Self {
         self.memory = memory;
         self

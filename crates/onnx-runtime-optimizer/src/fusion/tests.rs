@@ -193,7 +193,15 @@ fn layernorm_graph() -> Graph {
     let scale = val(&mut g, "scale");
     let bias = val(&mut g, "bias");
     g.add_input(x);
-    g.add_input(two);
+    g.value_mut(two).shape = vec![];
+    g.set_initializer(
+        two,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            vec![],
+            2.0f32.to_le_bytes().to_vec(),
+        )),
+    );
     g.set_initializer(
         eps,
         WeightRef::Inline(TensorData::from_raw(
@@ -357,7 +365,15 @@ fn layernorm_split_graph(reverse_num_sub: bool) -> Graph {
     let scale = val(&mut g, "scale");
     let bias = val(&mut g, "bias");
     g.add_input(x);
-    g.add_input(two);
+    g.value_mut(two).shape = vec![];
+    g.set_initializer(
+        two,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            vec![],
+            2.0f32.to_le_bytes().to_vec(),
+        )),
+    );
     g.set_initializer(
         eps,
         WeightRef::Inline(TensorData::from_raw(
@@ -1865,7 +1881,7 @@ impl DifferentialGraphBuilder {
 
     fn add_layernorm(&mut self, split_diff: bool) {
         let x = self.input("ln_x", &[4]);
-        let two = self.input("ln_two", &[4]);
+        let two = self.scalar("ln_two", 2.0);
         let eps = self.scalar("ln_eps", 1e-12);
         let scale = self.input("ln_scale", &[4]);
         let bias = self.input("ln_bias", &[4]);
@@ -2462,4 +2478,193 @@ fn resumable_scan_matches_restart_reference_on_randomized_graphs() {
         saw_non_topological_ids,
         "randomized insertion must decouple NodeId from topological order"
     );
+}
+
+#[test]
+fn layernorm_requires_square_and_scalar_rank_preserving_coefficients() {
+    for case in [
+        "cube",
+        "runtime_power",
+        "vector_epsilon",
+        "expanding_epsilon",
+        "bad_payload",
+        "overflow_epsilon",
+    ] {
+        let mut graph = layernorm_graph();
+        let name = if matches!(case, "cube" | "runtime_power") {
+            "two"
+        } else {
+            "eps"
+        };
+        let value = graph
+            .values
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some(name))
+            .unwrap()
+            .0;
+        let (dims, data) = match case {
+            "cube" => (vec![], 3.0f32.to_le_bytes().to_vec()),
+            "runtime_power" => {
+                graph.initializers.remove(&value);
+                graph.add_input(value);
+                (vec![], vec![])
+            }
+            "vector_epsilon" => (
+                vec![4],
+                [1e-12f32, 0.5, 0.25, 0.125]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            ),
+            "expanding_epsilon" => (vec![1, 1], 1e-12f32.to_le_bytes().to_vec()),
+            "overflow_epsilon" => (vec![usize::MAX, 2], 1e-12f32.to_le_bytes().to_vec()),
+            "bad_payload" => (
+                vec![],
+                [1e-12f32, 0.5]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            ),
+            _ => unreachable!(),
+        };
+        if case != "runtime_power" {
+            graph.value_mut(value).shape = dims.iter().copied().map(Into::into).collect();
+            graph.set_initializer(
+                value,
+                WeightRef::Inline(TensorData::from_raw(DataType::Float32, dims, data)),
+            );
+        }
+        OpFusion::new()
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            graph.num_nodes(),
+            9,
+            "{case} must retain its original computation"
+        );
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.op_type != "LayerNormalization"),
+            "{case}"
+        );
+        graph.validate().unwrap();
+    }
+}
+
+#[test]
+fn scalar_coefficients_keep_singleton_broadcasts_without_expanding_rank() {
+    let mut graph = layernorm_graph();
+    for name in ["two", "eps"] {
+        let value = graph
+            .values
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some(name))
+            .unwrap()
+            .0;
+        let WeightRef::Inline(tensor) = graph.initializers.get_mut(&value).unwrap() else {
+            unreachable!()
+        };
+        tensor.dims = vec![1];
+        graph.value_mut(value).shape = vec![1.into()];
+    }
+    OpFusion::new()
+        .run(&mut graph, &PassContext::new())
+        .unwrap();
+    assert_eq!(graph.num_nodes(), 1);
+    assert_eq!(
+        graph.nodes.values().next().unwrap().op_type,
+        "LayerNormalization"
+    );
+    graph.validate().unwrap();
+}
+
+fn shaped_layernorm_graph(shape: &[usize], axes: &[i64]) -> Graph {
+    let mut graph = layernorm_graph();
+    let rank = shape.len() as i64;
+    let normalized: Vec<usize> = axes
+        .iter()
+        .map(|&axis| if axis < 0 { axis + rank } else { axis } as usize)
+        .collect();
+    let start = *normalized.iter().min().unwrap();
+    let mut reduced = shape.to_vec();
+    for &axis in &normalized {
+        reduced[axis] = 1;
+    }
+    let values: Vec<_> = graph.values.keys().collect();
+    for id in values {
+        let dims = if let Some(WeightRef::Inline(tensor)) = graph.initializers.get(&id) {
+            tensor.dims.as_slice()
+        } else {
+            match graph.value(id).name.as_deref().unwrap() {
+                "mean" | "var" | "vare" | "std" => &reduced,
+                "scale" | "bias" => &shape[start..],
+                _ => shape,
+            }
+        };
+        let shape = static_shape(dims.iter().copied());
+        graph.value_mut(id).shape = shape;
+    }
+    for node in graph
+        .nodes
+        .values_mut()
+        .filter(|node| node.op_type == "ReduceMean")
+    {
+        node.attributes
+            .insert("axes".into(), Attribute::Ints(axes.to_vec()));
+    }
+    graph
+}
+
+#[test]
+fn layernorm_only_reduces_a_complete_suffix_with_matching_affine_tensors() {
+    for (axes, expected) in [
+        (vec![1, -1], true),
+        (vec![2, 1], true),
+        (vec![0, 2], false),
+        (vec![1], false),
+    ] {
+        let mut graph = shaped_layernorm_graph(&[2, 3, 4], &axes);
+        OpFusion::new()
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            graph.num_nodes(),
+            if expected { 1 } else { 9 },
+            "axes {axes:?}"
+        );
+        if expected {
+            assert_eq!(
+                graph
+                    .nodes
+                    .values()
+                    .next()
+                    .unwrap()
+                    .attr("axis")
+                    .and_then(Attribute::as_int),
+                Some(-2)
+            );
+        }
+        graph.validate().unwrap();
+    }
+    for affine in ["scale", "bias"] {
+        let mut graph = shaped_layernorm_graph(&[2, 3, 4], &[-1]);
+        let value = graph
+            .values
+            .iter()
+            .find(|(_, value)| value.name.as_deref() == Some(affine))
+            .unwrap()
+            .0;
+        graph.value_mut(value).shape = vec![];
+        OpFusion::new()
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            graph.num_nodes(),
+            9,
+            "broadcast-only {affine} cannot satisfy the fused kernel signature"
+        );
+        graph.validate().unwrap();
+    }
 }

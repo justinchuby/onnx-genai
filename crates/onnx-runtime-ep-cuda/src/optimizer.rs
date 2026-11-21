@@ -1,4 +1,4 @@
-use onnx_runtime_ir::pattern::{MatchOptions, MatchSession, Pattern};
+use onnx_runtime_ir::pattern::{MatchBudgetScope, MatchOptions, MatchSession, Pattern};
 use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
@@ -57,7 +57,13 @@ type CastIndex = std::collections::HashMap<NodeId, (ValueId, ValueId)>;
 
 fn cast_index(session: &MatchSession<'_>) -> OptimizerResult<CastIndex> {
     session
-        .find_matches(&CAST, MatchOptions::default())?
+        .find_matches(
+            &CAST,
+            MatchOptions {
+                budget_scope: MatchBudgetScope::Root,
+                ..Default::default()
+            },
+        )?
         .into_iter()
         .map(|matched| {
             Ok((
@@ -682,7 +688,14 @@ impl CudaLinearAttentionGatingFusion {
         let Some(sigmoid_id) = graph.value(beta).producer else {
             return Ok(None);
         };
-        let Some(matched) = session.match_at(&BETA_GATE, sigmoid_id, MatchOptions::default())?
+        let Some(matched) = session.match_at(
+            &BETA_GATE,
+            sigmoid_id,
+            MatchOptions {
+                budget_scope: MatchBudgetScope::Root,
+                ..Default::default()
+            },
+        )?
         else {
             return Ok(None);
         };
@@ -705,8 +718,14 @@ impl CudaLinearAttentionGatingFusion {
             return Ok(None);
         };
         for (index, pattern) in DECAY_GATES.iter().enumerate() {
-            let matched =
-                session.match_at_where(pattern, root, MatchOptions::default(), |matched| {
+            let matched = session.match_at_where(
+                pattern,
+                root,
+                MatchOptions {
+                    budget_scope: MatchBudgetScope::Root,
+                    ..Default::default()
+                },
+                |matched| {
                     for &node in matched.nodes() {
                         for output in graph.node(node).output_values() {
                             let consumers = graph.consumers(output);
@@ -732,7 +751,8 @@ impl CudaLinearAttentionGatingFusion {
                     Ok(graph.value(a).dtype == io_dtype
                         && (graph.node(root).op_type != "Cast"
                             || graph.value(product).dtype == io_dtype))
-                })?;
+                },
+            )?;
             if let Some(matched) = matched {
                 return Ok(Some(DecaySoftplusFold {
                     a: capture_value(&matched, "a")?,
@@ -2278,7 +2298,13 @@ impl OptimizationPass for CudaSkipRmsNormMatMulFusion {
         let projections: std::collections::HashSet<NodeId> = {
             let session = MatchSession::new(graph)?;
             session
-                .find_matches(&QUANTIZED_PROJECTION, MatchOptions::default())?
+                .find_matches(
+                    &QUANTIZED_PROJECTION,
+                    MatchOptions {
+                        budget_scope: MatchBudgetScope::Root,
+                        ..Default::default()
+                    },
+                )?
                 .into_iter()
                 .map(|matched| matched.nodes()[0])
                 .collect()
@@ -3191,7 +3217,10 @@ impl CudaQkvProjectionFusion {
                     *input,
                     0,
                     12,
-                    MatchOptions::default(),
+                    MatchOptions {
+                        budget_scope: MatchBudgetScope::Root,
+                        ..Default::default()
+                    },
                 )?
                 else {
                     break;
@@ -3593,7 +3622,13 @@ impl OptimizationPass for CudaOnDeviceConstantSelect {
 
         let session = MatchSession::new(graph)?;
         let mut thresholds = std::collections::HashMap::new();
-        for matched in session.find_matches(&THRESHOLD, MatchOptions::default())? {
+        for matched in session.find_matches(
+            &THRESHOLD,
+            MatchOptions {
+                budget_scope: MatchBudgetScope::Root,
+                ..Default::default()
+            },
+        )? {
             thresholds.insert(
                 capture_value(&matched, "out")?,
                 capture_value(&matched, "threshold")?,
@@ -3780,7 +3815,13 @@ fn branch_is_pure_constants(branch: &Graph) -> OptimizerResult<bool> {
         return Ok(false);
     }
     let session = MatchSession::new(branch)?;
-    let matched = session.find_matches(&CONSTANT, MatchOptions::default())?;
+    let matched = session.find_matches(
+        &CONSTANT,
+        MatchOptions {
+            budget_scope: MatchBudgetScope::Root,
+            ..Default::default()
+        },
+    )?;
     Ok(matched.len() == branch.num_nodes()
         && matched.iter().all(|m| {
             matches!(

@@ -884,7 +884,7 @@ impl WorkflowRuntime {
         if runtime_manages_initializer_residency {
             let available = onnx_runtime_memory_governor::MemoryGovernor::available(
                 &resource_governor.device_authority(),
-                onnx_runtime_memory_governor::Tier::Device,
+                onnx_runtime_memory_api::Tier::Device,
             );
             anyhow::ensure!(
                 model_weights_bytes <= available,
@@ -983,7 +983,7 @@ impl WorkflowRuntime {
         let island_reservation_admitted = if runtime_manages_initializer_residency {
             let available = onnx_runtime_memory_governor::MemoryGovernor::available(
                 &resource_governor.device_authority(),
-                onnx_runtime_memory_governor::Tier::Device,
+                onnx_runtime_memory_api::Tier::Device,
             );
             if maximum_island_initializer_bytes <= available {
                 true

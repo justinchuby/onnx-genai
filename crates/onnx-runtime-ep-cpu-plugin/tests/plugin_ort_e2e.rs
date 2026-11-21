@@ -5474,6 +5474,7 @@ fn unary_assignment(fixture: &str, reg: &str) -> Option<(Vec<String>, Vec<String
 /// 0.45 ms, and that 12.4x win must actually be claimed.
 #[test]
 fn float16_round_is_assigned_because_it_wins() {
+    let _lock = lock_ort_ep();
     let Some((ours, _)) = unary_assignment("round_assignment_f16_above", "cpu_ep_round_f16") else {
         eprintln!(
             "*** SKIPPED: float16_round_is_assigned_because_it_wins — \
@@ -5492,6 +5493,7 @@ fn float16_round_is_assigned_because_it_wins() {
 /// from being widened into "never claim Exp".
 #[test]
 fn bfloat16_exp_is_still_assigned_because_ort_has_no_kernel() {
+    let _lock = lock_ort_ep();
     let Some((ours, _theirs)) = unary_assignment("exp_assignment_bf16_large", "cpu_ep_exp_bf16")
     else {
         return;
@@ -5514,6 +5516,7 @@ fn bfloat16_exp_is_still_assigned_because_ort_has_no_kernel() {
 /// is ours.
 #[test]
 fn float32_relu_stays_claimed_because_it_anchors_a_fusion() {
+    let _lock = lock_ort_ep();
     let Some((ours, _theirs)) = unary_assignment("relu_assignment_f32_large", "cpu_ep_relu_f32")
     else {
         return;
@@ -5864,10 +5867,8 @@ struct MatmulFamilyCase {
     output_elem: ort::ONNXTensorElementDataType,
     /// Whether ORT's own CPU EP can build a kernel for this node at all.
     ///
-    /// `false` is not a limitation of the test — it is the point. ORT's CPU
-    /// `MatMulNBits` `ORT_ENFORCE`s `block_size` in {16, 32, 64, 128, 256} at
-    /// kernel construction, so a 512-wide block is a model ORT cannot load and
-    /// this EP can. There was never a host to hand that node to.
+    /// Keep this expectation aligned with the pinned runtime: ORT 1.32 can
+    /// construct the 512-wide block case that older runtimes rejected.
     ort_can_build: bool,
     /// Absolute tolerance for the elementwise comparison against ORT.
     tolerance: f32,
@@ -6309,9 +6310,8 @@ fn matmul_family_cases() -> Vec<MatmulFamilyCase> {
         // 8-bit MatMulNBits: claimed at decode, deferred once the row count was
         // statically >= 256. This is that shape.
         nbits_case("nbits8_prefill", 256, 256, 4096, 8, 32, ELEM_F32, true),
-        // A block size ORT's CPU EP cannot construct a kernel for. Claimed
-        // before and now, but for a reason that has nothing to do with speed.
-        nbits_case("nbits4_block512", 1, 512, 2048, 4, 512, ELEM_F32, false),
+        // ORT 1.32 also supports this wider block: require numerical parity.
+        nbits_case("nbits4_block512", 1, 512, 2048, 4, 512, ELEM_F32, true),
         // A float16 activation is the shape a quantized LLM actually decodes
         // in, and it is only reachable at all because the dtype filter now
         // lists the quantized edge dtypes.

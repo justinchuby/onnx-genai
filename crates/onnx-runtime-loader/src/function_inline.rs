@@ -90,25 +90,44 @@ fn resolve_attribute_binding<'a, T>(
     function: &'a FunctionProto,
     function_name: String,
     node_name: String,
+    expected: attribute_proto::AttributeType,
+    supplied_kind: impl FnOnce(&T) -> i32,
 ) -> Result<Option<AttributeBinding<'a, T>>, LoaderError> {
-    if let Some(value) = supplied {
-        return Ok(Some(AttributeBinding::Supplied(value)));
-    }
-    if let Some(default) = function
+    let binding = if let Some(value) = supplied {
+        AttributeBinding::Supplied(value)
+    } else if let Some(default) = function
         .attribute_proto
         .iter()
         .find(|attribute| attribute.name == name)
     {
-        return Ok(Some(AttributeBinding::Default(default)));
-    }
-    if function.attribute.iter().any(|required| required == name) {
+        AttributeBinding::Default(default)
+    } else if function.attribute.iter().any(|required| required == name) {
         return Err(LoaderError::MissingRequiredFunctionAttribute {
             function: function_name,
             node: node_name,
             attribute: name.to_string(),
         });
+    } else {
+        return Ok(None);
+    };
+    let actual = match &binding {
+        AttributeBinding::Supplied(value) => supplied_kind(value),
+        AttributeBinding::Default(value) => value.r#type,
+    };
+    // Legacy ONNX declarations may omit the reference kind. A typed reference
+    // is a contract: neither a caller nor a default may silently change it.
+    if expected != attribute_proto::AttributeType::Undefined && actual != expected as i32 {
+        return Err(LoaderError::FunctionAttributeTypeMismatch {
+            function: function_name,
+            node: node_name,
+            attribute: name.to_string(),
+            expected,
+            actual: attribute_proto::AttributeType::try_from(actual)
+                .map(|kind| format!("{kind:?}"))
+                .unwrap_or_else(|_| format!("unknown ONNX AttributeType {actual}")),
+        });
     }
-    Ok(None)
+    Ok(Some(binding))
 }
 
 /// Resolve formal/default function attributes into a cloned IR body.
@@ -133,7 +152,7 @@ pub fn bind_ir_function_attributes(
             for key in keys {
                 let current = graph.node(node_id).attributes[&key].clone();
                 let replacement = match current {
-                    Attribute::Ref { name, .. } => match resolve_attribute_binding(
+                    Attribute::Ref { name, kind } => match resolve_attribute_binding(
                         &name,
                         call.attributes.get(&name),
                         &function.declaration,
@@ -143,6 +162,8 @@ pub fn bind_ir_function_attributes(
                         } else {
                             call.name.clone()
                         },
+                        kind,
+                        |value| value.kind() as i32,
                     )? {
                         Some(AttributeBinding::Supplied(value)) => Some(value.clone()),
                         Some(AttributeBinding::Default(default)) => Some(
@@ -804,6 +825,13 @@ fn bind_attribute(
         func,
         fmt_key(key),
         node_label(call),
+        attribute_proto::AttributeType::try_from(attr.r#type).map_err(|_| {
+            LoaderError::GraphBuild(format!(
+                "function {} attribute {:?} references {:?} with unknown ONNX AttributeType {}; supply a valid reference kind",
+                fmt_key(key), attr.name, a, attr.r#type
+            ))
+        })?,
+        |value| value.r#type,
     )?;
     let mut bound = match source {
         Some(AttributeBinding::Supplied(value)) => value.clone(),

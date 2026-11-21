@@ -23,6 +23,7 @@ tracing = ["dep:tracing"]
 gpu-tests = []
 
 [dependencies]
+onnx-runtime-memory-api = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
 onnx-runtime-virtual-memory = { workspace = true }
 thiserror = { workspace = true }

@@ -1445,7 +1445,7 @@ fn crate_residency_for_stress(
     residency
         .adopt_governed_budget(
             governor,
-            onnx_runtime_memory_governor::Tier::Device,
+            onnx_runtime_memory_api::Tier::Device,
             HolderId::new(42),
         )
         .expect("1 MiB of a 1 GiB ledger is affordable");

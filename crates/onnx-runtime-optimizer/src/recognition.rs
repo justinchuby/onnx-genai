@@ -1,7 +1,8 @@
 //! Shared structural rules for provider-owned rewrites.
 
 use onnx_runtime_ir::pattern::{
-    BoundaryPolicy, Match, MatchOptions, MatchSession, Pattern, PatternError, ValueCapture,
+    BoundaryPolicy, Match, MatchBudgetScope, MatchOptions, MatchSession, Pattern, PatternError,
+    ValueCapture,
 };
 use onnx_runtime_ir::{Graph, NodeId, ValueId};
 use std::sync::LazyLock;
@@ -91,6 +92,7 @@ impl RecognitionRule {
             &self.pattern,
             MatchOptions {
                 boundary: BoundaryPolicy::OrtBoundary,
+                budget_scope: MatchBudgetScope::Root,
                 ..Default::default()
             },
         )? {
@@ -160,6 +162,28 @@ mod tests {
         let output = graph.create_value(DataType::Float32, vec![]);
         let node = graph.insert_node(Node::new(NodeId(0), op, vec![Some(input)], vec![output]));
         (node, output)
+    }
+
+    #[test]
+    fn production_recognition_scales_past_one_query_candidate_limit() {
+        let rule = RecognitionRule::parse(
+            "large graph identity",
+            "(x)=>{out=Identity(x);return out}",
+            "out",
+        )
+        .unwrap();
+        let mut graph = Graph::new();
+        let x = graph.create_value(DataType::Float32, vec![]);
+        graph.add_input(x);
+        let outputs = (0..10_001)
+            .map(|_| unary(&mut graph, "Identity", x).1)
+            .collect();
+        graph.set_outputs(outputs);
+        let session = MatchSession::new(&graph).unwrap();
+        let candidates = rule.candidates(&session).expect(
+            "independent roots must not exhaust one small query's aggregate candidate budget",
+        );
+        assert_eq!(candidates.len(), 10_001);
     }
 
     #[test]

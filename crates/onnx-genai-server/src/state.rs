@@ -965,7 +965,8 @@ mod authority_tests {
 
     #[test]
     fn multi_device_limit_failure_leaves_every_limit_and_policy_unchanged() {
-        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryRole, Tier};
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
 
         let provider = ServerMemoryAuthorities::new(ResourceLimit::Bytes(100));
         let first = provider
@@ -1001,8 +1002,9 @@ mod authority_tests {
     fn failed_multi_device_preflight_does_not_trim_an_earlier_pool() {
         use cudarc::driver::CudaContext;
         use onnx_runtime_ep_cuda::virtual_memory::{CudaVirtualBacking, PhysicalHandlePool};
-        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryRole, Tier};
-        use onnx_runtime_virtual_memory::VirtualBacking;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        use onnx_runtime_virtual_memory::ReservationBacking;
 
         let context = CudaContext::new(0).expect("CUDA driver");
         let probe = CudaVirtualBacking::new(Arc::clone(&context), 0);

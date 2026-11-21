@@ -76,9 +76,8 @@ use onnx_runtime_ir::{DataType, NodeId, ValueId, WeightRef};
 use onnx_runtime_loader::{
     ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, WeightRegionCatalog,
 };
-use onnx_runtime_memory_governor::{
-    DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole,
-};
+use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, MemoryRole};
+use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
 
 // ---------------------------------------------------------------------------
 // Fault-injection seam (mirrors coarse_residency_plan_gpu.rs). The consumer's

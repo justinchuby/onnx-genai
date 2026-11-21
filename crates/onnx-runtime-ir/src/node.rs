@@ -190,6 +190,27 @@ pub enum Attribute {
 }
 
 impl Attribute {
+    /// The declared ONNX attribute kind, including unresolved formal references.
+    pub fn kind(&self) -> AttributeType {
+        match self {
+            Self::Ref { kind, .. } => *kind,
+            Self::Int(_) => AttributeType::Int,
+            Self::Float(_) => AttributeType::Float,
+            Self::String(_) => AttributeType::String,
+            Self::Ints(_) => AttributeType::Ints,
+            Self::Floats(_) => AttributeType::Floats,
+            Self::Strings(_) => AttributeType::Strings,
+            Self::Tensor(_) => AttributeType::Tensor,
+            Self::Tensors(_) => AttributeType::Tensors,
+            Self::SparseTensor(_) => AttributeType::SparseTensor,
+            Self::SparseTensors(_) => AttributeType::SparseTensors,
+            Self::Graph(_) => AttributeType::Graph,
+            Self::Graphs(_) => AttributeType::Graphs,
+            Self::TypeProto(_) => AttributeType::TypeProto,
+            Self::TypeProtos(_) => AttributeType::TypeProtos,
+        }
+    }
+
     /// The `i64` value, if this is an [`Attribute::Int`].
     pub fn as_int(&self) -> Option<i64> {
         match self {

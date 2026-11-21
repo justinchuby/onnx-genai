@@ -393,19 +393,18 @@ pub(crate) fn weight_offload_host_budget(governor_bytes: u64) -> Result<usize, &
 
 pub(crate) fn effective_host_budget_u64(
     governor_bytes: u64,
-) -> Result<u64, onnx_runtime_memory_governor::MemoryError> {
+) -> Result<u64, onnx_runtime_memory_api::MemoryError> {
     if let Some(value) = std::env::var_os(WEIGHT_OFFLOAD_HOST_BYTES_ENV) {
-        let value =
-            value
-                .to_str()
-                .ok_or(onnx_runtime_memory_governor::MemoryError::InvalidRequest {
-                    tier: onnx_runtime_memory_governor::Tier::Host.name(),
-                    requested: governor_bytes,
-                    reason: "host-cache byte budget is not valid UTF-8",
-                })?;
+        let value = value
+            .to_str()
+            .ok_or(onnx_runtime_memory_api::MemoryError::InvalidRequest {
+                tier: onnx_runtime_memory_api::Tier::Host.name(),
+                requested: governor_bytes,
+                reason: "host-cache byte budget is not valid UTF-8",
+            })?;
         return value.parse::<u64>().map_err(|_| {
-            onnx_runtime_memory_governor::MemoryError::InvalidRequest {
-                tier: onnx_runtime_memory_governor::Tier::Host.name(),
+            onnx_runtime_memory_api::MemoryError::InvalidRequest {
+                tier: onnx_runtime_memory_api::Tier::Host.name(),
                 requested: governor_bytes,
                 reason: "host-cache byte budget must be an unsigned decimal byte count",
             }

@@ -15,7 +15,8 @@ pub enum BoundaryPolicy {
     OrtBoundary,
 }
 
-/// Per-call bounds, shared by alternatives, nested bodies and predicates.
+/// Bounds shared by alternatives, nested bodies and predicates within the
+/// budget scope selected by [`MatchOptions::budget_scope`].
 #[derive(Clone, Copy, Debug)]
 pub struct MatchBudget {
     pub steps: usize,
@@ -33,10 +34,24 @@ impl Default for MatchBudget {
     }
 }
 
+/// How a multi-root search accounts for its configured limits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MatchBudgetScope {
+    /// One aggregate budget for the complete query, including every root.
+    #[default]
+    Search,
+    /// Reset only when moving to another root. Alternatives, nested bodies and
+    /// predicates still share that root's limits. Suitable for full-graph
+    /// scans with trusted built-in rules, without a fixed model-size ceiling.
+    Root,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MatchOptions {
     pub boundary: BoundaryPolicy,
     pub budget: MatchBudget,
+    /// Budget lifetime for `find_matches`; anchored/whole-graph calls have one root.
+    pub budget_scope: MatchBudgetScope,
 }
 
 /// A borrowed value whose identity includes its owning graph.
@@ -532,6 +547,9 @@ impl<'g> MatchSession<'g> {
         let mut budget = options.budget;
         let mut matches = Vec::new();
         for root in roots {
+            if options.budget_scope == MatchBudgetScope::Root {
+                budget = options.budget;
+            }
             self.run(
                 pattern,
                 0,

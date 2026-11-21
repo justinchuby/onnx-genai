@@ -41,6 +41,7 @@ cuda-13000 = [
 gpu-tests = ["onnx-runtime-cuda-memory/gpu-tests"]
 
 [dependencies]
+onnx-runtime-memory-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-loader = { workspace = true }

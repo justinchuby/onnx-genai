@@ -1409,16 +1409,12 @@ impl InferenceSession {
     pub fn prepare_mapped_growth(
         &self,
         bytes: u64,
-        role: onnx_runtime_memory_governor::MemoryRole,
+        role: onnx_runtime_memory_api::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
         self.exec.prepare_mapped_growth(bytes, role)
     }
 
-    pub fn release_mapped_growth(
-        &self,
-        bytes: u64,
-        role: onnx_runtime_memory_governor::MemoryRole,
-    ) {
+    pub fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_api::MemoryRole) {
         self.exec.release_mapped_growth(bytes, role);
     }
 
@@ -1900,7 +1896,7 @@ impl InferenceSession {
     pub fn adopt_memory_governor(
         &self,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
-        tier: onnx_runtime_memory_governor::Tier,
+        tier: onnx_runtime_memory_api::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<u64> {
         Ok(self.exec.adopt_memory_governor(governor, tier, holder)?)

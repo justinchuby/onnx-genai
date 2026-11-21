@@ -34,7 +34,7 @@ classifiers = [
 # `onnxruntime` is an optional runtime peer: nxrt_ep_cpu.register() uses it, but
 # get_library_path() works without it. Pin to a release exposing the plugin-EP
 # registration API.
-onnxruntime = ["onnxruntime>=1.22"]
+onnxruntime = ["onnxruntime>=1.32,<2"]
 
 [project.urls]
 repository = "https://github.com/justinchuby/onnx-genai"

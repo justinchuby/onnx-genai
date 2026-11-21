@@ -71,25 +71,32 @@
 //! eviction pass deleted the very session it was writing to in order to satisfy
 //! a budget. Live state is never taken to make room.
 
-pub mod allocator;
+//! ## Import boundaries
+//!
+//! Allocation mechanisms and capabilities are defined in
+//! `onnx-runtime-memory-api`; this crate supplies governance and transactions.
+//! Import each contract from its owner, without a compatibility allocator module:
+//!
+//! ```
+//! use onnx_runtime_memory_api::{DeviceAllocator, MemoryError, MemoryRole, Tier};
+//! use onnx_runtime_memory_governor::{MemoryGovernor, ProcessMemoryManager};
+//! ```
+//!
+//! The previous mechanism export paths have been removed:
+//!
+//! ```compile_fail
+//! use onnx_runtime_memory_governor::allocator::DeviceAllocator;
+//! ```
+//!
+//! ```compile_fail
+//! use onnx_runtime_memory_governor::DeviceAllocator;
+//! ```
+
 pub mod large_alloc_cache;
 pub mod manager;
 pub mod shareability;
 pub mod shared_prefix;
 
-pub use allocator::{
-    AllocationCommitRange, AllocationGeneration, AllocationIdentity, AllocationReleaseOutcome,
-    AllocationReleaseState, AuthorityIdentity, BindingError, BindingGeneration, BindingId,
-    BindingIdentity, BindingRegistry, BindingResource, BoundAllocation, BoundMemoryView,
-    BoundSharedMapping, BoundSharedPrefix, BoundVirtualBacking, DeferredEnqueueError,
-    DeferredEnqueueRejection, DeferredReleaseDisposition, DeferredReleaseQueue, DeviceAllocator,
-    DeviceKey, ExplicitReleaseError, HostAllocator, MappedAllocation, MechanismCoherence,
-    MechanismIdentity, MechanismLifecycle, MechanismSnapshot, MemoryBinding, OwnedView,
-    OwningAllocation, OwningReleaseError, PreparedAllocationRelease, ProviderContextIdentity,
-    QuarantineReason, QuarantinedAllocation, RegisteredAuthority, RegisteredMechanism,
-    RegisteredProviderContext, ReleaseAccounting, ReleaseFailure, ResidualOwnership,
-    SharedDevicePrefix, SharedMapping, SharedPrefixCommitInfo, ValidatedMemoryView, VirtualBacking,
-};
 pub use large_alloc_cache::{
     DEFAULT_CACHE_BUDGET_BYTES, FALLBACK_FLOOR_BYTES, LargeAllocCache, LargeAllocCacheStats,
     MAX_CACHED_BYTES, calibrate_floor_bytes, calibrated_floor_bytes, default_budget_bytes,
@@ -105,7 +112,7 @@ pub use manager::{
     ScopedAllocationContext, ScopedMemoryBinding, ScopedVirtualBacking, SharedPhysicalIdentity,
     WeakProcessMemoryManager,
 };
-pub use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
+use onnx_runtime_memory_api::{DeviceKey, MemoryError, MemoryRole, Tier};
 pub use shareability::{
     KvFragmentation, ModelKvGeometry, PrefixShareability, evaluate_geometry_shareability,
     evaluate_prefix_shareability,

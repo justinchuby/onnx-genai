@@ -31,7 +31,7 @@ pub use builder::{
 };
 pub use execute::{
     AttributeCapture, BindingView, BoundaryPolicy, DimensionValue, Match, MatchBudget,
-    MatchOptions, MatchSession, ScopedValue, ValueCapture,
+    MatchBudgetScope, MatchOptions, MatchSession, ScopedValue, ValueCapture,
 };
 
 use std::collections::BTreeMap;

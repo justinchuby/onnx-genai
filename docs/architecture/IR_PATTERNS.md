@@ -396,6 +396,13 @@ axis, dtype/layout, broadcast, alias, liveness and kernel eligibility guards
 remain separate. Rules request `OrtBoundary`; intentionally retained additional
 outputs, such as a residual sum, are explicit returns.
 
+LayerNorm eligibility proves a square with immutable exponent 2, exact scalar
+coefficient payloads, rank-preserving broadcasts, and matching kept-dimension
+reductions over a complete normalized suffix. The affine tensors must represent
+that suffix's coefficient array; harmless leading singleton dimensions are
+accepted without allowing rank expansion. This does not turn an arbitrary
+reduction or a dynamic exponent into LayerNorm.
+
 Native `value` means any present SSA value, including unknown or non-tensor type
 metadata. `value | None` additionally permits a missing slot; it does not mean an
 ONNX `Optional<T>` container or manufacture tensor facts. This distinction keeps
@@ -441,7 +448,10 @@ imports, formal/default/reference attributes and canonical `FunctionProto`
 declaration. That declaration is the serialization source; the derived body is
 an execution/analysis view, not a function-rewrite API. Calls retain overload and
 raw attribute binding metadata. Execution lowering binds explicit/default
-attributes; unresolved references are not fabricated values.
+attributes; unresolved references are not fabricated values. A typed attribute
+reference also constrains the selected call-site/default value's ONNX kind.
+Both protobuf and IR lowering reject a mismatch with function, call-node and
+formal-attribute context before copying it into the body.
 
 Dense and sparse initializer defaults retain their shared identity with graph
 inputs. `Graph::is_initializer` covers either storage form;
@@ -488,7 +498,12 @@ expanded calls. Definition and graph nesting are limited to **32**, expression
 nesting to 64 and combined assignment/body search depth to 96. These deliberately
 stricter depth limits are not the upstream 64-definition ceiling.
 `MatchBudget` bounds shared steps, completed candidates, and tensor/attribute/
-sequence comparison bytes across an entire public call, including nested bodies.
+sequence comparison bytes. `MatchBudgetScope::Search` (the default) shares these
+limits across the complete public query. `Root` resets them only between roots
+in `find_matches`; alternatives, nested bodies and predicates at each root still
+share one budget. Trusted built-in full-graph scans select `Root`, so model size
+alone cannot exhaust a small single-query candidate cap. Total work and retained
+matches still scale with the graph; this does not make discovery allocation-free.
 Tensor comparison accounting includes names, dimensions, string payloads and
 per-string metadata, not just numeric data buffers.
 There is no recursive user pattern or unbounded variadic splitting.

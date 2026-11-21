@@ -2550,3 +2550,35 @@ fn literal_attribute_comparisons_obey_the_byte_budget() {
         );
     }
 }
+
+#[test]
+fn root_scoped_budget_scales_the_scan_but_preserves_each_root_limit() {
+    use onnx_runtime_ir::pattern::MatchBudgetScope;
+    let pattern = Pattern::parse_ort("(x)=>return Identity(x)").unwrap();
+    let mut graph = Graph::new();
+    let x = input(&mut graph, "x");
+    let outputs = (0..24)
+        .map(|_| op(&mut graph, "Identity", &[Some(x)], 1).1[0])
+        .collect();
+    graph.set_outputs(outputs);
+    let session = MatchSession::new(&graph).unwrap();
+    let mut options = MatchOptions {
+        budget: MatchBudget {
+            steps: 8,
+            candidates: 1,
+            tensor_bytes: 1024,
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        session.find_matches(&pattern, options).unwrap_err().kind,
+        PatternErrorKind::BudgetExceeded
+    );
+    options.budget_scope = MatchBudgetScope::Root;
+    assert_eq!(session.find_matches(&pattern, options).unwrap().len(), 24);
+    options.budget.candidates = 0;
+    assert_eq!(
+        session.find_matches(&pattern, options).unwrap_err().kind,
+        PatternErrorKind::BudgetExceeded
+    );
+}

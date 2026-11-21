@@ -467,12 +467,9 @@ fn f32_low_parallelism_reduce_prepared_workspace_uses_the_injected_allocator() {
     let injected = Arc::new(common::ExternalEagerAllocator::new(
         common::require_context("cuDNN Reduce prepared-workspace allocator substitution"),
     ));
-    let ep =
-        require_cuda()
-            .with_memory(
-                Arc::clone(&injected) as Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>
-            )
-            .expect("the injected allocator must be accepted for the visible CUDA device");
+    let ep = require_cuda()
+        .with_memory(Arc::clone(&injected) as Arc<dyn onnx_runtime_memory_api::DeviceAllocator>)
+        .expect("the injected allocator must be accepted for the visible CUDA device");
     let runtime = ep.runtime();
     let dtype = DataType::Float32;
     let in_shape = [1usize, 1, 4096];
@@ -600,12 +597,9 @@ fn cudnn_rewarm_failure_preserves_a(mode: CudnnRewarmFailure) {
     let injected = Arc::new(common::ExternalEagerAllocator::new(
         common::require_context("transactional cuDNN Reduce rewarm"),
     ));
-    let ep =
-        require_cuda()
-            .with_memory(
-                Arc::clone(&injected) as Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>
-            )
-            .expect("the injected allocator must be accepted for the visible CUDA device");
+    let ep = require_cuda()
+        .with_memory(Arc::clone(&injected) as Arc<dyn onnx_runtime_memory_api::DeviceAllocator>)
+        .expect("the injected allocator must be accepted for the visible CUDA device");
     let runtime = ep.runtime();
     let dtype = DataType::Float32;
     let a_in = [1usize, 4096];

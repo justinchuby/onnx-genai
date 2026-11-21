@@ -46,8 +46,6 @@ use cuda::{
     cuda_provider_unavailable_error,
 };
 #[cfg(test)]
-use options::auto_default_execution_providers;
-#[cfg(test)]
 use providers::{append_execution_provider, named_provider_options, provider_is_available};
 
 /// Tensor metadata for a model input or output.

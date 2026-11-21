@@ -38,9 +38,8 @@ use cudarc::driver::sys as cu;
 use onnx_runtime_cuda_memory::vmm_allocator::{
     CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV, CudaVmmAllocator,
 };
-use onnx_runtime_memory_governor::{
-    DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole, VirtualBacking,
-};
+use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, MemoryRole, VirtualBacking};
+use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
 
 const HOLDER: HolderId = HolderId::new(716);
 const GRANULE: usize = 2 << 20;

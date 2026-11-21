@@ -278,10 +278,10 @@ impl DriverFailure {
                 source.downcast_ref::<SchedulerAdmissionError>(),
                 Some(SchedulerAdmissionError::ByteBudget { .. })
             ) || matches!(
-                source.downcast_ref::<onnx_runtime_memory_governor::MemoryError>(),
+                source.downcast_ref::<onnx_runtime_memory_api::MemoryError>(),
                 Some(
-                    onnx_runtime_memory_governor::MemoryError::TierExhausted { .. }
-                        | onnx_runtime_memory_governor::MemoryError::CapacityUnavailable { .. },
+                    onnx_runtime_memory_api::MemoryError::TierExhausted { .. }
+                        | onnx_runtime_memory_api::MemoryError::CapacityUnavailable { .. },
                 )
             )
         });
@@ -3063,40 +3063,37 @@ mod admission_tests {
             DriverFailure::from_engine_error(&memory_error).kind,
             DriverFailureKind::MemoryOverload
         );
-        let workspace_error: anyhow::Error =
-            onnx_runtime_memory_governor::MemoryError::TierExhausted {
-                tier: "device",
-                requested: 4096,
-                used: 8192,
-                limit: 8192,
-                available: 0,
-                role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
-            }
-            .into();
+        let workspace_error: anyhow::Error = onnx_runtime_memory_api::MemoryError::TierExhausted {
+            tier: "device",
+            requested: 4096,
+            used: 8192,
+            limit: 8192,
+            available: 0,
+            role: onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+        }
+        .into();
         assert_eq!(
             DriverFailure::from_engine_error(&workspace_error).kind,
             DriverFailureKind::MemoryOverload
         );
         let mapped_physical_error: anyhow::Error =
-            onnx_runtime_memory_governor::MemoryError::CapacityUnavailable {
+            onnx_runtime_memory_api::MemoryError::CapacityUnavailable {
                 tier: "device",
                 requested: 4096,
                 available: 0,
-                role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+                role: onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
                 detail: "cuMemMap could not grow the physical handle pool".into(),
                 // Shaped the way the allocator actually reports this: the
                 // governor's refusal is carried whole, so classification must
                 // not depend on the wording of `detail`.
                 source: Some(Box::new(
-                    onnx_runtime_memory_governor::MemoryError::TierExhausted {
+                    onnx_runtime_memory_api::MemoryError::TierExhausted {
                         tier: "device",
                         requested: 4096,
                         used: 0,
                         limit: 0,
                         available: 0,
-                        role: onnx_runtime_memory_governor::MemoryRole::Workspace {
-                            step_scoped: false,
-                        },
+                        role: onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
                     },
                 )),
             }
@@ -3105,13 +3102,12 @@ mod admission_tests {
             DriverFailure::from_engine_error(&mapped_physical_error).kind,
             DriverFailureKind::MemoryOverload
         );
-        let invalid_error: anyhow::Error =
-            onnx_runtime_memory_governor::MemoryError::InvalidRequest {
-                tier: "device",
-                requested: 1,
-                reason: "invalid allocation range",
-            }
-            .into();
+        let invalid_error: anyhow::Error = onnx_runtime_memory_api::MemoryError::InvalidRequest {
+            tier: "device",
+            requested: 1,
+            reason: "invalid allocation range",
+        }
+        .into();
         assert_eq!(
             DriverFailure::from_engine_error(&invalid_error).kind,
             DriverFailureKind::Internal

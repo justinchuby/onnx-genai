@@ -1,6 +1,6 @@
 use super::*;
 use crate::recognition::{capture_node, capture_value};
-use onnx_runtime_ir::pattern::{Match, MatchOptions};
+use onnx_runtime_ir::pattern::{Match, MatchBudgetScope, MatchOptions};
 use std::sync::LazyLock;
 
 pub(super) static LAYERNORM: LazyLock<RecognitionRule> = LazyLock::new(|| {
@@ -73,7 +73,13 @@ impl FusionPattern {
         let mut scaled_outputs = HashSet::new();
         let mut transposes = HashMap::new();
         if self.kind == RewriteKind::Attention {
-            for matched in session.find_matches(&SCORE_SCALE, MatchOptions::default())? {
+            for matched in session.find_matches(
+                &SCORE_SCALE,
+                MatchOptions {
+                    budget_scope: MatchBudgetScope::Root,
+                    ..Default::default()
+                },
+            )? {
                 let scores = capture_value(&matched, "scores")?;
                 let scaled = capture_value(&matched, "scaled")?;
                 if score_multiplier(graph, scores, graph.node(capture_node(&matched, "scaled")?))
@@ -82,7 +88,13 @@ impl FusionPattern {
                     scaled_outputs.insert(scaled);
                 }
             }
-            for matched in session.find_matches(&TRANSPOSE, MatchOptions::default())? {
+            for matched in session.find_matches(
+                &TRANSPOSE,
+                MatchOptions {
+                    budget_scope: MatchBudgetScope::Root,
+                    ..Default::default()
+                },
+            )? {
                 transposes.insert(
                     capture_value(&matched, "out")?,
                     capture_node(&matched, "out")?,
@@ -208,7 +220,7 @@ pub(super) fn score_multiplier(graph: &Graph, scores: ValueId, node: &Node) -> O
         if a != scores {
             return None;
         }
-        let divisor = read_scalar_const_f32(graph, b)?;
+        let divisor = read_scalar_const_f32(graph, b, scores)?;
         (divisor != 0.0).then_some(1.0 / divisor)
     } else {
         let constant = if a == scores {
@@ -218,7 +230,7 @@ pub(super) fn score_multiplier(graph: &Graph, scores: ValueId, node: &Node) -> O
         } else {
             return None;
         };
-        read_scalar_const_f32(graph, constant)
+        read_scalar_const_f32(graph, constant, scores)
     }
 }
 
@@ -239,12 +251,14 @@ pub(super) fn transpose_eligible(graph: &Graph, node: &Node, score: NodeId) -> b
 pub(super) fn scaled_is(graph: &Graph, node: &Node, x: ValueId, divisor: f32, factor: f32) -> bool {
     match node.inputs.as_slice() {
         [Some(a), Some(b)] if node.op_type == "Div" && *a == x => {
-            read_scalar_const_f32(graph, *b).is_some_and(|value| approx(value, divisor))
+            read_scalar_const_f32(graph, *b, x).is_some_and(|value| approx(value, divisor))
         }
         [Some(a), Some(b)] if node.op_type == "Mul" => {
-            (*a == x && read_scalar_const_f32(graph, *b).is_some_and(|value| approx(value, factor)))
+            (*a == x
+                && read_scalar_const_f32(graph, *b, x).is_some_and(|value| approx(value, factor)))
                 || (*b == x
-                    && read_scalar_const_f32(graph, *a).is_some_and(|value| approx(value, factor)))
+                    && read_scalar_const_f32(graph, *a, x)
+                        .is_some_and(|value| approx(value, factor)))
         }
         _ => false,
     }

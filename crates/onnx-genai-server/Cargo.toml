@@ -63,6 +63,7 @@ native-backend = ["onnx-genai-engine/native-backend"]
 mlas = ["native-backend", "onnx-genai-engine/mlas"]
 
 [dependencies]
+onnx-runtime-memory-api = { workspace = true }
 onnx-genai = { path = "../onnx-genai", version = "=0.1.0-dev.6", default-features = false }
 onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.6", default-features = false }
 onnx-genai-metadata = { workspace = true }
