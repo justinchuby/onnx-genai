@@ -691,6 +691,37 @@ are separate work and are not made borrowed by this change. The compact owned
 packs still need governor admission and pressure reclamation; the f32 expansion
 cache's owned Host grants do not govern these other allocations.
 
+## Reference reachability and numerical comparisons
+
+Linkage is not a particular ISA, selected backend, or blocked-layout capability.
+The A/B GEMM list includes every implemented route available in the build:
+Generic, runtime-supported x86 SIMD, Apple Accelerate, and explicitly linked
+MLAS. MLAS SGEMM can be compared on ARM64 too; its x86 microkernel ID is zero
+there because that ID is architecture-specific instrumentation. An explicit
+`NXRT_CPU_GEMM_BACKEND=mlas` research override can select the library on those
+targets without changing the Apple default. Add/pooling route tests observe the
+selected native or research path rather than assuming linkage leaves vDSP/BNNS
+selected. The NCHWc rewrite consumes a resolved block width: tests exercise
+8/16-lane graph rewrites and an unavailable layout without pretending the host
+can execute blocked convolutions. Production still uses the actual MLAS query.
+
+MLAS is also not a mathematical oracle. On Apple ARM64, the native scalar Tanh
+at `f32::MIN_POSITIVE` preserves the input while the MLAS rational differs by
+28 ULP. Scalar Sigmoid(-88.5) produces about 3.672302e-39 while MLAS rounds to
+zero; their ULP distance is large because the outputs are tiny. Treat these as
+finite approximation/underflow comparisons, not changes to signed-zero or
+nonfinite semantics. No kernel arithmetic is changed to make two algorithms
+imitate one another.
+
+The activation differential test keeps the existing bitwise special-value and
+one-ULP interior guards when the native AVX2 approximation runs. It keeps
+nonfinite/signed-zero checks on every target. Both finite routes are also
+checked against the existing independent f64 oracle and per-family accuracy
+bounds, reused from the native accuracy tests. Scalar native finite
+underflow/tail fixtures additionally match the rounded f64 oracle bitwise. This
+preserves the native quality guarantee while exposing reference rounding;
+feature linkage alone cannot certify numerical equivalence or performance.
+
 ## Opting *in*, for research only
 
 MLAS is off everywhere by default. To reach the reference deliberately:

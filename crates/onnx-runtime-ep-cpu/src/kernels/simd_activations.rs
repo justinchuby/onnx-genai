@@ -1162,11 +1162,10 @@ const MLAS_FIXUP_BLOCK: usize = 8192;
 ///
 /// `MlasComputeGeluErf` evaluates `x·0.5·(1 + erf(x/√2))` without special-casing
 /// the `-inf` limit, so it computes `-inf · 0` and returns NaN where the limit
-/// is `0`. That is the *only* input on which MLAS and the pure-Rust path
-/// disagree, across `Tanh`, `Sigmoid`, `Erf` and exact `Gelu` and every special
-/// value — NaN (both signs), ±Inf, ±0, ±`MIN_POSITIVE`, the smallest
-/// subnormals, `MAX`/`MIN` and the exp saturation thresholds. That claim is
-/// pinned by `mlas_ab::mlas_matches_rust_simd_on_special_values`, which fails
+/// is `0`. The repair aligns this exact limit with the native path. Other
+/// nonfinite values, signed zeros and saturation tails have bitwise guards;
+/// finite values also have independent f64 accuracy checks because the scalar
+/// native fallback and MLAS can round tiny inputs differently. This is pinned by `mlas_ab::mlas_matches_rust_simd_on_special_values`, which fails
 /// if a future MLAS bump changes any of it.
 ///
 /// Note this makes us *disagree with ORT*, which calls `MlasComputeGeluErf`
@@ -2778,11 +2777,11 @@ mod tests {
 
     // ---- f64 references, rounded once to f32 --------------------------------
 
-    fn tanh_ref(x: f32) -> f32 {
+    pub(super) fn tanh_ref(x: f32) -> f32 {
         f64::from(x).tanh() as f32
     }
 
-    fn sigmoid_ref(x: f32) -> f32 {
+    pub(super) fn sigmoid_ref(x: f32) -> f32 {
         let x = f64::from(x);
         if x >= 0.0 {
             (1.0 / (1.0 + (-x).exp())) as f32
@@ -2816,14 +2815,14 @@ mod tests {
         (xf * s) as f32
     }
 
-    fn erf_ref(x: f32) -> f32 {
+    pub(super) fn erf_ref(x: f32) -> f32 {
         if x.is_nan() {
             return f32::NAN;
         }
         libm::erf(f64::from(x)) as f32
     }
 
-    fn erf_gelu_ref(x: f32) -> f32 {
+    pub(super) fn erf_gelu_ref(x: f32) -> f32 {
         if x == f32::NEG_INFINITY {
             return 0.0;
         }
@@ -2834,7 +2833,7 @@ mod tests {
     /// Error normalised by the documented contract: absolute error scaled by
     /// `max(1, |x|)`. `tanh`/`sigmoid` are bounded in magnitude so the scale is
     /// 1; the GELU forms multiply by `x`, so their error scales with `|x|`.
-    fn scaled_err(got: f32, want: f32, x: f32) -> f64 {
+    pub(super) fn scaled_err(got: f32, want: f32, x: f32) -> f64 {
         if (got.is_nan() && want.is_nan()) || got == want {
             return 0.0;
         }
@@ -2875,9 +2874,9 @@ mod tests {
     // ---- accuracy sweeps ----------------------------------------------------
 
     /// Documented bound: `|err| <= 4e-7 * max(1, |x|)`.
-    const TANH_BOUND: f64 = 4e-7;
+    pub(super) const TANH_BOUND: f64 = 4e-7;
     /// Documented bound: `|err| <= 2e-7` (output is in `[0, 1]`).
-    const SIGMOID_BOUND: f64 = 2e-7;
+    pub(super) const SIGMOID_BOUND: f64 = 2e-7;
     /// Documented bound: `|err| <= 4e-7 * max(1, |x|)`.
     const GELU_BOUND: f64 = 4e-7;
 
@@ -2945,9 +2944,9 @@ mod tests {
     /// ulp of the correctly-rounded `f32` result; one ulp just below `1.0` is
     /// `5.96e-8`, so `3e-7` is a ~5x margin that still fails loudly if a
     /// coefficient is mistyped.
-    const ERF_BOUND: f64 = 3e-7;
+    pub(super) const ERF_BOUND: f64 = 3e-7;
     /// Documented bound: `|err| <= 4e-7 * max(1, |x|)`, as for tanh GELU.
-    const ERF_GELU_BOUND: f64 = 4e-7;
+    pub(super) const ERF_GELU_BOUND: f64 = 4e-7;
 
     #[test]
     fn erf_dense_sweep_matches_f64_reference() {
@@ -5100,28 +5099,20 @@ mod mlas_ab {
         }
     }
 
-    /// MLAS must agree with the pure-Rust route on every special value, not
-    /// just on the dense interior sweep.
+    /// Preserve bitwise checks for shared vector approximations and exact
+    /// nonfinite/signed-zero semantics. Portable scalar libm has different
+    /// finite underflow and saturation rounding from MLAS's polynomial.
     ///
-    /// **Bit-identical on the special values themselves** — NaN, ±inf, ±0,
-    /// subnormals and the saturation tails are where the two routes have
-    /// genuinely different behaviour (MLAS clamps; we repair), so any
-    /// divergence there is a behavioural one and this suite is the only place
-    /// that would see it.
-    ///
-    /// **Within one ULP on the finite interior.** The native route is what
-    /// production runs and MLAS is a research reference (see
-    /// `docs/performance/CPU_MLAS_MIGRATION.md`); two different polynomial
-    /// evaluations of the same transcendental are not required to agree to the
-    /// last bit, and demanding it made this test fail on `main` for a
-    /// 1-ULP `Erf(1.0)` — `0.84270084` vs `0.8427008`, adjacent floats — which
-    /// is not a defect in either route. The bound is asserted rather than
-    /// assumed: 1 ULP, with the observed value in the message, so a real
-    /// numerical regression still fails here.
+    /// When the native AVX2 approximation runs, keep the existing one-ULP
+    /// differential guard. A portable scalar libm fallback is an independent,
+    /// often more accurate algorithm: on ARM the MLAS rational's intermediate
+    /// underflow changes tiny Tanh outputs by many ULPs (or rounds them to zero).
+    /// Grade both against the existing independent f64 accuracy contracts too,
+    /// rather than treating either implementation as a mathematical oracle.
     #[test]
     fn mlas_matches_rust_simd_on_special_values() {
-        /// Values whose *bits* must match, because they are where the repair
-        /// passes act: a divergence here is behaviour, not rounding.
+        /// Bitwise fixture for the vector route. Finite underflow and tails
+        /// take the f64 accuracy checks when the native route is scalar.
         fn is_special(x: f32) -> bool {
             !x.is_finite() || x == 0.0 || x.abs() < f32::MIN_POSITIVE || x.abs() >= 88.0
         }
@@ -5164,23 +5155,66 @@ mod mlas_ab {
         let mut mlas = vec![0.0f32; n];
 
         #[allow(clippy::type_complexity)]
-        let cases: [(&str, fn(&[f32], &mut [f32]), fn(&[f32], &mut [f32])); 4] = [
-            ("Tanh", tanh_avx2_shim, tanh_mlas_ref),
-            ("Sigmoid", sigmoid_avx2_shim, sigmoid_mlas_ref),
-            ("Erf", erf_avx2_shim, mlas_sys::compute_erf),
-            ("GeluErf", erf_gelu_avx2_shim, erf_gelu_mlas),
+        let cases: [(
+            &str,
+            fn(&[f32], &mut [f32]),
+            fn(&[f32], &mut [f32]),
+            fn(f32) -> f32,
+            f64,
+        ); 4] = [
+            (
+                "Tanh",
+                tanh_avx2_shim,
+                tanh_mlas_ref,
+                super::tests::tanh_ref,
+                super::tests::TANH_BOUND,
+            ),
+            (
+                "Sigmoid",
+                sigmoid_avx2_shim,
+                sigmoid_mlas_ref,
+                super::tests::sigmoid_ref,
+                super::tests::SIGMOID_BOUND,
+            ),
+            (
+                "Erf",
+                erf_avx2_shim,
+                mlas_sys::compute_erf,
+                super::tests::erf_ref,
+                super::tests::ERF_BOUND,
+            ),
+            (
+                "GeluErf",
+                erf_gelu_avx2_shim,
+                erf_gelu_mlas,
+                super::tests::erf_gelu_ref,
+                super::tests::ERF_GELU_BOUND,
+            ),
         ];
         // A tolerance nothing exercises is a tolerance that proves nothing, so
         // record whether the strict half of this test ran at all.
         let mut special_comparisons = 0usize;
-        for (name, rust, mlas_fn) in cases {
+        let mut oracle_comparisons = 0usize;
+        let native_vector = vector_path_available();
+        for (name, rust, mlas_fn, oracle, bound) in cases {
+            let mut worst_scaled = [0.0f64; 2];
+            let mut worst_ulps = 0u32;
             rust(&x, &mut ours);
             mlas_fn(&x, &mut mlas);
             for (i, ((a, b), input)) in ours.iter().zip(&mlas).zip(&x).enumerate() {
-                if a.is_nan() && b.is_nan() {
+                if input.is_nan() {
+                    assert!(
+                        a.is_nan() && b.is_nan(),
+                        "{name}: NaN input must produce NaN on both routes"
+                    );
                     continue;
                 }
-                if is_special(*input) {
+                let oracle_value = oracle(*input);
+                // Bit identity guards nonfinite values/zeros and retains the
+                // original differential guard when the native vector runs.
+                // Finite underflow in an independent scalar algorithm belongs
+                // to the numerical accuracy contract instead.
+                if is_special(*input) && (native_vector || *input == 0.0 || !input.is_finite()) {
                     special_comparisons += 1;
                     assert_eq!(
                         a.to_bits(),
@@ -5190,18 +5224,52 @@ mod mlas_ab {
                          {input:e} (native={a:e} mlas={b:e}); special values are \
                          where the repair passes act, so this is behaviour"
                     );
-                    continue;
+                    if !input.is_finite() || *input == 0.0 {
+                        assert_eq!(
+                            a.to_bits(),
+                            oracle_value.to_bits(),
+                            "{name}: nonfinite limit/signed zero must match the independent oracle"
+                        );
+                        if !input.is_finite() {
+                            continue;
+                        }
+                    }
+                }
+                if !native_vector && is_special(*input) {
+                    assert_eq!(
+                        a.to_bits(),
+                        oracle_value.to_bits(),
+                        "{name}: native scalar underflow/tail result must match the f64 oracle at {input:e}"
+                    );
+                }
+                let expected = f64::from(oracle_value);
+                for (route, value) in [*a, *b].into_iter().enumerate() {
+                    let error = super::tests::scaled_err(value, oracle_value, *input);
+                    worst_scaled[route] = worst_scaled[route].max(error);
+                    assert!(
+                        value.is_finite() && error <= bound,
+                        "{name}: route {route} at input {input:e} returned {value:e}, f64 reference {expected:e}, scaled error {error:e} exceeds documented {bound:e}"
+                    );
+                    oracle_comparisons += 1;
                 }
                 let apart = ulps_apart(*a, *b);
+                worst_ulps = worst_ulps.max(apart);
                 assert!(
-                    apart <= INTERIOR_ULP_BUDGET,
+                    !native_vector || apart <= INTERIOR_ULP_BUDGET,
                     "{name}: the MLAS reference and the native SIMD route are \
                      {apart} ULP apart at index {i} for input {input:e} \
                      (native={a:e} mlas={b:e}), over the {INTERIOR_ULP_BUDGET} \
                      ULP budget for finite interior values"
                 );
             }
+            eprintln!(
+                "{name}: native_vector={native_vector}, worst ULP difference={worst_ulps}, native/reference scaled errors={worst_scaled:?}"
+            );
         }
+        assert!(
+            oracle_comparisons > 0,
+            "independent finite-value accuracy contract must be exercised"
+        );
         assert!(
             special_comparisons >= 4 * specials.len(),
             "the bit-identity half of this test compared only \

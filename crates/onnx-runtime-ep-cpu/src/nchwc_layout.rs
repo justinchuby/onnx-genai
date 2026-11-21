@@ -103,7 +103,14 @@ impl OptimizationPass for NchwcLayoutPropagation {
             // leave every Conv on the per-op NCHWc/im2col path.
             return Ok(());
         }
-        let block = mlas_sys::nchwc_block_size();
+        Self::rewrite_for_block(graph, mlas_sys::nchwc_block_size())
+    }
+}
+
+impl NchwcLayoutPropagation {
+    /// The rewrite depends on the resolved blocked layout, not on how the
+    /// host acquired that capability. Production always supplies the MLAS query.
+    fn rewrite_for_block(graph: &mut Graph, block: usize) -> Result<()> {
         if block < 8 {
             // Host has no blocked-convolution kernel; the per-op path already
             // falls back to im2col, so there is nothing to propagate.
@@ -927,9 +934,47 @@ mod tests {
     }
 
     fn run_pass(graph: &mut Graph) {
-        NchwcLayoutPropagation::new()
-            .run(graph, &PassContext::new())
-            .expect("layout propagation pass");
+        let mut wide = graph.clone();
+        NchwcLayoutPropagation::rewrite_for_block(&mut wide, 16)
+            .expect("16-lane layout propagation pass");
+        NchwcLayoutPropagation::rewrite_for_block(graph, 8)
+            .expect("8-lane layout propagation pass");
+        for op in [
+            NCHWC_CONV_OP,
+            REORDER_TO_BLOCKED_OP,
+            REORDER_TO_NCHW_OP,
+            "Conv",
+            "Relu",
+            "Add",
+        ] {
+            assert_eq!(
+                count_op(graph, op),
+                count_op(&wide, op),
+                "both resolved block widths must preserve the fixture topology for {op}"
+            );
+        }
+        assert!(wide.validate().is_ok());
+    }
+
+    #[test]
+    fn unavailable_blocked_layout_preserves_the_graph() {
+        let mut graph = Graph::new();
+        let x = graph.create_named_value("x", DataType::Float32, static_shape([1, 16, 8, 8]));
+        graph.add_input(x);
+        let w = weight(&mut graph, "w", 16, 16);
+        let y = graph.create_named_value("y", DataType::Float32, static_shape([1, 16, 8, 8]));
+        graph.insert_node(conv_node("conv", x, w, y));
+        graph.add_output(y);
+        NchwcLayoutPropagation::rewrite_for_block(&mut graph, 1).unwrap();
+        if mlas_sys::nchwc_block_size() < 8 {
+            NchwcLayoutPropagation::new()
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+        }
+        assert_eq!(count_op(&graph, "Conv"), 1);
+        assert_eq!(count_op(&graph, NCHWC_CONV_OP), 0);
+        assert_eq!(count_op(&graph, REORDER_TO_BLOCKED_OP), 0);
+        assert!(graph.validate().is_ok());
     }
 
     /// A 3x3-same Conv weight value with `[out, in, 3, 3]`.

@@ -5238,10 +5238,9 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn default_gemm_backend_matches_generic_reference() {
-        // Locks the auto-detected default GEMM path: after flipping the f32
-        // default to MLAS, `gemm()` (which dispatches on `CpuBackend::auto_detect`)
-        // must still match the generic reference within f32 tolerance, so the
-        // faster default never changes decode outputs (token-ID parity).
+        // The actual default (including Apple Accelerate) must agree with
+        // the portable reference. Linking MLAS does not select it on every OS;
+        // explicit MLAS arithmetic is exercised by the backend A/B suite.
         const SHAPES: &[(usize, usize, usize)] = &[
             (1, 2048, 2048), // decode GEMV (m=1), the dense hot path
             (1, 2304, 9216), // GeGLU up/gate projection tile
@@ -5249,7 +5248,6 @@ mod tests {
             (5, 128, 256),
             (32, 512, 512),
         ];
-        assert_eq!(CpuBackend::auto_detect(), CpuBackend::Mlas);
         let mut state = 0x1234_abcd_u32;
         let mut next_f32 = || {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -5468,8 +5466,15 @@ mod tests {
 
     #[cfg(feature = "mlas")]
     #[test]
-    fn mlas_selects_a_float_kernel_on_x86_64() {
+    fn mlas_float_kernel_report_matches_target() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         assert_ne!(mlas_sys::selected_float_kernel(), 0);
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        assert_eq!(
+            mlas_sys::selected_float_kernel(),
+            0,
+            "the reference kernel ID is x86 instrumentation; arithmetic is checked independently"
+        );
     }
 
     #[test]
