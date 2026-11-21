@@ -1426,9 +1426,9 @@ fn whole_graph_control_flow_executes_on_the_ep_in_real_ort() {
                 "output size",
             );
             let expected = if condition != 0 {
-                vec![3., -2.]
+                vec![3., 0.]
             } else {
-                vec![3., -2., 3., -2.]
+                vec![3., 0., 3., 0.]
             };
             assert_eq!(count, expected.len());
             let mut data = ptr::null_mut();
@@ -1495,9 +1495,9 @@ fn whole_graph_control_flow_executes_through_native_plugin_session() {
         let cond = Tensor::from_raw(DataType::Bool, vec![], &[condition]).unwrap();
         let actual = session.run(&[("x", &x), ("condition", &cond)]).unwrap();
         let expected = if condition != 0 {
-            vec![3., -2.]
+            vec![3., 0.]
         } else {
-            vec![3., -2., 3., -2.]
+            vec![3., 0., 3., 0.]
         };
         assert_eq!(actual[0].shape, [expected.len()]);
         assert_eq!(actual[0].to_vec_f32(), expected);

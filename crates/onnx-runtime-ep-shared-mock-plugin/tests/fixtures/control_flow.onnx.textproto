@@ -5,19 +5,20 @@ graph {
   input { name: "x" type { tensor_type { elem_type: 1 shape { dim { dim_value: 2 } } } } }
   input { name: "condition" type { tensor_type { elem_type: 9 shape {} } } }
   output { name: "output" type { tensor_type { elem_type: 1 shape { dim { dim_param: "n" } } } } }
+  node { name: "typed_float_default" op_type: "LeakyRelu" input: "x" output: "captured" attribute { name: "alpha" type: FLOAT f: 0 } }
   node {
     name: "select" op_type: "If" input: "condition" output: "selected"
     attribute {
       name: "then_branch" type: GRAPH g {
         name: "then"
-        node { op_type: "Identity" input: "x" output: "then_output" }
+        node { op_type: "Identity" input: "captured" output: "then_output" }
         output { name: "then_output" type { tensor_type { elem_type: 1 shape { dim { dim_value: 2 } } } } }
       }
     }
     attribute {
       name: "else_branch" type: GRAPH g {
         name: "else"
-        node { op_type: "Concat" input: "x" input: "x" output: "else_output" attribute { name: "axis" type: INT i: -1 } }
+        node { op_type: "Concat" input: "captured" input: "captured" output: "else_output" attribute { name: "axis" type: INT i: 0 } }
         output { name: "else_output" type { tensor_type { elem_type: 1 shape { dim { dim_value: 4 } } } } }
       }
     }

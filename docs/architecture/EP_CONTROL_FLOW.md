@@ -65,6 +65,11 @@ and the distinction between unknown rank and scalar. Outbound import preserves
 scalar/list attributes, tensor attributes and binary string contents; attribute
 read errors include the owning node and attribute instead of dropping metadata.
 Tensor-attribute OrtValues and shape descriptors have explicit owned lifetimes.
+For typed proto3 INT/FLOAT attributes whose zero field is omitted on the wire,
+ORT 32's explicit field-absence response is decoded as the protobuf scalar
+default; other attribute errors still propagate. Real ORT conformance includes
+zero-valued integer and float attributes so a reader cannot silently decline
+the complete graph at this boundary.
 Large initializer payloads remain lazy; discovery does not copy all weights.
 
 For native legacy-plugin claims containing nested bodies, Compute may allocate

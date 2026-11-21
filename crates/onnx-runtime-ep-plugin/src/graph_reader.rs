@@ -888,7 +888,7 @@ impl OutboundGraphReader {
         // u64 storage provides alignment for every supported scalar/list type.
         let mut storage = vec![0u64; required.div_ceil(8)];
         let mut written = 0;
-        Self::check(unsafe {
+        let read = Self::check(unsafe {
             read_attr(
                 attr_ptr,
                 attr_type,
@@ -896,7 +896,23 @@ impl OutboundGraphReader {
                 required,
                 &mut written,
             )
-        })?;
+        });
+        if let Err(reason) = read {
+            // ONNX's discriminator gives proto3 scalar attributes their type
+            // even when a zero-valued field is omitted from the wire. ORT 32
+            // ReadOpAttr still tests protobuf has_i/has_f in these two cases.
+            // Interpret only its explicit field-absence reports as the typed
+            // protobuf default; all buffer/type/host failures remain errors.
+            match (attr_type, required, written, reason.as_str()) {
+                (ort::ORT_OP_ATTR_INT, 8, 8, "Attribute has no int64 value.") => {
+                    return Ok(Some(Attribute::Int(0)));
+                }
+                (ort::ORT_OP_ATTR_FLOAT, 4, 4, "Attribute has no float value.") => {
+                    return Ok(Some(Attribute::Float(0.0)));
+                }
+                _ => return Err(reason),
+            }
+        }
         if written != required {
             return Err(format!(
                 "attribute size changed while reading: expected {required} bytes, got {written}"
