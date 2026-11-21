@@ -7,8 +7,9 @@ use onnx_genai_ort::{
     DataType, Environment, ManagedCudaAllocatorConfig, Session, SessionOptions, Value,
     available_execution_providers, ep_selection,
 };
+use onnx_runtime_memory_api::DeviceKey;
 use onnx_runtime_memory_governor::{
-    DeviceKey, LeaseLedger, LedgerGovernor, ProcessMemoryLimits, ProcessMemoryManager,
+    LeaseLedger, LedgerGovernor, ProcessMemoryLimits, ProcessMemoryManager,
 };
 
 fn tiny_llm() -> PathBuf {

@@ -32,9 +32,7 @@ use onnx_runtime_cuda_memory::release::{
     ScriptedDriver, SpanReleaseReport, TransactionalUnmap, block_bytes, contiguous_runs,
     dispose_released_blocks, release_runs, unmap_runs_transactional,
 };
-use onnx_runtime_memory_governor::{
-    AllocationReleaseOutcome, AllocationReleaseState, QuarantineReason,
-};
+use onnx_runtime_memory_api::{AllocationReleaseOutcome, AllocationReleaseState, QuarantineReason};
 
 const GRANULE: usize = 2 << 20;
 const ALLOCATION: usize = 8 * GRANULE;
@@ -175,7 +173,7 @@ fn a_release_that_unmaps_nothing_is_still_complete() {
     assert!(report.is_complete());
     assert_eq!(
         outcome,
-        AllocationReleaseOutcome::complete(onnx_runtime_memory_governor::ReleaseAccounting::new(
+        AllocationReleaseOutcome::complete(onnx_runtime_memory_api::ReleaseAccounting::new(
             ALLOCATION as u64,
             0
         ))

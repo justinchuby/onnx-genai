@@ -18,10 +18,9 @@ use onnx_runtime_cuda_memory::virtual_memory::{
     ReservationTeardownTicket, cuda_teardown_stats, physical_pool_authority_gate,
     trim_physical_handle_pools,
 };
-use onnx_runtime_memory_governor::{
-    HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
-};
-use onnx_runtime_virtual_memory::{VirtualBacking, VirtualBuffer};
+use onnx_runtime_memory_api::{MemoryRole, Tier};
+use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+use onnx_runtime_virtual_memory::{ReservationBacking, VirtualBuffer};
 
 const HOLDER: HolderId = HolderId::new(11);
 

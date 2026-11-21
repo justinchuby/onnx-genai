@@ -18,7 +18,8 @@ use onnx_runtime_ep_cuda::coarse_residency::{
 };
 use onnx_runtime_ep_cuda::weight_paging::DeviceOffloadPolicy;
 use onnx_runtime_ir::DataType;
-use onnx_runtime_memory_governor::{DeviceKey, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier};
+use onnx_runtime_memory_api::{DeviceKey, Tier};
+use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor, MemoryGovernor};
 use onnx_runtime_session::{DeviceGraphCaptureResult, DeviceIoBinding, InferenceSession};
 
 const EXPERTS: usize = 4;

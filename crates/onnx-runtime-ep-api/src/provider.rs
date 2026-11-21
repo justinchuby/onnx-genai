@@ -13,10 +13,10 @@ use crate::weight::ExecutionProviderCapabilities;
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, GraphView, Node, NodeId, NodeIndex, Shape, TensorLayout,
 };
-use onnx_runtime_memory_governor::{
-    AllocationIdentity, ManagedAllocation, MemoryLease, MemoryRole, OwningAllocation,
-    ProviderContextIdentity,
+use onnx_runtime_memory_api::{
+    AllocationIdentity, MemoryRole, OwningAllocation, ProviderContextIdentity,
 };
+use onnx_runtime_memory_governor::{ManagedAllocation, MemoryLease};
 
 /// Index of an EP within an [`crate::registry::EpRegistry`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -2168,7 +2168,7 @@ pub trait ExecutionProvider: Send + Sync {
     fn reserve_workspace(
         &self,
         _bytes: u64,
-        _role: onnx_runtime_memory_governor::MemoryRole,
+        _role: onnx_runtime_memory_api::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
         Ok(None)
     }
@@ -2176,7 +2176,7 @@ pub trait ExecutionProvider: Send + Sync {
     fn prepare_mapped_growth(
         &self,
         bytes: u64,
-        role: onnx_runtime_memory_governor::MemoryRole,
+        role: onnx_runtime_memory_api::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
         // `role` describes content/lifetime. Providers whose allocator
         // suballocates shared granules must canonicalize it to the arena's
@@ -2190,7 +2190,7 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(bytes as u64)
     }
 
-    fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_governor::MemoryRole) {
+    fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_api::MemoryRole) {
         // This must use the same canonical physical zone as
         // `prepare_mapped_growth`; allocation lifetime is not map ownership.
         let _ = (bytes, role);
@@ -2232,7 +2232,7 @@ pub trait ExecutionProvider: Send + Sync {
     /// `false` is the safe default -- a consumer that believes `true` will
     /// under-reserve.
     ///
-    /// [`DeviceAllocator::commits_on_demand`]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
+    /// [`DeviceAllocator::commits_on_demand`]: onnx_runtime_memory_api::DeviceAllocator::commits_on_demand
     fn commits_on_demand(&self) -> bool {
         false
     }
@@ -2251,7 +2251,7 @@ pub trait ExecutionProvider: Send + Sync {
     fn adopt_memory_governor(
         &self,
         _governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
-        _tier: onnx_runtime_memory_governor::Tier,
+        _tier: onnx_runtime_memory_api::Tier,
         _holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<u64> {
         Ok(0)
@@ -2552,8 +2552,8 @@ mod tests {
 
     /// A host-backed binding, so the bound-ownership contract can be exercised
     /// without a device.
-    fn host_binding() -> onnx_runtime_memory_governor::MemoryBinding {
-        use onnx_runtime_memory_governor::{BindingRegistry, DeviceKey, HostAllocator};
+    fn host_binding() -> onnx_runtime_memory_api::MemoryBinding {
+        use onnx_runtime_memory_api::{BindingRegistry, DeviceKey, HostAllocator};
         use std::sync::Arc;
 
         #[derive(Debug)]
@@ -2583,8 +2583,8 @@ mod tests {
     /// under Miri's leak check, a test that leaks. Rather than exempt these
     /// tests from that check or weaken it globally, the test reclaims what it
     /// asked the runtime to retain.
-    fn reclaim_quarantined(binding: &onnx_runtime_memory_governor::MemoryBinding) -> usize {
-        use onnx_runtime_memory_governor::{DeviceAllocator, HostAllocator};
+    fn reclaim_quarantined(binding: &onnx_runtime_memory_api::MemoryBinding) -> usize {
+        use onnx_runtime_memory_api::{DeviceAllocator, HostAllocator};
 
         let quarantined = binding.quarantined().expect("quarantine list");
         for record in &quarantined {
@@ -2630,9 +2630,10 @@ mod tests {
 
     #[test]
     fn a_managed_buffer_keeps_charge_attached_to_bound_ownership() {
+        use onnx_runtime_memory_api::{DeviceKey, HostAllocator, MemoryRole, Tier};
         use onnx_runtime_memory_governor::{
-            AllocationPublication, AllocationRequest, DeviceKey, HostAllocator, LeaseLedger,
-            LedgerGovernor, MemoryGovernor, MemoryRole, ProcessMemoryManager, Tier,
+            AllocationPublication, AllocationRequest, LeaseLedger, LedgerGovernor, MemoryGovernor,
+            ProcessMemoryManager,
         };
         use std::sync::Arc;
 
@@ -2698,9 +2699,8 @@ mod tests {
 
     #[test]
     fn failed_workspace_deallocation_quarantine_keeps_compatibility_charge() {
-        use onnx_runtime_memory_governor::{
-            DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole, Tier,
-        };
+        use onnx_runtime_memory_api::{DeviceKey, MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
 
         #[derive(Debug)]
         struct WorkspaceDeallocationEp {

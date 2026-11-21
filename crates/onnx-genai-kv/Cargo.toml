@@ -9,6 +9,7 @@ keywords = ["llm", "inference", "kv-cache", "genai"]
 categories = ["caching", "science"]
 
 [dependencies]
+onnx-runtime-memory-api = { workspace = true }
 onnx-genai-metadata = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
 thiserror = { workspace = true }

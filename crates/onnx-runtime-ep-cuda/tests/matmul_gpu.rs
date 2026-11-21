@@ -34,7 +34,7 @@ use onnx_runtime_ep_cuda::blas::{self, GemmDtype, GemmParams, WORKSPACE_BYTES};
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ir::{DataType, DeviceId, Node, NodeId, compute_contiguous_strides};
 #[cfg(feature = "gpu-tests")]
-use onnx_runtime_memory_governor::DeviceAllocator;
+use onnx_runtime_memory_api::DeviceAllocator;
 
 /// Reinterpret an `&[f32]` as its little-endian bytes (host side).
 fn f32_bytes(v: &[f32]) -> &[u8] {

@@ -105,8 +105,7 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::MemoryError;
-use crate::allocator::{DeviceAllocator, DeviceKey, HostAllocator};
+use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, HostAllocator, MemoryError};
 
 /// Fallback floor, used when calibration is disabled or inconclusive.
 ///
@@ -333,7 +332,7 @@ fn resolve_cgroup_limit(
 /// `ONNX_GENAI_HOST_ALLOC_CACHE_BYTES` wins outright when set — including `0`,
 /// which disables retention and is the control arm for A/B measurement.
 /// Otherwise the budget is the smaller of [`DEFAULT_CACHE_BUDGET_BYTES`] and a
-/// [share](BUDGET_SHARE_DENOMINATOR) of what the process is allowed, so the
+/// share (`BUDGET_SHARE_DENOMINATOR`) of what the process is allowed, so the
 /// same binary is not a 2 GiB squatter inside a 1 GiB container.
 pub fn default_budget_bytes() -> usize {
     if let Ok(raw) = std::env::var("ONNX_GENAI_HOST_ALLOC_CACHE_BYTES")

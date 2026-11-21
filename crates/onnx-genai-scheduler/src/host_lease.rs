@@ -40,9 +40,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use onnx_runtime_memory_governor::{
-    HolderId, LeaseAccounting, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
-};
+use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
+use onnx_runtime_memory_governor::{HolderId, LeaseAccounting, MemoryGovernor, MemoryLease};
 use onnx_runtime_protocol_trace::LocalDeviceId;
 
 use crate::pressure::{HostAllocation, HostGovernor, HostPageRequest, HostPriority, TicketPoll};

@@ -33,12 +33,11 @@
 
 use std::sync::Arc;
 
-use onnx_runtime_memory_governor::{
-    HolderId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
-};
+use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
+use onnx_runtime_memory_governor::{HolderId, MemoryGovernor, MemoryLease};
 
 use crate::VirtualMemoryError;
-use crate::backing::{HostBacking, PhysicalMemoryAccounting, VirtualBacking};
+use crate::backing::{HostBacking, PhysicalMemoryAccounting, ReservationBacking};
 
 /// A growable region whose base address never changes.
 ///
@@ -46,7 +45,7 @@ use crate::backing::{HostBacking, PhysicalMemoryAccounting, VirtualBacking};
 /// that starts at zero. [`VirtualBuffer::grow_to`] commits pages;
 /// [`VirtualBuffer::shrink_to`] gives them back. The pointer returned by
 /// [`VirtualBuffer::as_ptr`] is the same for the buffer's whole life.
-pub struct VirtualBuffer<B: VirtualBacking = HostBacking> {
+pub struct VirtualBuffer<B: ReservationBacking = HostBacking> {
     backing: B,
     reservation: B::Reservation,
     /// Address space reserved at construction. Recorded here because a
@@ -117,7 +116,7 @@ impl VirtualBuffer<HostBacking> {
     }
 }
 
-impl<B: VirtualBacking> VirtualBuffer<B> {
+impl<B: ReservationBacking> VirtualBuffer<B> {
     /// Reserve `capacity` bytes of address space from `backing`, committing
     /// nothing.
     ///
@@ -308,7 +307,7 @@ fn round_up(granule: usize, bytes: usize) -> usize {
 // `MemoryGovernor` is not `Debug` — it is a trait a third party implements, and
 // requiring `Debug` of them to make this struct derivable would be the wrong
 // way round. Report what the buffer itself knows.
-impl<B: VirtualBacking> std::fmt::Debug for VirtualBuffer<B> {
+impl<B: ReservationBacking> std::fmt::Debug for VirtualBuffer<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VirtualBuffer")
             .field("base", &self.as_ptr())
@@ -325,7 +324,8 @@ impl<B: VirtualBacking> std::fmt::Debug for VirtualBuffer<B> {
 mod tests {
     use super::*;
     use crate::granularity;
-    use onnx_runtime_memory_governor::{DeviceKey, LeaseLedger, LedgerGovernor, MemoryAuthorityId};
+    use onnx_runtime_memory_api::DeviceKey;
+    use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor, MemoryAuthorityId};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const HOLDER: HolderId = HolderId::new(4);
@@ -352,7 +352,7 @@ mod tests {
 
     // SAFETY: this test backing returns an inert address, never exposes slices,
     // and records mapping calls without touching memory.
-    unsafe impl VirtualBacking for AuthorityBacking {
+    unsafe impl ReservationBacking for AuthorityBacking {
         type Reservation = usize;
 
         fn granularity(&self) -> usize {

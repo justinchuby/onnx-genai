@@ -9,6 +9,7 @@ keywords = ["memory", "virtual", "mmap", "paging", "inference"]
 categories = ["memory-management", "science"]
 
 [dependencies]
+onnx-runtime-memory-api = { workspace = true }
 thiserror = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
 

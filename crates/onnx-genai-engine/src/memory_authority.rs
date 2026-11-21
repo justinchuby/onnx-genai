@@ -1,10 +1,11 @@
 use std::{fmt, sync::Arc};
 
 use onnx_genai_scheduler::{GovernorSnapshot, ResourceLimit, TierSnapshot};
+use onnx_runtime_memory_api::{DeviceKey, MemoryError, MemoryRole, Tier};
 use onnx_runtime_memory_governor::{
-    DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MappedAllowance, MappedGrowthGrant,
-    MappedGrowthMetrics, MappedHolderRegistration, MemoryAuthorityId, MemoryError, MemoryGovernor,
-    MemoryLease, MemoryRole, ProcessMemoryManager, ReclaimableMappedHolder, Tier,
+    HolderId, LeaseLedger, LedgerGovernor, MappedAllowance, MappedGrowthGrant, MappedGrowthMetrics,
+    MappedHolderRegistration, MemoryAuthorityId, MemoryGovernor, MemoryLease, ProcessMemoryManager,
+    ReclaimableMappedHolder,
 };
 
 /// Physical-device compatibility domain for a shared device memory authority.

@@ -1487,7 +1487,8 @@ mod tests {
             0,
         )
         .unwrap();
-        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor as _, MemoryRole, Tier};
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor as _};
 
         let _device = governor
             .memory()

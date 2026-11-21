@@ -16,7 +16,8 @@ use onnx_runtime_ep_cuda::weight_paging::{DeviceOffloadPolicy, RouteBankReservat
 use onnx_runtime_ep_cuda::{CudaExecutionProvider, RoutePrepareCommitInterlock};
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, ValueId, WeightRef, static_shape};
 use onnx_runtime_loader::{ExpertStorageOrder, ExpertTensorLayout, WeightRegionCatalog};
-use onnx_runtime_memory_governor::{DeviceKey, LeaseLedger, LedgerGovernor, MemoryGovernor};
+use onnx_runtime_memory_api::DeviceKey;
+use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor, MemoryGovernor};
 
 const EXPERTS: usize = 4;
 const EXPERT_BYTES: usize = 2 << 20;

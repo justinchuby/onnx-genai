@@ -19,6 +19,7 @@ cuda-13000 = ["cudarc/cuda-13000", "onnx-runtime-ep-cuda?/cuda-13000"]
 mlas = ["onnx-runtime-ep-cpu/mlas"]
 
 [dependencies]
+onnx-runtime-memory-api = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
 onnx-runtime-memory = { workspace = true }
 onnx-genai-runtime-config = { workspace = true }

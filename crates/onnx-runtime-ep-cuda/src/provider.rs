@@ -53,13 +53,16 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{
     DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
 };
+use onnx_runtime_memory_api::{
+    AllocationIdentity, AllocationReleaseOutcome, BindingError, DeviceAllocator, MemoryRole,
+    OwningAllocation, ProviderContextIdentity,
+};
 use onnx_runtime_memory_governor::{
-    AllocationChargeMode, AllocationIdentity, AllocationPublication, AllocationReleaseOutcome,
-    AllocationRequest, AllocationSettlementStatus, AllocationSettlementToken,
-    AllocationSettlementWait, AllocationStepError, AllocationTransactionError, BindingError,
-    DeviceAllocator, MemoryRole, OwningAllocation, ProcessMemoryManager, ProviderContextIdentity,
-    RegisteredMemoryAuthority, RegisteredMemoryContext, RegisteredMemoryHolder,
-    RegisteredMemoryMechanism, ScopedMemoryBinding, ScopedVirtualBacking,
+    AllocationChargeMode, AllocationPublication, AllocationRequest, AllocationSettlementStatus,
+    AllocationSettlementToken, AllocationSettlementWait, AllocationStepError,
+    AllocationTransactionError, ProcessMemoryManager, RegisteredMemoryAuthority,
+    RegisteredMemoryContext, RegisteredMemoryHolder, RegisteredMemoryMechanism,
+    ScopedMemoryBinding, ScopedVirtualBacking,
 };
 
 use crate::deferred_release::{
@@ -340,17 +343,14 @@ fn issue_artifact_provider_id() -> Result<ExecutorArtifactProviderId> {
 #[derive(Debug, Default)]
 pub(crate) struct CudaMappedAttribution {
     requesters: Mutex<
-        HashMap<
-            onnx_runtime_memory_governor::MemoryRole,
-            onnx_runtime_memory_governor::MappedAllowance,
-        >,
+        HashMap<onnx_runtime_memory_api::MemoryRole, onnx_runtime_memory_governor::MappedAllowance>,
     >,
 }
 
 impl CudaMappedAttribution {
     fn allowance(
         &self,
-        role: onnx_runtime_memory_governor::MemoryRole,
+        role: onnx_runtime_memory_api::MemoryRole,
     ) -> Option<onnx_runtime_memory_governor::MappedAllowance> {
         self.requesters
             .lock()
@@ -370,7 +370,7 @@ impl CudaMappedAttribution {
         // The allowance is cloned out under the lock and unmapped outside it, so
         // the governor is never called while this lock is held.
         if let Some(requester) = self.allowance(mapped_attribution_role(
-            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
         )) {
             requester.unmap(unmapped);
         }
@@ -814,12 +814,12 @@ pub fn dynamic_kv_weight_lending_enabled() -> bool {
 }
 
 fn mapped_attribution_role(
-    _role: onnx_runtime_memory_governor::MemoryRole,
-) -> onnx_runtime_memory_governor::MemoryRole {
+    _role: onnx_runtime_memory_api::MemoryRole,
+) -> onnx_runtime_memory_api::MemoryRole {
     // This provider has one suballocating VMM arena. KV and both workspace
     // lifetimes can touch the same physical granule, so mapped attribution is
     // one arena zone even though their content leases/metrics remain distinct.
-    onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false }
+    onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false }
 }
 
 fn dynamic_lending_enabled_for(value: Option<&str>) -> bool {
@@ -865,12 +865,12 @@ fn validate_offload_policy(policy: &DeviceOffloadPolicy) -> Result<()> {
 /// host or foreign-device pointer handed to a kernel — only shows up inside a
 /// launch, far from the substitution that caused it.
 ///
-/// [`DeviceAllocator::device`]: onnx_runtime_memory_governor::DeviceAllocator::device
+/// [`DeviceAllocator::device`]: onnx_runtime_memory_api::DeviceAllocator::device
 fn reject_foreign_device(
     expected_index: u32,
-    offered: onnx_runtime_memory_governor::DeviceKey,
+    offered: onnx_runtime_memory_api::DeviceKey,
 ) -> Option<EpError> {
-    let expected = onnx_runtime_memory_governor::DeviceKey::device(expected_index);
+    let expected = onnx_runtime_memory_api::DeviceKey::device(expected_index);
     (offered != expected).then(|| {
         EpError::KernelFailed(format!(
             "cuda_ep: this execution provider serves CUDA device {}, but the allocator offered \
@@ -966,7 +966,7 @@ fn vmm_unavailable(
 /// question with two answers, and neither the accounting nor the capture-safety
 /// invariants held for both.
 enum CudaMemory {
-    Injected(Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>),
+    Injected(Arc<dyn onnx_runtime_memory_api::DeviceAllocator>),
     Vmm(Arc<crate::vmm_allocator::CudaVmmAllocator>),
 }
 
@@ -992,8 +992,7 @@ struct TeardownTrackedAllocator {
 
 #[derive(Debug, Default)]
 struct WorkspaceReleaseBarrier {
-    pending:
-        Mutex<HashMap<onnx_runtime_memory_governor::AllocationIdentity, AllocationSettlementWait>>,
+    pending: Mutex<HashMap<onnx_runtime_memory_api::AllocationIdentity, AllocationSettlementWait>>,
 }
 
 impl WorkspaceReleaseBarrier {
@@ -1069,7 +1068,7 @@ impl DeviceAllocator for TeardownTrackedAllocator {
         &self,
         bytes: usize,
         align: usize,
-    ) -> std::result::Result<NonNull<u8>, onnx_runtime_memory_governor::MemoryError> {
+    ) -> std::result::Result<NonNull<u8>, onnx_runtime_memory_api::MemoryError> {
         self.inner.allocate(bytes, align)
     }
 
@@ -1093,7 +1092,7 @@ impl DeviceAllocator for TeardownTrackedAllocator {
         unsafe { self.inner.release(ptr, bytes, align) }
     }
 
-    fn device(&self) -> onnx_runtime_memory_governor::DeviceKey {
+    fn device(&self) -> onnx_runtime_memory_api::DeviceKey {
         self.inner.device()
     }
 
@@ -1101,17 +1100,17 @@ impl DeviceAllocator for TeardownTrackedAllocator {
         self.inner.commits_on_demand()
     }
 
-    fn as_virtual_backing(&self) -> Option<&dyn onnx_runtime_memory_governor::VirtualBacking> {
+    fn as_virtual_backing(&self) -> Option<&dyn onnx_runtime_memory_api::VirtualBacking> {
         self.inner.as_virtual_backing()
     }
 
-    fn as_shared_mapping(&self) -> Option<&dyn onnx_runtime_memory_governor::SharedMapping> {
+    fn as_shared_mapping(&self) -> Option<&dyn onnx_runtime_memory_api::SharedMapping> {
         self.inner.as_shared_mapping()
     }
 }
 
 impl CudaMemory {
-    fn allocator(&self) -> &dyn onnx_runtime_memory_governor::DeviceAllocator {
+    fn allocator(&self) -> &dyn onnx_runtime_memory_api::DeviceAllocator {
         match self {
             Self::Injected(allocator) => allocator.as_ref(),
             Self::Vmm(arena) => arena.as_ref(),
@@ -1123,11 +1122,11 @@ impl CudaMemory {
     /// The VMM variant stays concrete in this enum so its governor-specific
     /// capacity path keeps working, but the registry is handed the *same*
     /// object: one mechanism, one coherent allocator, one release path.
-    fn allocator_arc(&self) -> Arc<dyn onnx_runtime_memory_governor::DeviceAllocator> {
+    fn allocator_arc(&self) -> Arc<dyn onnx_runtime_memory_api::DeviceAllocator> {
         match self {
             Self::Injected(allocator) => Arc::clone(allocator),
             Self::Vmm(arena) => {
-                Arc::clone(arena) as Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>
+                Arc::clone(arena) as Arc<dyn onnx_runtime_memory_api::DeviceAllocator>
             }
         }
     }
@@ -1559,12 +1558,12 @@ impl CudaExecutionProvider {
                 Some(governor) => {
                     crate::vmm_allocator::CudaVmmAllocator::new_with_reservation_queue(
                         runtime.cuda_context(),
-                        onnx_runtime_memory_governor::DeviceKey::device(ordinal),
+                        onnx_runtime_memory_api::DeviceKey::device(ordinal),
                         ordinal as i32,
                         reservation_bytes,
                         governor,
                         onnx_runtime_memory_governor::HolderId::new(64),
-                        onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+                        onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
                         Arc::clone(&reservation_queue),
                         // Only the dynamic-lending path takes a retained pool by
                         // default. Left deliberately unchanged by the removal of
@@ -1580,11 +1579,11 @@ impl CudaExecutionProvider {
                 None => {
                     crate::vmm_allocator::CudaVmmAllocator::standalone_with_reservation_queue(
                         runtime.cuda_context(),
-                        onnx_runtime_memory_governor::DeviceKey::device(ordinal),
+                        onnx_runtime_memory_api::DeviceKey::device(ordinal),
                         ordinal as i32,
                         reservation_bytes,
                         onnx_runtime_memory_governor::HolderId::new(64),
-                        onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+                        onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
                         Arc::clone(&reservation_queue),
                         // Standalone (plugin, no-governor) VMM path: retain a
                         // pool of physical granules by default so repeated
@@ -1727,7 +1726,7 @@ impl CudaExecutionProvider {
         governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
         allocator: Arc<dyn DeviceAllocator>,
     ) -> Result<CudaMemoryBinding> {
-        let device = onnx_runtime_memory_governor::DeviceKey::device(ordinal);
+        let device = onnx_runtime_memory_api::DeviceKey::device(ordinal);
         let cuda_context_identity =
             crate::virtual_memory::physical_pool_context_identity(runtime.cuda_context().as_ref())
                 .map_err(|error| {
@@ -1744,8 +1743,8 @@ impl CudaExecutionProvider {
             .as_ref()
             .map(|governor| {
                 governor
-                    .used(onnx_runtime_memory_governor::Tier::Device)
-                    .checked_add(governor.available(onnx_runtime_memory_governor::Tier::Device))
+                    .used(onnx_runtime_memory_api::Tier::Device)
+                    .checked_add(governor.available(onnx_runtime_memory_api::Tier::Device))
                     .ok_or_else(|| {
                         EpError::KernelFailed(
                             "cuda_ep: device authority capacity overflows u64".into(),
@@ -1788,11 +1787,11 @@ impl CudaExecutionProvider {
             }
         };
         if let Some(capacity) = governed_capacity
-            && manager.process_limit(onnx_runtime_memory_governor::Tier::Device) != u64::MAX
-            && !authority.has_process_delegation(onnx_runtime_memory_governor::Tier::Device)
+            && manager.process_limit(onnx_runtime_memory_api::Tier::Device) != u64::MAX
+            && !authority.has_process_delegation(onnx_runtime_memory_api::Tier::Device)
             && let Err(error) = manager.delegate_authority_capacity(
                 &authority,
-                onnx_runtime_memory_governor::Tier::Device,
+                onnx_runtime_memory_api::Tier::Device,
                 capacity,
             )
         {
@@ -1902,7 +1901,7 @@ impl CudaExecutionProvider {
     }
 
     /// The single allocator selected for this provider.
-    fn memory(&self) -> &dyn onnx_runtime_memory_governor::DeviceAllocator {
+    fn memory(&self) -> &dyn onnx_runtime_memory_api::DeviceAllocator {
         self.memory.allocator()
     }
 
@@ -1913,7 +1912,7 @@ impl CudaExecutionProvider {
     /// are both checked from that selected allocator reference.
     fn managed_vmm(&self) -> Option<&Arc<crate::vmm_allocator::CudaVmmAllocator>> {
         let arena = self.memory.vmm()?;
-        let selected: &dyn onnx_runtime_memory_governor::DeviceAllocator = arena.as_ref();
+        let selected: &dyn onnx_runtime_memory_api::DeviceAllocator = arena.as_ref();
         (selected.commits_on_demand() && selected.as_virtual_backing().is_some()).then_some(arena)
     }
 
@@ -2130,10 +2129,10 @@ impl CudaExecutionProvider {
     /// provider exactly as it was.
     pub fn with_memory(
         mut self,
-        memory: Arc<dyn onnx_runtime_memory_governor::DeviceAllocator>,
+        memory: Arc<dyn onnx_runtime_memory_api::DeviceAllocator>,
     ) -> Result<Self> {
         let key = memory.device();
-        let expected = onnx_runtime_memory_governor::DeviceKey::device(self.device.index);
+        let expected = onnx_runtime_memory_api::DeviceKey::device(self.device.index);
         if let Some(error) = reject_foreign_device(expected.index, key) {
             return Err(error);
         }
@@ -3378,11 +3377,11 @@ impl CudaExecutionProvider {
         let delegated = self
             .memory_binding
             .authority
-            .has_process_delegation(onnx_runtime_memory_governor::Tier::Device);
+            .has_process_delegation(onnx_runtime_memory_api::Tier::Device);
         let request = AllocationRequest {
             allocation_bytes: size,
             alignment,
-            tier: onnx_runtime_memory_governor::Tier::Device,
+            tier: onnx_runtime_memory_api::Tier::Device,
             role,
             holder: self.memory_binding.holder.clone(),
             charge_mode,
@@ -3475,7 +3474,7 @@ impl CudaExecutionProvider {
                 AllocationRequest::authority_managed(
                     size,
                     alignment,
-                    onnx_runtime_memory_governor::Tier::Device,
+                    onnx_runtime_memory_api::Tier::Device,
                     role,
                     self.memory_binding.holder.clone(),
                     requested,
@@ -4379,11 +4378,11 @@ impl ExecutionProvider for CudaExecutionProvider {
             && let Some(arena) = self.managed_vmm()
             && let Some(governor) = self.governor.as_deref()
             && let Some(requester) = self.attribution.allowance(mapped_attribution_role(
-                onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
             ))
         {
             let virtual_backing =
-                onnx_runtime_memory_governor::DeviceAllocator::as_virtual_backing(arena.as_ref())
+                onnx_runtime_memory_api::DeviceAllocator::as_virtual_backing(arena.as_ref())
                     .expect("managed_vmm requires VirtualBacking");
             let bytes = virtual_backing
                 .mapped_bytes_for_allocation(size, alignment)
@@ -4571,7 +4570,7 @@ impl ExecutionProvider for CudaExecutionProvider {
                             manager_failure("cannot validate a mapped-growth commit range", error)
                         })?;
                 }
-                Ok(onnx_runtime_memory_governor::AllocationCommitRange {
+                Ok(onnx_runtime_memory_api::AllocationCommitRange {
                     ptr: owner.as_ptr(),
                     allocation_bytes: owner.len(),
                     align: owner.alignment(),
@@ -4604,7 +4603,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             .iter()
             .map(|&(buffer, offset, bytes)| {
                 let owner = self.bound_owner(buffer, "querying mapped bytes for ranges")?;
-                Ok(onnx_runtime_memory_governor::AllocationCommitRange {
+                Ok(onnx_runtime_memory_api::AllocationCommitRange {
                     ptr: owner.as_ptr(),
                     allocation_bytes: owner.len(),
                     align: owner.alignment(),
@@ -5485,7 +5484,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     fn reserve_workspace(
         &self,
         bytes: u64,
-        role: onnx_runtime_memory_governor::MemoryRole,
+        role: onnx_runtime_memory_api::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
         if self.memory().commits_on_demand() {
             return Ok(None);
@@ -5494,7 +5493,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             .as_deref()
             .map(|governor| {
                 governor.reserve(
-                    onnx_runtime_memory_governor::Tier::Device,
+                    onnx_runtime_memory_api::Tier::Device,
                     bytes,
                     role,
                     onnx_runtime_memory_governor::HolderId::new(64),
@@ -5507,7 +5506,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     fn prepare_mapped_growth(
         &self,
         bytes: u64,
-        role: onnx_runtime_memory_governor::MemoryRole,
+        role: onnx_runtime_memory_api::MemoryRole,
     ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
         if bytes == 0 || !dynamic_lending_enabled() || self.managed_vmm().is_none() {
             return Ok(None);
@@ -5531,7 +5530,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let holder = match role {
-                    onnx_runtime_memory_governor::MemoryRole::KvCache => {
+                    onnx_runtime_memory_api::MemoryRole::KvCache => {
                         onnx_runtime_memory_governor::HolderId::new(65)
                     }
                     _ => onnx_runtime_memory_governor::HolderId::new(66),
@@ -5539,7 +5538,7 @@ impl ExecutionProvider for CudaExecutionProvider {
                 entry.insert(
                     governor
                         .reserve_mapped_allowance(
-                            onnx_runtime_memory_governor::Tier::Device,
+                            onnx_runtime_memory_api::Tier::Device,
                             0,
                             role,
                             holder,
@@ -5554,7 +5553,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             .map_err(EpError::Memory)
     }
 
-    fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_governor::MemoryRole) {
+    fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_api::MemoryRole) {
         // VMM deallocation performs the canonical arena-zone refund. Keeping
         // this hook as a no-op preserves compatibility for callers/providers
         // that do not use the CUDA arena without permitting double release.
@@ -5589,7 +5588,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     fn adopt_memory_governor(
         &self,
         governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
-        tier: onnx_runtime_memory_governor::Tier,
+        tier: onnx_runtime_memory_api::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<u64> {
         if let Some(arena) = self.memory.vmm() {
@@ -5704,7 +5703,8 @@ mod tests {
         ExecutionProvider, ExternalMmapRegion, LazyWeight, MmapRegionSource, ResidentWeight,
         WeightHandleError,
     };
-    use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, Tier};
+    use onnx_runtime_memory_api::Tier;
+    use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
 
     use crate::error::driver_err;
     use crate::test_support::EnvVarGuard;
@@ -6085,9 +6085,10 @@ extern "C" __global__ void spin_delay(long long spin) {
     struct WorkspaceTestPin;
 
     fn managed_host_workspace(bytes: usize) -> WorkspaceAllocation {
+        use onnx_runtime_memory_api::{DeviceKey, HostAllocator, MemoryRole, Tier};
         use onnx_runtime_memory_governor::{
-            AllocationPublication, AllocationRequest, DeviceKey, HostAllocator, LeaseLedger,
-            LedgerGovernor, MemoryGovernor, MemoryRole, ProcessMemoryManager, Tier,
+            AllocationPublication, AllocationRequest, LeaseLedger, LedgerGovernor, MemoryGovernor,
+            ProcessMemoryManager,
         };
 
         let manager = ProcessMemoryManager::new().unwrap();
@@ -6322,10 +6323,9 @@ extern "C" __global__ void spin_delay(long long spin) {
 
     #[test]
     fn workspace_lifetimes_share_one_physical_mapping_zone() {
-        let step_content =
-            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: true };
+        let step_content = onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: true };
         let persistent_content =
-            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false };
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false };
         assert_ne!(
             step_content, persistent_content,
             "content accounting keeps lifetime categories distinct"
@@ -6335,7 +6335,7 @@ extern "C" __global__ void spin_delay(long long spin) {
         assert_eq!(step, persistent);
         assert_eq!(
             step,
-            mapped_attribution_role(onnx_runtime_memory_governor::MemoryRole::KvCache),
+            mapped_attribution_role(onnx_runtime_memory_api::MemoryRole::KvCache),
             "the current provider's KV and workspace suballocate one arena"
         );
     }
@@ -6427,10 +6427,10 @@ extern "C" __global__ void spin_delay(long long spin) {
     /// allocated through it — never accepted and then ignored.
     #[test]
     fn injection_is_refused_for_a_device_this_provider_does_not_serve() {
-        let host = onnx_runtime_memory_governor::HostAllocator.device();
+        let host = onnx_runtime_memory_api::HostAllocator.device();
         assert_ne!(
             host,
-            onnx_runtime_memory_governor::DeviceKey::device(0),
+            onnx_runtime_memory_api::DeviceKey::device(0),
             "premise: the host allocator must not claim to serve CUDA device 0"
         );
         let refused = reject_foreign_device(0, host).expect("host memory is not CUDA device 0");
@@ -6440,11 +6440,11 @@ extern "C" __global__ void spin_delay(long long spin) {
             "the refusal must name the device that was expected: {message}"
         );
         assert!(
-            reject_foreign_device(0, onnx_runtime_memory_governor::DeviceKey::device(1)).is_some(),
+            reject_foreign_device(0, onnx_runtime_memory_api::DeviceKey::device(1)).is_some(),
             "another CUDA device's allocator is refused too, not just host memory"
         );
         assert!(
-            reject_foreign_device(0, onnx_runtime_memory_governor::DeviceKey::device(0)).is_none(),
+            reject_foreign_device(0, onnx_runtime_memory_api::DeviceKey::device(0)).is_none(),
             "the matching device must be accepted, or injection is refused for everyone and \
              criterion 4 is met vacuously"
         );
@@ -6574,7 +6574,7 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
     )]
     #[test]
     fn standalone_vmm_scratch_reuse_pools_committed_memory_and_does_not_scale_cumemcreate() {
-        use onnx_runtime_memory_governor::DeviceAllocator;
+        use onnx_runtime_memory_api::DeviceAllocator;
 
         let Ok(provider) = CudaExecutionProvider::new(0) else {
             eprintln!(
@@ -6592,11 +6592,11 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
                 as Arc<dyn crate::virtual_memory::DeferredReservationQueue>;
         let arena = crate::vmm_allocator::CudaVmmAllocator::standalone_with_reservation_queue(
             runtime.cuda_context(),
-            onnx_runtime_memory_governor::DeviceKey::device(0),
+            onnx_runtime_memory_api::DeviceKey::device(0),
             0,
             64 << 30,
             onnx_runtime_memory_governor::HolderId::new(64),
-            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
             reservation_queue,
             Some(DEFAULT_STANDALONE_PHYSICAL_POOL_BYTES),
         )
@@ -6759,15 +6759,13 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
     )]
     #[test]
     fn general_deallocation_refunds_the_canonical_arena_zone() {
-        use onnx_runtime_memory_governor::{
-            HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, Tier,
-        };
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
 
         let governor_impl = Arc::new(LedgerGovernor::new(LeaseLedger::new(8 << 30, 0, 0)));
-        let zone_role =
-            mapped_attribution_role(onnx_runtime_memory_governor::MemoryRole::Workspace {
-                step_scoped: true,
-            });
+        let zone_role = mapped_attribution_role(onnx_runtime_memory_api::MemoryRole::Workspace {
+            step_scoped: true,
+        });
         let zone_allowance = governor_impl
             .reserve_mapped_allowance(Tier::Device, 4 << 20, zone_role, HolderId::new(736))
             .expect("canonical arena allowance");
@@ -6812,7 +6810,7 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
             let grant = provider
                 .prepare_mapped_growth(
                     bytes,
-                    onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: true },
+                    onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: true },
                 )
                 .expect("prepare workspace growth")
                 .expect("governed grant");
@@ -6846,7 +6844,7 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         assert_eq!(requester.mapped_bytes(), 0);
         provider.release_mapped_growth(
             mapped,
-            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: true },
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: true },
         );
         assert_eq!(
             requester.mapped_bytes(),
