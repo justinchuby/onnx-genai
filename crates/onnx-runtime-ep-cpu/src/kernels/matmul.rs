@@ -2840,12 +2840,12 @@ fn count_half_yielded_to_widened() {
 
 /// Number of times the current thread took the widened-`f32` SGEMM instead of
 /// the blocked half GEMM.
-#[cfg(all(test, feature = "mlas"))]
+#[cfg(all(test, feature = "mlas", target_arch = "x86_64"))]
 pub(crate) fn half_yielded_to_widened_calls() -> u64 {
     HALF_YIELDED_TO_WIDENED.with(|c| c.get())
 }
 
-#[cfg(all(test, feature = "mlas"))]
+#[cfg(all(test, feature = "mlas", target_arch = "x86_64"))]
 pub(crate) fn reset_half_yielded_to_widened_calls() {
     HALF_YIELDED_TO_WIDENED.with(|c| c.set(0));
 }

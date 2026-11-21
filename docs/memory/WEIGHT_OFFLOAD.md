@@ -313,13 +313,21 @@ That layout is the correct storage boundary.
 The current correctness kernel nevertheless materializes the complete FC1 and FC2
 inputs before routing
 ([moe.rs lines 225-229](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L225-L229)).
-Likewise, `BlockQuantizedMatMul` dequantizes a constant packed matrix into a full f32
-`OnceLock<Vec<f32>>`
-([block_quantized_matmul.rs lines 77-83](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L77-L83),
-[lines 151-166](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L151-L166),
-[lines 189-212](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L189-L212)).
-Those are valid correctness baselines but must not be used for huge offloaded experts.
-The paging fast path needs fused MoE and compressed-domain kernels.
+`BlockQuantizedMatMul` and `BlockQuantizedMoE` now use a bounded per-kernel
+LRU for dense f32 expansions, with row decoding when the complete projection
+set exceeds that kernel's ceiling. These paths still compute in f32 rather than
+the quantized domain. See [the current CPU contract](../quantization/SUB4BIT_QUANT.md).
+
+Integer QMoE independently borrows each contiguous host-accessible packed,
+scale and optional zero-point operand, including byte offsets. A strided operand
+materializes its compressed/metadata storage without forcing copies of the other
+operands. This borrow decision does not depend on `ONNX_GENAI_WEIGHT_OFFLOAD` or
+mmap catalog eligibility; the latter still controls route-first paging, metrics
+and cache identity. Device-only operands fail before CPU reads, with instructions
+to move the named tensor to CPU. Borrowing removes duplicate source buffers;
+QMoE's selected expert dense expansions and their transient grants remain
+separate convergence work. Huge-model paging still needs bounded transient
+weight storage and compressed-domain kernels.
 
 `MOE_SUPPORT.md` already requires expert-major contiguous external data so each expert
 slice can be computed from the initializer descriptor without materializing the tensor
