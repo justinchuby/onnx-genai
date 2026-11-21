@@ -35,7 +35,7 @@ use super::moe::{
 };
 use super::{check_arity, quantized_input_bytes, to_dense_f32, write_dense_f32};
 use crate::DerivedWeightMemory;
-use crate::resources::{DenseWeightGrant, WeightAdmission};
+use crate::resources::{DerivedWeightGrant, WeightAdmission};
 use crate::weight_offload::{
     WeightOffloadMode, checked_host_budget, effective_host_budget_u64, metrics,
     weight_offload_prefetch_default,
@@ -594,7 +594,7 @@ struct DequantizedExpert {
     fc3: Option<Vec<f32>>,
     _residency: Option<DequantizedExpertResidency>,
     // Payloads above are destroyed before returning their owned Host capacity.
-    _grant: Option<Arc<DenseWeightGrant>>,
+    _grant: Option<Arc<DerivedWeightGrant>>,
 }
 
 impl DequantizedExpert {
@@ -604,7 +604,7 @@ impl DequantizedExpert {
         fc2: &QuantizedExperts<'_>,
         fc3: Option<&QuantizedExperts<'_>>,
         track_residency: bool,
-        grant: Option<Arc<DenseWeightGrant>>,
+        grant: Option<Arc<DerivedWeightGrant>>,
     ) -> Result<Self> {
         Ok(Self {
             fc1: fc1.dequantize_expert(expert)?,
@@ -721,21 +721,21 @@ enum ExpertExecution {
 /// missing selected expert; active hits are pinned through the operation.
 enum ExpertMemoryScope<'a> {
     OnDemand(&'a DerivedWeightMemory),
-    StreamingWindow(Arc<DenseWeightGrant>),
+    StreamingWindow(Arc<DerivedWeightGrant>),
     Selected {
-        grants: Mutex<BTreeMap<usize, DenseWeightGrant>>,
+        grants: Mutex<BTreeMap<usize, DerivedWeightGrant>>,
         _pins: Vec<Arc<DequantizedExpert>>,
     },
 }
 
 enum ExpertGrantAdmission {
-    Granted(Option<Arc<DenseWeightGrant>>),
+    Granted(Option<Arc<DerivedWeightGrant>>),
     Declined(onnx_runtime_memory_api::MemoryError),
 }
 
-fn owned_expert_grant(grant: DenseWeightGrant) -> Option<Arc<DenseWeightGrant>> {
+fn owned_expert_grant(grant: DerivedWeightGrant) -> Option<Arc<DerivedWeightGrant>> {
     match grant {
-        DenseWeightGrant::Local => None,
+        DerivedWeightGrant::Local => None,
         grant => Some(Arc::new(grant)),
     }
 }
@@ -802,7 +802,7 @@ fn load_transient_expert(
                 fc3,
                 track_residency,
                 match grant {
-                    DenseWeightGrant::Local => None,
+                    DerivedWeightGrant::Local => None,
                     grant => Some(Arc::new(grant)),
                 },
             )?)))
@@ -1373,7 +1373,7 @@ impl HostCacheOperation<'_> {
         load: F,
     ) -> Result<ExpertLease>
     where
-        F: FnOnce(Option<Arc<DenseWeightGrant>>) -> Result<DequantizedExpert>,
+        F: FnOnce(Option<Arc<DerivedWeightGrant>>) -> Result<DequantizedExpert>,
     {
         if self.budget_bytes == 0 {
             metrics().record_host_cache_miss();

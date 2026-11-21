@@ -570,3 +570,30 @@ physical-capacity reconciliation, cross-engine host-book unification, compact
 native/MLAS owned-pack admission, scratch/activation accounting and process-wide
 coverage remain work. CUDA callbacks/runtime lifetime have not been exercised on
 this host. No throughput, RSS or NUMA-performance claim is made.
+
+
+### Owned compact wire-layout NBits preparation
+
+Compact wire-layout NBits operands now use the same `DerivedWeightMemory`
+source as dense expansions and QMoE experts when conversion, strided gathering,
+or explicit first-touch placement requires ownership. Before preparing any whole
+payload, sizing checks Host accessibility, supported operand dtypes and checked
+byte arithmetic. Admission covers packed bytes, f32 scales and optional packed
+zero points, plus a portable bound on half-scale widening or source/destination
+placement overlap. The extra allowance returns after preparation; actual payload
+ownership retains its exact grant until the transient operand or constant kernel
+cache is destroyed. Payload fields drop before their grant. Capacity refusals
+propagate instead of allocating an uncharged copy.
+
+Unchanged contiguous Host Uint8/Float32 wire operands remain borrowed, including
+with zero Host headroom. Warm prepared constants reuse their allocation without
+another grant. A cold-fill gate prevents competing threads from building copies
+under a one-payload budget; callbacks never acquire that gate. Existing numeric,
+offset, strided, dtype-conversion and placement dispatch guards remain.
+
+This covers the shared wire-layout operand used by native 2-bit and nibble
+execution. Other ISA-specific transformed int8/int4/u8, N16/KAI and optional MLAS
+packs still need owned-grant integration, and retained compact OnceLock entries
+are not yet idle-reclaimable. Scratch/activation coverage, physical Host/Device
+book reconciliation and process-wide limits remain separate work. No speedup,
+NUMA placement performance or CUDA execution is claimed.

@@ -40,9 +40,10 @@ use super::dense_weight_cache::{
 use super::int4_nibble;
 use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_f32};
-use crate::CpuMemoryResources;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::resources::{DerivedWeightGrant, WeightAdmission};
 use crate::strided::numel;
+use crate::{CpuMemoryResources, DerivedWeightMemory};
 
 /// Temporary, opt-in per-phase timers for the f16-activation MatMulNBits decode
 /// path, gated by `ONNX_GENAI_PROFILE_MM=1`. Zero-cost when unset (one cached
@@ -696,7 +697,9 @@ pub struct MatMulNBitsKernel {
     packed_int4_weight: OnceLock<PackedInt4Weight>,
     packed_int4_n16_weight: OnceLock<PackedN16SdotWeight>,
     packed_kai_qsi4_weight: OnceLock<PackedKaiSdotWeight>,
-    packed_nbits_weight: OnceLock<PackedNBitsWeight>,
+    packed_nbits_weight: OnceLock<PreparedNBitsWeight>,
+    compact_memory: DerivedWeightMemory,
+    packed_nbits_fill: std::sync::Mutex<()>,
     packed_u8_weight: OnceLock<PackedU8Weight>,
     packed_u8_n16_weight: OnceLock<PackedN16SdotWeight>,
     packed_kai_qsi8_weight: OnceLock<PackedKaiSdotWeight>,
@@ -1224,6 +1227,18 @@ struct PackedNBitsWeight {
     zero_points: Option<Vec<u8>>,
 }
 
+/// A prepared wire-layout payload cannot outlive its Host ownership grant.
+/// Declaration order frees all payload buffers before returning capacity.
+struct PreparedNBitsWeight {
+    weight: PackedNBitsWeight,
+    _grant: DerivedWeightGrant,
+}
+impl PreparedNBitsWeight {
+    fn view(&self) -> PackedNBitsView<'_> {
+        self.weight.view()
+    }
+}
+
 /// Call-scoped wire-layout operands shared by owned and borrowed execution.
 /// No source tensor reference is retained in a kernel cache.
 #[derive(Clone, Copy)]
@@ -1236,7 +1251,7 @@ struct PackedNBitsView<'a> {
 /// Ownership is necessary only when conversion or explicit placement requires it.
 enum PackedNBitsOperand<'a> {
     View(PackedNBitsView<'a>),
-    Owned(PackedNBitsWeight),
+    Owned(PreparedNBitsWeight),
 }
 
 impl PackedNBitsOperand<'_> {
@@ -1534,6 +1549,8 @@ impl KernelFactory for MatMulNBitsFactory {
             packed_int4_n16_weight: OnceLock::new(),
             packed_kai_qsi4_weight: OnceLock::new(),
             packed_nbits_weight: OnceLock::new(),
+            compact_memory: self.resources.weight_memory().clone(),
+            packed_nbits_fill: std::sync::Mutex::new(()),
             packed_u8_weight: OnceLock::new(),
             packed_u8_n16_weight: OnceLock::new(),
             packed_kai_qsi8_weight: OnceLock::new(),
@@ -2396,10 +2413,17 @@ impl MatMulNBitsKernel {
             if let Some(weight) = self.packed_nbits_weight.get() {
                 return Ok(PackedNBitsOperand::View(weight.view()));
             }
-            let weight = self.prepack_nbits_weight(packed, scales, zero_points)?;
-            let _ = self
-                .packed_nbits_weight
-                .set(numa_place_nbits(weight, self.n));
+            // Serialize cold conversion only. Warm hits and pressure callbacks
+            // never acquire this gate; concurrent misses cannot duplicate packs.
+            let _fill = self
+                .packed_nbits_fill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(weight) = self.packed_nbits_weight.get() {
+                return Ok(PackedNBitsOperand::View(weight.view()));
+            }
+            let weight = self.prepare_nbits_weight(packed, scales, zero_points)?;
+            let _ = self.packed_nbits_weight.set(weight);
             Ok(PackedNBitsOperand::View(
                 self.packed_nbits_weight
                     .get()
@@ -2407,9 +2431,35 @@ impl MatMulNBitsKernel {
                     .view(),
             ))
         } else {
-            let weight = self.prepack_nbits_weight(packed, scales, zero_points)?;
-            Ok(PackedNBitsOperand::Owned(numa_place_nbits(weight, self.n)))
+            Ok(PackedNBitsOperand::Owned(self.prepare_nbits_weight(
+                packed,
+                scales,
+                zero_points,
+            )?))
         }
+    }
+
+    fn prepare_nbits_weight(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<PreparedNBitsWeight> {
+        let placed = numa_decode_active().is_some() || spmd_decode_active().is_some();
+        let (bytes, peak) = nbits_preparation_bytes(packed, scales, zero_points, placed)?;
+        let mut grant = match self.compact_memory.try_grant(peak)? {
+            WeightAdmission::Granted(grant) => grant,
+            WeightAdmission::Declined(reason) => return Err(EpError::Memory(reason)),
+        };
+        let weight = self.prepack_nbits_weight(packed, scales, zero_points)?;
+        let weight = numa_place_nbits(weight, self.n);
+        // Placement can briefly own source and destination. Release that extra
+        // allowance only after source buffers have been destroyed.
+        let owned = grant.split_off(bytes)?;
+        Ok(PreparedNBitsWeight {
+            weight,
+            _grant: owned,
+        })
     }
 
     fn prepack_nbits_weight(
@@ -7405,6 +7455,74 @@ fn contiguous_host_addr(view: &TensorView) -> Option<usize> {
     Some(view.data_ptr::<u8>() as usize)
 }
 
+/// Exact logical payload size after widening scales, with an upper bound for
+/// first-touch source/destination overlap. Check arithmetic before allocating.
+fn nbits_preparation_bytes(
+    packed: &TensorView,
+    scales: &TensorView,
+    zero_points: Option<&TensorView>,
+    placed: bool,
+) -> Result<(usize, usize)> {
+    let overflow = || {
+        error(
+            "compact NBits preparation byte count overflows usize; use addressable operand shapes",
+        )
+    };
+    for (name, view, valid_dtype) in [
+        ("B", packed, packed.dtype == DataType::Uint8),
+        (
+            "scales",
+            scales,
+            matches!(
+                scales.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ),
+        ),
+    ]
+    .into_iter()
+    .chain(zero_points.map(|view| ("zero_points", view, view.dtype == DataType::Uint8)))
+    {
+        if !view.device.is_host_accessible() {
+            return Err(error(format!(
+                "compact NBits {name} must be Host-accessible, got {:?}; explicitly transfer it before CPU execution",
+                view.device
+            )));
+        }
+        if !valid_dtype {
+            return Err(error(format!(
+                "compact NBits {name} has unsupported dtype {:?}; use Uint8 packed/zero-point bytes and Float32, Float16 or BFloat16 scales",
+                view.dtype
+            )));
+        }
+    }
+    let elements = |view: &TensorView| -> Result<usize> {
+        view.validate()?;
+        view.shape
+            .iter()
+            .try_fold(1usize, |n, &dim| n.checked_mul(dim).ok_or_else(overflow))
+    };
+    let mut bytes = elements(packed)?;
+    bytes = bytes
+        .checked_add(elements(scales)?.checked_mul(4).ok_or_else(overflow)?)
+        .ok_or_else(overflow)?;
+    if let Some(points) = zero_points {
+        bytes = bytes.checked_add(elements(points)?).ok_or_else(overflow)?;
+    }
+    // Portable widening can briefly keep gathered half values and f32 output.
+    // ISA bulk conversions may need less; reserve a valid bound on every host.
+    let widen_extra = if scales.dtype == DataType::Float32 {
+        0
+    } else {
+        elements(scales)?.checked_mul(2).ok_or_else(overflow)?
+    };
+    let peak = bytes.checked_add(widen_extra).ok_or_else(overflow)?.max(
+        bytes
+            .checked_mul(if placed { 2 } else { 1 })
+            .ok_or_else(overflow)?,
+    );
+    Ok((bytes, peak))
+}
+
 /// Every operand must already have the dtype and contiguous host layout
 /// consumed by the compact kernels. Half scales and strided inputs are prepared
 /// together instead, so constant conversion is still amortized across calls.
@@ -11546,6 +11664,260 @@ mod tests {
     }
 
     #[test]
+    fn compact_nbits_preparation_grants_cover_owned_payloads_and_conversion_peak() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let (k, n, block) = (33usize, 3usize, 16usize);
+        let blocks = k.div_ceil(block);
+        let b = Owned::u8(&[n, blocks, block / 4], &vec![0x39; n * blocks * block / 4]);
+        let points = Owned::u8(
+            &[n, blocks.div_ceil(4)],
+            &vec![0x12; n * blocks.div_ceil(4)],
+        );
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            let scales = match dtype {
+                DataType::Float16 => Owned::f16(&[n, blocks], &vec![0.125; n * blocks]),
+                _ => Owned::bf16(&[n, blocks], &vec![0.125; n * blocks]),
+            };
+            let (bytes, peak) =
+                nbits_preparation_bytes(&b.view(), &scales.view(), Some(&points.view()), false)
+                    .unwrap();
+            assert_eq!(bytes, n * blocks * (block / 4 + 4) + n * blocks.div_ceil(4));
+            assert_eq!(peak, bytes + n * blocks * 2);
+            let (governor, resources) = governed_dense_resources(peak, 0);
+            let owner = MatMulNBitsFactory::new(resources)
+                .create(&governed_dense_node(k, n, 2, block), &[])
+                .unwrap();
+            let kernel = owner.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+            let dynamic = kernel
+                .resolve_nbits_operand(&b.view(), &scales.view(), Some(&points.view()), false)
+                .unwrap();
+            assert!(matches!(dynamic, PackedNBitsOperand::Owned(_)));
+            assert_eq!(governor.used(Tier::Host), bytes as u64);
+            assert_eq!(dynamic.view().scales, &[0.125; 9]);
+            assert!(kernel.packed_nbits_weight.get().is_none());
+            drop(dynamic);
+            assert_eq!(governor.used(Tier::Host), 0);
+            let bv = b.view();
+            let sv = scales.view();
+            let zv = points.view();
+            let first = kernel
+                .resolve_nbits_operand(&bv, &sv, Some(&zv), true)
+                .unwrap();
+            assert_eq!(governor.used(Tier::Host), bytes as u64);
+            let blocker = governor
+                .reserve(
+                    Tier::Host,
+                    (peak - bytes) as u64,
+                    MemoryRole::KvCache,
+                    HolderId::new(2),
+                )
+                .unwrap();
+            let second = kernel
+                .resolve_nbits_operand(&bv, &sv, Some(&zv), true)
+                .unwrap();
+            assert_eq!(first.view().values.as_ptr(), second.view().values.as_ptr());
+            assert_eq!(first.view().scales.as_ptr(), second.view().scales.as_ptr());
+            assert_eq!(
+                governor.used(Tier::Host),
+                peak as u64,
+                "a warm prepared hit must not need another grant"
+            );
+            drop(blocker);
+            // The kernel owns the retained grant, not either call-scoped view.
+            drop(first);
+            drop(second);
+            assert_eq!(governor.used(Tier::Host), bytes as u64);
+            drop(owner);
+            assert_eq!(governor.used(Tier::Host), 0);
+        }
+    }
+
+    #[test]
+    fn compact_nbits_preparation_serializes_cold_fills_under_one_payload_budget() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let b = Owned::u8(&[3, 3, 4], &[0x39; 36]);
+        let scales = Owned::f16(&[3, 3], &[0.125; 9]);
+        let (bytes, peak) =
+            nbits_preparation_bytes(&b.view(), &scales.view(), None, false).unwrap();
+        let (governor, resources) = governed_dense_resources(peak, 0);
+        let owner = MatMulNBitsFactory::new(resources)
+            .create(&governed_dense_node(33, 3, 2, 16), &[])
+            .unwrap();
+        let kernel = owner.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+        let start = std::sync::Barrier::new(16);
+        let pointers = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        let bv = b.view();
+                        let sv = scales.view();
+                        let prepared = kernel.resolve_nbits_operand(&bv, &sv, None, true).unwrap();
+                        assert_eq!(prepared.view().scales, &[0.125; 9]);
+                        prepared.view().values.as_ptr() as usize
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(pointers.iter().all(|p| *p == pointers[0]));
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(owner);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn compact_nbits_preparation_sizes_placement_and_rejects_invalid_dtype_before_grants() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let b = Owned::u8(&[3, 3, 4], &[0x39; 36]);
+        let scales = Owned::f16(&[3, 3], &[0.125; 9]);
+        let (bytes, peak) = nbits_preparation_bytes(&b.view(), &scales.view(), None, true).unwrap();
+        assert_eq!(bytes, 72);
+        assert_eq!(
+            peak, 144,
+            "first-touch may overlap whole source/destination payloads"
+        );
+        let bad = Owned::i32(&[3, 3], &[1; 9]);
+        let (governor, resources) = governed_dense_resources(0, 0);
+        let owner = MatMulNBitsFactory::new(resources)
+            .create(&governed_dense_node(33, 3, 2, 16), &[])
+            .unwrap();
+        let kernel = owner.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+        let failure = kernel
+            .resolve_nbits_operand(&b.view(), &bad.view(), None, true)
+            .err()
+            .unwrap();
+        assert!(
+            failure
+                .to_string()
+                .contains("scales has unsupported dtype Int32"),
+            "{failure}"
+        );
+        assert_eq!(governor.used(Tier::Host), 0);
+        assert!(kernel.packed_nbits_weight.get().is_none());
+        let floats = Owned::f32(&[1], &[0.125]);
+        let fv = floats.view();
+        let bv = b.view();
+        let borrowed = kernel.resolve_nbits_operand(&bv, &fv, None, false).unwrap();
+        assert_eq!(borrowed.view().values.as_ptr(), bv.data_ptr::<u8>());
+        assert_eq!(
+            governor.used(Tier::Host),
+            0,
+            "wire borrowing needs no Host headroom"
+        );
+        drop(borrowed);
+        // Sizing only: synthetic metadata must be rejected before any read or allocation.
+        let shape = [usize::MAX / 4 + 1];
+        let mut huge = floats.view();
+        huge.shape = &shape;
+        huge.strides = &[1];
+        let failure = nbits_preparation_bytes(&bv, &huge, None, false).unwrap_err();
+        assert!(failure.to_string().contains("byte count overflows usize"));
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn compact_nbits_preparation_refusals_keep_cache_empty_and_borrowing_unfunded() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let (k, n, block) = (33usize, 3usize, 16usize);
+        let b = Owned::u8(&[n, 3, block / 4], &[0x39; 36]);
+        let half = Owned::f16(&[n, 3], &[0.125; 9]);
+        let scales = Owned::f32(&[n, 3], &[0.125; 9]);
+        let (bytes, peak) = nbits_preparation_bytes(&b.view(), &half.view(), None, false).unwrap();
+        assert!(peak > bytes);
+        let (governor, resources) = governed_dense_resources(peak - 1, 0);
+        let owner = MatMulNBitsFactory::new(resources)
+            .create(&governed_dense_node(k, n, 2, block), &[])
+            .unwrap();
+        let kernel = owner.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+        for retained in [false, true] {
+            assert!(matches!(
+                kernel.resolve_nbits_operand(&b.view(), &half.view(), None, retained),
+                Err(EpError::Memory(
+                    onnx_runtime_memory_api::MemoryError::TierExhausted { .. }
+                ))
+            ));
+            assert!(kernel.packed_nbits_weight.get().is_none());
+            assert_eq!(governor.used(Tier::Host), 0);
+        }
+        let bv = b.view();
+        let sv = scales.view();
+        let borrowed = kernel.resolve_nbits_operand(&bv, &sv, None, true).unwrap();
+        assert_eq!(borrowed.view().values.as_ptr(), bv.data_ptr::<u8>());
+        assert_eq!(borrowed.view().scales.as_ptr(), sv.data_ptr::<f32>());
+        assert_eq!(governor.used(Tier::Host), 0);
+        assert!(kernel.packed_nbits_weight.get().is_none());
+    }
+
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    fn compact_nbits_governed_execution_funds_constant_and_dynamic_half_scale_weights() {
+        let _probe = lock_dispatch_probe();
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let (k, n, block) = (33usize, 3usize, 16usize);
+        let packed = vec![0x39; 36];
+        let scale_values = vec![0.125; 9];
+        let b = Owned::u8(&[n, 3, 4], &packed);
+        let scales = Owned::f16(&[n, 3], &scale_values);
+        let (bytes, peak) =
+            nbits_preparation_bytes(&b.view(), &scales.view(), None, false).unwrap();
+        let dequantized = dequantize_2bit_reference(&packed, &scale_values, None, n, k, block);
+        for retained in [false, true] {
+            for capacity in [peak - 1, peak] {
+                let (governor, resources) = governed_dense_resources(capacity, 0);
+                let mut kernel = MatMulNBitsFactory::new(resources)
+                    .create(&governed_dense_node(k, n, 2, block), &[])
+                    .unwrap();
+                kernel.set_constant_inputs(&[false, retained, retained]);
+                for m in [1, 4] {
+                    let a = Owned::f32(&[m, k], &vec![0.25; m * k]);
+                    let mut y = Owned::zeros_f32(&[m, n]);
+                    let outcome =
+                        kernel.execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()]);
+                    if capacity < peak {
+                        assert!(matches!(
+                            outcome,
+                            Err(EpError::Memory(
+                                onnx_runtime_memory_api::MemoryError::TierExhausted { .. }
+                            ))
+                        ));
+                        assert_eq!(governor.used(Tier::Host), 0);
+                        assert!(
+                            kernel
+                                .as_any()
+                                .downcast_ref::<MatMulNBitsKernel>()
+                                .unwrap()
+                                .packed_nbits_weight
+                                .get()
+                                .is_none()
+                        );
+                    } else {
+                        outcome.unwrap();
+                        assert_close(
+                            &y.to_f32(),
+                            &reference(&vec![0.25; m * k], &dequantized, m, k, n),
+                        );
+                        assert_eq!(
+                            governor.used(Tier::Host),
+                            if retained { bytes as u64 } else { 0 }
+                        );
+                    }
+                }
+                drop(kernel);
+                assert_eq!(governor.used(Tier::Host), 0);
+            }
+        }
+    }
+
+    #[test]
     fn compact_nbits_wire_borrows_offsets_and_prepares_strided_operands_once() {
         let (k, n, block) = (33usize, 3usize, 16usize);
         let blocks = k.div_ceil(block);
@@ -11582,7 +11954,12 @@ mod tests {
             zv.shape = &shapes[2];
             zv.strides = &strides[2];
             zv.byte_offset = 1;
-            let kernel = test_kernel(k, n, block);
+            use onnx_runtime_memory_api::Tier;
+            use onnx_runtime_memory_governor::MemoryGovernor;
+            let bytes = values.len() + scales.len() * 4 + points.len();
+            let (governor, resources) = governed_dense_resources(bytes, 0);
+            let mut kernel = test_kernel(k, n, block);
+            kernel.compact_memory = resources.weight_memory().clone();
             let first = kernel
                 .resolve_nbits_operand(&bv, &sv, Some(&zv), true)
                 .unwrap();
@@ -11591,6 +11968,10 @@ mod tests {
             assert_eq!(first.scales, scales);
             assert_eq!(first.zero_points.unwrap(), points);
             assert_eq!(kernel.packed_nbits_weight.get().is_none(), mask == 0);
+            assert_eq!(
+                governor.used(Tier::Host),
+                if mask == 0 { 0 } else { bytes as u64 }
+            );
             if mask == 0 {
                 assert_eq!(first.values.as_ptr(), bv.data_ptr::<u8>());
                 assert_eq!(first.scales.as_ptr(), sv.data_ptr::<f32>());
@@ -11755,6 +12136,8 @@ mod tests {
             packed_int4_n16_weight: OnceLock::new(),
             packed_kai_qsi4_weight: OnceLock::new(),
             packed_nbits_weight: OnceLock::new(),
+            compact_memory: DerivedWeightMemory::default(),
+            packed_nbits_fill: std::sync::Mutex::new(()),
             packed_u8_n16_weight: OnceLock::new(),
             packed_kai_qsi8_weight: OnceLock::new(),
             #[cfg(feature = "mlas")]
@@ -20319,7 +20702,7 @@ mod tests {
             );
             if placement {
                 let cached = kernel.packed_nbits_weight.get().unwrap();
-                assert_ne!(cached.values.as_ptr(), b.view().data_ptr::<u8>());
+                assert_ne!(cached.weight.values.as_ptr(), b.view().data_ptr::<u8>());
             }
         });
         output.bytes

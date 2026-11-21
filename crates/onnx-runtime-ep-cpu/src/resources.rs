@@ -29,8 +29,9 @@ impl Default for CpuWeightCacheLimits {
     }
 }
 
-/// Immutable CPU weight resources. Full f32 block-format/NBits expansions and retained
-/// or transient QMoE experts use one Host grant source. Private fields
+/// Immutable CPU weight resources. Full f32 block-format/NBits expansions,
+/// owned wire-layout NBits preparations and retained or transient QMoE experts
+/// use one Host grant source. Private fields
 /// prevent a shared expert cache from being paired with a different authority.
 /// Cache ceilings and the legacy planned-family verdict only admit retention;
 /// they reserve no idle physical capacity.
@@ -112,7 +113,7 @@ impl CpuMemoryResources {
     pub(crate) fn expert_cache(&self) -> &WeightOffloadHostCache {
         &self.host_cache
     }
-    /// Whether block/NBits/QMoE full payloads obtain actual Host grants.
+    /// Whether supported derived-weight payloads obtain actual Host grants.
     pub fn is_governed(&self) -> bool {
         self.host_cache.memory().is_governed()
     }
@@ -246,16 +247,18 @@ impl DerivedWeightMemory {
 
     pub(crate) fn try_grant(&self, bytes: usize) -> Result<WeightAdmission> {
         let Some(owner) = &self.owner else {
-            return Ok(WeightAdmission::Granted(DenseWeightGrant::Local));
+            return Ok(WeightAdmission::Granted(DerivedWeightGrant::Local));
         };
         let requested = u64::try_from(bytes).map_err(|_| EpError::KernelFailed(
-            "derived dense weight byte count exceeds u64; use dimensions addressable by the Host memory governor".into()
+            "derived weight byte count exceeds u64; use dimensions addressable by the Host memory governor".into()
         ))?;
         // Admission/retry belongs to the actual accounting authority, including
         // ordinary KV reserve/grow/sibling requests. Do not run a second CPU-only
         // pressure pass after that authority declines.
         match owner.domain.anchor.reserve_sibling(requested) {
-            Ok(lease) => Ok(WeightAdmission::Granted(DenseWeightGrant::Governed(lease))),
+            Ok(lease) => Ok(WeightAdmission::Granted(DerivedWeightGrant::Governed(
+                lease,
+            ))),
             Err(
                 failure @ (MemoryError::TierExhausted { .. }
                 | MemoryError::CapacityUnavailable { .. }),
@@ -296,23 +299,26 @@ impl PressureResponder for DerivedWeightDomain {
 }
 
 pub(crate) enum WeightAdmission {
-    Granted(DenseWeightGrant),
+    Granted(DerivedWeightGrant),
     Declined(MemoryError),
 }
 
-pub(crate) enum DenseWeightGrant {
+pub(crate) enum DerivedWeightGrant {
     Local,
     Governed(MemoryLease),
 }
 
-impl DenseWeightGrant {
+impl DerivedWeightGrant {
     pub(crate) fn split_off(&mut self, bytes: usize) -> Result<Self> {
         match self {
             Self::Local => Ok(Self::Local),
             Self::Governed(lease) => {
-                let bytes = u64::try_from(bytes).map_err(|_| EpError::KernelFailed(
-                    "derived dense weight slice exceeds u64; use addressable projection dimensions".into()
-                ))?;
+                let bytes = u64::try_from(bytes).map_err(|_| {
+                    EpError::KernelFailed(
+                        "derived weight slice exceeds u64; use addressable projection dimensions"
+                            .into(),
+                    )
+                })?;
                 Ok(Self::Governed(lease.split_off(bytes)?))
             }
         }
@@ -407,7 +413,7 @@ mod tests {
 
     struct IdleFixture {
         source: DerivedWeightMemory,
-        grant: Mutex<Option<DenseWeightGrant>>,
+        grant: Mutex<Option<DerivedWeightGrant>>,
         wants: Mutex<Vec<usize>>,
     }
     impl IdleWeightCache for IdleFixture {
@@ -431,7 +437,7 @@ mod tests {
             self.wants.lock().unwrap().push(want);
             let retired = self.grant.lock().unwrap().take();
             let bytes = match &retired {
-                Some(DenseWeightGrant::Governed(lease)) => lease.bytes() as usize,
+                Some(DerivedWeightGrant::Governed(lease)) => lease.bytes() as usize,
                 _ => 0,
             };
             drop(retired);

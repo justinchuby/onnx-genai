@@ -8,7 +8,7 @@ use onnx_runtime_ep_api::{EpError, Result};
 use onnx_runtime_memory_api::MemoryError;
 
 use crate::DerivedWeightMemory;
-use crate::resources::{DenseWeightGrant, IdleWeightCache, WeightAdmission};
+use crate::resources::{DerivedWeightGrant, IdleWeightCache, WeightAdmission};
 
 pub(super) trait DenseWeightKey: Clone + Eq + Hash + Send + Sync + 'static {
     fn dense_bytes(&self) -> Result<usize>;
@@ -33,7 +33,7 @@ pub(super) fn parse_dense_weight_cache_bytes(value: Option<&str>) -> usize {
 pub(super) struct DenseWeight {
     values: Vec<f32>,
     // Declaration order frees the payload before returning its grant.
-    _grant: DenseWeightGrant,
+    _grant: DerivedWeightGrant,
 }
 
 impl DenseWeight {
