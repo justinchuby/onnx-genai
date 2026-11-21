@@ -259,3 +259,27 @@ allocation-cache floor calibration touches approximately 512 MiB when the floor
 is not configured. Every measurement arm explicitly sets the same 1 MiB floor
 to isolate expert memory. Startup calibration remains unchanged and should be
 addressed in a separate allocator-lifecycle change.
+
+
+### Follow-up: defer host-cache calibration until a retention decision needs it
+
+`LargeAllocCache` construction captures explicit configuration and otherwise
+leaves its automatic floor pending. The existing process-wide calibration stays
+the sole measured answer. Disabled retention, invalid layouts, requests above
+the maximum and requests below every possible automatic floor skip calibration.
+The lower bound comes from the same probe ladder and fallback used to resolve
+the floor; explicit configured floors, including smaller values, remain honored.
+
+`floor_bytes()` now returns `Option<usize>` without performing a probe.
+`resolve_floor_bytes()` explicitly permits calibration. There is no old-signature
+shim. Pending/resolved state is encoded with `OnceLock`; automatic resolution
+still runs once per process, and initialized instances take the resolved path.
+Exact layouts, retained-byte admission, counters, poisoning, drain and concurrent
+ownership guards stay in place. Zero-byte layouts are explicitly ineligible even
+with a configured floor of zero, matching the documented allocation contract.
+
+[Startup process evidence](../benchmarks/HOST_CACHE_LAZY_FLOOR.md) compares the
+unchanged cache implementation with the lazy path and an explicit-floor control.
+This avoids needless construction/small-request work; it does not remove the
+probe from eligible large workloads or turn a retention cap into a peak-memory
+guarantee. The separate global grant and active-allocation work remains open.
