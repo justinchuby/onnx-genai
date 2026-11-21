@@ -102,7 +102,7 @@ pub static ADD_SCALAR_TEST_HITS: std::sync::atomic::AtomicU64 =
 
 /// Dispatch counter for the explicitly linked MLAS reference path.
 #[cfg(all(test, feature = "mlas"))]
-static ADD_MLAS_TEST_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ADD_MLAS_REF_TEST_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Kernel for AddKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -111,7 +111,7 @@ impl Kernel for AddKernel {
         #[cfg(feature = "mlas")]
         if add_contiguous_f32(inputs, &mut outputs[0])? {
             #[cfg(test)]
-            ADD_MLAS_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ADD_MLAS_REF_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -400,7 +400,7 @@ mod tests {
     fn add_contiguous_f32_same_shape_uses_selected_backend() {
         use std::sync::atomic::Ordering;
         #[cfg(feature = "mlas")]
-        let counter = &super::ADD_MLAS_TEST_HITS;
+        let counter = &super::ADD_MLAS_REF_TEST_HITS;
         #[cfg(not(feature = "mlas"))]
         let counter = &super::ADD_VDSP_TEST_HITS;
         let before = counter.load(Ordering::Relaxed);

@@ -17,7 +17,7 @@ pub static POOL_SCALAR_TEST_HITS: std::sync::atomic::AtomicU64 =
 
 /// Dispatch counter for the explicitly linked MLAS reference path.
 #[cfg(all(test, feature = "mlas"))]
-static POOL_MLAS_TEST_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static POOL_MLAS_REF_TEST_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 enum AutoPad {
@@ -315,7 +315,7 @@ impl Kernel for PoolKernel {
         #[cfg(feature = "mlas")]
         if try_mlas_pool(self, inputs, outputs, &expected, &pads)? {
             #[cfg(test)]
-            POOL_MLAS_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            POOL_MLAS_REF_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1305,7 +1305,7 @@ mod tests {
     fn max_pool_2d_no_padding_uses_selected_backend() {
         use std::sync::atomic::Ordering;
         #[cfg(feature = "mlas")]
-        let counter = &super::POOL_MLAS_TEST_HITS;
+        let counter = &super::POOL_MLAS_REF_TEST_HITS;
         #[cfg(not(feature = "mlas"))]
         let counter = &super::POOL_BNNS_TEST_HITS;
         let before = counter.load(Ordering::Relaxed);
@@ -1336,7 +1336,7 @@ mod tests {
     fn max_pool_2d_with_padding_uses_selected_backend() {
         use std::sync::atomic::Ordering;
         #[cfg(feature = "mlas")]
-        let counter = &super::POOL_MLAS_TEST_HITS;
+        let counter = &super::POOL_MLAS_REF_TEST_HITS;
         #[cfg(not(feature = "mlas"))]
         let counter = &super::POOL_BNNS_TEST_HITS;
         let before = counter.load(Ordering::Relaxed);
