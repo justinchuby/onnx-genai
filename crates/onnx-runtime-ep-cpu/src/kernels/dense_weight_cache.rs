@@ -8,9 +8,9 @@ use onnx_runtime_ep_api::{EpError, Result};
 use onnx_runtime_memory_api::MemoryError;
 
 use crate::DerivedWeightMemory;
-use crate::resources::{DenseWeightGrant, WeightAdmission};
+use crate::resources::{DenseWeightGrant, IdleWeightCache, WeightAdmission};
 
-pub(super) trait DenseWeightKey: Clone + Eq + Hash {
+pub(super) trait DenseWeightKey: Clone + Eq + Hash + Send + Sync + 'static {
     fn dense_bytes(&self) -> Result<usize>;
 }
 
@@ -93,7 +93,7 @@ pub(super) enum DenseWeightLoad {
 pub(super) struct DenseWeightCache<K> {
     max_bytes: usize,
     memory: DerivedWeightMemory,
-    inner: Mutex<CacheState<K>>,
+    inner: Arc<Mutex<CacheState<K>>>,
     // Cold fills serialize separately: accountant callbacks and decoding never
     // run under the payload lock. Warm hits do not acquire this gate.
     fill: Mutex<()>,
@@ -140,10 +140,14 @@ impl<K: DenseWeightKey> Default for DenseWeightCache<K> {
 
 impl<K: DenseWeightKey> DenseWeightCache<K> {
     pub(super) fn new(memory: DerivedWeightMemory, max_bytes: usize) -> Self {
+        let inner = Arc::new(Mutex::new(CacheState::default()));
+        if max_bytes != 0 {
+            memory.register_idle_cache(&inner);
+        }
         Self {
             max_bytes,
             memory,
-            inner: Mutex::new(CacheState::default()),
+            inner,
             fill: Mutex::new(()),
         }
     }
@@ -314,24 +318,9 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
             Vec::new()
         };
         drop(evicted);
-        let mut grant = loop {
-            match self.memory.try_grant(required)? {
-                WeightAdmission::Granted(grant) => break grant,
-                WeightAdmission::Declined(reason) => {
-                    let victim = {
-                        let mut inner = self
-                            .inner
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        oldest_unused(&inner, specs, true).map(|key| remove_entry(&mut inner, &key))
-                    };
-                    if let Some(victim) = victim {
-                        drop(victim);
-                    } else {
-                        return Ok(DenseWeightLoad::Declined(reason));
-                    }
-                }
-            }
+        let mut grant = match self.memory.try_grant(required)? {
+            WeightAdmission::Granted(grant) => grant,
+            WeightAdmission::Declined(reason) => return Ok(DenseWeightLoad::Declined(reason)),
         };
         let mut statuses = vec![DenseWeightCacheStatus::Hit; specs.len()];
         for (index, spec) in specs.iter().enumerate() {
@@ -466,6 +455,29 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
     }
 }
 
+impl<K: DenseWeightKey> IdleWeightCache for Mutex<CacheState<K>> {
+    fn reclaim_idle(&self, want: usize) -> Result<usize> {
+        let (retired, released) = {
+            let mut inner = self
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut retired = Vec::new();
+            let mut released = 0usize;
+            while released < want {
+                let Some(key) = oldest_unused(&inner, &[], true) else {
+                    break;
+                };
+                let entry = remove_entry(&mut inner, &key);
+                released += entry.bytes;
+                retired.push(entry);
+            }
+            (retired, released)
+        };
+        drop(retired);
+        Ok(released)
+    }
+}
+
 fn oldest_unused<K: DenseWeightKey>(
     inner: &CacheState<K>,
     specs: &[DenseWeightSpec<'_, K>],
@@ -535,6 +547,190 @@ mod tests {
             DenseWeightLoad::Ready(ready) => ready,
             DenseWeightLoad::Declined(reason) => panic!("expected grant: {reason}"),
         }
+    }
+
+    #[test]
+    fn shared_pressure_reclaims_another_dense_cache_without_touching_active_readers() {
+        let (governor, source) = memory(32);
+        let a = DenseWeightCache::<DenseWeightCacheKey>::new(source.clone(), 32);
+        let b = DenseWeightCache::<DenseWeightCacheKey>::new(source.clone(), 32);
+        let c = DenseWeightCache::<DenseWeightCacheKey>::new(source, 0);
+        let packed_a = Owned::u8(&[4], &[1; 4]);
+        let packed_b = Owned::u8(&[4], &[2; 4]);
+        let ka = key(&packed_a);
+        let kb = key(&packed_b);
+        drop(ready(
+            a.load_group(&[cached(&ka)], |_, row| {
+                row.fill(1.0);
+                Ok(())
+            })
+            .unwrap(),
+        ));
+        let held = ready(
+            b.load_group(&[cached(&kb)], |_, row| {
+                row.fill(2.0);
+                Ok(())
+            })
+            .unwrap(),
+        );
+        assert_eq!(governor.used(Tier::Host), 32);
+        let transient = ready(
+            c.load_group(&[DenseWeightSpec::transient(16)], |_, row| {
+                row.fill(3.0);
+                Ok(())
+            })
+            .unwrap(),
+        );
+        assert_eq!(a.stats(), (0, 0));
+        assert_eq!(b.stats(), (1, 16));
+        assert_eq!(held.weights[0].as_slice(), &[2.0; 4]);
+        assert_eq!(transient.weights[0].as_slice(), &[3.0; 4]);
+        assert_eq!(governor.used(Tier::Host), 32);
+        let mut built = false;
+        assert!(matches!(
+            c.load_group(&[DenseWeightSpec::transient(16)], |_, _| {
+                built = true;
+                Ok(())
+            })
+            .unwrap(),
+            DenseWeightLoad::Declined(_)
+        ));
+        assert!(!built);
+        drop(transient);
+        drop(b);
+        assert_eq!(
+            governor.used(Tier::Host),
+            16,
+            "active reader retains the exact grant after its cache drops"
+        );
+        drop(held);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn shared_pressure_concurrent_cold_fills_keep_active_payloads_and_do_not_take_foreign_fill_gates()
+     {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        struct Key(usize);
+        impl DenseWeightKey for Key {
+            fn dense_bytes(&self) -> Result<usize> {
+                Ok(16)
+            }
+        }
+        let (governor, source) = memory(16);
+        let caches = [
+            DenseWeightCache::<Key>::new(source.clone(), 16),
+            DenseWeightCache::<Key>::new(source, 16),
+        ];
+        let barrier = Barrier::new(2);
+        let admitted = AtomicUsize::new(0);
+        let declined = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for (worker, cache) in caches.iter().enumerate() {
+                let barrier = &barrier;
+                let admitted = &admitted;
+                let declined = &declined;
+                let governor = &governor;
+                scope.spawn(move || {
+                    for round in 0..32 {
+                        let key = Key(2 * round + worker);
+                        barrier.wait();
+                        let loaded = cache
+                            .load_group(&[DenseWeightSpec::cached(&key).unwrap()], |_, row| {
+                                row.fill(key.0 as f32);
+                                Ok(())
+                            })
+                            .unwrap();
+                        match &loaded {
+                            DenseWeightLoad::Ready(ready) => {
+                                admitted.fetch_add(1, Ordering::Relaxed);
+                                assert_eq!(ready.weights[0].as_slice(), &[key.0 as f32; 4]);
+                            }
+                            DenseWeightLoad::Declined(_) => {
+                                declined.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        assert!(governor.used(Tier::Host) <= 16);
+                        // Both results stay alive until both allocations finish:
+                        // a successful payload must not fund the competing miss.
+                        barrier.wait();
+                        drop(loaded);
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::Relaxed), 32);
+        assert_eq!(declined.load(Ordering::Relaxed), 32);
+        assert_eq!(governor.used(Tier::Host), 16);
+        drop(caches);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn shared_pressure_keeps_partial_hit_groups_pinned_and_respects_source_domains() {
+        let (governor, source) = memory(48);
+        let a = DenseWeightCache::<DenseWeightCacheKey>::new(source.clone(), 64);
+        let other = DenseWeightCache::<DenseWeightCacheKey>::new(source, 64);
+        let p = [
+            Owned::u8(&[4], &[1; 4]),
+            Owned::u8(&[4], &[2; 4]),
+            Owned::u8(&[4], &[3; 4]),
+        ];
+        let keys: Vec<_> = p.iter().map(key).collect();
+        drop(ready(
+            a.load_group(&[cached(&keys[0])], |_, row| {
+                row.fill(1.0);
+                Ok(())
+            })
+            .unwrap(),
+        ));
+        drop(ready(
+            other
+                .load_group(&[cached(&keys[1])], |_, row| {
+                    row.fill(2.0);
+                    Ok(())
+                })
+                .unwrap(),
+        ));
+        let foreign_source = DerivedWeightMemory::governed(&governor, HolderId::new(14)).unwrap();
+        let foreign = DenseWeightCache::<DenseWeightCacheKey>::new(foreign_source.clone(), 16);
+        drop(ready(
+            foreign
+                .load_group(&[cached(&keys[2])], |_, row| {
+                    row.fill(9.0);
+                    Ok(())
+                })
+                .unwrap(),
+        ));
+        let hit = a.test_get(&keys[0]).unwrap();
+        let loaded = ready(
+            a.load_group(&[cached(&keys[0]), cached(&keys[2])], |index, row| {
+                assert_eq!(index, 1);
+                row.fill(3.0);
+                Ok(())
+            })
+            .unwrap(),
+        );
+        assert!(Arc::ptr_eq(&hit, &loaded.weights[0]));
+        assert_eq!(other.stats(), (0, 0));
+        assert_eq!(foreign.stats(), (1, 16));
+        assert_eq!(governor.used(Tier::Host), 48);
+        drop(loaded);
+        drop(hit);
+        let pins = foreign.test_get(&keys[2]).unwrap();
+        assert!(
+            matches!(
+                foreign_source.try_grant(16).unwrap(),
+                WeightAdmission::Declined(_)
+            ),
+            "separate sources cannot evict one another even when their physical books coincide"
+        );
+        drop(pins);
+        assert_eq!(a.stats(), (2, 32));
+        drop(a);
+        drop(foreign);
+        assert_eq!(governor.used(Tier::Host), 0);
     }
 
     #[test]

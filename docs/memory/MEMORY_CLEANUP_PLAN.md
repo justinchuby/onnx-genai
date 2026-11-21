@@ -508,7 +508,7 @@ Host tests cover actual KV competition, independent source/retention policy,
 active payloads after kernel drop, construction-peak refunds, refusal before a
 full builder, rollback on invalid builders/group indices, all bit widths and
 zero-point modes, strided operands, lower precision, bias and multiple rows.
-This does not finish compact native/MLAS packing grants, pressure reclamation,
+This does not finish compact native/MLAS packing grants, external pressure coordination,
 row scratch/activation accounting, CPU Device/Host capacity reconciliation,
 process-global capacity or asynchronous GPU validation. Standalone default
 resources remain local and ungoverned. No throughput or GPU execution claim.
@@ -522,3 +522,37 @@ The optional MLAS Apple route test also checks the resolved platform policy,
 including the native int8 fallback, rather than assuming linkage guarantees
 QNBit/KAI execution. The unchanged main branch reproduces its former failure
 in an isolated build directory; the original numerical guard is retained.
+
+
+### Idle derived-weight reclamation across CPU caches
+
+A governed `DerivedWeightMemory` clone now carries one ownership domain:
+its zero-byte Host anchor and weak registrations for the dense and shared QMoE
+expert caches. On a real capacity refusal, the requester snapshots live caches
+in rotating order, releases the registration lock, and makes one bounded pass.
+Each cache retires idle entries in its existing LRU/frequency order until the
+reported shortfall is reached (whole payload granularity). It drops retired
+payloads outside its data lock before the requester retries the actual grant.
+An allocator/configuration error propagates without eviction; a request larger
+than a reported total Host ceiling cannot flush the caches pointlessly.
+
+Only entries with no active `Arc` reader can fund pressure relief. Partial-hit
+projection groups and selected-expert prefetch keep their pins, and caller-owned
+payloads keep their Host grants even after their cache disappears. Ordinary QMoE
+frequency pinning remains a retention policy; it cannot make an inactive payload
+immune to physical Host pressure. A failed bounded pass preserves the typed
+capacity refusal and the existing row/serial fallback. No callback takes a cold
+fill gate, and no governance callback runs under cache/registration data locks.
+
+This is scoped to caches sharing the same `DerivedWeightMemory` instance through
+clones. Constructing another source, even over identical physical books, does
+not authorize it to evict that domain's caches. Registrations are weak and dead
+ones are pruned on registration/pressure; they keep neither kernels nor weight
+payloads alive. Warm hits never enter the reclamation mechanism.
+
+This is demand-driven CPU derived-weight admission, not a process-wide pressure
+coordinator: a raw Host KV governor request does not call it. Routing external
+KV/allocator/process pressure through the existing process memory manager remains
+work, as do compact native/MLAS owned-pack admission, scratch accounting and the
+CPU Device/Host physical-capacity reconciliation. There is no new throughput,
+RSS, NUMA-performance or CUDA-runtime claim.
