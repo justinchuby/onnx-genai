@@ -254,7 +254,7 @@ impl HostKernelContext {
             if !requested { return Ok(None); }
             let dims = value.tensor.dims.ok_or_else(|| EpError::KernelFailed(format!("plugin did not allocate requested dynamic output {index}; call KernelContext_GetOutput during Compute")))?;
             let shape = dims.into_iter().map(|dim| usize::try_from(dim).map_err(|_| EpError::KernelFailed(format!("plugin output {index} has invalid extent {dim}")))).collect::<Result<Vec<_>>>()?;
-            let dtype = DataType::from_onnx(value.tensor.dtype as i32).ok_or_else(|| EpError::KernelFailed(format!("plugin output {index} has unknown dtype {}", value.tensor.dtype)))?;
+            let dtype = DataType::from_onnx(value.tensor.dtype as _).ok_or_else(|| EpError::KernelFailed(format!("plugin output {index} has unknown dtype {}", value.tensor.dtype)))?;
             let HostOrtValueStorage::Owned(bytes) = value.storage else { return Err(EpError::KernelFailed(format!("plugin dynamic output {index} does not own its payload"))); };
             Ok(Some(crate::KernelSizedOutput { shape, dtype, bytes }))
         }).collect()
@@ -2134,7 +2134,7 @@ unsafe extern "C" fn host_kernel_context_get_output(
                 );
             }
         };
-        let Some(dtype) = DataType::from_onnx(value.tensor.dtype as i32) else {
+        let Some(dtype) = DataType::from_onnx(value.tensor.dtype as _) else {
             return status_error(
                 "KernelContext_GetOutput: unknown output dtype; declare tensor output types before Compile",
             );

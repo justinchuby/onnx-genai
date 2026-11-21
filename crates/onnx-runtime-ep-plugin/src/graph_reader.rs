@@ -733,7 +733,7 @@ impl OutboundGraphReader {
         let mut elem_type: ort::ONNXTensorElementDataType = 0;
         let status = unsafe { get_elem_type(tensor_info, &mut elem_type) };
         Self::check(status)?;
-        let dtype = DataType::from_onnx(elem_type as i32).unwrap_or(DataType::Undefined);
+        let dtype = DataType::from_onnx(elem_type as _).unwrap_or(DataType::Undefined);
 
         let has_shape = unsafe { (*api).TensorTypeAndShape_HasShape }
             .ok_or("OrtApi.TensorTypeAndShape_HasShape is null; unknown rank must be distinguishable from a scalar")?;
@@ -991,7 +991,7 @@ impl OutboundGraphReader {
                 .GetTensorElementType
                 .ok_or("GetTensorElementType is null")?)(shape.0, &mut dtype)
         })?;
-        let dtype = DataType::from_onnx(dtype as i32)
+        let dtype = DataType::from_onnx(dtype as _)
             .ok_or_else(|| format!("unsupported tensor attribute dtype {dtype}"))?;
         let mut rank = 0;
         Self::check(unsafe {
