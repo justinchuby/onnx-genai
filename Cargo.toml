@@ -264,7 +264,7 @@ onnx-runtime-ort-testkit = { path = "crates/onnx-runtime-ort-testkit" }
 # crate itself. `fancy-regex` is the pure-Rust regex backend, which is what
 # llguidance's `toktrie_hf_tokenizers` already selects.
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
 arc-swap = "1"

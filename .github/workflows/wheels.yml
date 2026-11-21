@@ -40,15 +40,13 @@ jobs:
           # an Intel-macOS ONNX Runtime; a job that can never pass just trains
           # everyone to ignore a red pipeline.
           # See .squad/decisions.md and crates/onnx-runtime-python/README.md.
-          # macos-14 is the GitHub-hosted Apple Silicon runner.
+          # macos-15 is the oldest supported GitHub-hosted Apple Silicon runner.
           - name: macOS arm64
-            os: macos-14
+            os: macos-15
             archs: arm64
     runs-on: ${{ matrix.os }}
     env:
       CIBW_ARCHS: ${{ matrix.archs }}
-      # maturin adds this Cargo feature to [tool.maturin].features (abi3-py310).
-      CIBW_CONFIG_SETTINGS: ${{ matrix.cibw_config_settings }}
       CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64:2026.07.25-1
       # DXCore is a Windows API set resolved by the OS loader, not a DLL to vendor.
       CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
@@ -56,10 +54,10 @@ jobs:
         -w {dest_dir} -v {wheel}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
       # Keep wheel publishing on Rust stable deliberately: this follows Rust's
@@ -83,13 +81,13 @@ jobs:
           exit 1
 
       - name: Build and smoke-test CPU wheel
-        uses: pypa/cibuildwheel@v4.1.0
+        uses: pypa/cibuildwheel@v4.3.5
         with:
           package-dir: crates/onnx-runtime-python
           output-dir: wheelhouse
 
       - name: Upload CPU wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cpu-wheels-${{ matrix.os }}-${{ matrix.archs }}
           path: wheelhouse/*.whl
@@ -121,10 +119,10 @@ jobs:
       CIBW_CONFIG_SETTINGS: "build-args='--features ort-cuda'"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
       # Keep wheel publishing on Rust stable deliberately: this follows Rust's
@@ -139,7 +137,7 @@ jobs:
       # promotion still requires CUDA-enabled self-hosted runners to verify the
       # driver/toolkit and nvidia-*-cu13 dependency set end to end.
       - name: Build and import-test CUDA wheel
-        uses: pypa/cibuildwheel@v4.1.0
+        uses: pypa/cibuildwheel@v4.3.5
         with:
           package-dir: crates/onnx-runtime-python
           output-dir: wheelhouse
@@ -148,7 +146,7 @@ jobs:
       # Keep CUDA artifacts separate until release engineering chooses a distinct
       # distribution name, version suffix/index, and GPU validation environment.
       - name: Upload CUDA wheel candidate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cuda-wheels-${{ matrix.os }}-${{ matrix.archs }}
           path: wheelhouse/*.whl
