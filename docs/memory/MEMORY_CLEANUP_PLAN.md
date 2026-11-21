@@ -572,28 +572,39 @@ coverage remain work. CUDA callbacks/runtime lifetime have not been exercised on
 this host. No throughput, RSS or NUMA-performance claim is made.
 
 
-### Owned compact wire-layout NBits preparation
+### Owned native NBits preparation
 
-Compact wire-layout NBits operands now use the same `DerivedWeightMemory`
-source as dense expansions and QMoE experts when conversion, strided gathering,
-or explicit first-touch placement requires ownership. Before preparing any whole
-payload, sizing checks Host accessibility, supported operand dtypes and checked
-byte arithmetic. Admission covers packed bytes, f32 scales and optional packed
-zero points, plus a portable bound on half-scale widening or source/destination
-placement overlap. The extra allowance returns after preparation; actual payload
-ownership retains its exact grant until the transient operand or constant kernel
-cache is destroyed. Payload fields drop before their grant. Capacity refusals
-propagate instead of allocating an uncharged copy.
+All eight native NBits cache slots now use the same `DerivedWeightMemory`
+source as dense expansions and QMoE experts. A `NativePackedWeight` payload type
+fixes its physical layout and construction recipe; admission cannot pair an
+expanded/tiled payload with a cheaper wire-layout charge. The six layouts cover
+wire bytes, direct int4, expanded int8, direct u8, N16 SDOT and KAI qsi4/qsi8.
+Runtime geometry determines padding, values and metadata sizes with checked
+arithmetic. Invalid dtype, inaccessible Host operands, unsupported layout
+geometry and size overflow fail before payload preparation.
 
-Unchanged contiguous Host Uint8/Float32 wire operands remain borrowed, including
-with zero Host headroom. Warm prepared constants reuse their allocation without
-another grant. A cold-fill gate prevents competing threads from building copies
-under a one-payload budget; callbacks never acquire that gate. Existing numeric,
-offset, strided, dtype-conversion and placement dispatch guards remain.
+Before allocating, the authority grants a bound for the entire transformation:
+input gathering, portable half-scale widening, simultaneous input/output buffers,
+tile-padded scales/sums/zero-point offsets and first-touch placement overlap.
+Once construction destroys its temporary inputs, the prepared value keeps only
+its exact payload grant. Data fields drop before returning that grant. Dynamic
+preparations release at call end; retained constants release at kernel drop.
+Capacity refusal cannot allocate an uncharged copy. All native representations
+share one cold-fill admission mechanism, with warm lock-free cache reads and a
+single gate preventing duplicate retained preparations. Pressure responders do
+not take that cold-fill gate.
 
-This covers the shared wire-layout operand used by native 2-bit and nibble
-execution. Other ISA-specific transformed int8/int4/u8, N16/KAI and optional MLAS
-packs still need owned-grant integration, and retained compact OnceLock entries
-are not yet idle-reclaimable. Scratch/activation coverage, physical Host/Device
-book reconciliation and process-wide limits remain separate work. No speedup,
-NUMA placement performance or CUDA execution is claimed.
+Unchanged contiguous Host Uint8/Float32 wire operands still borrow directly,
+including with zero Host headroom. Numeric accumulation, ISA selection,
+quantization and placement algorithms are unchanged. Tests compare the actual
+six payload allocations with their charged bytes over tail/tile geometries,
+scales dtypes and symmetric/affine inputs, including failure/refund and warm
+reuse under a full Host budget. Real u8 decode and wire 2-bit execution exercise
+the governed factory path; raw transformed-layout builders also execute on hosts
+without their corresponding instruction-set route. That does not prove x86 ISA
+execution or multi-node NUMA placement on this Apple host.
+
+Optional MLAS-owned packs and scratch/activation allocations still need their
+own integration. Retained native OnceLock entries are not yet idle-reclaimable.
+Physical Host/Device book reconciliation and process-wide limits remain work.
+No speedup, placement performance or CUDA runtime claim is made.

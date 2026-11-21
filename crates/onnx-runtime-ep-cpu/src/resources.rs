@@ -30,7 +30,7 @@ impl Default for CpuWeightCacheLimits {
 }
 
 /// Immutable CPU weight resources. Full f32 block-format/NBits expansions,
-/// owned wire-layout NBits preparations and retained or transient QMoE experts
+/// owned native NBits preparations and retained or transient QMoE experts
 /// use one Host grant source. Private fields
 /// prevent a shared expert cache from being paired with a different authority.
 /// Cache ceilings and the legacy planned-family verdict only admit retention;
@@ -222,7 +222,7 @@ impl DerivedWeightMemory {
         self.owner.is_some()
     }
 
-    /// Whether the supplying authority can reclaim these idle weights for any
+    /// Whether the supplying authority can reclaim enrolled idle caches for any
     /// Host claimant, including KV lease growth. Third-party authorities without
     /// a pressure capability still fund payloads, but cannot reclaim them here.
     pub fn supports_pressure_reclaim(&self) -> bool {

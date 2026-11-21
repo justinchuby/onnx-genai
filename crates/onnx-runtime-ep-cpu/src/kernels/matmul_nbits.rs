@@ -693,16 +693,16 @@ pub struct MatMulNBitsKernel {
     weight_prepacked: bool,
     constant_inputs: [bool; 5],
     dense_weights: DenseWeightCache<NBitsDenseKey>,
-    int8_weight: OnceLock<Int8Weight>,
-    packed_int4_weight: OnceLock<PackedInt4Weight>,
-    packed_int4_n16_weight: OnceLock<PackedN16SdotWeight>,
-    packed_kai_qsi4_weight: OnceLock<PackedKaiSdotWeight>,
-    packed_nbits_weight: OnceLock<PreparedNBitsWeight>,
-    compact_memory: DerivedWeightMemory,
-    packed_nbits_fill: std::sync::Mutex<()>,
-    packed_u8_weight: OnceLock<PackedU8Weight>,
-    packed_u8_n16_weight: OnceLock<PackedN16SdotWeight>,
-    packed_kai_qsi8_weight: OnceLock<PackedKaiSdotWeight>,
+    int8_weight: OnceLock<PreparedWeight<Int8Weight>>,
+    packed_int4_weight: OnceLock<PreparedWeight<PackedInt4Weight>>,
+    packed_int4_n16_weight: OnceLock<PreparedWeight<PackedN16SdotWeight>>,
+    packed_kai_qsi4_weight: OnceLock<PreparedWeight<PackedKaiSdotWeight>>,
+    packed_nbits_weight: OnceLock<PreparedWeight<PackedNBitsWeight>>,
+    weight_memory: DerivedWeightMemory,
+    native_pack_fill: std::sync::Mutex<()>,
+    packed_u8_weight: OnceLock<PreparedWeight<PackedU8Weight>>,
+    packed_u8_n16_weight: OnceLock<PreparedWeight<PackedN16SdotWeight>>,
+    packed_kai_qsi8_weight: OnceLock<PreparedWeight<PackedKaiSdotWeight>>,
     #[cfg(feature = "mlas")]
     mlas_shards: OnceLock<Option<Arc<Vec<Option<MlasShard>>>>>,
     #[cfg(feature = "mlas")]
@@ -1227,15 +1227,140 @@ struct PackedNBitsWeight {
     zero_points: Option<Vec<u8>>,
 }
 
-/// A prepared wire-layout payload cannot outlive its Host ownership grant.
+/// A prepared native payload cannot outlive its Host ownership grant.
 /// Declaration order frees all payload buffers before returning capacity.
-struct PreparedNBitsWeight {
-    weight: PackedNBitsWeight,
+struct PreparedWeight<T> {
+    weight: T,
     _grant: DerivedWeightGrant,
 }
-impl PreparedNBitsWeight {
-    fn view(&self) -> PackedNBitsView<'_> {
-        self.weight.view()
+impl<T> std::ops::Deref for PreparedWeight<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.weight
+    }
+}
+
+/// A cached borrow or a call-owned preparation always keeps its funding alive.
+enum PreparedWeightRef<'a, T> {
+    Cached(&'a PreparedWeight<T>),
+    Owned(PreparedWeight<T>),
+}
+impl<T> std::ops::Deref for PreparedWeightRef<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        match self {
+            Self::Cached(weight) => &weight.weight,
+            Self::Owned(weight) => &weight.weight,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NativePackLayout {
+    Wire,
+    Int4,
+    Int8,
+    U8,
+    N16,
+    Kai,
+}
+
+/// A payload's Rust type fixes its physical layout and preparation recipe.
+/// Admission cannot accidentally charge a compact layout for an expanded pack.
+trait NativePackedWeight: Sized {
+    const LAYOUT: NativePackLayout;
+    fn build(
+        kernel: &MatMulNBitsKernel,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<Self>;
+}
+impl NativePackedWeight for PackedNBitsWeight {
+    const LAYOUT: NativePackLayout = NativePackLayout::Wire;
+    fn build(
+        kernel: &MatMulNBitsKernel,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<Self> {
+        Ok(numa_place_nbits(
+            kernel.prepack_nbits_weight(packed, scales, zero_points)?,
+            kernel.n,
+        ))
+    }
+}
+impl NativePackedWeight for Int8Weight {
+    const LAYOUT: NativePackLayout = NativePackLayout::Int8;
+    fn build(
+        kernel: &MatMulNBitsKernel,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<Self> {
+        Ok(numa_place_int8(
+            kernel.prepack_int8_weight(packed, scales, zero_points)?,
+            kernel.n,
+        ))
+    }
+}
+impl NativePackedWeight for PackedU8Weight {
+    const LAYOUT: NativePackLayout = NativePackLayout::U8;
+    fn build(
+        kernel: &MatMulNBitsKernel,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<Self> {
+        Ok(numa_place_u8(
+            kernel.prepack_u8_weight(packed, scales, zero_points)?,
+            kernel.n,
+        ))
+    }
+}
+impl NativePackedWeight for PackedN16SdotWeight {
+    const LAYOUT: NativePackLayout = NativePackLayout::N16;
+    fn build(
+        kernel: &MatMulNBitsKernel,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<Self> {
+        Ok(numa_place_n16_sdot(
+            kernel.prepack_n16_sdot_weight(packed, scales, zero_points)?,
+            kernel.n,
+        ))
+    }
+}
+impl NativePackedWeight for PackedKaiSdotWeight {
+    const LAYOUT: NativePackLayout = NativePackLayout::Kai;
+    fn build(
+        kernel: &MatMulNBitsKernel,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<Self> {
+        Ok(numa_place_kai_sdot(
+            kernel.prepack_kai_sdot_weight(packed, scales, zero_points)?,
+            kernel.n,
+        ))
+    }
+}
+impl NativePackedWeight for PackedInt4Weight {
+    const LAYOUT: NativePackLayout = NativePackLayout::Int4;
+    fn build(
+        kernel: &MatMulNBitsKernel,
+        packed: &TensorView,
+        scales: &TensorView,
+        _zero_points: Option<&TensorView>,
+    ) -> Result<Self> {
+        Ok(numa_place_int4(
+            Self {
+                values: to_dense_bytes(packed)?,
+                scales: to_dense_compute_f32(scales)?,
+            },
+            kernel.n,
+        ))
     }
 }
 
@@ -1251,14 +1376,14 @@ struct PackedNBitsView<'a> {
 /// Ownership is necessary only when conversion or explicit placement requires it.
 enum PackedNBitsOperand<'a> {
     View(PackedNBitsView<'a>),
-    Owned(PreparedNBitsWeight),
+    Prepared(PreparedWeightRef<'a, PackedNBitsWeight>),
 }
 
 impl PackedNBitsOperand<'_> {
     fn view(&self) -> PackedNBitsView<'_> {
         match self {
             Self::View(view) => *view,
-            Self::Owned(weight) => weight.view(),
+            Self::Prepared(weight) => weight.view(),
         }
     }
 }
@@ -1549,8 +1674,8 @@ impl KernelFactory for MatMulNBitsFactory {
             packed_int4_n16_weight: OnceLock::new(),
             packed_kai_qsi4_weight: OnceLock::new(),
             packed_nbits_weight: OnceLock::new(),
-            compact_memory: self.resources.weight_memory().clone(),
-            packed_nbits_fill: std::sync::Mutex::new(()),
+            weight_memory: self.resources.weight_memory().clone(),
+            native_pack_fill: std::sync::Mutex::new(()),
             packed_u8_weight: OnceLock::new(),
             packed_u8_n16_weight: OnceLock::new(),
             packed_kai_qsi8_weight: OnceLock::new(),
@@ -1888,25 +2013,14 @@ impl Kernel for MatMulNBitsKernel {
             && dot_kernel.supports_int4_direct(self.block_size, zero_points.is_some())
         {
             if dot_kernel.uses_kai_sdot_direct(self.bits, self.block_size) {
-                let owned_weight;
-                let packed_weight = if can_prepack {
-                    if let Some(weight) = self.packed_kai_qsi4_weight.get() {
-                        weight
-                    } else {
-                        let weight =
-                            self.prepack_kai_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
-                        let weight = numa_place_kai_sdot(weight, self.n);
-                        let _ = self.packed_kai_qsi4_weight.set(weight);
-                        self.packed_kai_qsi4_weight
-                            .get()
-                            .expect("constant MatMulNBits KAI qsi4 weight was just initialized")
-                    }
-                } else {
-                    let built =
-                        self.prepack_kai_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
-                    owned_weight = numa_place_kai_sdot(built, self.n);
-                    &owned_weight
-                };
+                let prepared_weight = self.load_native_weight(
+                    &self.packed_kai_qsi4_weight,
+                    can_prepack,
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                )?;
+                let packed_weight = &*prepared_weight;
                 with_decode_pool(|| {
                     kai_sdot_matmul_m1(
                         &activations,
@@ -1919,25 +2033,14 @@ impl Kernel for MatMulNBitsKernel {
                     );
                 })?;
             } else if dot_kernel.uses_n16_sdot_direct() {
-                let owned_weight;
-                let packed_weight = if can_prepack {
-                    if let Some(weight) = self.packed_int4_n16_weight.get() {
-                        weight
-                    } else {
-                        let weight =
-                            self.prepack_n16_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
-                        let weight = numa_place_n16_sdot(weight, self.n);
-                        let _ = self.packed_int4_n16_weight.set(weight);
-                        self.packed_int4_n16_weight
-                            .get()
-                            .expect("constant MatMulNBits N16 int4 weight was just initialized")
-                    }
-                } else {
-                    let built =
-                        self.prepack_n16_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
-                    owned_weight = numa_place_n16_sdot(built, self.n);
-                    &owned_weight
-                };
+                let prepared_weight = self.load_native_weight(
+                    &self.packed_int4_n16_weight,
+                    can_prepack,
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                )?;
+                let packed_weight = &*prepared_weight;
                 with_decode_pool(|| {
                     n16_sdot_matmul_m1(
                         &activations,
@@ -1950,29 +2053,14 @@ impl Kernel for MatMulNBitsKernel {
                     );
                 })?;
             } else {
-                let owned_weight;
-                let packed_weight = if can_prepack {
-                    if let Some(weight) = self.packed_int4_weight.get() {
-                        weight
-                    } else {
-                        let weight = PackedInt4Weight {
-                            values: to_dense_bytes(&inputs[1])?,
-                            scales: to_dense_compute_f32(&inputs[2])?,
-                        };
-                        let weight = numa_place_int4(weight, self.n);
-                        let _ = self.packed_int4_weight.set(weight);
-                        self.packed_int4_weight
-                            .get()
-                            .expect("constant MatMulNBits packed int4 weight was just initialized")
-                    }
-                } else {
-                    let built = PackedInt4Weight {
-                        values: to_dense_bytes(&inputs[1])?,
-                        scales: to_dense_compute_f32(&inputs[2])?,
-                    };
-                    owned_weight = numa_place_int4(built, self.n);
-                    &owned_weight
-                };
+                let prepared_weight = self.load_native_weight(
+                    &self.packed_int4_weight,
+                    can_prepack,
+                    &inputs[1],
+                    &inputs[2],
+                    None,
+                )?;
+                let packed_weight = &*prepared_weight;
                 with_decode_pool(|| {
                     int4_matmul_m1(
                         &activations,
@@ -2015,23 +2103,14 @@ impl Kernel for MatMulNBitsKernel {
             })?;
         } else if self.bits == 4 && self.accuracy_level == 4 && group_indices.is_none() {
             record_int4_route(Int4Route::ExpandedInt8);
-            let owned_weight;
-            let int8_weight = if can_prepack {
-                if let Some(weight) = self.int8_weight.get() {
-                    weight
-                } else {
-                    let weight = self.prepack_int8_weight(&inputs[1], &inputs[2], zero_points)?;
-                    let weight = numa_place_int8(weight, self.n);
-                    let _ = self.int8_weight.set(weight);
-                    self.int8_weight
-                        .get()
-                        .expect("constant MatMulNBits int8 prepack was just initialized")
-                }
-            } else {
-                let built = self.prepack_int8_weight(&inputs[1], &inputs[2], zero_points)?;
-                owned_weight = numa_place_int8(built, self.n);
-                &owned_weight
-            };
+            let prepared_weight = self.load_native_weight(
+                &self.int8_weight,
+                can_prepack,
+                &inputs[1],
+                &inputs[2],
+                zero_points,
+            )?;
+            let int8_weight = &*prepared_weight;
             if m == 1 {
                 with_decode_pool(|| {
                     int8_matmul(
@@ -2111,25 +2190,14 @@ impl Kernel for MatMulNBitsKernel {
             // (`reduced_precision_activation_allowed`).
             let int8_compute_allowed = self.accuracy_level == 4;
             if int8_compute_allowed && dot_kernel.uses_kai_sdot_direct(self.bits, self.block_size) {
-                let owned_weight;
-                let packed_weight = if can_prepack {
-                    if let Some(weight) = self.packed_kai_qsi8_weight.get() {
-                        weight
-                    } else {
-                        let weight =
-                            self.prepack_kai_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
-                        let weight = numa_place_kai_sdot(weight, self.n);
-                        let _ = self.packed_kai_qsi8_weight.set(weight);
-                        self.packed_kai_qsi8_weight
-                            .get()
-                            .expect("constant MatMulNBits KAI qsi8 weight was just initialized")
-                    }
-                } else {
-                    let built =
-                        self.prepack_kai_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
-                    owned_weight = numa_place_kai_sdot(built, self.n);
-                    &owned_weight
-                };
+                let prepared_weight = self.load_native_weight(
+                    &self.packed_kai_qsi8_weight,
+                    can_prepack,
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                )?;
+                let packed_weight = &*prepared_weight;
                 with_decode_pool(|| {
                     kai_sdot_matmul_m1(
                         &activations,
@@ -2146,25 +2214,14 @@ impl Kernel for MatMulNBitsKernel {
                 && self.block_size == 128
                 && activation_quant_group() == 32
             {
-                let owned_weight;
-                let packed_weight = if can_prepack {
-                    if let Some(weight) = self.packed_u8_n16_weight.get() {
-                        weight
-                    } else {
-                        let weight =
-                            self.prepack_n16_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
-                        let weight = numa_place_n16_sdot(weight, self.n);
-                        let _ = self.packed_u8_n16_weight.set(weight);
-                        self.packed_u8_n16_weight
-                            .get()
-                            .expect("constant MatMulNBits N16 bits8 weight was just initialized")
-                    }
-                } else {
-                    let built =
-                        self.prepack_n16_sdot_weight(&inputs[1], &inputs[2], zero_points)?;
-                    owned_weight = numa_place_n16_sdot(built, self.n);
-                    &owned_weight
-                };
+                let prepared_weight = self.load_native_weight(
+                    &self.packed_u8_n16_weight,
+                    can_prepack,
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                )?;
+                let packed_weight = &*prepared_weight;
                 with_decode_pool(|| {
                     n16_sdot_u8_i16_matmul_m1(
                         &activations,
@@ -2177,23 +2234,14 @@ impl Kernel for MatMulNBitsKernel {
                     );
                 })?;
             } else {
-                let owned_weight;
-                let weight_u8 = if can_prepack {
-                    if let Some(weight) = self.packed_u8_weight.get() {
-                        weight
-                    } else {
-                        let weight = self.prepack_u8_weight(&inputs[1], &inputs[2], zero_points)?;
-                        let weight = numa_place_u8(weight, self.n);
-                        let _ = self.packed_u8_weight.set(weight);
-                        self.packed_u8_weight
-                            .get()
-                            .expect("constant MatMulNBits u8 prepack was just initialized")
-                    }
-                } else {
-                    let built = self.prepack_u8_weight(&inputs[1], &inputs[2], zero_points)?;
-                    owned_weight = numa_place_u8(built, self.n);
-                    &owned_weight
-                };
+                let prepared_weight = self.load_native_weight(
+                    &self.packed_u8_weight,
+                    can_prepack,
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                )?;
+                let weight_u8 = &*prepared_weight;
                 let int16_activation = eight_bit_int16_activation()
                     && reduced_precision_activation_allowed(self.accuracy_level);
                 with_decode_pool(|| {
@@ -2409,57 +2457,175 @@ impl MatMulNBitsKernel {
         {
             return Ok(PackedNBitsOperand::View(view));
         }
-        if can_prepack {
-            if let Some(weight) = self.packed_nbits_weight.get() {
-                return Ok(PackedNBitsOperand::View(weight.view()));
-            }
-            // Serialize cold conversion only. Warm hits and pressure callbacks
-            // never acquire this gate; concurrent misses cannot duplicate packs.
-            let _fill = self
-                .packed_nbits_fill
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(weight) = self.packed_nbits_weight.get() {
-                return Ok(PackedNBitsOperand::View(weight.view()));
-            }
-            let weight = self.prepare_nbits_weight(packed, scales, zero_points)?;
-            let _ = self.packed_nbits_weight.set(weight);
-            Ok(PackedNBitsOperand::View(
-                self.packed_nbits_weight
-                    .get()
-                    .expect("constant MatMulNBits packed weight was just initialized")
-                    .view(),
-            ))
-        } else {
-            Ok(PackedNBitsOperand::Owned(self.prepare_nbits_weight(
-                packed,
-                scales,
-                zero_points,
-            )?))
-        }
+        Ok(PackedNBitsOperand::Prepared(self.load_native_weight(
+            &self.packed_nbits_weight,
+            can_prepack,
+            packed,
+            scales,
+            zero_points,
+        )?))
     }
 
-    fn prepare_nbits_weight(
+    fn load_native_weight<'a, T: NativePackedWeight>(
+        &'a self,
+        cache: &'a OnceLock<PreparedWeight<T>>,
+        retain: bool,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<PreparedWeightRef<'a, T>> {
+        if !retain {
+            return self
+                .prepare_native_weight(packed, scales, zero_points)
+                .map(PreparedWeightRef::Owned);
+        }
+        if let Some(weight) = cache.get() {
+            return Ok(PreparedWeightRef::Cached(weight));
+        }
+        // No data/accounting lock is held. Pressure callbacks never take this
+        // cold-fill gate. All native packs share the same admission mechanism.
+        let _fill = self
+            .native_pack_fill
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(weight) = cache.get() {
+            return Ok(PreparedWeightRef::Cached(weight));
+        }
+        let _ = cache.set(self.prepare_native_weight(packed, scales, zero_points)?);
+        Ok(PreparedWeightRef::Cached(cache.get().expect(
+            "serialized native weight preparation initialized the cache",
+        )))
+    }
+
+    fn prepare_native_weight<T: NativePackedWeight>(
         &self,
         packed: &TensorView,
         scales: &TensorView,
         zero_points: Option<&TensorView>,
-    ) -> Result<PreparedNBitsWeight> {
+    ) -> Result<PreparedWeight<T>> {
         let placed = numa_decode_active().is_some() || spmd_decode_active().is_some();
-        let (bytes, peak) = nbits_preparation_bytes(packed, scales, zero_points, placed)?;
-        let mut grant = match self.compact_memory.try_grant(peak)? {
+        let (bytes, peak) =
+            self.native_preparation_bytes(T::LAYOUT, packed, scales, zero_points, placed)?;
+        let mut grant = match self.weight_memory.try_grant(peak)? {
             WeightAdmission::Granted(grant) => grant,
             WeightAdmission::Declined(reason) => return Err(EpError::Memory(reason)),
         };
-        let weight = self.prepack_nbits_weight(packed, scales, zero_points)?;
-        let weight = numa_place_nbits(weight, self.n);
-        // Placement can briefly own source and destination. Release that extra
-        // allowance only after source buffers have been destroyed.
+        let weight = T::build(self, packed, scales, zero_points)?;
+        // Temporary input copies and first-touch sources have been destroyed.
         let owned = grant.split_off(bytes)?;
-        Ok(PreparedNBitsWeight {
+        Ok(PreparedWeight {
             weight,
             _grant: owned,
         })
+    }
+
+    fn native_preparation_bytes(
+        &self,
+        layout: NativePackLayout,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        placed: bool,
+    ) -> Result<(usize, usize)> {
+        let (raw, widen_peak) = nbits_preparation_bytes(packed, scales, zero_points, false)?;
+        let valid_layout = self.block_size != 0
+            && match layout {
+                NativePackLayout::Wire => matches!(self.bits, 2 | 4 | 8),
+                NativePackLayout::Int4 => self.bits == 4 && zero_points.is_none(),
+                NativePackLayout::Int8 => self.bits == 4 && self.block_size.is_multiple_of(2),
+                NativePackLayout::U8 => self.bits == 8,
+                NativePackLayout::N16 | NativePackLayout::Kai => {
+                    matches!(self.bits, 4 | 8) && self.block_size.is_multiple_of(4)
+                }
+            };
+        if !valid_layout {
+            return Err(error(format!(
+                "native {layout:?} preparation rejects bits={}, block_size={}, zero_points={}; use supported bit/block geometry and symmetric operands for Int4",
+                self.bits,
+                self.block_size,
+                zero_points.is_some()
+            )));
+        }
+        let overflow = || {
+            error(format!(
+                "native {layout:?} preparation byte count overflows for K={}, N={}, bits={}, block_size={}; use addressable weight dimensions",
+                self.k, self.n, self.bits, self.block_size
+            ))
+        };
+        let product = |dims: &[usize]| {
+            dims.iter().try_fold(1usize, |bytes, &dim| {
+                bytes.checked_mul(dim).ok_or_else(overflow)
+            })
+        };
+        let scale_bytes = product(scales.shape)?.checked_mul(4).ok_or_else(overflow)?;
+        let blocks = self.k.div_ceil(self.block_size);
+        let metadata = product(&[self.n, blocks])?;
+        let scale_retained = scale_bytes;
+        let (payload, input_copies) = match layout {
+            NativePackLayout::Wire | NativePackLayout::Int4 => (raw, 0),
+            NativePackLayout::Int8 => {
+                let values = product(&[self.n, blocks, self.block_size])?;
+                let sums = metadata.checked_mul(4).ok_or_else(overflow)?;
+                (
+                    values
+                        .checked_add(sums)
+                        .and_then(|v| v.checked_add(scale_retained))
+                        .ok_or_else(overflow)?,
+                    raw.checked_sub(scale_bytes).ok_or_else(overflow)?,
+                )
+            }
+            NativePackLayout::U8 => {
+                let values = product(&[self.n, self.k])?;
+                let points = metadata.checked_mul(4).ok_or_else(overflow)?;
+                (
+                    values
+                        .checked_add(points)
+                        .and_then(|v| v.checked_add(scale_retained))
+                        .ok_or_else(overflow)?,
+                    raw.checked_sub(scale_bytes).ok_or_else(overflow)?,
+                )
+            }
+            NativePackLayout::N16 => {
+                let outputs = self
+                    .n
+                    .div_ceil(N16_SDOT_OUTPUTS)
+                    .checked_mul(N16_SDOT_OUTPUTS)
+                    .ok_or_else(overflow)?;
+                let values = product(&[outputs, blocks, self.block_size])?;
+                let points = metadata.checked_mul(2).ok_or_else(overflow)?;
+                (
+                    values
+                        .checked_add(points)
+                        .and_then(|v| v.checked_add(scale_retained))
+                        .ok_or_else(overflow)?,
+                    raw.checked_sub(scale_bytes).ok_or_else(overflow)?,
+                )
+            }
+            NativePackLayout::Kai => {
+                let outputs = self
+                    .n
+                    .div_ceil(KAI_SDOT_OUTPUTS)
+                    .checked_mul(KAI_SDOT_OUTPUTS)
+                    .ok_or_else(overflow)?;
+                let values = product(&[
+                    outputs,
+                    blocks,
+                    self.block_size / 4,
+                    if self.bits == 4 { 2 } else { 4 },
+                ])?;
+                // Tiled f32 scales, i32 RHS sums and i16 zero-point offsets.
+                let meta = product(&[outputs, blocks, 10])?;
+                (values.checked_add(meta).ok_or_else(overflow)?, raw)
+            }
+        };
+        let build_peak = payload
+            .checked_add(input_copies)
+            .ok_or_else(overflow)?
+            .max(widen_peak);
+        let placement_peak = payload
+            .checked_mul(if placed { 2 } else { 1 })
+            .ok_or_else(overflow)?;
+        Ok((payload, build_peak.max(placement_peak)))
     }
 
     fn prepack_nbits_weight(
@@ -11664,6 +11830,318 @@ mod tests {
     }
 
     #[test]
+    fn native_pack_grants_match_real_payloads_and_bound_transformation_peaks() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        fn check<T: NativePackedWeight>(
+            kernel: &mut MatMulNBitsKernel,
+            packed: &TensorView,
+            scales: &TensorView,
+            points: Option<&TensorView>,
+            payload_bytes: impl Fn(&T) -> usize,
+        ) {
+            let (bytes, peak) = kernel
+                .native_preparation_bytes(T::LAYOUT, packed, scales, points, false)
+                .unwrap();
+            let (_, placed_peak) = kernel
+                .native_preparation_bytes(T::LAYOUT, packed, scales, points, true)
+                .unwrap();
+            assert!(placed_peak >= bytes * 2);
+            for retain in [false, true] {
+                for capacity in [peak - 1, peak] {
+                    let (governor, resources) = governed_dense_resources(capacity, 0);
+                    kernel.weight_memory = resources.weight_memory().clone();
+                    let cache = OnceLock::<PreparedWeight<T>>::new();
+                    let value = kernel.load_native_weight(&cache, retain, packed, scales, points);
+                    if capacity < peak {
+                        assert!(matches!(
+                            value,
+                            Err(EpError::Memory(
+                                onnx_runtime_memory_api::MemoryError::TierExhausted { .. }
+                            ))
+                        ));
+                        assert!(cache.get().is_none());
+                        assert_eq!(governor.used(Tier::Host), 0);
+                    } else {
+                        let value = value.unwrap();
+                        assert_eq!(
+                            payload_bytes(&value),
+                            bytes,
+                            "{:?} K={} N={} bits={} block={}",
+                            T::LAYOUT,
+                            kernel.k,
+                            kernel.n,
+                            kernel.bits,
+                            kernel.block_size
+                        );
+                        assert_eq!(governor.used(Tier::Host), bytes as u64);
+                        if retain {
+                            let blocker = governor
+                                .reserve(
+                                    Tier::Host,
+                                    (peak - bytes) as u64,
+                                    MemoryRole::KvCache,
+                                    HolderId::new(2),
+                                )
+                                .unwrap();
+                            let warm = kernel
+                                .load_native_weight(&cache, true, packed, scales, points)
+                                .unwrap();
+                            assert!(std::ptr::eq::<T>(&*value, &*warm));
+                            assert_eq!(
+                                governor.used(Tier::Host),
+                                peak as u64,
+                                "warm transformed packs need no new grant"
+                            );
+                            drop(warm);
+                            drop(blocker);
+                        }
+                        drop(value);
+                        assert_eq!(
+                            governor.used(Tier::Host),
+                            if retain { bytes as u64 } else { 0 }
+                        );
+                    }
+                    drop(cache);
+                    assert_eq!(
+                        governor.used(Tier::Host),
+                        0,
+                        "payload ownership must refund on final drop"
+                    );
+                }
+            }
+        }
+        for bits in [4, 8] {
+            for n in [1usize, 17] {
+                for k in [1usize, 33, 129] {
+                    for block in [16usize, 128] {
+                        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+                            for affine in [false, true] {
+                                let blocks = k.div_ceil(block);
+                                let b = Owned::u8(
+                                    &[n, blocks, block * bits / 8],
+                                    &vec![0x39; n * blocks * block * bits / 8],
+                                );
+                                let values = vec![0.125; n * blocks];
+                                let scales = match dtype {
+                                    DataType::Float16 => Owned::f16(&[n, blocks], &values),
+                                    DataType::BFloat16 => Owned::bf16(&[n, blocks], &values),
+                                    _ => Owned::f32(&[n, blocks], &values),
+                                };
+                                let points = affine.then(|| {
+                                    Owned::u8(
+                                        &[n, (blocks * bits).div_ceil(8)],
+                                        &vec![0x12; n * (blocks * bits).div_ceil(8)],
+                                    )
+                                });
+                                let bv = b.view();
+                                let sv = scales.view();
+                                let zv = points.as_ref().map(Owned::view);
+                                let mut kernel = test_kernel(k, n, block);
+                                kernel.bits = bits;
+                                check::<PackedNBitsWeight>(
+                                    &mut kernel,
+                                    &bv,
+                                    &sv,
+                                    zv.as_ref(),
+                                    |w| {
+                                        w.values.len()
+                                            + w.scales.len() * 4
+                                            + w.zero_points.as_ref().map_or(0, Vec::len)
+                                    },
+                                );
+                                check::<PackedN16SdotWeight>(
+                                    &mut kernel,
+                                    &bv,
+                                    &sv,
+                                    zv.as_ref(),
+                                    |w| {
+                                        w.values.len()
+                                            + w.scales.len() * 4
+                                            + w.zero_point_offsets.len() * 2
+                                    },
+                                );
+                                check::<PackedKaiSdotWeight>(
+                                    &mut kernel,
+                                    &bv,
+                                    &sv,
+                                    zv.as_ref(),
+                                    |w| {
+                                        w.values.len()
+                                            + w.scales.len() * 4
+                                            + w.rhs_sums.len() * 4
+                                            + w.zero_point_offsets.len() * 2
+                                    },
+                                );
+                                if bits == 4 {
+                                    check::<PackedInt4Weight>(&mut kernel, &bv, &sv, None, |w| {
+                                        w.values.len() + w.scales.len() * 4
+                                    });
+                                    check::<Int8Weight>(&mut kernel, &bv, &sv, zv.as_ref(), |w| {
+                                        w.values.len() + w.scales.len() * 4 + w.block_sums.len() * 4
+                                    });
+                                } else {
+                                    check::<PackedU8Weight>(
+                                        &mut kernel,
+                                        &bv,
+                                        &sv,
+                                        zv.as_ref(),
+                                        |w| {
+                                            w.values.len()
+                                                + w.scales.len() * 4
+                                                + w.scaled_zero_points.len() * 4
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "mlas"))]
+    #[test]
+    fn native_pack_governed_u8_decode_charges_and_reuses_the_actual_selected_cache() {
+        let _probe = lock_dispatch_probe();
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let (k, n, block) = (33usize, 3usize, 16usize);
+        let b = Owned::u8(&[n, 3, block], &[0x39; 144]);
+        let scales = Owned::f16(&[n, 3], &[0.125; 9]);
+        let points = Owned::u8(&[n, 3], &[0x12; 9]);
+        let a = Owned::f32(&[1, k], &vec![0.25; k]);
+        let mut probe = test_kernel(k, n, block);
+        probe.bits = 8;
+        let (bytes, peak) = probe
+            .native_preparation_bytes(
+                NativePackLayout::U8,
+                &b.view(),
+                &scales.view(),
+                Some(&points.view()),
+                false,
+            )
+            .unwrap();
+        for retained in [false, true] {
+            for capacity in [peak - 1, peak] {
+                let (governor, resources) = governed_dense_resources(capacity, 0);
+                let mut kernel = MatMulNBitsFactory::new(resources)
+                    .create(&governed_dense_node(k, n, 8, block), &[])
+                    .unwrap();
+                kernel.set_constant_inputs(&[false, retained, retained, retained]);
+                let mut blocker = None;
+                for _ in 0..3 {
+                    let mut output = Owned::zeros_f32(&[1, n]);
+                    let result = kernel.execute(
+                        &[a.view(), b.view(), scales.view(), points.view()],
+                        &mut [output.view_mut()],
+                    );
+                    let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                    if capacity < peak {
+                        assert!(matches!(
+                            result,
+                            Err(EpError::Memory(
+                                onnx_runtime_memory_api::MemoryError::TierExhausted { .. }
+                            ))
+                        ));
+                        assert!(concrete.packed_u8_weight.get().is_none());
+                        assert_eq!(governor.used(Tier::Host), 0);
+                    } else {
+                        result.unwrap();
+                        // Independent wire semantics: (57 - 18) * .125 * .25 per K.
+                        assert_eq!(output.to_f32(), vec![k as f32 * 39.0 * 0.125 * 0.25; n]);
+                        assert_eq!(concrete.packed_u8_weight.get().is_some(), retained);
+                        if retained && blocker.is_none() {
+                            assert_eq!(governor.used(Tier::Host), bytes as u64);
+                            blocker = Some(
+                                governor
+                                    .reserve(
+                                        Tier::Host,
+                                        (peak - bytes) as u64,
+                                        MemoryRole::KvCache,
+                                        HolderId::new(2),
+                                    )
+                                    .unwrap(),
+                            );
+                        }
+                        assert_eq!(
+                            governor.used(Tier::Host),
+                            if retained { peak as u64 } else { 0 }
+                        );
+                    }
+                }
+                drop(blocker);
+                drop(kernel);
+                assert_eq!(governor.used(Tier::Host), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn native_pack_preparation_never_builds_before_grant_and_refunds_builder_failure() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        static BUILDS: AtomicUsize = AtomicUsize::new(0);
+        struct Broken;
+        impl NativePackedWeight for Broken {
+            const LAYOUT: NativePackLayout = NativePackLayout::Wire;
+            fn build(
+                _kernel: &MatMulNBitsKernel,
+                _packed: &TensorView,
+                _scales: &TensorView,
+                _points: Option<&TensorView>,
+            ) -> Result<Self> {
+                BUILDS.fetch_add(1, Ordering::Relaxed);
+                Err(error(
+                    "fixture native preparation failed; restore its builder",
+                ))
+            }
+        }
+        let b = Owned::u8(&[1, 1, 8], &[0x39; 8]);
+        let scales = Owned::f32(&[1, 1], &[0.125]);
+        for capacity in [0, 12] {
+            let (governor, resources) = governed_dense_resources(capacity, 0);
+            let mut kernel = test_kernel(16, 1, 16);
+            kernel.weight_memory = resources.weight_memory().clone();
+            let cache = OnceLock::<PreparedWeight<Broken>>::new();
+            let failure = kernel
+                .load_native_weight(&cache, true, &b.view(), &scales.view(), None)
+                .err()
+                .unwrap();
+            if capacity == 0 {
+                assert!(matches!(
+                    failure,
+                    EpError::Memory(onnx_runtime_memory_api::MemoryError::TierExhausted { .. })
+                ));
+                assert_eq!(BUILDS.load(Ordering::Relaxed), 0);
+            } else {
+                assert!(failure.to_string().contains("restore its builder"));
+                assert_eq!(BUILDS.load(Ordering::Relaxed), 1);
+            }
+            assert!(cache.get().is_none());
+            assert_eq!(governor.used(Tier::Host), 0);
+        }
+        let mut kernel = test_kernel(usize::MAX, 17, 16);
+        for layout in [
+            NativePackLayout::Int8,
+            NativePackLayout::U8,
+            NativePackLayout::N16,
+            NativePackLayout::Kai,
+        ] {
+            kernel.bits = if matches!(layout, NativePackLayout::U8) {
+                8
+            } else {
+                4
+            };
+            let failure = kernel
+                .native_preparation_bytes(layout, &b.view(), &scales.view(), None, false)
+                .unwrap_err();
+            assert!(failure.to_string().contains("overflows"), "{failure}");
+        }
+    }
+
+    #[test]
     fn compact_nbits_preparation_grants_cover_owned_payloads_and_conversion_peak() {
         use onnx_runtime_memory_api::{MemoryRole, Tier};
         use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
@@ -11692,7 +12170,10 @@ mod tests {
             let dynamic = kernel
                 .resolve_nbits_operand(&b.view(), &scales.view(), Some(&points.view()), false)
                 .unwrap();
-            assert!(matches!(dynamic, PackedNBitsOperand::Owned(_)));
+            assert!(matches!(
+                dynamic,
+                PackedNBitsOperand::Prepared(PreparedWeightRef::Owned(_))
+            ));
             assert_eq!(governor.used(Tier::Host), bytes as u64);
             assert_eq!(dynamic.view().scales, &[0.125; 9]);
             assert!(kernel.packed_nbits_weight.get().is_none());
@@ -11959,7 +12440,7 @@ mod tests {
             let bytes = values.len() + scales.len() * 4 + points.len();
             let (governor, resources) = governed_dense_resources(bytes, 0);
             let mut kernel = test_kernel(k, n, block);
-            kernel.compact_memory = resources.weight_memory().clone();
+            kernel.weight_memory = resources.weight_memory().clone();
             let first = kernel
                 .resolve_nbits_operand(&bv, &sv, Some(&zv), true)
                 .unwrap();
@@ -11997,7 +12478,10 @@ mod tests {
             let dynamic = kernel
                 .resolve_nbits_operand(&b.view(), &scales.view(), None, false)
                 .unwrap();
-            assert!(matches!(dynamic, PackedNBitsOperand::Owned(_)));
+            assert!(matches!(
+                dynamic,
+                PackedNBitsOperand::Prepared(PreparedWeightRef::Owned(_))
+            ));
             assert_eq!(dynamic.view().scales, scale_values);
             assert!(kernel.packed_nbits_weight.get().is_none());
         }
@@ -12136,8 +12620,8 @@ mod tests {
             packed_int4_n16_weight: OnceLock::new(),
             packed_kai_qsi4_weight: OnceLock::new(),
             packed_nbits_weight: OnceLock::new(),
-            compact_memory: DerivedWeightMemory::default(),
-            packed_nbits_fill: std::sync::Mutex::new(()),
+            weight_memory: DerivedWeightMemory::default(),
+            native_pack_fill: std::sync::Mutex::new(()),
             packed_u8_n16_weight: OnceLock::new(),
             packed_kai_qsi8_weight: OnceLock::new(),
             #[cfg(feature = "mlas")]
