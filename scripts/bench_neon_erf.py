@@ -293,8 +293,8 @@ def run(directory, binary, cargo_receipt, reps, sweeps):
         "freeze the entire checkout before measuring; commit or move pending source/artifact files",
     )
     metadata = {
-        "schema": 3,
-        "arms": ARM_SCHEMAS[3],
+        "schema": 2,
+        "arms": ARM_SCHEMAS[2],
         "repetitions": reps,
         "sweeps": sweeps,
         "binary_sha256": sha(binary.read_bytes()),

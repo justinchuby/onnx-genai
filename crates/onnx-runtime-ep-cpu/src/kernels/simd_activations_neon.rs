@@ -129,7 +129,7 @@ unsafe fn gelu_lanes<const EXPLICIT_NAN_REPAIR: bool>(x: float32x4_t) -> float32
 /// zero-filled stack lanes avoid reading/writing beyond either slice.
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn map<const PAIRED: bool>(
+unsafe fn map(
     input: &[f32],
     output: &mut [f32],
     mut kernel: impl FnMut(float32x4_t) -> float32x4_t,
@@ -140,21 +140,7 @@ unsafe fn map<const PAIRED: bool>(
         "NEON activation input/output lengths must match"
     );
     let body = input.len() & !3;
-    let paired_end = if PAIRED { body & !7 } else { 0 };
-    for i in (0..paired_end).step_by(8) {
-        // SAFETY: this iteration owns eight live elements in both slices.
-        // Each vector keeps its original arithmetic order; two independent
-        // vectors expose overlap without reassociating any polynomial.
-        unsafe {
-            let x0 = vld1q_f32(input.as_ptr().add(i));
-            let x1 = vld1q_f32(input.as_ptr().add(i + 4));
-            let y0 = kernel(x0);
-            let y1 = kernel(x1);
-            vst1q_f32(output.as_mut_ptr().add(i), y0);
-            vst1q_f32(output.as_mut_ptr().add(i + 4), y1);
-        }
-    }
-    for i in (paired_end..body).step_by(4) {
+    for i in (0..body).step_by(4) {
         // SAFETY: each iteration has four initialized input/output elements.
         unsafe {
             vst1q_f32(
@@ -178,7 +164,7 @@ pub(super) unsafe fn erf(input: &[f32], output: &mut [f32]) {
     #[cfg(test)]
     ERF_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: caller establishes NEON; map checks lengths and bounds all accesses.
-    unsafe { map::<true>(input, output, |x| erf_lanes::<false>(x)) };
+    unsafe { map(input, output, |x| erf_lanes::<false>(x)) };
 }
 
 #[target_feature(enable = "neon")]
@@ -186,7 +172,7 @@ pub(super) unsafe fn gelu(input: &[f32], output: &mut [f32]) {
     #[cfg(test)]
     GELU_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: caller establishes NEON; map checks lengths and bounds all accesses.
-    unsafe { map::<true>(input, output, |x| gelu_lanes::<false>(x)) };
+    unsafe { map(input, output, |x| gelu_lanes::<false>(x)) };
 }
 
 // Kept out of non-test builds. Both controls retain the same hit-counter
@@ -196,30 +182,14 @@ pub(super) unsafe fn gelu(input: &[f32], output: &mut [f32]) {
 pub(super) unsafe fn erf_guarded_before(input: &[f32], output: &mut [f32]) {
     ERF_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: caller establishes NEON; map bounds every lane and checks lengths.
-    unsafe { map::<false>(input, output, |x| erf_lanes::<true>(x)) };
+    unsafe { map(input, output, |x| erf_lanes::<true>(x)) };
 }
 #[cfg(test)]
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn gelu_guarded_before(input: &[f32], output: &mut [f32]) {
     GELU_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: same feature, length, and mapper contract as the native arm.
-    unsafe { map::<false>(input, output, |x| gelu_lanes::<true>(x)) };
-}
-
-// Exact previous four-lane loop, without the earlier NaN repair overhead.
-#[cfg(test)]
-#[target_feature(enable = "neon")]
-pub(super) unsafe fn erf_single_before(input: &[f32], output: &mut [f32]) {
-    ERF_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // SAFETY: caller establishes NEON; mapper bounds both slices.
-    unsafe { map::<false>(input, output, |x| erf_lanes::<false>(x)) };
-}
-#[cfg(test)]
-#[target_feature(enable = "neon")]
-pub(super) unsafe fn gelu_single_before(input: &[f32], output: &mut [f32]) {
-    GELU_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // SAFETY: same feature and slice contract as the native arm.
-    unsafe { map::<false>(input, output, |x| gelu_lanes::<false>(x)) };
+    unsafe { map(input, output, |x| gelu_lanes::<true>(x)) };
 }
 
 /// Fused bias add and exact GELU, with no full-sized intermediate allocation.
@@ -253,7 +223,7 @@ pub(super) unsafe fn gelu_bias(input: &[f32], bias: &[f32], width: usize, output
         // SAFETY: all patterns have four initialized lanes; map bounds the
         // source/destination and caller establishes the NEON feature.
         unsafe {
-            map::<false>(input, output, |x| {
+            map(input, output, |x| {
                 let b = vld1q_f32(patterns[phase].as_ptr());
                 phase += advance;
                 if phase >= width {
@@ -628,62 +598,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn native_paired_loop_matches_single_loop_at_every_boundary() {
-        eprintln!("NEON paired-loop proof FPCR={:#x}", proof_fpcr());
-        let mut seed = 0x4d12_17a9_u32;
-        let mut input: Vec<f32> = (0..65_541)
-            .map(|_| {
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                f32::from_bits(seed)
-            })
-            .collect();
-        input[..8].copy_from_slice(&[
-            0.0,
-            -0.0,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::from_bits(0x7f80_0001),
-            f32::from_bits(0xffc0_1234),
-            f32::from_bits(1),
-            -f32::from_bits(1),
-        ]);
-        for offset in 0..4 {
-            for n in (0..=257).chain([4095, 4096, 4097, 65_537]) {
-                for op in 0..2 {
-                    let x = &input[offset..offset + n];
-                    let mut before = vec![0.0; n];
-                    let mut backing = vec![-12345.5; n + 8];
-                    // SAFETY: AArch64 NEON host, initialized equal-length slices.
-                    unsafe {
-                        if op == 0 {
-                            erf_single_before(x, &mut before);
-                            erf(x, &mut backing[4..4 + n]);
-                        } else {
-                            gelu_single_before(x, &mut before);
-                            gelu(x, &mut backing[4..4 + n]);
-                        }
-                    }
-                    assert!(
-                        before
-                            .iter()
-                            .zip(&backing[4..4 + n])
-                            .all(|(a, b)| a.to_bits() == b.to_bits()),
-                        "paired loop changes output: op={op}, offset={offset}, n={n}"
-                    );
-                    assert!(
-                        backing[..4]
-                            .iter()
-                            .chain(&backing[4 + n..])
-                            .all(|&v| v == -12345.5)
-                    );
-                }
-            }
-        }
-    }
-
     /// Same-process wall-only comparison. Production uses native; MLAS and the
     /// exact former scalar body are explicit controls, never runtime toggles.
     #[cfg(feature = "mlas")]
@@ -746,8 +660,8 @@ mod tests {
                                     (1, 1 | 2) => erf_gelu_f32_slice_native(input, out),
                                     (0, 3) => super::super::erf_f32_slice(input, out),
                                     (1, 3) => super::super::erf_gelu_f32_slice(input, out),
-                                    (0, 4) => super::super::erf_single_before_native(input, out),
-                                    (1, 4) => super::super::gelu_single_before_native(input, out),
+                                    (0, 4) => super::super::erf_guarded_before_native(input, out),
+                                    (1, 4) => super::super::gelu_guarded_before_native(input, out),
                                     _ => unreachable!(
                                         "the wall diagnostic has two operations and five arms"
                                     ),
