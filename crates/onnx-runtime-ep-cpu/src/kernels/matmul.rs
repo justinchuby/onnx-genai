@@ -364,32 +364,34 @@ fn dense_operand_cache_bytes(node: &Node, graph: &Graph, index: usize) -> u64 {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct MatMulDenseKey {
-    // Logical strides/shape of an initializer are immutable within this node.
-    // Address, dtype and extent also reject a distinct source/shape at this slot.
+/// A materialized copy is a function of the complete logical source view.
+/// Immutable backing bytes do not imply immutable shape/strides: runtime views
+/// and shape variants may interpret the same address and extent differently.
+/// The output element width is part of the cache's type, not runtime metadata.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MatMulCopyKey<const ELEMENT_BYTES: usize> {
     source: usize,
     dtype: DataType,
-    elements: usize,
+    shape: Vec<usize>,
+    strides: Vec<i64>,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct MatMulHalfKey {
-    source: usize,
-    elements: usize,
-}
-
-impl WeightCacheKey for MatMulHalfKey {
-    fn weight_bytes(&self) -> Result<usize> {
-        self.elements.checked_mul(std::mem::size_of::<u16>()).ok_or_else(||
-            EpError::KernelFailed("MatMul constant f16 copy byte count overflow; use addressable weight dimensions".into()))
+impl<const ELEMENT_BYTES: usize> MatMulCopyKey<ELEMENT_BYTES> {
+    fn from_view(view: &TensorView<'_>) -> Self {
+        Self {
+            source: view.data_ptr::<u8>() as usize,
+            dtype: view.dtype,
+            shape: view.shape.to_vec(),
+            strides: view.strides.to_vec(),
+        }
     }
 }
 
-impl WeightCacheKey for MatMulDenseKey {
+impl<const ELEMENT_BYTES: usize> WeightCacheKey for MatMulCopyKey<ELEMENT_BYTES> {
     fn weight_bytes(&self) -> Result<usize> {
-        self.elements.checked_mul(std::mem::size_of::<f32>()).ok_or_else(||
-            EpError::KernelFailed("MatMul constant f32 payload size overflows usize; use addressable operand dimensions".into()))
+        self.shape.iter().try_fold(1usize, |elements, &dim| elements.checked_mul(dim))
+            .and_then(|elements| elements.checked_mul(ELEMENT_BYTES)).ok_or_else(||
+            EpError::KernelFailed(format!("MatMul constant copy of {:?} with {ELEMENT_BYTES}-byte elements overflows usize; use addressable operand dimensions", self.shape)))
     }
 }
 
@@ -473,7 +475,7 @@ struct MatMulWeights {
     /// memory plan (#1056): filled only under an admitting verdict, and reports
     /// its own held bytes via the caches' actual retained payload bytes. Only populated
     /// when the operand is not already contiguous f32 (see [`MatMulPrepack::dense`]).
-    dense: [WeightCache<MatMulDenseKey>; 2],
+    dense: [WeightCache<MatMulCopyKey<4>>; 2],
     #[cfg(feature = "mlas")]
     packed_b: WeightCache<SgemmPackKey, mlas_sys::PackedB>,
     /// Reclaimable MLAS-packed f32 panels derived from a constant **f16** B weight.
@@ -505,7 +507,7 @@ struct MatMulWeights {
         not(any(target_os = "macos", target_os = "ios")),
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
-    contiguous_b_f16: WeightCache<MatMulHalfKey, Vec<u16>>,
+    contiguous_b_f16: WeightCache<MatMulCopyKey<2>, Vec<u16>>,
 }
 
 /// Installed global transpose keys retire when the final node-weight owner
@@ -704,11 +706,7 @@ impl MatMulPrepack {
                 .map(|values| DenseOperand(DenseOperandStorage::Direct(values)));
         }
         validate_f32_widen_input("MatMul constant operand", view)?;
-        let key = MatMulDenseKey {
-            source: view.data_ptr::<u8>() as usize,
-            dtype: view.dtype,
-            elements: view.numel(),
-        };
+        let key = MatMulCopyKey::<4>::from_view(view);
         let spec = if self.retain_caches {
             WeightSpec::cached(&key)?
         } else {
@@ -884,8 +882,8 @@ impl MatMulPrepack {
     ///   - the element-by-element `to_dense_f32_widen` (~1 s at 136 M elements)
     ///   - the 2× memory of f16→f32 widening
     ///
-    /// The node's initializer layout is immutable. Source address and element
-    /// count distinguish different operands at this slot (#845). Both retained
+    /// Source address, dtype, shape and strides identify each logical view of
+    /// immutable backing storage at this slot (#845). Both retained
     /// and transient copies hold a Host grant until their last reader drops.
     #[cfg_attr(
         not(any(target_os = "macos", target_os = "ios")),
@@ -900,10 +898,7 @@ impl MatMulPrepack {
             return Ok(None); // already contiguous or not cacheable
         }
         validate_f32_widen_input("MatMul constant f16 contiguous preparation", b_view)?;
-        let key = MatMulHalfKey {
-            source: b_view.data_ptr::<u16>() as usize,
-            elements: b_view.shape.iter().try_fold(1usize, |n, &dim| n.checked_mul(dim)).ok_or_else(|| EpError::KernelFailed("MatMul constant f16 contiguous preparation: element count overflow; use addressable weight dimensions".into()))?,
-        };
+        let key = MatMulCopyKey::<2>::from_view(b_view);
         let spec = if self.retain_caches {
             WeightSpec::cached(&key)?
         } else {
@@ -4002,6 +3997,183 @@ fn broadcast_offset(bidx: &[usize], batch: &[usize], batch_strides: &[i64]) -> u
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    #[test]
+    fn materialized_constant_copies_distinguish_complete_logical_views() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let layouts = [
+            ([2, 3], [4, 1], [5., 6., 7., 9., 10., 11.]),
+            ([2, 3], [1, 2], [5., 7., 9., 6., 8., 10.]),
+            ([3, 2], [4, 1], [5., 6., 9., 10., 13., 14.]),
+            ([2, 3], [0, 1], [5., 6., 7., 5., 6., 7.]),
+            ([2, 3], [-4, 1], [5., 6., 7., 1., 2., 3.]),
+        ];
+        for (half_copy, slot) in [(false, 0), (false, 1), (true, 1)] {
+            let payload_bytes = if half_copy { 12 } else { 24 };
+            let books = LedgerGovernor::new(LeaseLedger::new(0, payload_bytes * 5, 0));
+            let resources = CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+            let source = if half_copy {
+                Owned::f16(&[16], &(1..=16).map(|n| n as f32).collect::<Vec<_>>())
+            } else {
+                Owned::f64(&[16], &(1..=16).map(|n| n as f64).collect::<Vec<_>>())
+            };
+            let mut owner = MatMulPrepack::new(resources.clone());
+            owner.set_constant_inputs(&[slot == 0, slot == 1]);
+            let mut pointers = Vec::new();
+            for (index, (shape, strides, expected)) in layouts.iter().enumerate() {
+                let mut view = source.view();
+                view.shape = shape;
+                view.strides = strides;
+                view.byte_offset = if half_copy { 8 } else { 32 };
+                let (values, pointer) = if half_copy {
+                    let reader = owner.contiguous_b_f16(&view).unwrap().unwrap();
+                    (
+                        reader
+                            .as_slice()
+                            .iter()
+                            .map(|&v| half::f16::from_bits(v).to_f32())
+                            .collect::<Vec<_>>(),
+                        reader.as_slice().as_ptr() as usize,
+                    )
+                } else {
+                    let reader = owner.dense(slot, &view).unwrap();
+                    (reader.to_vec(), reader.as_ptr() as usize)
+                };
+                assert_eq!(
+                    values, expected,
+                    "layout {index}, half={half_copy}, slot={slot}"
+                );
+                assert!(
+                    !pointers.contains(&pointer),
+                    "different logical views cannot share a derived payload"
+                );
+                pointers.push(pointer);
+                assert_eq!(books.used(Tier::Host), payload_bytes * (index as u64 + 1));
+            }
+            let mut peer = MatMulPrepack::new(resources);
+            peer.set_constant_inputs(&[slot == 0, slot == 1]);
+            assert!(
+                peer.adopt_shareable_constant_state(owner.shareable_constant_state().unwrap())
+                    .unwrap()
+            );
+            drop(owner);
+            for (index, (shape, strides, expected)) in layouts.iter().enumerate() {
+                let mut view = source.view();
+                view.shape = shape;
+                view.strides = strides;
+                view.byte_offset = if half_copy { 8 } else { 32 };
+                let (values, pointer) = if half_copy {
+                    let reader = peer.contiguous_b_f16(&view).unwrap().unwrap();
+                    (
+                        reader
+                            .as_slice()
+                            .iter()
+                            .map(|&v| half::f16::from_bits(v).to_f32())
+                            .collect::<Vec<_>>(),
+                        reader.as_slice().as_ptr() as usize,
+                    )
+                } else {
+                    let reader = peer.dense(slot, &view).unwrap();
+                    (reader.to_vec(), reader.as_ptr() as usize)
+                };
+                assert_eq!(values, expected);
+                assert_eq!(
+                    pointer, pointers[index],
+                    "an equivalent logical view must reuse its payload"
+                );
+                assert_eq!(books.used(Tier::Host), payload_bytes * 5);
+            }
+            let activity = if half_copy {
+                peer.weights.contiguous_b_f16.activity()
+            } else {
+                peer.weights.dense[slot].activity()
+            };
+            assert_eq!(
+                activity,
+                (5, 5),
+                "five builds and five warm hits, including after owner adoption"
+            );
+            drop(peer);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
+    #[test]
+    fn provider_matmul_family_reuses_only_equivalent_constant_views() {
+        if retention_control_in_child(
+            "kernels::matmul::tests::provider_matmul_family_reuses_only_equivalent_constant_views",
+            None,
+        ) {
+            return;
+        }
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::NodeId;
+        let source = Owned::f64(&[12], &(1..=12).map(|n| n as f64).collect::<Vec<_>>());
+        let shape = [2, 3];
+        for op in ["MatMul", "Gemm", "FusedMatMulBias", "FusedGemm"] {
+            for slot in [0, 1] {
+                let provider = crate::CpuExecutionProvider::with_resources(Default::default());
+                let mut node = Node::new(NodeId(0), op, vec![], vec![]);
+                if matches!(op, "FusedMatMulBias" | "FusedGemm") {
+                    node.domain = "com.microsoft".into();
+                }
+                let (m, k, n) = if slot == 0 { (2, 3, 2) } else { (2, 2, 3) };
+                let a = Owned::f64(&[m, k], &vec![1.; m * k]);
+                let b = Owned::f64(&[k, n], &vec![1.; k * n]);
+                let bias = Owned::f64(&[n], &vec![0.; n]);
+                let mut first = provider
+                    .get_kernel(&node, &[vec![m, k], vec![k, n]], 17)
+                    .unwrap();
+                first.set_constant_inputs(&[slot == 0, slot == 1]);
+                let mut peer = provider
+                    .get_kernel(&node, &[vec![m, k], vec![k, n]], 17)
+                    .unwrap();
+                peer.set_constant_inputs(&[slot == 0, slot == 1]);
+                for (index, strides) in [[4, 1], [1, 2], [4, 1]].iter().enumerate() {
+                    let mut constant = source.view();
+                    constant.shape = &shape;
+                    constant.strides = strides;
+                    let (av, bv) = if slot == 0 {
+                        (constant, b.view())
+                    } else {
+                        (a.view(), constant)
+                    };
+                    let inputs = if op == "MatMul" {
+                        vec![av, bv]
+                    } else {
+                        vec![av, bv, bias.view()]
+                    };
+                    let mut output = Owned::zeros(DataType::Float64, &[m, n]);
+                    let kernel = if index == 0 {
+                        first.as_ref()
+                    } else {
+                        peer.as_ref()
+                    };
+                    kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
+                    let expected = match (slot, index == 1) {
+                        (0, false) => vec![6., 6., 18., 18.],
+                        (0, true) => vec![9., 9., 12., 12.],
+                        (1, false) => vec![6., 8., 10., 6., 8., 10.],
+                        _ => vec![3., 7., 11., 3., 7., 11.],
+                    };
+                    assert_eq!(output.to_f64(), expected, "{op} slot {slot} layout {index}");
+                    if index == 0 {
+                        assert!(
+                            peer.adopt_shareable_constant_state(
+                                first.shareable_constant_state().unwrap()
+                            )
+                            .unwrap()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn provider_matmul_family_shape_variants_share_one_operand_grant() {

@@ -1442,3 +1442,37 @@ Clippy pass again. Downstream native-backend engine load and memory-strategy
 groups each pass 29 tests with the cached ORT library. The temporary negative
 control worktree and consumed editing scripts are removed; validation drivers,
 raw logs and the stable host-lock inode remain.
+
+
+### Materialized copy identity follows the complete source view
+
+Dense f32 and contiguous f16 copies now share a cache-key implementation with
+effective address, source dtype, shape and signed strides. Immutable storage
+does not make all its logical views identical. The previous keys could return
+the first copy when a runtime view changed strides without changing address or
+element count. Shape must also participate: equal-size views can have identical
+stride vectors but different row boundaries.
+
+The direct control exercises both dense operand slots and native-width half
+copies across positive, broadcast and negative strides, a same-strides shape
+change, and a nonzero byte offset. Five distinct views hold five actual payload
+grants (24 bytes each for dense f32, 12 for f16); after node-owner adoption,
+five identical views hit the original allocations without new grants and final
+drop refunds all bytes. A public-provider control executes MatMul, Gemm,
+FusedMatMulBias and FusedGemm for both immutable operand slots, changes layout
+through a shared preparation owner, then returns to the original layout.
+
+Both unchanged controls fail numerically on parent 5bc65dce7. In the public
+MatMul operand-A case, the changed view incorrectly repeats [6,6,18,18] instead
+of [9,9,12,12]. These are correctness/ownership controls, not performance results;
+CUDA and other CPU ISAs were not exercised on the Apple host.
+
+Validation after an explicit CPU/session package clean on Apple M1 Max ARM64
+macOS / Rust 1.98: native CPU 1,986 passed / 20 ignored and session 277 passed;
+optional-MLAS CPU 2,023 passed / 35 ignored and session 279 passed. Strict
+all-target Clippy passes for both crates in both configurations. Formatting and
+dispatch manifest/reachability/platform/feature checks pass. Both exact new
+controls selected one test and passed before the old-version negative controls;
+the rebuilt full suites include both afterward. Consumed insertion fragments
+and the temporary baseline worktree are removed; validation drivers/logs and
+the stable host lock remain.

@@ -982,3 +982,22 @@ constant preparation or retained operand conversion. Allocation still follows
 storage presence; view dispatch keeps its existing immutable-source path. Static
 and runtime flag disagreement declines static adoption and prepares normally.
 This does not redesign view provenance or fund legacy transpose payloads.
+
+
+### Materialized operand identity includes logical layout
+
+Immutable backing bytes can feed runtime views with different logical layouts.
+The former dense-f32 and contiguous-half keys used only address/type/element
+count, so equal-size views at the same origin could reuse a stale copy. Both
+now use one typed copy key containing effective source address (including byte
+offset), source dtype, full shape and signed element strides. Output element
+width is a type parameter; payload bytes still use checked shape arithmetic.
+No compatibility key or alternate classification remains.
+
+The existing node owner and WeightCache admission/pressure/reader rules remain
+in force. Distinct views own distinct funded copies; repeated identical views
+reuse the same allocation, including after owner adoption by a sibling kernel.
+Direct initializer predictions still count one immutable layout per operand;
+custom runtime views are not represented by WeightRef and rely on actual grants.
+This corrects materialized-copy identity, not transpose funding or native panel
+source-lifetime policy.
