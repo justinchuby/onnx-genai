@@ -1,0 +1,43 @@
+{
+  "protocol": 2,
+  "source_commit": "803d5bca1fbc18c485184ecbdd2d1d28b3bff376",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_nbits.rs": "9afe23e1ae458a5659b885855759a698e51b8dad7c04b01a295b513ac6d792a8",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs": "f7d5e19e774d32bd03155c662c331f5629bb333db5b1232ceb07510c169f97ed",
+    "scripts/bench_apple_dense_execute.py": "d2576f372d8aa047fead867067a1584533f233938e00616214c46509938f6bde",
+    "scripts/test_bench_apple_dense_execute.py": "c9282a778c13a8db4079c5370a66042fb4edc3e1d140cf503a792d90f0574150"
+  },
+  "binary": "/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-a26db3a5d89b84f9",
+  "binary_sha256": "64a5cecdb96c7740fc38c11caf0aea9cf7bb91daf7cafd9520d4a05cd5b6c62e",
+  "cargo_lock_sha256": "d84aae080dc08d740c9a44e02780a72c943716de13048d06110c9039bf6da54d",
+  "cargo_manifest_sha256": "9e87e15986f1c87b243ad43c787fc1f8bc42423c65cbf0d20e4eadcf299bd52e",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "cpu": "Apple M1 Max",
+  "features": "default; no MLAS",
+  "selected_environment": {
+    "NXRT_CPU_DISPATCH_LEDGER": null,
+    "ONNX_GENAI_PROFILE_MM": null,
+    "NXRT_CPU_GEMM_BACKEND": null,
+    "RAYON_NUM_THREADS": null,
+    "VECLIB_MAXIMUM_THREADS": null,
+    "VECLIB_NUM_THREADS": null,
+    "OMP_NUM_THREADS": null
+  },
+  "shared_host_lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "scope": "synchronous real factory kernel execute; process CPU includes worker activity/spin; libtest cache bookkeeping and test-only route selector included; no affinity or isolation claim",
+  "sweep": 3,
+  "load_before": [
+    3.4833984375,
+    2.35693359375,
+    2.28515625
+  ],
+  "start_utc": "2026-11-22T12:06:32Z",
+  "rayon_threads": 10,
+  "load_after": [
+    3.837890625,
+    2.47509765625,
+    2.32763671875
+  ],
+  "end_utc": "2026-11-22T12:06:43Z"
+}

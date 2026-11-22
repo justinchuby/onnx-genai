@@ -5,7 +5,7 @@ use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::{check_arity, write_dense_bytes};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
-use crate::strided::numel;
+use crate::strided::{next_index, numel};
 
 /// Dispatch counter for the BNNS pooling fast path (macOS/iOS).
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -154,6 +154,7 @@ fn pool_params(node: &Node, dims: usize) -> Result<(PoolParams, AutoPad, bool)> 
     ))
 }
 
+#[cfg(test)]
 fn coordinates(mut index: usize, shape: &[usize]) -> Vec<usize> {
     let mut coords = vec![0; shape.len()];
     for axis in (0..shape.len()).rev() {
@@ -271,6 +272,116 @@ impl KernelFactory for MaxPoolFactory {
     }
 }
 
+impl PoolKernel {
+    /// Walk the validated dense input in row-major kernel order. Output staging
+    /// remains call-local so strided/aliased tensor boundaries keep their prior
+    /// materialization semantics; only the window-coordinate scratch is reused.
+    fn pool_dense(
+        &self,
+        x: &[f32],
+        x_shape: &[usize],
+        output_spatial: &[usize],
+        pads: &[usize],
+        indices_requested: bool,
+    ) -> (Vec<f32>, Vec<i64>) {
+        let spatial = &x_shape[2..];
+        let spatial_size = numel(spatial);
+        let kernel_size = numel(&self.params.kernel);
+        let output_size = numel(output_spatial);
+        let elements = x_shape[0] * x_shape[1] * output_size;
+        let mut values = Vec::with_capacity(elements);
+        let mut indices = if indices_requested {
+            Vec::with_capacity(elements)
+        } else {
+            Vec::new()
+        };
+        // One invocation owns its rank-sized workspace. Neither output windows
+        // nor kernel samples allocate coordinates; no retained cache is needed.
+        let mut out_coords = vec![0; spatial.len()];
+        let mut starts = vec![0isize; spatial.len()];
+        let mut kernel_coords = vec![0; spatial.len()];
+        let mut input_coords = vec![0; spatial.len()];
+        for nc in 0..x_shape[0] * x_shape[1] {
+            out_coords.fill(0);
+            for _ in 0..output_size {
+                for (axis, start) in starts.iter_mut().enumerate() {
+                    *start = (out_coords[axis] * self.params.strides[axis]) as isize
+                        - pads[axis] as isize;
+                }
+                let mut sum = 0.0;
+                let mut count = 0usize;
+                let mut maximum = f32::NEG_INFINITY;
+                let mut maximum_index = 0usize;
+                kernel_coords.fill(0);
+                for _ in 0..kernel_size {
+                    let mut in_bounds = true;
+                    for axis in 0..spatial.len() {
+                        let coordinate = starts[axis]
+                            + (kernel_coords[axis] * self.params.dilations[axis]) as isize;
+                        if coordinate < 0 || coordinate >= spatial[axis] as isize {
+                            in_bounds = false;
+                            break;
+                        }
+                        input_coords[axis] = coordinate as usize;
+                    }
+                    // Advance even for padding-only samples, preserving the old
+                    // row-major order of floating-point accumulation and ties.
+                    next_index(&self.params.kernel, &mut kernel_coords);
+                    if !in_bounds {
+                        continue;
+                    }
+                    let index = nc * spatial_size + spatial_index(&input_coords, spatial, false);
+                    let value = x[index];
+                    match self.kind {
+                        PoolKind::Average { .. } => {
+                            sum += value;
+                            count += 1;
+                        }
+                        PoolKind::Lp { p } => {
+                            sum += value.abs().powi(p);
+                            count += 1;
+                        }
+                        PoolKind::Max { storage_order } => {
+                            if value > maximum {
+                                maximum = value;
+                                if indices_requested {
+                                    maximum_index = nc * spatial_size
+                                        + spatial_index(&input_coords, spatial, storage_order);
+                                }
+                            }
+                        }
+                    }
+                }
+                match self.kind {
+                    PoolKind::Average { include_pad } => {
+                        let divisor = if include_pad { kernel_size } else { count };
+                        values.push(if divisor == 0 {
+                            0.0
+                        } else {
+                            sum / divisor as f32
+                        });
+                    }
+                    PoolKind::Lp { p } => {
+                        values.push(if count == 0 {
+                            0.0
+                        } else {
+                            sum.powf(1.0 / p as f32)
+                        });
+                    }
+                    PoolKind::Max { .. } => {
+                        values.push(maximum);
+                        if indices_requested {
+                            indices.push(maximum_index as i64);
+                        }
+                    }
+                }
+                next_index(output_spatial, &mut out_coords);
+            }
+        }
+        (values, indices)
+    }
+}
+
 impl Kernel for PoolKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Pool", inputs, outputs, 1, 1, 1)?;
@@ -326,83 +437,8 @@ impl Kernel for PoolKernel {
         POOL_SCALAR_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let x = to_dense_f32_widen("Pool", &inputs[0])?;
-        let spatial_size = numel(spatial);
-        let kernel_size = numel(&self.params.kernel);
-        let mut values = Vec::with_capacity(numel(&expected));
-        let mut indices = Vec::with_capacity(numel(&expected));
-        for nc in 0..x_shape[0] * x_shape[1] {
-            for out_flat in 0..numel(&output_spatial) {
-                let out_coords = coordinates(out_flat, &output_spatial);
-                let starts: Vec<isize> = out_coords
-                    .iter()
-                    .enumerate()
-                    .map(|(axis, &coord)| {
-                        (coord * self.params.strides[axis]) as isize - pads[axis] as isize
-                    })
-                    .collect();
-                let mut sum = 0.0;
-                let mut count = 0usize;
-                let mut maximum = f32::NEG_INFINITY;
-                let mut maximum_index = 0usize;
-                for kernel_flat in 0..kernel_size {
-                    let kernel_coords = coordinates(kernel_flat, &self.params.kernel);
-                    let mut input_coords = Vec::with_capacity(spatial.len());
-                    let mut in_bounds = true;
-                    for axis in 0..spatial.len() {
-                        let coordinate = starts[axis]
-                            + (kernel_coords[axis] * self.params.dilations[axis]) as isize;
-                        if coordinate < 0 || coordinate >= spatial[axis] as isize {
-                            in_bounds = false;
-                            break;
-                        }
-                        input_coords.push(coordinate as usize);
-                    }
-                    if !in_bounds {
-                        continue;
-                    }
-                    let index = nc * spatial_size + spatial_index(&input_coords, spatial, false);
-                    let value = x[index];
-                    match self.kind {
-                        PoolKind::Average { .. } => {
-                            sum += value;
-                            count += 1;
-                        }
-                        PoolKind::Lp { p } => {
-                            sum += value.abs().powi(p);
-                            count += 1;
-                        }
-                        PoolKind::Max { storage_order } => {
-                            if value > maximum {
-                                maximum = value;
-                                maximum_index = nc * spatial_size
-                                    + spatial_index(&input_coords, spatial, storage_order);
-                            }
-                        }
-                    }
-                }
-                match self.kind {
-                    PoolKind::Average { include_pad } => {
-                        let divisor = if include_pad { kernel_size } else { count };
-                        values.push(if divisor == 0 {
-                            0.0
-                        } else {
-                            sum / divisor as f32
-                        });
-                    }
-                    PoolKind::Lp { p } => {
-                        values.push(if count == 0 {
-                            0.0
-                        } else {
-                            sum.powf(1.0 / p as f32)
-                        });
-                    }
-                    PoolKind::Max { .. } => {
-                        values.push(maximum);
-                        indices.push(maximum_index as i64);
-                    }
-                }
-            }
-        }
+        let (values, indices) =
+            self.pool_dense(&x, x_shape, &output_spatial, &pads, outputs.len() == 2);
         write_dense_f32_narrow("Pool", &mut outputs[0], &values)?;
         if outputs.len() == 2 {
             write_dense_bytes(
@@ -917,6 +953,100 @@ mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
 
+    // Exact allocating window walk before workspace reuse. Test-only oracle;
+    // keeps summation order, nonfinite/tie policy and both index storage orders.
+    fn historical_pool_values(
+        kernel: &PoolKernel,
+        x: &[f32],
+        x_shape: &[usize],
+        output_spatial: &[usize],
+        pads: &[usize],
+    ) -> (Vec<f32>, Vec<i64>) {
+        let spatial = &x_shape[2..];
+        let expected = [x_shape[0], x_shape[1]]
+            .into_iter()
+            .chain(output_spatial.iter().copied())
+            .collect::<Vec<_>>();
+        let spatial_size = numel(spatial);
+        let kernel_size = numel(&kernel.params.kernel);
+        let mut values = Vec::with_capacity(numel(&expected));
+        let mut indices = Vec::with_capacity(numel(&expected));
+        for nc in 0..x_shape[0] * x_shape[1] {
+            for out_flat in 0..numel(output_spatial) {
+                let out_coords = coordinates(out_flat, output_spatial);
+                let starts: Vec<isize> = out_coords
+                    .iter()
+                    .enumerate()
+                    .map(|(axis, &coord)| {
+                        (coord * kernel.params.strides[axis]) as isize - pads[axis] as isize
+                    })
+                    .collect();
+                let mut sum = 0.0;
+                let mut count = 0usize;
+                let mut maximum = f32::NEG_INFINITY;
+                let mut maximum_index = 0usize;
+                for kernel_flat in 0..kernel_size {
+                    let kernel_coords = coordinates(kernel_flat, &kernel.params.kernel);
+                    let mut input_coords = Vec::with_capacity(spatial.len());
+                    let mut in_bounds = true;
+                    for axis in 0..spatial.len() {
+                        let coordinate = starts[axis]
+                            + (kernel_coords[axis] * kernel.params.dilations[axis]) as isize;
+                        if coordinate < 0 || coordinate >= spatial[axis] as isize {
+                            in_bounds = false;
+                            break;
+                        }
+                        input_coords.push(coordinate as usize);
+                    }
+                    if !in_bounds {
+                        continue;
+                    }
+                    let index = nc * spatial_size + spatial_index(&input_coords, spatial, false);
+                    let value = x[index];
+                    match kernel.kind {
+                        PoolKind::Average { .. } => {
+                            sum += value;
+                            count += 1;
+                        }
+                        PoolKind::Lp { p } => {
+                            sum += value.abs().powi(p);
+                            count += 1;
+                        }
+                        PoolKind::Max { storage_order } => {
+                            if value > maximum {
+                                maximum = value;
+                                maximum_index = nc * spatial_size
+                                    + spatial_index(&input_coords, spatial, storage_order);
+                            }
+                        }
+                    }
+                }
+                match kernel.kind {
+                    PoolKind::Average { include_pad } => {
+                        let divisor = if include_pad { kernel_size } else { count };
+                        values.push(if divisor == 0 {
+                            0.0
+                        } else {
+                            sum / divisor as f32
+                        });
+                    }
+                    PoolKind::Lp { p } => {
+                        values.push(if count == 0 {
+                            0.0
+                        } else {
+                            sum.powf(1.0 / p as f32)
+                        });
+                    }
+                    PoolKind::Max { .. } => {
+                        values.push(maximum);
+                        indices.push(maximum_index as i64);
+                    }
+                }
+            }
+        }
+        (values, indices)
+    }
+
     fn average(kernel: &PoolKernel, x: &Owned, shape: &[usize]) -> Vec<f32> {
         let mut out = Owned::zeros_f32(shape);
         kernel.execute(&[x.view()], &mut [out.view_mut()]).unwrap();
@@ -934,6 +1064,152 @@ mod tests {
             strides: strides.to_vec(),
             pads: pads.to_vec(),
             dilations: dilations.to_vec(),
+        }
+    }
+
+    #[test]
+    fn reused_window_coordinates_preserve_values_and_indices_across_ranks() {
+        let mut cases = 0;
+        for rank in 1..=5 {
+            for variant in 0..4 {
+                let spatial: Vec<_> = (0..rank).map(|axis| 3 + (axis + variant) % 2).collect();
+                let shape: Vec<_> = [2, 2].into_iter().chain(spatial.iter().copied()).collect();
+                let parameters = PoolParams {
+                    kernel: (0..rank).map(|axis| 1 + (axis + variant) % 2).collect(),
+                    strides: vec![1 + variant % 2; rank],
+                    dilations: (0..rank).map(|axis| 1 + (axis + variant / 2) % 2).collect(),
+                    pads: (0..2 * rank).map(|axis| (axis + variant) % 2).collect(),
+                };
+                for special in [false, true] {
+                    let mut x: Vec<_> = (0..numel(&shape))
+                        .map(|i| {
+                            // Cancellation and ties expose any change in traversal.
+                            [1.0e20, 1.0, -1.0e20, -0.0, 0.0, 7.0, 7.0, -3.5][(i + variant) % 8]
+                        })
+                        .collect();
+                    if special {
+                        for (i, value) in x.iter_mut().enumerate().step_by(19) {
+                            *value = [
+                                f32::from_bits(0x7f80_1234),
+                                f32::INFINITY,
+                                f32::NEG_INFINITY,
+                                f32::from_bits(1),
+                            ][(i / 19) % 4];
+                        }
+                    }
+                    for auto_pad in [
+                        AutoPad::NotSet,
+                        AutoPad::Valid,
+                        AutoPad::SameUpper,
+                        AutoPad::SameLower,
+                    ] {
+                        for ceil_mode in [false, true] {
+                            let (out, pads) =
+                                parameters.output_shape(&spatial, auto_pad, ceil_mode);
+                            for kind in [
+                                PoolKind::Average { include_pad: false },
+                                PoolKind::Average { include_pad: true },
+                                PoolKind::Lp { p: 1 },
+                                PoolKind::Lp { p: 2 },
+                                PoolKind::Max {
+                                    storage_order: false,
+                                },
+                                PoolKind::Max {
+                                    storage_order: true,
+                                },
+                            ] {
+                                let kernel = PoolKernel {
+                                    params: parameters.clone(),
+                                    auto_pad,
+                                    ceil_mode,
+                                    kind,
+                                };
+                                let wants_indices = matches!(kernel.kind, PoolKind::Max { .. });
+                                let expected =
+                                    historical_pool_values(&kernel, &x, &shape, &out, &pads);
+                                let actual =
+                                    kernel.pool_dense(&x, &shape, &out, &pads, wants_indices);
+                                assert_eq!(actual.0.len(), numel(&out) * 4);
+                                assert!(
+                                    actual
+                                        .0
+                                        .iter()
+                                        .zip(&expected.0)
+                                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                                    "values changed: rank={rank} variant={variant} special={special} ceil={ceil_mode}"
+                                );
+                                assert_eq!(
+                                    actual.1, expected.1,
+                                    "MaxPool storage-order indices changed"
+                                );
+                                if wants_indices {
+                                    let omitted = kernel.pool_dense(&x, &shape, &out, &pads, false);
+                                    assert!(
+                                        omitted.1.is_empty(),
+                                        "indices must not be staged when absent"
+                                    );
+                                    assert!(
+                                        omitted
+                                            .0
+                                            .iter()
+                                            .zip(&actual.0)
+                                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                                    );
+                                }
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            cases, 1920,
+            "the complete rank/geometry/value/kind matrix must run"
+        );
+    }
+
+    #[test]
+    fn reused_window_coordinates_preserve_empty_and_padding_only_windows() {
+        for (shape, parameters) in [
+            (vec![1, 1, 0], params(&[1], &[1], &[0, 0], &[1])),
+            (vec![0, 2, 4], params(&[2], &[1], &[1, 1], &[1])),
+            (vec![1, 1, 1], params(&[1], &[1], &[2, 2], &[1])),
+        ] {
+            let x = vec![-0.0; numel(&shape)];
+            let (out, pads) = parameters.output_shape(&shape[2..], AutoPad::NotSet, false);
+            for kind in [
+                PoolKind::Average { include_pad: false },
+                PoolKind::Average { include_pad: true },
+                PoolKind::Lp { p: 2 },
+                PoolKind::Max {
+                    storage_order: true,
+                },
+            ] {
+                let kernel = PoolKernel {
+                    params: parameters.clone(),
+                    auto_pad: AutoPad::NotSet,
+                    ceil_mode: false,
+                    kind,
+                };
+                let expected = historical_pool_values(&kernel, &x, &shape, &out, &pads);
+                let actual = kernel.pool_dense(
+                    &x,
+                    &shape,
+                    &out,
+                    &pads,
+                    matches!(kernel.kind, PoolKind::Max { .. }),
+                );
+                assert_eq!(actual.0.len(), expected.0.len());
+                assert!(
+                    actual
+                        .0
+                        .iter()
+                        .zip(&expected.0)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+                assert_eq!(actual.1, expected.1);
+            }
         }
     }
 

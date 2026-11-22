@@ -41,7 +41,7 @@ pub struct CpuExecutionProvider {
     device: DeviceId,
     initialized: bool,
     registry: OpRegistry,
-    retain_caches: bool,
+    resources: CpuMemoryResources,
     /// Where this EP's buffers come from.
     ///
     /// The same `DeviceAllocator` contract the ONNX Runtime side uses, so an
@@ -110,8 +110,8 @@ impl CpuExecutionProvider {
         Self {
             device: DeviceId::cpu(),
             initialized: false,
-            retain_caches: resources.cache_retention().is_admitted(),
-            registry: build_cpu_registry_with_resources(resources),
+            registry: build_cpu_registry_with_resources(resources.clone()),
+            resources,
             memory: default_cpu_memory(),
         }
     }
@@ -317,22 +317,28 @@ impl ExecutionProvider for CpuExecutionProvider {
     fn prepare_static_constants(
         &self,
         node: &Node,
+        constant_inputs: &[bool],
         constants: &[Option<onnx_runtime_ep_api::KernelConstantInput<'_>>],
     ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>> {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if self.retain_caches
+        if self.resources.cache_retention().is_admitted()
             && ((node.is_default_domain() && node.op_type == "MatMul")
                 || (node.domain == "com.microsoft" && node.op_type == "FusedMatMulBias"))
         {
-            let mut prepack = crate::kernels::matmul::MatMulPrepack::new(self.retain_caches);
-            prepack.set_constant_inputs(&[false, constants.get(1).is_some_and(Option::is_some)]);
+            let mut prepack = crate::kernels::matmul::MatMulPrepack::new(self.resources.clone());
+            prepack.set_constant_inputs(constant_inputs);
             prepack.prepare_constants(constants);
             if prepack.has_prepared_transpose() {
-                return Ok(Some(std::sync::Arc::new(prepack)));
+                return Ok(prepack.shareable_constant_state());
             }
         }
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        let _ = (self.retain_caches, node, constants);
+        let _ = (
+            self.resources.cache_retention().is_admitted(),
+            node,
+            constant_inputs,
+            constants,
+        );
         Ok(None)
     }
 

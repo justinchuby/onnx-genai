@@ -1,0 +1,12 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 40094, "load_before": [2.47265625, 2.4677734375, 2.29443359375], "command": ["python3", "/tmp/nxrt-apple-nt-verify.py"]}
+PASS /tmp/nxrt-apple-nt-native-cpu.tests.log
+PASS /tmp/nxrt-apple-nt-native-cpu.clippy.log
+PASS /tmp/nxrt-apple-nt-native-session.tests.log
+PASS /tmp/nxrt-apple-nt-native-session.clippy.log
+PASS /tmp/nxrt-apple-nt-mlas-cpu.tests.log
+PASS /tmp/nxrt-apple-nt-mlas-cpu.clippy.log
+PASS /tmp/nxrt-apple-nt-mlas-session.tests.log
+PASS /tmp/nxrt-apple-nt-mlas-session.clippy.log
+PASS /tmp/nxrt-apple-nt-release-sgemm.log
+PASS /tmp/nxrt-apple-nt-release-prefill.log
+{"wall_s": 312.78981579100946, "cpu_s": 690.098846, "maxrss_bytes": 4029546496, "load_after": [2.92333984375, 3.8896484375, 3.16796875]}

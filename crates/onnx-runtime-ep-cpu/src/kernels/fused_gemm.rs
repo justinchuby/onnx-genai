@@ -31,17 +31,37 @@ pub struct FusedGemmKernel {
 }
 
 /// Factory for [`FusedGemmKernel`] (no attributes).
-pub struct FusedGemmFactory;
+#[derive(Default)]
+pub struct FusedGemmFactory {
+    resources: crate::CpuMemoryResources,
+}
+impl FusedGemmFactory {
+    pub fn new(resources: crate::CpuMemoryResources) -> Self {
+        Self { resources }
+    }
+}
 
 impl KernelFactory for FusedGemmFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(FusedGemmKernel::default()))
+        Ok(Box::new(FusedGemmKernel {
+            prepack: MatMulPrepack::new(self.resources.clone()),
+        }))
     }
 }
 
 impl Kernel for FusedGemmKernel {
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
         self.prepack.set_constant_inputs(constant_inputs);
+    }
+
+    fn shareable_constant_state(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.prepack.shareable_constant_state()
+    }
+    fn adopt_shareable_constant_state(
+        &mut self,
+        state: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<bool> {
+        self.prepack.adopt_shareable_constant_state(state)
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {

@@ -1,0 +1,7 @@
+{
+  "reader_source_commit": "cd4dc683d95fca1a8a3f14123eca1a2550258bbb",
+  "reader_sha256": "d6eae6f2ed1e4a44b38434cb7175fe3f2fd58d1a49e82618346ba06a55e275f5",
+  "control_driver_python_optimization": 0,
+  "saved_summary_cli_python_optimization": 1,
+  "assertions_enabled_in_control_driver": true
+}

@@ -1341,7 +1341,9 @@ mod tests {
     fn production_dispatch_sites_record_lazily() {
         // (file, source, how many sites are expected to record)
         let sites: &[(&str, &str, usize)] = &[
-            ("kernels/matmul.rs", include_str!("kernels/matmul.rs"), 1),
+            // NN and NT dispatch each record lazily; cached NBits prefill
+            // must retain the same observation boundary as its former NN path.
+            ("kernels/matmul.rs", include_str!("kernels/matmul.rs"), 2),
             (
                 "kernels/simd_activations.rs",
                 include_str!("kernels/simd_activations.rs"),

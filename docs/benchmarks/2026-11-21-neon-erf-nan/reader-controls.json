@@ -1,0 +1,52 @@
+[
+  {
+    "control": "raw_checksum",
+    "rejected": true,
+    "reason": "raw CSV checksum differs"
+  },
+  {
+    "control": "duplicate_identity",
+    "rejected": true,
+    "reason": "duplicate or unexpected sample identity"
+  },
+  {
+    "control": "wrong_width_same_count",
+    "rejected": true,
+    "reason": "duplicate or unexpected sample identity"
+  },
+  {
+    "control": "wrong_batch",
+    "rejected": true,
+    "reason": "sample work batch differs"
+  },
+  {
+    "control": "wrong_explicit_arm_identity",
+    "rejected": true,
+    "reason": "explicit arm identities differ from schema"
+  },
+  {
+    "control": "nonstandard_nan_mode",
+    "rejected": true,
+    "reason": "FPCR proof/measurement mode differs from standard IEEE mode"
+  },
+  {
+    "control": "missing_validation",
+    "rejected": true,
+    "reason": "missing full-buffer validation"
+  },
+  {
+    "control": "no_actual_worker_participation",
+    "rejected": true,
+    "reason": "parallel validation lacks actual worker participation"
+  },
+  {
+    "control": "changed_guarded_output_hash",
+    "rejected": true,
+    "reason": "full output hash changes with pool/sweep/mode"
+  },
+  {
+    "control": "changed_summary",
+    "rejected": true,
+    "reason": "saved results differ from raw-data reanalysis"
+  }
+]

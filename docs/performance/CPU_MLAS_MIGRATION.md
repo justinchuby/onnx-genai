@@ -127,9 +127,9 @@ Measured, Linux x86-64, release, 200 M calls:
 
 That is ~2 cycles. The smallest GEMM in our own bench suite (`1×256×256`) takes
 ~17,000 ns, so one recording site is **0.005%** of the cheapest operation it
-observes. There are three sites in total (`matmul::gemm_with_backend`, the
-`dispatch_mlas!` macro in `simd_activations.rs`, and softmax's
-`record_softmax_route`), all per-call rather than per-element.
+observes. Production callers are NN and NT GEMM dispatch, the activation
+routes, and softmax. Each records per invocation rather than per element;
+the source-level guard counts every lazy call and rejects eager recording.
 
 Current plan, condensed. `Native-over-MLAS` means our kernel owns the
 structure — blocking, threading, fusion, special-value handling — and calls MLAS
@@ -179,10 +179,74 @@ work. No shipped build reaches any of these.
 
 | primitive | why not |
 |---|---|
-| `MlasEltwiseAdd` | measured no better than our dense SIMD `Add`; `Elementwise` is graduated |
 | `MlasComputeTanh` | native beat MLAS-plus-clamp by up to **1.39×** at 256 Ki (#1121) — de-graduated from MLAS deliberately |
 | `MlasComputeLogistic` for `Sigmoid` | same measurement as Tanh; the route was removed |
 | `MlasComputeActivation` (fused) | our fusions cover more op pairs and keep the epilogue native |
+
+### QLinearMatMul reference packing ownership
+
+Optional QLinearMatMul packed weights obtain their actual packed-buffer bytes
+from the provider's `DerivedWeightMemory` Host authority before allocation.
+The payload owns its grant; an active call keeps both alive independently of
+the kernel cache. Retention permission reserves no idle bytes. Temporary Host
+capacity refusal leaves construction retryable and executes the existing
+unpacked reference route; allocator/configuration errors propagate. First
+construction is serialized, and a different weight identity declines packing
+before allocating a discarded replacement. No arithmetic or ISA route changes.
+
+The regression `provider_qlinear_pack_owns_its_host_grant` executes through the
+provider registry: before this change the ARM64 macOS fixture retained a
+6,528-byte pack while the supplied Host ledger reported zero. The corrected
+path charges that payload, reuses its charge on a warm call, and releases it on
+last-owner drop. `qlinear_pack_capacity_refusal_retries_and_active_owner_keeps_grant`
+covers KV competition and retry with byte-identical outputs;
+`qlinear_pack_concurrent_builders_share_one_granted_payload` checks eight
+simultaneous builders obtain the same payload under a one-pack budget.
+
+The existing executor constant-state seam shares one cache across activation
+shape variants of the same session node. Adoption requires the same immutable
+grant source, constant B and admitted retention; even independently constructed
+sources over the same Host books/holder cannot exchange caches. Different
+nodes and sessions retain their own state. The session's node prediction uses
+the largest possible signedness layout for one logical B matrix, including
+sign-domain translation, vector B and leading unit dimensions; no fixed count
+of prefill/decode copies remains. Prediction and packing share the same matrix
+shape rule. Overridable initializers and distinct weight batches are excluded.
+The real executor regression previously charged 6,528 then 13,056 bytes when
+activation shape changed; it now retains one pack across three shapes and
+checks separate-session charges and complete release on drop.
+
+Each shared cache enrolls weakly in the same Host pressure domain. Ordinary KV
+reservation/growth and another weight admission can evict its entire idle
+packed payload; active Arc owners prevent eviction.
+Reclamation removes the entry under its state lock and releases the payload
+and grant after unlocking. Construction is serialized separately, so admission
+can synchronously visit the requesting cache without deadlocking. An evicted
+entry can be rebuilt on later use, or run unpacked while capacity is occupied.
+The bounded `qlinear_pack_pressure_reclaims_idle_without_deadlocking_builders`
+parent runs a named child that exercises self-callback admission, KV reserve
+and growth, active-owner exclusion, zero-pressure no-op, unrelated authorities,
+rebuild and weak registration lifetime. The old implementation fails the idle
+KV-reservation case; a deliberate admission-under-state-lock fault is rejected
+by the named parent after its child reaches self-cache admission and times out.
+The shared-source policy/lifetime tests cover adoption, idle reclamation after
+the originating kernel drops, rebuilding, and an active payload outliving the
+remaining kernel. Eight concurrent shape-kernel builders share one granted
+payload under a one-pack budget. This does not graduate QLinearMatMul or retire
+its MLAS reference. The governed amount is the packed payload, not all
+transient operand/output or accumulator storage.
+
+### Retired reference capabilities
+
+`Elementwise` is graduated. Add now always uses its existing native vDSP/dense
+or general dtype/broadcast path, including when the remaining MLAS reference is
+linked. Its former optional route, Rust/C binding, f32/fp16 MLAS Add templates
+and Add-only ARM dispatch/header/source leaves have been deleted. No compatibility
+API remains. Native same-shape and suffix-broadcast route guards run in both
+feature configurations, with IEEE special-value, tail and empty-storage checks.
+Add validates both input views and the output before native pointer access,
+preserves typed validation causes, and rejects non-Host-accessible storage.
+The MLAS multiplication primitive remains required by the independent SiLU reference.
 
 ### Gaps — MLAS has no primitive
 
@@ -222,6 +286,126 @@ Ordered by *decode-path impact × distance from parity*, which is also
 6. **Quantization / `MatMulNBits` prefill / `MoE`.** Highest value, most work.
    #1104 absorbed int4 acc0 decode (1.36× / 1.56×); prefill is the remainder,
    and `MoE` follows it.
+
+Native byte-GEMM column-zero-point compensation consumes each A row sum where
+it is used, rather than allocating an m-element sum buffer for every batch.
+An all-zero B zero-point vector skips that compensation entirely. The raw dot
+kernel, ISA selection, threading and each K-reduction order remain unchanged;
+all arithmetic is still wrapping i32. Seeded-accumulator tests cover zero,
+sparse/extreme and mixed column offsets against the integer oracle.
+`qgemm_compensation_allocation` observes actual serial ARM64 QLinearMatMul
+execute calls with per-row A quantization, which cannot select MLAS even in a
+reference build. It checks that allocation count does not grow with batch
+count, using a positive allocator control and every output byte. Caller-owned
+inputs/output and factory setup are excluded, with one unobserved warm call.
+For the ARM64 fixture, the old zero-B-offset implementation requests 25, 26,
+and 41 allocations for 1, 2 and 17 batches in both debug and release. The new
+implementation requests 24 in every cell for B offsets 0 and 1, in debug and
+release with and without the optional reference. The reduction is one allocation
+per native GEMM batch, with no retained replacement buffer.
+These are calling-thread allocation-call counts for complete serial executes,
+including remaining parameter/geometry storage, rather than allocated-byte or
+RSS bounds. The regression removes batch-wise compensation churn. AVX2 retains
+its independent A-pair and B-panel scratch. No latency or end-to-end throughput
+claim follows from removing the sum buffer.
+
+Native ARM64 per-row activation-scale requantization now uses the shared
+8-lane NEON NaN/clamp/ties-to-even/pack core, forming `(a_scale * b_scale) /
+y_scale` in registers with separate multiply/divide steps. Short rows and tails
+remain portable, with no temporary scale vector. A mode-specific calling-thread
+witness prevents shared-scale or concurrent tests from satisfying the per-row
+coverage check. Positive finite rounding-boundary counterexamples, nonfinite/
+subnormal scales, offset slices, saturation, batches and parallel rows preserve
+output bytes. The [M1 Max serial-row diagnostic](../benchmarks/2026-11-22-per-row-requant.md)
+retains 2,646 samples over three independent process sweeps: 42/42 CPU and
+42/42 wall A/A cells qualify. The initial candidate’s failed cell remains in
+its separately archived corpus. Qualified widths 65–2048 show CPU portable/native
+ratios 1.549–1.859; shorter widths offer smaller gains. Test-only witness bookkeeping is included
+in native timings. These row measurements establish neither GEMM/model gains
+nor family graduation; the optional reference remains.
+
+Native SiLU shares the runtime chunk scheduler with host-pool preference and
+nested-pool avoidance. ARM64 retains its exp polynomial and stable scalar
+formula, but records exact exceptional-lane positions in four u32 masks.
+Empty repair sets skip rereads, full sets use a contiguous stable repair walk,
+and partial sets decode only their set bits. The 128-element bound derives
+from four lanes and u32 mask capacity; the bitmap is 16 bytes of local storage,
+with no heap scratch or retained weight copy. Scalar tails and numerical guards
+remain intact. [M1 Max diagnostics](../benchmarks/2026-11-21-silu-density-repair.md)
+show ordinary/sparse latency gains over the previous native path; wide-pool
+per-cell CPU timing fails its A/A control and does not establish CPU savings.
+The [standalone clock-boundary diagnostic](../benchmarks/2026-11-21-cpu-clock-scope.md)
+finds both process CPU APIs sensitive to completion scope. Waiting through worker
+quiescence reduces the largest excursions but still fails some A/A cells; neither
+a clock API swap nor batching alone qualifies as a CPU-cost measurement fix.
+The [direct MLAS rational counterexample](../benchmarks/2026-11-21-silu-native.md)
+near x=-16.435 still exceeds the existing native error budget. The MLAS research
+route remains; other hardware/ISA and global graduation work are outstanding.
+The CPU crate retains the absorbed SIMD coefficients' complete MIT notice in
+`MLAS_LICENSE`, independently of eventual vendor/reference removal.
+
+ARM64 native Erf and exact GELU now share the existing AVX2 coefficient set and
+use four-lane NEON, including partial tails and fused BiasGelu. Runtime feature
+detection and the existing short-slice scalar seam remain. The
+[M1 Max absorption diagnostic](../benchmarks/2026-11-21-neon-erf.md) retains 15120
+samples across 180 cells with native A/A ratios 0.994–1.010. It measures 14–18×
+less wall time for Erf and 12–14× for exact GELU than the former scalar bodies,
+but MLAS remains faster in most cells. This closes the ARM64 scalar capability
+gap without graduating the family or removing its optional reference. BiasGelu
+bitwise consistency is tested; its latency and end-to-end models were not
+measured. The existing numerical bounds and NaN/signed-zero policies remain.
+
+The [NaN propagation follow-up](../benchmarks/2026-11-21-neon-erf-nan.md) removes
+redundant NEON masking/repair while preserving every f32 NaN payload/sign and
+before/after output bits. Qualified M1 Max cells with at least 257 elements
+show about 7–12% less wall time than the previous NEON body. All 18900 samples
+are retained; 179/180 cells pass A/A and one large runtime GELU cell is
+performance-unqualified. MLAS still wins some qualified cells, so the family
+and its optional reference remain.
+
+A [paired-vector loop experiment](../benchmarks/2026-11-21-neon-erf-paired.md)
+was rejected: all 180 A/A cells pass, but small M1 Max Erf/GELU calls regress
+and larger cases show no repeatable improvement. The candidate and 18900 raw
+samples remain reproducible; production retains the single-vector loop. Generated
+GELU code has a larger stack frame and more spills, so simple unrolling is not
+an evidence-backed next step for this implementation.
+
+Native Softmax row APIs take a buffer and column count, deriving row count from
+complete slices instead of accepting an ignored independent `n`. They return
+an explicit error for nonempty zero-width input, partial rows, or unequal source
+and destination extents before writing. Empty storage is a no-op. A checked
+`NonZeroUsize` width and exact-row iterators establish each raw kernel's extent
+from its borrowed row. Native and research A/B callers use the same geometry
+validation, including when MLAS is unavailable; no old signature or compatibility
+alias remains. These boundary changes do not remeasure the frozen latency tables
+below.
+
+ARM64 contiguous native Softmax now uses a four-lane NEON max/exp/sum/normalize
+core from eight elements onward, sharing the AVX2 polynomial coefficients while
+preserving gradual underflow and the original scalar short-row path. Both
+in-place and disjoint outputs share one row core. The
+[M1 Max experiment](../benchmarks/2026-11-21-neon-softmax.md) retains all three
+mechanisms and 31752 samples; 107/108 final A/A cells qualify. Qualified large
+cases are 2.25–2.77x faster than the former scalar body, but MLAS still wins
+those comparisons. This closes the ARM64 scalar-exp capability gap without
+graduating Softmax or removing its optional reference. Other ISAs, model
+throughput, and CPU-cost improvements are not inferred.
+
+The generic native Pool window walker now reuses four rank-sized coordinate
+buffers and a row-major cursor, preserving sum order and both MaxPool index
+orders. Unrequested index output is no longer staged. The
+[actual-execution allocation proof](../benchmarks/2026-11-21-pool-window-workspace.md)
+observes 8 allocations per call across its four geometries, versus 261–146885
+before, in optimized native builds; the MLAS-feature build reaches the same
+native LpPool path and also observes 8. This is bounded coordinate workspace,
+not whole-call allocation freedom, a latency comparison, or Pool graduation.
+The optional MLAS Pool/NCHWc references remain.
+
+Generic f32 GEMM's thin-M column-parallel path now borrows the original B
+stride and caller-owned output rows. It retains the same scalar register tiles
+and K-panel accumulation order, replacing full B/output element copies with
+row-reference metadata. This is a memory-ownership improvement in the portable
+fallback; see the [allocation proof and scoped diagnostic](../benchmarks/2026-11-21-generic-gemm-borrowed-columns.md).
 
 The native `QLinearMatMul` byte GEMM now has AVX2 and row-reusing ARM64
 NEON implementations. NEON borrows the original weight bytes and retains no
@@ -695,9 +879,36 @@ Half/bfloat scales and strided inputs still require preparation. Constants
 reuse that prepared allocation; dynamic inputs own it only during execution.
 An active NUMA/SPMD placement scope also retains the existing first-touch
 preparation, even on a pool with one node. Layout-transforming int4/int8 packs
-are separate work and are not made borrowed by this change. The compact owned
-packs still need governor admission and pressure reclamation; the f32 expansion
-cache's owned Host grants do not govern these other allocations.
+are separate work and are not made borrowed by this change. All eight native
+prepared-pack slots now own Host grants covering their retained buffers; build
+admission also covers simultaneous conversion/placement sources. Their typed
+cache registers with the same authority pressure mechanism as dense expansions.
+An executing call holds an `Arc` to its pack: pressure evicts only a slot with no
+external readers, drops its buffers and grant outside the cache lock, and the
+next call can rebuild under fresh admission. Destroying the kernel does not
+refund a pack still held by a caller. The normal cache read takes a short mutex
+and clones an `Arc`; it allocates or copies no weight data. The existing separate
+cold-fill gate remains, so memory admission and construction do not run under a
+payload lock. This is a lifecycle change, not a throughput claim.
+
+`native_pack_pressure_preserves_readers_reclaims_idle_and_rebuilds` exercises all
+eight factory-wired slots using real Host/KV reservations, including pressure
+from another thread. Existing native-pack tests continue to verify payload and
+conversion-peak byte accounting, refusal before construction, failed-builder
+refund, warm reuse, dynamic call ownership, and the actual selected operator
+cache. Compact borrowing and numerical kernels are unchanged. Native layout slots and their cold-fill gate now share one owner among the
+shape variants of an executor node, using the existing constant-state hook.
+Adoption verifies fixed preparation parameters, constant-input policy and the
+exact immutable grant source; separate nodes/sessions keep separate state.
+The active-reader and idle-pressure lifetimes remain unchanged. The
+[host regression](../benchmarks/NBITS_NODE_PACK_SHARING.md) checks a real
+executor, all eight native layout slots and independent concurrent builders.
+F32 NK expansions now share that node state too, including the existing dense
+cache and its cold-fill gate. Adoption additionally requires the same immutable
+dense-byte limit, so a disabled or smaller retention policy cannot inherit a
+larger cache. The [dense ownership regression](../benchmarks/NBITS_DENSE_NODE_SHARING.md)
+checks three actual executor shape variants, session isolation, pressure and
+concurrent builders. The MLAS research layouts now share explicit node-scoped state and participate in Host pressure reclamation as described below.
 
 ## Reference reachability and numerical comparisons
 
@@ -764,17 +975,470 @@ Carried forward from [`ABSORBING_MLAS.md`](ABSORBING_MLAS.md), unchanged:
 
 - **Any resident buffer must be governed** (#1056): declared to the memory plan
   before allocation, in the bytes actually allocated, and declinable. Dense
-  expansions use `DenseWeightCache` with `DerivedWeightMemory`; each payload
-  owns its Host grant until the final reader drops it. Compact retained packs
-  remain outstanding work; an estimate alone does not fund an allocation.
+  expansions use `WeightCache` with `DerivedWeightMemory`; each payload
+  owns its Host grant until the final reader drops it. Native compact packs
+  also own grants; an estimate alone does not fund an allocation.
 - **Anything cached per kernel instance is retained at least twice** — the
   executor's `KernelCache` is shape-keyed, so prefill and decode are separate
-  instances. Share eligible weights through the owning `CpuMemoryResources`
-  cache using explicit immutable source identity, rather than a process-global
-  raw-address cache. Borrow unchanged source layouts when placement permits.
+  instances. Share eligible weights through the executor node's constant state
+  using the exact immutable `CpuMemoryResources` grant source, rather than a
+  process-global raw-address cache. Borrow unchanged source layouts when placement permits.
 - **The memory-cheapest technique wins ties.** The MLAS int4 route holds a packed
   copy at ~2× the int4 bytes; on a 14B model that is 16.7 GB and the memory plan
   declines it (#1051), so the model that most needs the speed is the one that
   cannot afford it. A technique that allocates nothing is available everywhere.
 - **A numerical change shipped as a performance change is how a correctness
   regression enters unnoticed.**
+
+
+## Apple transposed-B dense prefill
+
+The Apple native backend now exposes checked Accelerate NT SGEMM, reading
+`B[N,K]` directly through the same NT capability predicate used by x86 and the
+optional MLAS reference. Eligible grouped/dense NBits prefill reuses its granted
+NK expansion across calls and activation shapes instead of rebuilding a KN
+transpose for every prefill. Refusal and zero-retention behavior still follow
+the existing cache, grant and row/KN fallback policies. NN and NT now both record
+through the existing lazy dispatch ledger.
+
+NN and NT may use different floating-point reductions. Equal matrix layouts do
+not establish bit identity, and the old universal bit-identity comments are
+removed. The [Apple NT evidence](../benchmarks/APPLE_NT_GEMM.md) records finite
+f64-oracle bounds, actual NN/NT bit differences, offset/tail cases, a nonfinite
+smoke test and real executor prefill/decode reuse. This is a numerical backend
+extension, not a claim of unchanged model token IDs or measured throughput.
+
+The common NN/NT BLAS boundary validates exact extents, checked products and
+signed 32-bit ABI dimensions, handles zero axes without entering BLAS, and
+returns actionable errors. Its validated operand type also serves GEMV; ABI
+limits are enforced only for BLAS, preserving the native large-GEMV usize
+extent domain. The optional MLAS reference is unchanged and no family is
+thereby graduated.
+
+
+### Resolve NT implementation and reuse policy together
+
+The transposed-GEMM predicate and unchecked backend dispatcher are replaced by
+one resolved `NtGemm` value with private fields. Resolution includes backend
+availability (and runtime AVX2/FMA eligibility for the native x86 implementation)
+and its prefill weight-reuse requirement. Execution consumes that value. Generic
+NN remains available when NT cannot resolve; no compatibility functions remain.
+
+The [real-execute comparison](../benchmarks/APPLE_NT_EXECUTE_AB.md) preserves an
+initial transient-NT candidate with qualified wall regressions in its zero-cache
+128x1024x1024 fixture. The Apple descriptor now requires admitted NK retention,
+using the existing constant-input and dense-byte-limit rule rather than a model
+or geometry threshold. Disabled/insufficient retention and mutable metadata keep
+the established KN route. Other NT backend policies are unchanged. Protocol 2
+records successful NT calls so the zero-retention null cannot silently measure
+NT. Original results and failed A/A cells are retained separately.
+
+These are instrumented real-kernel execute observations on one Apple tier, not
+model throughput, production-latency guarantees or MLAS graduation. The separate
+non-dyadic numerical contract and all grant/pressure/fallback guards remain.
+
+
+### Node-scoped ownership for optional SQNBit reference packs
+
+The optional MLAS SQNBit store is now owned by a node's shared constant state,
+matching native layouts and dense expansions. The executor's existing adoption
+hook shares it across eligible shape variants only after fixed preparation
+parameters, constant-input policy, dense-byte limit, MLAS retention verdict and
+exact immutable grant source agree. Operand addresses distinguish layouts inside
+that owner; matching addresses or physical Host books never discover another
+node or session's cache.
+
+There is no process-global store, test-only thread-local replacement, installer
+key list, or executor blanket-clear API. Retiring the original builder leaves
+adopted variants warm; the final owner releases membership. Active packed-payload
+readers keep their own grants until they drop. Cold-fill gates still serialize
+identical builds without holding a value-map lock during admission or refunds.
+Dynamic and serialized-input paths retain their existing eligibility rules;
+serialized prepacked inputs are not newly eligible for constant-state adoption.
+
+The regressions check explicit sharing after builder retirement, deterministic
+weak-owner teardown in the recycled-address test, independent-node charges on the
+same source operands/Host books, concurrent preparation and lock-safe refunds,
+and a real executor running three activation shapes plus an independent session.
+The executor test reruns the survivor after peer teardown and checks warm charges
+and complete final refund. This changes ownership only; it does not change packed
+arithmetic, claim performance parity, graduate a family or remove the remaining
+optional reference dependency. Reference maps now support idle pressure eviction
+through the same Host authority, as described below.
+
+Validation on Apple M1 Max / ARM64 macOS, Rust 1.98, using cached ORT headers
+and libraries: native CPU 1,969 passed / 20 ignored, native session 274 passed;
+optional-MLAS CPU 1,997 passed / 34 ignored, optional-MLAS session 276 passed.
+Strict all-target Clippy passes for both crates in both configurations. After
+strengthening scale-key coverage and adding the session test's unsupported-tier
+qualification, both named controls selected one test and passed again, and both
+MLAS all-target Clippy checks passed again. The qualification did not skip the
+session control on this host. Rust formatting, dispatch manifest/reachability,
+platform naming and feature-gate coverage checks pass. These are correctness and
+ownership results, with no CUDA execution or new performance measurement.
+
+
+### Idle pressure reclaims SQNBit reference layouts
+
+The node's MLAS layout maps now register weakly with the supplying
+`DerivedWeightMemory` pressure domain. Redundant per-kernel strong `OnceLock`
+memos are removed. Every executing call clones its layout `Arc` while holding
+the corresponding map lock, which is also the lock used to decide whether an
+entry is idle. Pressure removes only entries whose sole strong owner is that
+map, releases all map locks, then drops payloads and refunds their grants. It
+never takes a cold-fill gate; a build can safely trigger pressure on its own
+empty map. Full-width and sharded entries account for their actual packed and
+retained metadata bytes; MLAS workspace/scratch remains outside this scope.
+
+After eviction, standard wire inputs can use the established native fallback
+while Host capacity is occupied, then rebuild under fresh admission. Serialized
+MLAS bytes retain their existing actionable capacity failure and retry because
+they cannot be interpreted as ONNX wire weights. Active readers retain their
+grants even after the node owner drops. The weak pressure registration does not
+keep a retired node alive and follows adopted node state after its builder drops.
+
+Contiguous immutable operands use complete operand-address layout keys inside
+the node owner. Noncontiguous immutable operands use an explicit `NodeConstant`
+source variant, so deleting the memo does not sacrifice their preparation reuse.
+This logical slot relies on the existing constant-input contract and explicit
+node adoption; dynamic operands never enter it, and no cross-node address lookup
+is restored. Warm lookups respect the current call's sharded/full-width decision
+and cannot bypass the asymmetric M=1 numerical guard.
+
+A bounded subprocess regression drives real factory-created kernels through
+sharded, full-width, serialized and strided-scale layouts. It verifies self-cache
+admission, another node's idle donation, zero-pressure no-op, unrelated authority
+isolation, warm MLAS execution while a reader holds the existing payload,
+active-reader refusal, cross-thread KV reservation and growth, fallback/refusal
+and retry, source-owner retirement and final grant refund. Standard-wire cases
+also race four execute readers against repeated Host pressure. Grant/refund
+callbacks are checked outside map and gate-registry locks. This is lifecycle
+validation, not a performance or graduation claim.
+
+Validated on Apple M1 Max / ARM64 macOS with Rust 1.98 and the cached ORT root:
+native CPU 1,969 passed / 20 ignored, native session 274 passed; optional-MLAS
+CPU 1,998 passed / 35 ignored, optional-MLAS session 276 passed. Strict all-target
+Clippy passes for both crates in both configurations. The bounded pressure
+parent is a passing ordinary test; it explicitly launches the named ignored
+child and checks its success, so that child is not uncovered by the aggregate
+ignored count. After adding warm prefill/unscoped-decode layout switching under
+a one-pack budget, the parent selected one test and passed again, with explicit
+markers proving all four layouts ran on this host; final CPU MLAS all-target
+Clippy also passed again. Formatting and dispatch/reachability/platform/feature
+coverage checks pass. No other ISA's execution or CUDA behavior is established.
+
+
+### MatMul preparation obeys the captured retention verdict
+
+Ordinary SGEMM packing is retained derived-weight state. The shared
+`MatMulPrepack` f32 and once-widened-f16 MLAS packing entries now require both
+constant B and an admitting retention verdict. Previously these two entries
+looked only at constant-input status, so a provider configured to retain nothing
+could still keep a packed panel. Declined calls take the existing unpacked/half
+computation paths; admitted calls keep their existing packed reuse. MatMul,
+Gemm and FusedMatMulBias consume these same preparation entries.
+
+Native noncontiguous f16 preparation had the same retention gap. Its private
+API now returns a grant-carrying reader: an admitted cache shares its existing
+copy, while a declined call owns a transient until computation finishes. It
+must not return `None` merely because retention is declined: the existing
+constant-weight rescue branch still needs actual operands to compute. The BNNS
+column-major zero-copy route remains unchanged. This makes the temporary
+lifetime explicit without changing the arithmetic primitives.
+
+Three regressions fail on their corresponding old behavior: retained f32 pack,
+retained widened-f16 pack, and retained strided-f16 copy despite decline. Final
+controls exercise both verdicts, repeated calls, changed activations and admitted
+reuse. The strided control also executes the Apple rescue path and checks that
+decline produces the expected result without filling either persistent half or
+dense-f32 storage. Their short dyadic corpus is exactly representable; its exact
+comparisons do not establish broad packed/unpacked bit identity or model token
+parity. Named bounded child processes keep these new real-kernel calls from
+perturbing existing libtest-wide platform dispatch observations.
+
+This closes a retention-policy bypass. Ordinary constant f32 materializations
+and native contiguous-half copies now obtain Host grants as described below.
+SGEMM packed panels and transpose payloads still need authority/lifecycle work;
+ordinary node-owned sharing is consolidated below. No
+performance improvement is established by these retention checks.
+
+Validation on Apple M1 Max / ARM64 macOS with Rust 1.98 and cached ORT:
+native CPU 1,970 passed / 20 ignored and session 274 passed; optional-MLAS CPU
+2,001 passed / 35 ignored and session 276 passed. Both crates/configurations
+pass strict all-target Clippy. After isolating all new execution controls from
+shared platform probe counters, the final `honors_retention` filter selected
+three tests and all passed again; final MLAS CPU all-target Clippy also passed.
+Formatting and dispatch manifest/reachability/platform/feature checks pass.
+These results establish the tested retention behavior, not physical allocation
+limits, production speed, full-model numerics or another ISA's execution.
+
+
+### Ordinary MatMul constant f32 copies own actual Host grants
+
+MatMul, Gemm, FusedMatMulBias and FusedGemm factories now consume immutable
+`CpuMemoryResources`, replacing their bool-only/default preparation wiring.
+Load-time preparation uses the same provider resources. The FusedGemm factory
+previously constructed an ungoverned default prepack regardless of its provider;
+it now captures the supplying source and retention policy too. The existing
+dense-preparation predictor covers all four consumers in their registered
+domains, for both constant operands. Node ownership below removes the historical
+shape-instance multiplier.
+
+The prepack's widened/densified constant slots use `WeightCache` and the
+provider's `DerivedWeightMemory`. Full f32 payload admission precedes allocation
+and conversion. A sealed operand reader carries the owned payload/grant through
+computation, whether cache retention is allowed or declined. Cache removal and
+kernel destruction do not refund an executing reader. Independent idle copies
+can be reclaimed by ordinary KV reserve/growth through the existing weak
+pressure domain. Warm fills use the cache's existing singleflight mechanism.
+The legacy family retention verdict remains separate from the block/NBits dense
+expansion ceiling; no implicit new 256-MiB limit is introduced for ordinary
+MatMul. An explicitly ungoverned default source remains local ownership.
+
+Contiguous f32 constants still borrow original storage and claim zero bytes.
+Dynamic activation conversion remains scratch, outside this weight-grant scope.
+A materialized constant must fit its actual Host grant even when retention is
+disabled; capacity refusal reports the MatMul constant-input admission operation
+and preserves the typed memory cause. It does not silently allocate an uncharged
+full matrix. Later calls may retry after capacity returns.
+
+Conversion can fill an already admitted destination directly. The shared dtype
+wrapper uses the same converter, preserving its existing F16C/NEON f16 and x86
+bf16 helpers. Scalar strided conversion reads original elements into f32 output
+without a second full matrix in the source dtype, including f64. Rank-sized
+index bookkeeping is outside payload accounting. This changes materialization
+ownership, not GEMM arithmetic, and is not a latency/throughput claim.
+
+A dependent legacy transpose still uses the conversion buffer's address as its
+key. Its memo now holds a source reader until that address-keyed entry retires.
+Pressure therefore cannot free/recycle the source address underneath a retained
+transpose. Such dependent sources remain pinned until the transpose owner drops;
+transpose payload grants and reclaiming that dependency as a unit remain work.
+Ordinary MLAS SGEMM packed panels, graph activations, outputs and other scratch
+are not covered by this f32-copy grant claim. Native half copies are funded in
+the next step below.
+
+The unchanged public-provider regression fails on parent 2aa11cfc7: a real
+MatMul retains a 24-byte f32 copy while Host books report zero. The corrected
+regression drives all four factories with retention on/off, KV competition,
+refusal, retry and final release. Additional controls check call-owned/retained
+reader lifetime, borrowed f32 at zero capacity, eight simultaneous builders under
+one-payload capacity, the transpose/source dependency, and conversion with
+positive/negative strides, offsets, dtype variation and rejected destinations.
+No CUDA device or other-ISA execution is inferred from these host checks.
+
+Validation: native CPU 1,977 passed / 20 ignored and session 274 passed;
+optional-MLAS CPU 2,008 passed / 35 ignored and session 276 passed. Strict
+all-target Clippy passes for both crates in both configurations. Seven selected
+ownership/factory/conversion/dependency/prediction controls pass, with explicit
+nonzero selected counts. Formatting and dispatch manifest/reachability/platform/
+feature checks pass. Host: Apple M1 Max ARM64 macOS, Rust 1.98, cached ORT root.
+The parent comparison selected the exact named provider test and failed on the
+0-versus-24-byte assertion, rather than treating a compilation error or zero-test
+filter as evidence. The temporary parent worktree was restored and removed;
+raw validation transcripts remain separate from performance evidence.
+
+
+### Native noncontiguous f16 payload funding
+
+`WeightCache` now stores flat copyable payload elements, sharing its
+existing admission, singleflight and idle-pressure implementation between f32
+expansions and native `u16` half-bit copies. A required noncontiguous constant
+f16 B copy obtains actual Host funding before allocating its payload, even when
+retention is declined. Its reader keeps the grant until the last owner drops.
+The existing parallel 2-D and scalar N-D copy routes write directly into the
+admitted destination; empty layouts avoid zero-sized parallel chunks. Both
+Apple rescue callers propagate admission errors instead of returning zero
+results or allocating an uncharged fallback. BNNS zero-copy transposed input
+and GEMM arithmetic remain unchanged.
+
+On parent 3e2588329, the exact unchanged public-provider regression executes one
+selected test and fails with ledger usage 0 versus 306 expected bytes. The new
+controls check retained/transient lifetimes, negative strides and offsets, eight
+concurrent fills under one-payload capacity, active-reader exclusion, KV idle
+reclamation, refusal/retry/refund, invalid sources, empty payloads, and actual
+Apple half rescue results. Baseline worktree is removed; logs remain available.
+This is ownership/correctness evidence on Apple M1 Max ARM64, not a performance
+claim or evidence about CUDA/other ISAs. Ordinary SGEMM panels, transpose
+payloads and scratch remain separate work; shape-variant ownership is
+consolidated below.
+
+Validation: native CPU 1,981 passed / 20 ignored and session 274 passed;
+optional-MLAS CPU 2,012 passed / 35 ignored and session 276 passed. Strict
+all-target Clippy passes for both crates/configurations. Formatting and dispatch
+manifest/reachability/platform/feature checks pass. These test totals include
+the four new half-copy controls and the existing real rescue control, whose
+Host grant assertions now run under both retention verdicts.
+
+
+### A checked allocation plan for ordinary SGEMM panels
+
+Before attaching Host admission to ordinary MLAS SGEMM panels, their allocation
+size must be a reliable preflight value. The old constructor used unchecked
+logical multiplication, an unchecked native padded-size query, allocation
+`unwrap`/assertions and no error return. `PackedBPlan` now binds dimensions and
+native layout without allocating payloads; packing consumes that checked layout
+and returns `SgemmPackError`. Both the plan and pack expose owned heap bytes.
+
+The shim derives padding/alignment from MLAS's own definitions and checks every
+rounding/product before querying the native size. It refuses disagreement with
+the standalone generic layout. Rust checks source extent and addressable
+allocation size; empty operands allocate a one-byte sentinel without calling
+native packing, and an empty packed reduction writes zeros without reading it.
+The shim now uses MLAS's canonical half definition instead of redeclaring it.
+
+MatMul's f32 and once-widened half callers propagate actionable typed errors.
+Cold fills serialize separately from immutable warm lookup; a failed build is
+not memoized. F32 warm reuse validates source extent and packed geometry. The
+once-widened half caller plans before materializing its source. These are
+allocation-contract changes; the following step adds actual Host funding and
+idle reclamation for ordinary panels and half-packing scratch.
+
+Validation on Apple M1 Max ARM64 macOS / Rust 1.98: native CPU 1,981 passed
+/ 20 ignored and session 274 passed; optional-MLAS CPU 2,013 passed / 35 ignored
+and session 276 passed. Binding suite: 54 passed / 3 ignored, followed by five
+explicitly selected SGEMM controls (four new controls plus the existing parallel
+SGEMM check). Strict all-target Clippy passes for bindings and both CPU/session
+configurations; formatting and dispatch manifest/reachability/platform/feature
+checks pass. The unchanged exact constructor regression fails on bc4bac366
+with the old length assertion unwinding. After the comparison, shared-target
+stale artifacts were rejected, the bindings rebuilt from the current source,
+and all five selected controls passed with their names/counts checked. The
+temporary baseline worktree is removed. Logs are correctness evidence, not
+performance or CUDA/other-ISA validation.
+
+
+### Funded ordinary SGEMM panel ownership
+
+Ordinary f32 SGEMM panels and panels widened from constant half weights now use
+the same `WeightCache` authority as dense f32 expansions and native half copies.
+Its owned-payload contract verifies actual allocation bytes for flat vectors or
+MLAS-aligned panels. Remove the dedicated SGEMM OnceLock/build-lock mechanism;
+executing Arc readers retain the payload and grant together, while idle cache
+membership is reclaimable by ordinary Host/KV pressure. Source, dtype and K/N
+geometry distinguish payloads. Distinct sources obtain distinct funded packs,
+never each other's values; warm same-source hits skip planning/cold filling.
+
+Half packing reserves panel bytes plus the f32 conversion peak before building
+either payload. Only panel bytes remain after the conversion drops. A denied
+optional prepack performs no conversion or packing and falls through to existing
+unpacked computation without memoizing refusal. Retention-off behavior and
+numerical primitives stay unchanged. Default native builds remain MLAS-free.
+The existing dense expansion ceiling remains a policy for its original consumers,
+not a new limit on ordinary MatMul preparation.
+
+Controls exercise real native panel execution through live readers, exact Host
+charge, concurrent single construction, active-reader protection, KV idle
+reclamation, refusal/retry/refund, and half conversion peak boundaries. Public
+provider execution runs both f32 and f16 inputs with retention on/off, sufficient
+and zero capacity, and competing KV ownership, checking packed and unpacked
+results. The prior distinct-source regression now checks both products and
+reuse rather than merely rejecting the second source. Legacy transpose grants,
+other scratch and performance measurements remain separate work. Ordinary
+shape-variant ownership is consolidated below.
+
+Validation on Apple M1 Max ARM64 macOS / Rust 1.98 / cached ORT: native CPU
+1,981 passed / 20 ignored, session 274 passed; optional-MLAS CPU 2,017 passed
+/ 35 ignored, session 276 passed. Strict all-target Clippy passes for both
+crates/configurations, as do formatting and dispatch manifest/reachability/
+platform/feature checks. The same public-provider fixture fails on 2fcd486f1
+with ledger 0 versus 320 native panel bytes. After that exact baseline test,
+the CPU crate was explicitly cleaned/rebuilt and the three panel lifecycle/peak/
+concurrency controls plus the exact provider control ran with checked nonzero
+counts and passed; both CPU Clippy configurations passed again. The temporary
+baseline worktree is removed and raw logs retained. No performance/CUDA or
+other-ISA inference follows from these ownership tests.
+
+
+### Share ordinary preparation across a node's shape variants
+
+The four MatMul-prepack consumers now implement the existing Kernel constant-
+state sharing seam. A node-owned Arc contains dense f32 materializations,
+contiguous half copies, native SGEMM panels and transpose memos. Each compiled
+kernel keeps its own policy/flags, geometry, attributes and FLOP estimate. The
+executor's existing same-node state exchange performs adoption without adding
+MatMul knowledge to generic session code.
+
+A state is accepted only with the same immutable operand flags and exact
+DerivedWeightMemory source. Unrecognized state and retention-off/runtime-only
+variants decline sharing; foreign grant sources and incompatible flags report
+actionable errors. Node/session boundaries remain the executor's sharing scope,
+with fresh owners constructed for new nodes or sessions. Installed process-global
+transpose keys retire with the last shared preparation owner rather than the
+first evicted kernel, and active readers still retain actual payload grants.
+This changes transpose-key ownership, not transpose payload funding.
+
+The dense estimator now counts one copy per constant operand per node and
+removes its fixed shape multiplier. Its regression executes three shape
+variants, verifies one actual Host charge and numerical results, then checks
+exported-owner lifetime/final refund. Factory controls cover all four ops and
+both constant slots with a no-pressure authority and exactly one-payload budget.
+Other controls cover foreign-source/flag rejection, last-owner transpose
+retirement and actual native panel reuse across activation shapes.
+
+An end-to-end executor control exercises several activation widths with one
+and two graph nodes, then a second session on the same provider. It verifies
+node-local sharing, node/session isolation, one-copy prediction and final
+release. Pressure reclamation is unavailable in that fixture, so a repeat
+allocation cannot be hidden by eviction and a denied optional SGEMM pack cannot
+evict a peer's payload on another CPU backend. No kernel arithmetic, production
+backend default or performance claim changes in this step.
+
+Validation on Apple M1 Max ARM64 macOS / Rust 1.98 / cached ORT: native CPU
+1,984 passed / 20 ignored, session 275 passed; optional-MLAS CPU 2,021 passed
+/ 35 ignored, session 277 passed. Strict all-target Clippy passes for both
+crates/configurations; formatting and dispatch manifest/reachability/platform/
+feature checks pass. Session suites/Clippy were rerun after making the resource
+fixture pressure-independent for portable footprint measurement.
+
+The unchanged exact public-factory fixture fails on parent d65b889d8: the second
+shape kernel requests another 24-byte constant copy while the first holds the
+complete budget. After explicitly cleaning/rebuilding the CPU crate, the exact
+provider control, a 15-test MatMul group containing the three new owner controls,
+and the exact one-copy prediction control execute nonzero checked counts and
+pass. Both CPU Clippy configurations pass again. The baseline worktree and
+consumed editing helpers are removed; raw transcripts remain. These are
+ownership/correctness results, not performance or CUDA/other-ISA evidence.
+
+Downstream validation: engine load tests 29 passed and memory-strategy tests
+29 passed with `--no-default-features --features native-backend` and the cached
+ORT library. The first load filter selected zero tests and was rejected by the
+validation driver; the corrected `engine::load::` filter actually ran 29 tests.
+No zero-test result is counted as coverage.
+
+
+### Load-time preparation joins node ownership
+
+Static CPU transpose preparation now exports the same MatMul weight owner used
+by runtime shape variants. The generic kernel cache offers node-scoped static
+state to the first kernel after checking immutable-input metadata, including
+fully static materialization. Unknown state retains its lifetime and falls
+through to ordinary preparation. Immutable flags are explicit provider API
+inputs, independent of whether host bytes are available for every operand.
+
+Session controls cover two nodes, static/symbolic shapes, repeated execution,
+recognized/opaque/incompatible state, correct numerical outputs and final owner
+release. The Apple CPU control verifies exact owner adoption, transpose reuse
+and half-input numerical execution with either immutable operand-A flag even
+when its host descriptor is absent.
+
+A separate f64 Mul-to-MatMul regression changes a producer-backed initializer's
+runtime value between requests. The unchanged test fails numerically on parent
+87930c4a5: the second output remains 10 instead of 20. It passes with the shared
+immutable-initializer classification. This is correctness evidence; no kernel
+performance improvement or CUDA coverage is claimed.
+
+On Apple M1 Max ARM64 macOS / Rust 1.98, full CPU suites pass in native
+(1,984 passed / 20 ignored) and optional MLAS (2,021 / 35 ignored) configurations.
+Session suites pass with 277 native and 279 MLAS tests, including the final f64
+regression. Strict all-target Clippy passes for both CPU/session configurations;
+formatting and dispatch manifest/reachability/platform/feature checks pass.
+
+After the old-version negative control, the shared target's API/CPU/session
+packages were explicitly cleaned. Fresh current controls each selected and
+passed one test (generic handoff, writable-default regression, Apple prewarm
+adoption). API tests pass 96/96; API and native CPU/session strict all-target
+Clippy pass again. Downstream native-backend engine load and memory-strategy
+groups each pass 29 tests with the cached ORT library. The temporary negative
+control worktree and consumed editing scripts are removed; validation drivers,
+raw logs and the stable host-lock inode remain.

@@ -482,8 +482,6 @@ pub(crate) struct Executor {
     /// build; dynamic (symbol-shaped) values are allocated per run and cached
     /// here so a run whose resolved shape is unchanged reuses the allocation.
     pub(super) buffers: HashMap<ValueId, DeviceBuffer>,
-    /// Retains provider-prepared constants through symbolic and concrete plans.
-    pub(super) static_constant_states: Vec<Arc<dyn std::any::Any + Send + Sync>>,
     /// The concrete shape each live buffer in [`Self::buffers`] is currently
     /// sized for — the reuse key for run-scoped buffers.
     pub(super) buffer_shapes: HashMap<ValueId, Vec<usize>>,

@@ -130,7 +130,12 @@ unsafe extern "C" {
         multithread: c_int,
     );
 
-    fn mlas_sgemm_pack_b_size(trans_a: c_int, trans_b: c_int, n: usize, k: usize) -> usize;
+    fn mlas_sgemm_pack_b_layout(
+        n: usize,
+        k: usize,
+        bytes: *mut usize,
+        alignment: *mut usize,
+    ) -> c_int;
     fn mlas_sgemm_pack_b(
         trans_a: c_int,
         trans_b: c_int,
@@ -179,7 +184,6 @@ unsafe extern "C" {
     /// to a `copy(input -> output)` followed by [`mlas_compute_softmax_in_place`],
     /// but without the copy. `input` and `output` must not overlap.
     fn mlas_compute_softmax(input: *const f32, output: *mut f32, n: usize, d: usize);
-    fn mlas_eltwise_add(left: *const f32, right: *const f32, output: *mut f32, n: usize);
     fn mlas_compute_activation(
         kind: c_int,
         minimum: f32,
@@ -884,20 +888,6 @@ pub fn compute_softmax(input: &[f32], output: &mut [f32], n: usize, d: usize) {
     unsafe { mlas_compute_softmax(input.as_ptr(), output.as_mut_ptr(), n, d) };
 }
 
-/// Compute contiguous Float32 elementwise addition with MLAS SIMD.
-pub fn eltwise_add(left: &[f32], right: &[f32], output: &mut [f32]) {
-    assert_eq!(left.len(), right.len());
-    assert_eq!(left.len(), output.len());
-    unsafe {
-        mlas_eltwise_add(
-            left.as_ptr(),
-            right.as_ptr(),
-            output.as_mut_ptr(),
-            output.len(),
-        );
-    }
-}
-
 /// Compute contiguous Float32 ReLU with MLAS SIMD.
 pub fn compute_relu(input: &[f32], output: &mut [f32]) {
     assert_eq!(input.len(), output.len());
@@ -1230,9 +1220,136 @@ pub fn nchwc_pool(
         );
     }
 }
-///
-/// MLAS's packed layout is accessed with aligned AVX-512 loads/stores, so the
-/// backing allocation is 64-byte aligned (a plain `Vec<u8>` is not).
+/// A rejected SGEMM packed-weight request. Validation precedes native reads.
+#[derive(Debug)]
+pub enum SgemmPackError {
+    Geometry {
+        n: usize,
+        k: usize,
+        reason: &'static str,
+    },
+    Length {
+        expected: usize,
+        actual: usize,
+    },
+    Layout {
+        bytes: usize,
+        alignment: usize,
+        source: std::alloc::LayoutError,
+    },
+    Allocation {
+        bytes: usize,
+        alignment: usize,
+    },
+}
+
+impl std::fmt::Display for SgemmPackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Geometry {n,k,reason} => write!(f, "SGEMM packing rejects N={n}, K={k}: {reason}; use addressable dimensions including native column and allocation padding"),
+            Self::Length {expected,actual} => write!(f, "SGEMM B has {actual} f32 elements, expected {expected}; supply the complete row-major K-by-N matrix"),
+            Self::Layout {bytes,alignment,source} => write!(f, "SGEMM cannot address {bytes} packed bytes aligned to {alignment}: {source}; reduce weight dimensions"),
+            Self::Allocation {bytes,alignment} => write!(f, "SGEMM cannot allocate {bytes} packed bytes aligned to {alignment}; release memory or reduce the weight footprint"),
+        }
+    }
+}
+impl std::error::Error for SgemmPackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Layout { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Immutable, checked allocation geometry for one row-major SGEMM B operand.
+/// Querying a plan allocates no weight payload. Its private fields bind the
+/// dimension validation, native padding and actual allocation to one layout.
+#[derive(Clone, Copy, Debug)]
+pub struct PackedBPlan {
+    n: usize,
+    k: usize,
+    elements: usize,
+    layout: std::alloc::Layout,
+}
+
+impl PackedBPlan {
+    pub fn new(n: usize, k: usize) -> Result<Self, SgemmPackError> {
+        let invalid = |reason| SgemmPackError::Geometry { n, k, reason };
+        let elements = n
+            .checked_mul(k)
+            .ok_or_else(|| invalid("logical element count overflows usize"))?;
+        if n > isize::MAX as usize
+            || k > isize::MAX as usize
+            || elements
+                .checked_mul(std::mem::size_of::<f32>())
+                .is_none_or(|bytes| bytes > isize::MAX as usize)
+        {
+            return Err(invalid(
+                "logical source cannot fit an addressable f32 slice",
+            ));
+        }
+        let (mut bytes, mut alignment) = (0, 0);
+        // SAFETY: output pointers refer to live usize locals. The shim checks
+        // every generic-layout rounding/product before querying MLAS; it reads
+        // no tensor storage and refuses unsupported layout changes.
+        if unsafe { mlas_sgemm_pack_b_layout(n, k, &mut bytes, &mut alignment) } == 0 {
+            return Err(invalid(
+                "native packed layout overflows or disagrees with the standalone SGEMM layout",
+            ));
+        }
+        // Empty operands keep a valid allocation owner but never call the packer.
+        let bytes = bytes.max(1);
+        let layout = std::alloc::Layout::from_size_align(bytes, alignment).map_err(|source| {
+            SgemmPackError::Layout {
+                bytes,
+                alignment,
+                source,
+            }
+        })?;
+        Ok(Self {
+            n,
+            k,
+            elements,
+            layout,
+        })
+    }
+
+    /// Bytes requested from the allocator, including padding and the empty sentinel.
+    pub fn owned_heap_bytes(&self) -> usize {
+        self.layout.size()
+    }
+
+    pub fn pack(&self, b: &[f32]) -> Result<PackedB, SgemmPackError> {
+        if b.len() != self.elements {
+            return Err(SgemmPackError::Length {
+                expected: self.elements,
+                actual: b.len(),
+            });
+        }
+        // SAFETY: new validated a nonzero addressable layout and native padding.
+        let ptr = unsafe { std::alloc::alloc_zeroed(self.layout) };
+        if ptr.is_null() {
+            return Err(SgemmPackError::Allocation {
+                bytes: self.layout.size(),
+                alignment: self.layout.align(),
+            });
+        }
+        if self.elements != 0 {
+            // SAFETY: source is the complete K*N f32 matrix and destination is
+            // aligned/sized for exactly the immutable plan's native pack layout.
+            unsafe { mlas_sgemm_pack_b(0, 0, self.n, self.k, b.as_ptr(), self.n, ptr) };
+        }
+        Ok(PackedB {
+            ptr,
+            layout: self.layout,
+            n: self.n,
+            k: self.k,
+        })
+    }
+}
+
+/// An immutable native SGEMM B panel with MLAS-required allocation alignment.
 pub struct PackedB {
     ptr: *mut u8,
     layout: std::alloc::Layout,
@@ -1246,15 +1363,13 @@ unsafe impl Send for PackedB {}
 unsafe impl Sync for PackedB {}
 
 impl PackedB {
-    /// Pack a row-major `k x n` B matrix (no transpose, `ldb = n`).
-    pub fn new(n: usize, k: usize, b: &[f32]) -> Self {
-        assert_eq!(b.len(), k * n);
-        let size = unsafe { mlas_sgemm_pack_b_size(0, 0, n, k) }.max(1);
-        let layout = std::alloc::Layout::from_size_align(size, 64).unwrap();
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        assert!(!ptr.is_null(), "packed-B allocation failed");
-        unsafe { mlas_sgemm_pack_b(0, 0, n, k, b.as_ptr(), n, ptr) };
-        Self { ptr, layout, n, k }
+    /// Validate and pack a row-major K-by-N B matrix.
+    pub fn new(n: usize, k: usize, b: &[f32]) -> Result<Self, SgemmPackError> {
+        PackedBPlan::new(n, k)?.pack(b)
+    }
+
+    pub fn owned_heap_bytes(&self) -> usize {
+        self.layout.size()
     }
 
     /// Return the logical `(k, n)` dimensions of the packed B matrix.
@@ -1272,8 +1387,23 @@ impl Drop for PackedB {
 /// `C = A * packed(B)` for row-major A (`m x k`), reusing a pre-packed B.
 pub fn sgemm_nn_packed(m: usize, a: &[f32], packed: &PackedB, c: &mut [f32]) {
     let (n, k) = (packed.n, packed.k);
-    assert_eq!(a.len(), m * k);
-    assert_eq!(c.len(), m * n);
+    assert_eq!(
+        a.len(),
+        m.checked_mul(k)
+            .expect("SGEMM packed A element count overflows usize")
+    );
+    assert_eq!(
+        c.len(),
+        m.checked_mul(n)
+            .expect("SGEMM packed C element count overflows usize")
+    );
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        c.fill(0.0);
+        return;
+    }
     ensure_threading();
     unsafe {
         mlas_sgemm_packed(
@@ -3002,13 +3132,82 @@ mod tests {
     }
 
     #[test]
+    fn sgemm_invalid_constructor_request_returns_without_unwinding() {
+        for (n, k) in [(3, 5), (usize::MAX, 2)] {
+            let request = std::panic::catch_unwind(|| {
+                let _ = PackedB::new(n, k, &[]);
+            });
+            assert!(
+                request.is_ok(),
+                "invalid SGEMM construction must return an actionable error, not unwind"
+            );
+        }
+    }
+
+    #[test]
+    fn sgemm_packing_plan_checks_geometry_and_exact_input_before_native_reads() {
+        for (n, k) in [
+            (usize::MAX, 2),
+            (1, usize::MAX),
+            (1, usize::MAX / 64 + 1),
+            (17, isize::MAX as usize / (17 * 4)),
+        ] {
+            let error = PackedBPlan::new(n, k).unwrap_err().to_string();
+            assert!(error.contains("SGEMM"), "{error}");
+            assert!(error.contains("dimensions"), "{error}");
+            assert!(PackedB::new(n, k, &[]).is_err());
+        }
+        let plan = PackedBPlan::new(3, 5).unwrap();
+        for input in [vec![], vec![1.; 14], vec![1.; 16]] {
+            let error = plan
+                .pack(&input)
+                .err()
+                .expect("wrong source length must fail before allocation");
+            assert!(matches!(error, SgemmPackError::Length { expected: 15, .. }));
+            assert!(error.to_string().contains("row-major K-by-N matrix"));
+        }
+        let packed = plan.pack(&[0.25; 15]).unwrap();
+        assert_eq!(packed.dimensions(), (5, 3));
+        assert_eq!(packed.owned_heap_bytes(), plan.owned_heap_bytes());
+        assert!(packed.owned_heap_bytes() >= 15 * 4);
+        assert_eq!(packed.ptr as usize % plan.layout.align(), 0);
+    }
+
+    #[test]
+    fn sgemm_native_layout_query_refuses_overflow_without_changing_outputs() {
+        for (n, k) in [(usize::MAX, 1), (1, usize::MAX), (1, usize::MAX / 64 + 1)] {
+            let (mut bytes, mut alignment) = (123, 456);
+            // SAFETY: live output locals, no tensor pointers; rejected dimensions
+            // must return before the native unchecked query or any output write.
+            assert_eq!(
+                unsafe { mlas_sgemm_pack_b_layout(n, k, &mut bytes, &mut alignment) },
+                0
+            );
+            assert_eq!((bytes, alignment), (123, 456));
+        }
+    }
+
+    #[test]
+    fn sgemm_empty_packing_has_a_valid_owner_and_empty_reduction_is_zero() {
+        for (n, k) in [(0, 0), (0, 7), (7, 0)] {
+            let plan = PackedBPlan::new(n, k).unwrap();
+            let packed = plan.pack(&[]).unwrap();
+            assert_eq!(packed.owned_heap_bytes(), 1);
+            assert_eq!(packed.ptr as usize % plan.layout.align(), 0);
+            let mut output = vec![f32::NAN; 3 * n];
+            sgemm_nn_packed(3, &vec![1.; 3 * k], &packed, &mut output);
+            assert_eq!(output, vec![0.; 3 * n]);
+        }
+    }
+
+    #[test]
     fn correctness_packed_b() {
         for (m, n, k) in [(32usize, 512usize, 512usize), (7, 13, 19), (1, 64, 64)] {
             let a = seq(m * k, 0.5);
             let b = seq(k * n, 1.5);
             let mut c_mlas = vec![0.0f32; m * n];
             let mut c_ref = vec![0.0f32; m * n];
-            let packed = PackedB::new(n, k, &b);
+            let packed = PackedB::new(n, k, &b).unwrap();
             sgemm_nn_packed(m, &a, &packed, &mut c_mlas);
             ref_sgemm(false, false, m, n, k, 1.0, &a, k, &b, n, 0.0, &mut c_ref, n);
             assert_close(&c_mlas, &c_ref, 1e-3, &format!("packed {m}x{n}x{k}"));
@@ -3122,7 +3321,7 @@ mod tests {
         );
 
         // Pre-packed B (parity with ORT's constant-weight pre-packing).
-        let packed = PackedB::new(n, k, &b);
+        let packed = PackedB::new(n, k, &b).unwrap();
         for _ in 0..50 {
             sgemm_nn_packed(m, &a, &packed, &mut c);
         }

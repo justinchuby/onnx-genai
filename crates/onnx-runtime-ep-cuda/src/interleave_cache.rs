@@ -53,8 +53,7 @@
 //! entry dies at the exact instant its key stops naming a weight.
 //!
 //! Tying it to the free rather than to a point in teardown is deliberate. The
-//! CPU EP's `clear_mlas_packed_caches` remains a blanket clear ordered before
-//! `Executor::drop` frees its buffers; transpose owners now evict their own
+//! CPU EP's node-scoped packed caches and transpose owners release their
 //! entries before buffer release. A blanket clear cannot be used
 //! here: a blanket clear would free interleaves belonging to *other* executors
 //! sharing this provider, and a CUDA graph one of those captured has the

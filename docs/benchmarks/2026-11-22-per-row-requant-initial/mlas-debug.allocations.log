@@ -1,0 +1,15 @@
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-ep-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.72s
+     Running tests/qgemm_compensation_allocation.rs (/tmp/nxrt-erf-nan-target/debug/deps/qgemm_compensation_allocation-d1ba97a7d569faf2)
+
+running 1 test
+b_zero=0 batches=1 execute_allocations=24
+b_zero=0 batches=2 execute_allocations=24
+b_zero=0 batches=17 execute_allocations=24
+b_zero=1 batches=1 execute_allocations=24
+b_zero=1 batches=2 execute_allocations=24
+b_zero=1 batches=17 execute_allocations=24
+test native_qgemm_compensation_allocations_do_not_scale_with_batches ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

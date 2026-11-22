@@ -11,6 +11,17 @@ pub(crate) static PREBIND_FAST_PATH_TEST_HITS: std::sync::atomic::AtomicUsize =
 pub(crate) static PREBIND_FALLBACK_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Presence of default bytes is not immutability: producer-backed storage is
+/// writable, and overridable initializer inputs are not graph constants.
+pub(super) fn is_immutable_initializer(graph: &Graph, value: ValueId) -> bool {
+    graph.is_constant_initializer(value) && graph.value(value).producer.is_none()
+}
+
+pub(super) struct StaticConstantState {
+    pub(super) constant_inputs: Vec<bool>,
+    pub(super) state: Arc<dyn std::any::Any + Send + Sync>,
+}
+
 pub(super) fn resolve_kernel_constant_inputs<'a>(
     graph: &'a Graph,
     weights: &'a onnx_runtime_loader::WeightStore,
@@ -24,6 +35,9 @@ pub(super) fn resolve_kernel_constant_inputs<'a>(
             let Some(value) = input else {
                 return Ok(None);
             };
+            if !is_immutable_initializer(graph, *value) {
+                return Ok(None);
+            }
             let Some(weight) = graph.initializers.get(value) else {
                 return Ok(None);
             };
@@ -761,6 +775,9 @@ pub struct CacheStats {
 #[derive(Default)]
 pub(crate) struct KernelCache {
     pub(super) entries: HashMap<KernelKey, Box<dyn onnx_runtime_ep_api::Kernel>>,
+    /// Node-scoped load-time owners survive specialization/variant eviction and
+    /// are offered to the first kernel, including fully static materialization.
+    pub(super) static_constant_states: HashMap<NodeId, StaticConstantState>,
     /// Logical time each entry was last served, for the per-node bound below.
     /// Kept beside `entries` rather than inside them so a shared-reference hit
     /// can record its use without the map itself becoming interior-mutable.
@@ -1094,8 +1111,8 @@ impl KernelCache {
             let shared_constant_state = self
                 .entries
                 .iter()
-                .find(|(existing, _)| existing.node == key.node)
-                .and_then(|(_, kernel)| kernel.shareable_constant_state());
+                .filter(|(existing, _)| existing.node == key.node)
+                .find_map(|(_, kernel)| kernel.shareable_constant_state());
             // Verify the EP claims this op at these concrete shapes/layouts
             // before compiling — same gate the static path used at build.
             let shape_dims: Vec<Shape> = input_shapes
@@ -1148,11 +1165,17 @@ impl KernelCache {
                 Err(error) => return Err(error.into()),
             };
             kernel.set_constant_inputs(constant_inputs);
-            let adopted = if let Some(state) = shared_constant_state {
+            let mut adopted = if let Some(state) = shared_constant_state {
                 kernel.adopt_shareable_constant_state(state)?
             } else {
                 false
             };
+            if !adopted
+                && let Some(prepared) = self.static_constant_states.get(&node_id)
+                && prepared.constant_inputs == constant_inputs
+            {
+                adopted = kernel.adopt_shareable_constant_state(Arc::clone(&prepared.state))?;
+            }
             if !adopted {
                 kernel.prepare_constant_inputs(constant_values, ep)?;
             }

@@ -756,8 +756,8 @@ pub trait Kernel: Send + KernelType {
 
     /// Validate and bind immutable graph constants before the first launch.
     ///
-    /// The session calls this exactly once for a newly constructed kernel,
-    /// after [`Kernel::set_constant_inputs`]. Stock kernels need no preparation.
+    /// The session calls this for a new kernel without compatible adopted
+    /// preparation, after [`Kernel::set_constant_inputs`]. Stock kernels need none.
     fn prepare_constant_inputs(
         &mut self,
         constants: &[Option<KernelConstantInput<'_>>],
@@ -774,7 +774,9 @@ pub trait Kernel: Send + KernelType {
         None
     }
 
-    /// Adopt state returned by [`Kernel::shareable_constant_state`].
+    /// Adopt state returned by [`Kernel::shareable_constant_state`] or
+    /// [`ExecutionProvider::prepare_static_constants`]. Unrecognized state must
+    /// return false so ordinary preparation can run.
     ///
     /// Returns `true` when the state was recognized and installed.
     fn adopt_shareable_constant_state(

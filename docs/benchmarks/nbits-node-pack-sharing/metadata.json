@@ -1,0 +1,34 @@
+{
+  "source_commit": "cb457194486ea1d019147f68cf8774788101fddf",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_nbits.rs": "3a575b26fe97222ebaef4a0c728ce33a450fab5fd3211faa814df535526e7b69",
+    "crates/onnx-runtime-ep-cpu/src/resources.rs": "d08e4733686f1ba71b17e64a46428cb3ee6cfa5ebd6efcf23abe19ac25368708",
+    "crates/onnx-runtime-session/src/executor/tests.rs": "92ce4392978926464c39ef3ce6cbbfdbaf1aabcaa6a37c6c3d579bbf9e967f1e"
+  },
+  "base": "85475bd70c49c18a32ace6461e6125fdb3638ba3",
+  "scope": "ARM64 macOS host; Host grant ledger bytes and exact fixture outputs, not allocator byte counts, RSS or latency",
+  "cargo_incremental": "0",
+  "ort": "existing cached ORT_ROOT",
+  "validation_wrapper": "/tmp/nxrt-darwin-measure.py",
+  "shared_lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "cargo_lock_sha256": "d84aae080dc08d740c9a44e02780a72c943716de13048d06110c9039bf6da54d",
+  "validation_counts": {
+    "native-cpu": {
+      "passed": 1959,
+      "ignored": 19
+    },
+    "native-session": {
+      "passed": 272,
+      "ignored": 0
+    },
+    "mlas-cpu": {
+      "passed": 1987,
+      "ignored": 33
+    },
+    "mlas-session": {
+      "passed": 273,
+      "ignored": 0
+    }
+  }
+}

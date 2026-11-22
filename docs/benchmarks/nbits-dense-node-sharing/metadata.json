@@ -1,0 +1,37 @@
+{
+  "source_commit": "8812d9a22f7a964a2b3f94c1356d4bf049a90839",
+  "base": "32f603670b893b0d8db27547ce73b96085b9f700",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_nbits.rs": "4a8520e53de471b4a2dc084a7d380176396deee29ddfc2d23acd3b6c1250a5b9",
+    "crates/onnx-runtime-session/src/executor/tests.rs": "4121514cb7fb0a96a8cb6b9075842806c481fa7e0ccc3ea2f2aabf3e33d039d7"
+  },
+  "scope": "ARM64 macOS; Host ledger charges and exact fixtures, no RSS, latency, CUDA or other-ISA execution claim",
+  "shared_host_lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "cargo_incremental": "0",
+  "ort": "existing cached ORT_ROOT",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "cargo_lock_sha256": "d84aae080dc08d740c9a44e02780a72c943716de13048d06110c9039bf6da54d",
+  "validation_counts": {
+    "native-cpu": {
+      "passed": 1962,
+      "ignored": 19
+    },
+    "native-session": {
+      "passed": 273,
+      "ignored": 0
+    },
+    "mlas-cpu": {
+      "passed": 1990,
+      "ignored": 33
+    },
+    "mlas-session": {
+      "passed": 274,
+      "ignored": 0
+    }
+  },
+  "publication_doc_only_change": "Corrected one Rustdoc sentence after full validation; replacing that exact sentence reproduces the validated source byte-for-byte.",
+  "publication_source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_nbits.rs": "b1650e7b2ebf936b7df78d92dfb415f77bf4ea1d0b46028d86846832fa1dbd34",
+    "crates/onnx-runtime-session/src/executor/tests.rs": "4121514cb7fb0a96a8cb6b9075842806c481fa7e0ccc3ea2f2aabf3e33d039d7"
+  }
+}

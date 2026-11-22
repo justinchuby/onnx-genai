@@ -35,23 +35,23 @@ pub struct FusedMatMulBiasKernel {
 
 /// Factory for [`FusedMatMulBiasKernel`] (no attributes).
 pub struct FusedMatMulBiasFactory {
-    retain_caches: bool,
+    resources: crate::CpuMemoryResources,
 }
 impl FusedMatMulBiasFactory {
-    pub fn new(retain_caches: bool) -> Self {
-        Self { retain_caches }
+    pub fn new(resources: crate::CpuMemoryResources) -> Self {
+        Self { resources }
     }
 }
 impl Default for FusedMatMulBiasFactory {
     fn default() -> Self {
-        Self::new(true)
+        Self::new(crate::CpuMemoryResources::default())
     }
 }
 
 impl KernelFactory for FusedMatMulBiasFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(FusedMatMulBiasKernel {
-            prepack: MatMulPrepack::new(self.retain_caches),
+            prepack: MatMulPrepack::new(self.resources.clone()),
         }))
     }
 }
@@ -59,6 +59,16 @@ impl KernelFactory for FusedMatMulBiasFactory {
 impl Kernel for FusedMatMulBiasKernel {
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
         self.prepack.set_constant_inputs(constant_inputs);
+    }
+
+    fn shareable_constant_state(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.prepack.shareable_constant_state()
+    }
+    fn adopt_shareable_constant_state(
+        &mut self,
+        state: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<bool> {
+        self.prepack.adopt_shareable_constant_state(state)
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {

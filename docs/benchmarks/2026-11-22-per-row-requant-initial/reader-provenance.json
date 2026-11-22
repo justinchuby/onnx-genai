@@ -1,0 +1,7 @@
+{
+  "reader_sha256": "73ae85d65ef5c0b58c781d9949f544cd657b226831151b11917f550f214bdab8",
+  "controls_sha256": "ff6ef93b33d03d9b6ff11c4bc4a65a69a298a7d2e06f23020afda7fcf702feb0",
+  "python": "3.15.2 (main, Oct 25 2026, 16:57:51) [Clang 21.0.0 (clang-2100.3.34.2)]",
+  "analysis_commands": "python3 -O scripts/bench_qlinear_per_row.py run-N.csv",
+  "controls": "16 unittest methods passed normally and under -O; validations use explicit errors/unittest assertions"
+}

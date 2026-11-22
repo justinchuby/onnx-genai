@@ -322,12 +322,12 @@ fn bench_softmax() {
             let (n_s, m_s) = interleaved(
                 || {
                     native.copy_from_slice(&seed);
-                    backend_ab::softmax_rows_native(&mut native, rows, cols);
+                    backend_ab::softmax_rows_native(&mut native, cols).unwrap();
                     black_box(&native);
                 },
                 || {
                     mlas.copy_from_slice(&seed);
-                    backend_ab::softmax_rows_mlas(&mut mlas, rows, cols);
+                    backend_ab::softmax_rows_mlas(&mut mlas, cols).unwrap();
                     black_box(&mlas);
                 },
                 iters,
@@ -337,7 +337,7 @@ fn bench_softmax() {
             let (n_s, _) = interleaved(
                 || {
                     native.copy_from_slice(&seed);
-                    backend_ab::softmax_rows_native(&mut native, rows, cols);
+                    backend_ab::softmax_rows_native(&mut native, cols).unwrap();
                     black_box(&native);
                 },
                 || {},

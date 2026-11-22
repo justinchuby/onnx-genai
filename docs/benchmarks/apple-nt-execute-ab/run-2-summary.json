@@ -1,0 +1,337 @@
+{
+  "protocol": 2,
+  "sample_count": 720,
+  "cell_count": 10,
+  "cells": [
+    {
+      "m": 2,
+      "k": 33,
+      "n": 3,
+      "retained": 0,
+      "builds_host_bytes_and_nt_calls": [
+        49176,
+        98352,
+        0,
+        0,
+        0
+      ],
+      "cpu": {
+        "median_ns_per_call": [
+          228408.447265625,
+          227318.603515625,
+          228670.41015625
+        ],
+        "native_aa_ratio": 1.0059467488349765,
+        "qualified": true,
+        "legacy_over_native": 1.0018155719426405
+      },
+      "wall": {
+        "median_ns_per_call": [
+          32426.1171875,
+          32320.454833984375,
+          32546.13232421875
+        ],
+        "native_aa_ratio": 1.0069824973501635,
+        "qualified": true,
+        "legacy_over_native": 0.9997787338006835
+      }
+    },
+    {
+      "m": 2,
+      "k": 33,
+      "n": 3,
+      "retained": 1,
+      "builds_host_bytes_and_nt_calls": [
+        49176,
+        1,
+        0,
+        396,
+        98352
+      ],
+      "cpu": {
+        "median_ns_per_call": [
+          229496.337890625,
+          435.05859375,
+          430.17578125
+        ],
+        "native_aa_ratio": 1.011350737797957,
+        "qualified": true,
+        "legacy_over_native": 530.4836343115124
+      },
+      "wall": {
+        "median_ns_per_call": [
+          32803.21240234375,
+          416.513916015625,
+          416.869873046875
+        ],
+        "native_aa_ratio": 1.000854610176426,
+        "qualified": true,
+        "legacy_over_native": 78.72294333741512
+      }
+    },
+    {
+      "m": 8,
+      "k": 257,
+      "n": 65,
+      "retained": 0,
+      "builds_host_bytes_and_nt_calls": [
+        1440,
+        2880,
+        0,
+        0,
+        0
+      ],
+      "cpu": {
+        "median_ns_per_call": [
+          589686.440677966,
+          588898.3050847459,
+          588661.0169491526
+        ],
+        "native_aa_ratio": 1.0004030980968013,
+        "qualified": true,
+        "legacy_over_native": 1.0015401001784785
+      },
+      "wall": {
+        "median_ns_per_call": [
+          66793.78813559322,
+          66737.28813559322,
+          65858.75423728814
+        ],
+        "native_aa_ratio": 1.0133396677249578,
+        "qualified": true,
+        "legacy_over_native": 1.007477854395659
+      }
+    },
+    {
+      "m": 8,
+      "k": 257,
+      "n": 65,
+      "retained": 1,
+      "builds_host_bytes_and_nt_calls": [
+        1440,
+        1,
+        0,
+        66820,
+        2880
+      ],
+      "cpu": {
+        "median_ns_per_call": [
+          585915.2542372881,
+          4135.593220338983,
+          6076.271186440678
+        ],
+        "native_aa_ratio": 1.4692622950819674,
+        "qualified": false,
+        "legacy_over_native": 114.75186721991702
+      },
+      "wall": {
+        "median_ns_per_call": [
+          65200.567796610165,
+          3194.5677966101694,
+          3285.6610169491523
+        ],
+        "native_aa_ratio": 1.0285150374443905,
+        "qualified": true,
+        "legacy_over_native": 20.12292148085376
+      }
+    },
+    {
+      "m": 32,
+      "k": 1024,
+      "n": 1024,
+      "retained": 0,
+      "builds_host_bytes_and_nt_calls": [
+        120,
+        240,
+        0,
+        0,
+        0
+      ],
+      "cpu": {
+        "median_ns_per_call": [
+          7353500.0,
+          7430000.0,
+          7387250.0
+        ],
+        "native_aa_ratio": 1.0057869978679481,
+        "qualified": true,
+        "legacy_over_native": 0.9925593480571631
+      },
+      "wall": {
+        "median_ns_per_call": [
+          949822.875,
+          961020.875,
+          952854.25
+        ],
+        "native_aa_ratio": 1.0085706969350243,
+        "qualified": true,
+        "legacy_over_native": 0.9925651497246979
+      }
+    },
+    {
+      "m": 32,
+      "k": 1024,
+      "n": 1024,
+      "retained": 1,
+      "builds_host_bytes_and_nt_calls": [
+        120,
+        1,
+        0,
+        4194304,
+        240
+      ],
+      "cpu": {
+        "median_ns_per_call": [
+          7335500.0,
+          117625.0,
+          117375.0
+        ],
+        "native_aa_ratio": 1.0021299254526093,
+        "qualified": true,
+        "legacy_over_native": 62.42978723404255
+      },
+      "wall": {
+        "median_ns_per_call": [
+          937197.875,
+          117151.125,
+          117041.625
+        ],
+        "native_aa_ratio": 1.0009355645908027,
+        "qualified": true,
+        "legacy_over_native": 8.003645501408561
+      }
+    },
+    {
+      "m": 128,
+      "k": 1024,
+      "n": 1024,
+      "retained": 0,
+      "builds_host_bytes_and_nt_calls": [
+        120,
+        240,
+        0,
+        0,
+        0
+      ],
+      "cpu": {
+        "median_ns_per_call": [
+          7723875.0,
+          7695250.0,
+          7692750.0
+        ],
+        "native_aa_ratio": 1.0003249813135744,
+        "qualified": true,
+        "legacy_over_native": 1.0038828957629322
+      },
+      "wall": {
+        "median_ns_per_call": [
+          1052755.125,
+          1054677.125,
+          1055619.875
+        ],
+        "native_aa_ratio": 1.0008938754597527,
+        "qualified": true,
+        "legacy_over_native": 0.9977317173838564
+      }
+    },
+    {
+      "m": 128,
+      "k": 1024,
+      "n": 1024,
+      "retained": 1,
+      "builds_host_bytes_and_nt_calls": [
+        120,
+        1,
+        0,
+        4194304,
+        240
+      ],
+      "cpu": {
+        "median_ns_per_call": [
+          7759875.0,
+          375625.0,
+          376250.0
+        ],
+        "native_aa_ratio": 1.0016638935108153,
+        "qualified": true,
+        "legacy_over_native": 20.641396508728178
+      },
+      "wall": {
+        "median_ns_per_call": [
+          1053567.75,
+          202531.375,
+          202698.0
+        ],
+        "native_aa_ratio": 1.0008227120365918,
+        "qualified": true,
+        "legacy_over_native": 5.199858721989243
+      }
+    },
+    {
+      "m": 16,
+      "k": 2048,
+      "n": 2048,
+      "retained": 0,
+      "builds_host_bytes_and_nt_calls": [
+        120,
+        240,
+        0,
+        0,
+        0
+      ],
+      "cpu": {
+        "median_ns_per_call": [
+          26111375.0,
+          25862000.0,
+          25958875.0
+        ],
+        "native_aa_ratio": 1.0037458433222488,
+        "qualified": true,
+        "legacy_over_native": 1.0077550793960928
+      },
+      "wall": {
+        "median_ns_per_call": [
+          3973375.0,
+          4026604.125,
+          3982182.25
+        ],
+        "native_aa_ratio": 1.011155158707264,
+        "qualified": true,
+        "legacy_over_native": 0.9922539605758931
+      }
+    },
+    {
+      "m": 16,
+      "k": 2048,
+      "n": 2048,
+      "retained": 1,
+      "builds_host_bytes_and_nt_calls": [
+        120,
+        1,
+        0,
+        16777216,
+        240
+      ],
+      "cpu": {
+        "median_ns_per_call": [
+          26152500.0,
+          776625.0,
+          774125.0
+        ],
+        "native_aa_ratio": 1.003229452607783,
+        "qualified": true,
+        "legacy_over_native": 33.728840883443496
+      },
+      "wall": {
+        "median_ns_per_call": [
+          3926270.875,
+          776026.125,
+          773583.25
+        ],
+        "native_aa_ratio": 1.003157869563489,
+        "qualified": true,
+        "legacy_over_native": 5.067433042601462
+      }
+    }
+  ]
+}

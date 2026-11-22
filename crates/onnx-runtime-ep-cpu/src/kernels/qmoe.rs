@@ -3320,10 +3320,28 @@ mod tests {
     /// culprit. We therefore recover the guard from a poisoned mutex: the
     /// offending test still reports its own failure, but the remaining tests
     /// continue to run and report honestly (one failure stays one failure).
-    fn hold_metrics_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        metrics_test_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    struct MetricsTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for MetricsTestGuard {
+        fn drop(&mut self) {
+            // TLS destructors run after the test function returns, when a bare
+            // mutex guard has already let the next test reset process gauges.
+            // Retire this thread's resources while the metrics lock is held.
+            // Drop payloads outside the RefCell borrow for accountant callbacks.
+            let old = TEST_RESOURCES
+                .with(|resources| resources.replace(crate::CpuMemoryResources::default()));
+            drop(old);
+        }
+    }
+
+    fn hold_metrics_test_lock() -> MetricsTestGuard {
+        MetricsTestGuard {
+            _lock: metrics_test_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
     }
 
     thread_local! {
@@ -4481,15 +4499,13 @@ mod tests {
 
     #[test]
     fn shared_pressure_expert_and_dense_caches_reclaim_each_others_idle_payloads() {
-        use super::super::dense_weight_cache::{
-            DenseWeightCache, DenseWeightKey, DenseWeightLoad, DenseWeightSpec,
-        };
+        use super::super::weight_cache::{WeightCache, WeightCacheKey, WeightLoad, WeightSpec};
         use onnx_runtime_memory_api::Tier;
         use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         struct Key;
-        impl DenseWeightKey for Key {
-            fn dense_bytes(&self) -> Result<usize> {
+        impl WeightCacheKey for Key {
+            fn weight_bytes(&self) -> Result<usize> {
                 Ok(4)
             }
         }
@@ -4497,7 +4513,7 @@ mod tests {
         let governor = LedgerGovernor::new(LeaseLedger::new(0, 4, 0));
         let source = DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
         let experts = WeightOffloadHostCache::new(64, source.clone()).unwrap();
-        let dense = DenseWeightCache::<Key>::new(source, 4);
+        let dense = WeightCache::<Key>::new(source, 4);
         for _ in 0..4 {
             drop(
                 experts
@@ -4509,12 +4525,12 @@ mod tests {
         // when the shared Host books refuse another weight allocation.
         assert_eq!(experts.inner.cache.lock().unwrap().owned_bytes, 4);
         let loaded = dense
-            .load_group(&[DenseWeightSpec::cached(&Key).unwrap()], |_, row| {
+            .load_group(&[WeightSpec::cached(&Key).unwrap()], |_, row| {
                 row.fill(3.0);
                 Ok(())
             })
             .unwrap();
-        let DenseWeightLoad::Ready(loaded) = loaded else {
+        let WeightLoad::Ready(loaded) = loaded else {
             panic!("idle expert must fund dense payload");
         };
         assert_eq!(experts.inner.cache.lock().unwrap().owned_bytes, 0);
@@ -4542,11 +4558,11 @@ mod tests {
         let before = crate::weight_offload_stats();
         assert!(matches!(
             dense
-                .load_group(&[DenseWeightSpec::transient(4)], |_, _| panic!(
+                .load_group(&[WeightSpec::transient(4)], |_, _| panic!(
                     "active expert cannot be reclaimed"
                 ))
                 .unwrap(),
-            DenseWeightLoad::Declined(_)
+            WeightLoad::Declined(_)
         ));
         assert_eq!(
             crate::weight_offload_stats().host_cache_evictions,
@@ -4669,6 +4685,29 @@ mod tests {
         );
         drop(active);
         assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn metrics_guard_retires_thread_local_residency_before_unlock() {
+        {
+            let _guard = hold_metrics_test_lock();
+            reset_offload_test_state(4);
+            for _ in 0..2 {
+                drop(
+                    test_resources()
+                        .expert_cache()
+                        .lease(cache_key(0), 4, || Ok(expert_payload(1.0)))
+                        .unwrap(),
+                );
+            }
+            assert_eq!(crate::weight_offload_stats().owned_host_cache_bytes, 4);
+        }
+        // Do not reset metrics here: a later test must not inherit a cache
+        // whose eventual thread-local drop subtracts from that test's books.
+        let _next = hold_metrics_test_lock();
+        let stats = crate::weight_offload_stats();
+        assert_eq!(stats.owned_host_cache_bytes, 0);
+        assert_eq!(stats.host_cache_budget_bytes, 0);
     }
 
     #[test]

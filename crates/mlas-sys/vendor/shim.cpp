@@ -17,6 +17,7 @@
 // Licensed under the MIT License.
 
 #include "core/mlas/inc/mlas.h"
+#include "core/mlas/lib/mlasi.h"
 #include "core/mlas/inc/mlas_float16.h"
 #include "core/mlas/inc/mlas_qnbit.h"
 
@@ -25,13 +26,10 @@
 #include <cstring>
 #include <functional>
 #include <new>
+#include <limits>
 #include <vector>
 
 namespace onnxruntime {
-struct MLFloat16 {
-    uint16_t val;
-};
-
 std::atomic<int> saturation_count{0};
 }  // namespace onnxruntime
 
@@ -267,12 +265,40 @@ extern "C" void mlas_sgemm_batch(
 
 // ---- Pre-packed B variant (mirrors how ORT pre-packs constant weights) ----
 
-extern "C" size_t mlas_sgemm_pack_b_size(int transA, int transB, size_t N, size_t K)
+// The standalone SGEMM build uses the generic MLAS layout (no KleidiAI
+// SGEMM override). Check its padding arithmetic before invoking the native size
+// query, which itself uses unchecked size_t arithmetic. Constants and alignment
+// come from the same MLAS source as the packer, not a Rust-side guessed ceiling.
+extern "C" int mlas_sgemm_pack_b_layout(size_t N, size_t K,
+                                       size_t* size, size_t* alignment)
 {
-    return MlasGemmPackBSize(
-        transA ? CblasTrans : CblasNoTrans,
-        transB ? CblasTrans : CblasNoTrans,
-        N, K, nullptr);
+    const size_t max = std::numeric_limits<size_t>::max();
+    const size_t column_alignment = MLAS_SGEMM_STRIDEN_THREAD_ALIGN;
+    const size_t buffer_alignment = MlasGetPreferredBufferAlignment();
+    if (buffer_alignment == 0 || (buffer_alignment & (buffer_alignment - 1)) != 0 ||
+        N > max - (column_alignment - 1)) {
+        return 0;
+    }
+    const size_t aligned_n = (N + column_alignment - 1) & ~(column_alignment - 1);
+    if (K != 0 && aligned_n > max / K) {
+        return 0;
+    }
+    const size_t elements = aligned_n * K;
+    if (elements > max / sizeof(float)) {
+        return 0;
+    }
+    const size_t bytes = elements * sizeof(float);
+    if (bytes > max - (buffer_alignment - 1)) {
+        return 0;
+    }
+    const size_t aligned_bytes = (bytes + buffer_alignment - 1) & ~(buffer_alignment - 1);
+    // Refuse a changed/unsupported reference layout instead of underallocating.
+    if (MlasGemmPackBSize(CblasNoTrans, CblasNoTrans, N, K, nullptr) != aligned_bytes) {
+        return 0;
+    }
+    *size = aligned_bytes;
+    *alignment = buffer_alignment;
+    return 1;
 }
 
 extern "C" void mlas_sgemm_pack_b(
@@ -565,15 +591,6 @@ extern "C" void mlas_compute_silu(
     size_t n)
 {
     MlasComputeSilu(input, output, n);
-}
-
-extern "C" void mlas_eltwise_add(
-    const float* left,
-    const float* right,
-    float* output,
-    size_t n)
-{
-    MlasEltwiseAdd<float>(left, right, output, n);
 }
 
 extern "C" void mlas_compute_activation(

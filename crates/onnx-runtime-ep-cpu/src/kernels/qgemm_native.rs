@@ -191,25 +191,20 @@ pub(crate) fn qgemm(
         return;
     }
 
-    // `sum_k (a_ik - za_i)`, the multiplier on the column zero point. Computed
-    // once per row here rather than inside the `k` loop, which is the only
-    // reason the row loop below can be blocked at all.
-    let mut a_sums = vec![0i32; m];
-    for (row, sum) in a_sums.iter_mut().enumerate() {
-        let zero = a_zero_points[row];
-        let mut acc = 0i32;
-        for index in row * k..row * k + k {
-            acc = acc.wrapping_add(a.at(index).wrapping_sub(zero));
-        }
-        *sum = acc;
-    }
-
     accumulate_products(a, b, a_zero_points, m, k, n, products);
 
-    // The `- zb_j * sum_k(...)` half of the expansion, applied once per output
-    // rather than once per `k`.
+    // The entire column compensation is zero for symmetric weights. Otherwise
+    // consume each row's modular sum immediately instead of materializing an
+    // m-element buffer. The K order within both reductions stays fixed; their
+    // phase ordering is independent arithmetic.
+    if b_zero_points.iter().all(|&zero| zero == 0) {
+        return;
+    }
     for (row, out) in products.chunks_mut(n).enumerate() {
-        let sum = a_sums[row];
+        let zero = a_zero_points[row];
+        let sum = (row * k..row * k + k).fold(0i32, |acc, index| {
+            acc.wrapping_add(a.at(index).wrapping_sub(zero))
+        });
         if sum == 0 {
             continue;
         }
@@ -1404,6 +1399,58 @@ mod tests {
             expect.iter().any(|&value| value < 0),
             "the fixture must actually overflow, or it proves nothing"
         );
+    }
+
+    #[test]
+    fn zero_and_sparse_column_offsets_preserve_seeded_wrapping_results() {
+        for m in [1, 3, 8] {
+            for k in [1, 5, 65] {
+                for n in [1, 9, 17] {
+                    let a_bytes = bytes(m * k, 0x219);
+                    let b_bytes = bytes(k * n, 0x893);
+                    for a_signed in [false, true] {
+                        for b_signed in [false, true] {
+                            let a = Operand {
+                                bytes: &a_bytes,
+                                signed: a_signed,
+                            };
+                            let b = Operand {
+                                bytes: &b_bytes,
+                                signed: b_signed,
+                            };
+                            let az = zero_points(m, a_signed, 0x71);
+                            for offset_case in 0..4 {
+                                let mut bz = vec![0; n];
+                                match offset_case {
+                                    0 => {}
+                                    1 => bz[0] = i32::MAX,
+                                    2 => bz[n - 1] = i32::MIN,
+                                    _ => {
+                                        for (j, value) in bz.iter_mut().enumerate() {
+                                            *value = if j % 2 == 0 { 0 } else { -117 };
+                                        }
+                                    }
+                                }
+                                let seed: Vec<i32> = (0..m * n)
+                                    .map(|i| i32::MAX.wrapping_sub(i as i32 * 17))
+                                    .collect();
+                                let mut actual = seed.clone();
+                                let expected: Vec<_> = oracle(a, b, &az, &bz, m, k, n)
+                                    .into_iter()
+                                    .zip(&seed)
+                                    .map(|(sum, &initial)| initial.wrapping_add(sum))
+                                    .collect();
+                                qgemm(a, b, &az, &bz, m, k, n, &mut actual);
+                                assert_eq!(
+                                    actual, expected,
+                                    "{m}x{k}x{n}, signed={a_signed}/{b_signed}, offsets={offset_case}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// `products` is accumulated into, not overwritten: the caller owns the

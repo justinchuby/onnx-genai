@@ -7,8 +7,77 @@ use onnx_runtime_ir::{
 use rayon::prelude::*;
 
 use super::{check_arity, qgemm_native, to_dense_bytes, write_dense_bytes};
+use crate::DerivedWeightMemory;
+#[cfg(feature = "mlas")]
+use crate::resources::{DerivedWeightGrant, IdleWeightCache, WeightAdmission};
 use crate::strided::numel;
 use std::borrow::Cow;
+#[cfg(feature = "mlas")]
+use std::sync::{Arc, Mutex};
+
+/// The payload is dropped before its Host grant, including after cache eviction.
+#[cfg(feature = "mlas")]
+struct GrantedQgemmPack {
+    packed: mlas_sys::QgemmPackedB,
+    _grant: DerivedWeightGrant,
+}
+
+#[cfg(feature = "mlas")]
+struct CachedQgemmPack {
+    key: QgemmPackKey,
+    // None records a reference layout refusal, never a temporary capacity refusal.
+    packed: Option<Arc<GrantedQgemmPack>>,
+}
+
+/// Erased by the existing executor seam, which shares only within one node.
+/// Keep the immutable source beside the cache so adoption can verify ownership.
+#[cfg(feature = "mlas")]
+struct SharedQgemmPackState {
+    cache: Arc<QgemmPackCache>,
+    memory: DerivedWeightMemory,
+}
+
+/// Admission may synchronously ask this cache to reclaim, so the builder lock
+/// is independent of the state lock and callbacks only acquire the latter.
+#[cfg(feature = "mlas")]
+#[derive(Default)]
+struct QgemmPackCache {
+    slot: Mutex<Option<CachedQgemmPack>>,
+    build: Mutex<()>,
+}
+
+#[cfg(feature = "mlas")]
+impl QgemmPackCache {
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, Option<CachedQgemmPack>>> {
+        self.slot.lock().map_err(|_| EpError::KernelFailed(
+            "QLinearMatMul packed-weight cache lock was poisoned; recreate the CPU kernel before retrying".into()
+        ))
+    }
+}
+
+#[cfg(feature = "mlas")]
+impl IdleWeightCache for QgemmPackCache {
+    fn reclaim_idle(&self, want: usize) -> Result<usize> {
+        if want == 0 {
+            return Ok(0);
+        }
+        let retired = {
+            let mut slot = self.state()?;
+            let idle = slot
+                .as_ref()
+                .and_then(|cached| cached.packed.as_ref())
+                .is_some_and(|packed| Arc::strong_count(packed) == 1);
+            if idle { slot.take() } else { None }
+        };
+        let bytes = retired
+            .as_ref()
+            .and_then(|cached| cached.packed.as_ref())
+            .map_or(0, |payload| payload.packed.owned_heap_bytes());
+        // Release payload and its external accounting only after unlocking.
+        drop(retired);
+        Ok(bytes)
+    }
+}
 
 /// Borrow a tensor's bytes when they are already dense, copy them when they are
 /// not.
@@ -170,29 +239,12 @@ pub fn qlinear_packed_b_live_bytes() -> u64 {
     }
 }
 
-/// How many times a shape-keyed kernel cache materializes each `packed_b`.
-///
-/// The executor's kernel cache is keyed by `(node, resolved_input_shapes)`, so
-/// an autoregressive decoder compiles a `QLinearMatMul` node once for the
-/// prefill shape (`m > 1`) and once for the decode shape (`m == 1`), each a
-/// separate `QLinearMatMulKernel` holding its own `packed_b`. Both pack the same
-/// constant `B`, so the session holds two packed copies, not one -- the same
-/// shape-keyed multiplier #1051 corrected for the MLAS SQNBit buffer. Counting
-/// one copy would under-report by 2x, the dangerous direction for an admission
-/// gate; a prefill-only run holds one copy, so this over-estimates there, which
-/// only makes the gate decline sooner (safe).
-#[cfg(feature = "mlas")]
-const QLINEAR_PACKED_B_DECODE_INSTANTIATIONS: u64 = 2;
-
-/// Predicted resident bytes the constant-`B` pre-packs will hold for `graph`,
-/// for the memory plan to fold into its resident total (#1056).
-///
-/// For each `QLinearMatMul` whose `B` (input index 3) is a rank-2 constant
-/// initializer, this is the exact MLAS packed size for that `k x n` weight times
-/// [`QLINEAR_PACKED_B_DECODE_INSTANTIATIONS`]. `A`'s signedness is not a
-/// graph-static property (it is an activation), so the size is taken as the max
-/// over both `a_signed` possibilities -- the over-predicting (safe) direction.
-/// Zero without the `mlas` feature, where nothing is ever packed.
+/// Predicted resident packed-B bytes for `graph` under the session's node-scoped
+/// constant-state sharing. Activation shape variants share one cache entry;
+/// distinct graph nodes remain independent. A cache retains at most one layout,
+/// so bound it by the largest signedness layout, including exact sign-domain
+/// translation, rather than multiplying by a fixed number of shape variants.
+/// Zero without the optional MLAS research reference.
 pub fn qlinear_packed_b_predicted_bytes(graph: &Graph) -> u64 {
     #[cfg(not(feature = "mlas"))]
     {
@@ -209,10 +261,18 @@ pub fn qlinear_packed_b_predicted_bytes(graph: &Graph) -> u64 {
     }
 }
 
-/// Per-node contribution to [`qlinear_packed_b_predicted_bytes`]. Mirrors the
-/// packing condition in [`QLinearMatMulKernel::pack_key`]: a constant, rank-2
-/// `B`. The batched-`B` decline is not visible from a rank-2 initializer, so it
-/// need not be re-checked here.
+/// One logical B matrix: a vector is K×1, and leading unit dimensions do
+/// not create distinct weight batches. Shared by admission prediction and use.
+#[cfg(feature = "mlas")]
+fn single_matrix_shape(shape: &[usize]) -> Option<(usize, usize)> {
+    match shape {
+        [k] => Some((*k, 1)),
+        [batch @ .., k, n] if batch.iter().all(|&dimension| dimension == 1) => Some((*k, *n)),
+        _ => None,
+    }
+}
+
+/// Per-node contribution, using the same single-matrix rule as pack lookup.
 #[cfg(feature = "mlas")]
 fn node_qlinear_packed_b_bytes(node: &Node, graph: &Graph) -> u64 {
     if !node.is_default_domain() || node.op_type != "QLinearMatMul" {
@@ -221,24 +281,24 @@ fn node_qlinear_packed_b_bytes(node: &Node, graph: &Graph) -> u64 {
     let Some(Some(b_value)) = node.inputs.get(3).copied() else {
         return 0;
     };
+    if !graph.is_constant_initializer(b_value) {
+        return 0;
+    }
     let Some(weight) = graph.initializers.get(&b_value) else {
         return 0;
     };
-    let dims = weight.dims();
-    if dims.len() != 2 {
+    if !is_quantized(weight.dtype()) {
         return 0;
     }
-    let (k, n) = (dims[0], dims[1]);
-    let b_signed = weight.dtype() == DataType::Int8;
-    // A is an activation, so its signedness is unknown here; the packed size can
-    // differ with it, so take the larger of the two -- the safe (over-predicting)
-    // direction per #1056.
-    let packed = [false, true]
+    let Some((k, n)) = single_matrix_shape(weight.dims()) else {
+        return 0;
+    };
+    [false, true]
         .into_iter()
-        .filter_map(|a_signed| mlas_sys::qgemm_pack_b_size(n, k, a_signed, b_signed))
+        .flat_map(|a_signed| [false, true].map(|b_signed| (a_signed, b_signed)))
+        .filter_map(|(a_signed, b_signed)| mlas_sys::qgemm_pack_b_size(n, k, a_signed, b_signed))
         .max()
-        .unwrap_or(0) as u64;
-    packed.saturating_mul(QLINEAR_PACKED_B_DECODE_INSTANTIATIONS)
+        .unwrap_or(0) as u64
 }
 
 #[cfg(test)]
@@ -319,46 +379,64 @@ pub struct QLinearMatMulKernel {
     /// index 3 (`B`) is consulted; the rest are carried so the array lines up
     /// with the operand list.
     constant_inputs: [bool; 8],
-    /// `B` pre-packed into MLAS's quantized kernel layout, built at most once.
-    ///
-    /// `None` inside the `OnceLock` records that MLAS declined to pack this
-    /// shape, so the unpacked path is used and no further attempt is made.
+    /// One constant weight pack; construction is serialized before allocation.
+    /// Active calls own an Arc, so its grant follows the payload's last owner.
     #[cfg(feature = "mlas")]
-    packed_b: std::sync::OnceLock<Option<(QgemmPackKey, mlas_sys::QgemmPackedB)>>,
+    packed_b: Arc<QgemmPackCache>,
+    #[cfg(feature = "mlas")]
+    weight_memory: DerivedWeightMemory,
 }
 
 pub struct QLinearMatMulFactory {
     retain_caches: bool,
+    weight_memory: DerivedWeightMemory,
 }
 impl QLinearMatMulFactory {
-    pub fn new(retain_caches: bool) -> Self {
-        Self { retain_caches }
+    /// Bind retained reference packs to the provider's immutable Host grant source.
+    pub fn new(retain_caches: bool, weight_memory: DerivedWeightMemory) -> Self {
+        Self {
+            retain_caches,
+            weight_memory,
+        }
     }
 }
 impl Default for QLinearMatMulFactory {
     fn default() -> Self {
-        Self::new(true)
+        Self::new(true, DerivedWeightMemory::default())
     }
 }
 impl Default for QLinearMatMulKernel {
     fn default() -> Self {
-        Self::new(true)
+        Self::new(true, DerivedWeightMemory::default())
     }
 }
 
 impl KernelFactory for QLinearMatMulFactory {
     fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(QLinearMatMulKernel::new(self.retain_caches)))
+        Ok(Box::new(QLinearMatMulKernel::new(
+            self.retain_caches,
+            self.weight_memory.clone(),
+        )))
     }
 }
 
 impl QLinearMatMulKernel {
-    fn new(retain_caches: bool) -> Self {
+    fn new(retain_caches: bool, weight_memory: DerivedWeightMemory) -> Self {
+        #[cfg(not(feature = "mlas"))]
+        let _ = weight_memory;
+        #[cfg(feature = "mlas")]
+        let packed_b = Arc::new(QgemmPackCache::default());
+        #[cfg(feature = "mlas")]
+        if retain_caches {
+            weight_memory.register_idle_cache(&packed_b);
+        }
         Self {
             retain_caches,
             constant_inputs: [false; 8],
             #[cfg(feature = "mlas")]
-            packed_b: std::sync::OnceLock::new(),
+            packed_b,
+            #[cfg(feature = "mlas")]
+            weight_memory,
         }
     }
     /// The identity a pack for this call would have, or `None` when `B` must
@@ -381,7 +459,7 @@ impl QLinearMatMulKernel {
         if !self.constant_inputs[3] {
             return None;
         }
-        if geometry.b_batch.iter().any(|&dimension| dimension != 1) {
+        if single_matrix_shape(b.shape) != Some((geometry.k, geometry.n)) {
             return None;
         }
         Some(QgemmPackKey {
@@ -400,27 +478,67 @@ impl QLinearMatMulKernel {
     /// has a pack can skip densifying `B` entirely -- the dense bytes exist
     /// only to feed the packer.
     #[cfg(feature = "mlas")]
-    fn pack_lookup(&self, key: QgemmPackKey) -> Option<&mlas_sys::QgemmPackedB> {
-        self.packed_b
-            .get()?
+    fn pack_lookup(&self, key: QgemmPackKey) -> Result<Option<Arc<GrantedQgemmPack>>> {
+        let cache = self.packed_b.state()?;
+        Ok(cache
             .as_ref()
-            .and_then(|(cached, packed)| (*cached == key).then_some(packed))
+            .filter(|cached| cached.key == key)
+            .and_then(|cached| cached.packed.clone()))
     }
 
-    /// Build the pack for `key` from `b_bytes`, at most once per kernel.
-    ///
-    /// A stored `None` records that MLAS declined this shape, so the unpacked
-    /// path serves every later call without another attempt.
+    /// Serialize construction, then keep its grant with the payload.
+    /// A capacity refusal leaves the slot empty so a later call can retry.
+    /// A different weight never builds a throwaway pack or uses the cached one.
     #[cfg(feature = "mlas")]
-    fn pack_build(&self, key: QgemmPackKey, b_bytes: &[u8]) -> Option<&mlas_sys::QgemmPackedB> {
-        if b_bytes.len() != key.k.checked_mul(key.n)? {
-            return None;
+    fn pack_build(
+        &self,
+        key: QgemmPackKey,
+        b_bytes: &[u8],
+    ) -> Result<Option<Arc<GrantedQgemmPack>>> {
+        if key.k.checked_mul(key.n) != Some(b_bytes.len()) {
+            return Ok(None);
         }
-        let packed = mlas_sys::QgemmPackedB::new(key.n, key.k, b_bytes, key.a_signed, key.b_signed);
-        self.packed_b
-            .get_or_init(|| packed.map(|packed| (key, packed)))
+        let _build = self.packed_b.build.lock().map_err(|_| EpError::KernelFailed(
+            "QLinearMatMul packed-weight construction lock was poisoned; recreate the CPU kernel before retrying".into()
+        ))?;
+        {
+            let cache = self.packed_b.state()?;
+            if let Some(cached) = cache.as_ref() {
+                return Ok((cached.key == key).then(|| cached.packed.clone()).flatten());
+            }
+        }
+        // No state lock spans admission: the Host authority can synchronously
+        // reclaim this cache as well as another kernel's idle weight.
+        let Some(bytes) = mlas_sys::qgemm_pack_b_size(key.n, key.k, key.a_signed, key.b_signed)
+        else {
+            *self.packed_b.state()? = Some(CachedQgemmPack { key, packed: None });
+            return Ok(None);
+        };
+        let grant = match self.weight_memory.try_grant(bytes)? {
+            WeightAdmission::Granted(grant) => grant,
+            WeightAdmission::Declined(_) => return Ok(None),
+        };
+        let packed = mlas_sys::QgemmPackedB::new(key.n, key.k, b_bytes, key.a_signed, key.b_signed)
+            .map(|packed| {
+                Arc::new(GrantedQgemmPack {
+                    packed,
+                    _grant: grant,
+                })
+            });
+        if packed
             .as_ref()
-            .and_then(|(cached, packed)| (*cached == key).then_some(packed))
+            .is_some_and(|payload| payload.packed.owned_heap_bytes() != bytes)
+        {
+            return Err(EpError::KernelFailed(format!(
+                "QLinearMatMul packed B allocation disagrees with its {bytes}-byte Host grant for K={} N={}; fix the reference size query before retaining the pack",
+                key.k, key.n
+            )));
+        }
+        *self.packed_b.state()? = Some(CachedQgemmPack {
+            key,
+            packed: packed.clone(),
+        });
+        Ok(packed)
     }
 }
 
@@ -603,6 +721,36 @@ impl Kernel for QLinearMatMulKernel {
         }
     }
 
+    #[cfg(feature = "mlas")]
+    fn shareable_constant_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        (self.retain_caches && self.constant_inputs[3]).then(|| {
+            Arc::new(SharedQgemmPackState {
+                cache: self.packed_b.clone(),
+                memory: self.weight_memory.clone(),
+            }) as Arc<dyn std::any::Any + Send + Sync>
+        })
+    }
+
+    #[cfg(feature = "mlas")]
+    fn adopt_shareable_constant_state(
+        &mut self,
+        state: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<bool> {
+        let Ok(shared) = Arc::downcast::<SharedQgemmPackState>(state) else {
+            return Ok(false);
+        };
+        if !self.retain_caches || !self.constant_inputs[3] {
+            return Ok(false);
+        }
+        if !self.weight_memory.shares_source_with(&shared.memory) {
+            return Err(EpError::KernelFailed(
+                "QLinearMatMul cannot adopt a pack from a different derived-weight grant source; construct this node's shape variants from clones of the same CpuMemoryResources".into()
+            ));
+        }
+        self.packed_b = shared.cache.clone();
+        Ok(true)
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("QLinearMatMul", inputs, outputs, 8, 8, 1)?;
         let a = &inputs[0];
@@ -655,7 +803,12 @@ impl Kernel for QLinearMatMulKernel {
             .as_ref()
             .and_then(|plan| self.pack_key(&inputs[3], &geometry, plan));
         #[cfg(feature = "mlas")]
-        let pack_ready = pack_key.is_some_and(|key| self.pack_lookup(key).is_some());
+        let existing_pack = pack_key
+            .map(|key| self.pack_lookup(key))
+            .transpose()?
+            .flatten();
+        #[cfg(feature = "mlas")]
+        let pack_ready = existing_pack.is_some();
         #[cfg(not(feature = "mlas"))]
         let pack_ready = false;
         #[cfg_attr(not(feature = "mlas"), allow(unused_mut))]
@@ -685,10 +838,15 @@ impl Kernel for QLinearMatMulKernel {
         }
         // Loop-invariant: the pack depends only on the weight, not the batch.
         #[cfg(feature = "mlas")]
-        let packed = pack_key.and_then(|key| match self.pack_lookup(key) {
+        let packed_owner = match existing_pack {
             Some(packed) => Some(packed),
-            None => self.pack_build(key, &b_bytes),
-        });
+            None => pack_key
+                .map(|key| self.pack_build(key, &b_bytes))
+                .transpose()?
+                .flatten(),
+        };
+        #[cfg(feature = "mlas")]
+        let packed = packed_owner.as_deref().map(|owner| &owner.packed);
         #[cfg(not(feature = "mlas"))]
         let packed: Option<&()> = None;
         let (m, k, n) = (geometry.m, geometry.k, geometry.n);
@@ -1391,6 +1549,28 @@ fn requantize_byte(accumulated: i32, scale: f32, zero: i32, dtype: DataType) -> 
 #[cfg(all(test, target_arch = "aarch64"))]
 static QLINEAR_REQUANT_NEON_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(test, target_arch = "aarch64"))]
+static QLINEAR_ROW_REQUANT_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Directory-level proof counts one real vector dispatch per batch. The local
+/// witnesses below additionally prevent another thread/mode satisfying a test.
+#[cfg(all(test, target_arch = "aarch64"))]
+fn record_requantization_dispatch<const RESCALE: bool>(row: usize, prefix: usize) {
+    if row == 0 && prefix > 0 {
+        if RESCALE {
+            QLINEAR_ROW_REQUANT_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            QLINEAR_REQUANT_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+thread_local! {
+    // Separate calling-thread witnesses for shared and per-row scale routes.
+    static QLINEAR_REQUANT_NEON_THREAD_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
 
 /// Convert eight lanes at a time, returning the prefix length written. Tail
 /// elements use the same scalar contract on every target. No padding is read.
@@ -1400,9 +1580,11 @@ static QLINEAR_REQUANT_NEON_TEST_HITS: std::sync::atomic::AtomicUsize =
 /// must lie in the output dtype's range. The caller validates those properties.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn requantize_neon_prefix(
+unsafe fn requantize_neon_prefix<const RESCALE: bool>(
     accumulators: &[i32],
     scales: &[f32],
+    a_scale: f32,
+    y_scale: f32,
     zero: i32,
     signed: bool,
     bytes: &mut [u8],
@@ -1419,9 +1601,15 @@ unsafe fn requantize_neon_prefix(
         // of equal length; NEON is enabled by this function's contract.
         unsafe {
             let convert = |at: usize| {
+                let mut scale = vld1q_f32(scales.as_ptr().add(at));
+                if RESCALE {
+                    // Preserve the scalar association and both f32 rounding
+                    // steps. A reciprocal or reassociation changes output ties.
+                    scale = vdivq_f32(vmulq_f32(vdupq_n_f32(a_scale), scale), vdupq_n_f32(y_scale));
+                }
                 let values = vmulq_f32(
                     vcvtq_f32_s32(vld1q_s32(accumulators.as_ptr().add(at))),
-                    vld1q_f32(scales.as_ptr().add(at)),
+                    scale,
                 );
                 // Match Rust's NaN -> 0 conversion before clipping; propagating
                 // NaN through a platform min/max is not a portable substitute.
@@ -1457,7 +1645,23 @@ fn requantize_portable_row(
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[inline]
+fn requantize_per_row_portable_row(
+    accumulators: &[i32],
+    b_scales: &[f32],
+    a_scale: f32,
+    y_scale: f32,
+    zero: i32,
+    dtype: DataType,
+    bytes: &mut [u8],
+) {
+    for ((&accumulated, &b_scale), byte) in accumulators.iter().zip(b_scales).zip(bytes) {
+        *byte = requantize_byte(accumulated, a_scale * b_scale / y_scale, zero, dtype);
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[inline]
 fn requantize_neon_row(
     accumulators: &[i32],
     scales: &[f32],
@@ -1465,6 +1669,41 @@ fn requantize_neon_row(
     dtype: DataType,
     bytes: &mut [u8],
 ) {
+    let _ = requantize_neon_row_impl::<false>(accumulators, scales, 1.0, 1.0, zero, dtype, bytes);
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[inline]
+fn requantize_per_row_neon_row(
+    accumulators: &[i32],
+    b_scales: &[f32],
+    a_scale: f32,
+    y_scale: f32,
+    zero: i32,
+    dtype: DataType,
+    bytes: &mut [u8],
+) {
+    let _ = requantize_neon_row_impl::<true>(
+        accumulators,
+        b_scales,
+        a_scale,
+        y_scale,
+        zero,
+        dtype,
+        bytes,
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+fn requantize_neon_row_impl<const RESCALE: bool>(
+    accumulators: &[i32],
+    scales: &[f32],
+    a_scale: f32,
+    y_scale: f32,
+    zero: i32,
+    dtype: DataType,
+    bytes: &mut [u8],
+) -> usize {
     let mut start = 0;
     if scales.len() == accumulators.len() && bytes.len() == accumulators.len() {
         let valid_zero = match dtype {
@@ -1477,19 +1716,46 @@ fn requantize_neon_row(
             // establish every precondition; ordinary ONNX zero points satisfy
             // the range check by their i8/u8 dtype.
             start = unsafe {
-                requantize_neon_prefix(accumulators, scales, zero, dtype == DataType::Int8, bytes)
+                requantize_neon_prefix::<RESCALE>(
+                    accumulators,
+                    scales,
+                    a_scale,
+                    y_scale,
+                    zero,
+                    dtype == DataType::Int8,
+                    bytes,
+                )
             };
             #[cfg(test)]
-            QLINEAR_REQUANT_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if start > 0 {
+                QLINEAR_REQUANT_NEON_THREAD_HITS.with(|hits| {
+                    let mut counts = hits.get();
+                    counts[RESCALE as usize] += 1;
+                    hits.set(counts);
+                });
+            }
         }
     }
-    requantize_portable_row(
-        &accumulators[start..],
-        &scales[start..],
-        zero,
-        dtype,
-        &mut bytes[start..],
-    );
+    if RESCALE {
+        requantize_per_row_portable_row(
+            &accumulators[start..],
+            &scales[start..],
+            a_scale,
+            y_scale,
+            zero,
+            dtype,
+            &mut bytes[start..],
+        );
+    } else {
+        requantize_portable_row(
+            &accumulators[start..],
+            &scales[start..],
+            zero,
+            dtype,
+            &mut bytes[start..],
+        );
+    }
+    start
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1553,8 +1819,20 @@ fn requantize_rows(
             // portable loop without entering a vector dispatcher per row.
             #[cfg(target_arch = "aarch64")]
             if n >= 8 {
-                apply_requantization_rows(products, destination, n, |_, acc, out| {
-                    requantize_neon_row(acc, &scales, y_zero_point, dtype, out);
+                apply_requantization_rows(products, destination, n, |row, acc, out| {
+                    let prefix = requantize_neon_row_impl::<false>(
+                        acc,
+                        &scales,
+                        1.0,
+                        1.0,
+                        y_zero_point,
+                        dtype,
+                        out,
+                    );
+                    #[cfg(test)]
+                    record_requantization_dispatch::<false>(row, prefix);
+                    #[cfg(not(test))]
+                    let _ = (row, prefix);
                 });
                 return Ok(());
             }
@@ -1562,17 +1840,38 @@ fn requantize_rows(
                 requantize_portable_row(acc, &scales, y_zero_point, dtype, out);
             });
         }
-        None => apply_requantization_rows(products, destination, n, |row, acc, out| {
-            let a_scale = a_quant.at(a_batch, row).0;
-            for ((&accumulated, &b_scale), byte) in acc.iter().zip(b_scales).zip(out) {
-                *byte = requantize_byte(
-                    accumulated,
-                    a_scale * b_scale / y_scale,
+        None => {
+            #[cfg(target_arch = "aarch64")]
+            if n >= 8 {
+                apply_requantization_rows(products, destination, n, |row, acc, out| {
+                    let prefix = requantize_neon_row_impl::<true>(
+                        acc,
+                        b_scales,
+                        a_quant.at(a_batch, row).0,
+                        y_scale,
+                        y_zero_point,
+                        dtype,
+                        out,
+                    );
+                    #[cfg(test)]
+                    record_requantization_dispatch::<true>(row, prefix);
+                    #[cfg(not(test))]
+                    let _ = prefix;
+                });
+                return Ok(());
+            }
+            apply_requantization_rows(products, destination, n, |row, acc, out| {
+                requantize_per_row_portable_row(
+                    acc,
+                    b_scales,
+                    a_quant.at(a_batch, row).0,
+                    y_scale,
                     y_zero_point,
                     dtype,
+                    out,
                 );
-            }
-        }),
+            });
+        }
     }
     Ok(())
 }
@@ -1871,7 +2170,8 @@ mod tests {
         if !std::arch::is_aarch64_feature_detected!("neon") {
             return;
         }
-        let before = QLINEAR_REQUANT_NEON_TEST_HITS.load(Ordering::Relaxed);
+        let before = QLINEAR_REQUANT_NEON_THREAD_HITS.with(|hits| hits.get()[0]);
+        let dispatch_before = QLINEAR_REQUANT_NEON_TEST_HITS.load(Ordering::Relaxed);
         let a_quant = QuantParams {
             scales: vec![0.5],
             zero_points: vec![0],
@@ -1892,7 +2192,296 @@ mod tests {
         )
         .unwrap();
         assert_eq!(actual, [2; 17]);
-        assert!(QLINEAR_REQUANT_NEON_TEST_HITS.load(Ordering::Relaxed) > before);
+        assert!(QLINEAR_REQUANT_NEON_THREAD_HITS.with(|hits| hits.get()[0]) > before);
+        assert!(QLINEAR_REQUANT_NEON_TEST_HITS.load(Ordering::Relaxed) > dispatch_before);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn per_row_requantization_reaches_neon_with_exact_tail_outputs() {
+        use std::sync::atomic::Ordering;
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let before = QLINEAR_REQUANT_NEON_THREAD_HITS.with(|hits| hits.get()[1]);
+        let dispatch_before = QLINEAR_ROW_REQUANT_TEST_HITS.load(Ordering::Relaxed);
+        let a_quant = QuantParams {
+            scales: vec![0.5, 2., 0.25],
+            zero_points: vec![0; 3],
+            axis_len: 3,
+            per_axis: true,
+        };
+        let mut backing = [0xa5; 53];
+        requantize_rows(
+            &[3; 51],
+            &a_quant,
+            0,
+            &[1.; 17],
+            17,
+            1.,
+            127,
+            DataType::Uint8,
+            &mut backing[1..52],
+        )
+        .unwrap();
+        assert_eq!((backing[0], backing[52]), (0xa5, 0xa5));
+        for (row, value) in [129u8, 133, 128].into_iter().enumerate() {
+            assert!(
+                backing[1 + row * 17..1 + (row + 1) * 17]
+                    .iter()
+                    .all(|&byte| byte == value)
+            );
+        }
+        assert!(
+            QLINEAR_REQUANT_NEON_THREAD_HITS.with(|hits| hits.get()[1]) > before,
+            "native per-row scales must execute a vector block, not just the scalar loop"
+        );
+        assert!(QLINEAR_ROW_REQUANT_TEST_HITS.load(Ordering::Relaxed) > dispatch_before);
+    }
+
+    #[test]
+    fn per_row_requantization_matches_scalar_for_tails_and_nonfinite_scales() {
+        let values = [
+            i32::MIN,
+            i32::MAX,
+            -16_777_217,
+            16_777_217,
+            -511,
+            511,
+            -5,
+            -3,
+            -1,
+            0,
+            1,
+            3,
+            5,
+            127,
+            255,
+        ];
+        let factors = [
+            0.,
+            -0.,
+            0.5,
+            -0.5,
+            1.5,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(0x7fa0_0001),
+        ];
+        for n in (0..=33).chain([65, 257]) {
+            let acc: Vec<_> = (0..n + 2).map(|i| values[i % values.len()]).collect();
+            for shift in 0..factors.len() {
+                let columns: Vec<_> = (0..n + 2)
+                    .map(|i| factors[(i + shift) % factors.len()])
+                    .collect();
+                for a_scale in [
+                    0.,
+                    -0.,
+                    0.003125,
+                    1.5,
+                    f32::MIN_POSITIVE,
+                    f32::MAX,
+                    f32::INFINITY,
+                    f32::NAN,
+                ] {
+                    for y_scale in [
+                        1.,
+                        0.0625,
+                        0.,
+                        -0.,
+                        f32::MIN_POSITIVE,
+                        f32::from_bits(1),
+                        f32::MAX,
+                        f32::INFINITY,
+                        f32::NAN,
+                    ] {
+                        for (dtype, zeros) in [
+                            (DataType::Int8, [-128, -1, 0, 127]),
+                            (DataType::Uint8, [0, 1, 128, 255]),
+                        ] {
+                            for zero in zeros.into_iter().chain([i32::MIN, i32::MAX]) {
+                                let mut out = vec![0xa5; n + 2];
+                                #[cfg(target_arch = "aarch64")]
+                                requantize_per_row_neon_row(
+                                    &acc[1..n + 1],
+                                    &columns[1..n + 1],
+                                    a_scale,
+                                    y_scale,
+                                    zero,
+                                    dtype,
+                                    &mut out[1..n + 1],
+                                );
+                                #[cfg(not(target_arch = "aarch64"))]
+                                requantize_per_row_portable_row(
+                                    &acc[1..n + 1],
+                                    &columns[1..n + 1],
+                                    a_scale,
+                                    y_scale,
+                                    zero,
+                                    dtype,
+                                    &mut out[1..n + 1],
+                                );
+                                assert_eq!((out[0], out[n + 1]), (0xa5, 0xa5));
+                                for i in 0..n {
+                                    let expected = requantization_oracle(
+                                        acc[i + 1],
+                                        a_scale * columns[i + 1] / y_scale,
+                                        zero,
+                                        dtype,
+                                    );
+                                    assert_eq!(
+                                        out[i + 1],
+                                        expected,
+                                        "n={n} i={i} a={a_scale:?} y={y_scale:?} zero={zero} dtype={dtype:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn per_row_requantization_preserves_scale_association_at_rounding_boundaries() {
+        for (a_bits, b_bits, y_bits, acc) in [
+            (1080352412, 1168457022, 1329431408, 10677323),
+            (1153449446, 982523135, 1221068150, 15383253),
+        ] {
+            let a = f32::from_bits(a_bits);
+            let b = f32::from_bits(b_bits);
+            let y = f32::from_bits(y_bits);
+            let expected = requantization_oracle(acc, a * b / y, 0, DataType::Uint8);
+            assert_eq!(expected, 63);
+            if acc == 10677323 {
+                assert_eq!(
+                    requantization_oracle(acc, (a * b) * (1. / y), 0, DataType::Uint8),
+                    64,
+                    "reciprocal control must distinguish the output"
+                );
+                assert_eq!(
+                    (((acc as f32 * a) * b / y).round_ties_even() as i64).clamp(0, 255),
+                    64,
+                    "accumulator-first control must distinguish the output"
+                );
+            } else {
+                assert_eq!(
+                    requantization_oracle(acc, a * (b / y), 0, DataType::Uint8),
+                    64,
+                    "reassociation control must distinguish the output"
+                );
+            }
+            let mut out = [0; 17];
+            #[cfg(target_arch = "aarch64")]
+            requantize_per_row_neon_row(&[acc; 17], &[b; 17], a, y, 0, DataType::Uint8, &mut out);
+            #[cfg(not(target_arch = "aarch64"))]
+            requantize_per_row_portable_row(
+                &[acc; 17],
+                &[b; 17],
+                a,
+                y,
+                0,
+                DataType::Uint8,
+                &mut out,
+            );
+            assert_eq!(out, [expected; 17]);
+        }
+    }
+
+    /// Direct synchronous row epilogue comparison; no GEMM/model/pool claim.
+    /// Retain every rotating portable/native-A/native-B sample and its output
+    /// checksum. Test-only TLS witness bookkeeping is included in native arms.
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    #[ignore = "manual per-row epilogue diagnostic; run under the host lock"]
+    fn bench_per_row_requantization_neon_ab() {
+        fn cpu_seconds() -> f64 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            // SAFETY: getrusage initializes the writable object on success.
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: successful getrusage initialized usage.
+            let usage = unsafe { usage.assume_init() };
+            (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
+                + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 * 1e-6
+        }
+        use std::hint::black_box;
+        use std::time::Instant;
+        assert!(std::arch::is_aarch64_feature_detected!("neon"));
+        for n in [7, 8, 9, 17, 65, 257, 2048] {
+            for dtype in [DataType::Int8, DataType::Uint8] {
+                let acc: Vec<_> = (0..n)
+                    .map(|i| (i as i32 * 7919) % 65_537 - 32_768)
+                    .collect();
+                let scales: Vec<_> = (0..n).map(|i| (i % 7 + 1) as f32 / 4096.).collect();
+                let zero = if dtype == DataType::Int8 { -7 } else { 137 };
+                let (a, y) = (0.375, 0.625);
+                let expected: Vec<_> = acc
+                    .iter()
+                    .zip(&scales)
+                    .map(|(&v, &b)| requantization_oracle(v, a * b / y, zero, dtype))
+                    .collect();
+                assert!(
+                    expected.windows(2).any(|pair| pair[0] != pair[1]),
+                    "the fixture must not collapse to one clamped byte"
+                );
+                let checksum = expected.iter().fold(0xcbf29ce484222325u64, |hash, &value| {
+                    (hash ^ u64::from(value)).wrapping_mul(0x100000001b3)
+                });
+                let mut buffers = [vec![0; n], vec![0; n], vec![0; n]];
+                let iterations = (2_000_000 / n).max(1);
+                let before = QLINEAR_REQUANT_NEON_THREAD_HITS.with(|hits| hits.get()[1]);
+                for repetition in 0..21 {
+                    for offset in 0..3 {
+                        let arm = (repetition + offset) % 3;
+                        let kernel = if arm == 0 || n < 8 {
+                            requantize_per_row_portable_row
+                        } else {
+                            requantize_per_row_neon_row
+                        };
+                        let run = |out: &mut [u8]| {
+                            kernel(
+                                black_box(&acc),
+                                black_box(&scales),
+                                black_box(a),
+                                black_box(y),
+                                zero,
+                                dtype,
+                                out,
+                            )
+                        };
+                        run(&mut buffers[arm]);
+                        assert_eq!(buffers[arm], expected);
+                        let cpu = cpu_seconds();
+                        let wall = Instant::now();
+                        for _ in 0..iterations {
+                            run(black_box(&mut buffers[arm]));
+                        }
+                        let wall_ns = wall.elapsed().as_nanos();
+                        let cpu_ns = (cpu_seconds() - cpu) * 1e9;
+                        assert!(wall_ns > 0 && cpu_ns > 0.);
+                        assert_eq!(buffers[arm], expected);
+                        println!(
+                            "QRE_SAMPLE,1,{n},{dtype:?},{repetition},{arm},{iterations},{cpu_ns:.0},{wall_ns},{checksum}"
+                        );
+                    }
+                }
+                let hits = QLINEAR_REQUANT_NEON_THREAD_HITS.with(|counts| counts.get()[1]) - before;
+                assert_eq!(
+                    hits > 0,
+                    n >= 8,
+                    "the selected native arm must actually execute vectors"
+                );
+                println!("QRE_WITNESS,1,{n},{dtype:?},{hits}");
+            }
+        }
     }
 
     /// Same-process row epilogue diagnostic, not a GEMM or end-to-end claim.
@@ -3198,7 +3787,12 @@ mod tests {
     /// Returns whether this kernel is holding a built pack.
     #[cfg(all(test, feature = "mlas"))]
     fn qlinear_pack_state(kernel: &QLinearMatMulKernel) -> Option<bool> {
-        kernel.packed_b.get().map(|slot| slot.is_some())
+        kernel
+            .packed_b
+            .state()
+            .unwrap()
+            .as_ref()
+            .map(|slot| slot.packed.is_some())
     }
 
     #[cfg(feature = "mlas")]
@@ -3252,7 +3846,7 @@ mod tests {
     }
 
     #[cfg(feature = "mlas")]
-    fn run_with(kernel: &QLinearMatMulKernel, fixture: &PackFixture) -> Owned {
+    fn run_with(kernel: &dyn Kernel, fixture: &PackFixture) -> Owned {
         let mut output = Owned::zeros(DataType::Uint8, &[fixture.m, fixture.n]);
         let (a_scale, a_zero) = (Owned::f32(&[], &[0.02]), Owned::u8(&[], &[128]));
         let (b_scale, b_zero) = (Owned::f32(&[], &[0.01]), Owned::u8(&[], &[127]));
@@ -3269,6 +3863,522 @@ mod tests {
         ];
         kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
         output
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn provider_qlinear_pack_owns_its_host_grant() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let fixture = pack_fixture(3, 64, 96, 1);
+        let bytes = mlas_sys::qgemm_pack_b_size(96, 64, false, false)
+            .expect("the fixture must support an actual packed allocation");
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+        let resources = crate::CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+            crate::CpuWeightCacheLimits::default(),
+        )
+        .unwrap();
+        let provider = crate::CpuExecutionProvider::with_resources(resources);
+        let mut kernel = provider
+            .get_kernel(
+                &Node::new(onnx_runtime_ir::NodeId(0), "QLinearMatMul", vec![], vec![]),
+                &[],
+                10,
+            )
+            .unwrap();
+        kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        assert_eq!(governor.used(Tier::Host), 0);
+        let actual = run_with(kernel.as_ref(), &fixture);
+        assert_eq!(
+            governor.used(Tier::Host),
+            bytes as u64,
+            "the provider's Host books must fund the actual pack"
+        );
+        assert_eq!(
+            actual.bytes,
+            run_with(&QLinearMatMulKernel::default(), &fixture).bytes
+        );
+        assert_eq!(run_with(kernel.as_ref(), &fixture).bytes, actual.bytes);
+        assert_eq!(
+            governor.used(Tier::Host),
+            bytes as u64,
+            "a warm hit must not claim a second pack"
+        );
+        drop(kernel);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn qlinear_pack_capacity_refusal_retries_and_active_owner_keeps_grant() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let fixture = pack_fixture(3, 64, 96, 9);
+        let bytes = mlas_sys::qgemm_pack_b_size(96, 64, false, false).unwrap();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+        let memory = crate::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        let mut kernel = QLinearMatMulKernel::new(true, memory);
+        kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        let kv = governor
+            .reserve(
+                Tier::Host,
+                bytes as u64,
+                MemoryRole::KvCache,
+                HolderId::new(7),
+            )
+            .unwrap();
+        let unpacked = run_with(&kernel, &fixture);
+        assert!(
+            qlinear_pack_state(&kernel).is_none(),
+            "capacity refusal must leave a retryable empty slot"
+        );
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(kv);
+        assert_eq!(governor.used(Tier::Host), 0);
+        let packed = run_with(&kernel, &fixture);
+        assert_eq!(
+            packed.bytes, unpacked.bytes,
+            "refused and admitted routes must agree bitwise"
+        );
+        assert_eq!(qlinear_pack_state(&kernel), Some(true));
+        let key = kernel.packed_b.state().unwrap().as_ref().unwrap().key;
+        let live = kernel.pack_lookup(key).unwrap().unwrap();
+        assert_eq!(live.packed.owned_heap_bytes(), bytes);
+        drop(kernel);
+        assert_eq!(
+            governor.used(Tier::Host),
+            bytes as u64,
+            "an active call must keep its payload charged after kernel drop"
+        );
+        assert!(
+            governor
+                .reserve(Tier::Host, 1, MemoryRole::KvCache, HolderId::new(7))
+                .is_err()
+        );
+        drop(live);
+        assert_eq!(governor.used(Tier::Host), 0);
+        let _kv = governor
+            .reserve(
+                Tier::Host,
+                bytes as u64,
+                MemoryRole::KvCache,
+                HolderId::new(7),
+            )
+            .unwrap();
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn qlinear_pack_concurrent_builders_share_one_granted_payload() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let fixture = pack_fixture(3, 64, 96, 9);
+        let bytes = mlas_sys::qgemm_pack_b_size(96, 64, false, false).unwrap();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+        let memory = crate::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        let mut kernel = QLinearMatMulKernel::new(true, memory.clone());
+        let constant = [false, false, false, true, false, false, false, false];
+        kernel.set_constant_inputs(&constant);
+        let shared = kernel.shareable_constant_state().unwrap();
+        let builders: Vec<_> = (0..8)
+            .map(|_| {
+                let mut builder = QLinearMatMulKernel::new(true, memory.clone());
+                builder.set_constant_inputs(&constant);
+                assert!(
+                    builder
+                        .adopt_shareable_constant_state(shared.clone())
+                        .unwrap()
+                );
+                builder
+            })
+            .collect();
+        drop(shared);
+        let key = QgemmPackKey {
+            addr: fixture.b.bytes.as_ptr() as usize,
+            k: 64,
+            n: 96,
+            a_signed: false,
+            b_signed: false,
+            flip_b: false,
+        };
+        let barrier = std::sync::Barrier::new(8);
+        let owners = std::thread::scope(|scope| {
+            let threads: Vec<_> = builders
+                .iter()
+                .map(|builder| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        builder.pack_build(key, &fixture.b.bytes).unwrap().unwrap()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(owners.len(), 8);
+        assert!(owners.iter().all(|owner| Arc::ptr_eq(owner, &owners[0])));
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        let other = QgemmPackKey {
+            addr: key.addr + 1,
+            ..key
+        };
+        assert!(
+            kernel
+                .pack_build(other, &fixture.b.bytes)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(builders);
+        drop(kernel);
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(owners);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn qlinear_pack_pressure_reclaims_idle_without_deadlocking_builders() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let name = "kernels::qlinear_matmul::tests::qlinear_pack_pressure_child";
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--ignored", "--nocapture"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !timed_out,
+            "{name} deadlocked during Host pressure; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(
+            output.status.success() && stdout.contains(&format!("test {name} ... ok")),
+            "the named pressure child must run and pass; stdout={stdout}; stderr={stderr}"
+        );
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    #[ignore = "run by the bounded pressure parent to detect admission/reclaim deadlocks"]
+    fn qlinear_pack_pressure_child() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let fixture = pack_fixture(3, 64, 96, 9);
+        let bytes = mlas_sys::qgemm_pack_b_size(96, 64, false, false).unwrap();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+        let memory = crate::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        assert!(memory.supports_pressure_reclaim());
+        // Register the builder before the donor. Its own empty cache must be
+        // visited while admission holds the construction lock, without deadlock.
+        let mut builder = QLinearMatMulKernel::new(true, memory.clone());
+        let mut donor = QLinearMatMulKernel::new(true, memory);
+        for kernel in [&mut builder, &mut donor] {
+            kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        }
+        let reference = run_with(&donor, &fixture);
+        assert_eq!(qlinear_pack_state(&donor), Some(true));
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        let unrelated = LedgerGovernor::new(LeaseLedger::new(0, 0, 0));
+        assert!(
+            unrelated
+                .reserve(Tier::Host, 1, MemoryRole::KvCache, HolderId::new(7))
+                .is_err()
+        );
+        assert_eq!(
+            qlinear_pack_state(&donor),
+            Some(true),
+            "another authority must not evict this cache"
+        );
+        // The first pressure request visits the builder's empty cache before
+        // the donor. This constructs the self-callback case, before any round-
+        // robin snapshot advances the source's cursor.
+        eprintln!("pressure child: entering self-cache admission");
+        assert_eq!(run_with(&builder, &fixture).bytes, reference.bytes);
+        assert!(qlinear_pack_state(&donor).is_none());
+        assert_eq!(qlinear_pack_state(&builder), Some(true));
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        assert_eq!(builder.packed_b.reclaim_idle(0).unwrap(), 0);
+        assert_eq!(qlinear_pack_state(&builder), Some(true));
+        let kv = governor
+            .reserve(
+                Tier::Host,
+                bytes as u64,
+                MemoryRole::KvCache,
+                HolderId::new(7),
+            )
+            .expect("ordinary Host KV reserve must reclaim the idle packed weight");
+        assert!(qlinear_pack_state(&builder).is_none());
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        assert_eq!(run_with(&builder, &fixture).bytes, reference.bytes);
+        assert!(qlinear_pack_state(&builder).is_none());
+        drop(kv);
+        assert_eq!(run_with(&builder, &fixture).bytes, reference.bytes);
+        assert_eq!(qlinear_pack_state(&builder), Some(true));
+        let key = QgemmPackKey {
+            addr: fixture.b.bytes.as_ptr() as usize,
+            k: 64,
+            n: 96,
+            a_signed: false,
+            b_signed: false,
+            flip_b: false,
+        };
+        let active = builder.pack_lookup(key).unwrap().unwrap();
+        assert!(
+            governor
+                .reserve(Tier::Host, 1, MemoryRole::KvCache, HolderId::new(7))
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &active,
+            &builder.pack_lookup(key).unwrap().unwrap()
+        ));
+        drop(active);
+        assert_eq!(run_with(&donor, &fixture).bytes, reference.bytes);
+        assert!(qlinear_pack_state(&builder).is_none());
+        assert_eq!(qlinear_pack_state(&donor), Some(true));
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        let mut kv = governor
+            .reserve(Tier::Host, 0, MemoryRole::KvCache, HolderId::new(7))
+            .unwrap();
+        kv.grow(bytes as u64)
+            .expect("Host KV growth must also reclaim an idle pack");
+        assert!(qlinear_pack_state(&donor).is_none());
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(kv);
+        let builder_weak = Arc::downgrade(&builder.packed_b);
+        let donor_weak = Arc::downgrade(&donor.packed_b);
+        drop(builder);
+        drop(donor);
+        assert!(
+            builder_weak.upgrade().is_none() && donor_weak.upgrade().is_none(),
+            "pressure registration must not retain dead kernel caches"
+        );
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn shared_qlinear_state_keeps_source_policy_and_lifetime() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let fixture = pack_fixture(3, 64, 96, 11);
+        let bytes = mlas_sys::qgemm_pack_b_size(96, 64, false, false).unwrap();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+        let memory = DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        let mut first = QLinearMatMulKernel::new(true, memory.clone());
+        let mut second = QLinearMatMulKernel::new(true, memory);
+        for kernel in [&mut first, &mut second] {
+            kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        }
+        let expected = run_with(&first, &fixture);
+        assert!(
+            second
+                .adopt_shareable_constant_state(first.shareable_constant_state().unwrap())
+                .unwrap()
+        );
+        assert!(Arc::ptr_eq(&first.packed_b, &second.packed_b));
+        assert_eq!(run_with(&second, &fixture).bytes, expected.bytes);
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(first);
+        let kv = governor
+            .reserve(
+                Tier::Host,
+                bytes as u64,
+                MemoryRole::KvCache,
+                HolderId::new(7),
+            )
+            .unwrap();
+        assert!(
+            qlinear_pack_state(&second).is_none(),
+            "shared cache registration must survive its originating kernel"
+        );
+        drop(kv);
+        assert_eq!(run_with(&second, &fixture).bytes, expected.bytes);
+        let key = QgemmPackKey {
+            addr: fixture.b.bytes.as_ptr() as usize,
+            k: 64,
+            n: 96,
+            a_signed: false,
+            b_signed: false,
+            flip_b: false,
+        };
+        let live = second.pack_lookup(key).unwrap().unwrap();
+        drop(second);
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(live);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn shared_qlinear_state_rejects_foreign_sources_and_respects_retention() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, 1 << 20, 0));
+        let other = LedgerGovernor::new(LeaseLedger::new(0, 1 << 20, 0));
+        let memory = DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        let constant = [false, false, false, true, false, false, false, false];
+        let mut producer = QLinearMatMulKernel::new(true, memory.clone());
+        producer.set_constant_inputs(&constant);
+        let state = producer.shareable_constant_state().unwrap();
+        for source in [
+            DerivedWeightMemory::default(),
+            DerivedWeightMemory::governed(&other, HolderId::new(13)).unwrap(),
+            DerivedWeightMemory::governed(&governor, HolderId::new(14)).unwrap(),
+            DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+        ] {
+            let mut receiver = QLinearMatMulKernel::new(true, source);
+            receiver.set_constant_inputs(&constant);
+            let error = receiver
+                .adopt_shareable_constant_state(state.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("QLinearMatMul")
+                    && error.contains("grant source")
+                    && error.contains("CpuMemoryResources"),
+                "{error}"
+            );
+            assert!(!Arc::ptr_eq(&receiver.packed_b, &producer.packed_b));
+        }
+        for (retention, constants) in [(false, constant), (true, [false; 8])] {
+            let mut receiver = QLinearMatMulKernel::new(retention, memory.clone());
+            receiver.set_constant_inputs(&constants);
+            assert!(receiver.shareable_constant_state().is_none());
+            assert!(
+                !receiver
+                    .adopt_shareable_constant_state(state.clone())
+                    .unwrap()
+            );
+            assert!(!Arc::ptr_eq(&receiver.packed_b, &producer.packed_b));
+        }
+        let mut receiver = QLinearMatMulKernel::new(true, memory);
+        receiver.set_constant_inputs(&constant);
+        assert!(
+            !receiver
+                .adopt_shareable_constant_state(Arc::new(7usize))
+                .unwrap()
+        );
+        assert!(receiver.adopt_shareable_constant_state(state).unwrap());
+        assert!(Arc::ptr_eq(&receiver.packed_b, &producer.packed_b));
+        assert_eq!(
+            governor.used(Tier::Host),
+            0,
+            "sharing an empty state must reserve no payload"
+        );
+        assert_eq!(other.used(Tier::Host), 0);
+        let mut local = QLinearMatMulKernel::default();
+        let mut local_peer = QLinearMatMulKernel::default();
+        local.set_constant_inputs(&constant);
+        local_peer.set_constant_inputs(&constant);
+        assert!(
+            local_peer
+                .adopt_shareable_constant_state(local.shareable_constant_state().unwrap())
+                .unwrap()
+        );
+        assert!(Arc::ptr_eq(&local.packed_b, &local_peer.packed_b));
+        assert!(
+            receiver
+                .adopt_shareable_constant_state(local.shareable_constant_state().unwrap())
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn qlinear_prediction_covers_single_matrix_shapes_and_declines_distinct_batches() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let mut observed_pack = false;
+        for shape in [
+            vec![64],
+            vec![64, 96],
+            vec![1, 64, 96],
+            vec![1, 1, 64, 96],
+            vec![2, 64, 96],
+        ] {
+            let n = if shape.len() == 1 { 1 } else { 96 };
+            let mut fixture = pack_fixture(3, 64, n, 5);
+            fixture.b = Owned::u8(&shape, &vec![129; shape.iter().product()]);
+            let mut graph = Graph::new();
+            let b = graph.create_named_value(
+                "b",
+                DataType::Uint8,
+                shape.iter().map(|&d| Dim::Static(d)).collect(),
+            );
+            graph.set_initializer(
+                b,
+                onnx_runtime_ir::WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                    DataType::Uint8,
+                    shape.clone(),
+                    fixture.b.bytes.clone(),
+                )),
+            );
+            let mut node = Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "QLinearMatMul",
+                vec![None, None, None, Some(b)],
+                vec![],
+            );
+            let predicted = node_qlinear_packed_b_bytes(&node, &graph);
+            let governor = LedgerGovernor::new(LeaseLedger::new(0, 1 << 20, 0));
+            let mut kernel = QLinearMatMulKernel::new(
+                true,
+                DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+            );
+            kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+            let output_shape = Geometry::new(&fixture.a.shape, &fixture.b.shape)
+                .unwrap()
+                .output_shape;
+            let mut output = Owned::zeros(DataType::Uint8, &output_shape);
+            run_into(&kernel, &fixture, &mut output);
+            let mut reference = Owned::zeros(DataType::Uint8, &output_shape);
+            run_into(&QLinearMatMulKernel::default(), &fixture, &mut reference);
+            assert_eq!(output.bytes, reference.bytes);
+            let actual = governor.used(Tier::Host);
+            assert!(
+                predicted >= actual,
+                "shape={shape:?} prediction={predicted} actual={actual}"
+            );
+            if shape[0] == 2 {
+                assert_eq!(predicted, 0);
+                assert!(qlinear_pack_state(&kernel).is_none());
+            } else if qlinear_pack_state(&kernel) == Some(true) {
+                assert!(actual > 0);
+                observed_pack = true;
+            }
+            graph.add_input(b);
+            assert_eq!(
+                node_qlinear_packed_b_bytes(&node, &graph),
+                0,
+                "overridable initializers are not immutable weights"
+            );
+            node.domain = "custom".into();
+            assert_eq!(node_qlinear_packed_b_bytes(&node, &graph), 0);
+        }
+        assert!(
+            observed_pack,
+            "the bound must be checked against an actual packed allocation"
+        );
     }
 
     /// A constant weight must be packed exactly once and then reused, and the
@@ -3375,7 +4485,9 @@ mod tests {
                         )
                         .unwrap(),
                 )
+                .unwrap()
                 .unwrap();
+            let packed = &packed.packed;
             let zeros = vec![127u8; n];
             let mut products = vec![0i32; m * n];
             for _ in 0..3 {
@@ -3654,11 +4766,14 @@ mod tests {
             .pack_key(&flat.view(), &plan_geometry, &plan)
             .expect("a constant 2-D weight is packable, or the rest is vacuous");
         assert!(
-            kernel.pack_build(key, &[7u8; 8]).is_none(),
+            kernel.pack_build(key, &[7u8; 8]).unwrap().is_none(),
             "a byte count that is not k * n must be declined, not packed"
         );
         assert!(
-            kernel.pack_build(key, &vec![7u8; 64 * 96]).is_some(),
+            kernel
+                .pack_build(key, &vec![7u8; 64 * 96])
+                .unwrap()
+                .is_some(),
             "MLAS must accept this shape, or the decline above proves nothing"
         );
     }

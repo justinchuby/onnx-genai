@@ -21,8 +21,6 @@ use std::cell::Cell;
 #[cfg(feature = "mlas")]
 use std::collections::HashMap;
 use std::sync::Arc;
-#[cfg(feature = "mlas")]
-use std::sync::LazyLock;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "mlas")]
@@ -34,14 +32,12 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node};
 use rayon::prelude::*;
 
-use super::dense_weight_cache::{
-    DenseWeight, DenseWeightCache, DenseWeightKey, DenseWeightLoad, DenseWeightSpec,
-};
 use super::int4_nibble;
 use super::matmul::gemm;
+use super::weight_cache::{GrantedWeight, WeightCache, WeightCacheKey, WeightLoad, WeightSpec};
 use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_f32};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
-use crate::resources::{DerivedWeightGrant, WeightAdmission};
+use crate::resources::{DerivedWeightGrant, IdleWeightCache, WeightAdmission};
 use crate::strided::numel;
 use crate::{CpuMemoryResources, DerivedWeightMemory};
 
@@ -667,14 +663,14 @@ fn hand_int8_decode_has_native_dot() -> bool {
     }
 }
 
-// This key names the immutable f32 NK slot of one kernel, not a process-wide
+// This key names the immutable f32 NK slot of one node, not a process-wide
 // weight address. Only the existing all-constant operand proof enables retention.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct NBitsDenseKey {
     bytes: usize,
 }
-impl DenseWeightKey for NBitsDenseKey {
-    fn dense_bytes(&self) -> Result<usize> {
+impl WeightCacheKey for NBitsDenseKey {
+    fn weight_bytes(&self) -> Result<usize> {
         Ok(self.bytes)
     }
 }
@@ -692,73 +688,63 @@ pub struct MatMulNBitsKernel {
     flops: Option<u64>,
     weight_prepacked: bool,
     constant_inputs: [bool; 5],
-    dense_weights: DenseWeightCache<NBitsDenseKey>,
-    int8_weight: OnceLock<PreparedWeight<Int8Weight>>,
-    packed_int4_weight: OnceLock<PreparedWeight<PackedInt4Weight>>,
-    packed_int4_n16_weight: OnceLock<PreparedWeight<PackedN16SdotWeight>>,
-    packed_kai_qsi4_weight: OnceLock<PreparedWeight<PackedKaiSdotWeight>>,
-    packed_nbits_weight: OnceLock<PreparedWeight<PackedNBitsWeight>>,
+    dense_weights: Arc<WeightCache<NBitsDenseKey>>,
     weight_memory: DerivedWeightMemory,
+    native_packs: Arc<NativePackCaches>,
+    /// Node-local reference layouts, shared only through constant-state adoption.
+    #[cfg(feature = "mlas")]
+    mlas_caches: Arc<MlasPackedCaches>,
+}
+
+/// One node's native layout slots and cold-fill gate. Shape variants share
+/// this owner; active readers and pressure registration keep their old lifetime.
+struct NativePackCaches {
+    int8_weight: NativeWeightCache<Int8Weight>,
+    packed_int4_weight: NativeWeightCache<PackedInt4Weight>,
+    packed_int4_n16_weight: NativeWeightCache<PackedN16SdotWeight>,
+    packed_kai_qsi4_weight: NativeWeightCache<PackedKaiSdotWeight>,
+    packed_nbits_weight: NativeWeightCache<PackedNBitsWeight>,
+    packed_u8_weight: NativeWeightCache<PackedU8Weight>,
+    packed_u8_n16_weight: NativeWeightCache<PackedN16SdotWeight>,
+    packed_kai_qsi8_weight: NativeWeightCache<PackedKaiSdotWeight>,
     native_pack_fill: std::sync::Mutex<()>,
-    packed_u8_weight: OnceLock<PreparedWeight<PackedU8Weight>>,
-    packed_u8_n16_weight: OnceLock<PreparedWeight<PackedN16SdotWeight>>,
-    packed_kai_qsi8_weight: OnceLock<PreparedWeight<PackedKaiSdotWeight>>,
-    #[cfg(feature = "mlas")]
-    mlas_shards: OnceLock<Option<Arc<Vec<Option<MlasShard>>>>>,
-    #[cfg(feature = "mlas")]
-    mlas_packed: OnceLock<Option<Arc<MlasPreparedPacked>>>,
-    /// The shared-store keys this kernel *installed*, and is therefore
-    /// responsible for evicting when it drops (#1735). Empty when it only
-    /// shared an entry a sibling instance had already built.
-    #[cfg(feature = "mlas")]
-    mlas_owned: MlasPackedOwnership,
 }
-
-/// Packed weights a kernel installed in the process-global store must not
-/// outlive it (#1735) -- the same lifetime defect #1726 fixed for the
-/// weight-transpose caches, in the store that holds MLAS SQNBit packs.
-///
-/// The store is keyed on the operands' addresses and holds no claim on the
-/// buffers there. An address only names a weight while that weight is live;
-/// once freed, the next allocation of matching shape and pack parameters to
-/// land on it is served the previous weight's packed bytes, with the right
-/// route and silently foreign numbers. `clear_mlas_packed_caches` closes only
-/// the cross-*model* case, at `Executor` drop; this closes the transient weight
-/// freed while the process lives on.
-///
-/// Ownership is the installing call, never a hit: a kernel that shared its
-/// sibling's pack evicts nothing, so a prefill instance retiring cannot force
-/// the live decode instance to re-pack.
-///
-/// A separate type rather than a `Drop` on the kernel itself: `MatMulNBitsKernel`
-/// is built throughout the tests with functional-update syntax
-/// (`..test_kernel(..)`), and a type that implements `Drop` cannot be moved out
-/// of. Holding the responsibility in a field keeps the kernel freely movable
-/// while still running the eviction exactly once, when the kernel dies.
-#[cfg(feature = "mlas")]
-#[derive(Default)]
-struct MlasPackedOwnership {
-    shards: OnceLock<MlasPackedKey>,
-    packed: OnceLock<MlasPackedKey>,
-}
-
-#[cfg(feature = "mlas")]
-impl Drop for MlasPackedOwnership {
-    fn drop(&mut self) {
-        let shards = self.shards.get();
-        let packed = self.packed.get();
-        if shards.is_none() && packed.is_none() {
-            return;
+impl NativePackCaches {
+    fn new(memory: &DerivedWeightMemory) -> Self {
+        Self {
+            int8_weight: NativeWeightCache::new(memory),
+            packed_int4_weight: NativeWeightCache::new(memory),
+            packed_int4_n16_weight: NativeWeightCache::new(memory),
+            packed_kai_qsi4_weight: NativeWeightCache::new(memory),
+            packed_nbits_weight: NativeWeightCache::new(memory),
+            packed_u8_weight: NativeWeightCache::new(memory),
+            packed_u8_n16_weight: NativeWeightCache::new(memory),
+            packed_kai_qsi8_weight: NativeWeightCache::new(memory),
+            native_pack_fill: std::sync::Mutex::new(()),
         }
-        with_mlas_packed_caches(|caches| {
-            if let Some(key) = shards {
-                caches.remove_shards(key);
-            }
-            if let Some(key) = packed {
-                caches.remove_packed(key);
-            }
-        });
     }
+}
+
+#[derive(PartialEq, Eq)]
+struct NBitsWeightParameters {
+    k: usize,
+    n: usize,
+    bits: usize,
+    block_size: usize,
+    accuracy_level: i64,
+    weight_prepacked: bool,
+    constant_inputs: [bool; 5],
+    dense_byte_limit: usize,
+    #[cfg(feature = "mlas")]
+    retain_mlas_packs: bool,
+}
+struct SharedNBitsWeightState {
+    caches: Arc<NativePackCaches>,
+    #[cfg(feature = "mlas")]
+    mlas_caches: Arc<MlasPackedCaches>,
+    dense_weights: Arc<WeightCache<NBitsDenseKey>>,
+    memory: DerivedWeightMemory,
+    parameters: NBitsWeightParameters,
 }
 
 /// One contiguous output-column shard of an MLAS SQNBit-packed weight: columns
@@ -919,41 +905,33 @@ struct MlasPreparedInputs<'a> {
 /// Source encoding (wire or serialized) and scale dtype determine interpretation
 /// even when the input addresses are identical.
 ///
-/// * **`addr`** -- the constant weight's mmap address, distinguishing weights;
-/// * **`n`, `k`, `bits`, `block_size`** -- the geometry, so a same-address
-///   different-shape weight (an allocator recycling a freed address) misses
-///   rather than serving the wrong bytes;
-/// * **`has_zero_points`** -- symmetric vs asymmetric pack (different contents);
-/// * **`comp_int8`** -- the [`mlas_sys::SQNBitComputeType`] discriminant, since
-///   `Int8` bakes scale/zero-point into per-block sums while `Fp32` keeps the
-///   nibbles only, so the packed layouts differ.
+/// Layout identity includes source, geometry, scale dtype, serialized encoding,
+/// zero-point presence and compute type. CompInt8 bakes scales/zero points into
+/// block sums, while CompFp32 uses a different packed representation.
 ///
-/// `addr` alone is **not** an identity: an allocator recycles a freed weight's
-/// address for a later same-shaped weight (the #845/#1079 hazard that cost a
-/// full debugging cycle). The shape fields close the different-shape case, and
-/// the operand addresses close the same-shape-different-scales case. What no
-/// key can close is the *lifetime* case -- an address names a weight only while
-/// that weight is live -- so the entry is bounded by its installer instead:
-/// `MatMulNBitsKernel::drop` evicts what it installed (#1735), and
-/// [`clear_mlas_packed_caches`] clears the rest at `Executor` drop, the exact
-/// boundary at which `weight_transpose::clear_all` runs. The
-/// N-shard partition is *not* a field because it is a pure function of the fixed
-/// process topology and `n` (see [`MatMulNBitsKernel::mlas_shard_segments`]), so
-/// two instances of one node always partition identically.
+/// Source addresses distinguish contiguous operands inside one immutable node;
+/// noncontiguous constants use that node's explicit logical slot. The node owner
+/// bounds their lifetime. N-shard partitioning follows fixed topology and N.
+#[cfg(feature = "mlas")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum MlasPackedSource {
+    HostAddresses {
+        weight: usize,
+        scales: usize,
+        zero_points: usize,
+    },
+    /// Noncontiguous immutable operands belong to the explicit node owner.
+    /// Dynamic operands never enter this cache; no cross-node lookup exists.
+    NodeConstant,
+}
+
 #[cfg(feature = "mlas")]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct MlasPackedKey {
     authority: Option<onnx_runtime_memory_governor::MemoryAuthorityId>,
     prepacked: bool,
     scales_dtype: DataType,
-    addr: usize,
-    /// Address of the scales tensor, and of the zero-points tensor when present
-    /// (`0` when absent). The pack is a function of all three operands -- an
-    /// `Int8` pack bakes scale and zero-point into per-block sums -- so keying
-    /// on the quantized weight alone would let two nodes that share a `B`
-    /// initializer but carry different scales be served each other's pack.
-    scales_addr: usize,
-    zero_points_addr: usize,
+    source: MlasPackedSource,
     n: usize,
     k: usize,
     bits: usize,
@@ -969,9 +947,7 @@ impl MlasPackedKey {
         authority: Option<onnx_runtime_memory_governor::MemoryAuthorityId>,
         prepacked: bool,
         scales_dtype: DataType,
-        addr: usize,
-        scales_addr: usize,
-        zero_points_addr: usize,
+        source: MlasPackedSource,
         n: usize,
         k: usize,
         bits: usize,
@@ -983,9 +959,7 @@ impl MlasPackedKey {
             authority,
             prepacked,
             scales_dtype,
-            addr,
-            scales_addr,
-            zero_points_addr,
+            source,
             n,
             k,
             bits,
@@ -996,17 +970,10 @@ impl MlasPackedKey {
     }
 }
 
-/// Process-global, weight-identity-keyed store of MLAS SQNBit packed weights,
-/// so the prefill and decode instances of one node share a single packed
-/// allocation instead of packing one copy each (#1056).
-///
-/// Two maps because the two MLAS routes hold different value types -- the
-/// N-sharded decode layout (`shards`) and the single full-width layout
-/// (`packed`, used by `weight_prepacked=1` and the `NO_SHARD` A/B) -- but a
-/// given node only ever populates one of them, and both are keyed by the same
-/// [`MlasPackedKey`]. Entries are `Arc` so a kernel-local `OnceLock` memo and
-/// the store share one allocation; the byte total (`SQNBIT_PACKED_LIVE_BYTES` in
-/// `mlas-sys`) counts each packed buffer once, so a shared entry is one copy.
+/// One node's reference layouts and per-key cold-fill gates. Explicit constant
+/// state adoption shares this owner across activation shapes. Independent nodes
+/// and sessions never rendezvous by address, even on identical physical books.
+/// Active payload readers retain their own grants after this owner drops.
 #[cfg(feature = "mlas")]
 #[derive(Default)]
 struct MlasPackedCaches {
@@ -1015,14 +982,30 @@ struct MlasPackedCaches {
     packed: Mutex<HashMap<MlasPackedKey, Arc<MlasPreparedPacked>>>,
 }
 
-/// A store lookup's result: the shared entry, and whether *this* call installed
-/// it. Only the installer owns the eviction (#1735), so the flag has to survive
-/// all the way back to the caller rather than being folded into the `Arc`.
-#[cfg(feature = "mlas")]
-type MlasStoreEntry<T> = Result<Option<(Arc<T>, bool)>>;
-
 #[cfg(feature = "mlas")]
 impl MlasPackedCaches {
+    fn new(memory: &DerivedWeightMemory) -> Arc<Self> {
+        let caches = Arc::new(Self::default());
+        memory.register_idle_cache(&caches);
+        caches
+    }
+
+    fn shards(&self, key: &MlasPackedKey) -> Option<Arc<Vec<Option<MlasShard>>>> {
+        self.shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+
+    fn packed(&self, key: &MlasPackedKey) -> Option<Arc<MlasPreparedPacked>> {
+        self.packed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+
     /// A weak per-key gate serializes only identical cold preparations. Neither
     /// the value-map nor gate-registry mutex is held across a builder/accountant.
     fn fill_gate(&self, key: MlasPackedKey) -> Arc<Mutex<()>> {
@@ -1048,47 +1031,26 @@ impl MlasPackedCaches {
         &self,
         key: MlasPackedKey,
         build: impl FnOnce() -> Result<Option<Vec<Option<MlasShard>>>>,
-    ) -> MlasStoreEntry<Vec<Option<MlasShard>>> {
-        if let Some(hit) = self
-            .shards
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .cloned()
-        {
-            return Ok(Some((hit, false)));
+    ) -> Result<Option<Arc<Vec<Option<MlasShard>>>>> {
+        if let Some(hit) = self.shards(&key) {
+            return Ok(Some(hit));
         }
         let gate = self.fill_gate(key);
         let _fill = gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(hit) = self
-            .shards
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .cloned()
-        {
-            return Ok(Some((hit, false)));
+        if let Some(hit) = self.shards(&key) {
+            return Ok(Some(hit));
         }
         let Some(built) = build()? else {
             return Ok(None);
         };
         let arc = Arc::new(built);
-        let selected = {
-            let mut entries = self
-                .shards
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match entries.entry(key) {
-                std::collections::hash_map::Entry::Occupied(entry) => (entry.get().clone(), false),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    (entry.insert(arc.clone()).clone(), true)
-                }
-            }
-        };
-        drop(arc);
-        Ok(Some(selected))
+        self.shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, arc.clone());
+        Ok(Some(arc))
     }
 
     /// Full-width analogue of [`Self::get_or_build_shards`].
@@ -1096,56 +1058,30 @@ impl MlasPackedCaches {
         &self,
         key: MlasPackedKey,
         build: impl FnOnce() -> Result<Option<MlasPreparedPacked>>,
-    ) -> MlasStoreEntry<MlasPreparedPacked> {
-        if let Some(hit) = self
-            .packed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .cloned()
-        {
-            return Ok(Some((hit, false)));
+    ) -> Result<Option<Arc<MlasPreparedPacked>>> {
+        if let Some(hit) = self.packed(&key) {
+            return Ok(Some(hit));
         }
         let gate = self.fill_gate(key);
         let _fill = gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(hit) = self
-            .packed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .cloned()
-        {
-            return Ok(Some((hit, false)));
+        if let Some(hit) = self.packed(&key) {
+            return Ok(Some(hit));
         }
         let Some(built) = build()? else {
             return Ok(None);
         };
         let arc = Arc::new(built);
-        let selected = {
-            let mut entries = self
-                .packed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match entries.entry(key) {
-                std::collections::hash_map::Entry::Occupied(entry) => (entry.get().clone(), false),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    (entry.insert(arc.clone()).clone(), true)
-                }
-            }
-        };
-        drop(arc);
-        Ok(Some(selected))
+        self.packed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, arc.clone());
+        Ok(Some(arc))
     }
 
-    /// Drop the entry `key` names from the sharded store, if still present.
-    ///
-    /// The caller is the kernel that *installed* it. Entries are keyed on the
-    /// operands' addresses, and nothing in the key proves the bytes there are
-    /// still the ones that were packed, so an entry outliving its source is
-    /// served to whatever lands on that address next -- the #1726 defect, in a
-    /// store whose values are packed weights rather than transposes.
+    /// Exercise membership removal without revoking active readers.
+    #[cfg(test)]
     fn remove_shards(&self, key: &MlasPackedKey) {
         let retired = {
             self.shards
@@ -1156,17 +1092,7 @@ impl MlasPackedCaches {
         drop(retired);
     }
 
-    /// Full-width analogue of [`Self::remove_shards`].
-    fn remove_packed(&self, key: &MlasPackedKey) {
-        let retired = {
-            self.packed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(key)
-        };
-        drop(retired);
-    }
-
+    #[cfg(test)]
     fn clear(&self) {
         let shards = {
             std::mem::take(
@@ -1189,92 +1115,78 @@ impl MlasPackedCaches {
     }
 }
 
-/// The process-global packed store, the **only** store production uses.
 #[cfg(feature = "mlas")]
-// Under `cfg(test)` every kernel installs into the thread-local store below,
-// so this one is genuinely unreachable there; it is the production store.
-#[cfg_attr(test, allow(dead_code))]
-static MLAS_PACKED_GLOBAL: LazyLock<MlasPackedCaches> = LazyLock::new(MlasPackedCaches::default);
-
-#[cfg(all(test, feature = "mlas"))]
-thread_local! {
-    /// Test-only, per-thread packed store. libtest runs each `#[test]` on its
-    /// own fresh thread, so a thread-local store is empty at the start of every
-    /// test and dropped when the test's thread ends. That gives each test a
-    /// private store -- a weight address freed by one test can never serve a
-    /// stale pack to another test on a different thread -- while a single test's
-    /// prefill and decode kernels (which run on that one test thread) still share
-    /// one entry, exactly as production does. Production never reads this; the
-    /// process-global store is the only writer of any global (#983/#1033/#1079).
-    static MLAS_PACKED_TEST_LOCAL: MlasPackedCaches = MlasPackedCaches::default();
-}
-
-/// Run `f` against the active packed store: the per-thread store under test, the
-/// process-global store in production.
-#[cfg(feature = "mlas")]
-#[inline]
-fn with_mlas_packed_caches<R>(f: impl FnOnce(&MlasPackedCaches) -> R) -> R {
-    // Exactly one of these blocks survives cfg-stripping, so whichever it is
-    // becomes the tail expression. An early `return` in the first reads more
-    // obviously but trips `needless_return`, which reaches the `-D warnings`
-    // lane whenever the research `mlas` feature is on.
-    #[cfg(test)]
-    {
-        MLAS_PACKED_TEST_LOCAL.with(|caches| f(caches))
-    }
-    #[cfg(not(test))]
-    {
-        f(&MLAS_PACKED_GLOBAL)
-    }
-}
-
-/// Test-only: how many entries the active packed store holds, as
-/// `(shards, packed)`. Used to assert that a retiring kernel evicts exactly what
-/// it installed and nothing a live sibling still needs (#1735).
-#[cfg(all(test, feature = "mlas"))]
-fn mlas_store_len() -> (usize, usize) {
-    with_mlas_packed_caches(|caches| {
-        (
-            caches
+impl IdleWeightCache for MlasPackedCaches {
+    fn reclaim_idle(&self, want: usize) -> Result<usize> {
+        if want == 0 {
+            return Ok(0);
+        }
+        let mut bytes = 0usize;
+        let retired_shards: Vec<_> = {
+            let mut entries = self
                 .shards
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len(),
-            caches
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries
+                .extract_if(|_, value| {
+                    if bytes >= want || Arc::strong_count(value) != 1 {
+                        return false;
+                    }
+                    bytes = bytes.saturating_add(
+                        value
+                            .iter()
+                            .flatten()
+                            .map(|shard| shard.prepared.packed.owned_heap_bytes())
+                            .sum::<usize>(),
+                    );
+                    true
+                })
+                .collect()
+        };
+        let retired_packed: Vec<_> = {
+            let mut entries = self
                 .packed
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len(),
-        )
-    })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries
+                .extract_if(|_, value| {
+                    if bytes >= want || Arc::strong_count(value) != 1 {
+                        return false;
+                    }
+                    bytes = bytes.saturating_add(value.packed.owned_heap_bytes());
+                    true
+                })
+                .collect()
+        };
+        // Refund callbacks may reenter the authority and either map. No state
+        // or fill-registry lock may be held while a retired payload drops.
+        drop(retired_shards);
+        drop(retired_packed);
+        Ok(bytes)
+    }
 }
 
-/// Evict every shared MLAS SQNBit packed weight.
-///
-/// **Must** run when an `Executor` drops, for the same reason
-/// `weight_transpose::clear_all` does: the store is keyed on `(address, shape,
-/// pack params)`, which makes a stale hit impossible for a *different-shaped*
-/// weight, but a later model whose mmap places a same-shaped weight at a
-/// recycled address would still match. Clearing on `Executor` drop bounds the
-/// store across model lifetimes; a kernel outliving nothing but its own weight
-/// is handled earlier, by `MatMulNBitsKernel::drop` evicting what it installed
-/// (#1735). This runs *before* the executor frees its weight buffers, which is
-/// what makes the teardown ordering safe rather than merely lucky. In production only the
-/// global store exists; the per-test thread-locals are cleared by their threads
-/// ending, so this is a no-op for them.
-#[cfg(feature = "mlas")]
-pub fn clear_mlas_packed_caches() {
-    // Through `with_mlas_packed_caches`, not `MLAS_PACKED_GLOBAL` directly: under
-    // `cfg(test)` the kernels install into the thread-local store, so clearing
-    // the global one would drain a store nothing in the test ever touched and
-    // silently leave the real entries resident.
-    with_mlas_packed_caches(|caches| caches.clear());
+#[cfg(all(test, feature = "mlas"))]
+impl MatMulNBitsKernel {
+    fn cached_mlas_shards(&self) -> Option<Arc<Vec<Option<MlasShard>>>> {
+        self.mlas_caches
+            .shards
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .cloned()
+    }
+    fn cached_mlas_packed(&self) -> Option<Arc<MlasPreparedPacked>> {
+        self.mlas_caches
+            .packed
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .cloned()
+    }
 }
-
-/// No-op stand-in when the `mlas` feature is off, so the executor's drop path
-/// can call it unconditionally.
-#[cfg(not(feature = "mlas"))]
-pub fn clear_mlas_packed_caches() {}
 
 /// N-tile alignment for the persistent-pool MLAS SQNBit decode shards.
 ///
@@ -1417,6 +1329,7 @@ struct PackedNBitsWeight {
 /// Declaration order frees all payload buffers before returning capacity.
 struct PreparedWeight<T> {
     weight: T,
+    bytes: usize,
     _grant: DerivedWeightGrant,
 }
 impl<T> std::ops::Deref for PreparedWeight<T> {
@@ -1426,12 +1339,61 @@ impl<T> std::ops::Deref for PreparedWeight<T> {
     }
 }
 
-/// A cached borrow or a call-owned preparation always keeps its funding alive.
-enum PreparedWeightRef<'a, T> {
-    Cached(&'a PreparedWeight<T>),
+/// A kernel's immutable native layout slot. Readers own the payload so idle
+/// eviction never returns funding while a matrix multiplication still uses it.
+struct NativeWeightCache<T> {
+    inner: Arc<std::sync::Mutex<Option<Arc<PreparedWeight<T>>>>>,
+}
+impl<T: Send + Sync + 'static> NativeWeightCache<T> {
+    fn new(memory: &DerivedWeightMemory) -> Self {
+        let inner = Arc::new(std::sync::Mutex::new(None));
+        memory.register_idle_cache(&inner);
+        Self { inner }
+    }
+    fn get(&self) -> Option<Arc<PreparedWeight<T>>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    fn insert(&self, weight: Arc<PreparedWeight<T>>) {
+        let old = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(weight);
+        // Returning grants can call an external accountant; never do so under
+        // the cache lock, including when replacing an entry in a cold fill.
+        drop(old);
+    }
+}
+impl<T: Send + Sync> IdleWeightCache for std::sync::Mutex<Option<Arc<PreparedWeight<T>>>> {
+    fn reclaim_idle(&self, want: usize) -> Result<usize> {
+        let retired = {
+            let mut slot = self
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if want == 0
+                || slot
+                    .as_ref()
+                    .is_none_or(|weight| Arc::strong_count(weight) != 1)
+            {
+                return Ok(0);
+            }
+            slot.take()
+        };
+        let bytes = retired.as_ref().map_or(0, |weight| weight.bytes);
+        drop(retired);
+        Ok(bytes)
+    }
+}
+
+/// A shared cached reader or call-owned preparation keeps its funding alive.
+enum PreparedWeightRef<T> {
+    Cached(Arc<PreparedWeight<T>>),
     Owned(PreparedWeight<T>),
 }
-impl<T> std::ops::Deref for PreparedWeightRef<'_, T> {
+impl<T> std::ops::Deref for PreparedWeightRef<T> {
     type Target = T;
     fn deref(&self) -> &T {
         match self {
@@ -1453,7 +1415,7 @@ enum NativePackLayout {
 
 /// A payload's Rust type fixes its physical layout and preparation recipe.
 /// Admission cannot accidentally charge a compact layout for an expanded pack.
-trait NativePackedWeight: Sized {
+trait NativePackedWeight: Sized + Send + Sync + 'static {
     const LAYOUT: NativePackLayout;
     fn build(
         kernel: &MatMulNBitsKernel,
@@ -1562,7 +1524,7 @@ struct PackedNBitsView<'a> {
 /// Ownership is necessary only when conversion or explicit placement requires it.
 enum PackedNBitsOperand<'a> {
     View(PackedNBitsView<'a>),
-    Prepared(PreparedWeightRef<'a, PackedNBitsWeight>),
+    Prepared(PreparedWeightRef<PackedNBitsWeight>),
 }
 
 impl PackedNBitsOperand<'_> {
@@ -1847,30 +1809,18 @@ impl KernelFactory for MatMulNBitsFactory {
             flops,
             weight_prepacked: weight_prepacked == 1,
             constant_inputs: [false; 5],
-            dense_weights: DenseWeightCache::new(
+            dense_weights: Arc::new(WeightCache::new(
                 self.resources.weight_memory().clone(),
                 if self.resources.cache_retention().is_admitted() {
                     self.resources.weight_cache_limits().dense_bytes
                 } else {
                     0
                 },
-            ),
-            int8_weight: OnceLock::new(),
-            packed_int4_weight: OnceLock::new(),
-            packed_int4_n16_weight: OnceLock::new(),
-            packed_kai_qsi4_weight: OnceLock::new(),
-            packed_nbits_weight: OnceLock::new(),
+            )),
             weight_memory: self.resources.weight_memory().clone(),
-            native_pack_fill: std::sync::Mutex::new(()),
-            packed_u8_weight: OnceLock::new(),
-            packed_u8_n16_weight: OnceLock::new(),
-            packed_kai_qsi8_weight: OnceLock::new(),
+            native_packs: Arc::new(NativePackCaches::new(self.resources.weight_memory())),
             #[cfg(feature = "mlas")]
-            mlas_owned: MlasPackedOwnership::default(),
-            #[cfg(feature = "mlas")]
-            mlas_shards: OnceLock::new(),
-            #[cfg(feature = "mlas")]
-            mlas_packed: OnceLock::new(),
+            mlas_caches: MlasPackedCaches::new(self.resources.weight_memory()),
         }))
     }
 }
@@ -1880,6 +1830,42 @@ impl Kernel for MatMulNBitsKernel {
         for (index, is_constant) in self.constant_inputs.iter_mut().enumerate() {
             *is_constant = constant_inputs.get(index).copied().unwrap_or(false);
         }
+    }
+
+    fn shareable_constant_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        let parameters = self.shareable_weight_parameters()?;
+        Some(Arc::new(SharedNBitsWeightState {
+            caches: self.native_packs.clone(),
+            #[cfg(feature = "mlas")]
+            mlas_caches: self.mlas_caches.clone(),
+            dense_weights: self.dense_weights.clone(),
+            memory: self.weight_memory.clone(),
+            parameters,
+        }))
+    }
+
+    fn adopt_shareable_constant_state(
+        &mut self,
+        state: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<bool> {
+        let Ok(shared) = Arc::downcast::<SharedNBitsWeightState>(state) else {
+            return Ok(false);
+        };
+        if self.shareable_weight_parameters().as_ref() != Some(&shared.parameters) {
+            return Ok(false);
+        }
+        if !self.weight_memory.shares_source_with(&shared.memory) {
+            return Err(error(
+                "cannot adopt derived weights from a different derived-weight grant source; construct this node's shape variants from clones of the same CpuMemoryResources",
+            ));
+        }
+        self.native_packs = shared.caches.clone();
+        #[cfg(feature = "mlas")]
+        {
+            self.mlas_caches = shared.mlas_caches.clone();
+        }
+        self.dense_weights = shared.dense_weights.clone();
+        Ok(true)
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -2211,7 +2197,7 @@ impl Kernel for MatMulNBitsKernel {
         {
             if dot_kernel.uses_kai_sdot_direct(self.bits, self.block_size) {
                 let prepared_weight = self.load_native_weight(
-                    &self.packed_kai_qsi4_weight,
+                    &self.native_packs.packed_kai_qsi4_weight,
                     can_prepack,
                     &inputs[1],
                     &inputs[2],
@@ -2231,7 +2217,7 @@ impl Kernel for MatMulNBitsKernel {
                 })?;
             } else if dot_kernel.uses_n16_sdot_direct() {
                 let prepared_weight = self.load_native_weight(
-                    &self.packed_int4_n16_weight,
+                    &self.native_packs.packed_int4_n16_weight,
                     can_prepack,
                     &inputs[1],
                     &inputs[2],
@@ -2251,7 +2237,7 @@ impl Kernel for MatMulNBitsKernel {
                 })?;
             } else {
                 let prepared_weight = self.load_native_weight(
-                    &self.packed_int4_weight,
+                    &self.native_packs.packed_int4_weight,
                     can_prepack,
                     &inputs[1],
                     &inputs[2],
@@ -2301,7 +2287,7 @@ impl Kernel for MatMulNBitsKernel {
         } else if self.bits == 4 && self.accuracy_level == 4 && group_indices.is_none() {
             record_int4_route(Int4Route::ExpandedInt8);
             let prepared_weight = self.load_native_weight(
-                &self.int8_weight,
+                &self.native_packs.int8_weight,
                 can_prepack,
                 &inputs[1],
                 &inputs[2],
@@ -2388,7 +2374,7 @@ impl Kernel for MatMulNBitsKernel {
             let int8_compute_allowed = self.accuracy_level == 4;
             if int8_compute_allowed && dot_kernel.uses_kai_sdot_direct(self.bits, self.block_size) {
                 let prepared_weight = self.load_native_weight(
-                    &self.packed_kai_qsi8_weight,
+                    &self.native_packs.packed_kai_qsi8_weight,
                     can_prepack,
                     &inputs[1],
                     &inputs[2],
@@ -2412,7 +2398,7 @@ impl Kernel for MatMulNBitsKernel {
                 && activation_quant_group() == 32
             {
                 let prepared_weight = self.load_native_weight(
-                    &self.packed_u8_n16_weight,
+                    &self.native_packs.packed_u8_n16_weight,
                     can_prepack,
                     &inputs[1],
                     &inputs[2],
@@ -2432,7 +2418,7 @@ impl Kernel for MatMulNBitsKernel {
                 })?;
             } else {
                 let prepared_weight = self.load_native_weight(
-                    &self.packed_u8_weight,
+                    &self.native_packs.packed_u8_weight,
                     can_prepack,
                     &inputs[1],
                     &inputs[2],
@@ -2526,6 +2512,7 @@ impl Kernel for MatMulNBitsKernel {
             // materialize ~51 MB per prefill for a 3584x3584 8-bit node. The
             // fused pack allocates only per-strip scratch, so consult it first
             // whenever NT would not keep the weight resident.
+            #[cfg(target_arch = "x86_64")]
             let nt_keeps_weight_resident = self.can_retain_dense(can_prepack, &self.dense_key()?);
             #[cfg(target_arch = "x86_64")]
             let used_gebp_first = !nt_keeps_weight_resident
@@ -2538,14 +2525,8 @@ impl Kernel for MatMulNBitsKernel {
                     m,
                     result,
                 );
-            // Non-x86-64 has no fused GEBP microkernel, so the NT route is
-            // consulted unconditionally there and the residency verdict has no
-            // consumer; bind it so it is not an unused variable.
             #[cfg(not(target_arch = "x86_64"))]
-            let used_gebp_first = {
-                let _ = nt_keeps_weight_resident;
-                false
-            };
+            let used_gebp_first = false;
             let used_fast_nt = !used_gebp_first
                 && self.try_prefill_nk_nt(
                     &inputs[1],
@@ -2638,6 +2619,26 @@ impl Kernel for MatMulNBitsKernel {
 }
 
 impl MatMulNBitsKernel {
+    fn shareable_weight_parameters(&self) -> Option<NBitsWeightParameters> {
+        // Optional dynamic metadata still prevents retention at execute's
+        // can_prepack gate. No mutable operand can fill these shared slots.
+        if !self.constant_inputs[1] || !self.constant_inputs[2] || self.weight_prepacked {
+            return None;
+        }
+        Some(NBitsWeightParameters {
+            k: self.k,
+            n: self.n,
+            bits: self.bits,
+            block_size: self.block_size,
+            accuracy_level: self.accuracy_level,
+            weight_prepacked: self.weight_prepacked,
+            constant_inputs: self.constant_inputs,
+            dense_byte_limit: self.dense_weights.byte_limit(),
+            #[cfg(feature = "mlas")]
+            retain_mlas_packs: self.retain_mlas_packs,
+        })
+    }
+
     /// The compact kernels consume ONNX wire bytes and f32 scales unchanged.
     /// Borrow them when no conversion or NUMA/SPMD first-touch placement is
     /// required; otherwise retain the existing prepared constant/temporary path.
@@ -2655,7 +2656,7 @@ impl MatMulNBitsKernel {
             return Ok(PackedNBitsOperand::View(view));
         }
         Ok(PackedNBitsOperand::Prepared(self.load_native_weight(
-            &self.packed_nbits_weight,
+            &self.native_packs.packed_nbits_weight,
             can_prepack,
             packed,
             scales,
@@ -2663,14 +2664,14 @@ impl MatMulNBitsKernel {
         )?))
     }
 
-    fn load_native_weight<'a, T: NativePackedWeight>(
-        &'a self,
-        cache: &'a OnceLock<PreparedWeight<T>>,
+    fn load_native_weight<T: NativePackedWeight>(
+        &self,
+        cache: &NativeWeightCache<T>,
         retain: bool,
         packed: &TensorView,
         scales: &TensorView,
         zero_points: Option<&TensorView>,
-    ) -> Result<PreparedWeightRef<'a, T>> {
+    ) -> Result<PreparedWeightRef<T>> {
         if !retain {
             return self
                 .prepare_native_weight(packed, scales, zero_points)
@@ -2679,19 +2680,21 @@ impl MatMulNBitsKernel {
         if let Some(weight) = cache.get() {
             return Ok(PreparedWeightRef::Cached(weight));
         }
-        // No data/accounting lock is held. Pressure callbacks never take this
-        // cold-fill gate. All native packs share the same admission mechanism.
+        // Pressure callbacks take only the payload lock, never this fill gate.
+        // Admission and construction cannot run under a payload/accounting lock.
         let _fill = self
+            .native_packs
             .native_pack_fill
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(weight) = cache.get() {
             return Ok(PreparedWeightRef::Cached(weight));
         }
-        let _ = cache.set(self.prepare_native_weight(packed, scales, zero_points)?);
-        Ok(PreparedWeightRef::Cached(cache.get().expect(
-            "serialized native weight preparation initialized the cache",
-        )))
+        let weight = Arc::new(self.prepare_native_weight(packed, scales, zero_points)?);
+        cache.insert(Arc::clone(&weight));
+        // Keep a reader before publishing: pressure cannot remove a new pack
+        // between installation and the executing caller taking ownership.
+        Ok(PreparedWeightRef::Cached(weight))
     }
 
     fn prepare_native_weight<T: NativePackedWeight>(
@@ -2712,6 +2715,7 @@ impl MatMulNBitsKernel {
         let owned = grant.split_off(bytes)?;
         Ok(PreparedWeight {
             weight,
+            bytes,
             _grant: owned,
         })
     }
@@ -3031,24 +3035,13 @@ impl MatMulNBitsKernel {
                 ));
             }
 
-            let owned;
-            let packed_weight: &Option<Arc<MlasPreparedPacked>> = if can_prepack {
-                if let Some(weight) = self.mlas_packed.get() {
-                    weight
-                } else {
-                    let weight = self.shared_mlas_prepacked(packed, scales, zero_points, comp)?;
-                    let _ = self.mlas_packed.set(weight);
-                    self.mlas_packed
-                        .get()
-                        .expect("constant prepacked MatMulNBits weight was just initialized")
-                }
+            let packed_weight = if can_prepack {
+                self.shared_mlas_prepacked(packed, scales, zero_points, comp)?
             } else {
-                owned = self
-                    .build_mlas_prepacked(packed, scales, zero_points, comp)?
-                    .map(Arc::new);
-                &owned
+                self.build_mlas_prepacked(packed, scales, zero_points, comp)?
+                    .map(Arc::new)
             };
-            let packed_weight = packed_weight.as_ref().ok_or_else(|| {
+            let packed_weight = packed_weight.ok_or_else(|| {
                 error(format!(
                     "weight_prepacked=1 is unavailable for bits={}, block_size={}, accuracy_level={} on this CPU",
                     self.bits, self.block_size, self.accuracy_level
@@ -3057,35 +3050,70 @@ impl MatMulNBitsKernel {
             #[cfg(all(test, feature = "mlas"))]
             MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             mm_profile::time_gemv(|| {
-                self.run_mlas_prepared(packed_weight, m, activations, bias, result, true)
+                self.run_mlas_prepared(&packed_weight, m, activations, bias, result, true)
             })?;
             return Ok(Some(()));
         }
 
-        if can_prepack
-            && !mlas_no_shard()
-            && let Some(shards) = self.mlas_shards.get()
+        // Cross-CPU correctness guard: MLAS's AVX2 M=1 CompInt8 SQNBit kernel
+        // with a zero point (`SQ4BitGemmM1Kernel_CompInt8_avx2`, all block sizes)
+        // is numerically broken -- it disagrees with the reference by ~46% on
+        // asymmetric int4 (verified under Intel SDE `-hsw`; the AVX-512 M=1 and
+        // every AVX2 M>1 kernel are correct). The `sqnbit_decode_min() >= 2`
+        // crossover below also keeps the default M=1 decode on the hand int8
+        // kernel, but an operator lowering `NXRT_SQNBIT_DECODE_MIN` to <= 1 would
+        // otherwise expose the broken kernel, so refuse it explicitly here and
+        // fall back to the (correct) hand int8 path. Asymmetric = zero points
+        // present; only M=1 and only non-AVX-512 hosts are affected.
+        if matches!(comp, mlas_sys::SQNBitComputeType::Int8)
+            && m == 1
+            && zero_points.is_some()
+            && !host_supports_mlas_sqnbit_m1_asym_int8()
         {
-            let Some(shards) = shards.as_ref() else {
-                return Ok(None);
-            };
-            #[cfg(all(test, feature = "mlas"))]
-            MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
-            mm_profile::time_gemv(|| self.run_mlas_shards(shards, activations, m, bias, result));
-            return Ok(Some(()));
+            return Ok(None);
         }
 
-        if can_prepack
-            && mlas_no_shard()
-            && let Some(cached) = self.mlas_packed.get()
+        // Constant weights (the decode hot path) normally use the historical
+        // static-SPMD shards. `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1` opts into
+        // ORT's full-width `MlasQNBitGemmBatch(..., multithread=true)` design,
+        // where MLAS dynamically partitions N tiles across its persistent
+        // work-stealing intra-op pool, for A/B profiling without changing the
+        // default until correctness and throughput are proven.
+        //
+        // #1138: an *unscoped* `m == 1` decode GEMV (no persistent SPMD scope
+        // active — the ORT plugin EP, a third-party host, or any caller that did
+        // not enter `with_decode_pool_scope`) skips the per-worker shards and
+        // takes the full-width `multithread=true` path below, dispatching once to
+        // MLAS's own persistent work-stealing pool instead of running the shards
+        // serially (which capped the GEMV at the persistent worker count). The
+        // engine's single-token decode always runs inside the SPMD scope, so it
+        // keeps the sharded fast path and is unaffected; byte-identical either
+        // way (`max_ulp = 0`). `ONNX_GENAI_CPU_MM_MLAS_UNSCOPED_DECODE_SERIAL=1`
+        // restores the old serial-shard dispatch for A/B parity.
+        let unscoped_decode_full_width =
+            m == 1 && mlas_unscoped_decode_full_width() && spmd_decode_active().is_none();
+        let use_static_shards = can_prepack && !mlas_no_shard() && !unscoped_decode_full_width;
+        // A warm map lookup cannot override numerical legality or the
+        // current call's sharded/full-width layout decision.
+        let cached_key = can_prepack.then(|| {
+            self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp)
+        });
+        if use_static_shards
+            && let Some(shards) = cached_key.and_then(|key| self.mlas_caches.shards(&key))
         {
-            let Some(packed_weight) = cached.as_ref() else {
-                return Ok(None);
-            };
+            #[cfg(all(test, feature = "mlas"))]
+            MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            mm_profile::time_gemv(|| self.run_mlas_shards(&shards, activations, m, bias, result));
+            return Ok(Some(()));
+        }
+        if can_prepack
+            && !use_static_shards
+            && let Some(packed_weight) = cached_key.and_then(|key| self.mlas_caches.packed(&key))
+        {
             #[cfg(all(test, feature = "mlas"))]
             MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             mm_profile::time_gemv(|| {
-                self.run_mlas_prepared(packed_weight, m, activations, bias, result, true)
+                self.run_mlas_prepared(&packed_weight, m, activations, bias, result, true)
             })?;
             return Ok(Some(()));
         }
@@ -3143,80 +3171,25 @@ impl MatMulNBitsKernel {
             return Ok(None);
         }
 
-        // Cross-CPU correctness guard: MLAS's AVX2 M=1 CompInt8 SQNBit kernel
-        // with a zero point (`SQ4BitGemmM1Kernel_CompInt8_avx2`, all block sizes)
-        // is numerically broken -- it disagrees with the reference by ~46% on
-        // asymmetric int4 (verified under Intel SDE `-hsw`; the AVX-512 M=1 and
-        // every AVX2 M>1 kernel are correct). The `sqnbit_decode_min() >= 2`
-        // crossover above already keeps the default M=1 decode on the hand int8
-        // kernel, but an operator lowering `NXRT_SQNBIT_DECODE_MIN` to <= 1 would
-        // otherwise expose the broken kernel, so refuse it explicitly here and
-        // fall back to the (correct) hand int8 path. Asymmetric = zero points
-        // present; only M=1 and only non-AVX-512 hosts are affected.
-        if matches!(comp, mlas_sys::SQNBitComputeType::Int8)
-            && m == 1
-            && zero_points.is_some()
-            && !host_supports_mlas_sqnbit_m1_asym_int8()
-        {
-            return Ok(None);
-        }
-
-        // Constant weights (the decode hot path) normally use the historical
-        // static-SPMD shards. `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1` opts into
-        // ORT's full-width `MlasQNBitGemmBatch(..., multithread=true)` design,
-        // where MLAS dynamically partitions N tiles across its persistent
-        // work-stealing intra-op pool, for A/B profiling without changing the
-        // default until correctness and throughput are proven.
-        //
-        // #1138: an *unscoped* `m == 1` decode GEMV (no persistent SPMD scope
-        // active — the ORT plugin EP, a third-party host, or any caller that did
-        // not enter `with_decode_pool_scope`) skips the per-worker shards and
-        // takes the full-width `multithread=true` path below, dispatching once to
-        // MLAS's own persistent work-stealing pool instead of running the shards
-        // serially (which capped the GEMV at the persistent worker count). The
-        // engine's single-token decode always runs inside the SPMD scope, so it
-        // keeps the sharded fast path and is unaffected; byte-identical either
-        // way (`max_ulp = 0`). `ONNX_GENAI_CPU_MM_MLAS_UNSCOPED_DECODE_SERIAL=1`
-        // restores the old serial-shard dispatch for A/B parity.
-        let unscoped_decode_full_width =
-            m == 1 && mlas_unscoped_decode_full_width() && spmd_decode_active().is_none();
-        let use_static_shards = can_prepack && !mlas_no_shard() && !unscoped_decode_full_width;
         if use_static_shards {
-            let shards = if let Some(shards) = self.mlas_shards.get() {
-                shards
-            } else {
-                let built = self.shared_mlas_shards(packed, scales, zero_points, comp)?;
-                let _ = self.mlas_shards.set(built);
-                self.mlas_shards
-                    .get()
-                    .expect("constant MatMulNBits MLAS shards were just initialized")
-            };
-            let Some(shards) = shards.as_ref() else {
+            let Some(shards) = self.shared_mlas_shards(packed, scales, zero_points, comp)? else {
                 return Ok(None);
             };
             #[cfg(all(test, feature = "mlas"))]
             MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
-            mm_profile::time_gemv(|| self.run_mlas_shards(shards, activations, m, bias, result));
+            mm_profile::time_gemv(|| self.run_mlas_shards(&shards, activations, m, bias, result));
             return Ok(Some(()));
         }
 
         if can_prepack {
-            let cached = if let Some(cached) = self.mlas_packed.get() {
-                cached
-            } else {
-                let built = self.shared_mlas_packed(packed, scales, zero_points, comp)?;
-                let _ = self.mlas_packed.set(built);
-                self.mlas_packed
-                    .get()
-                    .expect("constant MatMulNBits MLAS full-width weight was just initialized")
-            };
-            let Some(packed_weight) = cached.as_ref() else {
+            let Some(packed_weight) = self.shared_mlas_packed(packed, scales, zero_points, comp)?
+            else {
                 return Ok(None);
             };
             #[cfg(all(test, feature = "mlas"))]
             MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             mm_profile::time_gemv(|| {
-                self.run_mlas_prepared(packed_weight, m, activations, bias, result, true)
+                self.run_mlas_prepared(&packed_weight, m, activations, bias, result, true)
             })?;
             return Ok(Some(()));
         }
@@ -3247,10 +3220,11 @@ impl MatMulNBitsKernel {
     /// It is available on every backend with an NT GEMM — MLAS's cache-tiled
     /// `sgemm` with `trans_b`, and, now, the native `SimdX86` packer that reads
     /// `B_nk` row-wise into an L1-resident pack tile (the same idea, ported off
-    /// MLAS). [`super::matmul::nt_gemm_supported`] is the single legality
-    /// predicate; [`super::matmul::gemm_nt_with_backend`] is proven
-    /// bit-identical to the `Kn` dense route for the same inputs, because
-    /// `B_nk[n, k]` is exactly the weight the `Kn` path stores transposed.
+    /// MLAS), plus Apple Accelerate's transposed-B SGEMM. The resolved
+    /// capability is [`super::matmul::NtGemm`], including its weight-reuse
+    /// policy. Apple prefill uses NT only with admitted NK retention. Both layouts represent
+    /// the same matrix, but f32 reduction order can differ; f64-oracle tests
+    /// validate numerical error rather than inferring bit identity from layout.
     #[allow(clippy::too_many_arguments)]
     fn try_prefill_nk_nt(
         &self,
@@ -3266,7 +3240,16 @@ impl MatMulNBitsKernel {
         use crate::backend::CpuBackend;
 
         let backend = CpuBackend::auto_detect();
-        if !super::matmul::nt_gemm_supported(backend) {
+        #[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+        if backend == CpuBackend::Accelerate && tests::legacy_apple_kn_forced() {
+            return Ok(false);
+        }
+        let Some(gemm) = super::matmul::NtGemm::resolve(backend) else {
+            return Ok(false);
+        };
+        if gemm.requires_retained_weights()
+            && !self.can_retain_dense(can_prepack, &self.dense_key()?)
+        {
             return Ok(false);
         }
 
@@ -3286,21 +3269,15 @@ impl MatMulNBitsKernel {
         let weight_nk = weight.as_slice();
 
         // C[m, n] = A[m, k] * B_nk[n, k]^T -- reads the Nk weight as the
-        // transposed operand without materializing a Kn copy. Bit-identical to
-        // the direct-`Kn` dense GEMM the caller would otherwise run. Timed on
+        // transposed operand without materializing a Kn copy. The selected
+        // backend may reduce f32 products differently from NN. Timed on
         // the same `gemv` phase the `Kn` route reports, so a profile taken
         // across the two routes compares like with like.
-        mm_profile::time_gemv(|| {
-            super::matmul::gemm_nt_with_backend(
-                backend,
-                activations,
-                weight_nk,
-                result,
-                m,
-                self.k,
-                self.n,
-            )
-        })?;
+        mm_profile::time_gemv(|| gemm.run(activations, weight_nk, result, m, self.k, self.n))?;
+        #[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+        if backend == CpuBackend::Accelerate {
+            tests::record_apple_nt_success();
+        }
         Ok(true)
     }
 
@@ -3555,11 +3532,9 @@ impl MatMulNBitsKernel {
         self.n * k_blocks * blob_size
     }
 
-    /// The shared-store identity of this node's packed weight, or `None` when the
-    /// weight is not a contiguous host buffer (so it has no stable address to key
-    /// on and cannot be shared). Only ever `Some` on the constant-weight
-    /// (`can_prepack`) route the callers already guard, where the initializer is
-    /// a contiguous mmap slice whose address is stable for the session.
+    /// A layout key inside this immutable node owner. Contiguous operands
+    /// additionally distinguish source addresses; noncontiguous constants use
+    /// the node's logical slot, preserving reuse without a global address key.
     #[cfg(feature = "mlas")]
     fn mlas_packed_key(
         &self,
@@ -3568,40 +3543,38 @@ impl MatMulNBitsKernel {
         zero_points: Option<&TensorView>,
         has_zero_points: bool,
         comp: mlas_sys::SQNBitComputeType,
-    ) -> Option<MlasPackedKey> {
-        let addr = contiguous_host_slice::<u8>(packed)?.as_ptr() as usize;
-        // The pack is a function of every operand that feeds it, so all of them
-        // are part of the identity. A non-contiguous or device-side scales
-        // tensor has no stable host address, which makes the whole weight
-        // unshareable rather than shareable under a partial identity.
-        let scales_addr = contiguous_host_addr(scales)?;
-        let zero_points_addr = match zero_points {
-            Some(view) => contiguous_host_addr(view)?,
-            None => 0,
-        };
-        Some(MlasPackedKey::new(
+    ) -> MlasPackedKey {
+        let source = (|| {
+            Some(MlasPackedSource::HostAddresses {
+                weight: contiguous_host_slice::<u8>(packed)?.as_ptr() as usize,
+                scales: contiguous_host_addr(scales)?,
+                zero_points: match zero_points {
+                    Some(view) => contiguous_host_addr(view)?,
+                    None => 0,
+                },
+            })
+        })()
+        .unwrap_or(MlasPackedSource::NodeConstant);
+        MlasPackedKey::new(
             self.weight_memory.host_authority_id(),
             self.weight_prepacked,
             scales.dtype,
-            addr,
-            scales_addr,
-            zero_points_addr,
+            source,
             self.n,
             self.k,
             self.bits,
             self.block_size,
             has_zero_points,
             comp,
-        ))
+        )
     }
 
     /// The N-sharded pack for this node, shared across its prefill and decode
-    /// kernel instances via the weight-identity store (#1056). The one-time pack
+    /// kernel instances via explicit shared node state. The one-time pack
     /// (and its `ONNX_GENAI_PROFILE_MM` timing) runs only on the *first*
     /// instance to reach it; the sibling instance takes the cached `Arc`, so the
-    /// runtime holds one packed copy per weight instead of two. Falls back to an
-    /// unshared owned pack only when the weight has no stable address to key on
-    /// (never on the constant route).
+    /// runtime holds one packed copy per weight instead of two. Strided
+    /// constants reuse the same owner through their logical node slot.
     #[cfg(feature = "mlas")]
     fn shared_mlas_shards(
         &self,
@@ -3615,23 +3588,10 @@ impl MatMulNBitsKernel {
                 self.build_mlas_shards(packed, scales, zero_points, comp)
             })
         };
-        let Some(key) =
-            self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp)
-        else {
-            return Ok(build()?.map(Arc::new));
-        };
-        let Some((shards, installed)) =
-            with_mlas_packed_caches(|caches| caches.get_or_build_shards(key, build))?
-        else {
+        let key = self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp);
+        let Some(shards) = self.mlas_caches.get_or_build_shards(key, build)? else {
             return Ok(None);
         };
-        if installed {
-            // Only the installing call owns the eviction (#1735). A kernel that
-            // merely shared its sibling's pack must leave it alone, or the first
-            // instance to drop would pull the packed weight out from under a
-            // live sibling and force it to re-pack.
-            let _ = self.mlas_owned.shards.set(key);
-        }
         Ok(Some(shards))
     }
 
@@ -3650,19 +3610,10 @@ impl MatMulNBitsKernel {
                 self.build_mlas_packed(packed, scales, zero_points, comp)
             })
         };
-        let Some(key) =
-            self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp)
-        else {
-            return Ok(build()?.map(Arc::new));
-        };
-        let Some((prepared, installed)) =
-            with_mlas_packed_caches(|caches| caches.get_or_build_packed(key, build))?
-        else {
+        let key = self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp);
+        let Some(prepared) = self.mlas_caches.get_or_build_packed(key, build)? else {
             return Ok(None);
         };
-        if installed {
-            let _ = self.mlas_owned.packed.set(key);
-        }
         Ok(Some(prepared))
     }
 
@@ -3677,19 +3628,10 @@ impl MatMulNBitsKernel {
         comp: mlas_sys::SQNBitComputeType,
     ) -> Result<Option<Arc<MlasPreparedPacked>>> {
         let build = || self.build_mlas_prepacked(packed, scales, zero_points, comp);
-        let Some(key) =
-            self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp)
-        else {
-            return Ok(build()?.map(Arc::new));
-        };
-        let Some((prepared, installed)) =
-            with_mlas_packed_caches(|caches| caches.get_or_build_packed(key, build))?
-        else {
+        let key = self.mlas_packed_key(packed, scales, zero_points, zero_points.is_some(), comp);
+        let Some(prepared) = self.mlas_caches.get_or_build_packed(key, build)? else {
             return Ok(None);
         };
-        if installed {
-            let _ = self.mlas_owned.packed.set(key);
-        }
         Ok(Some(prepared))
     }
 
@@ -4186,7 +4128,7 @@ impl MatMulNBitsKernel {
         group_indices: Option<&TensorView>,
         can_prepack: bool,
         layout: WeightLayout,
-    ) -> Result<Option<Arc<DenseWeight>>> {
+    ) -> Result<Option<Arc<GrantedWeight>>> {
         let key = self.dense_key()?;
         let retain = matches!(layout, WeightLayout::Nk) && self.can_retain_dense(can_prepack, &key);
         let placement = if matches!(layout, WeightLayout::Nk) {
@@ -4197,9 +4139,9 @@ impl MatMulNBitsKernel {
         // The resolved placement owns both the peak rule and the actual copy.
         let peak = placement.build_peak(key.bytes)?;
         let spec = if retain {
-            DenseWeightSpec::cached(&key)?
+            WeightSpec::cached(&key)?
         } else {
-            DenseWeightSpec::transient(key.bytes)
+            WeightSpec::transient(key.bytes)
         }
         .with_build_peak(peak);
         match self.dense_weights.load_group_owned(&[spec], |_| {
@@ -4214,8 +4156,8 @@ impl MatMulNBitsKernel {
             )?;
             Ok(placement.place(built, self.n))
         })? {
-            DenseWeightLoad::Ready(mut loaded) => Ok(Some(loaded.weights.remove(0))),
-            DenseWeightLoad::Declined(_) => Ok(None),
+            WeightLoad::Ready(mut loaded) => Ok(Some(loaded.weights.remove(0))),
+            WeightLoad::Declined(_) => Ok(None),
         }
     }
 
@@ -4709,10 +4651,10 @@ pub fn nbits_decode_f32_retention_candidate(
 /// own `mlas_shards` `OnceLock`, so a session held **two** copies (measured on
 /// `qwen05b-symzp`, 169 weight boundaries: a 1-token run packed 169 buffers, a
 /// multi-token run 338 = 2x169). #1056 makes the packed buffer **shared per
-/// weight**: both instances look it up in the weight-identity store
-/// ([`MlasPackedCaches`]) keyed on `(address, N, K, bits, block_size,
-/// has_zero_points, compute_type)`, so the first instance to reach it packs
-/// once and the sibling takes the same `Arc`. The session now holds **one**
+/// weight**. Shape variants now obtain that reuse through the executor's
+/// explicit node constant-state adoption of [`MlasPackedCaches`], rather than
+/// a process-global identity lookup. The first instance packs once and its
+/// adopted sibling takes the same `Arc`. The session holds **one**
 /// copy per weight, and `sqnbit_packed_live_bytes` reflects that (the
 /// multi-token run packs the *same* count as the 1-token run).
 ///
@@ -4813,10 +4755,10 @@ fn mlas_sqnbit_packed_b_cache_bytes(
 ///
 /// Compact native packs and decoder/activation scratch are outside this
 /// estimate; zero does not imply a zero-copy execution. MLAS packs share the
-/// `MLAS_PACKED_DECODE_INSTANTIATIONS` count. F32 expansions belong to each
-/// compiled kernel: dynamic prefill/decode instances may retain separate
-/// payloads, and policy/physical refusal may retain none. Owned Host grants,
-/// not this estimate, authorize their actual live bytes.
+/// `MLAS_PACKED_DECODE_INSTANTIATIONS` count. F32 NK cache entries share the
+/// executor node's immutable state across shape variants; policy/physical
+/// refusal may retain none. Active evicted payloads keep their own Host grants.
+/// Those grants, not this estimate, authorize their actual live bytes.
 #[allow(clippy::too_many_arguments)]
 pub fn planned_nbits_node_retained_bytes(
     bits: usize,
@@ -12559,7 +12501,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .owned_bytes;
-        let (books, resources) = governed_dense_resources(bytes, 0);
+        let (books, resources) = governed_dense_resources(2 * bytes, 0);
         first.weight_memory = resources.weight_memory().clone();
         let source = DerivedWeightMemory::governed(&books, HolderId::new(14)).unwrap();
         let mut second = test_kernel(k, n, block);
@@ -12574,8 +12516,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            Arc::ptr_eq(&pack, &shared),
-            "same Host books should pay once, even with separate sources/holders"
+            !Arc::ptr_eq(&pack, &shared),
+            "independent nodes must not share merely because operand addresses and Host books match"
         );
         let (foreign, resources) = governed_dense_resources(0, 0);
         let mut other = test_kernel(k, n, block);
@@ -12588,31 +12530,24 @@ mod tests {
         ));
         assert_eq!(foreign.used(Tier::Host), 0);
         let local = test_kernel(k, n, block);
-        let key = first.mlas_packed_key(&bv, &sv, None, false, comp).unwrap();
-        assert_ne!(
-            key,
-            local.mlas_packed_key(&bv, &sv, None, false, comp).unwrap()
-        );
-        assert_ne!(
-            key,
-            other.mlas_packed_key(&bv, &sv, None, false, comp).unwrap()
-        );
+        let key = first.mlas_packed_key(&bv, &sv, None, false, comp);
+        assert_ne!(key, local.mlas_packed_key(&bv, &sv, None, false, comp));
+        assert_ne!(key, other.mlas_packed_key(&bv, &sv, None, false, comp));
         let mut half_view = sv;
         half_view.dtype = DataType::Float16;
         assert_ne!(
             key,
-            second
-                .mlas_packed_key(&bv, &half_view, None, false, comp)
-                .unwrap(),
+            second.mlas_packed_key(&bv, &half_view, None, false, comp),
             "scale widening dtype is part of the packed value's identity"
         );
         second.weight_prepacked = true;
         assert_ne!(
             key,
-            second.mlas_packed_key(&bv, &sv, None, false, comp).unwrap(),
+            second.mlas_packed_key(&bv, &sv, None, false, comp),
             "wire and serialized source encodings are distinct identities"
         );
-        drop(first); // installer eviction does not revoke a sharer's live grant
+        assert_eq!(books.used(Tier::Host), (2 * bytes) as u64);
+        drop(first);
         drop(second);
         drop(shared);
         assert_eq!(books.used(Tier::Host), bytes as u64);
@@ -12725,9 +12660,7 @@ mod tests {
         );
         let caches = Arc::new(MlasPackedCaches::default());
         *books.cache.lock().unwrap() = Arc::downgrade(&caches);
-        let key = kernel
-            .mlas_packed_key(&b.view(), &scales.view(), None, false, comp)
-            .unwrap();
+        let key = kernel.mlas_packed_key(&b.view(), &scales.view(), None, false, comp);
         let blocker = books
             .governor
             .reserve(
@@ -12769,7 +12702,6 @@ mod tests {
                             })
                             .unwrap()
                             .unwrap()
-                            .0
                     })
                 })
                 .collect();
@@ -12802,7 +12734,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(books.governor.used(Tier::Host), bytes as u64);
-        caches.remove_packed(&key);
+        assert_eq!(caches.reclaim_idle(bytes).unwrap(), bytes);
         assert_eq!(books.governor.used(Tier::Host), 0);
         assert!(
             !books.blocked.load(Ordering::Relaxed),
@@ -12865,8 +12797,7 @@ mod tests {
                 .as_any()
                 .downcast_ref::<MatMulNBitsKernel>()
                 .unwrap()
-                .mlas_packed
-                .get()
+                .cached_mlas_packed()
                 .is_none(),
             "capacity refusal cannot poison the static capability memo"
         );
@@ -12882,9 +12813,7 @@ mod tests {
         assert_eq!(MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) - before, 3);
         let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
         let retained = concrete
-            .mlas_packed
-            .get()
-            .and_then(Option::as_ref)
+            .cached_mlas_packed()
             .expect("unscoped M=1 must retain the full-width pack")
             .clone();
         assert_eq!(retained.packed.owned_heap_bytes(), bytes);
@@ -12892,6 +12821,1297 @@ mod tests {
         assert_eq!(books.used(Tier::Host), bytes as u64);
         drop(retained);
         assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_pack_pressure_reclaims_idle_without_deadlocking_builders() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let name = "kernels::matmul_nbits::tests::mlas_pack_pressure_child";
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--ignored", "--nocapture"])
+            .env("ONNX_GENAI_CPU_MM_MLAS_NO_SHARD", "0")
+            .env("ONNX_GENAI_CPU_MM_MLAS_QNBIT", "1")
+            .env("ONNX_GENAI_CPU_MM_MLAS_UNSCOPED_DECODE_SERIAL", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !timed_out,
+            "{name} deadlocked during Host pressure; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(
+            output.status.success() && stdout.contains(&format!("test {name} ... ok")),
+            "named pressure child must run and pass; stdout={stdout}; stderr={stderr}"
+        );
+        eprintln!("{stderr}");
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    #[ignore = "run by the bounded pressure parent to detect admission/reclaim deadlocks"]
+    fn mlas_pack_pressure_child() {
+        let _probe = lock_dispatch_probe();
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let (k, n, block) = (128usize, 16usize, 32usize);
+        let comp = mlas_sys::SQNBitComputeType::Fp32;
+        let Some(original) = mlas_sys::SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block,
+            comp,
+            &vec![0x39; n * k / 2],
+            &vec![0.125; n * k / block],
+            None,
+        )
+        .unwrap() else {
+            eprintln!("MLAS Fp32 SQNBit unavailable; pressure cases not exercised");
+            return;
+        };
+        let bytes = original.owned_heap_bytes();
+        for layout in ["sharded", "full-width", "serialized", "strided-scales"] {
+            let serialized = layout == "serialized";
+            let strided = layout == "strided-scales";
+            let rows = if layout == "full-width" { 1 } else { 3 };
+            let b = if serialized {
+                Owned::u8(&[original.as_bytes().len()], original.as_bytes())
+            } else {
+                Owned::u8(&[n, k / block, block / 2], &vec![0x39; n * k / 2])
+            };
+            let scales = Owned::f32(&[n, k / block], &vec![0.125; n * k / block]);
+            let strided_scales = Owned::f32(
+                &[2 * n * k / block],
+                &(0..2 * n * k / block)
+                    .map(|i| if i % 2 == 0 { 0.125 } else { 99. })
+                    .collect::<Vec<_>>(),
+            );
+            let scale_shape = [n, k / block];
+            let scale_strides = [(2 * k / block) as i64, 2];
+            let a = Owned::f32(&[rows, k], &vec![0.25; rows * k]);
+            let capacity = bytes + if strided { n * k / block * 4 } else { 0 };
+            let (books, resources) = governed_dense_resources(capacity, 0);
+            assert!(resources.weight_memory().supports_pressure_reclaim());
+            let factory = MatMulNBitsFactory::new(resources);
+            let mut node = governed_dense_node(k, n, 4, block);
+            if serialized {
+                node.attributes
+                    .insert("weight_prepacked".into(), Attribute::Int(1));
+            }
+            let create = || {
+                let mut kernel = factory.create(&node, &[]).unwrap();
+                kernel.set_constant_inputs(&[false, true, true]);
+                kernel
+            };
+            // Builder registers first: admission may visit its own empty map
+            // while its per-key cold-fill lock is held.
+            let builder = create();
+            let donor = create();
+            let run = |kernel: &dyn Kernel| {
+                let mut output = Owned::zeros_f32(&[rows, n]);
+                let mut sv = if strided {
+                    strided_scales.view()
+                } else {
+                    scales.view()
+                };
+                if strided {
+                    sv.shape = &scale_shape;
+                    sv.strides = &scale_strides;
+                }
+                kernel.execute(&[a.view(), b.view(), sv], &mut [output.view_mut()])?;
+                assert_eq!(output.to_f32(), vec![-8.; rows * n]);
+                Ok::<_, EpError>(())
+            };
+            let concrete = |kernel: &dyn Kernel| {
+                kernel
+                    .as_any()
+                    .downcast_ref::<MatMulNBitsKernel>()
+                    .unwrap()
+                    .mlas_caches
+                    .clone()
+            };
+            run(&*donor).unwrap();
+            assert_eq!(
+                books.used(Tier::Host),
+                bytes as u64,
+                "{layout}: real pack owns one grant"
+            );
+            let saved_shards = donor
+                .as_any()
+                .downcast_ref::<MatMulNBitsKernel>()
+                .unwrap()
+                .cached_mlas_shards();
+            let saved_packed = donor
+                .as_any()
+                .downcast_ref::<MatMulNBitsKernel>()
+                .unwrap()
+                .cached_mlas_packed();
+            let before = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
+            run(&*donor).unwrap();
+            assert_eq!(
+                MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed),
+                before + 1,
+                "{layout}: warm reuse must execute MLAS, not silently fall back during a duplicate admission"
+            );
+            drop(saved_shards);
+            drop(saved_packed);
+            let unrelated = onnx_runtime_memory_governor::LedgerGovernor::new(
+                onnx_runtime_memory_governor::LeaseLedger::new(0, 0, 0),
+            );
+            assert!(
+                unrelated
+                    .reserve(
+                        Tier::Host,
+                        (capacity - bytes + 1) as u64,
+                        MemoryRole::KvCache,
+                        HolderId::new(7)
+                    )
+                    .is_err()
+            );
+            assert_eq!(concrete(&*donor).reclaim_idle(0).unwrap(), 0);
+            eprintln!("{layout}: entering self-cache admission");
+            run(&*builder).unwrap();
+            assert!(concrete(&*donor).packed.lock().unwrap().is_empty());
+            assert!(concrete(&*donor).shards.lock().unwrap().is_empty());
+            assert_eq!(books.used(Tier::Host), bytes as u64);
+            let cache = concrete(&*builder);
+            if layout == "sharded" || strided {
+                // A warm prefill entry cannot select the layout of a later
+                // unscoped M=1 call. A one-pack budget forces the old layout
+                // to donate capacity rather than pinning two representations.
+                let decode_a = Owned::f32(&[1, k], &vec![0.25; k]);
+                let mut decode_out = Owned::zeros_f32(&[1, n]);
+                let mut sv = if strided {
+                    strided_scales.view()
+                } else {
+                    scales.view()
+                };
+                if strided {
+                    sv.shape = &scale_shape;
+                    sv.strides = &scale_strides;
+                }
+                builder
+                    .execute(
+                        &[decode_a.view(), b.view(), sv],
+                        &mut [decode_out.view_mut()],
+                    )
+                    .unwrap();
+                assert_eq!(decode_out.to_f32(), vec![-8.; n]);
+                assert!(cache.shards.lock().unwrap().is_empty());
+                assert_eq!(cache.packed.lock().unwrap().len(), 1);
+                assert_eq!(books.used(Tier::Host), bytes as u64);
+                run(&*builder).unwrap();
+                assert!(cache.packed.lock().unwrap().is_empty());
+                assert_eq!(cache.shards.lock().unwrap().len(), 1);
+            }
+            assert_eq!(cache.reclaim_idle(0).unwrap(), 0);
+            let active_shards = builder
+                .as_any()
+                .downcast_ref::<MatMulNBitsKernel>()
+                .unwrap()
+                .cached_mlas_shards();
+            let active_packed = builder
+                .as_any()
+                .downcast_ref::<MatMulNBitsKernel>()
+                .unwrap()
+                .cached_mlas_packed();
+            assert_eq!(active_shards.is_some(), layout == "sharded" || strided);
+            assert_eq!(active_packed.is_some(), layout != "sharded" && !strided);
+            assert!(
+                books
+                    .reserve(
+                        Tier::Host,
+                        (capacity - bytes + 1) as u64,
+                        MemoryRole::KvCache,
+                        HolderId::new(7)
+                    )
+                    .is_err(),
+                "{layout}: pressure cannot revoke an executing reader"
+            );
+            assert_eq!(cache.reclaim_idle(bytes).unwrap(), 0);
+            drop(active_shards);
+            drop(active_packed);
+            let kv = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        books.reserve(
+                            Tier::Host,
+                            capacity as u64,
+                            MemoryRole::KvCache,
+                            HolderId::new(7),
+                        )
+                    })
+                    .join()
+                    .unwrap()
+                    .unwrap()
+            });
+            assert!(
+                cache.packed.lock().unwrap().is_empty() && cache.shards.lock().unwrap().is_empty()
+            );
+            if serialized {
+                assert!(
+                    matches!(run(&*builder), Err(EpError::Memory(_))),
+                    "serialized bytes have no wire fallback while capacity is occupied"
+                );
+            } else {
+                run(&*builder).unwrap();
+            }
+            assert!(
+                cache.packed.lock().unwrap().is_empty() && cache.shards.lock().unwrap().is_empty()
+            );
+            drop(kv);
+            run(&*builder).unwrap();
+            assert_eq!(books.used(Tier::Host), bytes as u64);
+            let mut growing = books
+                .reserve(Tier::Host, 0, MemoryRole::KvCache, HolderId::new(7))
+                .unwrap();
+            growing.grow(capacity as u64).unwrap();
+            assert!(
+                cache.packed.lock().unwrap().is_empty() && cache.shards.lock().unwrap().is_empty()
+            );
+            drop(growing);
+            run(&*builder).unwrap();
+            // Registration survives retirement of the original shape variant.
+            let mut peer = create();
+            if !serialized {
+                assert!(
+                    peer.adopt_shareable_constant_state(
+                        builder.shareable_constant_state().unwrap()
+                    )
+                    .unwrap()
+                );
+                drop(builder);
+                let kv = books
+                    .reserve(
+                        Tier::Host,
+                        capacity as u64,
+                        MemoryRole::KvCache,
+                        HolderId::new(7),
+                    )
+                    .unwrap();
+                assert!(
+                    cache.packed.lock().unwrap().is_empty()
+                        && cache.shards.lock().unwrap().is_empty()
+                );
+                drop(kv);
+                run(&*peer).unwrap();
+            } else {
+                drop(builder);
+                run(&*peer).unwrap();
+            }
+            if !serialized {
+                let barrier = std::sync::Barrier::new(5);
+                std::thread::scope(|scope| {
+                    for _ in 0..4 {
+                        let barrier = &barrier;
+                        let run = &run;
+                        let peer = peer.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                        scope.spawn(move || {
+                            barrier.wait();
+                            for _ in 0..32 {
+                                run(peer).unwrap();
+                            }
+                        });
+                    }
+                    let barrier = &barrier;
+                    let books = &books;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..64 {
+                            let kv = books.reserve(
+                                Tier::Host,
+                                (capacity - bytes + 1) as u64,
+                                MemoryRole::KvCache,
+                                HolderId::new(7),
+                            );
+                            std::thread::yield_now();
+                            drop(kv);
+                        }
+                    });
+                });
+                run(&*peer).unwrap();
+            }
+            let active_shards = peer
+                .as_any()
+                .downcast_ref::<MatMulNBitsKernel>()
+                .unwrap()
+                .cached_mlas_shards();
+            let active_packed = peer
+                .as_any()
+                .downcast_ref::<MatMulNBitsKernel>()
+                .unwrap()
+                .cached_mlas_packed();
+            let weak = Arc::downgrade(&concrete(&*peer));
+            drop(peer);
+            drop(donor);
+            // An explicit test handle must not extend cache membership here.
+            drop(cache);
+            assert!(
+                weak.upgrade().is_none(),
+                "{layout}: weak registration cannot keep a node alive"
+            );
+            assert_eq!(
+                books.used(Tier::Host),
+                bytes as u64,
+                "{layout}: active payload outlives the cache owner"
+            );
+            drop(active_shards);
+            drop(active_packed);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+        eprintln!(
+            "exercised sharded, full-width, serialized and strided-scales Host pressure cases"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    thread_local! {
+        static LEGACY_APPLE_KN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static APPLE_NT_SUCCESSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(super) fn legacy_apple_kn_forced() -> bool {
+        LEGACY_APPLE_KN.with(std::cell::Cell::get)
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(super) fn record_apple_nt_success() {
+        APPLE_NT_SUCCESSES.with(|calls| calls.set(calls.get() + 1));
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn apple_nt_successes() -> usize {
+        APPLE_NT_SUCCESSES.with(std::cell::Cell::get)
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    struct AppleKnDiagnosticScope(bool);
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    impl AppleKnDiagnosticScope {
+        fn new(legacy: bool) -> Self {
+            Self(LEGACY_APPLE_KN.with(|flag| flag.replace(legacy)))
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    impl Drop for AppleKnDiagnosticScope {
+        fn drop(&mut self) {
+            LEGACY_APPLE_KN.with(|flag| flag.set(self.0));
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn apple_kn_diagnostic_scope_is_thread_local_and_restores_after_unwind() {
+        assert!(!legacy_apple_kn_forced());
+        let failed = std::panic::catch_unwind(|| {
+            let _scope = AppleKnDiagnosticScope::new(true);
+            assert!(legacy_apple_kn_forced());
+            assert!(!std::thread::spawn(legacy_apple_kn_forced).join().unwrap());
+            {
+                let _nested = AppleKnDiagnosticScope::new(false);
+                assert!(!legacy_apple_kn_forced());
+            }
+            assert!(legacy_apple_kn_forced());
+            panic!("diagnostic scope restore control");
+        });
+        assert!(failed.is_err());
+        assert!(!legacy_apple_kn_forced());
+    }
+
+    /// Synchronous real execute calls, with rotating KN / NT / repeated-NT
+    /// arms. Test-only cache bookkeeping and the route selector are included.
+    /// Inputs, outputs, warm validation/checksums and printing are not timed.
+    #[cfg(all(any(target_os = "macos", target_os = "ios"), unix))]
+    #[test]
+    #[ignore = "manual real-execute comparison; hold the shared host lock"]
+    fn bench_apple_dense_execute_kn_nt_ab() {
+        let _probe = lock_dispatch_probe();
+        #[cfg(feature = "mlas")]
+        let _env = backend_env_lock().lock().unwrap();
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        use std::hint::black_box;
+        use std::time::Instant;
+        assert_eq!(
+            crate::backend::CpuBackend::auto_detect(),
+            crate::backend::CpuBackend::Accelerate
+        );
+        assert!(numa_decode_active().is_none() && spmd_decode_active().is_none());
+        eprintln!(
+            "APPLE_EXECUTE_CONTEXT rayon_threads={} clocks=process-cpu,wall scope=synchronous-execute",
+            rayon::current_num_threads()
+        );
+        fn output_checksum(values: &[f32]) -> u64 {
+            values.iter().fold(0xcbf29ce484222325u64, |hash, &value| {
+                let bits = if value == 0. { 0 } else { value.to_bits() };
+                (hash ^ u64::from(bits)).wrapping_mul(0x100000001b3)
+            })
+        }
+        fn cpu_seconds() -> f64 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            // SAFETY: writable rusage is initialized on successful return.
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                0
+            );
+            let usage = unsafe { usage.assume_init() };
+            (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
+                + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 * 1e-6
+        }
+        for (m, k, n) in [
+            (2usize, 33usize, 3usize),
+            (8, 257, 65),
+            (32, 1024, 1024),
+            (128, 1024, 1024),
+            (16, 2048, 2048),
+        ] {
+            let block = 16;
+            let blocks = k.div_ceil(block);
+            let av: Vec<_> = (0..m * k).map(|i| ((i % 31) as f32 - 15.) / 32.).collect();
+            let bv: Vec<_> = (0..n * blocks * 8)
+                .map(|i| (i.wrapping_mul(73).wrapping_add(19) % 256) as u8)
+                .collect();
+            let sv: Vec<_> = (0..n * blocks).map(|i| (i % 7 + 1) as f32 / 128.).collect();
+            // Dyadic products have a common 1/4096 quantum and sums stay below
+            // 2^24 quanta, so this timing corpus has exact order-independent
+            // outputs. Broad non-dyadic numerical coverage is a separate test.
+            let expected: Vec<f32> = (0..m * n)
+                .map(|index| {
+                    let (row, col) = (index / n, index % n);
+                    (0..k)
+                        .map(|depth| {
+                            let offset = (col * blocks + depth / block) * 8 + (depth % block) / 2;
+                            let q = (bv[offset] >> ((depth % 2) * 4)) & 15;
+                            f64::from(av[row * k + depth])
+                                * f64::from(
+                                    (i32::from(q) - 8) as f32 * sv[col * blocks + depth / block],
+                                )
+                        })
+                        .sum::<f64>() as f32
+                })
+                .collect();
+            assert!(expected.windows(2).any(|p| p[0] != p[1]));
+            let expected_checksum = output_checksum(&expected);
+            let a = Owned::f32(&[m, k], &av);
+            let b = Owned::u8(&[n, blocks, 8], &bv);
+            let scales = Owned::f32(&[n, blocks], &sv);
+            let groups = Owned::i32(
+                &[k],
+                &(0..k).map(|i| (i / block) as i32).collect::<Vec<_>>(),
+            );
+            for retained in [false, true] {
+                let bytes = k * n * 4;
+                let limit = if retained { bytes } else { 0 };
+                let (old_books, old_resources) = governed_dense_resources(bytes * 2, limit);
+                let (new_books, new_resources) = governed_dense_resources(bytes * 2, limit);
+                let node = governed_dense_node(k, n, 4, block);
+                let mut old = MatMulNBitsFactory::new(old_resources)
+                    .create(&node, &[vec![m, k]])
+                    .unwrap();
+                let mut native = MatMulNBitsFactory::new(new_resources)
+                    .create(&node, &[vec![m, k]])
+                    .unwrap();
+                old.set_constant_inputs(&[false, true, true, false, true]);
+                native.set_constant_inputs(&[false, true, true, false, true]);
+                let mut outputs = [
+                    Owned::zeros_f32(&[m, n]),
+                    Owned::zeros_f32(&[m, n]),
+                    Owned::zeros_f32(&[m, n]),
+                ];
+                let nt_before = apple_nt_successes();
+                let iterations = (8_000_000 / (m * k * n)).clamp(4, 2048);
+                // Six orders balance positions and every predecessor pair,
+                // including round boundaries, for interleaved worker pools.
+                let orders = [
+                    [0, 1, 2],
+                    [1, 2, 0],
+                    [2, 0, 1],
+                    [0, 2, 1],
+                    [2, 1, 0],
+                    [1, 0, 2],
+                ];
+                for round in 0..24 {
+                    for arm in orders[round % orders.len()] {
+                        let _scope = AppleKnDiagnosticScope::new(arm == 0);
+                        let kernel = if arm == 0 {
+                            old.as_ref()
+                        } else {
+                            native.as_ref()
+                        };
+                        black_box(kernel)
+                            .execute(
+                                black_box(&[
+                                    a.view(),
+                                    b.view(),
+                                    scales.view(),
+                                    TensorView::absent(DataType::Uint8),
+                                    groups.view(),
+                                ]),
+                                &mut [black_box(&mut outputs[arm]).view_mut()],
+                            )
+                            .unwrap();
+                        assert_eq!(outputs[arm].to_f32(), expected);
+                        let cpu = cpu_seconds();
+                        let wall = Instant::now();
+                        for _ in 0..iterations {
+                            black_box(kernel)
+                                .execute(
+                                    black_box(&[
+                                        a.view(),
+                                        b.view(),
+                                        scales.view(),
+                                        TensorView::absent(DataType::Uint8),
+                                        groups.view(),
+                                    ]),
+                                    &mut [black_box(&mut outputs[arm]).view_mut()],
+                                )
+                                .unwrap();
+                        }
+                        let wall_ns = wall.elapsed().as_nanos();
+                        let cpu_ns = (cpu_seconds() - cpu) * 1e9;
+                        assert!(wall_ns > 0 && cpu_ns > 0.);
+                        let actual = outputs[arm].to_f32();
+                        assert_eq!(actual, expected);
+                        let checksum = output_checksum(&actual);
+                        assert_eq!(checksum, expected_checksum);
+                        println!(
+                            "ANT_SAMPLE,2,{m},{k},{n},{},{round},{arm},{iterations},{cpu_ns:.0},{wall_ns},{checksum}",
+                            usize::from(retained)
+                        );
+                    }
+                }
+                let old_kernel = old.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                let new_kernel = native.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                let old_builds = old_kernel.dense_weights.activity().1;
+                let new_builds = new_kernel.dense_weights.activity().1;
+                assert_eq!(old_builds, 24 * (iterations + 1));
+                assert_eq!(new_builds, if retained { 1 } else { 48 * (iterations + 1) });
+                assert_eq!(old_kernel.dense_weights.stats(), (0, 0));
+                assert_eq!(
+                    new_kernel.dense_weights.stats(),
+                    if retained { (1, bytes) } else { (0, 0) }
+                );
+                assert_eq!(old_books.used(Tier::Host), 0);
+                assert_eq!(
+                    new_books.used(Tier::Host),
+                    if retained { bytes as u64 } else { 0 }
+                );
+                let nt_calls = apple_nt_successes() - nt_before;
+                assert_eq!(nt_calls, if retained { 48 * (iterations + 1) } else { 0 });
+                println!(
+                    "ANT_WITNESS,2,{m},{k},{n},{},{old_builds},{new_builds},{},{},{nt_calls}",
+                    usize::from(retained),
+                    old_books.used(Tier::Host),
+                    new_books.used(Tier::Host)
+                );
+                drop(old);
+                drop(native);
+                assert_eq!(old_books.used(Tier::Host), 0);
+                assert_eq!(new_books.used(Tier::Host), 0);
+            }
+        }
+        assert!(!legacy_apple_kn_forced());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn apple_dense_prefill_without_reuse_keeps_kn_and_no_nt_calls() {
+        let _probe = lock_dispatch_probe();
+        #[cfg(feature = "mlas")]
+        let _env = backend_env_lock().lock().unwrap();
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        assert_eq!(
+            crate::backend::CpuBackend::auto_detect(),
+            crate::backend::CpuBackend::Accelerate
+        );
+        for (limit, constant_groups) in [(0, true), (395, true), (396, false)] {
+            let (books, resources) = governed_dense_resources(792, limit);
+            let mut kernel = MatMulNBitsFactory::new(resources)
+                .create(&governed_dense_node(33, 3, 4, 16), &[vec![3, 33]])
+                .unwrap();
+            kernel.set_constant_inputs(&[false, true, true, false, constant_groups]);
+            let a = Owned::f32(&[3, 33], &[0.25; 99]);
+            let b = Owned::u8(&[3, 3, 8], &[0x98; 72]);
+            let scales = Owned::f32(&[3, 3], &[0.125; 9]);
+            let groups = Owned::i32(&[33], &(0..33).map(|i| i / 16).collect::<Vec<_>>());
+            let before = apple_nt_successes();
+            for _ in 0..3 {
+                let mut output = Owned::zeros_f32(&[3, 3]);
+                kernel
+                    .execute(
+                        &[
+                            a.view(),
+                            b.view(),
+                            scales.view(),
+                            TensorView::absent(DataType::Uint8),
+                            groups.view(),
+                        ],
+                        &mut [output.view_mut()],
+                    )
+                    .unwrap();
+                assert_eq!(output.to_f32(), [0.5; 9]);
+                assert_eq!(books.used(Tier::Host), 0);
+            }
+            assert_eq!(
+                apple_nt_successes(),
+                before,
+                "no reuse must keep the established KN route"
+            );
+            let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+            assert!(cached_dense_weight(concrete).is_none());
+            assert_eq!(concrete.dense_weights.activity().1, 3);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn apple_dense_prefill_reuses_one_nk_expansion() {
+        let _probe = lock_dispatch_probe();
+        #[cfg(feature = "mlas")]
+        let _env = backend_env_lock().lock().unwrap();
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        assert_eq!(
+            crate::backend::CpuBackend::auto_detect(),
+            crate::backend::CpuBackend::Accelerate
+        );
+        let (books, resources) = governed_dense_resources(396, 396);
+        let mut kernel = MatMulNBitsFactory::new(resources)
+            .create(&governed_dense_node(33, 3, 4, 16), &[vec![3, 33]])
+            .unwrap();
+        kernel.set_constant_inputs(&[false, true, true, false, true]);
+        let b = Owned::u8(&[3, 3, 8], &[0x98; 72]);
+        let scales = Owned::f32(&[3, 3], &[0.125; 9]);
+        let groups = Owned::i32(&[33], &(0..33).map(|i| i / 16).collect::<Vec<_>>());
+        for _ in 0..3 {
+            let a = Owned::f32(&[3, 33], &[0.25; 99]);
+            let mut y = Owned::zeros_f32(&[3, 3]);
+            kernel
+                .execute(
+                    &[
+                        a.view(),
+                        b.view(),
+                        scales.view(),
+                        TensorView::absent(DataType::Uint8),
+                        groups.view(),
+                    ],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            assert_eq!(y.to_f32(), [0.5; 9]);
+            let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+            assert!(
+                cached_dense_weight(concrete).is_some(),
+                "Apple prefill must use the retained NK expansion rather than rebuilding KN"
+            );
+            assert_eq!(
+                concrete.dense_weights.activity().1,
+                1,
+                "warm prefill must decode only once"
+            );
+            assert_eq!(books.used(Tier::Host), 396);
+        }
+        drop(kernel);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn dense_weight_shared_shapes_preserve_readers_reclaim_and_rebuild() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let (books, resources) = governed_dense_resources(396, 396);
+        let factory = MatMulNBitsFactory::new(resources);
+        let node = governed_dense_node(33, 3, 4, 16);
+        let mut producer = factory.create(&node, &[vec![1, 33]]).unwrap();
+        producer.set_constant_inputs(&[false, true, true]);
+        let b = Owned::u8(&[3, 3, 8], &[0x98; 72]);
+        let scales = Owned::f32(&[3, 3], &[0.125; 9]);
+        let first = producer
+            .as_any()
+            .downcast_ref::<MatMulNBitsKernel>()
+            .unwrap();
+        let active = first
+            .load_dense_weight(
+                &b.view(),
+                &scales.view(),
+                None,
+                None,
+                true,
+                WeightLayout::Nk,
+            )
+            .unwrap()
+            .unwrap();
+        for feature in 0..3 {
+            for depth in 0..33 {
+                assert_eq!(
+                    active.as_slice()[feature * 33 + depth],
+                    (depth % 2) as f32 * 0.125
+                );
+            }
+        }
+        let mut receiver = factory.create(&node, &[vec![3, 33]]).unwrap();
+        receiver.set_constant_inputs(&[false, true, true]);
+        assert!(
+            receiver
+                .adopt_shareable_constant_state(producer.shareable_constant_state().unwrap())
+                .unwrap()
+        );
+        let second = receiver
+            .as_any()
+            .downcast_ref::<MatMulNBitsKernel>()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.dense_weights, &second.dense_weights));
+        let warm = second
+            .load_dense_weight(
+                &b.view(),
+                &scales.view(),
+                None,
+                None,
+                true,
+                WeightLayout::Nk,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&active, &warm));
+        drop(warm);
+        drop(producer);
+        assert_eq!(books.used(Tier::Host), 396);
+        assert!(
+            books
+                .reserve(Tier::Host, 396, MemoryRole::KvCache, HolderId::new(2))
+                .is_err(),
+            "active dense readers must keep their funding after producer teardown"
+        );
+        drop(active);
+        let kv = books
+            .reserve(Tier::Host, 396, MemoryRole::KvCache, HolderId::new(2))
+            .unwrap();
+        assert!(
+            cached_dense_weight(second).is_none(),
+            "pressure enrollment must survive producer teardown"
+        );
+        drop(kv);
+        let rebuilt = second
+            .load_dense_weight(
+                &b.view(),
+                &scales.view(),
+                None,
+                None,
+                true,
+                WeightLayout::Nk,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(books.used(Tier::Host), 396);
+        drop(receiver);
+        assert_eq!(books.used(Tier::Host), 396);
+        drop(rebuilt);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn dense_weight_shared_shapes_serialize_distinct_cold_builders() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let (books, resources) = governed_dense_resources(64, 64);
+        let factory = MatMulNBitsFactory::new(resources);
+        let node = governed_dense_node(16, 1, 4, 16);
+        let mut owner = factory.create(&node, &[vec![1, 16]]).unwrap();
+        owner.set_constant_inputs(&[false, true, true]);
+        let state = owner.shareable_constant_state().unwrap();
+        let peers: Vec<_> = (1..=8)
+            .map(|rows| {
+                let mut peer = factory.create(&node, &[vec![rows, 16]]).unwrap();
+                peer.set_constant_inputs(&[false, true, true]);
+                assert!(peer.adopt_shareable_constant_state(state.clone()).unwrap());
+                peer
+            })
+            .collect();
+        drop(owner);
+        drop(state);
+        let b = Owned::u8(&[1, 1, 8], &[0x98; 8]);
+        let scales = Owned::f32(&[1, 1], &[0.125]);
+        let barrier = std::sync::Barrier::new(8);
+        let payloads = std::thread::scope(|scope| {
+            let handles: Vec<_> = peers
+                .iter()
+                .map(|peer| {
+                    let kernel = peer.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                    let (barrier, b, scales) = (&barrier, &b, &scales);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        kernel
+                            .load_dense_weight(
+                                &b.view(),
+                                &scales.view(),
+                                None,
+                                None,
+                                true,
+                                WeightLayout::Nk,
+                            )
+                            .unwrap()
+                            .unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(payloads.iter().all(|p| Arc::ptr_eq(p, &payloads[0])));
+        assert_eq!(
+            payloads[0].as_slice(),
+            &[
+                0., 0.125, 0., 0.125, 0., 0.125, 0., 0.125, 0., 0.125, 0., 0.125, 0., 0.125, 0.,
+                0.125
+            ]
+        );
+        assert_eq!(books.used(Tier::Host), 64);
+        drop(peers);
+        assert_eq!(books.used(Tier::Host), 64);
+        drop(payloads);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn dense_weight_shared_shapes_preserve_dynamic_metadata_and_denied_retention() {
+        let _probe = lock_dispatch_probe();
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        for constant_group in [false, true] {
+            let (books, resources) =
+                governed_dense_resources(132, if constant_group { 0 } else { 132 });
+            let factory = MatMulNBitsFactory::new(resources);
+            let node = governed_dense_node(33, 1, 4, 16);
+            let mut owner = factory.create(&node, &[]).unwrap();
+            owner.set_constant_inputs(&[false, true, true, false, constant_group]);
+            let mut peer = factory.create(&node, &[]).unwrap();
+            peer.set_constant_inputs(&[false, true, true, false, constant_group]);
+            assert!(
+                peer.adopt_shareable_constant_state(owner.shareable_constant_state().unwrap())
+                    .unwrap()
+            );
+            let a = Owned::f32(&[1, 33], &[0.25; 33]);
+            let b = Owned::u8(&[1, 3, 8], &[0x98; 24]);
+            let scales = Owned::f32(&[1, 3], &[0.125, 0.25, 0.5]);
+            for kernel in [&owner, &peer] {
+                for group in if constant_group { [0, 0] } else { [0, 1] } {
+                    let groups = Owned::i32(&[33], &[group; 33]);
+                    let mut output = Owned::zeros_f32(&[1, 1]);
+                    kernel
+                        .execute(
+                            &[
+                                a.view(),
+                                b.view(),
+                                scales.view(),
+                                TensorView::absent(DataType::Uint8),
+                                groups.view(),
+                            ],
+                            &mut [output.view_mut()],
+                        )
+                        .unwrap();
+                    assert_eq!(output.to_f32(), [if group == 0 { 0.5 } else { 1.0 }]);
+                    let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                    assert!(cached_dense_weight(concrete).is_none());
+                    assert_eq!(books.used(Tier::Host), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_pack_shared_shapes_keep_all_layouts_alive_and_reclaimable() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        fn check<T: NativePackedWeight>(
+            bits: usize,
+            slot: impl Fn(&MatMulNBitsKernel) -> &NativeWeightCache<T>,
+        ) {
+            let b = Owned::u8(&[1, 1, 16 * bits / 8], &vec![0x39; 16 * bits / 8]);
+            let scales = Owned::f32(&[1, 1], &[0.125]);
+            let mut sizing = test_kernel(16, 1, 16);
+            sizing.bits = bits;
+            let (bytes, peak) = sizing
+                .native_preparation_bytes(T::LAYOUT, &b.view(), &scales.view(), None, false)
+                .unwrap();
+            let (books, resources) = governed_dense_resources(peak, 0);
+            let factory = MatMulNBitsFactory::new(resources);
+            let node = governed_dense_node(16, 1, bits, 16);
+            let mut producer = factory.create(&node, &[]).unwrap();
+            producer.set_constant_inputs(&[false, true, true]);
+            let mut receiver = factory.create(&node, &[]).unwrap();
+            receiver.set_constant_inputs(&[false, true, true]);
+            assert!(
+                receiver
+                    .adopt_shareable_constant_state(producer.shareable_constant_state().unwrap(),)
+                    .unwrap()
+            );
+            let first = producer
+                .as_any()
+                .downcast_ref::<MatMulNBitsKernel>()
+                .unwrap();
+            let second = receiver
+                .as_any()
+                .downcast_ref::<MatMulNBitsKernel>()
+                .unwrap();
+            assert!(Arc::ptr_eq(&first.native_packs, &second.native_packs));
+            let active = first
+                .load_native_weight(slot(first), true, &b.view(), &scales.view(), None)
+                .unwrap();
+            let warm = second
+                .load_native_weight(slot(second), true, &b.view(), &scales.view(), None)
+                .unwrap();
+            assert!(std::ptr::eq::<T>(&*active, &*warm));
+            drop(warm);
+            drop(producer);
+            assert_eq!(books.used(Tier::Host), bytes as u64);
+            assert!(
+                books
+                    .reserve(
+                        Tier::Host,
+                        peak as u64,
+                        MemoryRole::KvCache,
+                        HolderId::new(2)
+                    )
+                    .is_err(),
+                "active reader must survive pressure after originating kernel drops"
+            );
+            drop(active);
+            let kv = books
+                .reserve(
+                    Tier::Host,
+                    peak as u64,
+                    MemoryRole::KvCache,
+                    HolderId::new(2),
+                )
+                .unwrap();
+            assert!(
+                slot(second).get().is_none(),
+                "shared pressure enrollment must survive producer"
+            );
+            drop(kv);
+            let rebuilt = second
+                .load_native_weight(slot(second), true, &b.view(), &scales.view(), None)
+                .unwrap();
+            assert_eq!(books.used(Tier::Host), bytes as u64);
+            drop(receiver);
+            assert_eq!(books.used(Tier::Host), bytes as u64);
+            drop(rebuilt);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+        check::<Int8Weight>(4, |k| &k.native_packs.int8_weight);
+        check::<PackedInt4Weight>(4, |k| &k.native_packs.packed_int4_weight);
+        check::<PackedNBitsWeight>(4, |k| &k.native_packs.packed_nbits_weight);
+        check::<PackedU8Weight>(8, |k| &k.native_packs.packed_u8_weight);
+        check::<PackedN16SdotWeight>(4, |k| &k.native_packs.packed_int4_n16_weight);
+        check::<PackedN16SdotWeight>(8, |k| &k.native_packs.packed_u8_n16_weight);
+        check::<PackedKaiSdotWeight>(4, |k| &k.native_packs.packed_kai_qsi4_weight);
+        check::<PackedKaiSdotWeight>(8, |k| &k.native_packs.packed_kai_qsi8_weight);
+    }
+
+    #[test]
+    fn native_pack_shared_shapes_serialize_distinct_cold_builders() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let (books, resources) = governed_dense_resources(12, 0);
+        let factory = MatMulNBitsFactory::new(resources);
+        let node = governed_dense_node(16, 1, 4, 16);
+        let mut owner = factory.create(&node, &[]).unwrap();
+        owner.set_constant_inputs(&[false, true, true]);
+        let state = owner.shareable_constant_state().unwrap();
+        let peers: Vec<_> = (0..8)
+            .map(|_| {
+                let mut peer = factory.create(&node, &[]).unwrap();
+                peer.set_constant_inputs(&[false, true, true]);
+                assert!(peer.adopt_shareable_constant_state(state.clone()).unwrap());
+                peer
+            })
+            .collect();
+        drop(owner);
+        drop(state);
+        let b = Owned::u8(&[1, 1, 8], &[0x39; 8]);
+        let scales = Owned::f32(&[1, 1], &[0.125]);
+        let barrier = std::sync::Barrier::new(8);
+        let payloads = std::thread::scope(|scope| {
+            let handles: Vec<_> = peers
+                .iter()
+                .map(|peer| {
+                    let (barrier, b, scales) = (&barrier, &b, &scales);
+                    let kernel = peer.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        kernel
+                            .load_native_weight(
+                                &kernel.native_packs.packed_nbits_weight,
+                                true,
+                                &b.view(),
+                                &scales.view(),
+                                None,
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            payloads
+                .iter()
+                .all(|p| std::ptr::eq::<PackedNBitsWeight>(&**p, &*payloads[0]))
+        );
+        assert_eq!(books.used(Tier::Host), 12);
+        assert_eq!(payloads[0].values, [0x39; 8]);
+        assert_eq!(payloads[0].scales, [0.125]);
+        drop(peers);
+        assert_eq!(books.used(Tier::Host), 12);
+        drop(payloads);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn native_pack_shared_state_rejects_foreign_sources_and_parameters() {
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 1024, 0));
+        let foreign = LedgerGovernor::new(LeaseLedger::new(0, 1024, 0));
+        let memory = DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap();
+        let mut producer = test_kernel(16, 1, 16);
+        producer.weight_memory = memory.clone();
+        producer.set_constant_inputs(&[false, true, true]);
+        let state = producer.shareable_constant_state().unwrap();
+        for source in [
+            DerivedWeightMemory::default(),
+            DerivedWeightMemory::governed(&foreign, HolderId::new(13)).unwrap(),
+            DerivedWeightMemory::governed(&books, HolderId::new(14)).unwrap(),
+            DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+        ] {
+            let mut receiver = test_kernel(16, 1, 16);
+            receiver.weight_memory = source;
+            receiver.set_constant_inputs(&[false, true, true]);
+            let failure = receiver
+                .adopt_shareable_constant_state(state.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                failure.contains("MatMulNBits")
+                    && failure.contains("grant source")
+                    && failure.contains("CpuMemoryResources"),
+                "{failure}"
+            );
+            assert!(!Arc::ptr_eq(&receiver.native_packs, &producer.native_packs));
+        }
+        for mode in 0..11 {
+            let mut receiver = test_kernel(16, 1, 16);
+            receiver.weight_memory = memory.clone();
+            receiver.set_constant_inputs(&[false, true, true]);
+            match mode {
+                0 => receiver.k += 1,
+                1 => receiver.n += 1,
+                2 => receiver.bits = 8,
+                3 => receiver.block_size = 32,
+                4 => receiver.accuracy_level += 1,
+                5 => receiver.weight_prepacked = true,
+                6 => receiver.constant_inputs[1] = false,
+                7 => receiver.constant_inputs[3] = true,
+                8 => receiver.constant_inputs[2] = false,
+                9 => receiver.constant_inputs[4] = true,
+                _ => {
+                    receiver.dense_weights = Arc::new(WeightCache::new(
+                        memory.clone(),
+                        if receiver.dense_weights.byte_limit() == 0 {
+                            1
+                        } else {
+                            0
+                        },
+                    ))
+                }
+            }
+            assert!(
+                !receiver
+                    .adopt_shareable_constant_state(state.clone())
+                    .unwrap()
+            );
+            assert!(!Arc::ptr_eq(&receiver.native_packs, &producer.native_packs));
+        }
+        #[cfg(feature = "mlas")]
+        {
+            let mut receiver = test_kernel(16, 1, 16);
+            receiver.weight_memory = memory.clone();
+            receiver.set_constant_inputs(&[false, true, true]);
+            receiver.retain_mlas_packs = !producer.retain_mlas_packs;
+            assert!(
+                !receiver
+                    .adopt_shareable_constant_state(state.clone())
+                    .unwrap()
+            );
+            assert!(!Arc::ptr_eq(&receiver.mlas_caches, &producer.mlas_caches));
+        }
+        let mut receiver = test_kernel(16, 1, 16);
+        receiver.weight_memory = memory;
+        receiver.set_constant_inputs(&[false, true, true]);
+        assert!(
+            !receiver
+                .adopt_shareable_constant_state(Arc::new(7usize))
+                .unwrap()
+        );
+        assert!(receiver.adopt_shareable_constant_state(state).unwrap());
+        assert!(Arc::ptr_eq(&receiver.native_packs, &producer.native_packs));
+        assert!(Arc::ptr_eq(
+            &receiver.dense_weights,
+            &producer.dense_weights
+        ));
+        let mut local = test_kernel(16, 1, 16);
+        let mut peer = test_kernel(16, 1, 16);
+        local.set_constant_inputs(&[false, true, true]);
+        peer.set_constant_inputs(&[false, true, true]);
+        assert!(
+            peer.adopt_shareable_constant_state(local.shareable_constant_state().unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn native_pack_shared_shapes_keep_dynamic_metadata_uncached() {
+        let _probe = lock_dispatch_probe();
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let (books, resources) = governed_dense_resources(11, 0);
+        let factory = MatMulNBitsFactory::new(resources);
+        let node = governed_dense_node(16, 1, 2, 16);
+        let mut owner = factory.create(&node, &[]).unwrap();
+        owner.set_constant_inputs(&[false, true, true, false]);
+        let mut peer = factory.create(&node, &[]).unwrap();
+        peer.set_constant_inputs(&[false, true, true, false]);
+        assert!(
+            peer.adopt_shareable_constant_state(owner.shareable_constant_state().unwrap())
+                .unwrap()
+        );
+        let a = Owned::f32(&[1, 16], &[0.25; 16]);
+        let b = Owned::u8(&[1, 1, 4], &[0x39; 4]);
+        let scales = Owned::f16(&[1, 1], &[0.125]);
+        for kernel in [&owner, &peer] {
+            for (point, expected) in [(0, 0.75), (3, -0.75)] {
+                let zp = Owned::u8(&[1, 1], &[point]);
+                let mut output = Owned::zeros_f32(&[1, 1]);
+                kernel
+                    .execute(
+                        &[a.view(), b.view(), scales.view(), zp.view()],
+                        &mut [output.view_mut()],
+                    )
+                    .unwrap();
+                assert_eq!(output.to_f32(), [expected]);
+                assert_eq!(books.used(Tier::Host), 0);
+                let kernel = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                assert!(kernel.native_packs.packed_nbits_weight.get().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn native_pack_pressure_preserves_readers_reclaims_idle_and_rebuilds() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        fn check<T: NativePackedWeight>(
+            bits: usize,
+            slot: impl Fn(&MatMulNBitsKernel) -> &NativeWeightCache<T>,
+        ) {
+            let (k, n, block) = (16, 1, 16);
+            let b = Owned::u8(&[n, 1, block * bits / 8], &vec![0x39; block * bits / 8]);
+            let scales = Owned::f32(&[n, 1], &[0.125]);
+            let mut sizing = test_kernel(k, n, block);
+            sizing.bits = bits;
+            let (bytes, peak) = sizing
+                .native_preparation_bytes(T::LAYOUT, &b.view(), &scales.view(), None, false)
+                .unwrap();
+            let (governor, resources) = governed_dense_resources(peak, 0);
+            let owner = MatMulNBitsFactory::new(resources)
+                .create(&governed_dense_node(k, n, bits, block), &[])
+                .unwrap();
+            let kernel = owner.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+            let active = kernel
+                .load_native_weight(slot(kernel), true, &b.view(), &scales.view(), None)
+                .unwrap();
+            assert_eq!(governor.used(Tier::Host), bytes as u64);
+            let active_pressure = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        governor.reserve(
+                            Tier::Host,
+                            peak as u64,
+                            MemoryRole::KvCache,
+                            HolderId::new(2),
+                        )
+                    })
+                    .join()
+                    .unwrap()
+            });
+            assert!(
+                matches!(
+                    active_pressure,
+                    Err(onnx_runtime_memory_api::MemoryError::TierExhausted { .. })
+                ),
+                "another thread's pressure must not remove a pack held by an executing reader"
+            );
+            let warm = kernel
+                .load_native_weight(slot(kernel), true, &b.view(), &scales.view(), None)
+                .unwrap();
+            assert!(std::ptr::eq::<T>(&*active, &*warm));
+            drop(warm);
+            drop(active);
+            let kv = governor
+                .reserve(
+                    Tier::Host,
+                    peak as u64,
+                    MemoryRole::KvCache,
+                    HolderId::new(2),
+                )
+                .unwrap();
+            assert!(
+                slot(kernel).get().is_none(),
+                "the supplying authority must reclaim an idle native pack"
+            );
+            assert_eq!(governor.used(Tier::Host), peak as u64);
+            drop(kv);
+            assert_eq!(governor.used(Tier::Host), 0);
+            let rebuilt = kernel
+                .load_native_weight(slot(kernel), true, &b.view(), &scales.view(), None)
+                .unwrap();
+            assert_eq!(governor.used(Tier::Host), bytes as u64);
+            drop(owner);
+            assert_eq!(
+                governor.used(Tier::Host),
+                bytes as u64,
+                "kernel destruction must not refund a pack still held by a caller"
+            );
+            drop(rebuilt);
+            assert_eq!(governor.used(Tier::Host), 0);
+        }
+        check::<Int8Weight>(4, |k| &k.native_packs.int8_weight);
+        check::<PackedInt4Weight>(4, |k| &k.native_packs.packed_int4_weight);
+        check::<PackedNBitsWeight>(4, |k| &k.native_packs.packed_nbits_weight);
+        check::<PackedU8Weight>(8, |k| &k.native_packs.packed_u8_weight);
+        check::<PackedN16SdotWeight>(4, |k| &k.native_packs.packed_int4_n16_weight);
+        check::<PackedN16SdotWeight>(8, |k| &k.native_packs.packed_u8_n16_weight);
+        check::<PackedKaiSdotWeight>(4, |k| &k.native_packs.packed_kai_qsi4_weight);
+        check::<PackedKaiSdotWeight>(8, |k| &k.native_packs.packed_kai_qsi8_weight);
     }
 
     #[test]
@@ -12916,7 +14136,7 @@ mod tests {
                 for capacity in [peak - 1, peak] {
                     let (governor, resources) = governed_dense_resources(capacity, 0);
                     kernel.weight_memory = resources.weight_memory().clone();
-                    let cache = OnceLock::<PreparedWeight<T>>::new();
+                    let cache = NativeWeightCache::<T>::new(resources.weight_memory());
                     let value = kernel.load_native_weight(&cache, retain, packed, scales, points);
                     if capacity < peak {
                         assert!(matches!(
@@ -13110,13 +14330,16 @@ mod tests {
                                 onnx_runtime_memory_api::MemoryError::TierExhausted { .. }
                             ))
                         ));
-                        assert!(concrete.packed_u8_weight.get().is_none());
+                        assert!(concrete.native_packs.packed_u8_weight.get().is_none());
                         assert_eq!(governor.used(Tier::Host), 0);
                     } else {
                         result.unwrap();
                         // Independent wire semantics: (57 - 18) * .125 * .25 per K.
                         assert_eq!(output.to_f32(), vec![k as f32 * 39.0 * 0.125 * 0.25; n]);
-                        assert_eq!(concrete.packed_u8_weight.get().is_some(), retained);
+                        assert_eq!(
+                            concrete.native_packs.packed_u8_weight.get().is_some(),
+                            retained
+                        );
                         if retained && blocker.is_none() {
                             assert_eq!(governor.used(Tier::Host), bytes as u64);
                             blocker = Some(
@@ -13169,7 +14392,7 @@ mod tests {
             let (governor, resources) = governed_dense_resources(capacity, 0);
             let mut kernel = test_kernel(16, 1, 16);
             kernel.weight_memory = resources.weight_memory().clone();
-            let cache = OnceLock::<PreparedWeight<Broken>>::new();
+            let cache = NativeWeightCache::<Broken>::new(resources.weight_memory());
             let failure = kernel
                 .load_native_weight(&cache, true, &b.view(), &scales.view(), None)
                 .err()
@@ -13241,7 +14464,7 @@ mod tests {
             ));
             assert_eq!(governor.used(Tier::Host), bytes as u64);
             assert_eq!(dynamic.view().scales, &[0.125; 9]);
-            assert!(kernel.packed_nbits_weight.get().is_none());
+            assert!(kernel.native_packs.packed_nbits_weight.get().is_none());
             drop(dynamic);
             assert_eq!(governor.used(Tier::Host), 0);
             let bv = b.view();
@@ -13346,7 +14569,7 @@ mod tests {
             "{failure}"
         );
         assert_eq!(governor.used(Tier::Host), 0);
-        assert!(kernel.packed_nbits_weight.get().is_none());
+        assert!(kernel.native_packs.packed_nbits_weight.get().is_none());
         let floats = Owned::f32(&[1], &[0.125]);
         let fv = floats.view();
         let bv = b.view();
@@ -13390,7 +14613,7 @@ mod tests {
                     onnx_runtime_memory_api::MemoryError::TierExhausted { .. }
                 ))
             ));
-            assert!(kernel.packed_nbits_weight.get().is_none());
+            assert!(kernel.native_packs.packed_nbits_weight.get().is_none());
             assert_eq!(governor.used(Tier::Host), 0);
         }
         let bv = b.view();
@@ -13399,7 +14622,7 @@ mod tests {
         assert_eq!(borrowed.view().values.as_ptr(), bv.data_ptr::<u8>());
         assert_eq!(borrowed.view().scales.as_ptr(), sv.data_ptr::<f32>());
         assert_eq!(governor.used(Tier::Host), 0);
-        assert!(kernel.packed_nbits_weight.get().is_none());
+        assert!(kernel.native_packs.packed_nbits_weight.get().is_none());
     }
 
     #[cfg(not(feature = "mlas"))]
@@ -13441,6 +14664,7 @@ mod tests {
                                 .as_any()
                                 .downcast_ref::<MatMulNBitsKernel>()
                                 .unwrap()
+                                .native_packs
                                 .packed_nbits_weight
                                 .get()
                                 .is_none()
@@ -13513,7 +14737,10 @@ mod tests {
             assert_eq!(first.values, values);
             assert_eq!(first.scales, scales);
             assert_eq!(first.zero_points.unwrap(), points);
-            assert_eq!(kernel.packed_nbits_weight.get().is_none(), mask == 0);
+            assert_eq!(
+                kernel.native_packs.packed_nbits_weight.get().is_none(),
+                mask == 0
+            );
             assert_eq!(
                 governor.used(Tier::Host),
                 if mask == 0 { 0 } else { bytes as u64 }
@@ -13548,7 +14775,7 @@ mod tests {
                 PackedNBitsOperand::Prepared(PreparedWeightRef::Owned(_))
             ));
             assert_eq!(dynamic.view().scales, scale_values);
-            assert!(kernel.packed_nbits_weight.get().is_none());
+            assert!(kernel.native_packs.packed_nbits_weight.get().is_none());
         }
         let half = Owned::f16(&[3, 2], &scale_values);
         let first = kernel
@@ -13558,7 +14785,7 @@ mod tests {
             .resolve_nbits_operand(&b.view(), &half.view(), None, true)
             .unwrap();
         assert_eq!(first.view().scales.as_ptr(), second.view().scales.as_ptr());
-        assert!(kernel.packed_nbits_weight.get().is_some());
+        assert!(kernel.native_packs.packed_nbits_weight.get().is_some());
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -13648,7 +14875,7 @@ mod tests {
         }
     }
 
-    fn cached_dense_weight(kernel: &MatMulNBitsKernel) -> Option<Arc<DenseWeight>> {
+    fn cached_dense_weight(kernel: &MatMulNBitsKernel) -> Option<Arc<GrantedWeight>> {
         kernel.dense_weights.test_get(&kernel.dense_key().unwrap())
     }
     fn set_test_dense_retention(kernel: &mut MatMulNBitsKernel, enabled: bool) {
@@ -13656,14 +14883,14 @@ mod tests {
         {
             kernel.retain_mlas_packs = enabled;
         }
-        kernel.dense_weights = DenseWeightCache::new(
+        kernel.dense_weights = Arc::new(WeightCache::new(
             crate::DerivedWeightMemory::default(),
             if enabled {
-                super::super::dense_weight_cache::configured_dense_weight_cache_bytes()
+                super::super::weight_cache::configured_dense_weight_cache_bytes()
             } else {
                 0
             },
-        );
+        ));
     }
 
     fn test_kernel(k: usize, n: usize, block_size: usize) -> MatMulNBitsKernel {
@@ -13678,23 +14905,11 @@ mod tests {
             flops: None,
             weight_prepacked: false,
             constant_inputs: [false; 5],
-            dense_weights: DenseWeightCache::default(),
-            int8_weight: OnceLock::new(),
-            packed_u8_weight: OnceLock::new(),
-            packed_int4_weight: OnceLock::new(),
-            packed_int4_n16_weight: OnceLock::new(),
-            packed_kai_qsi4_weight: OnceLock::new(),
-            packed_nbits_weight: OnceLock::new(),
+            dense_weights: Arc::new(WeightCache::default()),
             weight_memory: DerivedWeightMemory::default(),
-            native_pack_fill: std::sync::Mutex::new(()),
-            packed_u8_n16_weight: OnceLock::new(),
-            packed_kai_qsi8_weight: OnceLock::new(),
+            native_packs: Arc::new(NativePackCaches::new(&DerivedWeightMemory::default())),
             #[cfg(feature = "mlas")]
-            mlas_owned: MlasPackedOwnership::default(),
-            #[cfg(feature = "mlas")]
-            mlas_shards: OnceLock::new(),
-            #[cfg(feature = "mlas")]
-            mlas_packed: OnceLock::new(),
+            mlas_caches: MlasPackedCaches::new(&DerivedWeightMemory::default()),
         }
     }
 
@@ -14165,40 +15380,40 @@ mod tests {
     /// route: MLAS SQNBit (`mlas_shards` or serialized `mlas_packed`) when
     /// available, otherwise the hand GEMV/int8 caches. Returning a raw address
     /// lets tests assert the cache is *reused* (stable) across calls, not merely
-    /// populated. Compact packs stay in their OnceLock; f32 payloads keep a
-    /// stable Arc allocation while retained in the owned dense cache.
+    /// populated. Native packs and f32 payloads keep stable Arc allocations
+    /// while retained, and may be rebuilt after pressure evicts an idle slot.
     fn prepack_cache_ptr(kernel: &MatMulNBitsKernel) -> Option<*const ()> {
         if let Some(w) = cached_dense_weight(kernel) {
             return Some(Arc::as_ptr(&w).cast());
         }
-        if let Some(w) = kernel.int8_weight.get() {
-            return Some(w as *const _ as *const ());
+        if let Some(w) = kernel.native_packs.int8_weight.get() {
+            return Some(Arc::as_ptr(&w).cast());
         }
-        if let Some(w) = kernel.packed_int4_weight.get() {
-            return Some(w as *const _ as *const ());
+        if let Some(w) = kernel.native_packs.packed_int4_weight.get() {
+            return Some(Arc::as_ptr(&w).cast());
         }
-        if let Some(w) = kernel.packed_int4_n16_weight.get() {
-            return Some(w as *const _ as *const ());
+        if let Some(w) = kernel.native_packs.packed_int4_n16_weight.get() {
+            return Some(Arc::as_ptr(&w).cast());
         }
-        if let Some(w) = kernel.packed_kai_qsi4_weight.get() {
-            return Some(w as *const _ as *const ());
+        if let Some(w) = kernel.native_packs.packed_kai_qsi4_weight.get() {
+            return Some(Arc::as_ptr(&w).cast());
         }
-        if let Some(w) = kernel.packed_nbits_weight.get() {
-            return Some(w as *const _ as *const ());
+        if let Some(w) = kernel.native_packs.packed_nbits_weight.get() {
+            return Some(Arc::as_ptr(&w).cast());
         }
-        if let Some(w) = kernel.packed_u8_n16_weight.get() {
-            return Some(w as *const _ as *const ());
+        if let Some(w) = kernel.native_packs.packed_u8_n16_weight.get() {
+            return Some(Arc::as_ptr(&w).cast());
         }
-        if let Some(w) = kernel.packed_kai_qsi8_weight.get() {
-            return Some(w as *const _ as *const ());
-        }
-        #[cfg(feature = "mlas")]
-        if let Some(w) = kernel.mlas_shards.get() {
-            return Some(w as *const _ as *const ());
+        if let Some(w) = kernel.native_packs.packed_kai_qsi8_weight.get() {
+            return Some(Arc::as_ptr(&w).cast());
         }
         #[cfg(feature = "mlas")]
-        if let Some(w) = kernel.mlas_packed.get() {
-            return Some(w as *const _ as *const ());
+        if let Some(w) = kernel.cached_mlas_shards() {
+            return Some(Arc::as_ptr(&w).cast());
+        }
+        #[cfg(feature = "mlas")]
+        if let Some(w) = kernel.cached_mlas_packed() {
+            return Some(Arc::as_ptr(&w).cast());
         }
         None
     }
@@ -14283,14 +15498,8 @@ mod tests {
             if kernel.mlas_sqnbit_owns_fp32_compute(true, !symmetric) {
                 // Per-kernel state, not the global counters: this is race-free
                 // proof that *this* node's weight was packed by MLAS SQNBit.
-                let mlas_packed_this_node = kernel
-                    .mlas_shards
-                    .get()
-                    .is_some_and(|shards| shards.is_some())
-                    || kernel
-                        .mlas_packed
-                        .get()
-                        .is_some_and(|packed| packed.is_some());
+                let mlas_packed_this_node =
+                    kernel.cached_mlas_shards().is_some() || kernel.cached_mlas_packed().is_some();
                 assert!(
                     mlas_packed_this_node,
                     "constant-weight int4 accuracy_level=0 must reach MLAS SQNBit CompFp32 when MLAS has a kernel for the shape"
@@ -15323,7 +16532,7 @@ mod tests {
 
         assert_close(&output.to_f32(), &expected);
         assert_eq!(
-            kernel.packed_nbits_weight.get().is_some(),
+            kernel.native_packs.packed_nbits_weight.get().is_some(),
             scale_dtype != DataType::Float32,
             "bits=2 must borrow wire operands, caching only required conversions"
         );
@@ -16011,7 +17220,7 @@ mod tests {
                 );
             }
             assert!(
-                kernel.int8_weight.get().is_none(),
+                kernel.native_packs.int8_weight.get().is_none(),
                 "sessions={sessions}: the expanded-i8 weight was built as well"
             );
             assert!(
@@ -16117,30 +17326,23 @@ mod tests {
         #[cfg(feature = "mlas")]
         if !hand_int8_decode_has_native_dot() {
             assert!(
-                kernel
-                    .mlas_shards
-                    .get()
-                    .is_some_and(|shards| shards.is_some())
-                    || kernel
-                        .mlas_packed
-                        .get()
-                        .is_some_and(|packed| packed.is_some()),
+                kernel.cached_mlas_shards().is_some() || kernel.cached_mlas_packed().is_some(),
                 "accuracy-4 decode must reach MLAS SQNBit where the hand int8 kernel has no native dot product"
             );
             assert!(
-                kernel.int8_weight.get().is_none(),
+                kernel.native_packs.int8_weight.get().is_none(),
                 "MLAS-owned accuracy-4 decode must not also build the hand int8 weight"
             );
             return;
         }
         assert_eq!(
-            kernel.packed_int4_weight.get().is_some()
-                || kernel.packed_int4_n16_weight.get().is_some()
-                || kernel.packed_kai_qsi4_weight.get().is_some()
+            kernel.native_packs.packed_int4_weight.get().is_some()
+                || kernel.native_packs.packed_int4_n16_weight.get().is_some()
+                || kernel.native_packs.packed_kai_qsi4_weight.get().is_some()
                 || {
                     #[cfg(feature = "mlas")]
                     {
-                        kernel.mlas_shards.get().is_some()
+                        kernel.cached_mlas_shards().is_some()
                     }
                     #[cfg(not(feature = "mlas"))]
                     {
@@ -16156,12 +17358,12 @@ mod tests {
         // must be built -- building both would mean the route was decided twice.
         let nibble = int4_nibble::supported(block_size);
         assert_eq!(
-            kernel.packed_nbits_weight.get().is_some(),
+            kernel.native_packs.packed_nbits_weight.get().is_some(),
             !direct_int4 && nibble,
             "the packed-nibble cache must be populated exactly when its route runs"
         );
         assert_eq!(
-            kernel.int8_weight.get().is_some(),
+            kernel.native_packs.int8_weight.get().is_some(),
             !direct_int4 && !nibble,
             "the expanded int8 weight must only be built when nothing cheaper applies"
         );
@@ -16237,16 +17439,16 @@ mod tests {
                     "{label}: bits={bits} block{block_size} asymmetric M=1 decode must route through MLAS QNBit",
                 );
                 assert!(
-                    kernel.mlas_shards.get().and_then(Option::as_ref).is_some(),
+                    kernel.cached_mlas_shards().is_some(),
                     "{label}: bits={bits} block{block_size} must prepack MLAS QNBit shards for decode by default",
                 );
                 assert!(
-                    kernel.mlas_packed.get().is_none(),
+                    kernel.cached_mlas_packed().is_none(),
                     "{label}: bits={bits} block{block_size} should only use full-width MLAS when ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1",
                 );
                 assert!(
-                    kernel.packed_kai_qsi4_weight.get().is_none()
-                        && kernel.packed_kai_qsi8_weight.get().is_none(),
+                    kernel.native_packs.packed_kai_qsi4_weight.get().is_none()
+                        && kernel.native_packs.packed_kai_qsi8_weight.get().is_none(),
                     "{label}: bits={bits} block{block_size} must prefer MLAS over the native KAI fallback",
                 );
             }
@@ -16360,20 +17562,19 @@ mod tests {
                     &mut result,
                 )
                 .expect("the MLAS SQNBit route must not error");
+            let owner = Arc::downgrade(&kernel.mlas_caches);
+            drop(kernel);
+            assert!(
+                owner.upgrade().is_none(),
+                "retired node left a cache owner alive"
+            );
             (result, addr, ran.is_some())
         };
 
-        // Reference outputs are taken against a *drained* store, so each is
-        // packed from its own weight by construction. Deriving them from the
+        // Each independent node owns a fresh store and packs its own weight. Deriving them from the
         // first round instead would let a stale hit poison the reference and
         // turn the per-round comparison into a tautology.
-        let truth: Vec<Vec<f32>> = (0..2)
-            .map(|which| {
-                clear_mlas_packed_caches();
-                decode(which).0
-            })
-            .collect();
-        clear_mlas_packed_caches();
+        let truth: Vec<Vec<f32>> = (0..2).map(|which| decode(which).0).collect();
         assert_ne!(
             truth[0], truth[1],
             "the two weights must produce different outputs, or a stale pack \
@@ -16384,16 +17585,6 @@ mod tests {
         let mut recycled_across_weights = false;
         for round in 0..8 {
             let which = round % 2;
-            // Allocator-independent, and the assertion that actually carries this
-            // test: the previous round's kernel has retired, so whatever it
-            // installed must be gone. Address recycling below is a second,
-            // stronger-but-hostier arm; this one holds on every allocator.
-            assert_eq!(
-                mlas_store_len(),
-                (0, 0),
-                "round {round}: the retired kernel left its pack in the store, \
-                 where a later weight at its address can inherit it"
-            );
             let (got, addr, routed) = decode(which);
             assert!(
                 routed,
@@ -16419,14 +17610,14 @@ mod tests {
         // code's: glibc's brk heap reuses these sizes readily, but an allocator
         // that serves each request fresh (ASan, valgrind, some musl and macOS
         // configurations) would fail a *correct* implementation here. The
-        // per-round store-drain assertion above covers the mechanism without
+        // per-round weak-owner assertion above covers the mechanism without
         // depending on it. Reported loudly so a run that skipped this arm is
         // never mistaken for one that exercised it.
         if !recycled_across_weights {
             eprintln!(
                 "NOTE: no full key was reused across weights in {} rounds, so \
                  this allocator did not exercise the recycling arm; the \
-                 per-round eviction assertion still covered the mechanism. \
+                 per-round owner-release assertion still covered the mechanism. \
                  Key addresses: {:#x?}",
                 seen.len(),
                 seen
@@ -16434,17 +17625,11 @@ mod tests {
         }
     }
 
-    /// A pack must survive the drop of a kernel that merely *shared* it (#1735).
-    ///
-    /// Ownership is the installing call, not everyone who reaches the entry. A
-    /// node's prefill and decode instances key identically, so the sharing this
-    /// store exists for (#1056: one packed copy per weight, not one per shape
-    /// instantiation) only holds if a retiring sibling leaves the entry alone.
-    /// Evicting on any drop would make the survivor re-pack -- the cost the
-    /// shared store was built to remove.
+    /// Explicit node sharing survives retirement of the original builder and
+    /// ends with the last adopted shape variant, without installer bookkeeping.
     #[cfg(feature = "mlas")]
     #[test]
-    fn a_shared_mlas_pack_outlives_the_sibling_that_only_shared_it() {
+    fn a_shared_mlas_pack_outlives_its_original_builder() {
         let _probe = lock_dispatch_probe();
         let _guard = backend_env_lock().lock().unwrap();
         let (k, n, block_size) = (128usize, 256usize, 32usize);
@@ -16483,9 +17668,18 @@ mod tests {
         let scales_t = Owned::f32(&[n, blocks], &scales);
         let zero_points = Owned::u8(&[n, zp_blob], &zps);
         let _env = crate::test_support::EnvVarGuard::set("NXRT_CPU_GEMM_BACKEND", "mlas");
+        let mut owner = accuracy4_kernel(k, n, block_size);
+        owner.set_constant_inputs(&[false, true, true, true]);
+        let state = owner.shareable_constant_state().unwrap();
         let run = || {
             let mut result = vec![0.0f32; m * n];
-            let kernel = accuracy4_kernel(k, n, block_size);
+            let mut kernel = accuracy4_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, true, true, true]);
+            assert!(
+                kernel
+                    .adopt_shareable_constant_state(state.clone())
+                    .unwrap()
+            );
             let ran = kernel
                 .try_mlas_sqnbit(
                     &b.view(),
@@ -16509,32 +17703,19 @@ mod tests {
             first_out, shared_out,
             "both instances of one weight must produce the same output"
         );
-        assert!(
-            installer.mlas_owned.shards.get().is_some(),
-            "the first instance to reach the store must record that it installed \
-             the entry"
-        );
-        assert!(
-            sharer.mlas_owned.shards.get().is_none(),
-            "an instance that hit an existing entry must not claim ownership of \
-             it, or it would evict a live sibling's pack"
-        );
-
-        let resident = |label: &str| {
-            assert!(
-                mlas_store_len().0 > 0,
-                "{label}: the shared pack must still be resident"
-            );
-        };
-        resident("with both instances alive");
-        drop(sharer);
-        resident("after the sharing instance retired");
+        assert!(Arc::ptr_eq(&installer.mlas_caches, &sharer.mlas_caches));
+        drop(owner);
+        drop(state);
+        let owner = Arc::downgrade(&installer.mlas_caches);
         drop(installer);
-        assert_eq!(
-            mlas_store_len().0,
-            0,
-            "once the installing instance retires, nothing keyed on that weight \
-             may remain in the store"
+        assert!(
+            owner.upgrade().is_some(),
+            "the sharing node variant owns the cache"
+        );
+        drop(sharer);
+        assert!(
+            owner.upgrade().is_none(),
+            "last node variant releases the cache"
         );
     }
 
@@ -16609,40 +17790,50 @@ mod tests {
             (result, kernel)
         };
 
-        // References against a drained store, so each is packed from its own
-        // scales by construction.
-        clear_mlas_packed_caches();
+        // Independent node owners pack each reference from its own scales.
         let want_first = run(&first_scales).0;
-        clear_mlas_packed_caches();
         let want_second = run(&second_scales).0;
-        clear_mlas_packed_caches();
         assert_ne!(
             want_first, want_second,
             "doubling the scales must change the output, or this test has no power"
         );
 
-        // The installer is held so its entry is still resident when the second
-        // scales tensor reaches the store on the same quantized blob.
-        let (got_first, _installer) = run(&first_scales);
-        let (got_second, _second) = run(&second_scales);
-        assert_eq!(
-            got_first, want_first,
-            "the installing pack must be unaffected"
+        // Drive both keys through one owner directly, so removing scales from
+        // the key still fails even though independent nodes no longer share.
+        let kernel = accuracy4_kernel(k, n, block_size);
+        let first = kernel
+            .shared_mlas_shards(
+                &b.view(),
+                &first_scales.view(),
+                Some(&zero_points.view()),
+                mlas_sys::SQNBitComputeType::Int8,
+            )
+            .unwrap()
+            .unwrap();
+        let second = kernel
+            .shared_mlas_shards(
+                &b.view(),
+                &second_scales.view(),
+                Some(&zero_points.view()),
+                mlas_sys::SQNBitComputeType::Int8,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "different scales must retain distinct entries within a node owner"
         );
-        assert_eq!(
-            got_second, want_second,
-            "a pack built for another scale tensor was served to this one: the \
-             store key does not close the operands the pack is a function of"
-        );
+        let mut got_first = vec![0.; m * n];
+        let mut got_second = vec![0.; m * n];
+        kernel.run_mlas_shards(&first, &activations, m, None, &mut got_first);
+        kernel.run_mlas_shards(&second, &activations, m, None, &mut got_second);
+        assert_eq!(got_first, want_first);
+        assert_eq!(got_second, want_second);
     }
 
-    /// The store's insert/evict pair must stay consistent under concurrent use.
+    /// A node's layout map stays consistent under concurrent membership changes.
     ///
-    /// Exercises `MlasPackedCaches` directly rather than through kernels: the
-    /// per-test store is thread-local (so kernels on different threads cannot
-    /// contend), while the production store is process-global and genuinely
-    /// shared. This drives the same `Mutex`/`entry`/`remove` paths the global
-    /// store uses, including an installer and a sharer racing for one key.
+    /// Shared node caches permit concurrent builders and membership changes.
     #[cfg(feature = "mlas")]
     #[test]
     fn the_packed_store_stays_consistent_under_concurrent_install_and_evict() {
@@ -16652,9 +17843,11 @@ mod tests {
                 None,
                 false,
                 DataType::Float32,
-                addr,
-                addr + 1,
-                0,
+                MlasPackedSource::HostAddresses {
+                    weight: addr,
+                    scales: addr + 1,
+                    zero_points: 0,
+                },
                 8,
                 8,
                 4,
@@ -16678,15 +17871,12 @@ mod tests {
                                 Ok(Some(Vec::new()))
                             })
                             .expect("building an empty shard vector cannot fail");
-                        let (_arc, installed) =
-                            got.expect("a build returning Some must yield an entry");
+                        let _arc = got.expect("a build returning Some must yield an entry");
                         assert!(
                             installed_count.get() <= 1,
                             "the build closure must run at most once per call"
                         );
-                        if installed {
-                            caches.remove_shards(&key);
-                        }
+                        caches.remove_shards(&key);
                         if thread % 2 == 0 {
                             caches.remove_shards(&key_at(round % 4));
                         }
@@ -16694,8 +17884,7 @@ mod tests {
                 });
             }
         });
-        // Every installer removed its own entry, and `remove` of an absent key
-        // is a no-op, so the store must drain rather than leak.
+        // Explicit removal of absent membership is a no-op.
         for addr in 0..4usize {
             caches.remove_shards(&key_at(addr));
         }
@@ -16779,9 +17968,9 @@ mod tests {
             kernel
                 .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
                 .unwrap();
-            let used_kai = kernel.packed_kai_qsi4_weight.get().is_some();
+            let used_kai = kernel.native_packs.packed_kai_qsi4_weight.get().is_some();
             #[cfg(feature = "mlas")]
-            let used_mlas = kernel.mlas_shards.get().is_some();
+            let used_mlas = kernel.cached_mlas_shards().is_some();
             #[cfg(not(feature = "mlas"))]
             let used_mlas = false;
             // Whether a fast int4 route exists at all is per-OS policy:
@@ -16795,7 +17984,7 @@ mod tests {
                 "aarch64 bits=4/block128 decode reached neither MLAS QNBit nor KAI SDOT for K={k} N={n}",
             );
             assert!(
-                kernel.int8_weight.get().is_none() || !kai_dispatch_enabled,
+                kernel.native_packs.int8_weight.get().is_none() || !kai_dispatch_enabled,
                 "block-128 direct int4 path must bypass the int8 prepack fallback"
             );
             if used_kai {
@@ -17154,10 +18343,11 @@ mod tests {
         }
         if reached_kai || reached_mlas {
             assert!(
-                kernel.packed_kai_qsi4_weight.get().is_some() || {
+                kernel.native_packs.packed_kai_qsi4_weight.get().is_some() || {
                     #[cfg(feature = "mlas")]
                     {
-                        kernel.mlas_shards.get().is_some() || kernel.mlas_packed.get().is_some()
+                        kernel.cached_mlas_shards().is_some()
+                            || kernel.cached_mlas_packed().is_some()
                     }
                     #[cfg(not(feature = "mlas"))]
                     {
@@ -17165,11 +18355,11 @@ mod tests {
                     }
                 }
             );
-            assert!(kernel.int8_weight.get().is_none());
+            assert!(kernel.native_packs.int8_weight.get().is_none());
         } else {
             assert!(!direct);
             assert!(
-                kernel.int8_weight.get().is_some(),
+                kernel.native_packs.int8_weight.get().is_some(),
                 "a disabled direct route must use the native int8 representation"
             );
         }
@@ -21352,14 +22542,7 @@ mod tests {
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
         assert!(
-            kernel
-                .mlas_shards
-                .get()
-                .is_some_and(|shards| shards.is_some())
-                || kernel
-                    .mlas_packed
-                    .get()
-                    .is_some_and(|packed| packed.is_some()),
+            kernel.cached_mlas_shards().is_some() || kernel.cached_mlas_packed().is_some(),
             "int4 accuracy_level=0 with constant block-32 weights must reach MLAS SQNBit on x86_64; \
              the borrowed path's block dot is aarch64-only, so pre-empting MLAS here means a scalar GEMV"
         );
@@ -21402,9 +22585,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     fn mlas_shards_owned_bytes(kernel: &MatMulNBitsKernel) -> u64 {
         kernel
-            .mlas_shards
-            .get()
-            .and_then(Option::as_ref)
+            .cached_mlas_shards()
             .map(|shards| {
                 shards
                     .iter()
@@ -21421,10 +22602,8 @@ mod tests {
     #[cfg(feature = "mlas")]
     fn mlas_shards_arc_ptr(kernel: &MatMulNBitsKernel) -> Option<*const Vec<Option<MlasShard>>> {
         kernel
-            .mlas_shards
-            .get()
-            .and_then(Option::as_ref)
-            .map(Arc::as_ptr)
+            .cached_mlas_shards()
+            .map(|weight| Arc::as_ptr(&weight))
     }
 
     /// #1027/#1051/#1056: the accounting the memory plan reads must equal the
@@ -21476,21 +22655,28 @@ mod tests {
         // The constant weight (`b`) and its scales are built **once** and shared
         // by both runs, exactly as the executor hands the same mmapped
         // initializer to a node's prefill and decode kernel instances. That
-        // shared address is what lets the two instances rendezvous on one packed
-        // buffer; building a fresh copy per run (distinct addresses) would defeat
-        // the dedup the same way distinct weights do.
+        // explicit shared node state lets the two instances reuse a packed buffer;
+        // matching operand addresses alone no longer authorizes sharing.
         let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
         let scales_t = Owned::f32(&[n, blocks], &scales);
 
         // Execute one kernel instance at row count `m` so it packs (or shares)
         // its MLAS shards exactly as the decode runtime does, then return the
         // kernel so its actual retained bytes can be read back.
+        let mut owner = test_kernel(k, n, block_size);
+        owner.set_constant_inputs(&[false, true, true]);
+        let state = owner.shareable_constant_state().unwrap();
         let run = |m: usize| -> MatMulNBitsKernel {
             let a_values: Vec<f32> = (0..m * k)
                 .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
                 .collect();
             let mut kernel = test_kernel(k, n, block_size);
             kernel.set_constant_inputs(&[false, true, true]);
+            assert!(
+                kernel
+                    .adopt_shareable_constant_state(state.clone())
+                    .unwrap()
+            );
             let a = Owned::f32(&[m, k], &a_values);
             let mut y = Owned::zeros_f32(&[m, n]);
             kernel
@@ -21660,8 +22846,8 @@ mod tests {
             "a declined MLAS route must not claim ownership"
         );
         assert!(
-            declined_kernel.mlas_shards.get().is_none()
-                && declined_kernel.mlas_packed.get().is_none(),
+            declined_kernel.cached_mlas_shards().is_none()
+                && declined_kernel.cached_mlas_packed().is_none(),
             "the declined route must not build any MLAS packed buffer"
         );
         assert!(
@@ -21923,11 +23109,9 @@ mod tests {
                 )
                 .unwrap();
             let cached_prepacked = prepacked_kernel
-                .mlas_packed
-                .get()
-                .and_then(Option::as_ref)
-                .expect("constant MLAS prepacked weight must be cached")
-                as *const _;
+                .cached_mlas_packed()
+                .map(|weight| Arc::as_ptr(&weight))
+                .expect("constant MLAS prepacked weight must be cached");
             let mut reused_output = Owned::zeros_f32(&[m, n]);
             prepacked_kernel
                 .execute(
@@ -21938,11 +23122,9 @@ mod tests {
             assert_eq!(
                 cached_prepacked,
                 prepacked_kernel
-                    .mlas_packed
-                    .get()
-                    .and_then(Option::as_ref)
-                    .expect("MLAS prepacked cache must remain populated")
-                    as *const _,
+                    .cached_mlas_packed()
+                    .map(|weight| Arc::as_ptr(&weight))
+                    .expect("MLAS prepacked cache must remain populated"),
                 "constant MLAS prepacked weight must be reused"
             );
 
@@ -22255,13 +23437,16 @@ mod tests {
                     &mut [output.view_mut()],
                 )
                 .unwrap();
-            assert_eq!(kernel.packed_nbits_weight.get().is_some(), placement);
+            assert_eq!(
+                kernel.native_packs.packed_nbits_weight.get().is_some(),
+                placement
+            );
             assert_eq!(
                 SPMD_TEST_DISPATCHES.load(Ordering::Relaxed) - before,
                 usize::from(persistent)
             );
             if placement {
-                let cached = kernel.packed_nbits_weight.get().unwrap();
+                let cached = kernel.native_packs.packed_nbits_weight.get().unwrap();
                 assert_ne!(cached.weight.values.as_ptr(), b.view().data_ptr::<u8>());
             }
         });
@@ -25250,16 +26435,13 @@ mod tests {
 
             if mlas_no_shard() {
                 assert!(
-                    kernel.mlas_shards.get().is_none(),
+                    kernel.cached_mlas_shards().is_none(),
                     "NO_SHARD must select the full-width MLAS call (k={k} blk={block_size})"
                 );
             } else {
                 let shards = kernel
-                    .mlas_shards
-                    .get()
-                    .expect("the cached sharded MLAS route must be populated")
-                    .as_ref()
-                    .expect("MLAS packed every worker shard");
+                    .cached_mlas_shards()
+                    .expect("the cached sharded MLAS route must be populated");
                 assert_eq!(shards.len(), segments.len());
                 assert!(
                     shards.iter().flatten().count() > 1,
@@ -25476,11 +26658,8 @@ mod tests {
                 "MLAS CompFp32 must serve this prefill (k={k} blk={block_size})"
             );
             let shards = kernel
-                .mlas_shards
-                .get()
-                .expect("the cached sharded MLAS route must be populated")
-                .as_ref()
-                .expect("MLAS packed every worker shard");
+                .cached_mlas_shards()
+                .expect("the cached sharded MLAS route must be populated");
             assert!(
                 shards.iter().flatten().count() > 1,
                 "the cached route must contain multiple real MLAS shards \

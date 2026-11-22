@@ -94,12 +94,8 @@ const MIN_PARALLEL_SOFTMAX_ELEMENTS: usize = 16 * 1024;
 /// use, which finds the row max, evaluates `exp` and normalizes in one pass
 /// over the row.
 ///
-/// The `exp` is only vectorised when the optional `mlas` feature is on, which
-/// it is **not** by default. The shipping build evaluates `f32::exp` one
-/// element at a time, and that is worth about 9x against ORT on a standalone
-/// `Softmax`. Fixing it is tracked separately; this comment previously claimed
-/// an 8-lane polynomial unconditionally, which was only ever true of the MLAS
-/// arm.
+/// Native AVX2+FMA and NEON row kernels evaluate a shared polynomial without
+/// linking MLAS. Other ISAs and short rows retain the scalar implementation.
 ///
 /// Rows are independent, so the outer loop fans out across the shared Rayon
 /// pool once the tensor is large enough to pay for it. ORT parallelizes the
@@ -236,7 +232,7 @@ fn scale_mask_softmax_serial(
             }
             None => {}
         }
-        softmax_rows_serial(tile, tile_rows, d);
+        softmax_rows_serial(tile, d);
         row0 += tile_rows;
     }
 }
@@ -254,6 +250,18 @@ fn scale_mask_softmax_serial(
 /// `the_parallel_fan_out_is_bit_identical_to_the_serial_path` test asserts that
 /// equality on both the MLAS and the pure-Rust builds.
 pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
+    softmax_rows_with_kernel(src, dst, n, d, softmax_rows_serial_out);
+}
+
+// Production and explicit test-only arithmetic controls share this scheduler.
+// A monomorphized function item keeps the selected row body direct/inlinable.
+fn softmax_rows_with_kernel(
+    src: &[f32],
+    dst: &mut [f32],
+    n: usize,
+    d: usize,
+    serial: impl Fn(&[f32], &mut [f32], usize) + Sync,
+) {
     debug_assert_eq!(src.len(), n * d);
     debug_assert_eq!(dst.len(), n * d);
     if d == 0 || n == 0 {
@@ -266,10 +274,10 @@ pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
         // hands out several chunks per task for balance.
         crate::task_runtime::chunk_runs_mut(dst, block, 1, |first, out| {
             let start = first * block;
-            softmax_rows_serial_out(&src[start..start + out.len()], out, out.len() / d, d);
+            serial(&src[start..start + out.len()], out, d);
         });
     } else {
-        softmax_rows_serial_out(src, dst, n, d);
+        serial(src, dst, d);
     }
 }
 
@@ -319,15 +327,19 @@ fn parallel_rows_per_task(n: usize, d: usize) -> Option<usize> {
 /// `tests/native_vs_mlas_differential.rs` hold the two against each other in
 /// one process.
 #[inline]
-fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
+fn softmax_rows_serial(data: &mut [f32], d: usize) {
     record_softmax_route(data.len());
     #[cfg(feature = "mlas")]
     {
-        mlas_sys::compute_softmax_in_place(data, n, d);
+        if let Some(width) =
+            checked_row_width(data.len(), d).expect("Softmax scheduler must supply complete rows")
+        {
+            mlas_sys::compute_softmax_in_place(data, data.len() / width.get(), width.get());
+        }
     }
     #[cfg(not(feature = "mlas"))]
     {
-        softmax_rows_serial_native(data, n, d);
+        softmax_rows_serial_native(data, d).expect("Softmax scheduler must supply complete rows");
     }
 }
 
@@ -336,15 +348,20 @@ fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
 /// `Output` alone, so this is bit-identical to `dst.copy_from_slice(src)`
 /// followed by the in-place form.
 #[inline]
-fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
+fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], d: usize) {
     record_softmax_route(src.len());
     #[cfg(feature = "mlas")]
     {
-        mlas_sys::compute_softmax(src, dst, n, d);
+        if let Some(width) =
+            checked_row_width(src.len(), d).expect("Softmax scheduler must supply complete rows")
+        {
+            mlas_sys::compute_softmax(src, dst, src.len() / width.get(), width.get());
+        }
     }
     #[cfg(not(feature = "mlas"))]
     {
-        softmax_rows_serial_out_native(src, dst, n, d);
+        softmax_rows_serial_out_native(src, dst, d)
+            .expect("Softmax scheduler must supply equal complete rows");
     }
 }
 
@@ -369,6 +386,29 @@ fn record_softmax_route(elements: usize) {
     });
 }
 
+// One coefficient set for the native AVX2 and NEON exponentials. These are
+// the existing degree-six fit, with exact constant/linear terms of one.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+#[allow(clippy::excessive_precision)]
+mod exp_coefficients {
+    pub(super) const LN2_HI: f32 = 0.693_359_375_f32;
+    pub(super) const LN2_LO: f32 = -2.121_944_40e-4_f32;
+    pub(super) const C2: f32 = 4.999_999_1e-1_f32;
+    pub(super) const C3: f32 = 1.666_642_0e-1_f32;
+    pub(super) const C4: f32 = 4.166_822_5e-2_f32;
+    pub(super) const C5: f32 = 8.374_816_0e-3_f32;
+    pub(super) const C6: f32 = 1.383_684_6e-3_f32;
+}
+
+// Two complete four-lane vectors amortize the polynomial/mask prologue.
+// Measured 4/7-element rows do not benefit; keep their original scalar body.
+#[cfg(target_arch = "aarch64")]
+const MIN_NEON_SOFTMAX_ROW: usize = 8;
+
+#[cfg(target_arch = "aarch64")]
+#[path = "softmax_neon.rs"]
+mod softmax_neon;
+
 /// Portable implementation with the same semantics: subtract the row max,
 /// `exp`, normalize. **This is the production route** — and the baseline the
 /// MLAS reference is differentially tested against, so it is compiled in every
@@ -378,37 +418,68 @@ fn record_softmax_route(elements: usize) {
 /// and was the entire gap against ORT's vectorised CPU softmax (9-11x on the
 /// attention shapes). Both the in-place and the out-of-place forms now route
 /// every row through the *one* [`softmax_row_core`] routine, which evaluates
-/// `exp` eight lanes at a time on AVX2+FMA (with a scalar fallback). Sharing a
+/// `exp` with AVX2+FMA or NEON (with a scalar fallback). Sharing a
 /// single core is also what keeps the two forms bit-identical - see
 /// `out_of_place_softmax_is_bit_identical_on_pathological_rows`.
-pub fn softmax_rows_serial_native(data: &mut [f32], n: usize, d: usize) {
-    for row in data.chunks_mut(d) {
+/// Row count comes from complete rows of `columns`; invalid geometry is an
+/// error before mutation. Empty storage, including zero-width rows, is a no-op.
+pub fn softmax_rows_serial_native(data: &mut [f32], columns: usize) -> Result<()> {
+    let Some(width) = checked_row_width(data.len(), columns)? else {
+        return Ok(());
+    };
+    for row in data.chunks_exact_mut(width.get()) {
         let ptr = row.as_mut_ptr();
-        // SAFETY: `row` is exactly `d` elements, so `ptr` is valid for `d` f32
-        // reads and writes. This is the in-place case (`src == dst`), which
-        // `softmax_row_core` supports because it loads each block from the
-        // source before storing the corresponding destination block, so no
-        // lane is ever read back after it is written.
-        unsafe { softmax_row_core(ptr as *const f32, ptr, d) };
+        // SAFETY: the borrowed complete row proves the extent directly. Exact
+        // alias is supported, and each source lane is read before its write.
+        unsafe { softmax_row_core(ptr.cast_const(), ptr, row.len()) };
     }
-    let _ = n;
+    Ok(())
 }
 
-/// Portable out-of-place counterpart of [`softmax_rows_serial`]: read `src`,
-/// write `dst`, no copy. Bit-identical to `dst.copy_from_slice(src)` followed by
-/// the in-place form because it calls the *same* [`softmax_row_core`] per row,
-/// reading each `src` element in place of the copied `dst` element it would
-/// otherwise have read.
-pub fn softmax_rows_serial_out_native(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
-    for (srow, drow) in src.chunks(d).zip(dst.chunks_mut(d)) {
-        debug_assert_eq!(srow.len(), d);
-        debug_assert_eq!(drow.len(), d);
-        // SAFETY: `srow` and `drow` are each exactly `d` elements. `softmax_rows`
-        // documents `src`/`dst` as disjoint, so these do not overlap; the core
-        // reads `d` floats from the first pointer and writes `d` to the second.
-        unsafe { softmax_row_core(srow.as_ptr(), drow.as_mut_ptr(), d) };
+/// Contiguous native Softmax with disjoint source/destination slices.
+/// Row count is derived from the slices; malformed extents fail before writes.
+pub fn softmax_rows_serial_out_native(src: &[f32], dst: &mut [f32], columns: usize) -> Result<()> {
+    if src.len() != dst.len() {
+        return Err(EpError::KernelFailed(format!(
+            "Softmax rows: source has {} elements, destination has {}, columns={columns}; supply equal-length buffers containing complete rows",
+            src.len(),
+            dst.len()
+        )));
     }
-    let _ = n;
+    let Some(width) = checked_row_width(src.len(), columns)? else {
+        return Ok(());
+    };
+    for (source, output) in src
+        .chunks_exact(width.get())
+        .zip(dst.chunks_exact_mut(width.get()))
+    {
+        // SAFETY: both complete rows have the same nonzero width and are
+        // disjoint by their Rust borrows. The core extent comes from the slice.
+        unsafe { softmax_row_core(source.as_ptr(), output.as_mut_ptr(), source.len()) };
+    }
+    Ok(())
+}
+
+/// Validate the one independent row dimension before entering a row kernel.
+/// Empty storage is a no-op, including a tensor with a zero-width axis.
+/// NonZeroUsize carries the validated divisor into exact-row iterators/FFI.
+pub(crate) fn checked_row_width(
+    elements: usize,
+    columns: usize,
+) -> Result<Option<std::num::NonZeroUsize>> {
+    if elements == 0 {
+        return Ok(None);
+    }
+    let width = std::num::NonZeroUsize::new(columns).ok_or_else(|| EpError::KernelFailed(format!(
+        "Softmax rows: columns=0 cannot describe {elements} elements; use empty buffers for a zero-width tensor or provide a nonzero column count"
+    )))?;
+    if !elements.is_multiple_of(width.get()) {
+        return Err(EpError::KernelFailed(format!(
+            "Softmax rows: {elements} elements do not form complete rows of {columns} columns ({} trailing elements); supply complete contiguous rows",
+            elements % width.get()
+        )));
+    }
+    Ok(Some(width))
 }
 
 /// The single row reducer shared by the in-place and out-of-place native
@@ -418,8 +489,9 @@ pub fn softmax_rows_serial_out_native(src: &[f32], dst: &mut [f32], n: usize, d:
 /// non-finite rows the parity tests pin), because the max/`exp`/normalize
 /// arithmetic is literally the same instructions in both.
 ///
-/// On x86 with AVX2+FMA it evaluates `exp` eight lanes at a time; elsewhere,
-/// and on the sub-8 tail of every row, it uses the scalar libm `exp`.
+/// AVX2+FMA evaluates eight lanes at a time; NEON evaluates four. Other ISAs,
+/// short rows, and incomplete vector tails retain scalar libm `exp`. NEON also
+/// preserves gradual underflow for the ARM64 scalar path's tiny probabilities.
 ///
 /// # Safety
 /// `src` must be valid for `d` f32 reads and `dst` for `d` f32 writes. The two
@@ -440,14 +512,21 @@ unsafe fn softmax_row_core(src: *const f32, dst: *mut f32, d: usize) {
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    if d >= MIN_NEON_SOFTMAX_ROW && std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: runtime detection proves NEON; preserve the identical-or-
+        // disjoint source/destination contract and the complete row bounds.
+        unsafe { softmax_neon::softmax_row(src, dst, d) };
+        return;
+    }
     // SAFETY: same pointer/length contract; the scalar path performs the
     // identical reads and writes without any SIMD.
     unsafe { softmax_row_scalar(src, dst, d) };
 }
 
 /// Scalar reference reducer: one libm `exp` per element. This is the fallback
-/// for non-x86 targets, for x86 without AVX2+FMA, and (in the AVX2 kernel) for
-/// the tail of a row whose length is not a multiple of 8.
+/// for targets without a supported vector ISA and for short rows. Vector row
+/// kernels use the same libm formula for their incomplete final vector.
 ///
 /// # Safety
 /// Same contract as [`softmax_row_core`].
@@ -495,6 +574,7 @@ unsafe fn softmax_row_scalar(src: *const f32, dst: *mut f32, d: usize) {
 /// normalization.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod softmax_avx2 {
+    use super::exp_coefficients as coeff;
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
@@ -525,8 +605,8 @@ mod softmax_avx2 {
         let log2e = _mm256_set1_ps(core::f32::consts::LOG2_E);
         // ln2 split into a high part that is exact in f32 and a low
         // correction (Cody-Waite), so `x - k*ln2` keeps its low bits.
-        let ln2_hi = _mm256_set1_ps(0.693_359_375_f32);
-        let ln2_lo = _mm256_set1_ps(-2.121_944_40e-4_f32);
+        let ln2_hi = _mm256_set1_ps(coeff::LN2_HI);
+        let ln2_lo = _mm256_set1_ps(coeff::LN2_LO);
         let one = _mm256_set1_ps(1.0);
 
         // Degree-6 minimax (Remez) coefficients for `exp(r)` on `|r| <= ln2/2`,
@@ -535,11 +615,11 @@ mod softmax_avx2 {
         // form below: 6 FMAs, no separate `r^2` multiply and no trailing add,
         // which is one fewer FMA-unit op and one fewer FADD than the Cephes
         // `1 + r + r^2·P5(r)` form it replaces, while staying at 1 ULP.
-        let c2 = _mm256_set1_ps(4.999_999_1e-1_f32);
-        let c3 = _mm256_set1_ps(1.666_642_0e-1_f32);
-        let c4 = _mm256_set1_ps(4.166_822_5e-2_f32);
-        let c5 = _mm256_set1_ps(8.374_816_0e-3_f32);
-        let c6 = _mm256_set1_ps(1.383_684_6e-3_f32);
+        let c2 = _mm256_set1_ps(coeff::C2);
+        let c3 = _mm256_set1_ps(coeff::C3);
+        let c4 = _mm256_set1_ps(coeff::C4);
+        let c5 = _mm256_set1_ps(coeff::C5);
+        let c6 = _mm256_set1_ps(coeff::C6);
 
         // Below this, f32 `exp` has underflowed to (sub)normals we flush to
         // 0; `-inf` lands here too and must become exactly 0. Ordered `<=`, so
@@ -1223,7 +1303,7 @@ mod vectorized_tests {
         ] {
             let src = synthetic(n, d, (n * 31 + d) as u32);
             let mut serial = src.clone();
-            softmax_rows_serial(&mut serial, n, d);
+            softmax_rows_serial(&mut serial, d);
 
             let mut fanned = src.clone();
             softmax_rows_in_place(&mut fanned, n, d);
@@ -1717,5 +1797,91 @@ mod vectorized_tests {
         .execute(&[x.view()], &mut [out.view_mut()])
         .unwrap();
         assert!(out.to_f32().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod native_row_boundaries {
+    use super::*;
+
+    #[test]
+    fn zero_width_empty_native_rows_are_a_no_op() {
+        let mut empty = [];
+        softmax_rows_serial_native(&mut empty, 0).unwrap();
+        softmax_rows_serial_out_native(&[], &mut empty, 0).unwrap();
+    }
+    #[test]
+    fn malformed_native_row_geometry_is_rejected_before_writing() {
+        for columns in [0, 3, usize::MAX] {
+            let mut data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            let before = data;
+            let error = softmax_rows_serial_native(&mut data, columns)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("Softmax rows")
+                    && error.contains(&columns.to_string())
+                    && error.contains('8'),
+                "{error}"
+            );
+            assert_eq!(data, before, "failed in-place validation changed its input");
+            let mut out = [-12345.5; 8];
+            let error = softmax_rows_serial_out_native(&before, &mut out, columns)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Softmax rows"));
+            assert_eq!(
+                out, [-12345.5; 8],
+                "failed output validation wrote a partial row"
+            );
+        }
+    }
+
+    #[test]
+    fn native_row_output_lengths_must_match_before_writing() {
+        for (input_len, output_len, columns) in [(8, 4, 2), (4, 8, 2), (0, 8, 0), (8, 0, 0)] {
+            let input = vec![1.0; input_len];
+            let mut output = vec![-12345.5; output_len];
+            let error = softmax_rows_serial_out_native(&input, &mut output, columns)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("source")
+                    && error.contains("destination")
+                    && error.contains("columns="),
+                "{error}"
+            );
+            assert!(output.iter().all(|&v| v == -12345.5));
+        }
+    }
+
+    #[test]
+    fn native_rows_derive_all_rows_and_handle_empty_storage() {
+        for columns in [0, 1, 8, usize::MAX] {
+            softmax_rows_serial_native(&mut [], columns).unwrap();
+            softmax_rows_serial_out_native(&[], &mut [], columns).unwrap();
+        }
+        let source = [1.0, 1.0, 2.0, 2.0, 7.0, 7.0];
+        let mut inplace = source;
+        softmax_rows_serial_native(&mut inplace, 2).unwrap();
+        assert_eq!(inplace, [0.5; 6]);
+        let mut output = [-12345.5; 6];
+        softmax_rows_serial_out_native(&source, &mut output, 2).unwrap();
+        assert_eq!(output, [0.5; 6]);
+    }
+
+    #[test]
+    fn checked_row_width_never_multiplies_untrusted_dimensions() {
+        assert!(checked_row_width(0, 0).unwrap().is_none());
+        assert!(checked_row_width(0, usize::MAX).unwrap().is_none());
+        assert_eq!(
+            checked_row_width(usize::MAX, usize::MAX)
+                .unwrap()
+                .unwrap()
+                .get(),
+            usize::MAX
+        );
+        assert!(checked_row_width(usize::MAX, 2).is_err());
+        assert!(checked_row_width(1, 0).is_err());
     }
 }

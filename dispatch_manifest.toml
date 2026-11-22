@@ -219,6 +219,15 @@ description = "2D undilated MaxPool dispatches to BNNS pooling on Apple Silicon"
 
 [[claim]]
 op = "Add"
+variant = "native_dense_suffix_broadcast"
+platform = "all"
+minimum_tier = "tier3"
+counter = "ADD_DENSE_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/add.rs"
+description = "Suffix-broadcast Add uses the shared native dense walk in both default and optional MLAS builds; no MLAS Add route remains"
+
+[[claim]]
+op = "Add"
 variant = "contiguous_f32"
 platform = "aarch64-apple-darwin"
 minimum_tier = "tier2"
@@ -383,3 +392,57 @@ minimum_tier = "tier2"
 counter = "QLINEAR_REQUANT_NEON_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/qlinear_matmul.rs"
 description = "Native QLinearMatMul requantizes shared-A-scale rows with exact eight-lane NEON rounding/clipping and scalar tails; no MLAS call or packed copy"
+
+[[claim]]
+op = "QLinearMatMul"
+variant = "per_row_scale_requantization"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "QLINEAR_ROW_REQUANT_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/qlinear_matmul.rs"
+description = "Native per-row activation scales use exact NEON multiply/divide association and shared rounding/clipping/packing, with portable short rows and tails and no scale-vector allocation"
+
+[[claim]]
+op = "MatMul"
+variant = "generic_borrowed_column_strips"
+platform = "all"
+minimum_tier = "tier3"
+counter = "GENERIC_BORROWED_COLS_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs"
+description = "Generic f32 GEMM parallel column strips borrow source B and caller output rows; only row-reference metadata is allocated, with the existing scalar register tile and K-panel accumulation order"
+
+[[claim]]
+op = "Erf"
+variant = "f32_native_polynomial"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "ERF_NEON_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/simd_activations_neon.rs"
+description = "Native f32 slices at SIMD_MIN_LEN use the NEON Erf polynomial including tails"
+
+[[claim]]
+op = "Gelu"
+variant = "f32_native_exact_polynomial"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "GELU_NEON_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/simd_activations_neon.rs"
+description = "Native exact f32 GELU fuses the NEON Erf polynomial without intermediate allocation"
+
+[[claim]]
+op = "Softmax"
+variant = "f32_native_contiguous_rows"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "SOFTMAX_NEON_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon.rs"
+description = "Native contiguous f32 rows with d>=8 use NEON max/exp/sum/normalize, including gradual underflow and scalar partial tails"
+
+[[claim]]
+op = "MatMulNBits"
+variant = "apple_dense_nt"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "ACCELERATE_NT_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/accelerate_gemm.rs"
+description = "Apple transposed-B SGEMM reads cached NK weights without a KN copy; buffer extents and BLAS ABI dimensions are checked before framework dispatch"

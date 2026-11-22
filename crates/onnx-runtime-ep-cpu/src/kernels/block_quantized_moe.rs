@@ -21,9 +21,7 @@
 //! routing or activation implementation. It is row-streamed f32 computation,
 //! not an integer/quantized-domain dot product.
 
-use super::dense_weight_cache::{
-    DenseWeightCache, DenseWeightCacheStatus, DenseWeightLoad, DenseWeightSpec,
-};
+use super::weight_cache::{WeightCache, WeightCacheStatus, WeightLoad, WeightSpec};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -178,7 +176,7 @@ pub struct BlockQuantizedMoEKernel {
     formats: ProjectionFormats,
     constant_inputs: [bool; 9],
     weight_identities: [DenseWeightIdentity; 3],
-    weight_cache: DenseWeightCache<DenseWeightCacheKey>,
+    weight_cache: WeightCache<DenseWeightCacheKey>,
 }
 
 #[derive(Debug)]
@@ -198,7 +196,7 @@ impl KernelFactory for BlockQuantizedMoEFactory {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-            weight_cache: DenseWeightCache::new(self.memory.clone(), self.cache_bytes),
+            weight_cache: WeightCache::new(self.memory.clone(), self.cache_bytes),
         }))
     }
 }
@@ -335,7 +333,7 @@ impl Kernel for BlockQuantizedMoEKernel {
                         fc1_size,
                     },
                 )? {
-                    DenseWeightLoad::Ready(loaded) => {
+                    WeightLoad::Ready(loaded) => {
                         #[cfg(test)]
                         if !counted_dense {
                             BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS.fetch_add(1, Ordering::Relaxed);
@@ -344,7 +342,7 @@ impl Kernel for BlockQuantizedMoEKernel {
                         dense_experts += 1;
                         Some(loaded.weights)
                     }
-                    DenseWeightLoad::Declined(reason) => {
+                    WeightLoad::Declined(reason) => {
                         grant_refusal = Some(reason);
                         None
                     }
@@ -462,7 +460,7 @@ impl BlockQuantizedMoEKernel {
         inputs: &[TensorView],
         expert: usize,
         dims: Dimensions,
-    ) -> Result<DenseWeightLoad> {
+    ) -> Result<WeightLoad> {
         let mut projections = vec![
             (2, dims.fc1_size, dims.hidden, self.formats.fc1, 1u8),
             (4, dims.hidden, dims.inter, self.formats.fc2, 2u8),
@@ -517,8 +515,8 @@ impl BlockQuantizedMoEKernel {
             .iter()
             .zip(&sizes)
             .map(|(key, bytes)| match key.as_deref() {
-                Some(key) => DenseWeightSpec::cached(key),
-                None => Ok(DenseWeightSpec::transient(*bytes)),
+                Some(key) => WeightSpec::cached(key),
+                None => Ok(WeightSpec::transient(*bytes)),
             })
             .collect::<Result<Vec<_>>>()?;
         let loaded = self.weight_cache.load_group(&specs, |index, output| {
@@ -537,9 +535,9 @@ impl BlockQuantizedMoEKernel {
                 DenseWeightLayout::Nk,
             )
         })?;
-        if let DenseWeightLoad::Ready(loaded) = &loaded {
+        if let WeightLoad::Ready(loaded) = &loaded {
             for status in &loaded.statuses {
-                if *status == DenseWeightCacheStatus::Hit {
+                if *status == WeightCacheStatus::Hit {
                     BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1284,8 +1282,8 @@ mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
     use crate::kernels::block_quantized_matmul::packed_for_format;
-    use crate::kernels::dense_weight_cache::DEFAULT_DENSE_WEIGHT_CACHE_BYTES;
     use crate::kernels::testutil::Owned;
+    use crate::kernels::weight_cache::DEFAULT_DENSE_WEIGHT_CACHE_BYTES;
     use onnx_runtime_ep_api::ExecutionProvider;
     use onnx_runtime_ir::{Attribute, Dim, Graph, NodeId, SymbolId, static_shape};
 
@@ -1530,7 +1528,7 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         kernel.set_constant_inputs(&[false, false, true, false, true, false, false, false]);
 
@@ -1647,7 +1645,7 @@ mod tests {
             // instead of the kernel. It fails loudly there rather than
             // silently, but a cell about cache accounting should not depend on
             // the box it runs on.
-            weight_cache: DenseWeightCache::with_limit(DEFAULT_DENSE_WEIGHT_CACHE_BYTES),
+            weight_cache: WeightCache::with_limit(DEFAULT_DENSE_WEIGHT_CACHE_BYTES),
         };
         kernel.set_constant_inputs(&[false, false, true, false, true, false, false, false]);
 
@@ -1712,8 +1710,8 @@ mod tests {
             )
             .expect("resolve complete expert projection set")
         {
-            DenseWeightLoad::Ready(mut loaded) => loaded.weights.remove(0),
-            DenseWeightLoad::Declined(reason) => {
+            WeightLoad::Ready(mut loaded) => loaded.weights.remove(0),
+            WeightLoad::Declined(reason) => {
                 panic!("standalone cache unexpectedly declined: {reason}")
             }
         };
@@ -1770,7 +1768,7 @@ mod tests {
                 formats,
                 constant_inputs: [false; 9],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-                weight_cache: DenseWeightCache::default(),
+                weight_cache: WeightCache::default(),
             };
             kernel.set_constant_inputs(&[false, false, true, false, true, false, false, false]);
             assert!(
@@ -1848,7 +1846,7 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-            weight_cache: DenseWeightCache::with_limit(0),
+            weight_cache: WeightCache::with_limit(0),
         };
         kernel.set_constant_inputs(&[false, false, true, false, true]);
         let values = (0..H).map(|i| i as f32 / 32. + 0.25).collect::<Vec<_>>();
@@ -2075,7 +2073,7 @@ mod tests {
                     formats,
                     constant_inputs: [false; 9],
                     weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-                    weight_cache: DenseWeightCache::with_limit(budget),
+                    weight_cache: WeightCache::with_limit(budget),
                 };
                 kernel.set_constant_inputs(&[false, false, true, false, true, false, has_fc3]);
                 kernel
@@ -2093,7 +2091,7 @@ mod tests {
             )
             .unwrap();
             let mut denied = make_kernel(dense_bytes);
-            denied.weight_cache = DenseWeightCache::with_limit_and_memory(dense_bytes, memory);
+            denied.weight_cache = WeightCache::with_limit_and_memory(dense_bytes, memory);
             let input = Owned::f32(
                 &[rows, hidden],
                 &(0..rows * hidden)
@@ -2273,7 +2271,7 @@ mod tests {
                 formats,
                 constant_inputs: [false; 9],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-                weight_cache: DenseWeightCache::default(),
+                weight_cache: WeightCache::default(),
             };
             let mut expected = Owned::f32(&[1, hidden], &vec![0.0; hidden]);
             uncached
@@ -2285,7 +2283,7 @@ mod tests {
                 formats,
                 constant_inputs: [false; 9],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-                weight_cache: DenseWeightCache::default(),
+                weight_cache: WeightCache::default(),
             };
             cached.set_constant_inputs(&[false, false, true, false, true]);
             let mut actual = Owned::f32(&[1, hidden], &vec![0.0; hidden]);
@@ -2784,7 +2782,7 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
 
         let input_values: Vec<f32> = (0..HID)
@@ -2897,7 +2895,7 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         let input_values: Vec<f32> = (0..HID).map(|index| (index as f32) / 256.0 + 0.1).collect();
         let input = Owned::f32(&[1, HID], &input_values);

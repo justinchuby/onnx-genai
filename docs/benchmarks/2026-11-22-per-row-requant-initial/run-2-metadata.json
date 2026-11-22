@@ -1,0 +1,19 @@
+{
+  "source_commit": "012573cb34e522d86a5629f6bcd6976e6d8728e8",
+  "source_sha256": "96b2a09ab282b08b2c38d8b39b1ec6c159608342e8d8cee9c3c2d61d33e298b5",
+  "binary": "/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-a26db3a5d89b84f9",
+  "binary_sha256": "7b6821d4da9d0fd8f27f8e5ed9edfb74972632aba28e63931eba74188f61002f",
+  "machine": "arm64",
+  "system": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "cpu": "Apple M1 Max",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "cargo_lock_sha256": "d84aae080dc08d740c9a44e02780a72c943716de13048d06110c9039bf6da54d",
+  "cargo_manifest_sha256": "9e87e15986f1c87b243ad43c787fc1f8bc42423c65cbf0d20e4eadcf299bd52e",
+  "features": "default; no MLAS",
+  "benchmark_name": "kernels::qlinear_matmul::tests::bench_per_row_requantization_neon_ab",
+  "shared_host_lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "scope": "synchronous serial per-row epilogue; process CPU and wall; test TLS bookkeeping included in native arms; no affinity or isolation claim",
+  "start_utc": "2026-11-22T09:43:33Z",
+  "end_utc": "2026-11-22T09:43:34Z",
+  "sweep": 2
+}

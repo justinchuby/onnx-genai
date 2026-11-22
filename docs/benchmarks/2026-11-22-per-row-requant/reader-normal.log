@@ -1,0 +1,21 @@
+test_bad_aa_cell_is_retained_as_unqualified (test_bench_qlinear_per_row.CorpusControls.test_bad_aa_cell_is_retained_as_unqualified) ... ok
+test_checksum_disagreement_is_rejected (test_bench_qlinear_per_row.CorpusControls.test_checksum_disagreement_is_rejected) ... ok
+test_complete_corpus_has_known_ratios (test_bench_qlinear_per_row.CorpusControls.test_complete_corpus_has_known_ratios) ... ok
+test_duplicate_sample_is_rejected (test_bench_qlinear_per_row.CorpusControls.test_duplicate_sample_is_rejected) ... ok
+test_duplicate_witness_is_rejected (test_bench_qlinear_per_row.CorpusControls.test_duplicate_witness_is_rejected) ... ok
+test_empty_corpus_is_not_success (test_bench_qlinear_per_row.CorpusControls.test_empty_corpus_is_not_success) ... ok
+test_false_native_witness_is_rejected (test_bench_qlinear_per_row.CorpusControls.test_false_native_witness_is_rejected) ... ok
+test_invalid_duration_is_rejected (test_bench_qlinear_per_row.CorpusControls.test_invalid_duration_is_rejected) ... ok
+test_missing_sample_is_rejected (test_bench_qlinear_per_row.CorpusControls.test_missing_sample_is_rejected) ... ok
+test_missing_witness_is_rejected (test_bench_qlinear_per_row.CorpusControls.test_missing_witness_is_rejected) ... ok
+test_unknown_arm_is_rejected (test_bench_qlinear_per_row.CorpusControls.test_unknown_arm_is_rejected) ... ok
+test_unknown_cell_is_rejected (test_bench_qlinear_per_row.CorpusControls.test_unknown_cell_is_rejected) ... ok
+test_unknown_protocol_is_rejected (test_bench_qlinear_per_row.CorpusControls.test_unknown_protocol_is_rejected) ... ok
+test_wrong_field_count_is_rejected (test_bench_qlinear_per_row.CorpusControls.test_wrong_field_count_is_rejected) ... ok
+test_wrong_iterations_are_rejected (test_bench_qlinear_per_row.CorpusControls.test_wrong_iterations_are_rejected) ... ok
+test_wrong_rotation_order_is_rejected (test_bench_qlinear_per_row.CorpusControls.test_wrong_rotation_order_is_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 0.047s
+
+OK

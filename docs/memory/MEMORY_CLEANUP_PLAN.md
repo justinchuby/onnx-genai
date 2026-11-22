@@ -604,8 +604,9 @@ the governed factory path; raw transformed-layout builders also execute on hosts
 without their corresponding instruction-set route. That does not prove x86 ISA
 execution or multi-node NUMA placement on this Apple host.
 
-Optional MLAS-owned packs and scratch/activation allocations still need their
-own integration. Retained native OnceLock entries are not yet idle-reclaimable.
+The optional MLAS pack admission is described below. Scratch/activation
+allocations still need their own integration. Retained native OnceLock entries
+are not yet idle-reclaimable.
 Physical Host/Device book reconciliation and process-wide limits remain work.
 No speedup, placement performance or CUDA runtime claim is made.
 
@@ -649,3 +650,335 @@ tile/activation scratch are separate scopes and remain ungoverned. Native/MLAS
 OnceLock retention still needs idle reclamation; process-wide quota, physical
 Host/Device book reconciliation and CUDA runtime proof remain unfinished. No
 RSS, throughput or multi-node placement claim is made.
+
+
+### Generic f32 GEMM borrows column panels
+
+The thin-M column-parallel fallback no longer creates per-call B element copies
+and secondary output strips. B keeps the original matrix stride; workers own
+disjoint mutable row slices of the caller output. Dense row blocks and column
+strips share the original register tile and K-panel accumulation through a
+monomorphized row-access interface. No unsafe aliasing, persistent cache or
+additional quota policy is needed for those borrowed elements.
+
+Row-reference descriptors still allocate `O(M * min(N, threads))` metadata;
+this is not zero allocation or full scratch governance. A public-kernel
+allocator probe marks B as a constant initializer, registers the caller and
+every explicit pool worker, observes
+an intentional weight-sized positive control, and proves no allocations above
+64 KiB on the first and repeated calls for its test geometry. Restoring the
+old copy path makes the named guard fail on the first call. Exact panel-order,
+partial-tile, output-bound and special-value checks preserve the previous
+arithmetic, including empty-K +0 initialization.
+
+See the [scoped diagnostic and allocation proof](../benchmarks/2026-11-21-generic-gemm-borrowed-columns.md).
+This removes one family of ungoverned matrix copies; mutable MLAS workspace,
+other transient scratch, idle OnceLock reclamation, process quota and physical
+Host/Device reconciliation remain unfinished.
+
+
+### Native NBits node pack ownership
+
+MatMulNBits native layout slots and their single cold-fill gate now form one
+shared node owner. The existing executor constant-state hook passes that owner
+between activation-shape variants; no process-wide address store, second cache
+registry or compatibility interface is added. Both publication and adoption
+consume one eligibility rule, and adoption verifies preparation attributes,
+constant-input flags and exact `DerivedWeightMemory` source identity. Only a
+clone of the same governed source is interchangeable, even behind identical
+Host books and holder numbers. Ungoverned standalone peers can still share.
+
+Every layout retains its existing pressure enrollment and owned payload grant.
+Dropping the producer kernel does not remove enrollment while a peer lives;
+pressure cannot evict active readers, idle slots can be reclaimed, and the next
+reader rebuilds under fresh admission. Optional dynamic metadata still forces
+call-owned preparation through the existing execution gate. Dense f32 caches
+and optional MLAS memo/store owners are unchanged.
+
+[Host evidence](../benchmarks/NBITS_NODE_PACK_SHARING.md) reproduces duplicate
+ledger charging in a real executor before the change, then verifies three
+shape variants, output bytes, session isolation, all eight slot lifetimes and
+concurrent cold builders. This is a node ownership change, not a throughput or
+GPU execution result. Other scratch/activation accounting, physical capacity
+relationships and CUDA asynchronous validation remain open.
+
+
+### NBits dense expansions share node ownership
+
+The NBits constant-state payload now carries its f32 NK cache as well as the
+native compact layout slots. Its existing cache object owns the cold-fill gate,
+pressure enrollment, payloads and grants; sharing an `Arc` to that object
+removes shape-local duplication without creating a second cache authority.
+The immutable dense-byte retention limit is part of the same resolved sharing
+parameters. A different limit, including disabled retention, cannot adopt a
+foreign policy even when the grant source and preparation attributes match.
+
+[Host validation](../benchmarks/NBITS_DENSE_NODE_SHARING.md) uses a real
+unknown-rank ONNX input to exercise vector, matrix and batched-vector shapes on
+every backend without assuming transposed-B GEMM support. Complete outputs and
+Host ledger charges distinguish one retained expansion from duplicate copies.
+Factory-level tests cover a warm state exported after filling, producer teardown,
+active readers, idle reclaim/rebuild and concurrent distinct cold builders under
+a single-payload quota. Mutable group indices and zero retention keep execution
+transient, with fresh numerical outputs and no retained charge. Dense arithmetic,
+placement, decoding, compact formats and optional MLAS memo/store policy remain
+unchanged. No memory prediction substitutes for live payload grants.
+
+
+### Apple dense prefill reuses NK ownership
+
+The native Apple backend now implements transposed-B GEMM, so dense NBits
+prefill can consume the same granted NK expansion that decode and node shape
+variants already share. Its capability predicate is the existing NT rule,
+not a model-specific gate. The cache ceiling and physical grant continue to
+control retention and admission; the existing fallbacks remain on refusal.
+Actual executor tests cover symbolic prefill/decode row counts and separate
+sessions, and a kernel test checks that warm prefill builds only once.
+
+[Validation](../benchmarks/APPLE_NT_GEMM.md) explicitly records NN/NT floating-point
+reduction differences and f64-oracle error bounds. No token-equivalence, GPU
+behavior or throughput claim follows. The shared BLAS boundary validates buffer
+extents and ABI dimensions before unsafe entry; pure native GEMV keeps usize
+shape extents. Memory placement and grant/reclaim algorithms are unchanged.
+
+
+### Reuse-gated Apple dense prefill
+
+The resolved NT capability declares its dense-prefill reuse policy. Apple uses
+NT only when immutable weights and the existing dense-byte ceiling admit NK
+retention. With disabled/insufficient retention or mutable metadata, it preserves
+KN preparation; physical grant refusal still follows the existing fallbacks.
+This does not add a budget, model identity gate or geometry tuning table.
+
+[Actual execute evidence](../benchmarks/APPLE_NT_EXECUTE_AB.md) keeps the initial
+transient-NT observations separate from a newly recorded reuse-gated corpus.
+Build-count, Host-charge and successful-NT-call witnesses accompany every cell.
+The source's thread-local diagnostic selector is absent from shipped builds;
+its scope/unwind behavior is tested. Process CPU includes framework/worker spin,
+and no model throughput, RSS or other-device behavior follows from the numbers.
+
+
+### Node-scoped optional reference ownership
+
+MLAS SQNBit reference layout maps join the existing per-node constant-state
+owner. Shape variants share only after the same source and preparation/retention
+policy checks; independent nodes and sessions retain separate maps, even if they
+use identical operand addresses and Host books. The global and test-local stores,
+installer eviction responsibility and executor-wide clear API are removed.
+Dropping an executor releases its kernel and static-state owners before source
+buffers, without touching another executor's caches. Active payloads continue to
+own Host grants through their final reader. No primitive arithmetic or production
+backend choice changes. See the
+[reference ownership contract](../performance/CPU_MLAS_MIGRATION.md#node-scoped-ownership-for-optional-sqnbit-reference-packs).
+
+Reference layout maps now participate in idle Host pressure reclamation and
+per-kernel strong memos are removed, as described in the follow-up below.
+Serialized prepacked sources retain their existing exclusion from node-state
+adoption.
+
+
+### Idle SQNBit layouts join Host pressure reclamation
+
+The optional reference's node maps now enroll weakly with the same derived-weight
+source as native caches. Per-call `Arc` readers replace permanent per-kernel
+memo ownership. Lookup and idle exclusion use the same map mutex; removed
+payloads and their grants drop after all map locks are released. Reclamation
+never takes a construction gate, including when a pack's own admission visits
+its cache. Real KV reservations/growth and other node admissions can now reclaim
+an idle reference pack without clearing any live session globally.
+
+The bounded factory regression includes sharded, full-width, serialized and
+noncontiguous-scale preparation, active readers, concurrent execute/pressure,
+retry and final-owner refund. Logical constant slots preserve strided preparation
+reuse inside the explicit node owner. MLAS scratch/workspace is not covered by
+this payload accounting, and serialized bytes still require capacity for a
+reference pack rather than taking a wire fallback. No CUDA execution or new
+performance claim is involved.
+
+
+### Ordinary MatMul derived copies honor retention decline
+
+The shared MatMul preparation layer previously retained MLAS f32 panels,
+once-widened f16 panels and native contiguous-half copies even with retention
+disabled. Both pack entries now require an admitted constant B. Strided f16
+copying returns an explicit grant-carrying reader, so a declined caller can
+compute through the existing rescue path and release its transient copy without
+populating the kernel cache. Existing admitted reuse and borrowed
+column-major execution remain available.
+
+The three old-behavior regressions demonstrate the bypass independently. New
+bounded real-kernel controls check both verdicts and unchanged expected results,
+while avoiding shared test-counter interference. This is retention enforcement,
+not physical Host funding by itself. Ordinary f32 constant materialization now
+joins Host admission below, followed by native half-copy payloads. SGEMM panels join Host admission below; transposes remain work; ordinary node ownership is consolidated below.
+
+
+### Ordinary constant materialization joins the Host authority
+
+All four MatMul-prepack consumers (MatMul, Gemm, FusedMatMulBias and FusedGemm)
+now receive the provider's immutable resources rather than a bool/default-only
+prepack. Both constant operand slots obtain actual Host payload grants before
+conversion, retaining them in an executing reader or idle cache. The common
+dense-cache authority handles singleflight construction and idle pressure.
+Contiguous f32 borrowing remains zero-copy; dynamic activations are a separate
+scratch scope. A declined retention policy changes lifetime, not the need to
+fund a required constant materialization. Admission refusal stays typed and
+retryable rather than allocating an uncharged fallback matrix.
+
+The dtype converter writes directly into an admitted f32 destination and keeps
+the existing SIMD conversion helpers. Strided/scalar conversion does not first
+allocate a full source-dtype copy. A sealed reader prevents sibling kernels from
+forging an uncharged materialized constant through the preparation API.
+Address-keyed legacy transpose memos retain their converted source reader until
+their key retires, preventing source-address recycling after pressure. This pins
+those dependencies; funding/reclaiming transpose payloads themselves remains
+separate, as do activation/output scratch and ordinary node ownership is consolidated below. Native contiguous-half copies and SGEMM panels are funded below.
+
+The same provider-level test fails against the parent implementation with Host
+usage 0 versus 24 expected bytes. New factory, active-reader, capacity/refusal,
+retry, concurrent-fill and transpose-source controls exercise actual ownership.
+The planner also includes Gemm and FusedGemm dense preparation, previously
+omitted despite using the same prepack, and preserves domain gates.
+
+
+### Native contiguous-half copies use the same grant lifecycle
+
+Noncontiguous constant f16 B materialization now uses the same dense-weight
+cache as f32 expansion, parameterized by its flat payload element (`u16` bits
+or `f32`). Both retained and transient copies reserve their actual 2-byte-per-
+element payload before allocation. Copying writes directly into that admitted
+slice, preserving the existing 2-D parallel and N-D strided routes; no f32
+weight matrix is needed. Source validation precedes admission and pointer reads.
+Empty payloads return before parallel chunking.
+
+The returned reader owns the grant through computation. Kernel destruction or
+cache eviction cannot revoke a live reader; idle retained copies can donate
+capacity to KV through the existing weak pressure registration. Retained cold
+fills share one payload, while transient calls each require their own capacity.
+Refusal propagates a typed, contextual error through both Apple rescue callers
+and leaves preparation retryable. Column-major zero-copy execution is unchanged.
+
+The unchanged public-provider regression fails on parent 3e2588329 with Host
+usage 0 versus 306 expected bytes. Controls cover both retention verdicts,
+negative strides/offsets, concurrent construction, active-reader protection,
+KV eviction/refusal/retry, final refund, invalid host sources and empty layouts.
+This step funds the native contiguous copy only. Ordinary SGEMM panel funding
+follows below; transpose payloads, activation/output scratch remain work; shape-variant ownership is consolidated
+below.
+
+
+### Check SGEMM panel allocation geometry before funding it
+
+The optional ordinary MLAS SGEMM packer now exposes an immutable `PackedBPlan`
+whose private fields bind logical dimensions, source extent, native padding and
+allocation layout. Planning allocates no payload. The native shim checks column
+rounding, products and buffer alignment against MLAS's own constants before its
+otherwise-unchecked size query. A disagreement with the standalone generic
+layout is an explicit refusal rather than a potentially undersized allocation.
+Rust additionally requires addressable source and destination layouts.
+
+`PackedB::new` and `PackedBPlan::pack` return typed errors for geometry, source
+length, layout and allocation failure; the old infallible interface is removed.
+The plan and resulting pack report actual owned allocation bytes, including
+padding and a one-byte empty sentinel. Empty operands do not call the packer.
+Ordinary MatMul propagates construction errors and leaves its memo retryable;
+a separate cold-fill gate prevents concurrent half conversions/packs while
+warm hits avoid that gate. Warm f32 memo hits validate source extent and the
+shape-specific packed dimensions before reuse.
+
+This is a prerequisite for panel admission, not panel funding itself. The
+next step below adds actual Host grants and idle pressure integration to
+ordinary SGEMM panels and the half-to-f32 packing temporary. Existing f32 and
+contiguous-half weight funding remains in place. No new GEMM primitive, backend default or performance
+claim is introduced by checking the reference packer's allocation geometry.
+
+
+### Ordinary SGEMM panels share the derived-weight authority
+
+The shared cache now accepts owned weight payloads rather than assuming every
+payload is a flat f32 vector. `WeightCache`, `GrantedWeight` and `WeightPayload`
+replace the old dense-only names; vector construction remains a specialized
+method and every caller uses the new types directly. Flat f32/u16 vectors and
+aligned MLAS SGEMM panels share admission-before-build, exact logical/allocation
+byte checks, serialized cold fills, active-reader ownership and weak idle
+pressure registration. The dense-expansion environment limit remains a separate
+policy and is not imposed on ordinary MatMul panels.
+
+Both ordinary f32 panels and once-widened half panels retain their actual native
+allocation grant in an executing Arc reader. Removing cache membership or
+dropping the kernel cannot revoke that reader. Independent idle panels can
+donate capacity to KV, and a subsequent call can rebuild. Keys bind the source,
+dtype and K/N geometry, so a different source/shape never receives stale packed
+values. Equal-source warm hits skip native layout planning and the fill gate.
+
+Half preparation preflights the packed allocation plus the entire simultaneously
+live f32 conversion before either buffer is created. Conversion writes directly
+into one fallibly allocated destination. The scratch portion is refunded after
+packing; only native panel bytes stay charged. Packing is optional: an admission
+refusal invokes no conversion/packing builder, records no failed cache entry and
+uses the existing unpacked execution route. Invalid layouts, bad source extents
+and actual construction failures remain contextual typed errors.
+
+This closes actual funding for ordinary SGEMM panel payloads and their half
+conversion peak. It does not fund unrelated activation/output/workspace scratch,
+legacy transpose payloads, and adds no shape sharing by itself; the next step consolidates node ownership.
+Forecast changes are not a substitute for these actual grants; future resident
+planning can use the checked native layout query.
+
+
+### One preparation owner per ordinary MatMul node
+
+`MatMulPrepack` keeps each kernel's retention/constant policy and grant source,
+while one Arc-owned `MatMulWeights` holds its derived preparations. MatMul, Gemm,
+FusedMatMulBias and FusedGemm expose/adopt that owner through the existing
+node-scoped Kernel constant-state interface. The executor already exchanges this
+state when compiling shape variants, so its generic cache needs no op-specific
+logic. Shape-specific geometry, attributes and FLOP metadata stay on the kernel.
+
+Adoption verifies immutable operand flags and the exact DerivedWeightMemory
+source. A different grant source is an error, including a distinct holder on the
+same Host ledger. Retention-off and runtime-only variants export/adopt no state;
+unrecognized state is declined. Each new node/session starts with its own owner,
+even when it uses the same provider and original initializer.
+
+Dense f32 copies, contiguous half copies, native SGEMM panels and existing
+transpose memos now survive an individual shape kernel's eviction under this
+owner. Installed global transpose keys retire at the last node-owner drop; an
+executing funded reader still keeps its payload/grant alive independently. The
+legacy transpose payloads themselves still need actual grants and reclamation.
+
+Dense-materialization prediction counts each constant non-f32 operand once per
+node. Remove the fixed prefill/decode shape multiplier. Required bytes follow
+the retained ownership unit and stay constant as activation shapes vary. The
+estimate still excludes native panels, transpose payloads and other scratch,
+and same-half paths may retain less; actual required copies remain governed.
+
+Public factory controls cover all four consumers and both constant operand
+slots under one-payload capacity with pressure reclamation unavailable. The
+real executor control varies activation widths, shares within a node, keeps
+distinct nodes/sessions separate, and verifies final refunds. It also disables
+pressure reclamation so denied optional reference packs cannot distort the
+resident-copy measurement on different CPU backends.
+
+
+### Hand static preparation ownership to runtime kernels
+
+Load-time provider preparation now lives in the existing kernel cache, indexed
+by node together with its immutable-input flags. A newly compiled kernel first
+tries a sibling owner, then compatible static preparation, and only performs
+ordinary preparation if neither is recognized. Unknown or incompatible static
+owners remain alive until executor teardown; kernels and these owners are
+released before source buffers. This applies to fully static materialization
+and symbolic-shape specialization without CPU-specific session dispatch.
+
+The provider API receives immutable-input flags separately from available host
+constant descriptors. CPU transpose prewarming returns the same shareable
+MatMul owner consumed by runtime kernels, including when another immutable
+operand has no load-time host descriptor. No compatibility signature remains.
+
+Direct initializer immutability has one predicate: ONNX constant-initializer
+semantics plus no producer. Writable producer-backed default bytes never enter
+constant preparation or retained operand conversion. Allocation still follows
+storage presence; view dispatch keeps its existing immutable-source path. Static
+and runtime flag disagreement declines static adoption and prepares normally.
+This does not redesign view provenance or fund legacy transpose payloads.

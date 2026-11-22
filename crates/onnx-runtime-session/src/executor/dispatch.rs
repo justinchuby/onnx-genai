@@ -652,9 +652,9 @@ impl Executor {
                     .iter()
                     .map(|input| {
                         input.is_some_and(|vid| {
-                            ctx.graph.initializers.contains_key(&vid)
+                            is_immutable_initializer(ctx.graph, vid)
                                 || ctx.views_meta.get(&vid).is_some_and(|view| {
-                                    ctx.graph.initializers.contains_key(&view.source)
+                                    is_immutable_initializer(ctx.graph, view.source)
                                 })
                         })
                     })

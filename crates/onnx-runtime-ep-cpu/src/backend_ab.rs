@@ -3,10 +3,10 @@
 //!
 //! # This module never runs in a shipped build's hot path
 //!
-//! The production CPU EP is native and links no MLAS. Every `*_mlas` entry
-//! point below is `#[cfg(feature = "mlas")]`, and that feature is not in
-//! `default` — it exists so research and benchmarks can reach the reference
-//! deliberately, never so a wheel or plugin can reach it by accident.
+//! The production CPU EP is native and links no MLAS. Calls to MLAS are gated
+//! by the non-default `mlas` feature; A/B entry points can report unavailability
+//! without linking it. The reference exists for deliberate research/benchmark
+//! comparisons, never for a wheel or plugin to reach by accident.
 //!
 //! # Why this is a module and not a test helper
 //!
@@ -31,7 +31,7 @@ use crate::dispatch_ledger::{Backend, KernelFamily};
 use crate::kernels::{matmul, sdpa, simd_activations, softmax};
 
 /// Whether this build linked the MLAS reference at all. False in every shipped
-/// build. When false, the `*_mlas` entry points return `false`, GEMM offers
+/// build. When false, the `*_mlas` entry points report unavailability, GEMM offers
 /// no reference backend, and differential tests use native self-consistency rather
 /// than silently passing on nothing.
 pub const fn mlas_available() -> bool {
@@ -85,25 +85,27 @@ pub fn gemm_ledger_backend(backend: CpuBackend) -> Backend {
 
 // ─── Softmax ────────────────────────────────────────────────────────────────
 
-/// Row-softmax `n` rows of `d` elements in place, native route.
-pub fn softmax_rows_native(data: &mut [f32], n: usize, d: usize) {
-    softmax::softmax_rows_serial_native(data, n, d);
+/// Native row-softmax; derive row count from complete rows of `columns`.
+/// Malformed geometry returns an error before writing any output.
+pub fn softmax_rows_native(data: &mut [f32], columns: usize) -> Result<()> {
+    softmax::softmax_rows_serial_native(data, columns)
 }
 
-/// Row-softmax `n` rows of `d` elements in place, MLAS route.
-///
-/// Returns `false` when this build has no MLAS, so the caller can report "not
-/// compared" instead of reporting a pass it never ran.
-pub fn softmax_rows_mlas(data: &mut [f32], n: usize, d: usize) -> bool {
+/// Explicit MLAS reference on complete rows. Returns false when not linked;
+/// malformed geometry is an error even if the reference is unavailable.
+pub fn softmax_rows_mlas(data: &mut [f32], columns: usize) -> Result<bool> {
+    let Some(width) = softmax::checked_row_width(data.len(), columns)? else {
+        return Ok(mlas_available());
+    };
     #[cfg(feature = "mlas")]
     {
-        mlas_sys::compute_softmax_in_place(data, n, d);
-        true
+        mlas_sys::compute_softmax_in_place(data, data.len() / width.get(), width.get());
+        Ok(true)
     }
     #[cfg(not(feature = "mlas"))]
     {
-        let _ = (data, n, d);
-        false
+        let _ = width;
+        Ok(false)
     }
 }
 
@@ -339,8 +341,25 @@ mod tests {
     #[test]
     fn mlas_entry_points_report_availability_honestly() {
         let mut data = vec![0.5f32; 64];
-        let ran = softmax_rows_mlas(&mut data, 4, 16);
+        let ran = softmax_rows_mlas(&mut data, 16).unwrap();
         assert_eq!(ran, mlas_available());
+    }
+
+    #[test]
+    fn softmax_geometry_errors_are_not_hidden_by_reference_availability() {
+        let mut input = [1.0; 10];
+        assert!(softmax_rows_native(&mut input, 8).is_err());
+        assert_eq!(input, [1.0; 10]);
+        assert!(softmax_rows_mlas(&mut input, 8).is_err());
+        assert!(softmax_rows_mlas(&mut input, 0).is_err());
+        assert_eq!(input, [1.0; 10]);
+        for columns in [0, 8, usize::MAX] {
+            assert_eq!(
+                softmax_rows_mlas(&mut [], columns).unwrap(),
+                mlas_available()
+            );
+            softmax_rows_native(&mut [], columns).unwrap();
+        }
     }
 
     /// Every family this module claims to A/B must actually have both halves
@@ -374,14 +393,14 @@ mod tests {
                 }
                 KernelFamily::Softmax => {
                     let mut native = vec![1.0f32, 2.0, 3.0, 4.0];
-                    softmax_rows_native(&mut native, 1, 4);
+                    softmax_rows_native(&mut native, 4).unwrap();
                     let sum: f32 = native.iter().sum();
                     assert!(
                         (sum - 1.0).abs() < 1e-5,
                         "the native A/B softmax must normalize, got {sum}"
                     );
                     let mut probe = native.clone();
-                    softmax_rows_mlas(&mut probe, 1, 4)
+                    softmax_rows_mlas(&mut probe, 4).unwrap()
                 }
                 KernelFamily::Activations => {
                     let input = [-1.0f32, 0.0, 1.0, 2.0];

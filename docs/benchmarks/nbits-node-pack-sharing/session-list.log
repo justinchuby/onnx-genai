@@ -1,0 +1,5 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_session-deb36e47176402f7)
+executor::tests::nbits_shape_variants_share_one_native_pack_within_the_session_node: test
+
+1 test, 0 benchmarks

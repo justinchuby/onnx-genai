@@ -24,14 +24,16 @@ pub struct CpuWeightCacheLimits {
 impl Default for CpuWeightCacheLimits {
     fn default() -> Self {
         Self {
-            dense_bytes: crate::kernels::dense_weight_cache::configured_dense_weight_cache_bytes(),
+            dense_bytes: crate::kernels::weight_cache::configured_dense_weight_cache_bytes(),
             expert_bytes: 0,
         }
     }
 }
 
-/// Immutable CPU weight resources. Full f32 block-format/NBits expansions,
-/// owned native/optional-MLAS NBits preparations and retained or transient QMoE experts
+/// Immutable CPU weight resources. Ordinary MatMul-family constant f32
+/// materializations, full f32 block-format/NBits expansions,
+/// owned native/optional-MLAS NBits preparations, optional QLinearMatMul packs,
+/// and retained or transient QMoE experts
 /// use one Host grant source. Private fields
 /// prevent a shared expert cache from being paired with a different authority.
 /// Cache ceilings and the legacy planned-family verdict only admit retention;
@@ -123,7 +125,7 @@ impl CpuMemoryResources {
     }
 }
 
-/// Grant source for owned f32 copies derived from packed weights.
+/// Grant source for owned weight preparations and constant conversions.
 ///
 /// A governed source retains a zero-byte anchor, rather than a standing cache
 /// allowance. Each owned expansion claims its payload bytes against the same
@@ -240,6 +242,16 @@ impl DerivedWeightMemory {
         self.owner
             .as_ref()
             .is_some_and(|owner| owner._registration.is_some())
+    }
+
+    /// Shared kernel preparation must retain the exact grant source, including
+    /// its holder/pressure domain, rather than merely using the same Host books.
+    pub(crate) fn shares_source_with(&self, other: &Self) -> bool {
+        match (&self.owner, &other.owner) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
     }
 
     pub(crate) fn register_idle_cache<T: IdleWeightCache + 'static>(&self, cache: &Arc<T>) {

@@ -1001,7 +1001,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     register_cnn_ops(&mut rec);
     rec.register(
         OpKey::new("MatMul", "", 1),
-        Box::new(matmul::MatMulFactory::new(retain_caches)),
+        Box::new(matmul::MatMulFactory::new(resources.clone())),
     );
     rec.register(
         OpKey::new("Einsum", "", 12),
@@ -1082,7 +1082,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     rec.register(
         OpKey::new("FusedMatMulBias", "com.microsoft", 1),
         Box::new(fused_matmul_bias::FusedMatMulBiasFactory::new(
-            retain_caches,
+            resources.clone(),
         )),
     );
     // The optimizer's `MatMul + Add(bias) + Relu` fusion emits `FusedGemm` in
@@ -1091,7 +1091,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // + elementwise Relu.
     rec.register(
         OpKey::new("FusedGemm", "com.microsoft", 1),
-        Box::new(fused_gemm::FusedGemmFactory),
+        Box::new(fused_gemm::FusedGemmFactory::new(resources.clone())),
     );
     // The optimizer's SDPA-core fusion (MatMul(QKᵀ) → scale → [+mask] → Softmax
     // → MatMul(·V)) emits `FusedAttention` in the contrib domain; bind its
@@ -1352,7 +1352,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // GEMM.
     rec.register(
         OpKey::new("Gemm", "", 1),
-        Box::new(gemm::GemmFactory::new(retain_caches)),
+        Box::new(gemm::GemmFactory::new(resources.clone())),
     );
     // Linear quantization evolved at opsets 10, 13, 19, 21, 23, and 25. The
     // implementation accepts the newest parameter set for all these revisions.
@@ -1372,7 +1372,10 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("QLinearMatMul", "", 10),
-        Box::new(qlinear_matmul::QLinearMatMulFactory::new(retain_caches)),
+        Box::new(qlinear_matmul::QLinearMatMulFactory::new(
+            retain_caches,
+            derived_weights.clone(),
+        )),
     );
     // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
     // Elementwise unary math (f32). Additive, default-domain-only registrations.
@@ -2977,4 +2980,4 @@ mod tests {
 }
 
 mod decoded_projection;
-pub(crate) mod dense_weight_cache;
+pub(crate) mod weight_cache;
