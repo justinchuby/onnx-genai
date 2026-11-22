@@ -1323,6 +1323,121 @@ mod silu_bench {
             println!("{n}\t{s:.1}\t{p:.1}\t{:.2}x", s / p);
         }
     }
+
+    /// Same-process, rotating MLAS/native/repeated-native diagnostic. Timers
+    /// include synchronous kernel calls and scheduler work, exclude allocation,
+    /// validation, warmup and printing. CPU time includes every process thread.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual SiLU diagnostic; run in release under the host lock"]
+    fn silu_native_vs_mlas_rotating() {
+        use crate::kernels::simd_activations::{PAR_MIN_LEN, parallel_dispatches};
+        use std::hint::black_box;
+
+        fn cpu_seconds() -> f64 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            // SAFETY: getrusage initializes the writable rusage on success.
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                0,
+                "SiLU diagnostic cannot read process CPU time"
+            );
+            // SAFETY: successful getrusage initialized usage.
+            let usage = unsafe { usage.assume_init() };
+            (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
+                + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 * 1e-6
+        }
+        fn mode<T>(serial: bool, body: impl FnOnce() -> T) -> T {
+            if serial { serial_scope(body) } else { body() }
+        }
+        let width = crate::task_runtime::testing::pool_width();
+        assert_eq!(width, crate::task_runtime::width());
+        let runs: [fn(&[f32], &mut [f32]); 3] =
+            [silu_f32_slice, silu_native_f32_slice, silu_native_f32_slice];
+        println!("SILU_CSV,width,mode,pattern,n,rep,order,arm,iters,cpu_ns,wall_ns");
+        for serial in [true, false] {
+            for pattern in ["in_band", "sparse_repairs", "dense_negative_tail"] {
+                for n in [3usize, 17, 4096, 65537, 1048581] {
+                    let input: Vec<f32> = (0..n)
+                        .map(|i| {
+                            let ordinary = ((i % 2003) as f32 - 1000.0) / 83.0;
+                            match pattern {
+                                "sparse_repairs" if i % 31 == 0 => [
+                                    -103.0,
+                                    -90.0,
+                                    -50.0,
+                                    -18.000002,
+                                    18.000002,
+                                    f32::MIN,
+                                    f32::MAX,
+                                    f32::NEG_INFINITY,
+                                    f32::INFINITY,
+                                    f32::NAN,
+                                    -0.0,
+                                ][(i / 31) % 11],
+                                "dense_negative_tail" => -20.0 - (i % 8401) as f32 / 100.0,
+                                _ => ordinary,
+                            }
+                        })
+                        .collect();
+                    let mut buffers: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0; n]);
+                    for (arm, run) in runs.iter().enumerate() {
+                        let before = parallel_dispatches();
+                        for _ in 0..4 {
+                            mode(serial, || run(&input, &mut buffers[arm]));
+                        }
+                        if !serial && width > 1 && n >= PAR_MIN_LEN {
+                            assert!(
+                                parallel_dispatches() > before,
+                                "arm={arm} n={n}: diagnostic did not reach parallel dispatch"
+                            );
+                        }
+                        for (&x, &got) in input.iter().zip(&buffers[arm]) {
+                            if x.is_nan() {
+                                assert!(got.is_nan());
+                            } else if !x.is_finite() || x.abs() > SILU_APPROX_SAFE_BOUND || x == 0.0
+                            {
+                                assert_eq!(got.to_bits(), silu(x).to_bits(), "arm={arm} x={x}");
+                            } else {
+                                let x = x as f64;
+                                let want = x / (1.0 + (-x).exp());
+                                assert!(
+                                    (got as f64 - want).abs() <= 2e-6 * want.abs().max(1.0),
+                                    "arm={arm} x={x}: got {got}, want {want}"
+                                );
+                            }
+                        }
+                    }
+                    let iters = (1usize << 20).div_ceil(n).clamp(1, 16384);
+                    for rep in 0..21 {
+                        for order in 0..3 {
+                            let arm = (rep + order) % 3;
+                            let (cpu, wall) = mode(serial, || {
+                                let cpu = cpu_seconds();
+                                let started = Instant::now();
+                                for _ in 0..iters {
+                                    black_box(runs[arm])(
+                                        black_box(&input),
+                                        black_box(&mut buffers[arm]),
+                                    );
+                                    black_box(&buffers[arm]);
+                                }
+                                let wall = started.elapsed().as_secs_f64();
+                                (cpu_seconds() - cpu, wall)
+                            });
+                            println!(
+                                "SILU_CSV,{width},{},{pattern},{n},{rep},{order},{},{iters},{:.3},{:.3}",
+                                if serial { "serial" } else { "runtime" },
+                                ["mlas", "native", "native_aa"][arm],
+                                cpu * 1e9 / iters as f64,
+                                wall * 1e9 / iters as f64
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Native SiLU must satisfy the same numerical and scheduling contract as the
