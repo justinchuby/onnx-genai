@@ -327,8 +327,7 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             let mut prepack = crate::kernels::matmul::MatMulPrepack::new(self.resources.clone());
             prepack.set_constant_inputs(constant_inputs);
-            prepack.prepare_constants(constants);
-            if prepack.has_prepared_transpose() {
+            if prepack.prepare_constants(constants)? {
                 return Ok(prepack.shareable_constant_state());
             }
         }

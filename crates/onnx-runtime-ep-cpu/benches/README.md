@@ -45,6 +45,36 @@ scripts/hostlock.sh run --owner cpu-bench \
 Do not move the lock inside a per-target loop: the suite is one evidence sweep,
 and releasing between targets makes its rows incomparable.
 
+### Weight admission and bounded expert evidence
+
+Each command holds the host lock across compilation, warmup and measurement.
+Set the same cache budget and allocator floor for every compared MoE arm, as
+specified in `bounded_expert_bench.rs`. For the warm example below, export
+`ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES=1048576`,
+`ONNX_GENAI_HOST_ALLOC_CACHE_FLOOR_BYTES=1048576` and `RAYON_NUM_THREADS=1`
+before launching. Its arguments select mode, rows, hidden
+width, intermediate width, iterations and output file:
+
+```bash
+scripts/hostlock.sh run --owner cpu-bench \
+  --reason "Bounded expert memory and CPU evidence" --wait --gate 3 --strict-reap -- \
+  cargo bench -p onnx-runtime-ep-cpu --bench bounded_expert_bench -- warm 1 256 512 100 /tmp/bounded-expert.tsv
+```
+
+The admission comparison checks governed footprints and numerical outputs and
+includes a runtime-only control. Keep backend, dtype, threads and retained
+representation expectations identical across matching revisions:
+
+```bash
+scripts/hostlock.sh run --owner cpu-bench \
+  --reason "Weight admission overhead evidence" --wait --gate 3 --strict-reap -- \
+  cargo bench -p onnx-runtime-ep-cpu --bench weight_admission_ab
+```
+
+On Darwin, use the cooperating sessions' shared stable `fcntl.flock` wrapper
+around the complete Cargo command; the Linux `hostlock.sh` implementation is
+unsupported there. Never move custody inside the benchmark binary.
+
 ### Exact Einsum census and evidence run
 
 Set the physical-core budget and a fresh absolute Cargo target directory from

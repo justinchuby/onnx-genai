@@ -1,6 +1,6 @@
 //! Real CPU MatMul A/B for derived-weight accounting. Warm-up is excluded.
-//! Interleave governed/local arms, a duplicate local A/A arm and an unaffected
-//! contiguous-f32 control. Retained and transient policies are separate rows.
+//! Interleave governed/local arms, a duplicate local A/A arm, a constant-f32
+//! comparison and an unaffected runtime-only f32 control. Retained and transient policies are separate rows.
 //! This is a CPU/tier-scoped measurement, not proof of zero cost on every EP.
 //! Run under the host lock with RAYON_NUM_THREADS=1; inspect full ranges/nulls.
 
@@ -17,19 +17,35 @@ use onnx_runtime_ir::{DataType, DeviceId, Node, NodeId};
 use onnx_runtime_memory_api::Tier;
 use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WeightFormat {
+    F32,
+    F64,
+    F16,
+}
+
 struct Case {
     kernel: Box<dyn Kernel>,
     a: Vec<f32>,
     b32: Vec<f32>,
     b64: Vec<f64>,
+    b16: Vec<u16>,
     output: Vec<f32>,
     shapes: [[usize; 2]; 3],
     strides: [[i64; 2]; 3],
-    wide: bool,
+    format: WeightFormat,
     governor: LedgerGovernor,
 }
 impl Case {
-    fn new(m: usize, k: usize, n: usize, wide: bool, governed: bool, retained: bool) -> Self {
+    fn new(
+        m: usize,
+        k: usize,
+        n: usize,
+        format: WeightFormat,
+        governed: bool,
+        retained: bool,
+        constant: bool,
+    ) -> Self {
         let governor = LedgerGovernor::new(LeaseLedger::new(0, (k * n * 16) as u64, 0));
         let memory = if governed {
             DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap()
@@ -44,16 +60,17 @@ impl Case {
         let mut kernel = provider
             .get_kernel(&node, &[vec![m, k], vec![k, n]], 17)
             .unwrap();
-        kernel.set_constant_inputs(&[false, true]);
+        kernel.set_constant_inputs(&[false, constant]);
         let mut case = Self {
             kernel,
             a: vec![0.25; m * k],
             b32: vec![0.5; k * n],
             b64: vec![0.5; k * n],
+            b16: vec![half::f16::from_f32(0.5).to_bits(); k * n],
             output: vec![0.; m * n],
             shapes: [[m, k], [k, n], [m, n]],
             strides: [[k as i64, 1], [n as i64, 1], [n as i64, 1]],
-            wide,
+            format,
             governor,
         };
         for _ in 0..16 {
@@ -62,6 +79,7 @@ impl Case {
         assert!(case.output.iter().all(|&v| v == k as f32 * 0.125));
         #[cfg(feature = "mlas")]
         let panel_bytes = if retained
+            && constant
             && onnx_runtime_ep_cpu::backend::CpuBackend::auto_detect()
                 == onnx_runtime_ep_cpu::backend::CpuBackend::Mlas
         {
@@ -71,14 +89,75 @@ impl Case {
         };
         #[cfg(not(feature = "mlas"))]
         let panel_bytes = 0u64;
-        assert_eq!(
-            case.governor.used(Tier::Host),
-            if governed && retained {
-                (if wide { k * n * 4 } else { 0 }) as u64 + panel_bytes
-            } else {
-                0
-            }
+        // The F16 switch is also copied unchanged to an older baseline whose
+        // transpose is uncharged. Record its actual bytes outside the timer;
+        // public provider tests separately require the new half grant.
+        println!(
+            "footprint\t{m}\t{k}\t{n}\t{format:?}\t{governed}\t{retained}\t{constant}\t{}",
+            case.governor.used(Tier::Host)
         );
+        // This assertion-only input selects the old or new expected footprint
+        // in before/current runs; it never changes runtime policy or compute.
+        let expect_transpose = match std::env::var("NXRT_ADMISSION_EXPECT_F32_TRANSPOSE_GRANT")
+            .as_deref()
+        {
+            Ok("0") => false,
+            Ok("1") | Err(_) => true,
+            Ok(value) => panic!(
+                "NXRT_ADMISSION_EXPECT_F32_TRANSPOSE_GRANT={value:?}; choose 0 or 1 for the expected footprint"
+            ),
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let transpose_bytes = if constant
+            && retained
+            && expect_transpose
+            && m == 1
+            && onnx_runtime_ep_cpu::backend::CpuBackend::auto_detect()
+                == onnx_runtime_ep_cpu::backend::CpuBackend::Accelerate
+        {
+            (k * n * 4) as u64
+        } else {
+            0
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let transpose_bytes = {
+            let _ = expect_transpose;
+            0u64
+        };
+        // Assertion-only baseline selector; direct preparation does not keep
+        // a second dense B on the admitted Accelerate decode route.
+        let expected_staging = match std::env::var("NXRT_ADMISSION_EXPECT_DENSE_B_COPY").as_deref()
+        {
+            Ok("1") => true,
+            Ok("0") | Err(_) => false,
+            Ok(value) => panic!(
+                "NXRT_ADMISSION_EXPECT_DENSE_B_COPY={value:?}; choose 0 or 1 for the expected footprint"
+            ),
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let direct_decode = constant
+            && retained
+            && m == 1
+            && onnx_runtime_ep_cpu::backend::CpuBackend::auto_detect()
+                == onnx_runtime_ep_cpu::backend::CpuBackend::Accelerate;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let direct_decode = false;
+        if format != WeightFormat::F16 {
+            assert_eq!(
+                case.governor.used(Tier::Host),
+                if governed && retained && constant {
+                    (if format == WeightFormat::F64 && (!direct_decode || expected_staging) {
+                        k * n * 4
+                    } else {
+                        0
+                    }) as u64
+                        + panel_bytes
+                        + transpose_bytes
+                } else {
+                    0
+                }
+            );
+        }
         case
     }
     fn execute(&mut self) {
@@ -89,10 +168,10 @@ impl Case {
             &self.strides[0],
             DeviceId::cpu(),
         );
-        let (pointer, dtype) = if self.wide {
-            (self.b64.as_ptr().cast(), DataType::Float64)
-        } else {
-            (self.b32.as_ptr().cast(), DataType::Float32)
+        let (pointer, dtype) = match self.format {
+            WeightFormat::F64 => (self.b64.as_ptr().cast(), DataType::Float64),
+            WeightFormat::F16 => (self.b16.as_ptr().cast(), DataType::Float16),
+            WeightFormat::F32 => (self.b32.as_ptr().cast(), DataType::Float32),
         };
         let b = TensorView::new(
             DevicePtr(pointer),
@@ -141,32 +220,44 @@ fn median(values: &[f64]) -> f64 {
     sorted[sorted.len() / 2]
 }
 fn main() {
+    let format = match std::env::var("NXRT_ADMISSION_WEIGHT_FORMAT").as_deref() {
+        Ok("f16") => WeightFormat::F16,
+        Ok("f64") | Err(_) => WeightFormat::F64,
+        Ok(value) => {
+            panic!("NXRT_ADMISSION_WEIGHT_FORMAT={value:?} is unsupported; choose f16 or f64")
+        }
+    };
+    println!(
+        "context\tweight_format={format:?}\tbackend={:?}",
+        onnx_runtime_ep_cpu::backend::CpuBackend::auto_detect()
+    );
     println!(
         "m\tk\tn\tretained\tarm\titerations\twall_ns_median\twall_ns_min\twall_ns_max\tcpu_ns_median"
     );
     for (m, k, n) in [(1, 16, 16), (1, 128, 256), (8, 128, 256)] {
         for retained in [true, false] {
             let mut cases = [
-                Case::new(m, k, n, true, false, retained),
-                Case::new(m, k, n, true, true, retained),
-                Case::new(m, k, n, true, false, retained),
-                Case::new(m, k, n, false, false, retained),
-                Case::new(m, k, n, false, true, retained),
+                Case::new(m, k, n, format, false, retained, true),
+                Case::new(m, k, n, format, true, retained, true),
+                Case::new(m, k, n, format, false, retained, true),
+                Case::new(m, k, n, WeightFormat::F32, false, retained, true),
+                Case::new(m, k, n, WeightFormat::F32, true, retained, true),
+                Case::new(m, k, n, WeightFormat::F32, true, retained, false),
             ];
             let ns = cases[0].batch(256).0;
             let iterations = ((10_000_000. / ns) as usize).clamp(16, 100_000);
-            let mut walls: [Vec<f64>; 5] = Default::default();
-            let mut cpus: [Vec<f64>; 5] = Default::default();
+            let mut walls: [Vec<f64>; 6] = Default::default();
+            let mut cpus: [Vec<f64>; 6] = Default::default();
             for round in 0..11 {
-                for offset in 0..5 {
-                    let arm = (round + offset) % 5;
+                for offset in 0..6 {
+                    let arm = (round + offset) % 6;
                     let (wall, cpu) = cases[arm].batch(iterations);
                     walls[arm].push(wall);
                     cpus[arm].push(cpu);
                 }
             }
             // Keep every sample outside timed regions for noise/null auditing.
-            for arm in 0..5 {
+            for arm in 0..6 {
                 for round in 0..11 {
                     println!(
                         "sample\t{m}\t{k}\t{n}\t{retained}\t{arm}\t{round}\t{:.2}\t{:.2}",
@@ -180,6 +271,7 @@ fn main() {
                 "wide_local_null",
                 "f32_local_control",
                 "f32_governed_control",
+                "runtime_f32_control",
             ]
             .iter()
             .enumerate()

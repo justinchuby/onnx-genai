@@ -153,7 +153,7 @@ impl GemmKernel {
                     k,
                     n,
                     trans_b,
-                );
+                )?;
                 return Ok(Some(result));
             }
         }
@@ -278,7 +278,6 @@ impl Kernel for GemmKernel {
             half_output
         } else {
             let a = self.prepack.dense(0, &inputs[0])?;
-            let b = self.prepack.dense(1, &inputs[1])?;
 
             // The shared GEMM consumes row-major `A[M,K]` and `B[K,N]`, so an
             // operand stored transposed is materialized in that layout first.
@@ -289,18 +288,22 @@ impl Kernel for GemmKernel {
             } else {
                 Cow::Borrowed(&a)
             };
-            let b_rm: Cow<'_, [f32]> = if self.trans_b {
-                match self.prepack.transposed_b(&b, n, k) {
-                    Some(cached) => Cow::Borrowed(cached),
-                    None => Cow::Owned(transpose_row_major(&b, n, k)),
-                }
+            let cached_b = if self.trans_b {
+                Some(self.prepack.required_transposed_b(&inputs[1], n, k)?)
             } else {
-                Cow::Borrowed(&b)
+                None
+            };
+            let dense_b;
+            let b_rm = if let Some(cached) = &cached_b {
+                cached.as_slice()
+            } else {
+                dense_b = self.prepack.dense(1, &inputs[1])?;
+                dense_b.as_ref()
             };
 
             let mut output = vec![0.0f32; m * n];
             if m != 0 && n != 0 && k != 0 {
-                matmul::gemm(&a_rm, &b_rm, &mut output, m, k, n)?;
+                matmul::gemm(&a_rm, b_rm, &mut output, m, k, n)?;
             }
             if self.alpha != 1.0 {
                 for value in &mut output {
@@ -1077,12 +1080,6 @@ mod tests {
         );
     }
 
-    /// Serializes the tests that read the process-global weight-transpose cache
-    /// bytes or toggle its admission flag, so they never observe each other's
-    /// entries or setting under Rust's parallel test harness (#1056). Analogous
-    /// to `matmul_nbits`'s `CACHE_FLAG_TEST_LOCK`.
-    static TRANSPOSE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Build a single-node `Gemm` graph with a constant `[n, k]` `B` initializer
     /// and `transB = 1`, for driving [`weight_transpose_cache_predicted_bytes`].
     /// The initializer's *bytes* are irrelevant (the predictor reads only its
@@ -1111,209 +1108,101 @@ mod tests {
         graph
     }
 
-    /// #1056 acceptance criterion: the predicted transpose-cache bytes must
-    /// equal the bytes actually held after a real run, ratio 1.00.
-    ///
-    /// This runs the constant-weight `transB` `Gemm` kernel through the `Kernel`
-    /// trait at *two* activation shapes (prefill `m = 4`, decode `m = 1`) — the
-    /// exact duplication the shape-keyed kernel cache produces in an
-    /// autoregressive session — and asserts that the process-global cache grows
-    /// by the predicted amount *once*, proving effect (b) from #1051 (per-
-    /// instantiation copies) does **not** apply here: the global cache keys on
-    /// the weight address, so the decode instance hits the prefill entry.
+    /// Shape variants share one actual Host-funded transpose per node; this
+    /// checks residency before any measuring lookup and reconciles its forecast.
     #[test]
     fn predicted_transpose_bytes_equal_actual_after_gemm_execution() {
-        let _guard = TRANSPOSE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Thread-local admit: never mutates the process-global the concurrent
-        // `transposed_b` tests read (#1056 isolation).
-
-        // Distinctive geometry so a stray same-shaped entry cannot alias it.
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
         let (n, k) = (37usize, 91usize);
-        let graph = trans_b_gemm_graph(n, k);
-        let predicted = matmul::weight_transpose_cache_predicted_bytes(&graph);
-        assert_eq!(
-            predicted,
-            (n as u64) * (k as u64) * 4,
-            "one f32 [k,n] transpose per constant transB Gemm weight"
-        );
-
-        // One `B` buffer, shared by both kernel instances, so both key the
-        // global cache identically.
-        let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.013).sin()).collect();
-        let b = Owned::f32(&[n, k], &b_data);
-        let b_ptr = b.view().data_ptr::<f32>();
-
-        // Evict any stale entry a since-freed weight of these dims may have left
-        // at this recycled address, so the first `run` below is a genuine miss
-        // and the byte total grows by `predicted` (rather than silently hitting a
-        // pre-existing entry and asserting against no growth). Safe: no live
-        // concurrent allocation can share `b_ptr`.
-        crate::kernels::weight_transpose::f32_cache_evict(b_ptr, n, k);
-
-        // The kernel is returned and held, because an entry is resident for as
-        // long as the kernel that installed it (#1726): a prepack evicts its
-        // keys on drop so that no entry can outlive the weight whose address
-        // keys it. A session holds its kernels for its lifetime, so this models
-        // production; dropping them here would measure a torn-down session.
-        let run = |m: usize| -> (Vec<f32>, GemmKernel) {
-            let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.007).cos()).collect();
-            let a = Owned::f32(&[m, k], &a_data);
-            let mut y = Owned::zeros_f32(&[m, n]);
+        let predicted = matmul::weight_transpose_cache_predicted_bytes(&trans_b_gemm_graph(n, k));
+        assert_eq!(predicted, (n * k * 4) as u64);
+        let books = LedgerGovernor::new(LeaseLedger::new(0, predicted, 0));
+        let resources = crate::CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.013).sin()).collect();
+        let b = Owned::f32(&[n, k], &data);
+        let run = |m, state: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>| {
+            let a = Owned::f32(&[m, k], &vec![0.25; m * k]);
+            let mut out = Owned::zeros_f32(&[m, n]);
             let mut kernel = GemmKernel {
-                alpha: 1.0,
-                beta: 1.0,
+                alpha: 1.,
+                beta: 1.,
                 trans_a: false,
                 trans_b: true,
-                prepack: MatMulPrepack::default(),
+                prepack: MatMulPrepack::new(resources.clone()),
             };
             kernel.set_constant_inputs(&[false, true]);
+            if let Some(state) = state {
+                assert!(kernel.adopt_shareable_constant_state(state).unwrap());
+            }
             kernel
-                .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
                 .unwrap();
-            (y.to_f32(), kernel)
+            for (j, &value) in out.to_f32().iter().take(n).enumerate() {
+                let expected = data[j * k..(j + 1) * k].iter().sum::<f32>() * 0.25;
+                assert!((value - expected).abs() < 1e-4, "{value} != {expected}");
+            }
+            kernel
         };
-
-        let (_prefill, prefill_kernel) = run(4);
-        let (_decode, decode_kernel) = run(1);
-
-        // The executed kernels' entry must still be resident, checked *before*
-        // the measuring lookup below -- `cached_transpose_f32` installs on a
-        // miss, so asking afterwards would answer `true` even if nothing had
-        // been retained, and the check would prove nothing.
-        //
-        // Stated against this weight's key rather than as a delta between two
-        // reads of the process-global total. Under the parallel harness that
-        // total is not monotonic: since #1726 a prepack evicts the entry it
-        // installed when it drops, so an unrelated concurrent test finishing
-        // mid-test legitimately *lowers* it, and `after >= before + predicted`
-        // then fails for a reason that has nothing to do with this weight.
-        // Residency here plus `actual == predicted` below states the same fact
-        // -- exactly `predicted` bytes for this weight are held in the global
-        // cache -- without depending on unrelated churn (#1056 isolation).
-        assert!(
-            crate::kernels::weight_transpose::f32_cache_contains(b.view().data_ptr::<f32>(), n, k),
-            "the transpose must be resident in the global cache while the \
-             kernels that installed it are alive"
-        );
-
-        // The process-global byte total is shared across the parallel test
-        // harness, so a *concurrent* test caching an unrelated weight can also
-        // grow it. Measure the bytes held for THIS weight directly by re-keying
-        // the global cache with the exact `B` pointer the kernel used (a
-        // constant, contiguous f32 input densifies to a borrow of its own
-        // buffer, so `dense(1)` and this query share one address): a hit returns
-        // the entry the two runs installed, never a fresh allocation.
-        //
-        // SAFETY: `b` is a live, contiguous `[n, k]` f32 tensor for the whole
-        // test, so its data pointer addresses exactly `n * k` f32 values.
-        let b_slice = unsafe { std::slice::from_raw_parts(b.view().data_ptr::<f32>(), n * k) };
-        let entry = crate::kernels::weight_transpose::cached_transpose_f32(b_slice, n, k)
-            .expect("the executed kernel cached this constant weight's transpose");
-        let actual = (entry.len() * std::mem::size_of::<f32>()) as u64;
-        assert_eq!(
-            actual, predicted,
-            "predicted transpose-cache bytes must equal the bytes actually held \
-             for this weight (ratio 1.00); two shape instantiations retain one \
-             shared copy"
-        );
-        // And that copy is genuinely part of the global total the plan budgets.
-        assert!(
-            matmul::weight_transpose_cache_bytes() >= predicted as usize,
-            "the global byte total must account for at least this weight's \
-             resident transpose"
-        );
-        drop((prefill_kernel, decode_kernel));
+        let first = run(4, None);
+        assert_eq!(first.prepack.f32_transpose_stats(), (1, predicted as usize));
+        assert_eq!(books.used(Tier::Host), predicted);
+        let next = run(1, first.shareable_constant_state());
+        assert_eq!(next.prepack.f32_transpose_stats(), (1, predicted as usize));
+        assert_eq!(books.used(Tier::Host), predicted);
+        drop(first);
+        assert_eq!(books.used(Tier::Host), predicted);
+        drop(next);
+        assert_eq!(books.used(Tier::Host), 0);
     }
 
-    /// #1056 decline contract: when the cache is declined, a constant `transB`
-    /// `Gemm` weight retains **nothing** (the transpose is recomputed per call
-    /// and freed), and the result is byte-identical to the admitted run — a pure
-    /// performance tradeoff, never a numerical one.
+    /// Disabling retention keeps no payload between calls. The required
+    /// layout copy is funded transiently and preserves identical arithmetic.
     #[test]
     fn declined_transpose_cache_retains_nothing_and_is_byte_identical() {
-        let _guard = TRANSPOSE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        // A fresh `B` never seen by the global cache. Built once so its data
-        // pointer is stable across both runs and can be probed by exact key.
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
         let (n, k, m) = (29usize, 53usize, 3usize);
-        let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.019).sin()).collect();
-        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.011).cos()).collect();
-        let b = Owned::f32(&[n, k], &b_data);
-        // `b` outlives every use of this pointer below and is a contiguous
-        // `[n, k]` f32 tensor, so the key names exactly this weight.
-        let b_ptr = b.view().data_ptr::<f32>();
-
-        // Address reuse hygiene: the cache keys on `(addr, K, N)`, and an earlier
-        // (now-freed) weight of the same dims could have been recycled onto this
-        // exact address, leaving a stale entry that would make the probe below a
-        // false positive. Evict that key first so the "before" state is
-        // deterministically empty. Safe under the parallel harness: no *live*
-        // concurrent allocation can share `b_ptr`, so the only entry this can
-        // touch is a stale one nobody is using.
-        crate::kernels::weight_transpose::f32_cache_evict(b_ptr, n, k);
-        assert!(
-            !crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
-            "precondition: this weight's key must start absent"
-        );
-
-        // Returns the kernel so residency is probed while the installer is
-        // still alive: entries are evicted when the owning prepack drops, so
-        // that none can outlive the weight whose address keys it (#1726).
-        let run = |retain_caches| -> (Vec<f32>, GemmKernel) {
-            let a = Owned::f32(&[m, k], &a_data);
-            let mut y = Owned::zeros_f32(&[m, n]);
+        let data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.019).sin()).collect();
+        let b = Owned::f32(&[n, k], &data);
+        let a = Owned::f32(&[m, k], &vec![0.25; m * k]);
+        let run = |retained| {
+            let books = LedgerGovernor::new(LeaseLedger::new(0, (n * k * 4) as u64, 0));
+            let resources = crate::CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                Default::default(),
+            )
+            .unwrap()
+            .with_cache_retention(crate::CpuCacheRetention::new(retained));
             let mut kernel = GemmKernel {
-                alpha: 1.0,
-                beta: 1.0,
+                alpha: 1.,
+                beta: 1.,
                 trans_a: false,
                 trans_b: true,
-                prepack: MatMulPrepack::new(
-                    crate::CpuMemoryResources::default()
-                        .with_cache_retention(crate::CpuCacheRetention::new(retain_caches)),
-                ),
+                prepack: MatMulPrepack::new(resources),
             };
             kernel.set_constant_inputs(&[false, true]);
+            let mut out = Owned::zeros_f32(&[m, n]);
             kernel
-                .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
                 .unwrap();
-            (y.to_f32(), kernel)
-        };
-
-        // Declined: this weight's transpose must not be resident afterward.
-        // Probe the exact `(addr, n, k)` key the kernel installs (it calls
-        // `transposed_b(&b, n, k)`) rather than a global byte total, so a
-        // concurrent test caching an unrelated weight cannot mask a leak.
-        let declined = {
-            let (out, kernel) = run(false);
-            assert!(
-                !crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
-                "a declined transpose cache must retain nothing for this weight"
+            assert_eq!(
+                kernel.prepack.f32_transpose_stats(),
+                if retained { (1, n * k * 4) } else { (0, 0) }
+            );
+            assert_eq!(
+                books.used(Tier::Host),
+                if retained { (n * k * 4) as u64 } else { 0 }
             );
             drop(kernel);
-            out
+            assert_eq!(books.used(Tier::Host), 0);
+            out.to_f32()
         };
-
-        // Admitted: byte-identical output (transpose is the same math either
-        // way) and now this weight *is* resident, confirming the two paths
-        // differ only in retention, not in numerics.
-        let admitted = {
-            let (out, kernel) = run(true);
-            assert!(
-                crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
-                "an admitted transpose cache must retain this weight while the \
-                 kernel that installed it is alive"
-            );
-            drop(kernel);
-            out
-        };
-        assert_eq!(
-            declined, admitted,
-            "declining the transpose cache must not change results"
-        );
+        assert_eq!(run(false), run(true), "retention changes no arithmetic");
     }
 }
 
