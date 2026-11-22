@@ -1,0 +1,247 @@
+{
+  "source_commit": "f967e8c1589327f605f61b0211a60e6615bda549",
+  "source_tree": "d276b79c33fb5a8c5eefb23c2718a21454c0fc1a",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/pooling.rs": "55913818d81bba780de33e49fd8dbc895b117ee7fa8daca067fc04d29eea4986",
+    "crates/onnx-runtime-ep-cpu/tests/pool_window_allocation.rs": "7416706635704cc03f78cd93b3bedf66829fa860e70814de954475fe15251f67",
+    "feature_gate_exemptions.toml": "134494b05bae02957304b731d12ae66e8084f09ad0df02ff6112fffb51304f04"
+  },
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "host": [
+    "Apple M1 Max",
+    "10",
+    "10",
+    "34359738368"
+  ],
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "metric": "calling-thread alloc/alloc_zeroed/realloc operations in synchronous native Pool execute; no wall-time comparison",
+  "timing_scope": "raw wrapper/test timings include compilation or test suites; not per-kernel measurements",
+  "logs": {
+    "debug-red": {
+      "artifact": "debug-red.log.gz",
+      "uncompressed_sha256": "6204ef1a9033e6dbcdded88dfbdf5c76c86e7d48b121bd8bc666268568a2baee"
+    },
+    "debug-green": {
+      "artifact": "debug-green.log.gz",
+      "uncompressed_sha256": "459db836a11109125f3ef240464212ae22c27f76dd8c5665afc70bf515694e94"
+    },
+    "release-red": {
+      "artifact": "release-red.log.gz",
+      "uncompressed_sha256": "8f7448065b7bbe3756ce030d0d9d788e4dbfb4d0d478b868bfb2f9398874d03a"
+    },
+    "release-native-green": {
+      "artifact": "release-native-green.log.gz",
+      "uncompressed_sha256": "6c2a0f3f4accf3f462b822b53ba2aa68e191ec1b386b2ec6fda7e51c92ece8c4"
+    },
+    "release-mlas-green": {
+      "artifact": "release-mlas-green.log.gz",
+      "uncompressed_sha256": "b75d862156c83b72a0cc04c323238d573b46a783f1d8fc121ae761c42b111104"
+    },
+    "native-full-tests": {
+      "artifact": "native-full-tests.log.gz",
+      "uncompressed_sha256": "c87304d74300b4609df7be7ad6f4c4919b17562a029cf9f6b61dac88374c099e"
+    },
+    "native-final-pooling-tests": {
+      "artifact": "native-final-pooling-tests.log.gz",
+      "uncompressed_sha256": "8d15fe7161fac0045e8c7dfd43787a3a877f847ed39b45672e70e82fd0a6aa11"
+    },
+    "mlas-release-full-tests": {
+      "artifact": "mlas-release-full-tests.log.gz",
+      "uncompressed_sha256": "98020194058aabe066e6be04d69e9b5d0d0806963ef74c8d727284b21550b733"
+    },
+    "native-clippy": {
+      "artifact": "native-clippy.log.gz",
+      "uncompressed_sha256": "3633ab4263cfc031853dfcbb47134d13745cec8a54cea00da6021368273bf904"
+    },
+    "mlas-clippy": {
+      "artifact": "mlas-clippy.log.gz",
+      "uncompressed_sha256": "c123fd978c9cce6cd88fc399663949605d578620e21f87100689267a9acd4a44"
+    },
+    "final-pipeline": {
+      "artifact": "final-pipeline.log.gz",
+      "uncompressed_sha256": "a7127e29e79eb9bcccdbb45b229c468a72048a6e1a66ca8846a050e2c1f6cd08"
+    },
+    "release-red-wrapper": {
+      "artifact": "release-red-wrapper.log.gz",
+      "uncompressed_sha256": "3ffc9de107103e29875f13bfcd1c7a11f03927e6b1204f56301a4a28f6daa31a"
+    }
+  },
+  "allocation_probes": {
+    "debug-red": {
+      "rows": [
+        [
+          64,
+          1,
+          261,
+          261
+        ],
+        [
+          64,
+          17,
+          1733,
+          1733
+        ],
+        [
+          4096,
+          1,
+          16389,
+          16389
+        ],
+        [
+          4096,
+          17,
+          146885,
+          146885
+        ]
+      ],
+      "row_fields": [
+        "input_length",
+        "kernel_width",
+        "cold_allocation_calls",
+        "warm_allocation_calls"
+      ]
+    },
+    "debug-green": {
+      "rows": [
+        [
+          64,
+          1,
+          8,
+          8
+        ],
+        [
+          64,
+          17,
+          8,
+          8
+        ],
+        [
+          4096,
+          1,
+          8,
+          8
+        ],
+        [
+          4096,
+          17,
+          8,
+          8
+        ]
+      ],
+      "row_fields": [
+        "input_length",
+        "kernel_width",
+        "cold_allocation_calls",
+        "warm_allocation_calls"
+      ]
+    },
+    "release-red": {
+      "rows": [
+        [
+          64,
+          1,
+          261,
+          261
+        ],
+        [
+          64,
+          17,
+          1733,
+          1733
+        ],
+        [
+          4096,
+          1,
+          16389,
+          16389
+        ],
+        [
+          4096,
+          17,
+          146885,
+          146885
+        ]
+      ],
+      "row_fields": [
+        "input_length",
+        "kernel_width",
+        "cold_allocation_calls",
+        "warm_allocation_calls"
+      ]
+    },
+    "release-native-green": {
+      "rows": [
+        [
+          64,
+          1,
+          8,
+          8
+        ],
+        [
+          64,
+          17,
+          8,
+          8
+        ],
+        [
+          4096,
+          1,
+          8,
+          8
+        ],
+        [
+          4096,
+          17,
+          8,
+          8
+        ]
+      ],
+      "row_fields": [
+        "input_length",
+        "kernel_width",
+        "cold_allocation_calls",
+        "warm_allocation_calls"
+      ],
+      "binary": "/tmp/nxrt-erf-nan-target/release/deps/pool_window_allocation-dcb7ae551f1c2663",
+      "binary_sha256": "213d26fa1bd4025b19cd9e021d03affc32771aaac090906a1396bb08e6b0e18a"
+    },
+    "release-mlas-green": {
+      "rows": [
+        [
+          64,
+          1,
+          8,
+          8
+        ],
+        [
+          64,
+          17,
+          8,
+          8
+        ],
+        [
+          4096,
+          1,
+          8,
+          8
+        ],
+        [
+          4096,
+          17,
+          8,
+          8
+        ]
+      ],
+      "row_fields": [
+        "input_length",
+        "kernel_width",
+        "cold_allocation_calls",
+        "warm_allocation_calls"
+      ],
+      "binary": "/tmp/nxrt-erf-nan-target/release/deps/pool_window_allocation-d23078225d13d57f",
+      "binary_sha256": "abe0a11cc6c53d42f01b481c5e72c8237ac53b3bb6bd0c11cfcfc09ecae0714d"
+    }
+  },
+  "validation_note": "native full 1941/18 preceded removal of two needless test-oracle borrows; production walker unchanged. Final frozen native pool module16/0; full release MLAS1962/30. Strict Clippy both configurations."
+}

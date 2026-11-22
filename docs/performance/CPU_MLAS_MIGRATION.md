@@ -280,6 +280,16 @@ samples remain reproducible; production retains the single-vector loop. Generate
 GELU code has a larger stack frame and more spills, so simple unrolling is not
 an evidence-backed next step for this implementation.
 
+The generic native Pool window walker now reuses four rank-sized coordinate
+buffers and a row-major cursor, preserving sum order and both MaxPool index
+orders. Unrequested index output is no longer staged. The
+[actual-execution allocation proof](../benchmarks/2026-11-21-pool-window-workspace.md)
+observes 8 allocations per call across its four geometries, versus 261–146885
+before, in optimized native builds; the MLAS-feature build reaches the same
+native LpPool path and also observes 8. This is bounded coordinate workspace,
+not whole-call allocation freedom, a latency comparison, or Pool graduation.
+The optional MLAS Pool/NCHWc references remain.
+
 Generic f32 GEMM's thin-M column-parallel path now borrows the original B
 stride and caller-owned output rows. It retains the same scalar register tiles
 and K-panel accumulation order, replacing full B/output element copies with
