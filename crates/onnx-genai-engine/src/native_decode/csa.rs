@@ -1948,6 +1948,84 @@ mod tests {
     }
 
     #[test]
+    fn complete_snapshot_restores_compressed_records_and_partial_carries_after_reset()
+    -> anyhow::Result<()> {
+        fn contents(
+            session: &NativeDecodeSession,
+        ) -> BTreeMap<String, (Vec<usize>, DataType, Vec<u8>)> {
+            session
+                .past
+                .iter()
+                .map(|(name, tensor)| {
+                    (
+                        name.clone(),
+                        (
+                            tensor.shape.clone(),
+                            tensor.dtype,
+                            tensor.as_bytes().to_vec(),
+                        ),
+                    )
+                })
+                .collect()
+        }
+        let model = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny-deepseek-v4-csa/model.onnx.textproto");
+        let mut session =
+            NativeDecodeSession::load_with_resolved_io(&model, NativeDecodeDevice::Cpu)?;
+        let mut oracle =
+            NativeDecodeSession::load_with_resolved_io(&model, NativeDecodeDevice::Cpu)?;
+        // Seven tokens retain both completed ratio-4 records and nonempty
+        // ratio-4/ratio-128 partial carries in this fixture.
+        let prompt = [1, 2, 3, 4, 5, 6, 7];
+        session.decode(&prompt, 0)?;
+        oracle.decode(&prompt, 0)?;
+        assert!(!session.compressed_state.is_empty());
+        let baseline = contents(&session);
+        for name in session.compressed_state.state_past_names() {
+            assert!(
+                baseline.contains_key(name),
+                "declared compressed state '{name}' must be materialized"
+            );
+        }
+        assert!(session.supports_past_snapshots());
+        let snapshot = session.snapshot_past()?;
+        assert!(snapshot.bytes() > 0);
+        session.reset()?;
+        session.decode(&[21, 22, 23, 24, 25], 0)?;
+        assert_ne!(
+            contents(&session),
+            baseline,
+            "replacement must really overwrite state"
+        );
+        session.restore_past_snapshot(&snapshot)?;
+        assert_eq!(session.current_len(), prompt.len());
+        assert_eq!(
+            contents(&session),
+            baseline,
+            "borrowed restore must retain every state byte and shape"
+        );
+        session.reset()?;
+        session.decode(&[31, 32, 33], 0)?;
+        session.restore_owned_past_snapshot(snapshot)?;
+        assert_eq!(session.current_len(), prompt.len());
+        assert_eq!(
+            contents(&session),
+            baseline,
+            "owned transaction restore must recover partial carries too"
+        );
+        assert_eq!(
+            session.decode(&[8, 9], prompt.len())?,
+            oracle.decode(&[8, 9], prompt.len())?
+        );
+        assert_eq!(
+            contents(&session),
+            contents(&oracle),
+            "restored continuation must reproduce the complete untouched state"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn internal_snapshot_restores_compressed_state_transactionally() -> anyhow::Result<()> {
         let model = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tiny-deepseek-v4-csa/model.onnx.textproto");

@@ -3747,6 +3747,7 @@ impl Engine {
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         let session_id = target.id();
+        let cached_request = matches!(&target, NativeSessionTarget::CachedRequest(_));
         request.options.validate()?;
         let mut options = request.options;
         reject_native_request_speculation(&options)?;
@@ -3835,9 +3836,15 @@ impl Engine {
             // Semantic-prefix caching targets recurrent history. Complete
             // turn snapshots also admit dense host KV, without changing this
             // cache's scope or its recurrent-prefix telemetry.
-            let supports_past_snapshots = self.native_session.as_ref().is_some_and(|native| {
-                native.has_recurrent_state() && native.supports_past_snapshots()
+            let prefix_reuse_permitted = self.metadata.decoder_io().is_none_or(|io| {
+                io.state_groups
+                    .iter()
+                    .all(|group| group.reuse.prefix_reusable)
             });
+            let supports_past_snapshots = prefix_reuse_permitted
+                && self.native_session.as_ref().is_some_and(|native| {
+                    native.has_recurrent_state() && native.supports_past_snapshots()
+                });
             let mut restored_prefix_len = None;
             let mut should_store_semantic_snapshot = false;
             if !active_matches
@@ -3973,6 +3980,15 @@ impl Engine {
                 };
                 if resume_from >= prompt_tokens.len() {
                     resume_from = prompt_tokens.len().saturating_sub(1);
+                }
+                // Reusing an implementation cache obeys the package's prefix
+                // policy. A recurrent/record state cannot be reconstructed by
+                // slicing an earlier token boundary; re-evaluate the complete
+                // prompt instead, under the already admitted turn checkpoint.
+                if (cached_request && !prefix_reuse_permitted)
+                    || (native.has_recurrent_state() && resume_from < native.current_len())
+                {
+                    resume_from = 0;
                 }
 
                 native.generate_incremental_with_callback_and_staged_observer(
@@ -4377,6 +4393,109 @@ mod tests {
             baseline,
             "rewinding length alone cannot restore bytes overwritten by prompt replacement"
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_compressed_prompt_replacement_cancellation_restores_complete_state()
+    -> anyhow::Result<()> {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-deepseek-v4-csa");
+        let directory = tempfile::tempdir()?;
+        for name in ["inference_metadata.yaml", "model.onnx.textproto"] {
+            std::fs::copy(source.join(name), directory.path().join(name))?;
+        }
+        let metadata: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(
+            source.join("inference_metadata.yaml"),
+        )?)?;
+        let vocab_size = metadata["package"]["tokenizer"]["vocab_size"]
+            .as_u64()
+            .context("fixture vocabulary size")?;
+        let vocab: serde_json::Map<String, serde_json::Value> = (0..vocab_size)
+            .map(|token| (format!("t{token}"), serde_json::json!(token)))
+            .collect();
+        std::fs::write(
+            directory.path().join("tokenizer.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version":"1.0", "truncation":null, "padding":null, "added_tokens":[], "normalizer":null,
+                "pre_tokenizer":{"type":"Whitespace"}, "post_processor":null, "decoder":null,
+                "model":{"type":"WordLevel", "vocab":vocab, "unk_token":"t0"}
+            }))?,
+        )?;
+        let mut engine = Engine::from_dir(
+            directory.path(),
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..EngineConfig::default()
+            },
+        )?;
+        let session = engine.create_session()?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2, 3, 4, 5, 6, 7]));
+        request.options.max_new_tokens = 1;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        request.options.semantic_prefix_len = Some(4);
+        engine.generate_in_session(session, request.clone())?;
+        assert_eq!(
+            engine.native_recurrent_prefix_stats.stores, 0,
+            "complete rollback checkpoints must not override a package's prefix_reusable=false contract"
+        );
+        let baseline = engine.native_session.as_mut().unwrap().snapshot_past()?;
+        let tokens = engine.native_sessions[&session].tokens.clone();
+        let authority = crate::GenerationControl::new();
+        let cancel = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == crate::GenerationBoundary::BeforeSemanticCommit {
+                assert!(cancel.cancel());
+            }
+            Ok(())
+        });
+        request.prompt = GeneratePrompt::TokenIds(vec![1, 2, 3, 21, 22]);
+        request.options.max_new_tokens = 2;
+        let mut published = Vec::new();
+        let error = engine
+            .generate_in_session_with_control_callbacks(
+                session,
+                request.clone(),
+                control,
+                None,
+                Some(&mut |token| {
+                    published.push(token.token_id);
+                    Ok(())
+                }),
+            )
+            .expect_err("compressed replacement must cancel at the semantic commit boundary");
+        assert!(
+            error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+            "{error:#}"
+        );
+        assert!(published.is_empty());
+        assert_eq!(engine.native_sessions[&session].tokens, tokens);
+        let restored = engine.native_session.as_mut().unwrap().snapshot_past()?;
+        assert_eq!(restored.len(), baseline.len());
+        assert_eq!(
+            restored.host_contents(),
+            baseline.host_contents(),
+            "all compressed records, cursors and partial carries must survive cancellation"
+        );
+        assert_eq!(engine.scheduler.running_count(), 0);
+        assert_eq!(
+            engine
+                .generate_in_session(session, request.clone())?
+                .token_ids
+                .len(),
+            2
+        );
+        assert_eq!(engine.generate(request.clone())?.token_ids.len(), 2);
+        request.prompt = GeneratePrompt::TokenIds(vec![1, 2, 3, 31, 32]);
+        assert_eq!(
+            engine.generate(request)?.token_ids.len(),
+            2,
+            "stateless replacement must reset a non-reusable partial prefix, not attempt an invalid record rewind"
+        );
+        assert_eq!(engine.native_recurrent_prefix_stats.stores, 0);
         Ok(())
     }
 

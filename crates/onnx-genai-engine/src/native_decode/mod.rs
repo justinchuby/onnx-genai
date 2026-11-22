@@ -310,6 +310,24 @@ pub(crate) struct NativePastSnapshot {
 
 impl NativePastSnapshot {
     #[cfg(test)]
+    pub(crate) fn host_contents(
+        &self,
+    ) -> std::collections::BTreeMap<String, (Vec<usize>, DataType, Vec<u8>)> {
+        self.past
+            .iter()
+            .map(|(name, tensor)| {
+                (
+                    name.clone(),
+                    (
+                        tensor.shape.clone(),
+                        tensor.dtype,
+                        tensor.as_bytes().to_vec(),
+                    ),
+                )
+            })
+            .collect()
+    }
+    #[cfg(test)]
     pub(crate) fn cpu_kv_snapshot(&self) -> Option<&cpu::CpuKvSnapshot> {
         self.cpu_kv.as_ref()
     }
@@ -743,7 +761,10 @@ impl NativeDecodeSession {
     }
 
     pub(crate) fn supports_past_snapshots(&self) -> bool {
-        self.cuda.is_none() && self.compressed_state.is_empty()
+        // A complete host capture contains the declared record cursors and
+        // partial carries too. It restores a saved boundary, not an arbitrary
+        // prefix inferred from a token count.
+        self.cuda.is_none()
     }
 
     fn recurrent_past_names(&self) -> HashSet<String> {
@@ -825,12 +846,9 @@ impl NativeDecodeSession {
     }
 
     pub(crate) fn snapshot_past(&mut self) -> anyhow::Result<NativePastSnapshot> {
-        if let Some(error) = self.compressed_state_refusal(NativeStateOperation::Snapshot, None) {
-            return Err(error);
-        }
         if !self.supports_past_snapshots() {
             bail!(
-                "native past snapshots require host-owned past tensors without compressed record cursors"
+                "complete native state snapshots require host-owned state; this decoder keeps state on the device"
             );
         }
         let recurrent = self.recurrent_past_names();
@@ -863,14 +881,9 @@ impl NativeDecodeSession {
         &mut self,
         snapshot: &NativePastSnapshot,
     ) -> anyhow::Result<()> {
-        if let Some(error) =
-            self.compressed_state_refusal(NativeStateOperation::Restore, Some(snapshot.len))
-        {
-            return Err(error);
-        }
         if !self.supports_past_snapshots() {
             bail!(
-                "native past snapshots require host-owned past tensors without compressed record cursors"
+                "complete native state snapshots require host-owned state; this decoder keeps state on the device"
             );
         }
         let mut restored = HashMap::with_capacity(snapshot.past.len());
@@ -894,7 +907,7 @@ impl NativeDecodeSession {
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.supports_past_snapshots(),
-            "complete native state restore requires host-owned past tensors without compressed record cursors"
+            "complete native state restore requires host-owned state; this decoder keeps state on the device"
         );
         self.restore_cpu_snapshot(snapshot.cpu_kv.as_ref())?;
         self.past = snapshot.past;

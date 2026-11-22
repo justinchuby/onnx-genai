@@ -296,3 +296,27 @@ restoring, and prove a later incompatible binding cannot partially overwrite an
 earlier valid one. Full native engine library: 792 passed / 1 inherited ignore;
 strict native engine and server all-target Clippy pass. Device and compressed
 state checkpoints and the broader compatibility rows remain unfinished.
+
+Compressed host-state milestone: complete checkpoints now retain compressed
+records, record cursors and unfinished ratio-4/ratio-128 carries at the saved
+boundary. Direct ONNX tests reset/overwrite the model, restore both borrowed and
+owned snapshots, compare every state shape/dtype/byte, and compare subsequent
+calculation with an untouched instance. A real Engine test cancels an edited,
+partially shared prompt before semantic commit, restores all compressed state,
+publishes no tokens, retries successfully and exercises stateless replacement.
+Non-sliceable state is reset/re-evaluated for edited prefixes rather than treated
+as a token-sliceable cache. Prefix snapshots and stateless cache reuse honor the
+canonical prefix_reusable policy; complete transaction recovery does not grant
+shared-prefix reuse.
+
+The Engine test exposed a loader refusal that treated seven growing state ports
+as ordinary key/value pairs. The shared paged bridge now resolves canonical
+role/layer identities, retaining all other ports for the decoder while selecting
+only its actual key/value pairs. Port order is irrelevant, and a uniquely
+identified unindexed pair needs no invented layer number. The explicit flat ABI
+keeps its existing pairing validation when no canonical groups are present.
+Tests cover shuffled declarations, unindexed pairs and missing-role refusal.
+Full native engine: 795 passed / 1 inherited ignore; full server: 392 passed /
+2 inherited ignores. The final canonical-role regression and strict native
+engine/server all-target Clippy pass. Device-resident complete checkpoints and
+the remaining compatibility features, conformance, review and merge remain open.

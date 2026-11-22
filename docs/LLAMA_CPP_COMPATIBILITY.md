@@ -122,12 +122,15 @@ races semantic commit atomically; after commit it affects delivery rather than
 rolling back durable state. Replay DELETE removes the producer and retained bytes.
 The real Chrome smoke verifies the frontend Stop request, worker release and
 cancelled-history removal, alongside active refresh and reader recovery.
-Host-owned and in-place CPU native KV restore complete state when a named conversation
+Host-owned dense/recurrent/compressed state and in-place CPU KV restore complete state when a named conversation
 replaces its cached prefix. Complete snapshots are budgeted before mutation.
-Backends with device/compressed state that lack this checkpoint return
+Backends with device-resident state that lack this checkpoint return
 409 for destructive conversation replacement. Appends retain their prefix-safe
 path, and stateless requests may discard their internal cache. Complete snapshot
 support for those remaining backends is still an implementation item.
+Complete compressed-state checkpoints restore saved record cursors and partial
+carries; they do not imply arbitrary token-prefix rewind or permission to ignore
+the package's prefix-reuse policy.
 
 Native generation accepts text, token IDs, mixed text/token rows and prompt
 batches, including text-only `prompt_string` objects. Only a first text segment
