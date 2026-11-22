@@ -1263,9 +1263,15 @@ pub trait ExecutionProvider: Send + Sync {
     /// even when activation shapes are unresolved. No runtime inputs are supplied.
     /// Returned state is owned by this executor until teardown, so providers can
     /// retain warmed constants without process-global lifetime or admission flags.
+    /// `constant_inputs` describes immutable graph operands independently of host
+    /// byte availability. A missing descriptor is not proof that an input varies.
+    /// The executor offers returned state to each node's first kernel through
+    /// [`crate::Kernel::adopt_shareable_constant_state`]; unrecognized state stays
+    /// alive until teardown and ordinary kernel preparation still runs.
     fn prepare_static_constants(
         &self,
         _node: &Node,
+        _constant_inputs: &[bool],
         _constants: &[Option<crate::KernelConstantInput<'_>>],
     ) -> Result<Option<Arc<dyn Any + Send + Sync>>> {
         Ok(None)

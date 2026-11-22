@@ -1188,7 +1188,6 @@ impl Executor {
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
-            static_constant_states: Vec::new(),
             provider_artifact_readiness: ProviderArtifactReadiness::default(),
             persistent_workspace: None,
             step_workspace: None,
@@ -1202,6 +1201,13 @@ impl Executor {
         // postpone load-time preparation to the first request.
         for node_plan in &exec.plan {
             let node = exec.graph.node(node_plan.node_id);
+            let constant_inputs: Vec<bool> = node_plan
+                .inputs
+                .iter()
+                .map(|input| {
+                    input.is_some_and(|value| is_immutable_initializer(&exec.graph, value))
+                })
+                .collect();
             let constants = node_plan
                 .inputs
                 .iter()
@@ -1209,9 +1215,7 @@ impl Executor {
                     let value = (*input)?;
                     // Producer-backed initializer storage is writable, not an
                     // immutable model constant, even when it has default bytes.
-                    if !exec.graph.is_constant_initializer(value)
-                        || exec.graph.value(value).producer.is_some()
-                    {
+                    if !is_immutable_initializer(&exec.graph, value) {
                         return None;
                     }
                     let weight = exec.graph.initializers.get(&value)?;
@@ -1235,8 +1239,17 @@ impl Executor {
                     })
                 })
                 .collect::<Vec<_>>();
-            if let Some(state) = exec.ep.prepare_static_constants(node, &constants)? {
-                exec.static_constant_states.push(state);
+            if let Some(state) =
+                exec.ep
+                    .prepare_static_constants(node, &constant_inputs, &constants)?
+            {
+                exec.cache.static_constant_states.insert(
+                    node.id,
+                    StaticConstantState {
+                        constant_inputs,
+                        state,
+                    },
+                );
             }
         }
 
@@ -2500,7 +2513,7 @@ impl Executor {
             let constant_inputs: Vec<bool> = self.plan[i]
                 .inputs
                 .iter()
-                .map(|input| input.is_some_and(|vid| self.graph.initializers.contains_key(&vid)))
+                .map(|input| input.is_some_and(|vid| is_immutable_initializer(&self.graph, vid)))
                 .collect();
             let constant_values = resolve_kernel_constant_inputs(
                 &self.graph,

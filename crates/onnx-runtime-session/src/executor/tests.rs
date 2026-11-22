@@ -8543,6 +8543,358 @@ fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() 
     assert!(!first.contains("more unsupported node"));
 }
 
+#[test]
+fn static_preparation_reaches_first_kernels_and_keeps_unrecognized_owners_alive() {
+    #[derive(Default)]
+    struct Probe {
+        adopted: AtomicUsize,
+        prepared: AtomicUsize,
+        owners: std::sync::Mutex<Vec<std::sync::Weak<dyn std::any::Any + Send + Sync>>>,
+    }
+    struct Ready {
+        node: NodeId,
+        flags: Vec<bool>,
+        value: f32,
+    }
+    struct PreparedEp {
+        cpu: CpuExecutionProvider,
+        probe: Arc<Probe>,
+        recognized: bool,
+    }
+    struct PreparedKernel {
+        inner: Box<dyn Kernel>,
+        node: NodeId,
+        flags: Vec<bool>,
+        ready: Option<Arc<Ready>>,
+        probe: Arc<Probe>,
+    }
+    impl Kernel for PreparedKernel {
+        fn set_constant_inputs(&mut self, flags: &[bool]) {
+            self.flags = flags.to_vec();
+            self.inner.set_constant_inputs(flags);
+        }
+        fn adopt_shareable_constant_state(
+            &mut self,
+            state: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> onnx_runtime_ep_api::Result<bool> {
+            let Ok(ready) = Arc::downcast::<Ready>(state) else {
+                return Ok(false);
+            };
+            assert_eq!(
+                ready.node, self.node,
+                "prepared state crossed node boundaries"
+            );
+            assert_eq!(ready.flags, self.flags);
+            self.probe.adopted.fetch_add(1, Ordering::Relaxed);
+            self.ready = Some(ready);
+            Ok(true)
+        }
+        fn prepare_constant_inputs(
+            &mut self,
+            constants: &[Option<KernelConstantInput<'_>>],
+            _: &dyn ExecutionProvider,
+        ) -> onnx_runtime_ep_api::Result<()> {
+            self.probe.prepared.fetch_add(1, Ordering::Relaxed);
+            let constant = constants[1].as_ref().unwrap();
+            self.ready = Some(Arc::new(Ready {
+                node: self.node,
+                flags: self.flags.clone(),
+                value: f32::from_le_bytes(constant.bytes[..4].try_into().unwrap()),
+            }));
+            Ok(())
+        }
+        fn execute(
+            &self,
+            inputs: &[TensorView],
+            outputs: &mut [TensorMut],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            let ready = self
+                .ready
+                .as_ref()
+                .expect("kernel must adopt or prepare before execution");
+            inputs[1].validate()?;
+            // SAFETY: the graph supplies one initialized f32 scalar constant.
+            assert_eq!(
+                unsafe { inputs[1].data_ptr::<f32>().read_unaligned() },
+                ready.value
+            );
+            self.inner.execute(inputs, outputs)
+        }
+    }
+    impl ExecutionProvider for PreparedEp {
+        fn name(&self) -> &str {
+            "static_preparation_probe"
+        }
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Cpu
+        }
+        fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+            self.cpu.device_id()
+        }
+        fn copy_async(
+            &self,
+            src: &DeviceBuffer,
+            dst: &mut DeviceBuffer,
+            size: usize,
+        ) -> onnx_runtime_ep_api::Result<Fence> {
+            self.cpu.copy_async(src, dst, size)
+        }
+        fn initialize(&mut self, _: &EpConfig) -> onnx_runtime_ep_api::Result<()> {
+            Ok(())
+        }
+        fn shutdown(&mut self) -> onnx_runtime_ep_api::Result<()> {
+            Ok(())
+        }
+        fn supports_op(
+            &self,
+            node: &Node,
+            opset: u64,
+            shapes: &[Shape],
+            dtypes: &[DataType],
+            layouts: &[TensorLayout],
+        ) -> KernelMatch {
+            self.cpu.supports_op(node, opset, shapes, dtypes, layouts)
+        }
+        fn get_kernel(
+            &self,
+            node: &Node,
+            shapes: &[Vec<usize>],
+            opset: u64,
+        ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+            Ok(Box::new(PreparedKernel {
+                inner: self.cpu.get_kernel(node, shapes, opset)?,
+                node: node.id,
+                flags: Vec::new(),
+                ready: None,
+                probe: self.probe.clone(),
+            }))
+        }
+        fn prepare_static_constants(
+            &self,
+            node: &Node,
+            constant_inputs: &[bool],
+            constants: &[Option<KernelConstantInput<'_>>],
+        ) -> onnx_runtime_ep_api::Result<Option<Arc<dyn std::any::Any + Send + Sync>>> {
+            assert_eq!(constant_inputs, [false, true]);
+            let value = f32::from_le_bytes(
+                constants[1].as_ref().unwrap().bytes[..4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let state: Arc<dyn std::any::Any + Send + Sync> = if self.recognized {
+                Arc::new(Ready {
+                    node: node.id,
+                    flags: constant_inputs.to_vec(),
+                    value,
+                })
+            } else {
+                Arc::new(value)
+            };
+            self.probe
+                .owners
+                .lock()
+                .unwrap()
+                .push(Arc::downgrade(&state));
+            Ok(Some(state))
+        }
+        fn allocate(
+            &self,
+            size: usize,
+            alignment: usize,
+        ) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+            self.cpu.allocate(size, alignment)
+        }
+        fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
+            self.cpu.deallocate(buffer)
+        }
+        fn copy(
+            &self,
+            src: &DeviceBuffer,
+            dst: &mut DeviceBuffer,
+            size: usize,
+        ) -> onnx_runtime_ep_api::Result<()> {
+            self.cpu.copy(src, dst, size)
+        }
+        fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+            self.cpu.sync()
+        }
+        fn copy_to_host(
+            &self,
+            src: &DeviceBuffer,
+            dst: &mut [u8],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            self.cpu.copy_to_host(src, dst)
+        }
+    }
+    for symbolic in [false, true] {
+        for mode in 0..3 {
+            if !symbolic && mode == 2 {
+                continue;
+            }
+            let mut graph = Graph::new();
+            graph.opset_imports.insert(String::new(), 17);
+            let shape = if symbolic {
+                let batch = graph.create_symbol(None);
+                vec![Dim::Symbolic(batch), Dim::Static(2)]
+            } else {
+                static_shape([1, 2])
+            };
+            let x = graph.create_named_value("x", DataType::Float32, shape.clone());
+            graph.add_input(x);
+            for index in 0..2 {
+                let b = graph.create_named_value(
+                    format!("b{index}"),
+                    DataType::Float32,
+                    static_shape([1]),
+                );
+                graph.initializers.insert(
+                    b,
+                    WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                        DataType::Float32,
+                        vec![1],
+                        (index as f32 + 2.).to_le_bytes().to_vec(),
+                    )),
+                );
+                let y =
+                    graph.create_named_value(format!("y{index}"), DataType::Float32, shape.clone());
+                graph.add_output(y);
+                graph.insert_node(Node::new(
+                    NodeId(index),
+                    "Add",
+                    vec![Some(x), Some(b)],
+                    vec![y],
+                ));
+            }
+            let probe = Arc::new(Probe::default());
+            let ep = Arc::new(PreparedEp {
+                cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
+                probe: probe.clone(),
+                recognized: mode != 1,
+            });
+            let mut executor =
+                Executor::build(graph, Arc::new(WeightStore::new()), ep, None).unwrap();
+            assert_eq!(probe.owners.lock().unwrap().len(), 2);
+            assert_eq!(executor.cache.static_constant_states.len(), 2);
+            if mode == 2 {
+                for prepared in executor.cache.static_constant_states.values_mut() {
+                    prepared.constant_inputs[0] = true;
+                }
+            }
+            if !symbolic && mode == 0 {
+                assert!(
+                    probe.adopted.load(Ordering::Relaxed) >= 2,
+                    "fully static materialization must receive load-time state"
+                );
+            }
+            let rows: Vec<_> = if symbolic { vec![1, 2, 1] } else { vec![1, 1] };
+            for rows in rows {
+                let input = Tensor::from_f32(&[rows, 2], &vec![1.; rows * 2]).unwrap();
+                let outputs = executor.run(&[("x", &input)]).unwrap();
+                assert_eq!(outputs[0].to_vec_f32(), vec![3.; rows * 2]);
+                assert_eq!(outputs[1].to_vec_f32(), vec![4.; rows * 2]);
+            }
+            if mode == 0 {
+                assert!(probe.adopted.load(Ordering::Relaxed) >= 2);
+                assert_eq!(
+                    probe.prepared.load(Ordering::Relaxed),
+                    0,
+                    "compatible load-time work must not be prepared again"
+                );
+            } else {
+                assert_eq!(probe.adopted.load(Ordering::Relaxed), 0);
+                assert!(
+                    probe.prepared.load(Ordering::Relaxed) >= 2,
+                    "unrecognized or incompatible state must fall through to normal preparation"
+                );
+            }
+            assert!(
+                probe
+                    .owners
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|owner| owner.upgrade().is_some()),
+                "even unrecognized provider owners must survive until teardown"
+            );
+            drop(executor);
+            assert!(
+                probe
+                    .owners
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|owner| owner.upgrade().is_none())
+            );
+        }
+    }
+}
+
+#[test]
+fn producer_backed_initializer_defaults_never_freeze_runtime_operands() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float64, static_shape([1, 5]));
+    graph.add_input(x);
+    let scale = graph.create_named_value("scale", DataType::Float64, static_shape([1]));
+    graph.initializers.insert(
+        scale,
+        WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+            DataType::Float64,
+            vec![1],
+            2.0f64.to_le_bytes().to_vec(),
+        )),
+    );
+    let a = graph.create_named_value("a", DataType::Float64, static_shape([1, 5]));
+    graph.initializers.insert(
+        a,
+        WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+            DataType::Float64,
+            vec![1, 5],
+            [0u8; 8].repeat(5),
+        )),
+    );
+    let b = graph.create_named_value("b", DataType::Float64, static_shape([5, 7]));
+    graph.initializers.insert(
+        b,
+        WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+            DataType::Float64,
+            vec![5, 7],
+            [1.0f64.to_le_bytes(); 35].concat(),
+        )),
+    );
+    let y = graph.create_named_value("y", DataType::Float64, static_shape([1, 7]));
+    graph.add_output(y);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Mul",
+        vec![Some(x), Some(scale)],
+        vec![a],
+    ));
+    graph.insert_node(Node::new(
+        NodeId(1),
+        "MatMul",
+        vec![Some(a), Some(b)],
+        vec![y],
+    ));
+    let cpu: Arc<dyn ExecutionProvider> =
+        Arc::new(CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap());
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), cpu, None).unwrap();
+    for (value, want) in [(1.0f64, 10.0f64), (2.0, 20.0)] {
+        let input = Tensor::from_raw(
+            DataType::Float64,
+            vec![1, 5],
+            &[value.to_le_bytes(); 5].concat(),
+        )
+        .unwrap();
+        let outputs = executor.run(&[("x", &input)]).unwrap();
+        assert_eq!(
+            outputs[0].as_bytes(),
+            [want.to_le_bytes(); 7].concat(),
+            "producer-backed default storage must not become a cached immutable operand"
+        );
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[test]
 fn symbolic_cpu_session_prepares_constants_at_load_with_own_retention_policy() {
@@ -8591,7 +8943,7 @@ fn symbolic_cpu_session_prepares_constants_at_load_with_own_retention_policy() {
             "activation specialization must still wait for the request"
         );
         assert_eq!(
-            executor.static_constant_states.len(),
+            executor.cache.static_constant_states.len(),
             usize::from(admitted),
             "constant warming must already obey this provider's verdict at load"
         );
@@ -8599,7 +8951,10 @@ fn symbolic_cpu_session_prepares_constants_at_load_with_own_retention_policy() {
             let input = Tensor::from_f32(&[rows, 5], &vec![1.; rows * 5]).unwrap();
             let output = executor.run(&[("x", &input)]).unwrap();
             assert_eq!(output[0].to_vec_f32(), vec![5.; rows * 7]);
-            assert_eq!(executor.static_constant_states.len(), usize::from(admitted));
+            assert_eq!(
+                executor.cache.static_constant_states.len(),
+                usize::from(admitted)
+            );
         }
     }
 }
@@ -8644,7 +8999,7 @@ fn static_constant_preparation_never_caches_producer_backed_initializer_defaults
         None,
     )
     .unwrap();
-    assert!(executor.static_constant_states.is_empty());
+    assert!(executor.cache.static_constant_states.is_empty());
     let input = Tensor::from_f32(&[1, 5], &[1.; 5]).unwrap();
     let actual = executor.run(&[("x", &input)]).unwrap();
     assert_eq!(
@@ -13739,7 +14094,7 @@ fn weight_derived_cache_owners_are_released_before_their_buffers_are_freed() {
         .expect("the drop body frees the executor's buffers");
     for clear in [
         "self.cache.entries.clear()",
-        "self.static_constant_states.clear()",
+        "self.cache.static_constant_states.clear()",
     ] {
         let at = drop_body
             .find(clear)

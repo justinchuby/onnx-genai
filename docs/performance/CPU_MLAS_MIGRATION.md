@@ -1405,3 +1405,40 @@ Downstream validation: engine load tests 29 passed and memory-strategy tests
 ORT library. The first load filter selected zero tests and was rejected by the
 validation driver; the corrected `engine::load::` filter actually ran 29 tests.
 No zero-test result is counted as coverage.
+
+
+### Load-time preparation joins node ownership
+
+Static CPU transpose preparation now exports the same MatMul weight owner used
+by runtime shape variants. The generic kernel cache offers node-scoped static
+state to the first kernel after checking immutable-input metadata, including
+fully static materialization. Unknown state retains its lifetime and falls
+through to ordinary preparation. Immutable flags are explicit provider API
+inputs, independent of whether host bytes are available for every operand.
+
+Session controls cover two nodes, static/symbolic shapes, repeated execution,
+recognized/opaque/incompatible state, correct numerical outputs and final owner
+release. The Apple CPU control verifies exact owner adoption, transpose reuse
+and half-input numerical execution with either immutable operand-A flag even
+when its host descriptor is absent.
+
+A separate f64 Mul-to-MatMul regression changes a producer-backed initializer's
+runtime value between requests. The unchanged test fails numerically on parent
+87930c4a5: the second output remains 10 instead of 20. It passes with the shared
+immutable-initializer classification. This is correctness evidence; no kernel
+performance improvement or CUDA coverage is claimed.
+
+On Apple M1 Max ARM64 macOS / Rust 1.98, full CPU suites pass in native
+(1,984 passed / 20 ignored) and optional MLAS (2,021 / 35 ignored) configurations.
+Session suites pass with 277 native and 279 MLAS tests, including the final f64
+regression. Strict all-target Clippy passes for both CPU/session configurations;
+formatting and dispatch manifest/reachability/platform/feature checks pass.
+
+After the old-version negative control, the shared target's API/CPU/session
+packages were explicitly cleaned. Fresh current controls each selected and
+passed one test (generic handoff, writable-default regression, Apple prewarm
+adoption). API tests pass 96/96; API and native CPU/session strict all-target
+Clippy pass again. Downstream native-backend engine load and memory-strategy
+groups each pass 29 tests with the cached ORT library. The temporary negative
+control worktree and consumed editing scripts are removed; validation drivers,
+raw logs and the stable host-lock inode remain.

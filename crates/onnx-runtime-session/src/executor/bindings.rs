@@ -600,7 +600,7 @@ impl Executor {
                 .inputs
                 .iter()
                 .map(|input| {
-                    input.is_some_and(|value| self.graph.initializers.contains_key(&value))
+                    input.is_some_and(|value| is_immutable_initializer(&self.graph, value))
                 })
                 .collect::<Vec<_>>();
             let constant_values = resolve_kernel_constant_inputs(
@@ -788,7 +788,7 @@ impl Executor {
             let constant_inputs = node
                 .inputs
                 .iter()
-                .map(|input| input.is_some_and(|value| graph.initializers.contains_key(&value)))
+                .map(|input| input.is_some_and(|value| is_immutable_initializer(graph, value)))
                 .collect::<Vec<_>>();
             kernel.set_constant_inputs(&constant_inputs);
             let constant_values =

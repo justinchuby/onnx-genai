@@ -959,3 +959,26 @@ real executor control varies activation widths, shares within a node, keeps
 distinct nodes/sessions separate, and verifies final refunds. It also disables
 pressure reclamation so denied optional reference packs cannot distort the
 resident-copy measurement on different CPU backends.
+
+
+### Hand static preparation ownership to runtime kernels
+
+Load-time provider preparation now lives in the existing kernel cache, indexed
+by node together with its immutable-input flags. A newly compiled kernel first
+tries a sibling owner, then compatible static preparation, and only performs
+ordinary preparation if neither is recognized. Unknown or incompatible static
+owners remain alive until executor teardown; kernels and these owners are
+released before source buffers. This applies to fully static materialization
+and symbolic-shape specialization without CPU-specific session dispatch.
+
+The provider API receives immutable-input flags separately from available host
+constant descriptors. CPU transpose prewarming returns the same shareable
+MatMul owner consumed by runtime kernels, including when another immutable
+operand has no load-time host descriptor. No compatibility signature remains.
+
+Direct initializer immutability has one predicate: ONNX constant-initializer
+semantics plus no producer. Writable producer-backed default bytes never enter
+constant preparation or retained operand conversion. Allocation still follows
+storage presence; view dispatch keeps its existing immutable-source path. Static
+and runtime flag disagreement declines static adoption and prepares normally.
+This does not redesign view provenance or fund legacy transpose payloads.
