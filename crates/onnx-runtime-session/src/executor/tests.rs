@@ -13730,13 +13730,16 @@ fn weight_derived_cache_owners_are_released_before_their_buffers_are_freed() {
         !drop_body.contains("clear_weight_transpose_caches()"),
         "dropping one executor must not clear another session's warmed transposes"
     );
+    assert!(
+        !drop_body.contains("clear_mlas_packed_caches()"),
+        "dropping one executor must not clear another session's reference packs"
+    );
     let free = drop_body
         .find("self.buffers.drain()")
         .expect("the drop body frees the executor's buffers");
     for clear in [
         "self.cache.entries.clear()",
         "self.static_constant_states.clear()",
-        "clear_mlas_packed_caches()",
     ] {
         let at = drop_body
             .find(clear)
@@ -14212,6 +14215,138 @@ fn nbits_shape_variants_share_one_dense_weight_within_the_session_node() {
     );
     drop(executor);
     assert_eq!(books.used(Tier::Host), 396);
+    drop(peer);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[cfg(feature = "mlas")]
+#[test]
+fn nbits_shape_variants_share_one_reference_pack_within_the_session_node() {
+    let predicted = onnx_runtime_ep_cpu::kernels::matmul_nbits::planned_nbits_node_retained_bytes(
+        4, 32, 0, 16, 128, false, false, false,
+    );
+    if predicted == 0 || predicted >= 128 * 16 * 4 {
+        eprintln!(
+            "MLAS Fp32 SQNBit pack unavailable on this tier; reference ownership regression not exercised"
+        );
+        return;
+    }
+    use onnx_runtime_memory_api::Tier;
+    use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 24);
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let a = graph.create_named_value("a", DataType::Float32, vec![]);
+    let y = graph.create_named_value("y", DataType::Float32, vec![]);
+    // Dynamic rows compile distinct shape variants of one reference-pack node.
+    graph.mark_value_shape_unknown(a);
+    graph.mark_value_shape_unknown(y);
+    let mut init = |name: &str, dtype, dims: Vec<usize>, bytes| {
+        let value = graph.create_named_value(name, dtype, static_shape(dims.iter().copied()));
+        graph.initializers.insert(
+            value,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(dtype, dims, bytes)),
+        );
+        value
+    };
+    let b = init("b", DataType::Uint8, vec![16, 4, 16], vec![0x98; 1024]);
+    let scales = init(
+        "scales",
+        DataType::Float32,
+        vec![16, 4],
+        [0.125f32.to_le_bytes(); 64].concat(),
+    );
+    let mut node = Node::new(
+        NodeId(0),
+        "MatMulNBits",
+        vec![Some(a), Some(b), Some(scales)],
+        vec![y],
+    );
+    node.domain = "com.microsoft".into();
+    for (name, value) in [("K", 128), ("N", 16), ("bits", 4), ("block_size", 32)] {
+        node.attributes
+            .insert(name.into(), onnx_runtime_ir::Attribute::Int(value));
+    }
+    graph.add_input(a);
+    graph.add_output(y);
+    graph.insert_node(node);
+    let books = LedgerGovernor::new(LeaseLedger::new(0, 1 << 20, 0));
+    let memory =
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap();
+    let resources =
+        onnx_runtime_ep_cpu::CpuMemoryResources::new(memory, Default::default()).unwrap();
+    let cpu: Arc<dyn ExecutionProvider> =
+        Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+    let mut executor = Executor::build(
+        graph.clone(),
+        Arc::new(WeightStore::new()),
+        cpu.clone(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+    let mut retained = None;
+    for shape in [vec![3, 128], vec![4, 128], vec![5, 128], vec![3, 128]] {
+        let rows = shape[0];
+        let input = Tensor::from_raw(
+            DataType::Float32,
+            shape,
+            &[0.25f32.to_le_bytes(); 128].repeat(rows).concat(),
+        )
+        .unwrap();
+        let output = executor.run(&[("a", &input)]).unwrap();
+        assert_eq!(output[0].shape, [rows, 16]);
+        assert_eq!(
+            output[0].as_bytes(),
+            &[2.0f32.to_le_bytes(); 16].repeat(rows).concat()
+        );
+        let bytes = books.used(Tier::Host);
+        if let Some(first) = retained {
+            assert_eq!(bytes, first, "shape variants must share one reference pack");
+        } else {
+            assert!(
+                bytes > 0 && bytes < 128 * 16 * 4,
+                "the reference pack must be resident without an f32 expansion: {bytes}"
+            );
+            assert_eq!(
+                bytes, predicted,
+                "one node owns exactly its predicted reference payload"
+            );
+            retained = Some(bytes);
+        }
+    }
+    let retained = retained.unwrap();
+    assert!(
+        executor.cache.stats().entries >= 3,
+        "distinct resolved activation ranks must build separate kernels"
+    );
+    let mut peer = Executor::build(graph, Arc::new(WeightStore::new()), cpu, None).unwrap();
+    let input = Tensor::from_raw(
+        DataType::Float32,
+        vec![3, 128],
+        &[0.25f32.to_le_bytes(); 384].concat(),
+    )
+    .unwrap();
+    assert_eq!(
+        peer.run(&[("a", &input)]).unwrap()[0].as_bytes(),
+        &[2.0f32.to_le_bytes(); 48].concat()
+    );
+    assert_eq!(
+        books.used(Tier::Host),
+        2 * retained,
+        "sessions must own distinct reference packs"
+    );
+    drop(executor);
+    assert_eq!(books.used(Tier::Host), retained);
+    assert_eq!(
+        peer.run(&[("a", &input)]).unwrap()[0].as_bytes(),
+        &[2.0f32.to_le_bytes(); 48].concat()
+    );
+    assert_eq!(
+        books.used(Tier::Host),
+        retained,
+        "other session teardown keeps warm ownership"
+    );
     drop(peer);
     assert_eq!(books.used(Tier::Host), 0);
 }

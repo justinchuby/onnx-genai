@@ -943,11 +943,6 @@ impl Drop for Executor {
                  dispatch_elided={dispatch_elided}"
             );
         }
-        // Same lifetime boundary for the shared MLAS SQNBit packed weights
-        // (#1056): they are keyed on the weight's address, so a later model whose
-        // mmap recycles an address for a same-shaped weight must not inherit this
-        // model's packed buffers.
-        onnx_runtime_ep_cpu::kernels::matmul_nbits::clear_mlas_packed_caches();
         let mut safe_to_release = match self.ep.sync() {
             Ok(()) => true,
             Err(error) => {
