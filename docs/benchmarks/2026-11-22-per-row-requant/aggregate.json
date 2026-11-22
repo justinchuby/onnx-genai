@@ -1,0 +1,22 @@
+{
+  "sample_count": 2646,
+  "cell_count": 42,
+  "metrics": {
+    "cpu": {
+      "qualified": 42,
+      "unqualified": [],
+      "width_ge_65_ratio_range": [
+        1.5487421383647797,
+        1.8591549295774648
+      ]
+    },
+    "wall": {
+      "qualified": 42,
+      "unqualified": [],
+      "width_ge_65_ratio_range": [
+        1.5492532898204778,
+        1.860418241370622
+      ]
+    }
+  }
+}

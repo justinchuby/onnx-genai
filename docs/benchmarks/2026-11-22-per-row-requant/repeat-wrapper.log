@@ -1,0 +1,4 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 33863, "load_before": [2.4755859375, 3.06201171875, 2.4921875], "command": ["python3", "/tmp/nxrt-per-row-requant-repeat.py"]}
+PASS independent process sweep 2
+PASS independent process sweep 3
+{"wall_s": 2.604162792005809, "cpu_s": 2.57946, "maxrss_bytes": 108855296, "load_after": [2.4755859375, 3.06201171875, 2.4921875]}

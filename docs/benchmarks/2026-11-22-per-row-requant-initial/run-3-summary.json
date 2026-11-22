@@ -1,0 +1,357 @@
+{
+  "protocol": 1,
+  "sample_count": 882,
+  "cell_count": 14,
+  "cells": [
+    {
+      "n": 7,
+      "dtype": "Int8",
+      "native_calls": 0,
+      "cpu": {
+        "median_ns_per_element": [
+          1.043001043001043,
+          1.0425010425010426,
+          1.0425010425010426
+        ],
+        "native_aa_ratio": 1.0,
+        "qualified": true,
+        "portable_over_native": 1.0004796163069545
+      },
+      "wall": {
+        "median_ns_per_element": [
+          1.0426885426885426,
+          1.0424180424180425,
+          1.0424385424385425
+        ],
+        "native_aa_ratio": 1.0000196658343061,
+        "qualified": true,
+        "portable_over_native": 1.0002496577099265
+      }
+    },
+    {
+      "n": 7,
+      "dtype": "Uint8",
+      "native_calls": 0,
+      "cpu": {
+        "median_ns_per_element": [
+          0.9865009865009865,
+          0.986000986000986,
+          0.9845009845009846
+        ],
+        "native_aa_ratio": 1.0015236160487555,
+        "qualified": true,
+        "portable_over_native": 1.0012687135244862
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.9861049861049861,
+          0.986021486021486,
+          0.9842509842509842
+        ],
+        "native_aa_ratio": 1.0017988315976631,
+        "qualified": true,
+        "portable_over_native": 1.0009833675122273
+      }
+    },
+    {
+      "n": 8,
+      "dtype": "Int8",
+      "native_calls": 10500042,
+      "cpu": {
+        "median_ns_per_element": [
+          0.9325,
+          0.786,
+          0.8325
+        ],
+        "native_aa_ratio": 1.0591603053435115,
+        "qualified": false,
+        "portable_over_native": 1.152301513747297
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.9327915,
+          0.785271,
+          0.832146
+        ],
+        "native_aa_ratio": 1.0596927684837463,
+        "qualified": false,
+        "portable_over_native": 1.1534335301285938
+      }
+    },
+    {
+      "n": 8,
+      "dtype": "Uint8",
+      "native_calls": 10500042,
+      "cpu": {
+        "median_ns_per_element": [
+          0.819,
+          0.7265,
+          0.733
+        ],
+        "native_aa_ratio": 1.008947006194081,
+        "qualified": true,
+        "portable_over_native": 1.1223021582733812
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.81875,
+          0.7260835,
+          0.732521
+        ],
+        "native_aa_ratio": 1.0088660601707655,
+        "qualified": true,
+        "portable_over_native": 1.12264839440712
+      }
+    },
+    {
+      "n": 9,
+      "dtype": "Int8",
+      "native_calls": 9333366,
+      "cpu": {
+        "median_ns_per_element": [
+          0.869000869000869,
+          0.8295008295008295,
+          0.8295008295008295
+        ],
+        "native_aa_ratio": 1.0,
+        "qualified": true,
+        "portable_over_native": 1.0476190476190477
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.8688343688343688,
+          0.8294798294798295,
+          0.8294803294803295
+        ],
+        "native_aa_ratio": 1.000000602788015,
+        "qualified": true,
+        "portable_over_native": 1.0474445261891723
+      }
+    },
+    {
+      "n": 9,
+      "dtype": "Uint8",
+      "native_calls": 9333366,
+      "cpu": {
+        "median_ns_per_element": [
+          0.8355008355008355,
+          0.823000823000823,
+          0.8225008225008225
+        ],
+        "native_aa_ratio": 1.0006079027355623,
+        "qualified": true,
+        "portable_over_native": 1.0154968094804013
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.8356468356468356,
+          0.8225633225633225,
+          0.8225428225428225
+        ],
+        "native_aa_ratio": 1.0000249227395075,
+        "qualified": true,
+        "portable_over_native": 1.015918441655226
+      }
+    },
+    {
+      "n": 17,
+      "dtype": "Int8",
+      "native_calls": 4941216,
+      "cpu": {
+        "median_ns_per_element": [
+          0.6330003165001582,
+          0.5470002735001368,
+          0.5475002737501369
+        ],
+        "native_aa_ratio": 1.0009140767824496,
+        "qualified": true,
+        "portable_over_native": 1.1566925536774784
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.6331878165939083,
+          0.5473542736771368,
+          0.5473332736666369
+        ],
+        "native_aa_ratio": 1.0000383678674591,
+        "qualified": true,
+        "portable_over_native": 1.1568375252469427
+      }
+    },
+    {
+      "n": 17,
+      "dtype": "Uint8",
+      "native_calls": 4941216,
+      "cpu": {
+        "median_ns_per_element": [
+          0.6145003072501536,
+          0.5415002707501354,
+          0.5415002707501354
+        ],
+        "native_aa_ratio": 1.0,
+        "qualified": true,
+        "portable_over_native": 1.1348107109879961
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.6141878070939035,
+          0.5413337706668854,
+          0.5413127706563853
+        ],
+        "native_aa_ratio": 1.000038794596467,
+        "qualified": true,
+        "portable_over_native": 1.134604478287455
+      }
+    },
+    {
+      "n": 65,
+      "dtype": "Int8",
+      "native_calls": 1292340,
+      "cpu": {
+        "median_ns_per_element": [
+          0.49700372752795646,
+          0.315502366267747,
+          0.315502366267747
+        ],
+        "native_aa_ratio": 1.0,
+        "qualified": true,
+        "portable_over_native": 1.5752773375594293
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.49712872846546347,
+          0.314898361737713,
+          0.3149813623602177
+        ],
+        "native_aa_ratio": 1.0002635790864285,
+        "qualified": true,
+        "portable_over_native": 1.5784877951974599
+      }
+    },
+    {
+      "n": 65,
+      "dtype": "Uint8",
+      "native_calls": 1292340,
+      "cpu": {
+        "median_ns_per_element": [
+          0.49150368627764707,
+          0.3135023512676345,
+          0.31300234751760636
+        ],
+        "native_aa_ratio": 1.0015974440894568,
+        "qualified": true,
+        "portable_over_native": 1.5690343176376698
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.49106618299637245,
+          0.3125648442363318,
+          0.31254434408258064
+        ],
+        "native_aa_ratio": 1.0000655911845449,
+        "qualified": true,
+        "portable_over_native": 1.5711373058424631
+      }
+    },
+    {
+      "n": 257,
+      "dtype": "Int8",
+      "native_calls": 326886,
+      "cpu": {
+        "median_ns_per_element": [
+          0.466006058078755,
+          0.2580033540436026,
+          0.2580033540436026
+        ],
+        "native_aa_ratio": 1.0,
+        "qualified": true,
+        "portable_over_native": 1.8062015503875968
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.4662350610557937,
+          0.2578158516060709,
+          0.25779485133306734
+        ],
+        "native_aa_ratio": 1.000081461180838,
+        "qualified": true,
+        "portable_over_native": 1.80847704827736
+      }
+    },
+    {
+      "n": 257,
+      "dtype": "Uint8",
+      "native_calls": 326886,
+      "cpu": {
+        "median_ns_per_element": [
+          0.464006032078417,
+          0.2580033540436026,
+          0.2580033540436026
+        ],
+        "native_aa_ratio": 1.0,
+        "qualified": true,
+        "portable_over_native": 1.7984496124031006
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.46375602882837474,
+          0.25737834591849695,
+          0.257419846458004
+        ],
+        "native_aa_ratio": 1.000161243322001,
+        "qualified": true,
+        "portable_over_native": 1.8017003000243785
+      }
+    },
+    {
+      "n": 2048,
+      "dtype": "Int8",
+      "native_calls": 41034,
+      "cpu": {
+        "median_ns_per_element": [
+          0.4637671298668033,
+          0.2501440829918033,
+          0.2501440829918033
+        ],
+        "native_aa_ratio": 1.0,
+        "qualified": true,
+        "portable_over_native": 1.8539999999999999
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.46368408203125,
+          0.25006103515625,
+          0.25008154697105534
+        ],
+        "native_aa_ratio": 1.0000820272330413,
+        "qualified": true,
+        "portable_over_native": 1.8542075744041515
+      }
+    },
+    {
+      "n": 2048,
+      "dtype": "Uint8",
+      "native_calls": 41034,
+      "cpu": {
+        "median_ns_per_element": [
+          0.46326684170081966,
+          0.2501440829918033,
+          0.2501440829918033
+        ],
+        "native_aa_ratio": 1.0,
+        "qualified": true,
+        "portable_over_native": 1.8519999999999999
+      },
+      "wall": {
+        "median_ns_per_element": [
+          0.4628080774526127,
+          0.24989393890881148,
+          0.24989393890881148
+        ],
+        "native_aa_ratio": 1.0,
+        "qualified": true,
+        "portable_over_native": 1.852018018018018
+      }
+    }
+  ]
+}

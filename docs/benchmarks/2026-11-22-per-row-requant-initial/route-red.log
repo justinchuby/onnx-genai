@@ -1,0 +1,21 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 29431, "load_before": [1.6015625, 1.82763671875, 2.17236328125], "command": ["cargo", "test", "-p", "onnx-runtime-ep-cpu", "--lib", "kernels::qlinear_matmul::tests::per_row_requantization_reaches_neon_with_exact_tail_outputs", "--", "--exact", "--nocapture"]}
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-ep-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.22s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-30635267f98d516a)
+
+running 1 test
+
+thread 'kernels::qlinear_matmul::tests::per_row_requantization_reaches_neon_with_exact_tail_outputs' (5349114) panicked at crates/onnx-runtime-ep-cpu/src/kernels/qlinear_matmul.rs:2069:9:
+native per-row scales must execute a vector block, not just the scalar loop
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test kernels::qlinear_matmul::tests::per_row_requantization_reaches_neon_with_exact_tail_outputs ... FAILED
+
+failures:
+
+failures:
+    kernels::qlinear_matmul::tests::per_row_requantization_reaches_neon_with_exact_tail_outputs
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p onnx-runtime-ep-cpu --lib`
+{"wall_s": 19.068794583989074, "cpu_s": 35.901444999999995, "maxrss_bytes": 2503327744, "load_after": [1.77587890625, 1.85205078125, 2.17431640625]}

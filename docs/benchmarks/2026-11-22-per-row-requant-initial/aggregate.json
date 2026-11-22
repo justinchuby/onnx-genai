@@ -1,0 +1,23 @@
+{
+  "sample_count": 2646,
+  "cell_count": 42,
+  "cpu_qualified": 41,
+  "wall_qualified": 41,
+  "unqualified_cells": [
+    {
+      "sweep": 3,
+      "n": 8,
+      "dtype": "Int8",
+      "cpu_aa": 1.0591603053435115,
+      "wall_aa": 1.0596927684837463
+    }
+  ],
+  "cpu_large_ratio_range": [
+    1.5690343176376698,
+    1.8539999999999999
+  ],
+  "wall_large_ratio_range": [
+    1.5690022756069615,
+    1.8542075744041515
+  ]
+}

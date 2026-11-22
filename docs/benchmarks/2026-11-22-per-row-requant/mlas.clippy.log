@@ -1,0 +1,4 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 32505, "load_before": [3.74658203125, 2.25244140625, 2.0419921875], "command": ["cargo", "clippy", "-p", "onnx-runtime-ep-cpu", "--all-targets", "--features", "mlas", "--", "-D", "warnings"]}
+    Checking onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-ep-cpu)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.25s
+{"wall_s": 9.361050542007433, "cpu_s": 17.211981, "maxrss_bytes": 1265500160, "load_after": [3.3974609375, 2.22705078125, 2.03515625]}
