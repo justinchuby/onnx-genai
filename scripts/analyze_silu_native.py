@@ -23,6 +23,32 @@ def require(condition, message):
 
 try:
     metadata = json.loads(args.metadata.read_text())
+    require(
+        metadata["schema"] == 2,
+        "unsupported metadata schema; regenerate explicit schema 2 metadata",
+    )
+    arms = metadata["arms"]
+    reps = metadata["repetitions"]
+    require(
+        len(arms) >= 3 and len(set(arms)) == len(arms) and reps > 0,
+        "declare distinct arms and a positive repetition count",
+    )
+    matrix = metadata["matrix"]
+    axes = ["sweep", "width", "mode", "pattern", "n"]
+    require(
+        all(
+            matrix[axis] and len(set(matrix[axis])) == len(matrix[axis])
+            for axis in axes
+        ),
+        "matrix axes must be nonempty and contain no duplicate entries",
+    )
+    expected_cells = set(itertools.product(*(matrix[axis] for axis in axes)))
+    expected_samples = len(expected_cells) * len(arms) * reps
+    batch = metadata["batch"]
+    require(
+        batch["target_elements"] > 0 and 0 < batch["min_iters"] <= batch["max_iters"],
+        "batch target/min/max must describe a positive iteration range",
+    )
     compressed = (args.metadata.parent / metadata["samples_file"]).read_bytes()
     require(
         hashlib.sha256(compressed).hexdigest() == metadata["samples_sha256"],
@@ -30,24 +56,28 @@ try:
     )
     rows = list(csv.DictReader(io.StringIO(gzip.decompress(compressed).decode())))
     require(
-        len(rows) == metadata["samples_count"] == 17010,
-        f"expected 17010 raw samples, got {len(rows)}; restore the complete archive",
+        len(rows) == metadata["samples_count"] == expected_samples,
+        f"expected {expected_samples} raw samples, got {len(rows)}; restore the complete archive",
     )
     groups = collections.defaultdict(list)
     for row in rows:
         rep, order = int(row["rep"]), int(row["order"])
         require(
-            0 <= rep < 21 and 0 <= order < 3,
+            0 <= rep < reps and 0 <= order < len(arms),
             f"invalid sample repetition/order: {rep}/{order}",
         )
         require(
-            row["arm"] == ["mlas", "native", "native_aa"][(rep + order) % 3],
+            row["arm"] == arms[(rep + order) % len(arms)],
             f"incorrect rotating arm at repetition {rep}, order {order}",
         )
         n = int(row["n"])
         require(n > 0, f"invalid vector length {n}; timing requires nonempty input")
         require(
-            int(row["iters"]) == max(1, min(16384, ((1 << 20) + n - 1) // n)),
+            int(row["iters"])
+            == max(
+                batch["min_iters"],
+                min(batch["max_iters"], (batch["target_elements"] + n - 1) // n),
+            ),
             f"incorrect batch length for n={n}",
         )
         require(
@@ -57,17 +87,8 @@ try:
         key = (int(row["sweep"]), int(row["width"]), row["mode"], row["pattern"], n)
         groups[key].append(row)
     require(
-        len(groups) == metadata["arm_summary_count"] == 270,
-        f"expected 270 cells, got {len(groups)}; restore complete data",
-    )
-    expected_cells = set(
-        itertools.product(
-            [1, 2, 3],
-            [1, 4, 8],
-            ["serial", "runtime"],
-            ["in_band", "sparse_repairs", "dense_negative_tail"],
-            [3, 17, 4096, 65537, 1048581],
-        )
+        len(groups) == metadata["cell_count"] == len(expected_cells),
+        f"expected {len(expected_cells)} cells, got {len(groups)}; restore complete data",
     )
     require(
         set(groups) == expected_cells,
@@ -85,12 +106,12 @@ try:
     for summary in metadata["summary"]:
         key = tuple(summary[k] for k in ["sweep", "width", "mode", "pattern", "n"])
         group = groups[key]
-        for arm in ["mlas", "native", "native_aa"]:
+        for arm in arms:
             arm_rows = [r for r in group if r["arm"] == arm]
             require(
-                len(arm_rows) == 21
-                and {int(r["rep"]) for r in arm_rows} == set(range(21)),
-                f"cell {key}, arm {arm}: expected all 21 repetitions exactly once",
+                len(arm_rows) == reps
+                and {int(r["rep"]) for r in arm_rows} == set(range(reps)),
+                f"cell {key}, arm {arm}: expected all {reps} repetitions exactly once",
             )
             for metric in ["cpu_ns", "wall_ns"]:
                 require(
@@ -99,12 +120,10 @@ try:
                     f"cell {key}, arm {arm}: published {metric} median differs from raw samples",
                 )
         m = summary["median"]
-        for field, numerator, denominator, metric in [
-            ("wall_ratio", "mlas", "native", "wall_ns"),
-            ("cpu_ratio", "mlas", "native", "cpu_ns"),
-            ("aa_wall_ratio", "native", "native_aa", "wall_ns"),
-            ("aa_cpu_ratio", "native", "native_aa", "cpu_ns"),
-        ]:
+        for field, ratio in metadata["ratios"].items():
+            numerator = ratio["numerator"]
+            denominator = ratio["denominator"]
+            metric = ratio["metric"]
             require(
                 m[numerator][metric] / m[denominator][metric] == summary[field],
                 f"cell {key}: published {field} differs from medians",
@@ -112,8 +131,8 @@ try:
     print(
         f"Validated {len(rows)} samples and {len(groups)} cells; ratios are MLAS/native (>1 favors native)."
     )
-    for pattern in ["in_band", "sparse_repairs", "dense_negative_tail"]:
-        for n in [3, 17, 4096, 65537, 1048581]:
+    for pattern in matrix["pattern"]:
+        for n in matrix["n"]:
             cells = [
                 s
                 for s in metadata["summary"]

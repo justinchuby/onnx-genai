@@ -492,12 +492,19 @@ fn silu_native_chunk(input: &[f32], output: &mut [f32]) {
         .chunks(SILU_CORRECTION_BLOCK)
         .zip(output.chunks_mut(SILU_CORRECTION_BLOCK))
     {
-        silu_f32_neon(xs, ys);
+        silu_f32_neon::<true>(xs, ys);
     }
     #[cfg(not(target_arch = "aarch64"))]
     for (output, &input) in output.iter_mut().zip(input) {
         *output = silu(input);
     }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+thread_local! {
+    // Calling-thread observation only: tests use serial_scope, so other tests
+    // and pool workers cannot make an ordinary block look repaired.
+    static NATIVE_SILU_REPAIR_ELEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// NEON-vectorized SiLU: `x / (1 + exp(-x))`, processing 4 floats per iteration.
@@ -507,19 +514,22 @@ fn silu_native_chunk(input: &[f32], output: &mut [f32]) {
 /// approximation only for finite |x| <= 18: outside that band the stable
 /// scalar formula preserves negative subnormal tails and positive limits.
 #[cfg(all(target_arch = "aarch64", any(not(feature = "mlas"), test)))]
-fn silu_f32_neon(input: &[f32], output: &mut [f32]) {
+fn silu_f32_neon<const FUSED_REPAIR_MASK: bool>(input: &[f32], output: &mut [f32]) {
     use std::arch::aarch64::*;
 
     debug_assert_eq!(input.len(), output.len());
 
     let len = input.len();
     let mut i = 0;
+    let needs_correction;
 
     // Process 4 elements at a time using NEON intrinsics.
     // exp(-x) is computed via Cody-Waite range reduction + degree-5 polynomial.
     #[allow(clippy::excessive_precision)]
     unsafe {
         // Constants for exp computation:
+        let mut repair_mask = vdupq_n_u32(0);
+        let safe_bound = vdupq_n_f32(SILU_APPROX_SAFE_BOUND);
         let log2ef = vdupq_n_f32(std::f32::consts::LOG2_E);
         let c1 = vdupq_n_f32(0.693359375_f32); // ln(2) high part (exact in f32)
         let c2 = vdupq_n_f32(-2.12194440e-4_f32); // ln(2) low part
@@ -536,6 +546,12 @@ fn silu_f32_neon(input: &[f32], output: &mut [f32]) {
 
         while i + 4 <= len {
             let x = vld1q_f32(input.as_ptr().add(i));
+            // Ordered <= is false for NaN and infinity. Accumulate while x
+            // is already in a register; ordinary blocks need no input rescan.
+            if FUSED_REPAIR_MASK {
+                repair_mask =
+                    vorrq_u32(repair_mask, vmvnq_u32(vcleq_f32(vabsq_f32(x), safe_bound)));
+            }
             let neg_x = vnegq_f32(x);
 
             // Clamp -x to prevent exp overflow/underflow.
@@ -568,14 +584,21 @@ fn silu_f32_neon(input: &[f32], output: &mut [f32]) {
             vst1q_f32(output.as_mut_ptr().add(i), result);
             i += 4;
         }
+        needs_correction = !FUSED_REPAIR_MASK || vmaxvq_u32(repair_mask) != 0;
     }
 
     // Keep corrections local to the caller's bounded block. In particular,
     // exp(-x) overflows for negative tails where x*exp(x) is still nonzero.
     let neon_end = i;
-    for j in 0..neon_end {
-        if !input[j].is_finite() || input[j].abs() > SILU_APPROX_SAFE_BOUND {
-            output[j] = silu(input[j]);
+    if needs_correction {
+        #[cfg(test)]
+        if FUSED_REPAIR_MASK {
+            NATIVE_SILU_REPAIR_ELEMENTS.with(|count| count.set(count.get() + neon_end));
+        }
+        for j in 0..neon_end {
+            if !input[j].is_finite() || input[j].abs() > SILU_APPROX_SAFE_BOUND {
+                output[j] = silu(input[j]);
+            }
         }
     }
     // Scalar tail for remaining elements.
@@ -1324,7 +1347,27 @@ mod silu_bench {
         }
     }
 
-    /// Same-process, rotating MLAS/native/repeated-native diagnostic. Timers
+    /// Test-only counterfactual: the same exp arithmetic with unconditional
+    /// prefix scanning. The const-false instantiation is absent from production.
+    #[cfg(unix)]
+    fn silu_before_mask_chunk(input: &[f32], output: &mut [f32]) {
+        #[cfg(target_arch = "aarch64")]
+        for (xs, ys) in input
+            .chunks(SILU_CORRECTION_BLOCK)
+            .zip(output.chunks_mut(SILU_CORRECTION_BLOCK))
+        {
+            silu_f32_neon::<false>(xs, ys);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        silu_native_chunk(input, output);
+    }
+
+    #[cfg(unix)]
+    fn silu_before_mask_slice(input: &[f32], output: &mut [f32]) {
+        crate::kernels::simd_activations::run_chunked_fn(input, output, silu_before_mask_chunk);
+    }
+
+    /// Same-process, rotating MLAS/before/native/repeated-native diagnostic. Timers
     /// include synchronous kernel calls and scheduler work, exclude allocation,
     /// validation, warmup and printing. CPU time includes every process thread.
     #[cfg(unix)]
@@ -1353,7 +1396,12 @@ mod silu_bench {
         let width = crate::task_runtime::testing::pool_width();
         assert_eq!(width, crate::task_runtime::width());
         type SliceKernel = fn(&[f32], &mut [f32]);
-        let runs: [SliceKernel; 3] = [silu_f32_slice, silu_native_f32_slice, silu_native_f32_slice];
+        let runs: [SliceKernel; 4] = [
+            silu_f32_slice,
+            silu_before_mask_slice,
+            silu_native_f32_slice,
+            silu_native_f32_slice,
+        ];
         println!("SILU_CSV,width,mode,pattern,n,rep,order,arm,iters,cpu_ns,wall_ns");
         for serial in [true, false] {
             for pattern in ["in_band", "sparse_repairs", "dense_negative_tail"] {
@@ -1380,7 +1428,7 @@ mod silu_bench {
                             }
                         })
                         .collect();
-                    let mut buffers: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0; n]);
+                    let mut buffers: [Vec<f32>; 4] = std::array::from_fn(|_| vec![0.0; n]);
                     for (arm, run) in runs.iter().enumerate() {
                         let before = parallel_dispatches();
                         for _ in 0..4 {
@@ -1409,9 +1457,20 @@ mod silu_bench {
                         }
                     }
                     let iters = (1usize << 20).div_ceil(n).clamp(1, 16384);
-                    for rep in 0..21 {
-                        for order in 0..3 {
-                            let arm = (rep + order) % 3;
+                    for (i, (&before, &after)) in buffers[1].iter().zip(&buffers[2]).enumerate() {
+                        if before.is_nan() {
+                            assert!(after.is_nan());
+                        } else {
+                            assert_eq!(
+                                before.to_bits(),
+                                after.to_bits(),
+                                "{pattern} n={n} index={i}: before/after differs"
+                            );
+                        }
+                    }
+                    for rep in 0..25 {
+                        for order in 0..4 {
+                            let arm = (rep + order) % 4;
                             let (cpu, wall) = mode(serial, || {
                                 let cpu = cpu_seconds();
                                 let started = Instant::now();
@@ -1428,7 +1487,7 @@ mod silu_bench {
                             println!(
                                 "SILU_CSV,{width},{},{pattern},{n},{rep},{order},{},{iters},{:.3},{:.3}",
                                 if serial { "serial" } else { "runtime" },
-                                ["mlas", "native", "native_aa"][arm],
+                                ["mlas", "before_mask", "native", "native_aa"][arm],
                                 cpu * 1e9 / iters as f64,
                                 wall * 1e9 / iters as f64
                             );
@@ -1537,6 +1596,101 @@ mod native_silu_contract {
                 "x={x}: got {got}, want {want}"
             );
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn native_silu_scans_only_blocks_with_exceptional_vector_lanes() {
+        let mut input = vec![0.5f32; SILU_CORRECTION_BLOCK];
+        let mut output = vec![0.0; input.len()];
+        let before = NATIVE_SILU_REPAIR_ELEMENTS.with(std::cell::Cell::get);
+        serial_scope(|| silu_native_f32_slice(&input, &mut output));
+        assert_eq!(
+            NATIVE_SILU_REPAIR_ELEMENTS.with(std::cell::Cell::get),
+            before,
+            "ordinary vector lanes must not trigger a repair rescan"
+        );
+        for slot in [0, 1, 2, 3, 8188, 8189, 8190, 8191] {
+            for value in [
+                -103.0,
+                18.000002,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NAN,
+            ] {
+                input[slot] = value;
+                let before = NATIVE_SILU_REPAIR_ELEMENTS.with(std::cell::Cell::get);
+                serial_scope(|| silu_native_f32_slice(&input, &mut output));
+                assert_eq!(
+                    NATIVE_SILU_REPAIR_ELEMENTS.with(std::cell::Cell::get) - before,
+                    SILU_CORRECTION_BLOCK,
+                    "slot={slot} value={value}: repair one bounded block"
+                );
+                let want = silu(value);
+                if want.is_nan() {
+                    assert!(output[slot].is_nan());
+                } else {
+                    assert_eq!(output[slot].to_bits(), want.to_bits());
+                }
+                input[slot] = 0.5;
+            }
+        }
+    }
+
+    /// Pin the captured pre-optimization native output bits on Apple ARM64, where
+    /// the staged scalar libm contract and NEON baseline were measured.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn native_silu_matches_preoptimization_output_bits() {
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        for mixed in [false, true] {
+            for n in [0usize, 1, 3, 4, 7, 8, 17, 8191, 8192, 8193, 65541] {
+                let mut state = 0x6a09_e667u32;
+                let input: Vec<f32> = (0..n)
+                    .map(|i| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        if mixed && i % 97 == 0 {
+                            [
+                                f32::NAN,
+                                f32::INFINITY,
+                                f32::NEG_INFINITY,
+                                -0.0,
+                                0.0,
+                                f32::from_bits(1),
+                                -f32::from_bits(1),
+                                -103.0,
+                                -18.000002,
+                                18.000002,
+                                -18.0,
+                                18.0,
+                            ][(i / 97) % 12]
+                        } else if mixed {
+                            f32::from_bits(state)
+                        } else {
+                            (state >> 8) as f32 * (36.0 / 16777216.0) - 18.0
+                        }
+                    })
+                    .collect();
+                let mut output = vec![0.0; n];
+                serial_scope(|| silu_native_f32_slice(&input, &mut output));
+                for bits in std::iter::once(n as u32).chain(
+                    output
+                        .iter()
+                        .map(|x| if x.is_nan() { 0x7fc0_0000 } else { x.to_bits() }),
+                ) {
+                    for byte in bits.to_le_bytes() {
+                        digest ^= u64::from(byte);
+                        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            digest, 0x2259_da81_05d9_ccf1,
+            "native SiLU output bits differ from the captured pre-optimization Apple ARM64 baseline"
+        );
     }
 
     #[test]

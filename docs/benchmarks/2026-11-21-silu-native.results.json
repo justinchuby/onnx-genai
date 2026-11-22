@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "base": "d4d0b01a92a401136123c4362afdf7cb652401e3",
   "source_sha256": "5a874ab3ba15c3c3cce17886d1dbfaf6a0bb0e55e3c78923ae701e3a7e4097ff",
   "platform": {
@@ -6949,7 +6949,6 @@
   "samples_file": "2026-11-21-silu-native.samples.csv.gz",
   "samples_sha256": "802d46c95ab8e9a26c40b1047c01bf77eda455bd02ae462a62ea77368801bcf7",
   "samples_count": 17010,
-  "arm_summary_count": 270,
   "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
   "lock_mechanism": "Darwin fcntl.flock held across all nine children; hostlock.sh unsupported on Darwin",
   "flags": {
@@ -6977,5 +6976,67 @@
       "failed": 1
     },
     "reverted": true
+  },
+  "arms": [
+    "mlas",
+    "native",
+    "native_aa"
+  ],
+  "repetitions": 21,
+  "matrix": {
+    "sweep": [
+      1,
+      2,
+      3
+    ],
+    "width": [
+      1,
+      4,
+      8
+    ],
+    "mode": [
+      "serial",
+      "runtime"
+    ],
+    "pattern": [
+      "in_band",
+      "sparse_repairs",
+      "dense_negative_tail"
+    ],
+    "n": [
+      3,
+      17,
+      4096,
+      65537,
+      1048581
+    ]
+  },
+  "batch": {
+    "target_elements": 1048576,
+    "min_iters": 1,
+    "max_iters": 16384
+  },
+  "cell_count": 270,
+  "ratios": {
+    "wall_ratio": {
+      "numerator": "mlas",
+      "denominator": "native",
+      "metric": "wall_ns"
+    },
+    "cpu_ratio": {
+      "numerator": "mlas",
+      "denominator": "native",
+      "metric": "cpu_ns"
+    },
+    "aa_wall_ratio": {
+      "numerator": "native",
+      "denominator": "native_aa",
+      "metric": "wall_ns"
+    },
+    "aa_cpu_ratio": {
+      "numerator": "native",
+      "denominator": "native_aa",
+      "metric": "cpu_ns"
+    }
   }
 }
