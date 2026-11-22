@@ -108,6 +108,13 @@ mod error {
         #[error("kernel execution failed: {0}")]
         KernelFailed(String),
 
+        #[error("backend operation {operation} failed: {source}")]
+        Backend {
+            operation: &'static str,
+            #[source]
+            source: Box<dyn std::error::Error + Send + Sync>,
+        },
+
         #[error("EP panicked during execution")]
         EpPanicked,
 

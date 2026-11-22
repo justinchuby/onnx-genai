@@ -2,9 +2,12 @@
 
 **Direction (repository owner, final):** we do not bundle MLAS by default, on any
 target, in any shipped artifact. We progressively absorb its optimizations into
-our own native kernels. MLAS stays in the tree as a *measurement reference* — a
-second implementation in the same process that lets us measure exactly how far
-our kernel is from a good one — and nothing ships behind it. Rejecting MLAS as a
+our own native kernels. MLAS temporarily stays in the tree as a *measurement
+reference* — a second implementation in the same process that lets us measure
+exactly how far our kernel is from a good one — and nothing ships behind it.
+Once the required capabilities have independent implementations and their
+numerical and dispatch checks pass, remove the optional `mlas` features, `mlas-sys`, its vendored sources, and the reference-only callers.
+Do not retain compatibility APIs for the removed integration. Rejecting MLAS as a
 default is not a re-opening of ORT's built-in CPU EP either; that remains
 forbidden.
 

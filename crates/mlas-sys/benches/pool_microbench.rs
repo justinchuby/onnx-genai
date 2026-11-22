@@ -131,6 +131,7 @@ fn qnbit_internal_pool_bench() {
                 &scales,
                 zps.as_deref(),
             )
+            .expect("valid SQNBit packing inputs")
             .map(|packed| (comp, packed))
         })
     else {
@@ -251,7 +252,8 @@ impl StaticQnbitBench {
             let pb = &packed_b[start * blocks * blob..(start + len) * blocks * blob];
             let sc = &scales[start * blocks..(start + len) * blocks];
             let zp = zps.map(|z| &z[start * zp_row..(start + len) * zp_row]);
-            let packed = SQNBitPackedB::new(len, k, 4, block_size, comp, pb, sc, zp)?;
+            let packed = SQNBitPackedB::new(len, k, 4, block_size, comp, pb, sc, zp)
+                .expect("valid SQNBit packing inputs")?;
             shards.push(StaticQnbitShard {
                 start_n: start,
                 packed,

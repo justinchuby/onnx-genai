@@ -3861,7 +3861,11 @@ impl MatMulNBitsKernel {
                 packed_shard,
                 scales_shard,
                 zero_points_shard,
-            ) {
+            )
+            .map_err(|source| EpError::Backend {
+                operation: "MatMulNBits MLAS packing",
+                source: Box::new(source),
+            })? {
                 Some(packed) => shards.push(Some(MlasShard {
                     start,
                     len,
@@ -3934,7 +3938,12 @@ impl MatMulNBitsKernel {
             &packed,
             &scales,
             zero_points.as_deref(),
-        ) else {
+        )
+        .map_err(|source| EpError::Backend {
+            operation: "MatMulNBits MLAS packing",
+            source: Box::new(source),
+        })?
+        else {
             return Ok(None);
         };
         Ok(Some(self.funded_mlas_prepared(
@@ -4001,7 +4010,12 @@ impl MatMulNBitsKernel {
             &packed,
             &scales,
             zero_points.as_deref(),
-        ) else {
+        )
+        .map_err(|source| EpError::Backend {
+            operation: "MatMulNBits MLAS packing",
+            source: Box::new(source),
+        })?
+        else {
             return Ok(None);
         };
         Ok(Some(self.funded_mlas_prepared(
@@ -12211,6 +12225,46 @@ mod tests {
     }
 
     #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_pack_input_errors_preserve_typed_backend_cause() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let Some((block, comp)) = mlas_grant_supported_case() else {
+            return;
+        };
+        let (n, k) = (16, 128);
+        let b = Owned::u8(&[1], &[0]);
+        let scales = Owned::f32(&[n, k / block], &vec![1.0; n * (k / block)]);
+        let (governor, resources) = governed_dense_resources(1 << 20, 0);
+        let mut kernel = test_kernel(k, n, block);
+        kernel.weight_memory = resources.weight_memory().clone();
+        let error = kernel
+            .build_mlas_packed(&b.view(), &scales.view(), None, comp)
+            .err()
+            .unwrap();
+        let cause = std::error::Error::source(&error).unwrap();
+        assert!(matches!(
+            cause.downcast_ref::<mlas_sys::SQNBitPackError>(),
+            Some(mlas_sys::SQNBitPackError::Length {
+                input: "quant_b_data",
+                expected: 1024,
+                actual: 1
+            })
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains("MatMulNBits")
+                && message.contains("quant_b_data")
+                && message.contains("1024")
+        );
+        assert_eq!(
+            governor.used(Tier::Host),
+            0,
+            "hard input errors return the construction grant"
+        );
+    }
+
+    #[cfg(feature = "mlas")]
     fn mlas_grant_supported_case() -> Option<(usize, mlas_sys::SQNBitComputeType)> {
         for comp in [
             mlas_sys::SQNBitComputeType::Fp32,
@@ -12401,6 +12455,7 @@ mod tests {
                                 &scale_values,
                                 z.as_ref().map(|v| v.bytes.as_slice()),
                             )
+                            .expect("valid SQNBit packing inputs")
                             .unwrap();
                             if dtype == DataType::Float32 {
                                 let mut backing = vec![0u8; 1 + b.bytes.len() * 2];
@@ -16151,6 +16206,7 @@ mod tests {
                     &scales,
                     Some(&zps),
                 )
+                .expect("valid SQNBit packing inputs")
                 .is_none()
                 {
                     eprintln!("MLAS QNBit bits={bits} CompInt8 unavailable; skipping reachability");
@@ -16260,6 +16316,7 @@ mod tests {
             &quantized[0].1,
             Some(&quantized[0].2),
         )
+        .expect("valid SQNBit packing inputs")
         .is_none()
         {
             eprintln!("MLAS QNBit unavailable on this host; skipping #1735 falsifier");
@@ -16415,6 +16472,7 @@ mod tests {
             &scales,
             Some(&zps),
         )
+        .expect("valid SQNBit packing inputs")
         .is_none()
         {
             eprintln!("MLAS QNBit unavailable on this host; skipping #1735 sharing test");
@@ -16515,6 +16573,7 @@ mod tests {
             &scales,
             Some(&zps),
         )
+        .expect("valid SQNBit packing inputs")
         .is_none()
         {
             eprintln!("MLAS QNBit unavailable on this host; skipping #1735 scales-identity test");
@@ -21826,7 +21885,8 @@ mod tests {
                 &packed,
                 &scales,
                 None,
-            ) else {
+            )
+            .expect("valid SQNBit packing inputs") else {
                 eprintln!(
                     "MLAS SQNBit int4 block_size={block_size} unavailable; skipping prepacked parity case"
                 );
@@ -25533,6 +25593,7 @@ mod tests {
                                 sc,
                                 zp,
                             )
+                            .expect("valid SQNBit packing inputs")
                         };
                         let Some(full) = make(0, n) else { continue };
                         let mut c_full = vec![0.0f32; n];
@@ -25864,6 +25925,7 @@ mod tests {
             &scales,
             None,
         )
+        .expect("valid SQNBit packing inputs")
         .is_none()
         {
             eprintln!("MLAS SQNBit int4 kernel unavailable; skipping M-gate test");
@@ -26021,6 +26083,7 @@ mod tests {
             &scales,
             None,
         )
+        .expect("valid SQNBit packing inputs")
         .is_none()
         {
             eprintln!("MLAS SQNBit int4 CompFp32 kernel unavailable; skipping slow-decode test");
@@ -26091,6 +26154,7 @@ mod tests {
             &scales,
             None,
         )
+        .expect("valid SQNBit packing inputs")
         .is_none()
         {
             eprintln!(
@@ -26214,6 +26278,7 @@ mod tests {
                 &scales,
                 None,
             )
+            .expect("valid SQNBit packing inputs")
             .expect("MLAS SQNBit int4 must be available for the perf probe");
 
             for &m in &[1usize, 32] {
@@ -26326,12 +26391,14 @@ mod tests {
                 let pb = &packed_bytes[start * k_blocks * blob..(start + len) * k_blocks * blob];
                 let sc = &scales[start * k_blocks..(start + len) * k_blocks];
                 let pack = mlas_sys::SQNBitPackedB::new(len, k, 4, block_size, comp, pb, sc, None)
+                    .expect("valid SQNBit packing inputs")
                     .expect("MLAS SQNBit int4 shard must pack");
                 (start, len, pack)
             })
             .collect();
         let full_pack =
             mlas_sys::SQNBitPackedB::new(n, k, 4, block_size, comp, &packed_bytes, &scales, None)
+                .expect("valid SQNBit packing inputs")
                 .expect("MLAS SQNBit int4 full-width must pack");
 
         let a = pseudo(k, 0.8);
@@ -26501,6 +26568,7 @@ mod tests {
                 &scales,
                 None,
             )
+            .expect("valid SQNBit packing inputs")
             .expect("MLAS SQNBit int4 must be available for the perf probe");
             let a = pseudo(k, 0.8);
             let weight_bytes = (n as f64) * (k as f64) / 2.0;
@@ -26600,6 +26668,7 @@ mod tests {
                         &scales,
                         None,
                     )
+                    .expect("valid SQNBit packing inputs")
                 };
                 let (Some(mlas_int8), Some(mlas_fp32)) = (
                     make(mlas_sys::SQNBitComputeType::Int8),
