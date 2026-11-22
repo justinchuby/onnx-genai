@@ -41,6 +41,8 @@ pub mod provider;
 pub mod registry;
 pub mod tensor;
 pub mod weight;
+pub mod workspace;
+pub use workspace::WorkspaceLayout;
 
 pub use abi::{LegacyOrtEp, PluginCompiledKernel, PluginExecutionPlan, SubgraphClaim};
 pub use epcontext::{EpContext, EpContextRegistry, build_ep_context_registry};
