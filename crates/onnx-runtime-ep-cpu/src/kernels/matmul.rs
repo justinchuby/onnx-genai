@@ -1233,6 +1233,41 @@ const NR: usize = 4;
 const KC: usize = 256;
 const MAX_MC: usize = 64;
 
+/// A borrowed column window of B. Row stride belongs to the source matrix;
+/// columns belong to this window and to each output row. No element is copied.
+#[derive(Clone, Copy)]
+struct GemmBPanel<'a> {
+    values: &'a [f32],
+    row_stride: usize,
+    columns: usize,
+}
+
+/// Output storage exposes disjoint rows. Dense row blocks and borrowed column
+/// strips run the same arithmetic without materializing a second output matrix.
+trait GemmOutputRows {
+    fn row_mut(&mut self, row: usize) -> &mut [f32];
+}
+struct DenseGemmOutput<'a> {
+    values: &'a mut [f32],
+    columns: usize,
+}
+impl GemmOutputRows for DenseGemmOutput<'_> {
+    #[inline]
+    fn row_mut(&mut self, row: usize) -> &mut [f32] {
+        &mut self.values[row * self.columns..(row + 1) * self.columns]
+    }
+}
+impl GemmOutputRows for [&mut [f32]] {
+    #[inline]
+    fn row_mut(&mut self, row: usize) -> &mut [f32] {
+        self[row]
+    }
+}
+
+#[cfg(test)]
+static GENERIC_BORROWED_COLS_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Pure-Rust blocked, register-tiled, rayon-parallelized f32 GEMM (the Generic
 /// backend). Overwrites `c` with `a @ b`.
 ///
@@ -1242,6 +1277,10 @@ const MAX_MC: usize = 64;
 /// hot inner loop over the N strip autovectorizes. Contains no `unsafe`.
 fn gemm_generic(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        c.fill(0.0);
         return;
     }
     let threads = rayon::current_num_threads();
@@ -1272,7 +1311,20 @@ fn gemm_generic(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usiz
             let i0 = blk * mc;
             let rows = c_block.len() / n; // last block may be short
             let a_block = &a[i0 * k..i0 * k + rows * k];
-            gemm_block(a_block, b, c_block, rows, k, n);
+            gemm_block(
+                a_block,
+                GemmBPanel {
+                    values: b,
+                    row_stride: n,
+                    columns: n,
+                },
+                &mut DenseGemmOutput {
+                    values: c_block,
+                    columns: n,
+                },
+                rows,
+                k,
+            );
         },
     );
 }
@@ -1286,38 +1338,58 @@ fn gemm_generic_col_parallel(
     n: usize,
     threads: usize,
 ) {
-    use rayon::prelude::*;
-    let cols_per_strip = n.div_ceil(threads).max(1);
-    let strips: Vec<(usize, usize)> = (0..n)
-        .step_by(cols_per_strip)
-        .map(|j0| (j0, cols_per_strip.min(n - j0)))
-        .collect();
-    let results: Vec<(usize, usize, Vec<f32>)> = strips
-        .into_par_iter()
-        .map(|(j0, strip_n)| {
-            let mut b_strip = vec![0.0f32; k * strip_n];
-            for row in 0..k {
-                b_strip[row * strip_n..row * strip_n + strip_n]
-                    .copy_from_slice(&b[row * n + j0..row * n + j0 + strip_n]);
-            }
-            let mut c_strip = vec![0.0f32; m * strip_n];
-            gemm_block(a, &b_strip, &mut c_strip, m, k, strip_n);
-            (j0, strip_n, c_strip)
-        })
-        .collect();
-    for (j0, strip_n, c_strip) in results {
-        for row in 0..m {
-            c[row * n + j0..row * n + j0 + strip_n]
-                .copy_from_slice(&c_strip[row * strip_n..row * strip_n + strip_n]);
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        c.fill(0.0);
+        return;
+    }
+    let cols_per_strip = n.div_ceil(threads.max(1)).max(1);
+    let strip_count = n.div_ceil(cols_per_strip);
+    // Split each caller-owned output row once. Rust owns every mutable cell in
+    // exactly one strip; only row references (not B/C elements) are allocated.
+    let mut strips: Vec<Vec<&mut [f32]>> =
+        (0..strip_count).map(|_| Vec::with_capacity(m)).collect();
+    for row in c.chunks_mut(n) {
+        for (strip, columns) in strips.iter_mut().zip(row.chunks_mut(cols_per_strip)) {
+            strip.push(columns);
         }
     }
+    strips
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(index, mut output)| {
+            let start = index * cols_per_strip;
+            let columns = cols_per_strip.min(n - start);
+            #[cfg(test)]
+            GENERIC_BORROWED_COLS_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            gemm_block(
+                a,
+                GemmBPanel {
+                    values: &b[start..],
+                    row_stride: n,
+                    columns,
+                },
+                output.as_mut_slice(),
+                m,
+                k,
+            );
+        });
 }
 
 /// Compute `c_block[rows,n] = a_block[rows,k] @ b[k,n]` (overwrite) for one row
 /// block, blocking over K and register-tiling MR x NR.
-fn gemm_block(a: &[f32], b: &[f32], c: &mut [f32], rows: usize, k: usize, n: usize) {
-    for v in c.iter_mut() {
-        *v = 0.0;
+fn gemm_block<O: GemmOutputRows + ?Sized>(
+    a: &[f32],
+    b: GemmBPanel<'_>,
+    c: &mut O,
+    rows: usize,
+    k: usize,
+) {
+    let n = b.columns;
+    for row in 0..rows {
+        c.row_mut(row).fill(0.0);
     }
     let mut kk = 0;
     while kk < k {
@@ -1328,7 +1400,7 @@ fn gemm_block(a: &[f32], b: &[f32], c: &mut [f32], rows: usize, k: usize, n: usi
             let mut j = 0;
             while j < n {
                 let nr = NR.min(n - j);
-                micro_kernel(a, b, c, k, n, i, j, kk, kc, mr, nr);
+                micro_kernel(a, b, c, k, i, j, kk, kc, mr, nr);
                 j += NR;
             }
             i += MR;
@@ -1341,12 +1413,11 @@ fn gemm_block(a: &[f32], b: &[f32], c: &mut [f32], rows: usize, k: usize, n: usi
 /// `[kk, kk+kc)`, adding into the existing `c` contents.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn micro_kernel(
+fn micro_kernel<O: GemmOutputRows + ?Sized>(
     a: &[f32],
-    b: &[f32],
-    c: &mut [f32],
+    b: GemmBPanel<'_>,
+    c: &mut O,
     k: usize,
-    n: usize,
     i: usize,
     j: usize,
     kk: usize,
@@ -1356,7 +1427,7 @@ fn micro_kernel(
 ) {
     let mut acc = [[0.0f32; NR]; MR];
     for p in kk..kk + kc {
-        let brow = &b[p * n + j..p * n + j + nr];
+        let brow = &b.values[p * b.row_stride + j..p * b.row_stride + j + nr];
         for (ii, acc_row) in acc.iter_mut().enumerate().take(mr) {
             let aik = a[(i + ii) * k + p];
             for (jj, acc_v) in acc_row.iter_mut().enumerate().take(nr) {
@@ -1365,7 +1436,7 @@ fn micro_kernel(
         }
     }
     for (ii, acc_row) in acc.iter().enumerate().take(mr) {
-        let c_row = &mut c[(i + ii) * n + j..(i + ii) * n + j + nr];
+        let c_row = &mut c.row_mut(i + ii)[j..j + nr];
         for (jj, cv) in c_row.iter_mut().enumerate().take(nr) {
             *cv += acc_row[jj];
         }
@@ -6778,6 +6849,382 @@ mod tests {
             // 1.57%; 1.8% keeps modest cross-machine headroom without letting a
             // real GEMV regression hide behind the old 2% envelope.
             assert!(max_rel < 1.8e-2, "[{m},{k},{n}]: max_rel={max_rel}");
+        }
+    }
+
+    /// Independent transcription of the previous per-column K-panel sum. The
+    /// panel addition boundary is observable in f32 and must not be reassociated.
+    fn generic_panel_order_reference(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; m * n];
+        for row in 0..m {
+            for column in 0..n {
+                for start in (0..k).step_by(KC) {
+                    let mut panel = 0.0f32;
+                    for inner in start..(start + KC).min(k) {
+                        panel += a[row * k + inner] * b[inner * n + column];
+                    }
+                    out[row * n + column] += panel;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn generic_borrowed_columns_preserve_panel_order_and_output_bounds() {
+        for threads in [1, 2, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for m in [1, 3, 7] {
+                for k in [0, 1, KC - 1, KC, KC + 1, 2 * KC + 3] {
+                    for n in [1, 3, NR + 1, 67] {
+                        let a: Vec<f32> = (0..m * k)
+                            .map(|i| ((i % 37) as f32 - 18.0) * 0.0037)
+                            .collect();
+                        let b: Vec<f32> = (0..k * n)
+                            .map(|i| ((i % 29) as f32 - 14.0) * 0.0061)
+                            .collect();
+                        let expected = generic_panel_order_reference(&a, &b, m, k, n);
+                        let mut storage = vec![f32::from_bits(0x7fc0_1234); m * n + 2];
+                        pool.install(|| {
+                            gemm_with_backend(
+                                CpuBackend::Generic,
+                                &a,
+                                &b,
+                                &mut storage[1..m * n + 1],
+                                m,
+                                k,
+                                n,
+                            )
+                        })
+                        .unwrap();
+                        assert_eq!(storage[0].to_bits(), 0x7fc0_1234);
+                        assert_eq!(storage[m * n + 1].to_bits(), 0x7fc0_1234);
+                        for (index, (&got, &want)) in
+                            storage[1..m * n + 1].iter().zip(&expected).enumerate()
+                        {
+                            assert_eq!(
+                                got.to_bits(),
+                                want.to_bits(),
+                                "threads={threads} m={m} k={k} n={n} index={index}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for (m, n) in [(0, 9), (3, 0)] {
+            gemm_generic(&[], &[], &mut [], m, 7, n);
+        }
+    }
+
+    #[test]
+    fn generic_borrowed_columns_reach_the_native_dispatch_and_special_values() {
+        use std::sync::atomic::Ordering;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let before = GENERIC_BORROWED_COLS_TEST_HITS.load(Ordering::Relaxed);
+        let (m, k, n) = (3, KC + 1, 17);
+        let a: Vec<f32> = (0..m * k).map(|i| [1.0, -1.0, 0.0][i / k]).collect();
+        let patterns = [
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| patterns[(i % n) % patterns.len()])
+            .collect();
+        let expected = generic_panel_order_reference(&a, &b, m, k, n);
+        assert!(expected.iter().any(|x| x.is_infinite()));
+        assert!(expected.iter().any(|x| x.is_nan()));
+        assert!(expected.iter().any(|x| x.is_finite() && *x != 0.0));
+        let mut actual = vec![42.0; m * n];
+        pool.install(|| gemm_with_backend(CpuBackend::Generic, &a, &b, &mut actual, m, k, n))
+            .unwrap();
+        assert!(GENERIC_BORROWED_COLS_TEST_HITS.load(Ordering::Relaxed) > before);
+        for (&got, &want) in actual.iter().zip(&expected) {
+            if want.is_nan() {
+                assert!(got.is_nan());
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits());
+            }
+        }
+    }
+
+    // Frozen pre-borrowing implementation from the base commit, test-only.
+    // Its original data copies and arithmetic serve as a same-binary A/B and
+    // exact-output reference; no compatibility entry exists in production.
+    mod copying_generic_reference {
+        use super::super::{KC, MAX_MC, MR, NR};
+        use rayon::prelude::*;
+        pub(super) fn gemm_generic(
+            a: &[f32],
+            b: &[f32],
+            c: &mut [f32],
+            m: usize,
+            k: usize,
+            n: usize,
+        ) {
+            if m == 0 || n == 0 {
+                return;
+            }
+            let threads = rayon::current_num_threads();
+            if threads > 1 && m < threads && n > 1 {
+                gemm_generic_col_parallel(a, b, c, m, k, n, threads);
+                return;
+            }
+            let mc = if threads <= 1 {
+                MAX_MC.min(m)
+            } else {
+                let target_tasks = threads.saturating_mul(2);
+                let rows = m.div_ceil(target_tasks).clamp(1, MAX_MC);
+                if rows == 1 {
+                    1
+                } else {
+                    rows.div_ceil(MR).saturating_mul(MR).min(MAX_MC)
+                }
+            };
+            // Parallelize over row blocks of C; each block owns a disjoint slice of `c`
+            // and reads shared, immutable `a`/`b`, so there is no aliasing. Size the
+            // blocks from the Rayon pool: prefill commonly has fewer rows than cores,
+            // while large matrices retain MR-row reuse and bounded task counts.
+            // `for_each_init` rather than `for_each` so a worker-lane span covers this
+            // worker's whole row block instead of being reopened per block.
+            c.par_chunks_mut(mc * n).enumerate().for_each_init(
+                || crate::trace::worker_span("MatMul.row_block"),
+                |_span, (blk, c_block)| {
+                    let i0 = blk * mc;
+                    let rows = c_block.len() / n; // last block may be short
+                    let a_block = &a[i0 * k..i0 * k + rows * k];
+                    gemm_block(a_block, b, c_block, rows, k, n);
+                },
+            );
+        }
+
+        fn gemm_generic_col_parallel(
+            a: &[f32],
+            b: &[f32],
+            c: &mut [f32],
+            m: usize,
+            k: usize,
+            n: usize,
+            threads: usize,
+        ) {
+            use rayon::prelude::*;
+            let cols_per_strip = n.div_ceil(threads).max(1);
+            let strips: Vec<(usize, usize)> = (0..n)
+                .step_by(cols_per_strip)
+                .map(|j0| (j0, cols_per_strip.min(n - j0)))
+                .collect();
+            let results: Vec<(usize, usize, Vec<f32>)> = strips
+                .into_par_iter()
+                .map(|(j0, strip_n)| {
+                    let mut b_strip = vec![0.0f32; k * strip_n];
+                    for row in 0..k {
+                        b_strip[row * strip_n..row * strip_n + strip_n]
+                            .copy_from_slice(&b[row * n + j0..row * n + j0 + strip_n]);
+                    }
+                    let mut c_strip = vec![0.0f32; m * strip_n];
+                    gemm_block(a, &b_strip, &mut c_strip, m, k, strip_n);
+                    (j0, strip_n, c_strip)
+                })
+                .collect();
+            for (j0, strip_n, c_strip) in results {
+                for row in 0..m {
+                    c[row * n + j0..row * n + j0 + strip_n]
+                        .copy_from_slice(&c_strip[row * strip_n..row * strip_n + strip_n]);
+                }
+            }
+        }
+
+        /// Compute `c_block[rows,n] = a_block[rows,k] @ b[k,n]` (overwrite) for one row
+        /// block, blocking over K and register-tiling MR x NR.
+        fn gemm_block(a: &[f32], b: &[f32], c: &mut [f32], rows: usize, k: usize, n: usize) {
+            for v in c.iter_mut() {
+                *v = 0.0;
+            }
+            let mut kk = 0;
+            while kk < k {
+                let kc = KC.min(k - kk);
+                let mut i = 0;
+                while i < rows {
+                    let mr = MR.min(rows - i);
+                    let mut j = 0;
+                    while j < n {
+                        let nr = NR.min(n - j);
+                        micro_kernel(a, b, c, k, n, i, j, kk, kc, mr, nr);
+                        j += NR;
+                    }
+                    i += MR;
+                }
+                kk += KC;
+            }
+        }
+
+        /// Accumulate an `mr x nr` (≤ `MR x NR`) tile of C over the K-panel
+        /// `[kk, kk+kc)`, adding into the existing `c` contents.
+        #[inline]
+        #[allow(clippy::too_many_arguments)]
+        fn micro_kernel(
+            a: &[f32],
+            b: &[f32],
+            c: &mut [f32],
+            k: usize,
+            n: usize,
+            i: usize,
+            j: usize,
+            kk: usize,
+            kc: usize,
+            mr: usize,
+            nr: usize,
+        ) {
+            let mut acc = [[0.0f32; NR]; MR];
+            for p in kk..kk + kc {
+                let brow = &b[p * n + j..p * n + j + nr];
+                for (ii, acc_row) in acc.iter_mut().enumerate().take(mr) {
+                    let aik = a[(i + ii) * k + p];
+                    for (jj, acc_v) in acc_row.iter_mut().enumerate().take(nr) {
+                        *acc_v += aik * brow[jj];
+                    }
+                }
+            }
+            for (ii, acc_row) in acc.iter().enumerate().take(mr) {
+                let c_row = &mut c[(i + ii) * n + j..(i + ii) * n + j + nr];
+                for (jj, cv) in c_row.iter_mut().enumerate().take(nr) {
+                    *cv += acc_row[jj];
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual Generic GEMM copy/borrow diagnostic; run under the host lock"]
+    fn bench_generic_borrowed_columns_ab() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        fn cpu_seconds() -> Option<f64> {
+            #[cfg(unix)]
+            {
+                let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+                // SAFETY: the OS initializes the writable rusage on success.
+                assert_eq!(
+                    unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                    0,
+                    "Generic GEMM CPU-time probe failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: successful getrusage initialized usage.
+                let usage = unsafe { usage.assume_init() };
+                Some(
+                    (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
+                        + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 * 1e-6,
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        }
+        println!("threads,m,k,n,iterations,arm,cpu_ms,wall_ms,cpu_min_ms,cpu_max_ms");
+        for threads in [1, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for (m, k, n) in [
+                (1, 256, 512),
+                (1, 1025, 257),
+                (1, 2048, 2048),
+                (3, 1025, 513),
+                (7, 1025, 513),
+                (15, 257, 131),
+            ] {
+                let a: Vec<f32> = (0..m * k)
+                    .map(|i| ((i % 37) as f32 - 18.0) * 0.0037)
+                    .collect();
+                let b: Vec<f32> = (0..k * n)
+                    .map(|i| ((i % 29) as f32 - 14.0) * 0.0061)
+                    .collect();
+                // Short per-call regions make process CPU-time samples mostly
+                // scheduler/spin jitter. Batch a deterministic amount of work
+                // in each sample, then normalize to one complete GEMM call.
+                let iterations = (1usize << 24).div_ceil(m * k * n).clamp(1, 128);
+                let expected = generic_panel_order_reference(&a, &b, m, k, n);
+                let mut buffers = [vec![0.0; m * n], vec![0.0; m * n], vec![0.0; m * n]];
+                let mut cpus: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::new());
+                let mut walls = cpus.clone();
+                for repetition in 0..21 {
+                    for offset in 0..3 {
+                        let arm = (repetition + offset) % 3;
+                        let kernel = if arm == 0 {
+                            copying_generic_reference::gemm_generic
+                        } else {
+                            gemm_generic
+                        };
+                        let run = |out: &mut [f32]| {
+                            pool.install(|| kernel(black_box(&a), black_box(&b), out, m, k, n))
+                        };
+                        run(&mut buffers[arm]);
+                        assert!(
+                            buffers[arm]
+                                .iter()
+                                .zip(&expected)
+                                .all(|(x, y)| x.to_bits() == y.to_bits())
+                        );
+                        let cpu = cpu_seconds();
+                        let wall = Instant::now();
+                        for _ in 0..iterations {
+                            run(black_box(&mut buffers[arm]));
+                        }
+                        let elapsed = wall.elapsed().as_secs_f64();
+                        let used = cpu_seconds().zip(cpu).map(|(end, start)| end - start);
+                        assert!(
+                            buffers[arm]
+                                .iter()
+                                .zip(&expected)
+                                .all(|(x, y)| x.to_bits() == y.to_bits())
+                        );
+                        if let Some(used) = used {
+                            cpus[arm].push(used * 1e3 / iterations as f64);
+                        }
+                        walls[arm].push(elapsed * 1e3 / iterations as f64);
+                    }
+                }
+                for arm in 0..3 {
+                    cpus[arm].sort_by(f64::total_cmp);
+                    walls[arm].sort_by(f64::total_cmp);
+                    let cpu = if cpus[arm].is_empty() {
+                        "unavailable".to_string()
+                    } else {
+                        format!("{:.6}", cpus[arm][10])
+                    };
+                    let low = cpus[arm]
+                        .first()
+                        .map_or_else(|| "unavailable".to_string(), |x| format!("{x:.6}"));
+                    let high = cpus[arm]
+                        .last()
+                        .map_or_else(|| "unavailable".to_string(), |x| format!("{x:.6}"));
+                    let label = ["copying", "borrowed", "borrowed_control"][arm];
+                    println!(
+                        "{threads},{m},{k},{n},{iterations},{label},{cpu},{:.6},{low},{high}",
+                        walls[arm][10]
+                    );
+                }
+            }
         }
     }
 

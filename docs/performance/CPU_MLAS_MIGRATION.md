@@ -223,6 +223,12 @@ Ordered by *decode-path impact × distance from parity*, which is also
    #1104 absorbed int4 acc0 decode (1.36× / 1.56×); prefill is the remainder,
    and `MoE` follows it.
 
+Generic f32 GEMM's thin-M column-parallel path now borrows the original B
+stride and caller-owned output rows. It retains the same scalar register tiles
+and K-panel accumulation order, replacing full B/output element copies with
+row-reference metadata. This is a memory-ownership improvement in the portable
+fallback; see the [allocation proof and scoped diagnostic](../benchmarks/2026-11-21-generic-gemm-borrowed-columns.md).
+
 The native `QLinearMatMul` byte GEMM now has AVX2 and row-reusing ARM64
 NEON implementations. NEON borrows the original weight bytes and retains no
 packed copy. Register tiles share each B load across up to four rows; tile
