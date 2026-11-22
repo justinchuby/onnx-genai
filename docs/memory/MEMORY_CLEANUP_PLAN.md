@@ -1179,8 +1179,9 @@ f32/f64 special values and before-write extent checks are included too.
 
 ## Current design decision: execution workspace domains
 
-Status: design reviewed; the unpublished per-node mutable-layout pool prototype
-was withdrawn. The existing node-owned immutable weight preparation remains the
+Status: design reviewed; the CPU resource-domain foundation is implemented,
+with kernel migration still pending. The unpublished per-node mutable-layout
+pool prototype was withdrawn. The existing node-owned immutable weight preparation remains the
 baseline. The next implementation is a CPU vertical through the existing
 executor workspace contract, not another kernel-specific resource pool.
 
@@ -1303,3 +1304,56 @@ Required validation for the new implementation:
 CPU tests and compilation may establish the Host contract. CUDA event ordering,
 Graph replay, quarantine and actual physical release still require real-device
 validation; no CUDA runtime or throughput claim follows from this design.
+
+### Implemented foundation: managed Host execution workspace
+
+`onnx-runtime-memory-governor::HostWorkspacePool` now borrows and returns whole
+managed Host workspace owners. Clones share idle execution lanes. A warm fit
+retains the original backing, authority and grant; capacity/alignment upgrades
+retain their joint high-water marks and release the replaced idle backing
+before admitting its replacement. Independent simultaneous executions receive
+independent owners. The pool contains no active owner and rejects returns with
+outstanding owned views. Physical release and issuer callbacks run outside pool
+locks; failed release preparation preserves its owner in the error, and an
+incomplete outcome remains charged/quarantined and is never reused.
+
+The domain retains its pressure responder strongly; the responder weakly
+references idle storage. Host authorities with a pressure registry can reclaim
+idle slots for KV requests. Other authorities require explicit idle trim.
+Private Host backing registrations retire after the scoped binding and verified
+idle releases; outstanding/quarantined ownership conservatively keeps its
+registration pinned. No empty budget-credit bank or per-kernel pool is added.
+
+CPU workspace allocation now forwards to this domain and returns a managed
+`DeviceBuffer` without an outer lease. Workspace backing uses uncached
+`HostAllocator`; ordinary tensors keep their existing configured allocator.
+Explicitly governed CPU resources require a matching workspace Host authority.
+An ungoverned provider lazily creates an ungoverned managed domain reporting
+unattributed physical bytes instead of inventing another budget.
+
+Engine construction selects the final shared memory/manager before creating
+CPU resources. Workers no longer construct CPU resources against temporary
+books and subsequently replace only their governor fields. The Host ledger
+identity now actually names the Host device, allowing canonical manager
+registration against those same books. The executor records the capacity and
+alignment returned by the provider, so a high-water backing is not needlessly
+replaced when a later requirement fits it.
+
+Native validation covers 77 governor unit tests (including six workspace
+regressions), 36 manager transaction tests, 25 CPU provider tests, 277 session
+tests, 15 engine governor tests and six authority tests, with strict all-target
+Clippy. The warm checkout/return control observes every issuer callback and
+performs 4,096 iterations without claims/refunds, including zero-byte calls.
+Other controls cover concurrent slots, KV idle reclamation versus active
+owners, alignment/capacity alternation, foreign or borrowed owners, delegated
+process capacity, incomplete release and registration retirement. The worker
+regression reconciles actual workspace and KV grants against the parent's Host
+books. Optional MLAS configuration additionally passes 25 provider tests, 279
+session tests and the exact worker regression; strict all-target Clippy passes
+across governor, CPU EP, session and engine in both configurations. Raw
+validation logs are `/tmp/nxrt-host-workspace-*`.
+
+This is the resource-domain foundation. Gemm and other CPU kernels still need
+the workspace-layout migration described above; these checks do not establish
+its end-to-end performance, control-flow scratch peak behavior, or CUDA runtime
+correctness. The remaining validation requirements remain open.

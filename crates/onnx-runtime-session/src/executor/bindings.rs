@@ -734,9 +734,9 @@ impl Executor {
         let old = slot.take().map(|workspace| workspace.buffer);
         let fresh = ep.replace_workspace(old, bytes, peak.alignment, peak.role)?;
         *slot = Some(PreparedWorkspace {
+            bytes: fresh.len(),
+            alignment: fresh.alignment(),
             buffer: fresh,
-            bytes,
-            alignment: peak.alignment,
         });
         Ok(())
     }
