@@ -428,7 +428,7 @@ pub struct ServerConfig {
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
     pub max_output_tokens: usize,
-    /// Maximum native completion prompts admitted by one request.
+    /// Maximum completion prompts admitted by one native or OpenAI request.
     pub max_completion_prompts: std::num::NonZeroUsize,
     /// Per query/document pair input budget for non-generative scoring.
     pub max_rerank_input_tokens: std::num::NonZeroUsize,

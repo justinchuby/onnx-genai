@@ -218,19 +218,21 @@ fn deserialize_seed<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::E
     }
 }
 
-/// Legacy completion wire fields plus the common generation controls.
+/// One completion input after HTTP batch classification, with shared controls.
 #[derive(Debug)]
 pub struct CompletionRequest {
-    pub prompt: String,
+    pub prompt: crate::MixedPrompt,
     pub suffix: Option<String>,
     pub logprobs: Option<usize>,
-    pub sampling: ChatCompletionRequest,
+    pub sampling: std::sync::Arc<ChatCompletionRequest>,
 }
 impl<'de> Deserialize<'de> for CompletionRequest {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let mut body = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
-        let prompt = body.remove("prompt").and_then(|value| value.as_str().map(str::to_owned))
-            .ok_or_else(||D::Error::custom("prompt is required and must be text for /v1/completions; use native /completion for mixed token/text batches"))?;
+        let prompt = body
+            .remove("prompt")
+            .ok_or_else(|| D::Error::custom("prompt is required for completions"))?;
+        let prompt = crate::MixedPrompt::parse_completion(prompt).map_err(D::Error::custom)?;
         let suffix = body
             .remove("suffix")
             .map(serde_json::from_value::<Option<String>>)
@@ -286,7 +288,7 @@ impl<'de> Deserialize<'de> for CompletionRequest {
             prompt,
             suffix,
             logprobs,
-            sampling,
+            sampling: std::sync::Arc::new(sampling),
         })
     }
 }

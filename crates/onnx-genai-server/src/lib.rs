@@ -50,6 +50,7 @@ pub use cli::{ServeArgs, run_serve};
 pub use models_config::{ModelSpec, ModelsConfig, from_models_dir};
 pub use multimodal::MultimodalSpecs;
 pub use registry::EvictionPolicy;
+pub use routes::prompt::{MixedPrompt, PromptPart};
 pub use routes::{build_generate_request, build_generate_request_with_protocol, build_prompt};
 pub use runtime_args::{
     CpuArgs, DeviceChoice, EngineArgs, decode_backend_name, parse_decode_backend, parse_device,

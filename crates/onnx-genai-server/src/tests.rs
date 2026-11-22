@@ -6709,6 +6709,142 @@ mod native_compat {
         }
     }
     #[tokio::test]
+    async fn legacy_completion_batches_preserve_indices_token_inputs_and_total_usage() {
+        let router = app(tiny_state());
+        let prompts = json!(["hello",[2,"world",3],[4,5],{"prompt_string":"hello"}]);
+        for probabilities in [false, true] {
+            let mut body =
+                json!({"prompt":prompts,"max_tokens":2,"temperature":0,"logit_bias":{"5":100}});
+            if probabilities {
+                body["logprobs"] = json!(2);
+            }
+            let response = request(router.clone(), "/v1/completions", body.clone()).await;
+            let status = response.status();
+            let buffered = json_body(response).await;
+            assert_eq!(status, StatusCode::OK, "{buffered}");
+            assert_eq!(buffered["choices"].as_array().unwrap().len(), 4);
+            for index in 0..4 {
+                assert!(
+                    buffered["workflow_outputs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["prompt_index"] == index && row["publication"].is_object())
+                );
+            }
+            assert_eq!(
+                buffered["usage"],
+                json!({"prompt_tokens":11,"completion_tokens":8,"total_tokens":19})
+            );
+            for (index, choice) in buffered["choices"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(choice["index"], index);
+                assert_eq!(choice["text"], "world world");
+            }
+            body["stream"] = json!(true);
+            body["stream_options"] = json!({"include_usage":true});
+            let response = request(router.clone(), "/v1/completions", body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let events = sse_json_events(&bytes);
+            assert_eq!(events.last().unwrap()["usage"], buffered["usage"]);
+            for index in 0..4 {
+                assert!(
+                    events
+                        .iter()
+                        .any(|row| row["prompt_index"] == index && row["publication"].is_object())
+                );
+            }
+            let chunks: Vec<_> = events
+                .iter()
+                .filter(|row| row["object"] == "text_completion")
+                .collect();
+            let id = chunks[0]["id"].clone();
+            assert!(id.is_string());
+            assert!(chunks.iter().all(|row| row["id"] == id));
+            for index in 0..4 {
+                let rows: Vec<_> = events
+                    .iter()
+                    .filter(|row| row["choices"][0]["index"] == index)
+                    .collect();
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| row["choices"][0]["finish_reason"].is_string())
+                        .count(),
+                    1
+                );
+                let text = rows
+                    .iter()
+                    .filter_map(|row| row["choices"][0]["text"].as_str())
+                    .collect::<String>();
+                assert_eq!(text, "world world");
+            }
+            assert_eq!(
+                std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .matches("data: [DONE]")
+                    .count(),
+                1
+            );
+        }
+        for prompt in [json!([2, "hello", 3]), json!([2, 4, 3])] {
+            let response = request(
+                router.clone(),
+                "/v1/completions",
+                json!({"prompt":prompt,"max_tokens":1,"temperature":0}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["choices"].as_array().unwrap().len(), 1);
+            assert_eq!(body["usage"]["prompt_tokens"], 3);
+        }
+    }
+    #[tokio::test]
+    async fn legacy_completion_batch_failures_are_rejected_before_stream_headers() {
+        let mut state = tiny_state();
+        state.config.max_completion_prompts = std::num::NonZeroUsize::new(2).unwrap();
+        let router = app(state);
+        for prompt in [
+            json!([]),
+            json!(["hello", "world", "the"]),
+            json!(["hello", [999999]]),
+            json!(["hello",{"prompt_string":false}]),
+        ] {
+            let response = request(
+                router.clone(),
+                "/v1/completions",
+                json!({"prompt":prompt,"max_tokens":1,"stream":true}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["type"],
+                "invalid_request_error"
+            );
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("X-Session-Id", "batch-conversation")
+                    .body(Body::from(
+                        json!({"prompt":["hello","world"],"max_tokens":1}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("single prompt")
+        );
+    }
+    #[tokio::test]
     async fn legacy_completion_uses_common_sampling_defaults_biases_and_stream_usage() {
         let router = app(tiny_state());
         let body = json!({"prompt":"hello","temperature":0,"max_tokens":2,

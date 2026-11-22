@@ -135,8 +135,8 @@ reports an actionable non-monotonic-decoder error instead of retracting bytes.
 Native transport consumes those canonical text events without decoding again.
 The full engine library passed 611 tests, with one existing external FIM-model
 ignore. OpenAI chat/completion HTTP tests compare streamed and buffered text,
-including tokenizer-inserted spaces. Legacy OpenAI completion prompt batching remains a follow-up; generation-control
-and default-model parity is covered below.
+including tokenizer-inserted spaces. Legacy OpenAI completion generation controls, default-model behavior and prompt
+batching are covered below.
 
 Engine-text checks: strict engine/server all-target Clippy, all 71 CLI library
 tests and the 291-asset provenance check pass. The server regression run covered
@@ -154,3 +154,28 @@ streamed usage and text, terminate on a declared stop with max_tokens=-1, and
 exercise malformed and unknown fields. Full server: 388 passed / 2 inherited
 ignores; all 27 native/alternate protocol tests and strict all-target Clippy pass
 after the error-path and source-order lint fixes.
+
+OpenAI batching follow-up: `/v1/completions` accepts text, token rows, mixed
+rows, text prompt objects and outer prompt batches using the same classifier
+and insertion policy as native completions. One immutable sampling object is
+shared across batch inputs. All prompts and output budgets are prepared before
+model work, with the common positive prompt-count bound. Buffered responses
+combine indexed choices and true summed usage; SSE retains one ID, indexed
+choice finishes, one aggregate usage frame and one DONE terminator. Explicit
+conversation headers are refused for multi-prompt requests. Delivery failures,
+truncated sources and disconnects never manufacture completed usage; a failed
+input aborts subsequent submissions. Canonical text chunks now also back the
+legacy/chat probability stream content, fixing tokenizer separator loss there.
+Real ONNX batch tests cover all input shapes with/without logprobs, exact totals,
+indices, pre-header validation and single-prompt conversation constraints.
+
+Batch ownership checks: native batches now retain one resolved model handle
+through all preparation and execution, so concurrent admin reloads cannot mix
+tokenizer/model versions inside a request. Multi-prompt legacy workflow-output
+extras carry prompt_index around the unchanged runtime publication, preserving
+input ownership in both buffered JSON and SSE. Single-input records keep their
+existing shape.
+
+OpenAI-batch validation: full server library 392 passed / 2 inherited ignores.
+After the final model-snapshot and publication-ownership checks, all 29 selected
+native/alternate-protocol tests and strict all-target Clippy pass.

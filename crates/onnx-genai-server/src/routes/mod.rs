@@ -53,7 +53,7 @@ mod images;
 pub(crate) mod llama;
 mod multimodal;
 pub(crate) mod native;
-mod prompt;
+pub(crate) mod prompt;
 pub(crate) mod ranking;
 mod sessions;
 mod speech;

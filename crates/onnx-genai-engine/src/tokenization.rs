@@ -47,10 +47,7 @@ impl TokenTextDecoder {
 }
 
 /// Decode a committed token batch with the same boundaries as live generation.
-pub(crate) fn token_texts(
-    tokenizer: Option<&Tokenizer>,
-    ids: &[u32],
-) -> anyhow::Result<Vec<String>> {
+pub fn token_texts(tokenizer: Option<&Tokenizer>, ids: &[u32]) -> anyhow::Result<Vec<String>> {
     let Some(tokenizer) = tokenizer else {
         return Ok(vec![String::new(); ids.len()]);
     };

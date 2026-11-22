@@ -4,30 +4,104 @@ use crate::tool_protocol::{self, ToolOutputConstraint, ToolProtocol};
 pub(crate) async fn completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    ApiJson(mut request): ApiJson<CompletionRequest>,
+    ApiJson(mut body): ApiJson<serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Response, ApiError> {
-    validate_completion_request(&request, &state.config)?;
-    let handle = resolve_model(&state.registry, &request.sampling.model).await?;
-    request.sampling.model = handle.id.clone();
+    let prompt = body
+        .remove("prompt")
+        .ok_or_else(|| ApiError::invalid_request("prompt is required for completions"))?;
+    let super::prompt::PromptBatch { first, rest } =
+        super::prompt::PromptBatch::parse(prompt, state.config.max_completion_prompts)?;
     let session_id = session_id_from_headers(&headers)?;
-    if request.suffix.is_some() && handle.fim_config.is_none() {
+    if !rest.is_empty() && session_id.is_some() {
         return Err(ApiError::invalid_request(
-            "FIM is not supported by this model because its tokenizer configuration does not declare recognized FIM tokens",
+            "X-Session-Id requires a single prompt; send independent batch prompts without a conversation header",
         ));
     }
-    if request.suffix.is_some() && session_id.is_some() {
+    body.insert("prompt".into(), first);
+    let first: CompletionRequest =
+        serde_path_to_error::deserialize(serde_json::Value::Object(body)).map_err(|error| {
+            ApiError::invalid_request(format!("invalid completion request: {error}"))
+        })?;
+    validate_completion_request(&first, &state.config)?;
+    let mut requests = Vec::with_capacity(rest.len());
+    for (index, prompt) in rest.into_iter().enumerate() {
+        requests.push(CompletionRequest {
+            prompt: super::prompt::MixedPrompt::parse_completion(prompt).map_err(|error| {
+                ApiError::invalid_request(format!("prompt[{}]: {error}", index + 1))
+            })?,
+            suffix: first.suffix.clone(),
+            logprobs: first.logprobs,
+            sampling: Arc::clone(&first.sampling),
+        });
+    }
+    let handle = resolve_model(&state.registry, &first.sampling.model).await?;
+    if first.suffix.is_some() && handle.fim_config.is_none() {
+        return Err(ApiError::invalid_request(
+            "suffix requires a model declaring FIM tokens; choose a FIM-capable package or omit suffix",
+        ));
+    }
+    if first.suffix.is_some() && session_id.is_some() {
         return Err(ApiError::invalid_request(
             "X-Session-Id is not supported for FIM completions",
         ));
     }
-
-    if request.sampling.stream {
-        Ok(stream_completion(state, handle, request, session_id)
-            .await?
-            .into_response())
-    } else {
-        Ok(Json(run_completion(state, handle, request, session_id).await?).into_response())
+    let prepare = |request: &CompletionRequest| -> Result<PreparedCompletion, ApiError> {
+        let mut prepared = prepare_completion(request, &handle, state.config.max_output_tokens)?;
+        let prompt_tokens = prepared.prompt_tokens;
+        admit_completion_output(
+            &mut prepared,
+            request,
+            prompt_tokens,
+            &state.config,
+            handle.model_max_context,
+        )?;
+        Ok(prepared)
+    };
+    let first_prepared = prepare(&first)?;
+    let mut rest = Vec::with_capacity(requests.len());
+    for (index, request) in requests.into_iter().enumerate() {
+        let prepared = prepare(&request).map_err(|error| ApiError {
+            message: format!("prompt[{}]: {}", index + 1, error.message),
+            ..error
+        })?;
+        rest.push((request, prepared));
     }
+    if first.sampling.stream {
+        return Ok(
+            stream_completions(state, handle, (first, first_prepared), rest, session_id)
+                .await?
+                .into_response(),
+        );
+    }
+    let is_batch = !rest.is_empty();
+    let mut response = run_completion(
+        &state,
+        &handle,
+        first,
+        first_prepared,
+        session_id.as_deref(),
+    )
+    .await?;
+    if is_batch {
+        response.workflow_outputs = index_completion_publications(response.workflow_outputs, 0);
+    }
+    for (index, (request, prepared)) in rest.into_iter().enumerate() {
+        let next = run_completion(&state, &handle, request, prepared, None).await?;
+        add_completion_usage(&mut response.usage, &next.usage)?;
+        response
+            .choices
+            .extend(next.choices.into_iter().map(|mut choice| {
+                choice.index = index + 1;
+                choice
+            }));
+        response
+            .workflow_outputs
+            .extend(index_completion_publications(
+                next.workflow_outputs,
+                index + 1,
+            ));
+    }
+    Ok(Json(response).into_response())
 }
 
 pub(crate) async fn embeddings(
@@ -144,238 +218,333 @@ fn validate_embedding_request(
     }
 }
 
+fn index_completion_publications(
+    publications: Vec<serde_json::Value>,
+    index: usize,
+) -> Vec<serde_json::Value> {
+    publications
+        .into_iter()
+        .map(|publication| serde_json::json!({"prompt_index":index,"publication":publication}))
+        .collect()
+}
+struct StartedCompletion {
+    events: mpsc::Receiver<DriverEvent>,
+    prompt_tokens: usize,
+}
+fn admit_completion_output(
+    prepared: &mut PreparedCompletion,
+    request: &CompletionRequest,
+    prompt_tokens: usize,
+    config: &ServerConfig,
+    max_context: Option<usize>,
+) -> Result<(), ApiError> {
+    prepared.generation.options_mut().max_new_tokens = admit_output_budget(
+        &request.sampling,
+        prompt_tokens,
+        request.sampling.output_budget(config.max_output_tokens),
+        max_context,
+    )?;
+    Ok(())
+}
+fn add_completion_usage(total: &mut Usage, next: &Usage) -> Result<(), ApiError> {
+    let overflow = || {
+        ApiError::internal(
+            "completion batch usage overflow; reduce the prompt count or output budget",
+        )
+    };
+    total.prompt_tokens = total
+        .prompt_tokens
+        .checked_add(next.prompt_tokens)
+        .ok_or_else(overflow)?;
+    total.completion_tokens = total
+        .completion_tokens
+        .checked_add(next.completion_tokens)
+        .ok_or_else(overflow)?;
+    total.total_tokens = total
+        .prompt_tokens
+        .checked_add(total.completion_tokens)
+        .ok_or_else(overflow)?;
+    Ok(())
+}
+async fn start_completion(
+    state: &AppState,
+    handle: &ModelHandle,
+    request: &CompletionRequest,
+    mut prepared: PreparedCompletion,
+    client_session_id: Option<&str>,
+) -> Result<StartedCompletion, ApiError> {
+    let conversational = conversational_session_id(&prepared.generation, client_session_id);
+    let lease = lease_bound_session(handle, &state.sessions, conversational)?;
+    let carried_tokens = carried_session_tokens(handle, lease.as_ref()).await?;
+    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
+    admit_completion_output(
+        &mut prepared,
+        request,
+        prompt_tokens,
+        &state.config,
+        handle.model_max_context,
+    )?;
+    let session = open_session_after_admission(state, handle, conversational, lease).await?;
+    let generation = submit_completion(handle, prepared.generation, session).await?;
+    await_driver_admission(generation.admission).await?;
+    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
+    Ok(StartedCompletion {
+        events: generation.events,
+        prompt_tokens,
+    })
+}
 async fn run_completion(
-    state: AppState,
-    handle: Arc<ModelHandle>,
+    state: &AppState,
+    handle: &ModelHandle,
     request: CompletionRequest,
-    client_session_id: Option<String>,
+    prepared: PreparedCompletion,
+    client_session_id: Option<&str>,
 ) -> Result<CompletionResponse, ApiError> {
     let id = text_completion_id();
     let created = now_unix();
-    let model = request.sampling.model.clone();
-    let requested_logprobs = request.logprobs;
-    let user_stop_sequences = request
+    let started = start_completion(state, handle, &request, prepared, client_session_id).await?;
+    let collected = collect_generation_with_publications(started.events)
+        .await
+        .map_err(generation_failure)?;
+    let result = collected.result;
+    let completion_tokens = result.token_ids.len();
+    let stops = request
         .sampling
         .stop
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
-    let tokenizer = handle.tokenizer.clone();
-    let mut prepared = prepare_completion(&request, &handle, state.config.max_output_tokens)?;
-    let conversational =
-        conversational_session_id(&prepared.generation, client_session_id.as_deref());
-    // Before the first driver round trip, so a second turn on a live session is
-    // refused here rather than queued behind the turn it conflicts with.
-    let lease = lease_bound_session(&handle, &state.sessions, conversational)?;
-    let carried_tokens = carried_session_tokens(&handle, lease.as_ref()).await?;
-    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
-    let output_budget = admit_output_budget(
-        &request.sampling,
-        prompt_tokens,
-        request
-            .sampling
-            .output_budget(state.config.max_output_tokens),
-        handle.model_max_context,
-    )?;
-    prepared.generation.options_mut().max_new_tokens = output_budget;
-    let session = open_session_after_admission(&state, &handle, conversational, lease).await?;
-    let generation = submit_completion(&handle, prepared.generation, session).await?;
-    let collected = collect_generation_with_publications(generation.events)
-        .await
-        .map_err(generation_failure)?;
-    let result = collected.result;
-    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
-    let completion_tokens = result.token_ids.len();
-    let logprobs = completion_logprobs(&result, &tokenizer, requested_logprobs)
-        .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
-
+    let logprobs = completion_logprobs(&result, &handle.tokenizer, request.logprobs)
+        .map_err(|error| ApiError::internal(format!("logprobs conversion failed: {error:#}")))?;
     Ok(CompletionResponse {
         id,
         object: "text_completion",
         created,
-        model,
+        model: handle.id.clone(),
         choices: vec![CompletionChoice {
-            text: text_before_stop(&result.text, &user_stop_sequences).to_owned(),
+            text: text_before_stop(&result.text, &stops).to_owned(),
             index: 0,
             finish_reason: finish_reason_label(&result.finish_reason),
             logprobs,
         }],
         usage: Usage {
-            prompt_tokens,
+            prompt_tokens: started.prompt_tokens,
             completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
+            total_tokens: started.prompt_tokens + completion_tokens,
         },
         workflow_outputs: collected.publications,
     })
 }
-
-async fn stream_completion(
+enum CompletionDelivery {
+    Finished(Usage),
+    Failed(DriverFailure),
+    Disconnected,
+}
+async fn deliver_completion(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    response: (&str, u64, &str, usize),
+    mut started: StartedCompletion,
+    tokenizer: &Tokenizer,
+    logprobs: Option<usize>,
+    stops: &[String],
+    is_batch: bool,
+) -> anyhow::Result<CompletionDelivery> {
+    let (id, created, model, index) = response;
+    let mut stop_buffer = StopBoundaryBuffer::new(stops.to_vec());
+    let mut emitted = false;
+    let result = loop {
+        match tokio::select! { _=tx.closed()=>return Ok(CompletionDelivery::Disconnected),event=started.events.recv()=>event }
+        {
+            Some(DriverEvent::Token(token)) => {
+                if logprobs.is_some() {
+                    continue;
+                }
+                let text = stop_buffer.push(&token.text);
+                if !text.is_empty() {
+                    emitted = true;
+                    send_completion_stream_chunk(
+                        tx,
+                        completion_chunk(id, created, model, index, text, None),
+                    )
+                    .await?;
+                }
+                if matches!(token.finish_reason, Some(FinishReason::StopSequence { .. })) {
+                    stop_buffer.pending.clear();
+                }
+            }
+            Some(DriverEvent::WorkflowPublications(publications)) => {
+                let publications = if is_batch {
+                    index_completion_publications(publications, index)
+                } else {
+                    publications
+                };
+                send_workflow_publications(tx, &publications).await?
+            }
+            Some(DriverEvent::Finished(result)) => break result,
+            Some(DriverEvent::Error(error)) => return Ok(CompletionDelivery::Failed(error)),
+            None => {
+                return Ok(CompletionDelivery::Failed(DriverFailure::internal(
+                    "generation stream ended before its final result; retry the request",
+                )));
+            }
+        }
+    };
+    if let Some(logprobs) = logprobs {
+        send_completion_logprob_chunks(tx, response, &result, tokenizer, logprobs, stops).await?;
+    } else if !emitted {
+        let text = text_before_stop(&result.text, stops).to_owned();
+        if !text.is_empty() {
+            send_completion_stream_chunk(
+                tx,
+                completion_chunk(id, created, model, index, text, None),
+            )
+            .await?;
+        }
+    } else if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
+        let text = stop_buffer.flush();
+        if !text.is_empty() {
+            send_completion_stream_chunk(
+                tx,
+                completion_chunk(id, created, model, index, text, None),
+            )
+            .await?;
+        }
+    }
+    send_completion_stream_chunk(
+        tx,
+        completion_done_chunk(
+            id,
+            created,
+            model,
+            index,
+            finish_reason_label(&result.finish_reason),
+        ),
+    )
+    .await?;
+    let completion_tokens = result.token_ids.len();
+    Ok(CompletionDelivery::Finished(Usage {
+        prompt_tokens: started.prompt_tokens,
+        completion_tokens,
+        total_tokens: started.prompt_tokens + completion_tokens,
+    }))
+}
+async fn send_completion_error(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    error: ApiError,
+    index: usize,
+) -> anyhow::Result<()> {
+    tx.send(Ok(Event::default().event("error").data(serde_json::json!({"error":{"code":error.status.as_u16(),"message":error.message,"type":error.kind},"index":index}).to_string())))
+        .await.context("completion error receiver closed")?;
+    Ok(())
+}
+async fn stream_completions(
     state: AppState,
     handle: Arc<ModelHandle>,
-    request: CompletionRequest,
+    first: (CompletionRequest, PreparedCompletion),
+    rest: Vec<(CompletionRequest, PreparedCompletion)>,
     client_session_id: Option<String>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
-    let id = text_completion_id();
-    let created = now_unix();
-    let model = request.sampling.model.clone();
-    let requested_logprobs = request.logprobs;
+    let is_batch = !rest.is_empty();
+    let (request, prepared) = first;
+    let started = start_completion(
+        &state,
+        &handle,
+        &request,
+        prepared,
+        client_session_id.as_deref(),
+    )
+    .await?;
     let include_usage = request.sampling.stream_options.include_usage;
-    let tokenizer = handle.tokenizer.clone();
-    let user_stop_sequences = request
+    let logprobs = request.logprobs;
+    let stops = request
         .sampling
         .stop
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
-    let mut prepared = prepare_completion(&request, &handle, state.config.max_output_tokens)?;
-    let conversational =
-        conversational_session_id(&prepared.generation, client_session_id.as_deref());
-    // Before the first driver round trip, so a second turn on a live session is
-    // refused here rather than queued behind the turn it conflicts with.
-    let lease = lease_bound_session(&handle, &state.sessions, conversational)?;
-    let carried_tokens = carried_session_tokens(&handle, lease.as_ref()).await?;
-    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
-    let output_budget = admit_output_budget(
-        &request.sampling,
-        prompt_tokens,
-        request
-            .sampling
-            .output_budget(state.config.max_output_tokens),
-        handle.model_max_context,
-    )?;
-    prepared.generation.options_mut().max_new_tokens = output_budget;
-    let session = open_session_after_admission(&state, &handle, conversational, lease).await?;
-    let generation = submit_completion(&handle, prepared.generation, session).await?;
-    await_driver_admission(generation.admission).await?;
-    let mut driver_rx = generation.events;
-    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
+    let id = text_completion_id();
+    let created = now_unix();
+    let model = handle.id.clone();
     let (tx, rx) = mpsc::channel(16);
-
     tokio::spawn(async move {
-        let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
-        let mut emitted_text = false;
-        let result = loop {
-            match tokio::select! {
-                _ = tx.closed() => return Ok(()),
-                event = driver_rx.recv() => event,
-            } {
-                Some(DriverEvent::Token(token)) => {
-                    if requested_logprobs.is_some() {
-                        continue;
-                    }
-                    let finish_reason = token.finish_reason.clone();
-                    let text = stop_buffer.push(&token.text);
-                    if !text.is_empty() {
-                        emitted_text = true;
-                        send_completion_stream_chunk(
-                            &tx,
-                            completion_chunk(&id, created, &model, text, None),
-                        )
-                        .await?;
-                    }
-                    if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
-                        stop_buffer.pending.clear();
-                    }
-                }
-                Some(DriverEvent::WorkflowPublications(publications)) => {
-                    send_workflow_publications(&tx, &publications).await?;
-                }
-                Some(DriverEvent::Finished(result)) => break Ok(result),
-                Some(DriverEvent::Error(error)) => break Err(error),
-                None => {
-                    break Err(DriverFailure::internal(
-                        "generation stream ended before result",
-                    ));
-                }
-            }
+        let mut current = started;
+        let mut rest = rest.into_iter();
+        let mut index = 0;
+        let mut total = Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
         };
-
-        match result {
-            Ok(result) => {
-                let completion_tokens = result.token_ids.len();
-                if let Some(requested_logprobs) = requested_logprobs {
-                    send_completion_logprob_chunks(
-                        &tx,
-                        (&id, created, &model),
-                        &result,
-                        &tokenizer,
-                        requested_logprobs,
-                        &user_stop_sequences,
-                    )
-                    .await?;
-                } else if !emitted_text && !result.text.is_empty() {
-                    send_completion_stream_chunk(
-                        &tx,
-                        completion_chunk(
-                            &id,
-                            created,
-                            &model,
-                            text_before_stop(&result.text, &user_stop_sequences).to_owned(),
-                            None,
-                        ),
-                    )
-                    .await?;
-                } else if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                    let text = stop_buffer.flush();
-                    if !text.is_empty() {
-                        send_completion_stream_chunk(
-                            &tx,
-                            completion_chunk(&id, created, &model, text, None),
-                        )
-                        .await?;
+        let mut failed = false;
+        loop {
+            match deliver_completion(
+                &tx,
+                (&id, created, &model, index),
+                current,
+                &handle.tokenizer,
+                logprobs,
+                &stops,
+                is_batch,
+            )
+            .await
+            {
+                Ok(CompletionDelivery::Finished(usage)) => {
+                    if let Err(error) = add_completion_usage(&mut total, &usage) {
+                        send_completion_error(&tx, error, index).await?;
+                        failed = true;
+                        break;
                     }
                 }
-                send_completion_stream_chunk(
-                    &tx,
-                    completion_done_chunk(
-                        &id,
-                        created,
-                        &model,
-                        finish_reason_label(&result.finish_reason),
-                    ),
-                )
-                .await?;
-                if include_usage {
-                    let usage = CompletionResponse {
-                        id: id.clone(),
-                        object: "text_completion",
-                        created,
-                        model: model.clone(),
-                        choices: Vec::new(),
-                        usage: Usage {
-                            prompt_tokens,
-                            completion_tokens,
-                            total_tokens: prompt_tokens + completion_tokens,
-                        },
-                        workflow_outputs: Vec::new(),
-                    };
-                    tx.send(Ok(Event::default().data(serde_json::to_string(&usage)?)))
-                        .await
-                        .context("completion usage receiver closed")?;
+                Ok(CompletionDelivery::Disconnected) => return Ok(()),
+                Ok(CompletionDelivery::Failed(error)) => {
+                    send_completion_error(&tx, generation_failure(error), index).await?;
+                    failed = true;
+                    break;
+                }
+                Err(error) => {
+                    if tx.is_closed() {
+                        return Ok(());
+                    }
+                    send_completion_error(&tx,ApiError::internal(format!(
+                        "completion output conversion failed for prompt {index}: {error:#}; check the package tokenizer and output contract"
+                    )),index).await?;
+                    failed = true;
+                    break;
                 }
             }
-            Err(err) => {
-                let error = generation_failure(err);
-                tx.send(Ok(Event::default().event("error").data(
-                    serde_json::to_string(&ErrorResponse {
-                        error: ErrorBody {
-                            code: error.status.as_u16(),
-                            message: error.message,
-                            kind: error.kind,
-                        },
-                    })?,
-                )))
-                .await
-                .context("stream receiver closed")?;
+            let Some((request, prepared)) = rest.next() else {
+                break;
+            };
+            index += 1;
+            let started = tokio::select! { biased; _=tx.closed()=>return Ok(()),started=start_completion(&state,&handle,&request,prepared,None)=>started };
+            match started {
+                Ok(started) => current = started,
+                Err(error) => {
+                    send_completion_error(&tx, error, index).await?;
+                    failed = true;
+                    break;
+                }
             }
         }
-
+        if include_usage && !failed {
+            let usage = CompletionResponse {
+                id,
+                object: "text_completion",
+                created,
+                model,
+                choices: Vec::new(),
+                usage: total,
+                workflow_outputs: Vec::new(),
+            };
+            tx.send(Ok(Event::default().data(serde_json::to_string(&usage)?)))
+                .await
+                .context("completion usage receiver closed")?;
+        }
         tx.send(Ok(Event::default().data("[DONE]")))
             .await
-            .context("stream receiver closed")?;
+            .context("completion receiver closed")?;
         Ok::<(), anyhow::Error>(())
     });
-
     Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
@@ -1745,21 +1914,34 @@ pub(crate) fn prepare_completion(
             .fim_config
             .as_ref()
             .ok_or_else(|| ApiError::invalid_request("FIM is not supported by this model"))?;
-        let prompt = fim_config.format_prompt(&request.prompt, suffix);
+        let super::prompt::MixedPrompt::Text(prefix) = &request.prompt else {
+            return Err(ApiError::invalid_request(
+                "suffix requires a text prompt; send text for FIM or omit suffix for token input",
+            ));
+        };
+        let prompt = fim_config.format_prompt(prefix, suffix);
         let prompt_tokens = tokenize_prompt(&handle.tokenizer, &prompt)?;
         Ok(PreparedCompletion {
             generation: CompletionGeneration::Fim {
-                prefix: request.prompt.clone(),
+                prefix: prefix.clone(),
                 suffix: suffix.clone(),
                 options,
             },
             prompt_tokens,
         })
     } else {
-        let token_ids = handle
-            .tokenizer
-            .encode(&request.prompt)
-            .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+        let token_ids = request.prompt.encode(
+            &handle.tokenizer,
+            onnx_genai_ort::TokenizationOptions {
+                add_special: true,
+                parse_special: true,
+            },
+        )?;
+        if token_ids.is_empty() {
+            return Err(ApiError::invalid_request(
+                "prompt must encode to at least one token; send nonempty text or token ids",
+            ));
+        }
         let prompt_tokens = token_ids.len();
         Ok(PreparedCompletion {
             generation: CompletionGeneration::Plain(GenerateRequest {
@@ -2677,20 +2859,17 @@ fn decode_logprob_token(tokenizer: &Tokenizer, token_id: u32) -> anyhow::Result<
 
 async fn send_completion_logprob_chunks(
     tx: &mpsc::Sender<Result<Event, Infallible>>,
-    response: (&str, u64, &str),
+    response: (&str, u64, &str, usize),
     result: &GenerateResult,
     tokenizer: &Tokenizer,
     requested_top_logprobs: usize,
     stop_sequences: &[String],
 ) -> anyhow::Result<()> {
-    let (id, created, model) = response;
+    let (id, created, model, choice_index) = response;
     let logprobs = completion_logprobs(result, tokenizer, Some(requested_top_logprobs))?
         .context("requested completion logprobs were not built")?;
-    let stream_text = result
-        .token_ids
-        .iter()
-        .map(|&token_id| tokenizer.decode(&[token_id]).map_err(anyhow::Error::from))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let stream_text =
+        onnx_genai_engine::tokenization::token_texts(Some(tokenizer), &result.token_ids)?;
     let visible_text = truncate_tokens_at_stop(&stream_text, stop_sequences);
     for (index, text) in visible_text.into_iter().enumerate() {
         if text.is_empty() {
@@ -2702,6 +2881,7 @@ async fn send_completion_logprob_chunks(
                 id,
                 created,
                 model,
+                choice_index,
                 text,
                 Some(CompletionLogprobs {
                     tokens: vec![logprobs.tokens[index].clone()],
@@ -2765,12 +2945,7 @@ async fn send_chat_logprob_chunks(
 
 fn truncate_tokens_at_stop(tokens: &[String], stop_sequences: &[String]) -> Vec<String> {
     let text = tokens.concat();
-    let cutoff = stop_sequences
-        .iter()
-        .filter(|stop| !stop.is_empty())
-        .filter_map(|stop| text.find(stop))
-        .min()
-        .unwrap_or(text.len());
+    let cutoff = text_before_stop(&text, stop_sequences).len();
     let mut cursor = 0;
     let mut visible = Vec::new();
     for token in tokens {
@@ -3559,4 +3734,82 @@ async fn send_usage(
     tx.send(Ok(Event::default().data(data.to_string())))
         .await
         .context("stream receiver closed before usage delivery")
+}
+
+#[cfg(test)]
+mod completion_delivery_tests {
+    use super::*;
+    fn tokenizer() -> Tokenizer {
+        Tokenizer::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn failed_or_truncated_completion_delivery_never_claims_finished_usage() {
+        let tokenizer = tokenizer();
+        for explicit_error in [false, true] {
+            let (source, events) = mpsc::channel(2);
+            if explicit_error {
+                source
+                    .send(DriverEvent::Error(DriverFailure::internal(
+                        "fixture forward failed; retry with a valid input",
+                    )))
+                    .await
+                    .unwrap();
+            }
+            drop(source);
+            let (tx, mut rx) = mpsc::channel(2);
+            let delivery = deliver_completion(
+                &tx,
+                ("id", 1, "model", 3),
+                StartedCompletion {
+                    events,
+                    prompt_tokens: 3,
+                },
+                &tokenizer,
+                None,
+                &[],
+                false,
+            )
+            .await
+            .unwrap();
+            let CompletionDelivery::Failed(error) = delivery else {
+                panic!("unfinished source must fail instead of claiming completed usage");
+            };
+            assert!(error.message.contains(if explicit_error {
+                "fixture forward"
+            } else {
+                "final result"
+            }));
+            assert!(
+                rx.try_recv().is_err(),
+                "an incomplete input must not publish a choice finish frame"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn disconnected_completion_delivery_releases_its_source_without_finishing() {
+        let tokenizer = tokenizer();
+        let (source, events) = mpsc::channel(2);
+        let (tx, rx) = mpsc::channel(2);
+        drop(rx);
+        let delivery = deliver_completion(
+            &tx,
+            ("id", 1, "model", 0),
+            StartedCompletion {
+                events,
+                prompt_tokens: 3,
+            },
+            &tokenizer,
+            None,
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(delivery, CompletionDelivery::Disconnected));
+        assert!(source.is_closed());
+    }
 }

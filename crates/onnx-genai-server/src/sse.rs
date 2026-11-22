@@ -319,6 +319,7 @@ pub(crate) fn completion_chunk(
     id: &str,
     created: u64,
     model: &str,
+    index: usize,
     text: String,
     logprobs: Option<CompletionLogprobs>,
 ) -> CompletionChunk {
@@ -329,7 +330,7 @@ pub(crate) fn completion_chunk(
         model: model.to_string(),
         choices: vec![CompletionChunkChoice {
             text,
-            index: 0,
+            index,
             finish_reason: None,
             logprobs,
         }],
@@ -340,6 +341,7 @@ pub(crate) fn completion_done_chunk(
     id: &str,
     created: u64,
     model: &str,
+    index: usize,
     finish_reason: &'static str,
 ) -> CompletionChunk {
     CompletionChunk {
@@ -349,7 +351,7 @@ pub(crate) fn completion_done_chunk(
         model: model.to_string(),
         choices: vec![CompletionChunkChoice {
             text: String::new(),
-            index: 0,
+            index,
             finish_reason: Some(finish_reason),
             logprobs: None,
         }],

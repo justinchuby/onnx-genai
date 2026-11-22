@@ -130,22 +130,9 @@ pub(crate) async fn completions(
             "prompt is required for native completions; send text, token ids or a prompt batch",
         )
     })?;
-    // A numeric element makes the outer array a single mixed prompt; otherwise
-    // it is a batch, exactly as tokenize_input_prompts in the pinned server.
-    let prompts = match prompt {
-        Value::Array(parts) if !parts.iter().any(Value::is_number) => parts,
-        prompt => vec![prompt],
-    };
-    if prompts.is_empty() || prompts.len() > state.config.max_completion_prompts.get() {
-        return Err(ApiError::invalid_request(format!(
-            "prompt must contain 1..={} prompts; split the batch or raise --max-completion-prompts",
-            state.config.max_completion_prompts
-        )));
-    }
-    let mut prompts = prompts.into_iter();
-    let first = prompts
-        .next()
-        .expect("nonempty prompt batch validated above");
+    let super::prompt::PromptBatch { first, rest } =
+        super::prompt::PromptBatch::parse(prompt, state.config.max_completion_prompts)?;
+    let prompts = rest.into_iter();
     body.insert("prompt".into(), first);
     let first = parse(body, false)?;
     let mut requests = Vec::with_capacity(prompts.len() + 1);
@@ -158,10 +145,13 @@ pub(crate) async fn completions(
             return_tokens: first.return_tokens,
         });
     }
+    validate_native_request(&first, &state.config)?;
+    // One batch retains one admitted package version across admin reloads.
+    let handle = resolve_model(&state.registry, &first.sampling.model).await?;
     let mut prepared = Vec::with_capacity(requests.len() + 1);
-    prepared.push(prepare(&state, first).await?);
+    prepared.push(prepare(&state, first, Arc::clone(&handle))?);
     for request in requests {
-        prepared.push(prepare(&state, request).await?);
+        prepared.push(prepare(&state, request, Arc::clone(&handle))?);
     }
     let mut inputs = prepared.into_iter().enumerate();
     let (index, first) = inputs
@@ -234,12 +224,14 @@ async fn forward_native_batch<T, I, Start, Started>(
         if (&mut source_completed).await.is_err() {
             return;
         }
+        if tx.is_closed() {
+            return;
+        }
         let Some((index, input)) = inputs.next() else {
             let _ = completed.send(());
             break;
         };
-        let output =
-            tokio::select! { _ = tx.closed() => return, output = start(input, index) => output };
+        let output = tokio::select! { biased; _ = tx.closed() => return, output = start(input, index) => output };
         match output {
             Ok(NativeOutput::Stream {
                 receiver,
@@ -262,15 +254,22 @@ pub(crate) async fn infill(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<Map<String, Value>>,
 ) -> Result<Response, ApiError> {
-    Ok(run(prepare(&state, parse(body, true)?).await?, 0)
+    let request = parse(body, true)?;
+    validate_native_request(&request, &state.config)?;
+    let handle = resolve_model(&state.registry, &request.sampling.model).await?;
+    Ok(run(prepare(&state, request, handle)?, 0)
         .await?
         .into_response())
 }
-
-async fn prepare(state: &AppState, request: NativeRequest) -> Result<PreparedNative, ApiError> {
-    super::completions::validate_request(&request.sampling, &state.config)?;
-    super::llama::validate_extensions(&request.sampling)?;
-    let handle = resolve_model(&state.registry, &request.sampling.model).await?;
+fn validate_native_request(request: &NativeRequest, config: &ServerConfig) -> Result<(), ApiError> {
+    super::completions::validate_request(&request.sampling, config)?;
+    super::llama::validate_extensions(&request.sampling)
+}
+fn prepare(
+    state: &AppState,
+    request: NativeRequest,
+    handle: Arc<ModelHandle>,
+) -> Result<PreparedNative, ApiError> {
     let tokens = match &request.prompt {
         MixedPrompt::Text(text) if request.suffix.is_some() => {
             let fim = handle.fim_config.as_ref().ok_or_else(|| {

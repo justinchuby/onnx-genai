@@ -1,16 +1,16 @@
-//! Native text/token mixtures share the upstream insertion policy across routes.
+//! Native and OpenAI prompts share classification and token insertion rules.
 use super::{ApiError, Tokenizer};
 use onnx_genai_ort::TokenizationOptions;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 #[derive(Debug)]
-pub(super) enum PromptPart {
+pub enum PromptPart {
     Text(String),
     Token(u32),
 }
 #[derive(Debug)]
-pub(super) enum MixedPrompt {
+pub enum MixedPrompt {
     Text(String),
     Parts(Vec<PromptPart>),
 }
@@ -20,7 +20,7 @@ impl<'de> Deserialize<'de> for MixedPrompt {
     }
 }
 impl MixedPrompt {
-    pub(super) fn parse_completion(value: Value) -> Result<Self, String> {
+    pub(crate) fn parse_completion(value: Value) -> Result<Self, String> {
         let Value::Object(mut object) = value else {
             return Self::parse(value);
         };
@@ -41,7 +41,7 @@ impl MixedPrompt {
         }
         Self::parse(prompt)
     }
-    pub(super) fn parse(value: Value) -> Result<Self, String> {
+    pub(crate) fn parse(value: Value) -> Result<Self, String> {
         match value {
             Value::String(text) => Ok(Self::Text(text)),
             Value::Array(parts) => parts.into_iter().enumerate().map(|(index, part)| {
@@ -56,7 +56,7 @@ impl MixedPrompt {
             _ => Err("input must be text or an array mixing text and unsigned token ids".into()),
         }
     }
-    pub(super) fn encode(
+    pub(crate) fn encode(
         &self,
         tokenizer: &Tokenizer,
         options: TokenizationOptions,
@@ -88,5 +88,32 @@ impl MixedPrompt {
                 Ok(ids)
             }
         }
+    }
+}
+
+/// A nonempty, bounded outer prompt batch, classified before model work.
+pub(crate) struct PromptBatch {
+    pub(crate) first: Value,
+    pub(crate) rest: Vec<Value>,
+}
+impl PromptBatch {
+    pub(crate) fn parse(value: Value, limit: std::num::NonZeroUsize) -> Result<Self, ApiError> {
+        let prompts = match value {
+            Value::Array(parts) if !parts.iter().any(Value::is_number) => parts,
+            prompt => vec![prompt],
+        };
+        if prompts.is_empty() || prompts.len() > limit.get() {
+            return Err(ApiError::invalid_request(format!(
+                "prompt must contain 1..={limit} prompts; split the batch or raise --max-completion-prompts"
+            )));
+        }
+        let mut prompts = prompts.into_iter();
+        let first = prompts
+            .next()
+            .ok_or_else(|| ApiError::invalid_request("prompt batch must not be empty"))?;
+        Ok(Self {
+            first,
+            rest: prompts.collect(),
+        })
     }
 }

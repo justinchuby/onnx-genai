@@ -25,7 +25,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/detokenize` | `tokens`, optional `model`; preserves special tokens, rejects absent vocabulary IDs |
 | POST | `/apply-template` | Chat request fields; same prompt renderer as chat inference |
 | POST | `/v1/chat/completions`, `/chat/completions` | Buffered/streaming text, tools, reasoning, declared image/audio inputs |
-| POST | `/v1/completions` | OpenAI text/FIM completion with shared generation controls, default model and optional stream usage |
+| POST | `/v1/completions` | OpenAI text/token/mixed prompt batches, shared controls, declared text FIM and optional stream usage |
 | POST | `/v1/embeddings` | Existing OpenAI embedding contract |
 | POST | `/completion`, `/completions`, `/infill` | Native buffered/streaming completion, bounded text/token/mixed batches, declared FIM metadata |
 | POST | `/embedding`, `/embeddings` | Native pooled embeddings with requested normalization |
@@ -86,8 +86,21 @@ before `[DONE]` when `stream_options.include_usage=true`. Text output omits stop
 strings in both buffered and streaming modes. Unknown controls are rejected;
 chat-template fields and tools require the chat endpoint. The default output
 budget follows the configured cap and remaining context; `max_tokens=-1` leaves
-that limit to the server. This endpoint currently accepts one text prompt;
-native `/completion` additionally accepts mixed and batched prompts.
+that limit to the server. Both this endpoint and native `/completion` accept
+text, explicit token IDs, mixed rows and bounded prompt batches. The same outer
+array classification and token insertion policy applies to both protocols.
+OpenAI batches return one response with indexed `choices` and summed prompt/output
+usage. Streams use one completion ID, one finish frame per choice, optional
+aggregate usage and one final `[DONE]`. For multiple prompts, nxrt workflow
+publication extras are wrapped as `{prompt_index, publication}` in buffered
+`workflow_outputs` and `workflow_output` SSE records; the inner runtime record
+keeps its identity and payload. Single-prompt publication records are unchanged.
+Prompts execute sequentially through
+ordinary admission; errors or disconnects prevent later submissions. All inputs
+are prepared before generation. `X-Session-Id` requires a single prompt, and
+`suffix` requires text with declared FIM metadata. The 128-prompt default and
+`--max-completion-prompts` limit apply to both endpoints. Probability streams
+use the common incremental text decoder for their content as well.
 
 The sampler pipeline is nxrt's existing fixed pipeline. Arbitrary `samplers`
 orders, dynamic temperature, thinking budgets, continuation of a final assistant

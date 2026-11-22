@@ -64,7 +64,7 @@ pub struct ServeArgs {
     /// Maximum requested output tokens per chat completion. Falls back to ONNX_GENAI_MAX_OUTPUT_TOKENS.
     #[arg(long, env = "ONNX_GENAI_MAX_OUTPUT_TOKENS", default_value_t = 4096)]
     pub max_output_tokens: usize,
-    /// Maximum native completion prompts in one request.
+    /// Maximum completion prompts in one native or OpenAI request.
     #[arg(long, default_value = "128")]
     pub max_completion_prompts: std::num::NonZeroUsize,
     /// Maximum tokens in one reranking query/document pair.
