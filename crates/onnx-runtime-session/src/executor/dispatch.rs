@@ -2106,9 +2106,9 @@ impl KernelDispatchContext<'_> {
                         requirement.role,
                     )?;
                     *prepared = Some(PreparedWorkspace {
+                        bytes: buffer.len(),
+                        alignment: buffer.alignment(),
                         buffer,
-                        bytes: required,
-                        alignment: requirement.alignment,
                     });
                 }
                 let prepared = prepared.as_mut().ok_or_else(|| {

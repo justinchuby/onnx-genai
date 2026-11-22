@@ -260,7 +260,12 @@ impl EngineMemoryGovernor {
     pub(crate) fn new(device: DeviceMemoryAuthority, host_bytes: u64, disk_bytes: u64) -> Self {
         Self {
             device,
-            local: LedgerGovernor::new(LeaseLedger::new(0, host_bytes, disk_bytes)),
+            local: LedgerGovernor::new(LeaseLedger::new_for_device(
+                DeviceKey::HOST,
+                0,
+                host_bytes,
+                disk_bytes,
+            )),
         }
     }
 
