@@ -203,7 +203,7 @@ fn softmax_rows_native_and_mlas_agree() {
     for &(n, d) in cases {
         let base = values(n * d, 0xdead_beef ^ (n * d) as u64);
         let mut native = base.clone();
-        backend_ab::softmax_rows_native(&mut native, n, d);
+        backend_ab::softmax_rows_native(&mut native, d).unwrap();
 
         // Rows must be probability distributions regardless of route.
         for row in native.chunks(d) {
@@ -215,7 +215,7 @@ fn softmax_rows_native_and_mlas_agree() {
         }
 
         let mut mlas = base.clone();
-        if !backend_ab::softmax_rows_mlas(&mut mlas, n, d) {
+        if !backend_ab::softmax_rows_mlas(&mut mlas, d).unwrap() {
             continue;
         }
         for (index, (a, b)) in mlas.iter().zip(&native).enumerate() {
@@ -234,12 +234,12 @@ fn softmax_stays_normalized_on_extreme_rows() {
     let d = 64;
     let mut row: Vec<f32> = (0..d).map(|i| (i as f32) * 50.0 - 1000.0).collect();
     let mut native = row.clone();
-    backend_ab::softmax_rows_native(&mut native, 1, d);
+    backend_ab::softmax_rows_native(&mut native, d).unwrap();
     assert!(native.iter().all(|v| v.is_finite()));
     let sum: f32 = native.iter().sum();
     assert!((sum - 1.0).abs() < 1e-5, "native sum {sum}");
 
-    if backend_ab::softmax_rows_mlas(&mut row, 1, d) {
+    if backend_ab::softmax_rows_mlas(&mut row, d).unwrap() {
         assert!(
             row.iter().all(|v| v.is_finite()),
             "mlas softmax went non-finite"
@@ -702,7 +702,7 @@ fn the_ledger_records_the_route_that_ran() {
         backend_ab::gemm_f32(backend, &a, &b, &mut c, m, k, n).unwrap();
     }
     let mut data = values(4 * 32, 13);
-    backend_ab::softmax_rows_native(&mut data, 4, 32);
+    backend_ab::softmax_rows_native(&mut data, 32).unwrap();
 
     let seen = dispatch_ledger::snapshot();
     dispatch_ledger::reset();

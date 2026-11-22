@@ -232,7 +232,7 @@ fn scale_mask_softmax_serial(
             }
             None => {}
         }
-        softmax_rows_serial(tile, tile_rows, d);
+        softmax_rows_serial(tile, d);
         row0 += tile_rows;
     }
 }
@@ -260,7 +260,7 @@ fn softmax_rows_with_kernel(
     dst: &mut [f32],
     n: usize,
     d: usize,
-    serial: impl Fn(&[f32], &mut [f32], usize, usize) + Sync,
+    serial: impl Fn(&[f32], &mut [f32], usize) + Sync,
 ) {
     debug_assert_eq!(src.len(), n * d);
     debug_assert_eq!(dst.len(), n * d);
@@ -274,10 +274,10 @@ fn softmax_rows_with_kernel(
         // hands out several chunks per task for balance.
         crate::task_runtime::chunk_runs_mut(dst, block, 1, |first, out| {
             let start = first * block;
-            serial(&src[start..start + out.len()], out, out.len() / d, d);
+            serial(&src[start..start + out.len()], out, d);
         });
     } else {
-        serial(src, dst, n, d);
+        serial(src, dst, d);
     }
 }
 
@@ -327,15 +327,19 @@ fn parallel_rows_per_task(n: usize, d: usize) -> Option<usize> {
 /// `tests/native_vs_mlas_differential.rs` hold the two against each other in
 /// one process.
 #[inline]
-fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
+fn softmax_rows_serial(data: &mut [f32], d: usize) {
     record_softmax_route(data.len());
     #[cfg(feature = "mlas")]
     {
-        mlas_sys::compute_softmax_in_place(data, n, d);
+        if let Some(width) =
+            checked_row_width(data.len(), d).expect("Softmax scheduler must supply complete rows")
+        {
+            mlas_sys::compute_softmax_in_place(data, data.len() / width.get(), width.get());
+        }
     }
     #[cfg(not(feature = "mlas"))]
     {
-        softmax_rows_serial_native(data, n, d);
+        softmax_rows_serial_native(data, d).expect("Softmax scheduler must supply complete rows");
     }
 }
 
@@ -344,15 +348,20 @@ fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
 /// `Output` alone, so this is bit-identical to `dst.copy_from_slice(src)`
 /// followed by the in-place form.
 #[inline]
-fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
+fn softmax_rows_serial_out(src: &[f32], dst: &mut [f32], d: usize) {
     record_softmax_route(src.len());
     #[cfg(feature = "mlas")]
     {
-        mlas_sys::compute_softmax(src, dst, n, d);
+        if let Some(width) =
+            checked_row_width(src.len(), d).expect("Softmax scheduler must supply complete rows")
+        {
+            mlas_sys::compute_softmax(src, dst, src.len() / width.get(), width.get());
+        }
     }
     #[cfg(not(feature = "mlas"))]
     {
-        softmax_rows_serial_out_native(src, dst, n, d);
+        softmax_rows_serial_out_native(src, dst, d)
+            .expect("Softmax scheduler must supply equal complete rows");
     }
 }
 
@@ -412,34 +421,65 @@ mod softmax_neon;
 /// `exp` with AVX2+FMA or NEON (with a scalar fallback). Sharing a
 /// single core is also what keeps the two forms bit-identical - see
 /// `out_of_place_softmax_is_bit_identical_on_pathological_rows`.
-pub fn softmax_rows_serial_native(data: &mut [f32], n: usize, d: usize) {
-    for row in data.chunks_mut(d) {
+/// Row count comes from complete rows of `columns`; invalid geometry is an
+/// error before mutation. Empty storage, including zero-width rows, is a no-op.
+pub fn softmax_rows_serial_native(data: &mut [f32], columns: usize) -> Result<()> {
+    let Some(width) = checked_row_width(data.len(), columns)? else {
+        return Ok(());
+    };
+    for row in data.chunks_exact_mut(width.get()) {
         let ptr = row.as_mut_ptr();
-        // SAFETY: `row` is exactly `d` elements, so `ptr` is valid for `d` f32
-        // reads and writes. This is the in-place case (`src == dst`), which
-        // `softmax_row_core` supports because it loads each block from the
-        // source before storing the corresponding destination block, so no
-        // lane is ever read back after it is written.
-        unsafe { softmax_row_core(ptr as *const f32, ptr, d) };
+        // SAFETY: the borrowed complete row proves the extent directly. Exact
+        // alias is supported, and each source lane is read before its write.
+        unsafe { softmax_row_core(ptr.cast_const(), ptr, row.len()) };
     }
-    let _ = n;
+    Ok(())
 }
 
-/// Portable out-of-place counterpart of [`softmax_rows_serial`]: read `src`,
-/// write `dst`, no copy. Bit-identical to `dst.copy_from_slice(src)` followed by
-/// the in-place form because it calls the *same* [`softmax_row_core`] per row,
-/// reading each `src` element in place of the copied `dst` element it would
-/// otherwise have read.
-pub fn softmax_rows_serial_out_native(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
-    for (srow, drow) in src.chunks(d).zip(dst.chunks_mut(d)) {
-        debug_assert_eq!(srow.len(), d);
-        debug_assert_eq!(drow.len(), d);
-        // SAFETY: `srow` and `drow` are each exactly `d` elements. `softmax_rows`
-        // documents `src`/`dst` as disjoint, so these do not overlap; the core
-        // reads `d` floats from the first pointer and writes `d` to the second.
-        unsafe { softmax_row_core(srow.as_ptr(), drow.as_mut_ptr(), d) };
+/// Contiguous native Softmax with disjoint source/destination slices.
+/// Row count is derived from the slices; malformed extents fail before writes.
+pub fn softmax_rows_serial_out_native(src: &[f32], dst: &mut [f32], columns: usize) -> Result<()> {
+    if src.len() != dst.len() {
+        return Err(EpError::KernelFailed(format!(
+            "Softmax rows: source has {} elements, destination has {}, columns={columns}; supply equal-length buffers containing complete rows",
+            src.len(),
+            dst.len()
+        )));
     }
-    let _ = n;
+    let Some(width) = checked_row_width(src.len(), columns)? else {
+        return Ok(());
+    };
+    for (source, output) in src
+        .chunks_exact(width.get())
+        .zip(dst.chunks_exact_mut(width.get()))
+    {
+        // SAFETY: both complete rows have the same nonzero width and are
+        // disjoint by their Rust borrows. The core extent comes from the slice.
+        unsafe { softmax_row_core(source.as_ptr(), output.as_mut_ptr(), source.len()) };
+    }
+    Ok(())
+}
+
+/// Validate the one independent row dimension before entering a row kernel.
+/// Empty storage is a no-op, including a tensor with a zero-width axis.
+/// NonZeroUsize carries the validated divisor into exact-row iterators/FFI.
+pub(crate) fn checked_row_width(
+    elements: usize,
+    columns: usize,
+) -> Result<Option<std::num::NonZeroUsize>> {
+    if elements == 0 {
+        return Ok(None);
+    }
+    let width = std::num::NonZeroUsize::new(columns).ok_or_else(|| EpError::KernelFailed(format!(
+        "Softmax rows: columns=0 cannot describe {elements} elements; use empty buffers for a zero-width tensor or provide a nonzero column count"
+    )))?;
+    if !elements.is_multiple_of(width.get()) {
+        return Err(EpError::KernelFailed(format!(
+            "Softmax rows: {elements} elements do not form complete rows of {columns} columns ({} trailing elements); supply complete contiguous rows",
+            elements % width.get()
+        )));
+    }
+    Ok(Some(width))
 }
 
 /// The single row reducer shared by the in-place and out-of-place native
@@ -1263,7 +1303,7 @@ mod vectorized_tests {
         ] {
             let src = synthetic(n, d, (n * 31 + d) as u32);
             let mut serial = src.clone();
-            softmax_rows_serial(&mut serial, n, d);
+            softmax_rows_serial(&mut serial, d);
 
             let mut fanned = src.clone();
             softmax_rows_in_place(&mut fanned, n, d);
@@ -1757,5 +1797,91 @@ mod vectorized_tests {
         .execute(&[x.view()], &mut [out.view_mut()])
         .unwrap();
         assert!(out.to_f32().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod native_row_boundaries {
+    use super::*;
+
+    #[test]
+    fn zero_width_empty_native_rows_are_a_no_op() {
+        let mut empty = [];
+        softmax_rows_serial_native(&mut empty, 0).unwrap();
+        softmax_rows_serial_out_native(&[], &mut empty, 0).unwrap();
+    }
+    #[test]
+    fn malformed_native_row_geometry_is_rejected_before_writing() {
+        for columns in [0, 3, usize::MAX] {
+            let mut data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            let before = data;
+            let error = softmax_rows_serial_native(&mut data, columns)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("Softmax rows")
+                    && error.contains(&columns.to_string())
+                    && error.contains('8'),
+                "{error}"
+            );
+            assert_eq!(data, before, "failed in-place validation changed its input");
+            let mut out = [-12345.5; 8];
+            let error = softmax_rows_serial_out_native(&before, &mut out, columns)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Softmax rows"));
+            assert_eq!(
+                out, [-12345.5; 8],
+                "failed output validation wrote a partial row"
+            );
+        }
+    }
+
+    #[test]
+    fn native_row_output_lengths_must_match_before_writing() {
+        for (input_len, output_len, columns) in [(8, 4, 2), (4, 8, 2), (0, 8, 0), (8, 0, 0)] {
+            let input = vec![1.0; input_len];
+            let mut output = vec![-12345.5; output_len];
+            let error = softmax_rows_serial_out_native(&input, &mut output, columns)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("source")
+                    && error.contains("destination")
+                    && error.contains("columns="),
+                "{error}"
+            );
+            assert!(output.iter().all(|&v| v == -12345.5));
+        }
+    }
+
+    #[test]
+    fn native_rows_derive_all_rows_and_handle_empty_storage() {
+        for columns in [0, 1, 8, usize::MAX] {
+            softmax_rows_serial_native(&mut [], columns).unwrap();
+            softmax_rows_serial_out_native(&[], &mut [], columns).unwrap();
+        }
+        let source = [1.0, 1.0, 2.0, 2.0, 7.0, 7.0];
+        let mut inplace = source;
+        softmax_rows_serial_native(&mut inplace, 2).unwrap();
+        assert_eq!(inplace, [0.5; 6]);
+        let mut output = [-12345.5; 6];
+        softmax_rows_serial_out_native(&source, &mut output, 2).unwrap();
+        assert_eq!(output, [0.5; 6]);
+    }
+
+    #[test]
+    fn checked_row_width_never_multiplies_untrusted_dimensions() {
+        assert!(checked_row_width(0, 0).unwrap().is_none());
+        assert!(checked_row_width(0, usize::MAX).unwrap().is_none());
+        assert_eq!(
+            checked_row_width(usize::MAX, usize::MAX)
+                .unwrap()
+                .unwrap()
+                .get(),
+            usize::MAX
+        );
+        assert!(checked_row_width(usize::MAX, 2).is_err());
+        assert!(checked_row_width(1, 0).is_err());
     }
 }
