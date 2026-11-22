@@ -1,0 +1,25 @@
+ir_version: 8
+opset_import { domain: "" version: 11 }
+graph { name: "token_pair_classifier"
+node { input: "input_ids" output: "input_ids.float" op_type: "Cast" attribute { name: "to" i: 1 type: INT } }
+node { input: "attention_mask" output: "attention_mask.float" op_type: "Cast" attribute { name: "to" i: 1 type: INT } }
+node { input: "token_type_ids" output: "token_type_ids.float" op_type: "Cast" attribute { name: "to" i: 1 type: INT } }
+node { input: "one" input: "token_type_ids.float" output: "query_type" op_type: "Sub"  }
+node { input: "query_type" input: "attention_mask.float" output: "query_mask" op_type: "Mul"  }
+node { input: "token_type_ids.float" input: "attention_mask.float" output: "document_mask" op_type: "Mul"  }
+node { input: "input_ids.float" input: "query_mask" output: "query_values" op_type: "Mul"  }
+node { input: "input_ids.float" input: "document_mask" output: "document_values" op_type: "Mul"  }
+node { input: "query_values" output: "query_sum" op_type: "ReduceSum" attribute { name: "axes" ints: 1 type: INTS } attribute { name: "keepdims" i: 0 type: INT } }
+node { input: "document_values" output: "document_sum" op_type: "ReduceSum" attribute { name: "axes" ints: 1 type: INTS } attribute { name: "keepdims" i: 0 type: INT } }
+node { input: "query_sum" input: "query_bias" output: "query_content" op_type: "Sub"  }
+node { input: "query_content" input: "document_sum" output: "difference" op_type: "Sub"  }
+node { input: "difference" output: "distance" op_type: "Abs"  }
+node { input: "distance" output: "logit" op_type: "Neg"  }
+node { input: "logit" output: "score" op_type: "Sigmoid"  }
+input { name: "input_ids" type { tensor_type { elem_type: 7 shape { dim { dim_param: "batch" } dim { dim_param: "sequence" } } } } }
+input { name: "attention_mask" type { tensor_type { elem_type: 7 shape { dim { dim_param: "batch" } dim { dim_param: "sequence" } } } } }
+input { name: "token_type_ids" type { tensor_type { elem_type: 7 shape { dim { dim_param: "batch" } dim { dim_param: "sequence" } } } } }
+output { name: "score" type { tensor_type { elem_type: 1 shape { dim { dim_param: "batch" } } } } }
+initializer { name: "one" data_type: 1 dims: 1 float_data: 1 }
+initializer { name: "query_bias" data_type: 1 dims: 1 float_data: 2 }
+}

@@ -53,6 +53,7 @@ mod images;
 pub(crate) mod llama;
 mod multimodal;
 pub(crate) mod native;
+pub(crate) mod ranking;
 mod sessions;
 mod speech;
 pub(crate) mod transports;

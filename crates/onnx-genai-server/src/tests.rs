@@ -6877,6 +6877,130 @@ mod native_compat {
         }
     }
 
+    fn ranking_state() -> AppState {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/reranking");
+        AppState::load(&root, Some("pair-ranker".into())).unwrap()
+    }
+    #[tokio::test]
+    async fn reranking_aliases_execute_real_pairs_and_return_native_jina_and_tei_shapes() {
+        let router = app(ranking_state());
+        for path in ["/reranking", "/rerank", "/v1/rerank", "/v1/reranking"] {
+            let response = request(
+                router.clone(),
+                path,
+                json!({"query":"hello","documents":["world","hello","the"],"top_n":2}),
+            )
+            .await;
+            let status = response.status();
+            let body = json_body(response).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["model"], "pair-ranker");
+            assert_eq!(body["object"], "list");
+            assert_eq!(body["results"][0]["index"], 1);
+            assert_eq!(body["results"][1]["index"], 0);
+            assert_eq!(body["results"].as_array().unwrap().len(), 2);
+            assert_eq!(body["usage"]["prompt_tokens"], 15);
+            assert!((body["results"][0]["relevance_score"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        }
+        let response=request(router.clone(),"/v1/rerank",json!({"query":{"text":["wor","ld"]},"texts":[{"text":["hel","lo"]},"world"],"return_text":true})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert!(body.is_array());
+        assert_eq!(body[0]["index"], 1);
+        assert_eq!(body[0]["text"], "world");
+        assert!(body[0].get("relevance_score").is_none());
+        let response = request(
+            router.clone(),
+            "/rerank",
+            json!({"query":"hello","documents":["world","hello"],"top_n":0}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["results"], json!([]));
+        assert_eq!(body["usage"]["prompt_tokens"], 10);
+        let response = request(
+            router.clone(),
+            "/rerank",
+            json!({"query":"hello","documents":["hello"],"texts":["world"],"return_text":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert!(body.is_array());
+        assert_eq!(body[0]["text"], "hello");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/props")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            json_body(response).await["nxrt_capabilities"]["reranking"],
+            true
+        );
+    }
+    #[tokio::test]
+    async fn reranking_rejects_unsupported_models_media_and_resource_overruns() {
+        let router = app(ranking_state());
+        for body in [
+            json!({"query":"hello","documents":[]}),
+            json!({"query":{"image":"data:image/png;base64,AAAA"},"documents":["hello"]}),
+            json!({"query":"hello","documents":["hello"],"top_n":-1}),
+            json!({"query":"hello","documents":[{"text":[1]}]}),
+        ] {
+            let response = request(router.clone(), "/rerank", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["type"],
+                "invalid_request_error"
+            );
+        }
+        let response = request(
+            app(tiny_state()),
+            "/rerank",
+            json!({"query":"hello","documents":["hello"]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reranking v1 profile")
+        );
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/reranking");
+        let state = AppState::load_with_config(
+            &root,
+            Some("pair-ranker".into()),
+            ServerConfig {
+                max_rerank_input_tokens: std::num::NonZeroUsize::new(4).unwrap(),
+                max_rerank_documents: std::num::NonZeroUsize::new(1).unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for documents in [json!(["hello"]), json!(["hello", "world"])] {
+            let response = request(
+                app(state.clone()),
+                "/rerank",
+                json!({"query":"hello","documents":documents}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = json_body(response).await;
+            assert!(
+                body["error"]["message"].as_str().unwrap().contains("limit")
+                    || body["error"]["message"].as_str().unwrap().contains("items")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn alternate_protocols_use_real_generation_and_usage() {
         let router = app(tiny_state());

@@ -64,6 +64,12 @@ pub struct ServeArgs {
     /// Maximum requested output tokens per chat completion. Falls back to ONNX_GENAI_MAX_OUTPUT_TOKENS.
     #[arg(long, env = "ONNX_GENAI_MAX_OUTPUT_TOKENS", default_value_t = 4096)]
     pub max_output_tokens: usize,
+    /// Maximum tokens in one reranking query/document pair.
+    #[arg(long, default_value = "8192")]
+    pub max_rerank_input_tokens: std::num::NonZeroUsize,
+    /// Maximum number of documents in one reranking request.
+    #[arg(long, default_value = "128")]
+    pub max_rerank_documents: std::num::NonZeroUsize,
 
     /// Maximum active/retained resumable generations (X-Conversation-Id).
     #[arg(long, default_value_t = 16)]
@@ -161,6 +167,8 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
     ServerConfig {
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
+        max_rerank_input_tokens: args.max_rerank_input_tokens,
+        max_rerank_documents: args.max_rerank_documents,
         max_replay_streams: args.max_replay_streams,
         replay_buffer_bytes: args.replay_buffer_bytes,
         default_reasoning_effort: args.default_reasoning_effort,
@@ -366,5 +374,23 @@ mod tests {
                 .vram_limit,
             ResourceLimit::Auto
         );
+    }
+    #[test]
+    fn reranking_resource_limits_are_positive_and_flow_to_server_config() {
+        let cli = TestCli::parse_from([
+            "test",
+            "model-dir",
+            "--max-rerank-input-tokens",
+            "256",
+            "--max-rerank-documents",
+            "8",
+        ]);
+        let config = server_config_from_args(&cli.serve);
+        assert_eq!(config.max_rerank_input_tokens.get(), 256);
+        assert_eq!(config.max_rerank_documents.get(), 8);
+        for flag in ["--max-rerank-input-tokens", "--max-rerank-documents"] {
+            let error = TestCli::try_parse_from(["test", "model-dir", flag, "0"]).unwrap_err();
+            assert!(error.to_string().contains(flag));
+        }
     }
 }

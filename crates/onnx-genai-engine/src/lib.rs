@@ -28,6 +28,7 @@ pub mod pipeline;
 pub mod pipeline_cache;
 pub(crate) mod platform_capacity;
 pub(crate) mod processors;
+pub mod ranking;
 #[cfg(feature = "native-backend")]
 pub mod runtime_trace;
 pub mod sampling;

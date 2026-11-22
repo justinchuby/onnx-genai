@@ -64,6 +64,7 @@ pub(crate) struct EngineDriver {
     /// What the loaded package's serialized workflow says, read once at
     /// startup. Facts about the document, not about which executor runs it.
     pub(crate) workflow_facts: WorkflowFacts,
+    pub(crate) reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
     /// One lock-free KV mirror per worker. The legacy aggregate fields continue
     /// to report worker 0; debug/status expose this full list.
     pub(crate) worker_kv_telemetry: Arc<Vec<Arc<KvTelemetry>>>,
@@ -190,6 +191,11 @@ pub(crate) enum DriverCommand {
         options: Box<GenerateOptions>,
         admission: oneshot::Sender<Result<(), DriverFailure>>,
         events: mpsc::Sender<DriverEvent>,
+        permit: WorkerPermit,
+    },
+    ScorePair {
+        pair: Box<onnx_genai_engine::ranking::PreparedTokenPair>,
+        reply: oneshot::Sender<anyhow::Result<onnx_genai_engine::ranking::RerankingScore>>,
         permit: WorkerPermit,
     },
     Embed {
@@ -407,6 +413,7 @@ struct EngineWorkerReady {
     memory_strategy_plan: Arc<MemoryStrategyPlan>,
     memory_accounting: Option<EngineMemoryAccounting>,
     workflow_facts: WorkflowFacts,
+    reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
 }
 
 fn prepare_engine_worker<DropProbe>(
@@ -417,7 +424,9 @@ fn prepare_engine_worker<DropProbe>(
     generation_capacity: Arc<Semaphore>,
     drop_probe: DropProbe,
     worker_count: usize,
-) -> (EngineWorkerState<DropProbe>, EngineWorkerReady) {
+) -> anyhow::Result<(EngineWorkerState<DropProbe>, EngineWorkerReady)> {
+    let reranking =
+        onnx_genai_metadata::task_profiles::reranking_contract(engine.metadata())?.map(Arc::new);
     let batching = Arc::new(BatchingReport::from_capability(
         &engine.batching_capability(),
         max_batch,
@@ -445,8 +454,9 @@ fn prepare_engine_worker<DropProbe>(
         memory_strategy_plan,
         memory_accounting,
         workflow_facts,
+        reranking,
     };
-    (
+    Ok((
         EngineWorkerState {
             engine,
             commands: Some(rx),
@@ -460,7 +470,7 @@ fn prepare_engine_worker<DropProbe>(
             _drop_probe: drop_probe,
         },
         ready,
-    )
+    ))
 }
 
 fn worker_start_error(error: WorkerStartError<anyhow::Error>) -> anyhow::Error {
@@ -571,7 +581,7 @@ impl EngineDriver {
                     driver_capacity,
                     drop_probe,
                     worker_count,
-                );
+                )?;
                 Ok((state, (ready_payload, factory, worker_ready)))
             },
             run_engine_driver,
@@ -601,7 +611,7 @@ impl EngineDriver {
                         let engine = factory.build_worker().with_context(|| {
                             format!("failed to construct ORT engine on worker {worker_id}")
                         })?;
-                        Ok(prepare_engine_worker(
+                        prepare_engine_worker(
                             engine,
                             rx,
                             max_batch,
@@ -609,7 +619,7 @@ impl EngineDriver {
                             driver_capacity,
                             (),
                             worker_count,
-                        ))
+                        )
                     },
                     run_engine_driver,
                 )
@@ -636,6 +646,7 @@ impl EngineDriver {
         for (index, ready) in worker_readies.iter().enumerate().skip(1) {
             if ready.batching.supported != first_ready.batching.supported
                 || ready.batching.effective_max_batch != first_ready.batching.effective_max_batch
+                || ready.reranking != first_ready.reranking
                 || ready.workflow_facts.components != first_ready.workflow_facts.components
                 || ready.workflow_facts.graph_components
                     != first_ready.workflow_facts.graph_components
@@ -680,6 +691,7 @@ impl EngineDriver {
                 memory_accounting: first_ready.memory_accounting,
                 batching: first_ready.batching,
                 workflow_facts: first_ready.workflow_facts,
+                reranking: first_ready.reranking,
                 worker_kv_telemetry,
             },
             ready_payload,
@@ -1097,6 +1109,26 @@ impl EngineDriver {
             }
         }
         anyhow::bail!("generation stream ended before result")
+    }
+
+    pub(crate) async fn score_pair(
+        &self,
+        pair: onnx_genai_engine::ranking::PreparedTokenPair,
+    ) -> Result<onnx_genai_engine::ranking::RerankingScore, GenerateSubmitError> {
+        let (commands, permit) = self.reserve_stateless_command()?;
+        let (reply, response) = oneshot::channel();
+        commands
+            .send(DriverCommand::ScorePair {
+                pair: Box::new(pair),
+                reply,
+                permit,
+            })
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+        response
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?
+            .map_err(|error| GenerateSubmitError::Failed(DriverFailure::from_engine_error(&error)))
     }
 
     pub(crate) async fn synthesize_speech(
@@ -1809,6 +1841,7 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
                     | DriverCommand::GenerateFim { .. }
                     | DriverCommand::SynthesizeSpeech { .. }
                     | DriverCommand::Embed { .. }
+                    | DriverCommand::ScorePair { .. }
             )
         })
         .count()
@@ -2189,6 +2222,19 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
                 })
             })();
             let _ = reply.send(result);
+        }
+        DriverCommand::ScorePair {
+            pair,
+            reply,
+            permit: _permit,
+        } => {
+            if !reply.is_closed() {
+                let result = engine.score_token_pair(*pair);
+                if let Ok(score) = &result {
+                    crate::metrics::add_prompt_tokens(score.prompt_tokens);
+                }
+                let _ = reply.send(result);
+            }
         }
         DriverCommand::Embed {
             input_ids,
@@ -3137,6 +3183,7 @@ mod admission_tests {
             .try_send(DriverCommand::ResourceSnapshot(reply))
             .expect("fill command queue");
         let driver = EngineDriver {
+            reranking: None,
             workflow_facts: crate::driver::WorkflowFacts {
                 components: 0,
                 graph_components: 0,
@@ -3493,6 +3540,7 @@ mod admission_tests {
     async fn a_session_on_an_unknown_worker_is_refused() {
         let (commands, _rx) = mpsc::channel(1);
         let driver = EngineDriver {
+            reranking: None,
             workflow_facts: WorkflowFacts {
                 components: 0,
                 graph_components: 0,
@@ -3545,6 +3593,7 @@ mod admission_tests {
     async fn a_turn_that_never_reaches_a_worker_releases_its_lease() {
         let (commands, rx) = mpsc::channel(1);
         let driver = EngineDriver {
+            reranking: None,
             workflow_facts: WorkflowFacts {
                 components: 0,
                 graph_components: 0,

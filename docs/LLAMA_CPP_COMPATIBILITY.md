@@ -118,12 +118,18 @@ Anthropic's `type: error` envelope and preserve retry headers. Stream adapters
 preserve the source error's status and protocol classification after headers
 have been sent.
 
+Native `/rerank`, `/reranking` and their `/v1` aliases execute a declared
+token-pair scoring workflow. Jina `documents` and TEI `texts` response shapes,
+stable score ordering, `top_n`, token usage and bounded input admission are
+supported. Packages must declare the [reranking v1 contract](RERANKING.md);
+ordinary embedding or language models are not advertised as rerankers.
+
 ## Remaining differences
 
 This is a functional Llama Chat integration, not a claim of complete llama-server
 parity. These upstream protocols are still unimplemented:
 
-- Reranking, realtime audio/WebSocket inference and `/v1/systemone`.
+- Multimodal reranking, realtime audio/WebSocket inference and `/v1/systemone`.
 - Slot save/restore, LoRA hot swapping and realtime reasoning control.
 - GGUF/Hugging Face model downloads and deletion.
 

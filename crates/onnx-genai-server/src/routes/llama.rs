@@ -99,7 +99,8 @@ pub(crate) async fn props(
         "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION")),
         "nxrt_capabilities": {
             "resumable_streams": true, "reasoning_control": false,
-            "tools": handle.tool_protocol.is_some(), "custom_sampler_order": false
+            "tools": handle.tool_protocol.is_some(), "custom_sampler_order": false,
+            "reranking": handle.engine.reranking.is_some()
         }
     })))
 }

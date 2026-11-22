@@ -47,7 +47,7 @@ tool indices and incomplete-stream rejection.
 
 This milestone does not check off the full rows above: active-generation browser refresh/reconnect,
 native batching/prefill-only, timing/progress, additional
-sampling and runtime-backed state/adapter/ranking work still need completion.
+sampling and runtime-backed state/adapter work still need completion.
 
 Sampling follow-up: `logit_bias` now lowers OpenAI objects and native token/text
 pairs into one typed engine processor, including explicit bans. Token vocabulary
@@ -93,3 +93,17 @@ batch and special framing is removed only when it matches marker+spelling;
 literal 0xff remains intact. ByteFallback and ByteLevel engine tests, special-token
 framing, invalid-id checks and an HTTP Unicode round-trip pass. Strict server
 all-target Clippy passes.
+
+Reranking follow-up: `/rerank`, `/reranking` and both `/v1` aliases now use a
+metadata-declared token-pair workflow with the package tokenizer's paired IDs,
+attention mask and segment IDs. Jina/TEI shapes, stable ordering, top_n, exact
+non-padding token usage and positive document/token budgets are covered by real
+ONNX HTTP tests. An actual raw-logit workflow is rejected with repair guidance;
+no embedding similarity is substituted for cross-encoder scores. Metadata guards
+cover ambiguous/unsupported profiles, vector scores and mismatched fixed inputs.
+Adapter and slot/state work in the shared delivery row remains outstanding.
+
+Reranking checkpoint: full server library 379 passed / 2 inherited ignores;
+metadata library 76 passed; both real engine ranking tests passed, including
+invalid score rejection. Strict server all-target Clippy and pinned asset checks
+pass. PR remains draft while the remaining compatibility work continues.

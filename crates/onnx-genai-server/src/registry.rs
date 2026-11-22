@@ -974,6 +974,7 @@ mod tests {
     fn stub_engine_driver() -> EngineDriver {
         let (tx, _rx) = mpsc::channel(1);
         EngineDriver {
+            reranking: None,
             workflow_facts: crate::driver::WorkflowFacts {
                 components: 0,
                 graph_components: 0,

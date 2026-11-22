@@ -879,6 +879,9 @@ const KNOWN_PROFILE_KINDS: &[&str] = &[
 /// A required profile must be executable by this reader; an ignorable profile
 /// may be skipped. Unknown core fields still fail through `deny_unknown_fields`.
 fn validate_profiles(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    if let Err(error) = crate::task_profiles::reranking_contract(metadata) {
+        errors.push(error.to_string());
+    }
     let workflow = metadata
         .pipeline
         .as_ref()
