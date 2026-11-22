@@ -1371,7 +1371,14 @@ mod native_silu_contract {
                 let mut input = values(n + rotation);
                 input.drain(..rotation);
                 let mut storage = vec![123.0; n + 2];
-                serial_scope(|| silu_native_f32_slice(&input, &mut storage[1..n + 1]));
+                serial_scope(|| {
+                    // Default builds exercise the actual selected entry point;
+                    // research builds exercise native alongside the MLAS route.
+                    #[cfg(not(feature = "mlas"))]
+                    silu_f32_slice(&input, &mut storage[1..n + 1]);
+                    #[cfg(feature = "mlas")]
+                    silu_native_f32_slice(&input, &mut storage[1..n + 1]);
+                });
                 assert_eq!(storage[0], 123.0);
                 assert_eq!(storage[n + 1], 123.0);
                 for (&x, &got) in input.iter().zip(&storage[1..n + 1]) {
