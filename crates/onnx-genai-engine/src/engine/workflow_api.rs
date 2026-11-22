@@ -267,6 +267,15 @@ impl Engine {
                 ),
             };
         }
+        if !request.request.options.selects_greedily()
+            && request
+                .request
+                .options
+                .dynamic_temperature
+                .is_some_and(|config| config.range > 0.0)
+        {
+            return Err(super::PackageExecutionError::DynamicTemperatureUnavailable.into());
+        }
         // Everything that reaches here runs the declared workflow: a
         // no-decode-core prompt, and any request carrying tensors or component
         // overrides. All of it still shares this runtime's scheduler, and —

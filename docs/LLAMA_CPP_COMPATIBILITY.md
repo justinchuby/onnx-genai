@@ -103,9 +103,15 @@ are prepared before generation. `X-Session-Id` requires a single prompt, and
 use the common incremental text decoder for their content as well.
 
 The sampler pipeline is nxrt's existing fixed pipeline. Arbitrary `samplers`
-orders, dynamic temperature, thinking budgets, continuation of a final assistant
-message and other unsupported active controls are rejected with an
-`invalid_request_error`. Neutral dynamic-temperature settings are accepted.
+orders, thinking budgets, continuation of a final assistant message and other
+unsupported active controls are rejected with an `invalid_request_error`.
+`dynatemp_range` and `dynatemp_exponent` drive entropy-based temperature scaling
+at the temperature stage of that fixed pipeline, using the pinned upstream
+interval and exponent formula. Zero range disables it; temperature zero remains
+greedy. Controls must be finite and non-negative. This processor uses the host
+distribution when the device sampler cannot express it. Authored sampler graphs
+without a dynamic-temperature input contract reject active dynamic temperature
+before execution rather than ignoring it.
 Optional progress/control subscription fields from Llama Chat are accepted, but
 `/props.nxrt_capabilities` advertises resumable streams and reports realtime
 reasoning control as unavailable. Per-token timing/progress events are not promised.

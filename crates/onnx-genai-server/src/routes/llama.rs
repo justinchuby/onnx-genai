@@ -211,8 +211,6 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
             "sse_ping_interval" => value.as_f64().is_some_and(|n| n >= 0.0),
             "cache_prompt" | "ignore_eos" => value.is_boolean(),
             "logit_bias" => value.is_object() || value.is_array(),
-            "dynatemp_range" => value.as_f64() == Some(0.0),
-            "dynatemp_exponent" => value.as_f64() == Some(1.0),
             "dry_penalty_last_n" => value
                 .as_i64()
                 .is_some_and(|n| n == -1 || usize::try_from(n).is_ok()),

@@ -14,6 +14,10 @@
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PackageExecutionError {
     #[error(
+        "dynatemp_range requires a runtime-owned token-policy executor; this authored workflow sampler declares no dynamic-temperature input contract. Select a package with runtime-owned sampling or set dynatemp_range=0"
+    )]
+    DynamicTemperatureUnavailable,
+    #[error(
         "native prompt replacement would overwrite committed decoder state, but this backend cannot capture a complete atomic-turn checkpoint. Append beyond the cached prefix, reset this session explicitly, or select a backend with complete state snapshots; the request was refused before mutation"
     )]
     NativePromptReplacementUnavailable,

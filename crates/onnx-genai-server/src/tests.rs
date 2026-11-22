@@ -5814,6 +5814,13 @@ async fn a_cancelled_client_does_not_leak_its_session_lease() {
 fn capability_refusals_map_to_the_status_their_variant_means() {
     use onnx_genai_engine::PackageExecutionError;
 
+    let dynamic = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageExecutionError::DynamicTemperatureUnavailable,
+    ));
+    let response = crate::routes::generation_failure(dynamic);
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert!(response.message.contains("dynatemp_range"));
+
     let replacement = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
         PackageExecutionError::NativePromptReplacementUnavailable,
     ));
@@ -6255,7 +6262,7 @@ mod llama_compat {
                 .ends_with("data: [DONE]\n\n")
         );
         for (key, value) in [
-            ("dynatemp_range", json!(0.2)),
+            ("dynatemp_range", json!(-0.2)),
             ("samplers", json!(["temperature"])),
             ("thinking_budget_tokens", json!(32)),
         ] {
@@ -6479,6 +6486,66 @@ mod native_compat {
             .await
             .unwrap()
     }
+    #[tokio::test]
+    async fn native_dynamic_temperature_matches_the_entropy_interval_endpoint() {
+        let router = app(tiny_state());
+        // Exponent zero maps every distribution to the upper endpoint. A real
+        // seeded decoder must agree with that fixed temperature, not the base.
+        let mut changed_from_base = false;
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    match id {
+                        5 => json!(1.0),
+                        6 => json!(0.0),
+                        _ => json!(false),
+                    },
+                )
+            })
+            .collect();
+        for seed in 0..8 {
+            let mut dynamic = json!({"prompt":"hello","n_predict":4,"temperature":0.1,
+                "dynatemp_range":1.4,"dynatemp_exponent":0.0,"seed":seed,"return_tokens":true,"ignore_eos":true,"logit_bias":bias});
+            let response = request(router.clone(), "/completion", dynamic.clone()).await;
+            let status = response.status();
+            let actual = json_body(response).await;
+            assert_eq!(status, StatusCode::OK, "{actual}");
+            dynamic["temperature"] = json!(1.5);
+            dynamic["dynatemp_range"] = json!(0.0);
+            let response = request(router.clone(), "/completion", dynamic.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let expected = json_body(response).await;
+            assert_eq!(actual["tokens"], expected["tokens"], "seed {seed}");
+            assert_eq!(actual["content"], expected["content"], "seed {seed}");
+            dynamic["temperature"] = json!(0.1);
+            let response = request(router.clone(), "/completion", dynamic).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            changed_from_base |= actual["tokens"] != json_body(response).await["tokens"];
+        }
+        assert!(
+            changed_from_base,
+            "this fixture must distinguish active dynamic temperature from an ignored range"
+        );
+        for (field, value) in [
+            ("dynatemp_range", json!(-1)),
+            ("dynatemp_exponent", json!(-0.1)),
+            ("dynatemp_exponent", json!("steep")),
+            ("dynatemp_range", json!(1e100)),
+        ] {
+            let mut body = json!({"prompt":"hello","n_predict":1});
+            body[field] = value;
+            let response = request(router.clone(), "/completion", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                json_body(response).await["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(field)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn native_completion_aliases_return_real_counts_tokens_and_stop_state() {
         let router = app(tiny_state());

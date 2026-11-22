@@ -320,3 +320,26 @@ Full native engine: 795 passed / 1 inherited ignore; full server: 392 passed /
 2 inherited ignores. The final canonical-role regression and strict native
 engine/server all-target Clippy pass. Device-resident complete checkpoints and
 the remaining compatibility features, conformance, review and merge remain open.
+
+Dynamic-temperature follow-up: `dynatemp_range` and `dynatemp_exponent` now lower
+into a typed entropy-temperature processor instead of accepting only neutral
+values. The interval and exponent formula follows the pinned upstream
+[`llama_sampler_temp_ext_apply`](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-sampler.cpp).
+The processor occupies nxrt's existing temperature stage; custom sampler order
+remains outstanding. Zero range disables adaptation, zero temperature retains
+greedy mode, and non-finite/negative controls fail with their field names.
+A distinct processor capability prevents the fixed device sampler from silently
+substituting a constant temperature. Authored sampler graphs without a matching
+input contract refuse active dynamic temperature before admission through a typed
+400 package-capability error. Formula, point-mass, custom/greedy chain, model
+sampling-default and actual seeded HTTP endpoint-equivalence tests accompany the
+change, including a fixed-base control that must produce different tokens.
+
+Dynamic-temperature validation after integrating main through #2430: full native
+engine library 799 passed / 1 inherited ignore; the authored-sampler refusal
+integration filter selected and passed one test; full server library 394 passed /
+2 inherited ignores. Strict all-target engine/server Clippy and the native
+benchmark library/profiling-bin Clippy pass. The seeded HTTP test also proves
+that disabling adaptation changes the fixture's output, so an ignored control
+cannot satisfy endpoint equivalence. PR remains draft while the other ledger
+items are implemented.

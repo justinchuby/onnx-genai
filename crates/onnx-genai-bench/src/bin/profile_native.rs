@@ -397,6 +397,7 @@ fn sampling_chain(args: &Args) -> ProcessorChain {
     if args.temperature > 0.0 && args.temperature != 1.0 {
         chain.add(Box::new(TemperatureProcessor {
             temperature: args.temperature,
+            dynamic: None,
         }));
     }
     if args.top_k > 0 {

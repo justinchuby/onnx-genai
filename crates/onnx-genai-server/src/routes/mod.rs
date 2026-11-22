@@ -606,7 +606,8 @@ pub(crate) fn package_execution_failure(capability: PackageExecutionError) -> Ap
         PackageExecutionError::CandidateTreeExecutionUnavailable { .. } => {
             ApiError::conflict(capability.to_string())
         }
-        PackageExecutionError::CandidateTreeRawWorkflowApi { .. }
+        PackageExecutionError::DynamicTemperatureUnavailable
+        | PackageExecutionError::CandidateTreeRawWorkflowApi { .. }
         | PackageExecutionError::DFlashRawWorkflowApi { .. } => {
             ApiError::invalid_request(capability.to_string())
         }

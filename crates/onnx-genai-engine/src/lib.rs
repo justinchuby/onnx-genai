@@ -47,11 +47,11 @@ pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
 pub use engine::graph_port_contracts;
 pub use engine::{
-    DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, Engine,
-    EngineConfig, EngineConfigError, EngineDecodeBackend, EngineGovernorError,
-    EngineResourceGovernor, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
-    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap,
-    KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
+    DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, DynamicTemperatureConfig,
+    Eagle3Config, Engine, EngineConfig, EngineConfigError, EngineDecodeBackend,
+    EngineGovernorError, EngineResourceGovernor, FinishReason, GenerateConstraint, GenerateOptions,
+    GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
+    GenerationBudgetCap, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
     MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
     OrtEngineWorkerFactory, OrtSessionWorkerLoadError, PackageExecutionError,

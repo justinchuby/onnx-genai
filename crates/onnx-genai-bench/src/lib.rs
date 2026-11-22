@@ -53,7 +53,10 @@ pub fn logit_processor_chain() -> ProcessorChain {
     chain.add(Box::new(PresencePenaltyProcessor {
         presence_penalty: 0.1,
     }));
-    chain.add(Box::new(TemperatureProcessor { temperature: 0.8 }));
+    chain.add(Box::new(TemperatureProcessor {
+        temperature: 0.8,
+        dynamic: None,
+    }));
     chain.add(Box::new(TopKProcessor { top_k: 50 }));
     chain.add(Box::new(TopPProcessor { top_p: 0.9 }));
     chain.add(Box::new(MinPProcessor { min_p: 0.05 }));

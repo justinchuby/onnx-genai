@@ -45,16 +45,17 @@ pub(crate) use std::path::Path;
 pub(crate) use std::sync::Arc;
 
 pub use crate::config::{
-    DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, EngineConfig,
-    EngineConfigError, EngineDecodeBackend, FinishReason, GenerateConstraint, GenerateOptions,
-    GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
-    GenerationBudgetCap, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
-    MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
-    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
-    PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
-    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint, SessionId,
-    SessionPosition, SpeculativeMode, TokenLogprob, ToolCallPolicy, WeightAccessPattern,
-    WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
+    DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, DynamicTemperatureConfig,
+    Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend, FinishReason,
+    GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
+    GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
+    KvConnectorConfig, LayerWeightBytes, LimitParseError, MemoryPolicyApplication, MemoryStrategy,
+    MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
+    MtpConfig, MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest,
+    PrioritizedGenerateResult, RecurrentPrefixCacheStats, RewindTokenCount, SamplingOverrides,
+    ScheduledGenerateArrival, SessionCheckpoint, SessionId, SessionPosition, SpeculativeMode,
+    TokenLogprob, ToolCallPolicy, WeightAccessPattern, WeightPlacementReport, XtcConfig,
+    parse_device_policy, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{

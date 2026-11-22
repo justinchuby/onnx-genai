@@ -1191,6 +1191,15 @@ pub struct XtcConfig {
     pub threshold: f32,
 }
 
+/// Entropy-driven temperature interval around `GenerateOptions::temperature`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DynamicTemperatureConfig {
+    /// Half-width of the temperature interval; zero disables adaptation.
+    pub range: f32,
+    /// Power applied to normalized entropy; zero selects the upper endpoint.
+    pub exponent: f32,
+}
+
 /// User-controllable decoding options for Phase 1 generation.
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
@@ -1198,6 +1207,8 @@ pub struct GenerateOptions {
     pub max_new_tokens: usize,
     /// Temperature applied before sampling. Zero forces greedy selection.
     pub temperature: f32,
+    /// Optional entropy-driven temperature scaling; zero range disables it.
+    pub dynamic_temperature: Option<DynamicTemperatureConfig>,
     /// Nucleus sampling probability. Values >= 1 disable top-p filtering.
     pub top_p: f32,
     /// Keep only the top-k logits before sampling. Zero disables top-k filtering.
@@ -1275,6 +1286,7 @@ impl Default for GenerateOptions {
         Self {
             max_new_tokens: 128,
             temperature: 1.0,
+            dynamic_temperature: None,
             top_p: 1.0,
             top_k: 0,
             min_p: 0.0,
@@ -1561,6 +1573,20 @@ impl GenerateOptions {
         }
         if !self.temperature.is_finite() || self.temperature < 0.0 {
             anyhow::bail!("temperature must be finite and non-negative");
+        }
+        if let Some(dynamic) = self.dynamic_temperature {
+            anyhow::ensure!(
+                dynamic.range.is_finite() && dynamic.range >= 0.0,
+                "dynatemp_range must be finite and non-negative"
+            );
+            anyhow::ensure!(
+                dynamic.exponent.is_finite() && dynamic.exponent >= 0.0,
+                "dynatemp_exponent must be finite and non-negative"
+            );
+            anyhow::ensure!(
+                (self.temperature + dynamic.range).is_finite(),
+                "temperature + dynatemp_range must be finite; reduce the requested range"
+            );
         }
         if !self.top_p.is_finite() || self.top_p < 0.0 {
             anyhow::bail!("top_p must be finite and non-negative");

@@ -20,6 +20,53 @@ use onnx_genai_engine::{
     SessionForkParticipantKind, SessionPosition,
 };
 
+#[test]
+fn authored_sampler_refuses_dynamic_temperature_before_admission() -> anyhow::Result<()> {
+    let mut engine = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let session = engine.create_session()?;
+    let mut request = tokens(&[2, 4, 3], 2);
+    request.options.greedy = false;
+    request.options.temperature = 1.0;
+    request.options.dynamic_temperature = Some(onnx_genai_engine::DynamicTemperatureConfig {
+        range: 0.4,
+        exponent: 1.0,
+    });
+    let mut admitted = false;
+    let error = engine
+        .generate_in_session_with_callbacks(
+            session,
+            request.clone(),
+            Some(&mut || admitted = true),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(
+        onnx_genai_engine::package_execution_error(&error),
+        Some(onnx_genai_engine::PackageExecutionError::DynamicTemperatureUnavailable)
+    );
+    let message = format!("{error:#}");
+    assert!(message.contains("dynatemp_range"), "{message}");
+    assert!(message.contains("runtime-owned token-policy"), "{message}");
+    assert!(!admitted);
+    assert_eq!(engine.session_token_count(session)?, 0);
+    assert!(
+        engine
+            .component_invocations()
+            .values()
+            .all(|&count| count == 0)
+    );
+    // Greedy mode does not ask this graph for a stochastic warper.
+    request.options.greedy = true;
+    assert!(
+        !engine
+            .generate_in_session(session, request)?
+            .token_ids
+            .is_empty()
+    );
+    engine.close_session(session)?;
+    Ok(())
+}
+
 fn decoder_package() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/onnx_genai_workflows/decoder")
 }

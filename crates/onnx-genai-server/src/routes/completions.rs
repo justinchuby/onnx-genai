@@ -1444,6 +1444,21 @@ pub(super) fn validate_request(
         }
     }
     validate_sampling_range(request.temperature, "temperature")?;
+    for (field, value) in [
+        ("dynatemp_range", request.dynatemp_range),
+        ("dynatemp_exponent", request.dynatemp_exponent),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(ApiError::invalid_request(format!(
+                "{field} must be finite and non-negative"
+            )));
+        }
+    }
+    if !(request.temperature.unwrap_or(NEUTRAL_SAMPLING) + request.dynatemp_range).is_finite() {
+        return Err(ApiError::invalid_request(
+            "temperature + dynatemp_range must be finite; reduce the requested range",
+        ));
+    }
     validate_sampling_range(request.top_p, "top_p")?;
     if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
         return Err(ApiError::invalid_request(
@@ -2085,6 +2100,18 @@ fn prepare_generate_request(
     })
 }
 
+fn requests_stochastic_sampling(request: &ChatCompletionRequest) -> bool {
+    request.temperature.is_some_and(|t| t > 0.0)
+        || request.dynatemp_range > 0.0
+        || request.seed.is_some()
+        || request.top_k > 0
+        || request.min_p > 0.0
+        || request.top_a > 0.0
+        || request.typical_p < 1.0
+        || request.mirostat > 0
+        || request.xtc_probability > 0.0
+}
+
 fn build_generate_options(
     request: &ChatCompletionRequest,
     output_budget: usize,
@@ -2092,17 +2119,16 @@ fn build_generate_options(
     // Chat historically used greedy decoding even with its default temperature
     // and top-p fields. Preserve that default while treating the newly exposed
     // stochastic controls as an explicit request to sample.
-    let stochastic_sampling_requested = request.temperature.is_some_and(|t| t > 0.0)
-        || request.seed.is_some()
-        || request.top_k > 0
-        || request.min_p > 0.0
-        || request.top_a > 0.0
-        || request.typical_p < 1.0
-        || request.mirostat > 0
-        || request.xtc_probability > 0.0;
+    let stochastic_sampling_requested = requests_stochastic_sampling(request);
     let mut options = GenerateOptions {
         max_new_tokens: output_budget,
         temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
+        dynamic_temperature: (request.dynatemp_range > 0.0).then_some(
+            onnx_genai_engine::DynamicTemperatureConfig {
+                range: request.dynatemp_range,
+                exponent: request.dynatemp_exponent,
+            },
+        ),
         top_p: request.top_p.unwrap_or(NEUTRAL_SAMPLING),
         top_k: request.top_k,
         min_p: request.min_p,
@@ -2197,14 +2223,7 @@ fn apply_tool_output_constraint(
 /// temperature/top_p/top_k, and only the greedy (do_sample) decision defers to
 /// the model.
 pub(super) fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides {
-    let requests_sampling = request.temperature.is_some_and(|t| t > 0.0)
-        || request.seed.is_some()
-        || request.top_k > 0
-        || request.min_p > 0.0
-        || request.top_a > 0.0
-        || request.typical_p < 1.0
-        || request.mirostat > 0
-        || request.xtc_probability > 0.0;
+    let requests_sampling = requests_stochastic_sampling(request);
     let greedy = if request.temperature == Some(0.0) {
         Some(true)
     } else if requests_sampling {
@@ -3217,6 +3236,28 @@ mod sampling_resolution_tests {
             object.insert(key.clone(), value.clone());
         }
         serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn dynamic_temperature_controls_request_sampling_and_preserves_greedy() {
+        let request = chat_request(json!({"dynatemp_range":0.4,"dynatemp_exponent":2.0}));
+        let mut options = build_generate_options(&request, 4);
+        options.resolve_sampling_defaults(
+            Some(&declared(Some(false), Some(0.8))),
+            &chat_sampling_overrides(&request),
+        );
+        assert!(!options.greedy);
+        assert_eq!(options.temperature, 0.8);
+        assert_eq!(
+            options.dynamic_temperature.unwrap(),
+            onnx_genai_engine::DynamicTemperatureConfig {
+                range: 0.4,
+                exponent: 2.0
+            }
+        );
+        let request = chat_request(json!({"temperature":0.0,"dynatemp_range":0.4}));
+        let options = build_generate_options(&request, 4);
+        assert!(options.selects_greedily());
     }
 
     // A silent chat request against a model that declares do_sample=true now

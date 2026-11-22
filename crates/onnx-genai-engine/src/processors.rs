@@ -150,9 +150,14 @@ pub(crate) fn build_processor_chain(
         return Ok(chain);
     }
 
-    if options.temperature > 0.0 && options.temperature != 1.0 {
+    if (options.temperature > 0.0 && options.temperature != 1.0)
+        || options
+            .dynamic_temperature
+            .is_some_and(|config| config.range > 0.0)
+    {
         chain.add(Box::new(TemperatureProcessor {
             temperature: options.temperature,
+            dynamic: options.dynamic_temperature,
         }));
     }
 
@@ -458,6 +463,37 @@ mod device_portability_tests {
         }
     }
 
+    #[test]
+    fn dynamic_temperature_requires_the_host_distribution_and_valid_controls() {
+        let mut options = GenerateOptions {
+            greedy: false,
+            temperature: 1.0,
+            dynamic_temperature: Some(crate::config::DynamicTemperatureConfig {
+                range: 0.4,
+                exponent: 0.0,
+            }),
+            ..Default::default()
+        };
+        options.validate().unwrap();
+        let chain = build_processor_chain(&options, None, false).unwrap();
+        assert_eq!(chain.names(), vec!["dynamic_temperature"]);
+        assert!(!is_device_portable_chain(&chain));
+        assert_eq!(
+            device_sampling_plan(&chain, &options, false, true, true),
+            DeviceSamplingPlan::Host
+        );
+        for (range, exponent, field) in [
+            (-0.1, 1.0, "dynatemp_range"),
+            (f32::INFINITY, 1.0, "dynatemp_range"),
+            (0.4, f32::NAN, "dynatemp_exponent"),
+            (0.4, -1.0, "dynatemp_exponent"),
+        ] {
+            options.dynamic_temperature =
+                Some(crate::config::DynamicTemperatureConfig { range, exponent });
+            assert!(options.validate().unwrap_err().to_string().contains(field));
+        }
+    }
+
     /// The standard sampling configuration must stay eligible for the device
     /// sampling fast path.
     ///
@@ -496,6 +532,10 @@ mod device_portability_tests {
         GenerateOptions {
             greedy: false,
             temperature: 0.7,
+            dynamic_temperature: Some(crate::config::DynamicTemperatureConfig {
+                range: 0.2,
+                exponent: 1.0,
+            }),
             top_k: 64,
             top_p: 0.95,
             min_p: 0.05,
@@ -516,6 +556,7 @@ mod device_portability_tests {
 
     const WARPER_NAMES: &[&str] = &[
         "temperature",
+        "dynamic_temperature",
         "top_k",
         "top_p",
         "top_k_top_p",
@@ -552,18 +593,33 @@ mod device_portability_tests {
     /// *every* request would pass, and sampling would silently become greedy.
     #[test]
     fn a_sampling_request_builds_every_warper_it_asked_for() {
-        let chain = build_processor_chain(&every_warper(), None, false)
-            .expect("sampling options build a chain");
-        let names = chain.names();
-        for warper in WARPER_NAMES {
-            if *warper == "top_k" || *warper == "top_p" {
-                // Fused into `top_k_top_p` when both are set, which they are here.
-                continue;
+        for dynamic_temperature in [None, every_warper().dynamic_temperature] {
+            let options = GenerateOptions {
+                dynamic_temperature,
+                ..every_warper()
+            };
+            let chain = build_processor_chain(&options, None, false)
+                .expect("sampling options build a chain");
+            let names = chain.names();
+            let temperature_stage = if dynamic_temperature.is_some() {
+                "dynamic_temperature"
+            } else {
+                "temperature"
+            };
+            assert!(names.contains(&temperature_stage), "{names:?}");
+            for warper in WARPER_NAMES {
+                if matches!(
+                    *warper,
+                    "top_k" | "top_p" | "temperature" | "dynamic_temperature"
+                ) {
+                    // Top-k/p are fused; the temperature stage was checked above.
+                    continue;
+                }
+                assert!(
+                    names.contains(warper),
+                    "sampling must keep {warper}, got {names:?}"
+                );
             }
-            assert!(
-                names.contains(warper),
-                "sampling must keep {warper}, got {names:?}"
-            );
         }
     }
 

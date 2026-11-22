@@ -852,19 +852,64 @@ impl JsonPrefixParser {
 
 pub struct TemperatureProcessor {
     pub temperature: f32,
+    pub dynamic: Option<crate::config::DynamicTemperatureConfig>,
+}
+
+impl TemperatureProcessor {
+    fn resolved_temperature(&self, logits: &[f32]) -> f32 {
+        let Some(dynamic) = self.dynamic.filter(|config| config.range > 0.0) else {
+            return self.temperature;
+        };
+        if logits.len() <= 1 {
+            return 1.0;
+        }
+        let Some(probabilities) = softmax_probabilities(logits) else {
+            return self.temperature;
+        };
+        let entropy: f32 = probabilities
+            .iter()
+            .filter(|&&p| p > 0.0)
+            .map(|&p| -p * p.ln())
+            .sum();
+        let normalized = (entropy / (logits.len() as f32).ln()).clamp(0.0, 1.0);
+        let minimum = (self.temperature - dynamic.range).max(0.0);
+        let maximum = self.temperature + dynamic.range;
+        minimum + (maximum - minimum) * normalized.powf(dynamic.exponent)
+    }
 }
 
 impl LogitProcessor for TemperatureProcessor {
     fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
-        if self.temperature.is_finite() && self.temperature > 0.0 && self.temperature != 1.0 {
+        let temperature = self.resolved_temperature(logits);
+        if temperature == 0.0 {
+            // A collapsed interval is a point mass on the first maximum, as
+            // in llama.cpp's temperature sampler. Preserve exclusions and never
+            // divide by zero when entropy underflows for a peaked distribution.
+            if let Some((best, _)) = logits
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| value.is_finite())
+                .max_by(|(a, x), (b, y)| x.total_cmp(y).then_with(|| b.cmp(a)))
+            {
+                for (index, logit) in logits.iter_mut().enumerate() {
+                    if index != best {
+                        *logit = f32::NEG_INFINITY;
+                    }
+                }
+            }
+        } else if temperature.is_finite() && temperature > 0.0 && temperature != 1.0 {
             for logit in logits.iter_mut() {
-                *logit /= self.temperature;
+                *logit /= temperature;
             }
         }
     }
 
     fn name(&self) -> &str {
-        "temperature"
+        if self.dynamic.is_some_and(|config| config.range > 0.0) {
+            "dynamic_temperature"
+        } else {
+            "temperature"
+        }
     }
 }
 
@@ -2679,8 +2724,54 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_temperature_resolves_entropy_interval_and_exponent() {
+        let processor = TemperatureProcessor {
+            temperature: 1.0,
+            dynamic: Some(crate::config::DynamicTemperatureConfig {
+                range: 0.5,
+                exponent: 2.0,
+            }),
+        };
+        let logits = [0.75_f32.ln(), 0.25_f32.ln()];
+        let entropy = -0.75_f32 * 0.75_f32.ln() - 0.25_f32 * 0.25_f32.ln();
+        let expected = 0.5 + (entropy / 2_f32.ln()).powi(2);
+        assert!((processor.resolved_temperature(&logits) - expected).abs() < 1e-6);
+        let mut scaled = logits;
+        processor.process(&mut scaled, &ProcessorContext::default());
+        for (actual, original) in scaled.into_iter().zip(logits) {
+            assert!((actual - original / expected).abs() < 1e-6);
+        }
+        assert!((processor.resolved_temperature(&[3.0, 3.0]) - 1.5).abs() < 1e-6);
+        assert_eq!(processor.resolved_temperature(&[0.0, -1000.0]), 0.5);
+    }
+
+    #[test]
+    fn dynamic_temperature_handles_zero_entropy_exclusions_and_single_candidate() {
+        let mut processor = TemperatureProcessor {
+            temperature: 0.5,
+            dynamic: Some(crate::config::DynamicTemperatureConfig {
+                range: 1.0,
+                exponent: 1.0,
+            }),
+        };
+        let mut logits = [0.0, -1000.0, f32::NEG_INFINITY];
+        processor.process(&mut logits, &ProcessorContext::default());
+        assert_eq!(logits, [0.0, f32::NEG_INFINITY, f32::NEG_INFINITY]);
+        let mut single = [7.0];
+        processor.process(&mut single, &ProcessorContext::default());
+        assert_eq!(single, [7.0]);
+        processor.dynamic.as_mut().unwrap().exponent = 0.0;
+        assert_eq!(processor.resolved_temperature(&[0.0, -1000.0]), 1.5);
+        processor.dynamic.as_mut().unwrap().range = 0.0;
+        assert_eq!(processor.resolved_temperature(&[0.0, -1000.0]), 0.5);
+    }
+
+    #[test]
     fn temperature_scales_logits() {
-        let processor = TemperatureProcessor { temperature: 2.0 };
+        let processor = TemperatureProcessor {
+            temperature: 2.0,
+            dynamic: None,
+        };
         let mut logits = vec![2.0, -4.0];
         processor.process(&mut logits, &ProcessorContext::default());
         assert_eq!(logits, vec![1.0, -2.0]);

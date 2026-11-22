@@ -116,6 +116,10 @@ pub struct ChatCompletionRequest {
     /// [`Self::sampling_overrides`].
     #[serde(default)]
     pub temperature: Option<f32>,
+    #[serde(default)]
+    pub dynatemp_range: f32,
+    #[serde(default = "default_typical_p")]
+    pub dynatemp_exponent: f32,
     /// Absent when the caller left sampling to the model. See
     /// [`Self::sampling_overrides`].
     #[serde(default)]
