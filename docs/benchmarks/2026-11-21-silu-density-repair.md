@@ -59,39 +59,40 @@ The shared Darwin fcntl lock covers the entire sweep, not individual cells.
 No affinity or exclusive-machine claim is made.
 
 27,000 samples and 270 cells were retained from nine exact-selector diagnostic
-children, each with one pass and no ignored test. Source commit `f71a780b0`
-matches the recorded activation-file SHA-256. Full native regression: 1,927
-passed / 18 existing ignored; optional MLAS: 1,948 passed / 29 ignored. Both
-all-target strict Clippy configurations and five release contract tests pass.
+children, each with one pass and no ignored test. Measured source commit
+`233283bbd1e29c4a1b1e100475a31ef4a2dc9820` integrates merged #2399/#2400 and matches
+the activation-file SHA-256. Full native regression: 1,931 passed / 18 existing
+ignored; optional MLAS: 1,952 passed / 29 ignored. Both all-target strict Clippy
+configurations and five release contract tests pass.
 
 Ratios below exceed one when native is faster. Ranges cover all widths,
 modes and three sweeps; small gains are not a uniform speedup claim.
 
 | Population | n | Before/native wall | MLAS/native wall |
 |---|---:|---:|---:|
-| ordinary | 3 | 1.000–1.011 | 1.110–1.131 |
-| ordinary | 17 | 1.145–1.171 | 1.109–1.147 |
-| ordinary | 4,096 | 1.565–1.589 | 1.112–1.117 |
-| ordinary | 65,537 | 1.564–1.611 | 1.101–1.144 |
-| ordinary | 1,048,581 | 1.557–1.572 | 1.136–1.399 |
-| sparse repairs | 3 | 1.005–1.008 | 1.363–1.382 |
-| sparse repairs | 17 | 1.082–1.089 | 1.342–1.351 |
-| sparse repairs | 4,096 | 1.540–1.571 | 1.766–1.858 |
-| sparse repairs | 65,537 | 1.516–1.571 | 1.736–1.817 |
-| sparse repairs | 1,048,581 | 1.513–1.555 | 1.729–1.833 |
-| dense negative tails | 3 | 0.999–1.011 | 1.693–1.709 |
-| dense negative tails | 17 | 1.019–1.026 | 1.126–1.146 |
-| dense negative tails | 4,096 | 1.048–1.057 | 1.063–1.087 |
-| dense negative tails | 65,537 | 1.023–1.057 | 1.063–1.071 |
-| dense negative tails | 1,048,581 | 1.048–1.054 | 1.066–1.072 |
+| ordinary | 3 | 1.010–1.012 | 1.122–1.126 |
+| ordinary | 17 | 1.162–1.171 | 1.139–1.147 |
+| ordinary | 4,096 | 1.566–1.613 | 1.113–1.117 |
+| ordinary | 65,537 | 1.567–1.580 | 1.117–1.126 |
+| ordinary | 1,048,581 | 1.552–1.575 | 1.137–1.151 |
+| sparse repairs | 3 | 1.005–1.007 | 1.363–1.365 |
+| sparse repairs | 17 | 1.082–1.089 | 1.342–1.346 |
+| sparse repairs | 4,096 | 1.540–1.606 | 1.751–1.816 |
+| sparse repairs | 65,537 | 1.525–1.546 | 1.743–1.768 |
+| sparse repairs | 1,048,581 | 1.505–1.544 | 1.737–1.820 |
+| dense negative tails | 3 | 1.009–1.035 | 1.700–1.721 |
+| dense negative tails | 17 | 1.018–1.038 | 1.115–1.133 |
+| dense negative tails | 4,096 | 1.053–1.056 | 1.069–1.081 |
+| dense negative tails | 65,537 | 1.046–1.052 | 1.064–1.070 |
+| dense negative tails | 1,048,581 | 1.041–1.052 | 1.058–1.072 |
 
-Wall A/A ratios span about 0.978–1.014 across all cells. Large ordinary and
+Wall A/A ratios span about 0.985–1.009 across all cells. Large ordinary and
 sparse before/after gains are well outside that control spread. Dense/tiny
-before/after effects are smaller and do not establish broad gains.
+effects are smaller and do not establish broad gains.
 
 **CPU qualification:** the eight-thread largest runtime cells have unreliable
-per-cell CPU windows: A/A ratios span 0.931–1.914 overall. In one dense cell,
-native and repeated-native CPU medians are about 2.036 ms and 1.064 ms for
+per-cell CPU windows: A/A ratios span 0.764–1.186 overall. In one ordinary cell,
+native and repeated-native CPU medians are about 0.779 ms and 1.020 ms for
 the same function. That control failure prevents a CPU-cost conclusion; it
 is not evidence of either CPU savings or a production CPU regression. Raw
 CPU values remain visible. Whole-child usage covers several seconds and no
@@ -99,6 +100,16 @@ child was discarded, but that aggregate mixes all arms/cells and cannot repair
 per-cell attribution. Validate a process CPU clock or lengthen batching before
 resource/graduation claims. The independent wall clock and wall A/A control
 support the latency diagnostic; no global MLAS graduation is declared.
+
+Cargo JSON build-script receipts bind the measured binary to its active MLAS
+OUT_DIR. Seven active archives contain 1,414 symbol lines: retired Add symbols
+are absent while Mul/SiLU remain. This excludes unreferenced caches from other
+build profiles rather than treating every cached archive as a linked input.
+
+Integration also exposed an existing Conv exclusion test using a process-wide
+counter as a negative assertion. Its test-only caller-local route observation
+now tolerates a deliberate real BNNS convolution on another thread. Aggregate
+coverage counters and production Conv behavior are retained.
 
 [Per-cell metadata](2026-11-21-silu-density-repair.results.json) ·
 [Raw samples](2026-11-21-silu-density-repair.samples.csv.gz)
