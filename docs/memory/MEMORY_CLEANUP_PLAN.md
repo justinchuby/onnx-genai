@@ -1176,3 +1176,130 @@ one test on parent `404fd04c4`, then fails at cold requests 3 versus expected 2
 (including the setup anchor). All 65,536 bit patterns of f16 and bf16 are compared
 bit-for-bit against the old conversion followed by an independent transpose;
 f32/f64 special values and before-write extent checks are included too.
+
+## Current design decision: execution workspace domains
+
+Status: design reviewed; the unpublished per-node mutable-layout pool prototype
+was withdrawn. The existing node-owned immutable weight preparation remains the
+baseline. The next implementation is a CPU vertical through the existing
+executor workspace contract, not another kernel-specific resource pool.
+
+### Resource and ownership boundaries
+
+| Resource | Owner / allocation unit | Authority interaction |
+|---|---|---|
+| Immutable prepared weights | Node preparation owner; independently reclaimable payloads or build groups | Cold build, growth and actual retirement |
+| Temporary scratch | Provider/session resource domain; one exclusive workspace per concurrent execution slot | Slot creation, capacity growth, idle trim and destruction |
+| KV and semantic persistent state | Their explicit state owners | Actual growth, shrink and release |
+| Kernel-local scratch regions | Aligned borrowed slices of the prepared workspace | No claims or refunds |
+
+Coarse allocation means pooling a real backing allocation with its existing
+charge. It does not mean reserving the sum of every forecast at model load, or
+introducing a second bank of unused budget credit. Stable-shape sequential
+nodes reuse the graph's scratch peak; independent concurrent runs need separate
+execution slots. A larger shape grows capacity at a preparation boundary.
+
+Retain object-level weight reclamation: placing all model weights into one
+session slab would let a small active reader pin an otherwise reclaimable slab.
+A weight build group can preflight its live construction peak once and split
+ownership afterward. `MemoryLease::split_off` avoids another claim, but each
+child lease still refunds through the issuer on drop; it is not a hot scratch
+suballocator.
+
+### Reuse the existing workspace seam
+
+`onnx-runtime-ep-api/src/kernel.rs` already supplies `workspace_requirement`,
+`workspace_requirement_for_execution` and `execute_with_workspace`.
+`onnx-runtime-session/src/executor/bindings.rs` collects workspace peaks and
+`executor/dispatch.rs` passes `WorkspaceView`. Keep this single execution seam.
+An EP describes checked size/alignment/layout and consumes borrowed regions;
+the common resource layer owns admission, pooling, concurrency and release.
+Direct kernel users should use the same public runner for workspace preparation.
+Provide one common checked layout/partition helper for overflow, alignment,
+capacity and non-overlap, so each EP supplies region requirements rather than
+reimplementing raw byte-offset validation and allocator fallback.
+
+Proposed lifecycle over the existing prepared-workspace allocation:
+
+```text
+run admission -> borrow exclusive execution slot -> dispatch with WorkspaceView
+              -> run completion -> return backing + charge to idle storage
+idle pressure / shutdown -> release backing -> settle its charge
+```
+
+Separate content lifetime from storage retention. Step-scoped contents expire
+at run completion, while their backing may remain idle and funded for reuse.
+Do not merely relabel temporary contents as `SessionPersistent`. State whose
+values must survive calls remains independently owned and cannot be overwritten
+by graph scratch reuse. An asynchronous slot enters pending until its completion
+event; capture pinning and quarantine also prevent idle reuse and refunds.
+
+The peak reflects overlap: mutually exclusive branches use a maximum; live
+parent regions add to the child's peak; concurrent branches need the sum of
+simultaneously active regions. Reuse is legal only at an established completion
+or ordering boundary. Do not add per-kernel synchronization to obtain reuse.
+
+Prepared-resource selection and scratch planning must agree. Either acquire and
+pin the selected prepared readers before computing scratch, or declare a peak
+that covers cache miss/refusal fallback. Workspace admission must not evict a
+weight whose presumed presence was used to omit required fallback storage.
+
+### CPU backing and accounting prerequisite
+
+The CPU provider currently inherits the default workspace reservation returning
+`None`. Merely advertising kernel workspace therefore does not prove a Host
+grant. Wire CPU workspace once at the provider/resource-domain boundary using
+`MemoryRole::Workspace` and the existing process memory manager's managed-owner
+and physical-release transactions. `DerivedWeightMemory` has a weight-role
+anchor; its sibling reservation must not misattribute scratch as weights.
+
+The default CPU allocator includes `LargeAllocCache`. Returning an allocation
+to that cache can retain its backing. An upper workspace pool must not refund
+capacity while a lower, unaccounted cache still holds the block. Use one reuse
+owner: trim either releases backing without reparking it, or transfers the same
+managed owner and charge into the lower cache. Logical availability inside a
+slot and physically releasable capacity are different facts, not two ledgers.
+
+### Implementation sequence and evidence
+
+1. Introduce borrow/return/idle-trim ownership for execution-slot workspace over
+   the existing prepared allocation; centralize its policy in the resource
+   domain, preserving active, pending, pinned and quarantined states.
+2. Connect CPU Host workspace backing and actual Workspace-role charges, with
+   one cache/release owner and an injectable authority for tests.
+3. Move dynamic Gemm A layout scratch into this workspace seam. Keep immutable
+   B preparation and checked original-view conversion; derive a single Gemm
+   layout plan for its selected route and fallback requirements. Gemm already
+   participates in workspace preparation; add no new op-name special case.
+4. Migrate accumulator/TLS/Einsum scratch through the shared mechanism and
+   remove their independent retention/accounting policies as each migrates.
+   Replace `is_planned_workspace_node` with compiled workspace-plan facts.
+
+The withdrawn prototype was useful evidence, not an implementation to publish:
+per-call transient grants made a tiny dynamic A case roughly 288 -> 403 ns on
+M1 Max. Retaining exclusive, refilled buffers eliminated warm issuer callbacks,
+but still measured approximately 300--309 ns versus 289 ns; local and governed
+arms were nearly equal. Zero issuer calls alone does not prove zero total cost.
+The experiment's exact source patch, baseline fixtures, full validation drivers
+and timing logs are preserved under `/tmp/nxrt-gemm-a-*`, with provenance in
+`nxrt-gemm-a-candidate-provenance.json`. It was not merged into runtime code.
+
+Required validation for the new implementation:
+
+- Sequential heterogeneous kernels share one graph peak rather than a sum of
+  node pools; simultaneous runs own independent slots.
+- Stable-shape warm multi-node sessions perform no issuer calls, including
+  zero-byte claims/refunds; growth admits only at the preparation boundary.
+- KV pressure reclaims idle backing while active, pending and pinned backing
+  remains funded. Cache refusal after route preparation remains executable
+  within the declared live peak or fails before output writes.
+- Allocation, execution and release failures preserve backing/charge ownership;
+  lower allocator retention never becomes an unaccounted second cache.
+- Shape growth, control-flow nesting, alignment and arithmetic overflow have
+  explicit success/refusal tests using the public runner/session.
+- Measure direct-kernel, common-runner and multi-node-session controls with the
+  same host lock, so kernel savings cannot hide dispatcher overhead.
+
+CPU tests and compilation may establish the Host contract. CUDA event ordering,
+Graph replay, quarantine and actual physical release still require real-device
+validation; no CUDA runtime or throughput claim follows from this design.
