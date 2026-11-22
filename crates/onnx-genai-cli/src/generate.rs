@@ -349,7 +349,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_generate_defaults_to_stats_only_on_the_repl_tty_path() {
+    fn text_generate_defaults_to_stats_only_on_the_generation_tty_path() {
         assert!(initial_generate_show_stats(
             InputMode::Tty,
             false,

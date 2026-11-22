@@ -297,7 +297,8 @@ fn chat_sampling_controls_round_trip_into_generate_options() {
         "dry_multiplier": 0.5,
         "dry_base": 1.75,
         "dry_allowed_length": 3,
-        "dry_sequence_breakers": ["hello"],
+        "dry_sequence_breakers": ["hello world"],
+        "dry_penalty_last_n": 7,
         "mirostat": 2,
         "mirostat_tau": 4.5,
         "mirostat_eta": 0.2,
@@ -330,12 +331,15 @@ fn chat_sampling_controls_round_trip_into_generate_options() {
         vec![
             fixture_tokenizer()
                 .inner()
-                .encode("hello", false)
+                .encode("hello world", false)
                 .unwrap()
                 .get_ids()
                 .to_vec()
         ]
     );
+
+    assert_eq!(dry.window, Some(7));
+    assert!(dry.sequence_breakers[0].len() > 1);
 
     let mirostat = options.mirostat.expect("Mirostat enabled");
     assert_eq!(mirostat.tau, 4.5);

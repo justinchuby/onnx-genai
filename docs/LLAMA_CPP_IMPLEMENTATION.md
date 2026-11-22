@@ -48,3 +48,16 @@ tool indices and incomplete-stream rejection.
 This milestone does not check off the full rows above: browser refresh/reconnect,
 media token counting, native batching/prefill-only, timing/progress, additional
 sampling and runtime-backed state/adapter/ranking work still need completion.
+
+Sampling follow-up: `logit_bias` now lowers OpenAI objects and native token/text
+pairs into one typed engine processor, including explicit bans. Token vocabulary
+validation is shared by the server and engine. Real tiny-model generation and
+engine processor tests pass, including the greedy/device-shortcut guard.
+
+Latest verified checkpoint: server library 367 passed / 2 inherited ignores,
+4 protocol-history tests, real logit-bias HTTP and engine tests, 6 DRY engine
+tests, and the multi-token DRY request mapping test pass. Strict server all-target
+Clippy passes. The real Chrome smoke now verifies chat, persisted conversation
+and byte-identical replay after reload, with no browser errors. CLI library tests:
+71 passed. Vendored asset and documented environment-variable checks pass.
+No merge has been performed.

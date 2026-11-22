@@ -66,9 +66,10 @@ rejected because these models execute in-process with explicit nxrt settings.
 - Assistant `reasoning_content` is preserved when rendering subsequent turns.
 - `stream_options.include_usage` adds an empty-choices usage event after the final
   finish chunk, before `[DONE]`, including the tool-calling stream path.
-- DRY breaker strings are tokenized with the requested model. The current backend
-  supports single-token breakers; multi-token breakers fail with a field-specific
-  error instead of being flattened into a different rule.
+- DRY breaker strings are tokenized with the requested model and retain complete
+  token sequences. Matching does not cross complete breakers; partial sequences
+  remain ordinary history. `dry_penalty_last_n` bounds prompt/generated history,
+  with -1 for full history and 0 to disable DRY.
 
 The sampler pipeline is nxrt's existing fixed pipeline. Arbitrary `samplers`
 orders, dynamic temperature, thinking budgets, continuation of a final assistant
@@ -134,5 +135,5 @@ For a browser smoke test, build the server, install Playwright in a temporary
 Node environment, then run `node scripts/test_llama_chat.mjs /absolute/path/to/playwright/index.mjs`.
 The script starts a tiny-fixture server on port 18080, sends a message through
 the actual UI, verifies the answer and persisted conversation, then shuts down
-Chrome and the server. Set `NXRT_UI_SCREENSHOT` to save a screenshot. Coordinate
+Chrome and the server. Append an optional screenshot path after the Playwright module path to save an image. Coordinate
 this inference workload with other sessions using the shared host lock.

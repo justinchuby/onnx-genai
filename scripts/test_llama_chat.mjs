@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Real-browser smoke test of the bundled upstream UI against a tiny ONNX model.
-// Usage: node scripts/test_llama_chat.mjs [absolute path to playwright/index.mjs]
+// Usage: node scripts/test_llama_chat.mjs [absolute path to playwright/index.mjs] [screenshot.png]
 // Requires a built target/debug/onnx-genai-server and Chrome. Run under the
 // host's shared workload lock when other sessions are measuring performance.
 import assert from 'node:assert/strict';
@@ -63,8 +63,17 @@ try {
   await page.reload({ waitUntil: 'networkidle' });
   await page.getByLabel('User message with actions', { exact: true }).first().waitFor({ timeout: 15000 });
   assert((await page.locator('body').innerText()).includes('hello'), 'conversation was not restored after reload');
+  const conversationId = (await firstResponse.request().allHeaders())['x-conversation-id'];
+  assert(conversationId, 'UI did not identify its conversation for resumable streaming');
+  const originalWire = await firstResponse.text();
+  const replay = await page.evaluate(async ({ origin, conversationId }) => {
+    const response = await fetch(`${origin}/v1/stream?conv_id=${encodeURIComponent(conversationId)}&from=0`);
+    return { status: response.status, body: await response.text() };
+  }, { origin, conversationId });
+  assert.equal(replay.status, 200, 'completed conversation was not available for replay');
+  assert.equal(replay.body, originalWire, 'browser replay changed the original streamed bytes');
   assert.deepEqual(errors, [], 'browser runtime errors');
-  if (process.env.NXRT_UI_SCREENSHOT) await page.screenshot({ path: process.env.NXRT_UI_SCREENSHOT, fullPage: true });
+  if (process.argv[3]) await page.screenshot({ path: process.argv[3], fullPage: true });
   console.log(JSON.stringify({ result: 'passed', successfulChatRequests: completions.length, answer, pageErrors: errors }));
 } finally {
   if (browser) await browser.close();
