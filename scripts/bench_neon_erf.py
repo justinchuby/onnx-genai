@@ -43,6 +43,13 @@ ARM_SCHEMAS = {
         "3": "mlas",
         "4": "neon_guarded_before",
     },
+    3: {
+        "0": "scalar_before",
+        "1": "native",
+        "2": "native_aa",
+        "3": "mlas",
+        "4": "neon_single_before",
+    },
 }
 
 
@@ -60,7 +67,7 @@ def analyze(raw, metadata):
     require(schema in ARM_SCHEMAS, "unsupported diagnostic schema")
     arm_labels = ARM_SCHEMAS[schema]
     arm_count = len(arm_labels)
-    if schema == 2:
+    if schema >= 2:
         require(
             metadata["arms"] == arm_labels, "explicit arm identities differ from schema"
         )
@@ -89,7 +96,7 @@ def analyze(raw, metadata):
     )
     checks, hashes = set(), {}
     for receipt in receipts:
-        if schema == 2:
+        if schema >= 2:
             modes = receipt["fpcr"]
             require(
                 len(modes) == 2
@@ -197,21 +204,22 @@ def analyze(raw, metadata):
                 "mlas_over_native": medians["3"] / medians["1"],
             }
         )
-        if schema == 2:
-            cells[-1]["guarded_before_over_native"] = medians["4"] / medians["1"]
+        if schema >= 2:
+            before = "guarded_before" if schema == 2 else "single_before"
+            cells[-1][f"{before}_over_native"] = medians["4"] / medians["1"]
     for op, n in itertools.product(("erf", "gelu"), LENGTHS):
         require(
             tokens[(op, n, 1)] == tokens[(op, n, 2)], "native A/A sample tokens differ"
         )
-    if schema == 2:
+    if schema >= 2:
         for op, n in itertools.product(("erf", "gelu"), LENGTHS):
             require(
                 hashes[(op, n, 4)] == hashes[(op, n, 1)],
-                "guarded before/native full output hashes differ",
+                "before/native full output hashes differ",
             )
             require(
                 tokens[(op, n, 4)] == tokens[(op, n, 1)],
-                "guarded before/native output tokens differ",
+                "before/native output tokens differ",
             )
     return {
         "schema": schema,
@@ -285,8 +293,8 @@ def run(directory, binary, cargo_receipt, reps, sweeps):
         "freeze the entire checkout before measuring; commit or move pending source/artifact files",
     )
     metadata = {
-        "schema": 2,
-        "arms": ARM_SCHEMAS[2],
+        "schema": 3,
+        "arms": ARM_SCHEMAS[3],
         "repetitions": reps,
         "sweeps": sweeps,
         "binary_sha256": sha(binary.read_bytes()),
