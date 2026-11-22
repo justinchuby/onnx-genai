@@ -801,13 +801,68 @@ performance claim is involved.
 The shared MatMul preparation layer previously retained MLAS f32 panels,
 once-widened f16 panels and native contiguous-half copies even with retention
 disabled. Both pack entries now require an admitted constant B. Strided f16
-copying returns an explicit borrowed-or-call-owned `Cow`, so a declined caller
-can compute through the existing rescue path and release its temporary copy
-without populating the kernel cache. Existing admitted reuse and borrowed
+copying returns an explicit grant-carrying reader, so a declined caller can
+compute through the existing rescue path and release its transient copy without
+populating the kernel cache. Existing admitted reuse and borrowed
 column-major execution remain available.
 
 The three old-behavior regressions demonstrate the bypass independently. New
 bounded real-kernel controls check both verdicts and unchanged expected results,
 while avoiding shared test-counter interference. This is retention enforcement,
-not physical Host funding for ordinary SGEMM/transpose/dense/half caches; their
-authority integration and shared-node/idle-pressure lifecycles remain work.
+not physical Host funding by itself. Ordinary f32 constant materialization now
+joins Host admission below, followed by native half-copy payloads. SGEMM panels,
+transposes and shared-node ownership for ordinary MatMul remain work.
+
+
+### Ordinary constant materialization joins the Host authority
+
+All four MatMul-prepack consumers (MatMul, Gemm, FusedMatMulBias and FusedGemm)
+now receive the provider's immutable resources rather than a bool/default-only
+prepack. Both constant operand slots obtain actual Host payload grants before
+conversion, retaining them in an executing reader or idle cache. The common
+dense-cache authority handles singleflight construction and idle pressure.
+Contiguous f32 borrowing remains zero-copy; dynamic activations are a separate
+scratch scope. A declined retention policy changes lifetime, not the need to
+fund a required constant materialization. Admission refusal stays typed and
+retryable rather than allocating an uncharged fallback matrix.
+
+The dtype converter writes directly into an admitted f32 destination and keeps
+the existing SIMD conversion helpers. Strided/scalar conversion does not first
+allocate a full source-dtype copy. A sealed reader prevents sibling kernels from
+forging an uncharged materialized constant through the preparation API.
+Address-keyed legacy transpose memos retain their converted source reader until
+their key retires, preventing source-address recycling after pressure. This pins
+those dependencies; funding/reclaiming transpose payloads themselves remains
+separate, as do MLAS panels, activation/output scratch and shared-node ownership
+of ordinary MatMul preparations. Native contiguous-half copies are funded below.
+
+The same provider-level test fails against the parent implementation with Host
+usage 0 versus 24 expected bytes. New factory, active-reader, capacity/refusal,
+retry, concurrent-fill and transpose-source controls exercise actual ownership.
+The planner also includes Gemm and FusedGemm dense preparation, previously
+omitted despite using the same prepack, and preserves domain gates.
+
+
+### Native contiguous-half copies use the same grant lifecycle
+
+Noncontiguous constant f16 B materialization now uses the same dense-weight
+cache as f32 expansion, parameterized by its flat payload element (`u16` bits
+or `f32`). Both retained and transient copies reserve their actual 2-byte-per-
+element payload before allocation. Copying writes directly into that admitted
+slice, preserving the existing 2-D parallel and N-D strided routes; no f32
+weight matrix is needed. Source validation precedes admission and pointer reads.
+Empty payloads return before parallel chunking.
+
+The returned reader owns the grant through computation. Kernel destruction or
+cache eviction cannot revoke a live reader; idle retained copies can donate
+capacity to KV through the existing weak pressure registration. Retained cold
+fills share one payload, while transient calls each require their own capacity.
+Refusal propagates a typed, contextual error through both Apple rescue callers
+and leaves preparation retryable. Column-major zero-copy execution is unchanged.
+
+The unchanged public-provider regression fails on parent 3e2588329 with Host
+usage 0 versus 306 expected bytes. Controls cover both retention verdicts,
+negative strides/offsets, concurrent construction, active-reader protection,
+KV eviction/refusal/retry, final refund, invalid host sources and empty layouts.
+This funds the native contiguous copy only: transpose payloads, ordinary MLAS
+SGEMM panels, shape-variant sharing and activation/output scratch remain work.

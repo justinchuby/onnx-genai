@@ -35,14 +35,19 @@ use onnx_runtime_ir::{
 use rayon::prelude::*;
 
 use super::check_arity;
-use super::governed_weight_cache::{CacheVerdict, GovernedWeightCache};
+use super::dense_weight_cache::{
+    DenseWeight, DenseWeightCache, DenseWeightKey, DenseWeightLoad, DenseWeightSpec,
+};
 use super::half_gemm::{self, HalfFormat, MatrixLayout};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use super::half_gemv;
 use super::weight_transpose::{self, WeightTransposeKey};
+use crate::CpuMemoryResources;
 use crate::backend::CpuBackend;
 use crate::dispatch_ledger;
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{
+    to_dense_f32_widen, to_dense_f32_widen_into, validate_f32_widen_input, write_dense_f32_narrow,
+};
 use crate::strided::{next_index, numel};
 
 // MLAS-style packed SIMD f32 GEMM (the `SimdX86` backend). Kept in a sibling
@@ -289,15 +294,6 @@ pub fn clear_weight_transpose_caches() {
     weight_transpose::clear_all();
 }
 
-// Retention is captured by each prepack; shared stores contain no admission switch.
-fn dense_cache_verdict(admitted: bool) -> CacheVerdict {
-    if admitted {
-        CacheVerdict::admit(0)
-    } else {
-        CacheVerdict::decline(0)
-    }
-}
-
 /// How many times an autoregressive decode session materializes each populated
 /// `MatMulPrepack::dense` copy -- the shape-keyed instantiation multiplier that
 /// the first cut of this accounting (like #1051's before it) missed.
@@ -319,7 +315,7 @@ const MATMUL_DENSE_DECODE_INSTANTIATIONS: u64 = 2;
 
 /// Predicted bytes the per-kernel `MatMulPrepack::dense` caches will hold for
 /// `graph` once it has run -- the *prediction* the memory-strategy plan budgets
-/// for, whose accuracy the summed [`GovernedWeightCache::live_bytes`] of the
+/// for, whose accuracy the summed the caches' actual retained payload bytes of the
 /// executed kernels measures after the fact.
 ///
 /// # What actually populates the cache
@@ -403,22 +399,16 @@ pub fn matmul_dense_cache_predicted_bytes(graph: &Graph) -> u64 {
 /// Per-node contribution to [`matmul_dense_cache_predicted_bytes`]. Mirrors the
 /// caching condition in [`MatMulPrepack::dense`] exactly.
 fn node_matmul_dense_cache_bytes(node: &Node, graph: &Graph) -> u64 {
-    // Only the f32 `MatMul` kernel and its bias-fused variant own a
-    // `MatMulPrepack`; every other op either has no dense cache or (MatMulNBits)
-    // is accounted separately. FusedMatMulBias is included because the optimiser
-    // may already have fused a `MatMul + Add` before this predictor runs, and it
-    // holds the identical `dense` cache.
-    //
-    // `MatMul` ships in the default domain; `FusedMatMulBias` ships in the
-    // optimizer's contrib domain (`com.microsoft`). A blanket
-    // `!node.is_default_domain()` bail would silently zero every
-    // `FusedMatMulBias` node here exactly as it once did in
-    // `node_weight_transpose_cache_bytes` (#1702) — the very defect that
-    // predictor's fix removed. Each op is gated to the domain it actually
-    // ships in instead of one shared domain check.
-    let is_matmul = node.op_type == "MatMul" && node.is_default_domain();
-    let is_fused_bias = node.op_type == "FusedMatMulBias" && node.domain == "com.microsoft";
-    if !is_matmul && !is_fused_bias {
+    // These are the registered consumers of MatMulPrepack's dense operand
+    // preparation. Scalar/transpose/epilogue attributes do not change the
+    // pre-operation widening bytes. The predictor and real-factory regression
+    // cover the same resource-bearing family, including both fused forms.
+    let uses_dense_prepack = match node.domain.as_str() {
+        "" | "ai.onnx" => matches!(node.op_type.as_str(), "MatMul" | "Gemm"),
+        "com.microsoft" => matches!(node.op_type.as_str(), "FusedMatMulBias" | "FusedGemm"),
+        _ => false,
+    };
+    if !uses_dense_prepack {
         return 0;
     }
     let mut total = 0_u64;
@@ -461,6 +451,67 @@ fn dense_operand_cache_bytes(node: &Node, graph: &Graph, index: usize) -> u64 {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct MatMulDenseKey {
+    // Logical strides/shape of an initializer are immutable within this node.
+    // Address, dtype and extent also reject a distinct source/shape at this slot.
+    source: usize,
+    dtype: DataType,
+    elements: usize,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MatMulHalfKey {
+    source: usize,
+    elements: usize,
+}
+
+impl DenseWeightKey for MatMulHalfKey {
+    fn dense_bytes(&self) -> Result<usize> {
+        self.elements.checked_mul(std::mem::size_of::<u16>()).ok_or_else(||
+            EpError::KernelFailed("MatMul constant f16 copy byte count overflow; use addressable weight dimensions".into()))
+    }
+}
+
+impl DenseWeightKey for MatMulDenseKey {
+    fn dense_bytes(&self) -> Result<usize> {
+        self.elements.checked_mul(std::mem::size_of::<f32>()).ok_or_else(||
+            EpError::KernelFailed("MatMul constant f32 payload size overflows usize; use addressable operand dimensions".into()))
+    }
+}
+
+/// A converted constant carries its Host grant through the executing reader;
+/// removing cache membership or dropping the kernel cannot revoke this payload.
+pub(super) struct DenseOperand<'a>(DenseOperandStorage<'a>);
+
+enum DenseOperandStorage<'a> {
+    Direct(Cow<'a, [f32]>),
+    Funded(Arc<DenseWeight>),
+}
+impl std::ops::Deref for DenseOperand<'_> {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        match &self.0 {
+            DenseOperandStorage::Direct(values) => values,
+            DenseOperandStorage::Funded(values) => values.as_slice(),
+        }
+    }
+}
+impl AsRef<[f32]> for DenseOperand<'_> {
+    fn as_ref(&self) -> &[f32] {
+        self
+    }
+}
+
+struct F32TransposeMemo {
+    key: WeightTransposeKey,
+    installed: bool,
+    values: Arc<Vec<f32>>,
+    // Global transpose identity is the conversion buffer's address. Keep its
+    // payload/grant alive until that address-keyed dependency is retired.
+    _source: Option<Arc<DenseWeight>>,
+}
+
 /// Per-kernel cache for immutable MatMul operands that require materialization.
 ///
 /// Contiguous f32 constants already have the ideal representation, so they stay
@@ -478,9 +529,9 @@ pub(crate) struct MatMulPrepack {
     constant_inputs: [bool; 2],
     /// Session-lifetime widened-f32 copy of a constant operand, governed by the
     /// memory plan (#1056): filled only under an admitting verdict, and reports
-    /// its own held bytes via [`GovernedWeightCache::live_bytes`]. Only populated
+    /// its own held bytes via the caches' actual retained payload bytes. Only populated
     /// when the operand is not already contiguous f32 (see [`Self::dense`]).
-    dense: [GovernedWeightCache<f32>; 2],
+    dense: [DenseWeightCache<MatMulDenseKey>; 2],
     #[cfg(feature = "mlas")]
     packed_b: OnceLock<mlas_sys::PackedB>,
     /// MLAS-packed f32 panel built once from a constant **f16** B weight.
@@ -497,7 +548,7 @@ pub(crate) struct MatMulPrepack {
         not(any(target_os = "macos", target_os = "ios")),
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
-    transposed_b: OnceLock<(WeightTransposeKey, bool, Arc<Vec<f32>>)>,
+    transposed_b: OnceLock<F32TransposeMemo>,
     /// Lazily-computed f16 transpose of the B weight matrix, with the key it
     /// was computed for. Stores the raw u16 bit patterns of half::f16 in N×K
     /// layout, read directly from the mmap'd model file without widening to
@@ -512,7 +563,7 @@ pub(crate) struct MatMulPrepack {
         not(any(target_os = "macos", target_os = "ios")),
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
-    contiguous_b_f16: OnceLock<Arc<Vec<u16>>>,
+    contiguous_b_f16: DenseWeightCache<MatMulHalfKey, u16>,
 }
 
 /// Entries this prepack *installed* in the process-global transpose caches must
@@ -545,8 +596,10 @@ pub(crate) struct MatMulPrepack {
 /// that the entry does not outlive the prepack that put it there.
 impl Drop for MatMulPrepack {
     fn drop(&mut self) {
-        if let Some((key, true, _)) = self.transposed_b.get() {
-            weight_transpose::evict_f32(key);
+        if let Some(memo) = self.transposed_b.get()
+            && memo.installed
+        {
+            weight_transpose::evict_f32(&memo.key);
         }
         if let Some((key, true, _)) = self.transposed_b_f16.get() {
             weight_transpose::evict_half(key);
@@ -556,7 +609,7 @@ impl Drop for MatMulPrepack {
 
 impl Default for MatMulPrepack {
     fn default() -> Self {
-        Self::new(true)
+        Self::new(CpuMemoryResources::default())
     }
 }
 
@@ -625,14 +678,17 @@ impl MatMulPrepack {
         }
     }
 
-    pub(crate) fn new(retain_caches: bool) -> Self {
-        let verdict = dense_cache_verdict(retain_caches);
+    pub(crate) fn new(resources: CpuMemoryResources) -> Self {
+        let retain_caches = resources.cache_retention().is_admitted();
+        // Preserve the legacy family retention verdict. The block/NBits dense
+        // expansion ceiling is not an implicit new limit on ordinary MatMul.
+        let limit = if retain_caches { usize::MAX } else { 0 };
         Self {
             retain_caches,
             constant_inputs: [false; 2],
             dense: [
-                GovernedWeightCache::new(verdict),
-                GovernedWeightCache::new(verdict),
+                DenseWeightCache::new(resources.weight_memory().clone(), limit),
+                DenseWeightCache::new(resources.weight_memory().clone(), limit),
             ],
             #[cfg(feature = "mlas")]
             packed_b: OnceLock::new(),
@@ -640,7 +696,7 @@ impl MatMulPrepack {
             packed_b_from_half: OnceLock::new(),
             transposed_b: OnceLock::new(),
             transposed_b_f16: OnceLock::new(),
-            contiguous_b_f16: OnceLock::new(),
+            contiguous_b_f16: DenseWeightCache::new(resources.weight_memory().clone(), limit),
         }
     }
 }
@@ -650,9 +706,17 @@ impl MatMulPrepack {
     /// operand slots -- the figure a prediction is checked against (#1056).
     #[cfg(test)]
     pub(crate) fn dense_live_bytes(&self) -> u64 {
-        self.dense[0]
-            .live_bytes()
-            .saturating_add(self.dense[1].live_bytes())
+        self.dense.iter().map(|cache| cache.stats().1 as u64).sum()
+    }
+
+    #[cfg(test)]
+    fn dense_payload(&self, index: usize) -> Option<Arc<DenseWeight>> {
+        self.dense[index].test_first()
+    }
+
+    #[cfg(test)]
+    fn dense_is_filled(&self, index: usize) -> bool {
+        self.dense[index].stats().0 != 0
     }
 
     pub(crate) fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
@@ -661,46 +725,44 @@ impl MatMulPrepack {
         }
     }
 
-    /// Widen a MatMul operand to dense f32, reusing a session-lifetime copy for
-    /// a constant operand when the memory plan admits it (#1056).
-    ///
-    /// A non-constant operand, or one already stored as contiguous f32, is
-    /// handled exactly as before: `to_dense_f32_widen` borrows contiguous f32
-    /// zero-copy and only allocates a transient for the widening cases.
-    ///
-    /// For a constant operand that must be widened (`Cow::Owned`), the widened
-    /// buffer is retained in the governed cache **iff the plan admitted it**.
-    /// When declined, [`GovernedWeightCache`] stores nothing, and this returns
-    /// the freshly-widened `Cow::Owned` for the caller to use and drop at the end
-    /// of the call -- byte-identical output, only recomputed each time.
-    pub(crate) fn dense<'a>(
-        &'a self,
+    /// Borrow unchanged contiguous f32 storage. Materialized constants obtain
+    /// their complete f32 payload grant before conversion, whether retained or
+    /// call-owned. Dynamic activation conversion remains a separate scratch scope.
+    pub(super) fn dense<'a>(
+        &self,
         index: usize,
         view: &'a TensorView<'_>,
-    ) -> Result<Cow<'a, [f32]>> {
-        if !self.constant_inputs[index] {
-            return to_dense_f32_widen("MatMul", view);
+    ) -> Result<DenseOperand<'a>> {
+        if !self.constant_inputs[index] || (view.dtype == DataType::Float32 && view.is_contiguous())
+        {
+            return to_dense_f32_widen("MatMul", view)
+                .map(|values| DenseOperand(DenseOperandStorage::Direct(values)));
         }
-        if let Some(cached) = self.dense[index].filled() {
-            return Ok(Cow::Borrowed(cached));
-        }
-
-        match to_dense_f32_widen("MatMul", view)? {
-            Cow::Borrowed(dense) => Ok(Cow::Borrowed(dense)),
-            Cow::Owned(dense) => {
-                if self.dense[index].verdict().is_admitted() {
-                    // Admitted: retain the widened copy for the session and hand
-                    // back a borrow of it. `get_or_fill` builds exactly once.
-                    let cached = self.dense[index]
-                        .get_or_fill(|| dense)
-                        .expect("an admitted governed cache fills its buffer");
-                    Ok(Cow::Borrowed(cached))
+        validate_f32_widen_input("MatMul constant operand", view)?;
+        let key = MatMulDenseKey {
+            source: view.data_ptr::<u8>() as usize,
+            dtype: view.dtype,
+            elements: view.numel(),
+        };
+        let spec = if self.retain_caches {
+            DenseWeightSpec::cached(&key)?
+        } else {
+            DenseWeightSpec::transient(key.dense_bytes()?)
+        };
+        match self.dense[index].load_group(&[spec], |_, output| {
+            to_dense_f32_widen_into("MatMul constant operand", view, output)
+        })? {
+            DenseWeightLoad::Ready(mut loaded) => Ok(DenseOperand(DenseOperandStorage::Funded(
+                loaded.weights.remove(0),
+            ))),
+            DenseWeightLoad::Declined(source) => Err(EpError::Backend {
+                operation: if index == 0 {
+                    "MatMul constant A widening admission"
                 } else {
-                    // Declined: keep nothing resident; the caller owns and frees
-                    // this transient widen at the end of the call.
-                    Ok(Cow::Owned(dense))
-                }
-            }
+                    "MatMul constant B widening admission"
+                },
+                source: Box::new(source),
+            }),
         }
     }
 
@@ -738,12 +800,20 @@ impl MatMulPrepack {
         if key.numel() != Some(b.len()) {
             return None;
         }
-        let (cached_key, _, bt) = self.transposed_b.get_or_init(|| {
-            let (bt, installed) = weight_transpose::cached_transpose_f32_reporting(b, k, n)
+        let memo = self.transposed_b.get_or_init(|| {
+            // A live caller already holds the conversion reader. Capture a
+            // second reader before publishing a transpose keyed on its address.
+            let source = self.dense[1].owner_of(b);
+            let (values, installed) = weight_transpose::cached_transpose_f32_reporting(b, k, n)
                 .expect("length was validated against [k, n] above");
-            (key, installed, bt)
+            F32TransposeMemo {
+                key,
+                installed,
+                values,
+                _source: source,
+            }
         });
-        (*cached_key == key).then(|| bt.as_slice())
+        (memo.key == key).then(|| memo.values.as_slice())
     }
 
     /// Returns a cached f16 transpose of B[K,N] → B_T[N,K] row-major.
@@ -850,24 +920,38 @@ impl MatMulPrepack {
     ///   - the element-by-element `to_dense_f32_widen` (~1 s at 136 M elements)
     ///   - the 2× memory of f16→f32 widening
     ///
-    /// The memo is validated against the current view's element count before it
-    /// is served: the consumers read it as a dense `K×N` buffer, so a memo
-    /// filled for a differently-sized operand must not be handed out (#845).
+    /// The node's initializer layout is immutable. Source address and element
+    /// count distinguish different operands at this slot (#845). Both retained
+    /// and transient copies hold a Host grant until their last reader drops.
     #[cfg_attr(
         not(any(target_os = "macos", target_os = "ios")),
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
-    pub(crate) fn contiguous_b_f16(&self, b_view: &TensorView) -> Option<Cow<'_, [u16]>> {
+    pub(super) fn contiguous_b_f16(
+        &self,
+        b_view: &TensorView,
+    ) -> Result<Option<Arc<DenseWeight<u16>>>> {
         use onnx_runtime_ir::DataType;
         if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || b_view.is_contiguous() {
-            return None; // already contiguous or not cacheable
+            return Ok(None); // already contiguous or not cacheable
         }
-        let build = || {
-            let numel = b_view.numel();
+        validate_f32_widen_input("MatMul constant f16 contiguous preparation", b_view)?;
+        let key = MatMulHalfKey {
+            source: b_view.data_ptr::<u16>() as usize,
+            elements: b_view.shape.iter().try_fold(1usize, |n, &dim| n.checked_mul(dim)).ok_or_else(|| EpError::KernelFailed("MatMul constant f16 contiguous preparation: element count overflow; use addressable weight dimensions".into()))?,
+        };
+        let spec = if self.retain_caches {
+            DenseWeightSpec::cached(&key)?
+        } else {
+            DenseWeightSpec::transient(key.dense_bytes()?)
+        };
+        let loaded = self.contiguous_b_f16.load_group(&[spec], |_, out| {
             let shape = b_view.shape;
             let strides = b_view.strides;
             let base = b_view.data_ptr::<u16>();
-            let mut out = vec![0u16; numel];
+            if out.is_empty() {
+                return Ok(());
+            }
 
             // Optimised 2-D path (covers all weight matrices).
             if shape.len() == 2 {
@@ -878,8 +962,8 @@ impl MatMulPrepack {
                 let rows_per_thread = rows.div_ceil(threads).max(1);
                 // SAFETY: `base` points into the model's mmap'd weight
                 // buffer which is immutable for the session lifetime.
-                // Each Rayon task reads a disjoint set of source rows
-                // and writes a disjoint output chunk.
+                // Concurrent source reads are immutable (strides may alias);
+                // each Rayon task writes a disjoint output chunk.
                 let base_usize = base as usize;
                 out.par_chunks_mut(rows_per_thread * cols)
                     .enumerate()
@@ -891,7 +975,7 @@ impl MatMulPrepack {
                             let row_base = unsafe { base.offset(i as isize * sr) };
                             let dst = &mut chunk[(i - i0) * cols..(i - i0 + 1) * cols];
                             for (j, d) in dst.iter_mut().enumerate() {
-                                *d = unsafe { *row_base.offset(j as isize * sc) };
+                                *d = unsafe { row_base.offset(j as isize * sc).read_unaligned() };
                             }
                         }
                     });
@@ -904,7 +988,7 @@ impl MatMulPrepack {
                         .zip(strides.iter())
                         .map(|(&i, &s)| i as isize * s as isize)
                         .sum();
-                    *o = unsafe { *base.offset(off) };
+                    *o = unsafe { base.offset(off).read_unaligned() };
                     for d in (0..shape.len()).rev() {
                         idx[d] += 1;
                         if idx[d] < shape[d] {
@@ -914,13 +998,15 @@ impl MatMulPrepack {
                     }
                 }
             }
-            out
-        };
-        if !self.retain_caches {
-            return Some(Cow::Owned(build()));
+            Ok(())
+        })?;
+        match loaded {
+            DenseWeightLoad::Ready(mut loaded) => Ok(Some(loaded.weights.remove(0))),
+            DenseWeightLoad::Declined(reason) => Err(EpError::Backend {
+                operation: "MatMul constant f16 contiguous preparation admission",
+                source: Box::new(reason),
+            }),
         }
-        let cached = self.contiguous_b_f16.get_or_init(|| Arc::new(build()));
-        (cached.len() == b_view.numel()).then(|| Cow::Borrowed(cached.as_slice()))
     }
 
     /// MLAS-packed B built by widening a constant f16 weight to f32 once.
@@ -999,16 +1085,16 @@ pub struct MatMulKernel {
 
 /// Factory for [`MatMulKernel`] (no attributes).
 pub struct MatMulFactory {
-    retain_caches: bool,
+    resources: CpuMemoryResources,
 }
 impl MatMulFactory {
-    pub fn new(retain_caches: bool) -> Self {
-        Self { retain_caches }
+    pub fn new(resources: CpuMemoryResources) -> Self {
+        Self { resources }
     }
 }
 impl Default for MatMulFactory {
     fn default() -> Self {
-        Self::new(true)
+        Self::new(CpuMemoryResources::default())
     }
 }
 
@@ -1020,7 +1106,7 @@ impl KernelFactory for MatMulFactory {
         };
         Ok(Box::new(MatMulKernel {
             flops,
-            prepack: MatMulPrepack::new(self.retain_caches),
+            prepack: MatMulPrepack::new(self.resources.clone()),
         }))
     }
 }
@@ -2400,7 +2486,10 @@ impl Kernel for MatMulKernel {
 impl MatMulKernel {
     pub(crate) fn with_cache_retention(retain_caches: bool) -> Self {
         Self {
-            prepack: MatMulPrepack::new(retain_caches),
+            prepack: MatMulPrepack::new(
+                CpuMemoryResources::default()
+                    .with_cache_retention(crate::CpuCacheRetention::new(retain_caches)),
+            ),
             flops: None,
         }
     }
@@ -2607,11 +2696,11 @@ impl MatMulKernel {
                         a_bits, bt_bits, &mut out, geom.m, geom.k, geom.n,
                     ) {
                         // Fallback: materialise contiguous copy
-                        if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view) {
+                        if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view)? {
                             half_gemm_tile(
                                 HalfFormat::F16,
                                 a_bits,
-                                &b_contig,
+                                b_contig.as_slice(),
                                 &mut out,
                                 geom.m,
                                 geom.k,
@@ -2619,17 +2708,22 @@ impl MatMulKernel {
                             );
                         }
                     }
-                } else if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view) {
+                } else if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view)? {
                     // Non-column-major or batched: use the prepared copy,
                     // borrowing the cache or owning a temporary until compute ends.
                     if trivial_batch {
                         if !accelerate_gemm::bnns_matmul_f16(
-                            a_bits, &b_contig, &mut out, geom.m, geom.k, geom.n,
+                            a_bits,
+                            b_contig.as_slice(),
+                            &mut out,
+                            geom.m,
+                            geom.k,
+                            geom.n,
                         ) {
                             half_gemm_tile(
                                 HalfFormat::F16,
                                 a_bits,
-                                &b_contig,
+                                b_contig.as_slice(),
                                 &mut out,
                                 geom.m,
                                 geom.k,
@@ -2637,7 +2731,7 @@ impl MatMulKernel {
                             );
                         }
                     } else {
-                        bnns_half_dense_into(a_bits, &b_contig, &geom, &mut out);
+                        bnns_half_dense_into(a_bits, b_contig.as_slice(), &geom, &mut out);
                     }
                 }
             }
@@ -3586,14 +3680,21 @@ fn matmul_dense_prepacked_with_backend(
 /// Shared owned-vector GEMM: allocate the result buffer and GEMM into it.
 /// Geometry is pre-computed by the caller to avoid redundant derivation.
 fn matmul_dense_impl_with_geom(
-    a_dense: Cow<'_, [f32]>,
-    b_dense: Cow<'_, [f32]>,
+    a_dense: impl AsRef<[f32]>,
+    b_dense: impl AsRef<[f32]>,
     geom: &MatMulGeometry,
     backend: CpuBackend,
     prepack: Option<&MatMulPrepack>,
 ) -> Result<Vec<f32>> {
     let mut out = vec![0.0f32; geom.result_len];
-    matmul_dense_into_with_backend(&a_dense, &b_dense, geom, backend, prepack, &mut out)?;
+    matmul_dense_into_with_backend(
+        a_dense.as_ref(),
+        b_dense.as_ref(),
+        geom,
+        backend,
+        prepack,
+        &mut out,
+    )?;
     Ok(out)
 }
 
@@ -3855,6 +3956,518 @@ mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
 
+    #[test]
+    fn dense_prediction_covers_every_resource_bearing_matmul_factory() {
+        let original = dense_matmul_graph(3, 2, DataType::Float64, true);
+        let expected = 3 * 2 * 4 * MATMUL_DENSE_DECODE_INSTANTIATIONS;
+        for op in ["MatMul", "Gemm", "FusedMatMulBias", "FusedGemm"] {
+            let mut graph = original.clone();
+            let node = graph.nodes.values_mut().next().unwrap();
+            node.op_type = op.into();
+            node.domain = if matches!(op, "FusedMatMulBias" | "FusedGemm") {
+                "com.microsoft"
+            } else {
+                ""
+            }
+            .into();
+            assert_eq!(matmul_dense_cache_predicted_bytes(&graph), expected, "{op}");
+            let node = graph.nodes.values_mut().next().unwrap();
+            node.domain = "unregistered.example".into();
+            assert_eq!(
+                matmul_dense_cache_predicted_bytes(&graph),
+                0,
+                "foreign-domain {op} is not our factory"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn provider_strided_half_copy_uses_host_authority() {
+        if retention_control_in_child(
+            "kernels::matmul::tests::provider_strided_half_copy_uses_host_authority",
+        ) {
+            return;
+        }
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::NodeId;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let (m, k, n) = (3, 17, 9);
+        let a = Owned::f16(&[m, k], &vec![0.25; m * k]);
+        let b = Owned::f16(&[k, 2 * n], &vec![0.5; k * 2 * n]);
+        let shape = [k, n];
+        let strides = [(2 * n) as i64, 2];
+        let bytes = (k * n * 2) as u64;
+        for retained in [true, false] {
+            let books = LedgerGovernor::new(LeaseLedger::new(0, bytes, 0));
+            let resources = CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                Default::default(),
+            )
+            .unwrap()
+            .with_cache_retention(crate::CpuCacheRetention::new(retained));
+            let provider = crate::CpuExecutionProvider::with_resources(resources);
+            let node = Node::new(NodeId(0), "MatMul", vec![], vec![]);
+            let mut kernel = provider
+                .get_kernel(&node, &[vec![m, k], vec![k, n]], 17)
+                .unwrap();
+            kernel.set_constant_inputs(&[false, true]);
+            let run = || {
+                let mut view = b.view();
+                view.shape = &shape;
+                view.strides = &strides;
+                let mut output = Owned::zeros_f32(&[m, n]);
+                kernel.execute(&[a.view(), view], &mut [output.view_mut()])?;
+                assert_eq!(output.to_f32(), vec![k as f32 * 0.125; m * n]);
+                Ok::<_, EpError>(())
+            };
+            run().unwrap();
+            assert_eq!(books.used(Tier::Host), if retained { bytes } else { 0 });
+            let kv = books
+                .reserve(Tier::Host, bytes, MemoryRole::KvCache, HolderId::new(7))
+                .unwrap();
+            let error = run()
+                .expect_err("occupied Host capacity must refuse the copy")
+                .to_string();
+            assert!(
+                error.contains("MatMul constant f16 contiguous preparation admission"),
+                "{error}"
+            );
+            drop(kv);
+            run().unwrap();
+            drop(kernel);
+            drop(provider);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
+    #[test]
+    fn half_copy_rejects_invalid_sources_before_admission_and_handles_empty_layouts() {
+        use onnx_runtime_ir::DeviceId;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 0, 0));
+        let resources = CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut prepack = MatMulPrepack::new(resources);
+        prepack.set_constant_inputs(&[false, true]);
+        let storage = Owned::f16(&[2, 4], &[0.; 8]);
+        let mut view = storage.view();
+        let shape = [2, 2];
+        let strides = [4, 2];
+        view.shape = &shape;
+        view.strides = &strides;
+        view.byte_offset = 1;
+        let error = prepack.contiguous_b_f16(&view).err().unwrap().to_string();
+        assert!(error.contains("byte_offset"), "{error}");
+        view.byte_offset = 0;
+        view.device = DeviceId::cuda(0);
+        let error = prepack.contiguous_b_f16(&view).err().unwrap().to_string();
+        assert!(error.contains("host-accessible storage"), "{error}");
+        assert_eq!(prepack.contiguous_b_f16.activity(), (0, 0));
+        assert_eq!(books.used(Tier::Host), 0);
+        view.device = DeviceId::cpu();
+        let shape = [2, 0];
+        view.shape = &shape;
+        let empty = prepack.contiguous_b_f16(&view).unwrap().unwrap();
+        assert!(empty.as_slice().is_empty());
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn half_copy_grants_cover_readers_refusal_and_idle_reclamation() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let values = [0.25f32, -0.5, 1.0, 2.0, -4.0, 0.0];
+        let storage: Vec<f32> = values.iter().rev().flat_map(|&v| [v, -99.]).collect();
+        let weight = Owned::f16(&[3, 4], &storage);
+        let mut view = weight.view();
+        let shape = [3, 2];
+        let strides = [-4, -2];
+        view.shape = &shape;
+        view.strides = &strides;
+        view.byte_offset = 20;
+        let expected = values.map(|v| half::f16::from_f32(v).to_bits());
+        let bytes = values.len() * 2;
+        for retained in [false, true] {
+            let books = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+            let resources = CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                Default::default(),
+            )
+            .unwrap()
+            .with_cache_retention(crate::CpuCacheRetention::new(retained));
+            let mut prepack = MatMulPrepack::new(resources);
+            prepack.set_constant_inputs(&[false, true]);
+            assert_eq!(books.used(Tier::Host), 0);
+            let reader = prepack.contiguous_b_f16(&view).unwrap().unwrap();
+            assert_eq!(reader.as_slice(), &expected);
+            assert_eq!(books.used(Tier::Host), bytes as u64);
+            assert_eq!(
+                prepack.contiguous_b_f16.stats().1 as u64,
+                if retained { bytes as u64 } else { 0 }
+            );
+            assert!(
+                books
+                    .reserve(Tier::Host, 1, MemoryRole::KvCache, HolderId::new(7))
+                    .is_err(),
+                "a live call must retain the complete grant"
+            );
+            if retained {
+                let warm = prepack.contiguous_b_f16(&view).unwrap().unwrap();
+                assert_eq!(reader.as_slice().as_ptr(), warm.as_slice().as_ptr());
+            } else {
+                let error = prepack
+                    .contiguous_b_f16(&view)
+                    .err()
+                    .expect("a second transient needs its own grant");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("MatMul constant f16 contiguous preparation admission")
+                );
+            }
+            drop(reader);
+            if retained {
+                let kv = books
+                    .reserve(
+                        Tier::Host,
+                        bytes as u64,
+                        MemoryRole::KvCache,
+                        HolderId::new(7),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    prepack.contiguous_b_f16.stats().1 as u64,
+                    0,
+                    "ordinary KV pressure must reclaim idle derived constants"
+                );
+                let before = prepack.contiguous_b_f16.activity();
+                assert!(prepack.contiguous_b_f16(&view).is_err());
+                assert_eq!(
+                    prepack.contiguous_b_f16.activity(),
+                    before,
+                    "refusal must precede conversion"
+                );
+                drop(kv);
+            }
+            let reader = prepack.contiguous_b_f16(&view).unwrap().unwrap();
+            let witness = prepack.contiguous_b_f16.test_first();
+            assert_eq!(witness.is_some(), retained);
+            drop(witness);
+            drop(prepack);
+            assert_eq!(
+                books.used(Tier::Host),
+                bytes as u64,
+                "kernel drop cannot revoke an executing reader"
+            );
+            assert_eq!(reader.as_slice(), &expected);
+            drop(reader);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
+    #[test]
+    fn dense_operand_grants_cover_retained_and_call_owned_readers() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let values = [0.25f64, -0.5, 1.0, 2.0, -4.0, 0.0];
+        let weight = Owned::f64(&[3, 2], &values);
+        let view = weight.view();
+        let bytes = values.len() * 4;
+        for retained in [false, true] {
+            let books = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+            let resources = CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                Default::default(),
+            )
+            .unwrap()
+            .with_cache_retention(crate::CpuCacheRetention::new(retained));
+            let mut prepack = MatMulPrepack::new(resources);
+            prepack.set_constant_inputs(&[false, true]);
+            assert_eq!(books.used(Tier::Host), 0);
+            let reader = prepack.dense(1, &view).unwrap();
+            assert_eq!(&*reader, &values.map(|value| value as f32));
+            assert_eq!(books.used(Tier::Host), bytes as u64);
+            assert_eq!(
+                prepack.dense_live_bytes(),
+                if retained { bytes as u64 } else { 0 }
+            );
+            assert!(
+                books
+                    .reserve(Tier::Host, 1, MemoryRole::KvCache, HolderId::new(7))
+                    .is_err(),
+                "a live call must retain the complete grant"
+            );
+            if retained {
+                let warm = prepack.dense(1, &view).unwrap();
+                assert_eq!(reader.as_ptr(), warm.as_ptr());
+            } else {
+                let error = prepack
+                    .dense(1, &view)
+                    .err()
+                    .expect("a second transient needs its own grant");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("MatMul constant B widening admission")
+                );
+            }
+            drop(reader);
+            if retained {
+                let kv = books
+                    .reserve(
+                        Tier::Host,
+                        bytes as u64,
+                        MemoryRole::KvCache,
+                        HolderId::new(7),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    prepack.dense_live_bytes(),
+                    0,
+                    "ordinary KV pressure must reclaim idle derived constants"
+                );
+                let before = prepack.dense[1].activity();
+                assert!(prepack.dense(1, &view).is_err());
+                assert_eq!(
+                    prepack.dense[1].activity(),
+                    before,
+                    "refusal must precede conversion"
+                );
+                drop(kv);
+            }
+            let reader = prepack.dense(1, &view).unwrap();
+            let witness = prepack.dense_payload(1);
+            assert_eq!(witness.is_some(), retained);
+            drop(witness);
+            drop(prepack);
+            assert_eq!(
+                books.used(Tier::Host),
+                bytes as u64,
+                "kernel drop cannot revoke an executing reader"
+            );
+            assert_eq!(&*reader, &values.map(|value| value as f32));
+            drop(reader);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+        // Borrowing an unchanged constant f32 input requires no grant at all.
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 0, 0));
+        let resources = CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut prepack = MatMulPrepack::new(resources);
+        prepack.set_constant_inputs(&[false, true]);
+        let f32_weight = Owned::f32(&[3, 2], &[0.25; 6]);
+        let f32_view = f32_weight.view();
+        let reader = prepack.dense(1, &f32_view).unwrap();
+        assert_eq!(reader.as_ptr(), f32_view.data_ptr::<f32>());
+        assert_eq!(books.used(Tier::Host), 0);
+        assert!(!prepack.dense_is_filled(1));
+    }
+
+    #[test]
+    fn address_keyed_transpose_keeps_its_funded_source_identity_alive() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 24, 0));
+        let resources = CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut prepack = MatMulPrepack::new(resources);
+        prepack.set_constant_inputs(&[false, true]);
+        let weight = Owned::f64(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
+        let view = weight.view();
+        let reader = prepack.dense(1, &view).unwrap();
+        let source = match &reader.0 {
+            DenseOperandStorage::Funded(source) => Arc::downgrade(source),
+            _ => panic!("expected funded copy"),
+        };
+        assert_eq!(
+            prepack.transposed_b(&reader, 3, 2).unwrap(),
+            [1., 3., 5., 2., 4., 6.]
+        );
+        drop(reader);
+        assert!(
+            books
+                .reserve(Tier::Host, 1, MemoryRole::KvCache, HolderId::new(7))
+                .is_err(),
+            "an address-keyed derived cache must not outlive its identity buffer"
+        );
+        assert!(source.upgrade().is_some());
+        assert!(prepack.transposed_b.get().unwrap()._source.is_some());
+        drop(prepack);
+        assert!(source.upgrade().is_none());
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn half_copy_concurrent_builders_share_one_granted_payload() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 12, 0));
+        let resources = CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut prepack = MatMulPrepack::new(resources);
+        prepack.set_constant_inputs(&[false, true]);
+        let weight = Owned::f16(&[3, 4], &[0.25; 12]);
+        let barrier = std::sync::Barrier::new(8);
+        let readers = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let mut view = weight.view();
+                        let shape = [3, 2];
+                        let strides = [4, 2];
+                        view.shape = &shape;
+                        view.strides = &strides;
+                        prepack.contiguous_b_f16(&view).unwrap().unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            readers
+                .iter()
+                .all(|reader| Arc::ptr_eq(reader, &readers[0]))
+        );
+        assert_eq!(prepack.contiguous_b_f16.activity().1, 1);
+        assert_eq!(books.used(Tier::Host), 12);
+        drop(prepack);
+        assert_eq!(books.used(Tier::Host), 12);
+        drop(readers);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn dense_operand_concurrent_builders_share_one_granted_payload() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 24, 0));
+        let resources = CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut prepack = MatMulPrepack::new(resources);
+        prepack.set_constant_inputs(&[false, true]);
+        let weight = Owned::f64(&[3, 2], &[0.25; 6]);
+        let barrier = std::sync::Barrier::new(8);
+        let readers = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        match prepack.dense(1, &weight.view()).unwrap().0 {
+                            DenseOperandStorage::Funded(reader) => reader,
+                            _ => panic!("constant widening must return a grant-carrying reader"),
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            readers
+                .iter()
+                .all(|reader| Arc::ptr_eq(reader, &readers[0]))
+        );
+        assert_eq!(prepack.dense[1].activity().1, 1);
+        assert_eq!(books.used(Tier::Host), 24);
+        drop(prepack);
+        assert_eq!(books.used(Tier::Host), 24);
+        drop(readers);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn provider_matmul_family_widening_uses_its_host_authority() {
+        if retention_control_in_child(
+            "kernels::matmul::tests::provider_matmul_family_widening_uses_its_host_authority",
+        ) {
+            return;
+        }
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::NodeId;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let a = Owned::f64(&[2, 3], &[0.25; 6]);
+        let b = Owned::f64(&[3, 2], &[0.5; 6]);
+        let bias = Owned::f64(&[2], &[0.; 2]);
+        for op in ["MatMul", "Gemm", "FusedMatMulBias", "FusedGemm"] {
+            for retained in [true, false] {
+                let books = LedgerGovernor::new(LeaseLedger::new(0, 24, 0));
+                let resources = CpuMemoryResources::new(
+                    crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                    Default::default(),
+                )
+                .unwrap()
+                .with_cache_retention(crate::CpuCacheRetention::new(retained));
+                let provider = crate::CpuExecutionProvider::with_resources(resources);
+                let mut node = Node::new(NodeId(0), op, vec![], vec![]);
+                if matches!(op, "FusedMatMulBias" | "FusedGemm") {
+                    node.domain = "com.microsoft".into();
+                }
+                let mut kernel = provider
+                    .get_kernel(&node, &[vec![2, 3], vec![3, 2], vec![2]], 17)
+                    .unwrap();
+                kernel.set_constant_inputs(&[false, true, true]);
+                let run = || {
+                    let mut out = Owned::zeros(DataType::Float64, &[2, 2]);
+                    let inputs = if op == "MatMul" {
+                        vec![a.view(), b.view()]
+                    } else {
+                        vec![a.view(), b.view(), bias.view()]
+                    };
+                    kernel.execute(&inputs, &mut [out.view_mut()])?;
+                    assert_eq!(out.to_f64(), vec![0.375; 4]);
+                    Ok::<_, EpError>(())
+                };
+                run().unwrap();
+                assert_eq!(
+                    books.used(Tier::Host),
+                    if retained { 24 } else { 0 },
+                    "{op}: actual factory must capture its grant source"
+                );
+                let kv = books
+                    .reserve(Tier::Host, 24, MemoryRole::KvCache, HolderId::new(7))
+                    .unwrap();
+                let error = run()
+                    .expect_err("full Host capacity must refuse conversion before allocation")
+                    .to_string();
+                assert!(
+                    error.contains("MatMul constant B widening admission"),
+                    "{op}: {error}"
+                );
+                assert_eq!(books.used(Tier::Host), 24);
+                drop(kv);
+                run().unwrap();
+                drop(kernel);
+                drop(provider);
+                assert_eq!(books.used(Tier::Host), 0);
+            }
+        }
+    }
+
     // --- #1056: MatMulPrepack::dense governance ---------------------------
 
     /// A single-`MatMul` graph whose `B` (input index 1) is a `[k, n]`
@@ -4022,7 +4635,7 @@ mod tests {
             // widened 4-byte copy. Prefill has no such path, so the widening is
             // unconditional there. Either way the weight must be retained once —
             // a run that retains neither is the regression this guards.
-            let dense_filled = kernel.prepack.dense[1].is_filled();
+            let dense_filled = kernel.prepack.dense_is_filled(1);
             let gemv_memo = kernel.prepack.transposed_b_f16.get().is_some();
             assert!(
                 dense_filled || (m == 1 && gemv_memo),
@@ -4030,7 +4643,7 @@ mod tests {
                  governed dense cache, or (decode only) as the f16 transposed-B memo"
             );
             assert!(
-                !kernel.prepack.dense[0].is_filled(),
+                !kernel.prepack.dense_is_filled(0),
                 "the contiguous f32 A is borrowed, never cached (m={m})"
             );
             actual += kernel.prepack.dense_live_bytes();
@@ -5520,13 +6133,29 @@ mod tests {
             .map(|&v| half::f16::from_f32(v).to_bits())
             .collect();
         for admitted in [false, true] {
-            let mut kernel = MatMulKernel::with_cache_retention(admitted);
+            use onnx_runtime_memory_api::Tier;
+            use onnx_runtime_memory_governor::{
+                HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor,
+            };
+            let bytes = (k * n * 2) as u64;
+            let books = LedgerGovernor::new(LeaseLedger::new(0, bytes, 0));
+            let resources = CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                Default::default(),
+            )
+            .unwrap()
+            .with_cache_retention(crate::CpuCacheRetention::new(admitted));
+            let mut kernel = MatMulKernel {
+                prepack: MatMulPrepack::new(resources),
+                flops: None,
+            };
             kernel.set_constant_inputs(&[false, true]);
             for _ in 0..3 {
-                let prepared = kernel.prepack.contiguous_b_f16(&b).unwrap();
-                assert_eq!(&*prepared, &expected_bits);
+                let prepared = kernel.prepack.contiguous_b_f16(&b).unwrap().unwrap();
+                assert_eq!(prepared.as_slice(), &expected_bits);
+                assert_eq!(books.used(Tier::Host), bytes);
                 assert_eq!(
-                    kernel.prepack.contiguous_b_f16.get().is_some(),
+                    kernel.prepack.contiguous_b_f16.stats().0 != 0,
                     admitted,
                     "noncontiguous f16 copying must follow retention permission"
                 );
@@ -5555,8 +6184,9 @@ mod tests {
                     expected,
                     "declining reuse must not turn the rescue output into zeros"
                 );
-                assert_eq!(kernel.prepack.contiguous_b_f16.get().is_some(), admitted);
+                assert_eq!(kernel.prepack.contiguous_b_f16.stats().0 != 0, admitted);
                 assert_eq!(kernel.prepack.dense_live_bytes(), 0);
+                assert_eq!(books.used(Tier::Host), if admitted { bytes } else { 0 });
             }
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             let _ = m;
@@ -5663,7 +6293,7 @@ mod tests {
             )
             .unwrap();
         let packed_ptr = kernel.prepack.packed_b.get().unwrap() as *const mlas_sys::PackedB;
-        let dense_ptr = kernel.prepack.dense[1].filled().unwrap().as_ptr();
+        let dense_ptr = kernel.prepack.dense_payload(1).unwrap().as_slice().as_ptr();
 
         let a2_data: Vec<f32> = (0..5 * 17)
             .map(|i| ((i as f32 * 0.07).cos()) * 0.2)
@@ -5683,10 +6313,10 @@ mod tests {
             packed_ptr
         );
         assert_eq!(
-            kernel.prepack.dense[1].filled().unwrap().as_ptr(),
+            kernel.prepack.dense_payload(1).unwrap().as_slice().as_ptr(),
             dense_ptr
         );
-        assert!(!kernel.prepack.dense[0].is_filled());
+        assert!(!kernel.prepack.dense_is_filled(0));
         assert_ne!(out1.to_f32(), out2.to_f32());
     }
 
@@ -5782,8 +6412,8 @@ mod tests {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         assert!(kernel.prepack.transposed_b_f16.get().is_some());
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        assert!(kernel.prepack.dense[1].is_filled());
-        assert!(!kernel.prepack.dense[0].is_filled());
+        assert!(kernel.prepack.dense_is_filled(1));
+        assert!(!kernel.prepack.dense_is_filled(0));
 
         // Capture the cache pointer *before* the second execute so the
         // comparison below is a real guard: it proves the first call populated
@@ -5791,7 +6421,7 @@ mod tests {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let ptr_before = kernel.prepack.transposed_b_f16.get().unwrap().2.as_ptr();
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        let ptr_before = kernel.prepack.dense[1].filled().unwrap().as_ptr();
+        let ptr_before = kernel.prepack.dense_payload(1).unwrap().as_slice().as_ptr();
 
         let a2 = Owned::f32(&[1, 2], &[4., 5.]);
         let mut out2 = Owned::zeros_f32(&[1, 2]);
@@ -5809,7 +6439,7 @@ mod tests {
         );
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         assert_eq!(
-            kernel.prepack.dense[1].filled().unwrap().as_ptr(),
+            kernel.prepack.dense_payload(1).unwrap().as_slice().as_ptr(),
             ptr_before,
             "dense[1] cache was reallocated on the second execute"
         );
@@ -6364,7 +6994,7 @@ mod tests {
             // The GEMV must never widen B to f32 -- that is 4x the stored
             // weight and was the cost `try_matmul_half` existed to avoid.
             assert!(
-                !kernel.prepack.dense[1].is_filled(),
+                !kernel.prepack.dense_is_filled(1),
                 "{format:?} decode must not widen B to f32"
             );
             // It *may* hold one transpose at the stored width, because the
@@ -6624,7 +7254,7 @@ mod tests {
             "an activation B must never be memoised as a weight transpose"
         );
         assert!(
-            !kernel.prepack.dense[1].is_filled(),
+            !kernel.prepack.dense_is_filled(1),
             "an activation B must never be memoised as a dense weight"
         );
         for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
@@ -6746,7 +7376,7 @@ mod tests {
         }
         if half_gemv::simd_available(HalfFormat::F16) {
             assert!(
-                !kernel.prepack.dense[1].is_filled(),
+                !kernel.prepack.dense_is_filled(1),
                 "the GEMV must not widen B to f32"
             );
             let retained = kernel
@@ -8786,7 +9416,7 @@ mod tests {
 /// # The escape this closes
 ///
 /// The governance guard greps new `OnceLock<..Cache..>` declarations and makes
-/// the author declare a [`GovernedWeightCache`] verdict. It is a good guard for
+/// the author declare a retained-weight policy. It is a good guard for
 /// "somebody added a new cache". It says nothing about the *other* half, which
 /// is how #1702 escaped: the cache already existed and was already governed,
 /// and a new **route** (`FusedMatMulBias` reaching the shared decode GEMV) was

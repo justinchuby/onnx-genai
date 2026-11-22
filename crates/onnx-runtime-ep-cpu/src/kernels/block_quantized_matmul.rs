@@ -2858,7 +2858,7 @@ mod tests {
 
     #[test]
     fn dense_weight_cache_is_bounded_and_lru_evicts() {
-        let cache = DenseWeightCache::with_limit(16);
+        let cache = DenseWeightCache::<DenseWeightCacheKey>::with_limit(16);
         let packed1 = Owned::u8(&[4], &[1, 2, 3, 4]);
         let packed2 = Owned::u8(&[4], &[5, 6, 7, 8]);
         let identity1 = DenseWeightIdentity::default();
@@ -2912,7 +2912,7 @@ mod tests {
             .key;
 
         for limit in [0, 15] {
-            let cache = DenseWeightCache::with_limit(limit);
+            let cache = DenseWeightCache::<DenseWeightCacheKey>::with_limit(limit);
             for expected_builds in 1..=2 {
                 let (_, status) = cache
                     .test_get_or_insert_with(key.as_ref(), || Ok(vec![1.0, 2.0, 3.0, 4.0]))
@@ -3015,7 +3015,7 @@ mod tests {
     fn dense_weight_cache_concurrent_miss_builds_once() {
         use std::sync::Barrier;
 
-        let cache = std::sync::Arc::new(DenseWeightCache::with_limit(1024));
+        let cache = std::sync::Arc::new(DenseWeightCache::<DenseWeightCacheKey>::with_limit(1024));
         let packed = Owned::u8(&[4], &[9, 8, 7, 6]);
         let identity = DenseWeightIdentity::default();
         let packed_view = packed.view();

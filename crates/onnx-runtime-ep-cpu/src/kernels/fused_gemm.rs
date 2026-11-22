@@ -31,11 +31,21 @@ pub struct FusedGemmKernel {
 }
 
 /// Factory for [`FusedGemmKernel`] (no attributes).
-pub struct FusedGemmFactory;
+#[derive(Default)]
+pub struct FusedGemmFactory {
+    resources: crate::CpuMemoryResources,
+}
+impl FusedGemmFactory {
+    pub fn new(resources: crate::CpuMemoryResources) -> Self {
+        Self { resources }
+    }
+}
 
 impl KernelFactory for FusedGemmFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(FusedGemmKernel::default()))
+        Ok(Box::new(FusedGemmKernel {
+            prepack: MatMulPrepack::new(self.resources.clone()),
+        }))
     }
 }
 

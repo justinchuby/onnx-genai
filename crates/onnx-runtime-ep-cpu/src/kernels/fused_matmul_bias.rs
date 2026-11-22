@@ -35,23 +35,23 @@ pub struct FusedMatMulBiasKernel {
 
 /// Factory for [`FusedMatMulBiasKernel`] (no attributes).
 pub struct FusedMatMulBiasFactory {
-    retain_caches: bool,
+    resources: crate::CpuMemoryResources,
 }
 impl FusedMatMulBiasFactory {
-    pub fn new(retain_caches: bool) -> Self {
-        Self { retain_caches }
+    pub fn new(resources: crate::CpuMemoryResources) -> Self {
+        Self { resources }
     }
 }
 impl Default for FusedMatMulBiasFactory {
     fn default() -> Self {
-        Self::new(true)
+        Self::new(crate::CpuMemoryResources::default())
     }
 }
 
 impl KernelFactory for FusedMatMulBiasFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(FusedMatMulBiasKernel {
-            prepack: MatMulPrepack::new(self.retain_caches),
+            prepack: MatMulPrepack::new(self.resources.clone()),
         }))
     }
 }
