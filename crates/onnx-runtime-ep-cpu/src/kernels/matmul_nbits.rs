@@ -13249,6 +13249,7 @@ mod tests {
 
     #[test]
     fn native_pack_shared_shapes_keep_dynamic_metadata_uncached() {
+        let _probe = lock_dispatch_probe();
         use onnx_runtime_memory_api::Tier;
         use onnx_runtime_memory_governor::MemoryGovernor;
         let (books, resources) = governed_dense_resources(11, 0);
