@@ -395,6 +395,7 @@ pub(crate) trait GenerationCore: WorkflowNodeHost {
 
 /// Everything one generation needs beyond its decode executor.
 pub(crate) struct GenerationRequest<'a> {
+    pub(crate) control: Option<&'a super::GenerationControl>,
     pub(crate) options: &'a GenerateOptions,
     pub(crate) chain: &'a ProcessorChain,
     pub(crate) tokenizer: &'a Tokenizer,
@@ -414,6 +415,7 @@ pub(crate) struct GenerationNodeHost<'a, 'c, B: DecodeLoopBackend + ?Sized> {
     chain: &'a ProcessorChain,
     tokenizer: &'a Tokenizer,
     max_context: Option<usize>,
+    control: Option<&'a super::GenerationControl>,
     callback: Option<&'a mut GenerateTokenCallback<'c>>,
     staged_output_observer: Option<&'a mut ToolCallStagedOutputObserver>,
     /// Logits from this iteration's decode node, awaiting its policy node.
@@ -451,6 +453,7 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             chain: request.chain,
             tokenizer: request.tokenizer,
             max_context: request.max_context,
+            control: request.control,
             callback,
             staged_output_observer,
             pending_forward: None,
@@ -483,6 +486,9 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             self.options,
             self.chain,
         )?);
+        if let Some(control) = self.control {
+            control.check(super::GenerationBoundary::AfterDecoderForward)?;
+        }
         Ok(())
     }
 
@@ -577,6 +583,13 @@ impl<B: DecodeLoopBackend + ?Sized> WorkflowNodeHost for GenerationNodeHost<'_, 
         DECODE_CORE_CONTRACTS
     }
 
+    fn observe_boundary(&mut self, boundary: super::GenerationBoundary) -> anyhow::Result<()> {
+        if let Some(control) = self.control {
+            control.check(boundary)?;
+        }
+        Ok(())
+    }
+
     fn begin_turn(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
         if let Some(observer) = self.staged_output_observer.as_deref_mut() {
             observer.begin_turn();
@@ -585,6 +598,9 @@ impl<B: DecodeLoopBackend + ?Sized> WorkflowNodeHost for GenerationNodeHost<'_, 
     }
 
     fn before_turn_commit(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
+        // The enclosing decoder participant owns semantic commit. This inner
+        // workflow pass only observes cancellation while its output is staged.
+        self.observe_boundary(super::GenerationBoundary::BeforeWorkflowNode)?;
         if let Some(observer) = self.staged_output_observer.as_deref_mut()
             && let StagedOutputObservation::TerminalComplete(calls) = observer
                 .finish("semantic commit")

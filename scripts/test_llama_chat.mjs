@@ -114,6 +114,59 @@ async function disconnectingProxy() {
   return { server: proxy, disconnectCount: () => disconnected };
 }
 
+async function longGenerationRequests(page, outputTokens) {
+  await page.route('**/v1/chat/completions', async route => {
+    if (!route.request().headers()['x-conversation-id']) return await route.continue();
+    const body = route.request().postDataJSON();
+    delete body.max_completion_tokens;
+    Object.assign(body, { max_tokens: outputTokens, temperature: 0, ignore_eos: true, logit_bias: { '5': 100 } });
+    await route.continue({ postData: JSON.stringify(body) });
+  });
+}
+
+async function stopActiveGeneration(browser, origin, outputTokens) {
+  const page = await browser.newPage();
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  try {
+    await longGenerationRequests(page, outputTokens);
+    await page.goto(origin, { waitUntil: 'networkidle' });
+    const started = page.waitForResponse(response => new URL(response.url()).pathname === '/v1/chat/completions'
+      && response.request().headers()['x-conversation-id'], { timeout: 30000 });
+    await page.getByRole('textbox').last().fill('Stop this generation while it is computing');
+    await page.getByRole('textbox').last().press('Enter');
+    const response = await started;
+    assert(response.ok(), 'Stop test generation was not admitted');
+    const conversationId = response.request().headers()['x-conversation-id'];
+    const activeTurns = async () => {
+      const response = await fetch(`${origin}/v1/status`, { signal: AbortSignal.timeout(3000) });
+      assert(response.ok);
+      const workers = (await response.json()).workers;
+      assert(workers.length > 0, 'status must expose actual inference workers');
+      return workers.reduce((sum, worker) => sum + worker.active_turns, 0);
+    };
+    const stop = page.getByRole('button', { name: 'Stop', exact: true });
+    await stop.waitFor({ state: 'visible' });
+    assert.equal(await activeTurns(), 1, 'generation must own a real worker before Stop');
+    const cancelled = page.waitForResponse(response => new URL(response.url()).pathname === '/v1/stream'
+      && response.request().method() === 'DELETE', { timeout: 10000 });
+    await stop.click();
+    assert.equal((await cancelled).status(), 204, 'frontend Stop must explicitly cancel its producer');
+    await stop.waitFor({ state: 'hidden', timeout: 10000 });
+    const deadline = Date.now() + 5000;
+    while (await activeTurns()) {
+      assert(Date.now() < deadline, 'cancelled inference did not release its worker within 5s');
+      await delay(25);
+    }
+    const replay = await fetch(`${origin}/v1/stream?conv_id=${encodeURIComponent(conversationId)}&from=0`);
+    assert.equal(replay.status, 404, 'Stop must discard the cancelled replay');
+    assert.deepEqual(errors, [], 'browser runtime errors while stopping generation');
+    console.log(JSON.stringify({ activeStop: 'passed', workerReleased: true, cancelledReplay: replay.status, pageErrors: errors }));
+  } finally {
+    await page.close();
+  }
+}
+
 async function activeReload(browser) {
   const fixture = await longContextFixture();
   const backendOrigin = 'http://127.0.0.1:18081';
@@ -136,13 +189,7 @@ async function activeReload(browser) {
       if (path === '/v1/chat/completions') posts.push(request);
       if (path === '/v1/stream' && request.method() === 'GET') replayRequests.push(request.url());
     });
-    await page.route('**/v1/chat/completions', async route => {
-      if (!route.request().headers()['x-conversation-id']) return await route.continue();
-      const body = route.request().postDataJSON();
-      delete body.max_completion_tokens;
-      Object.assign(body, { max_tokens: fixture.outputTokens, temperature: 0, ignore_eos: true, logit_bias: { '5': 100 } });
-      await route.continue({ postData: JSON.stringify(body) });
-    });
+    await longGenerationRequests(page, fixture.outputTokens);
     await page.goto(origin, { waitUntil: 'networkidle' });
     const networkRecovered = page.waitForResponse(response => {
       const url = new URL(response.url());
@@ -207,6 +254,7 @@ async function activeReload(browser) {
     console.log(JSON.stringify({ activeReload: 'passed', networkRecovery: 'passed', outputTokens: fixture.outputTokens,
       generationPosts: posts.filter(request => request.headers()['x-conversation-id']).length,
       automaticReplayRequests: replayRequests.length, pageErrors: errors }));
+    await stopActiveGeneration(browser, backendOrigin, fixture.outputTokens);
   } catch (error) {
     throw new Error(`${error.message}\n${diagnostics}`, { cause: error });
   } finally {

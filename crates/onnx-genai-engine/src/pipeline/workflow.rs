@@ -2053,9 +2053,7 @@ impl WorkflowNodeHost for ControlledWorkflowHost<'_, '_> {
     }
 
     fn observe_boundary(&mut self, boundary: GenerationBoundary) -> anyhow::Result<()> {
-        if self.control.observe(boundary)? {
-            return Err(GenerationCancelled { boundary }.into());
-        }
+        self.control.check(boundary)?;
         if let Some(host) = self.inner.as_deref_mut() {
             host.observe_boundary(boundary)?;
         }
@@ -2066,13 +2064,7 @@ impl WorkflowNodeHost for ControlledWorkflowHost<'_, '_> {
         if let Some(host) = self.inner.as_deref_mut() {
             host.before_turn_commit(turn)?;
         }
-        if !self.control.begin_commit()? {
-            return Err(GenerationCancelled {
-                boundary: GenerationBoundary::BeforeSemanticCommit,
-            }
-            .into());
-        }
-        Ok(())
+        self.control.require_commit()
     }
 
     fn supports_provisional_output_publications(&self) -> bool {

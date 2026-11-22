@@ -13,7 +13,7 @@ name or a successful empty response is not an implemented capability.
 - [x] Discovery, model properties/management, tokenizer and chat-template endpoints.
 - [x] Preserve the noninteractive generation/transcription/profiling commands.
 - [x] Create working branch and draft PR; incorporate current main before further work.
-- [ ] Resumable SSE: byte-exact replay, explicit cancellation, replacement, bounded history, expiry, frontend refresh/reconnect.
+- [x] Resumable SSE: byte-exact replay, explicit cancellation, replacement, bounded history, expiry, frontend refresh/reconnect.
 - [ ] Native completion/embedding/infill protocols and native request parameters.
 - [x] Token-counting protocols using the inference preparation path, including declared media.
 - [ ] Responses and Anthropic Messages, including tools and streamed event contracts.
@@ -45,8 +45,8 @@ through the admitted engine driver. A real tiny-model HTTP test covers both
 alternate protocols and their streamed usage; synthetic stream tests pin reasoning,
 tool indices and incomplete-stream rejection.
 
-This milestone does not check off the full rows above: ordinary-decoder
-mid-compute cancellation, native prefill-only, timing/progress, additional
+This milestone does not check off the remaining rows above: native prefill-only,
+timing/progress, additional
 sampling and runtime-backed state/adapter work still need completion.
 
 Sampling follow-up: `logit_bias` now lowers OpenAI objects and native token/text
@@ -191,11 +191,10 @@ The final script passed, including subprocess/proxy/fixture cleanup. Existing
 HTTP/unit checks cover byte boundaries, reader admission, replacement, history
 limits and expiry.
 
-Cancellation audit follow-up: the server creates a receiver-closure probe but
-currently attaches GenerationControl only to specialized speculative paths.
-DELETE already cancels transport retention, but true mid-compute
-cancellation/worker release still needs implementation and executable Stop tests.
-The complete resumable-generation delivery row therefore remains unchecked.
+Cancellation audit found a receiver-closure probe attached only to specialized
+speculative paths. DELETE initially cancelled transport retention without proof
+of mid-compute termination. The decoder and browser milestone below resolves
+that gap; transport cancellation alone was not counted as completed delivery.
 
 Generic-workflow cancellation: the engine accepts GenerationControl for declared
 workflow execution, checks it before each authored node and resolves the atomic
@@ -205,10 +204,34 @@ the existing transaction abort path. Specialized drivers retain their own contro
 authority rather than competing with a second commit owner. Tests cancel after
 two real hosted loop iterations, retract a prior provisional revision, cover both
 commit-race outcomes, and preserve a previously committed session value/version.
-Fused decoder propagation and the server's ordinary receiver-closure wiring
-remain outstanding; this milestone does not claim frontend Stop is complete.
+This generic-workflow checkpoint preceded the fused decoder propagation and
+server wiring verified below.
 
 Generic-cancellation validation: full engine library 613 passed / 1 inherited
 ignore; full server library 392 passed / 2 inherited ignores. Final focused
 checks selected and passed both cancellation tests plus the session-baseline
 regression. Strict all-target Clippy passes for both engine and server.
+
+Decoder-cancellation milestone: one driver receiver-closure authority now reaches
+generic, ORT and native requests, including cold/session generation. Ordinary
+node hosts observe it between authored nodes and after decoder forwards; the
+outer decoder participant retains the semantic commit race and baseline rollback.
+Speculative blocks observe the same authority without installing a transport
+callback or changing token publication. Native accepted-token staging also checks
+cancellation. The obsolete unsupported-control type and specialized-only server
+gate are removed. Real ORT and native CPU tests cancel after the second forward,
+publish no provisional tokens, restore a warm session, release the scheduler and
+retry with the same result as an independent engine.
+
+The real Chrome smoke now additionally clicks Stop while a real worker owns a
+long generation, observes DELETE /v1/stream returning 204, waits for active_turns
+to reach zero and verifies the cancelled replay returns 404. Basic chat, completed
+byte replay, injected reader disconnect, active reload, exact final token count
+and zero browser errors all pass with the same built server. The full resumable
+SSE row is now checked; remaining compatibility rows and PR merge stay open.
+
+Decoder validation: full engine library 614 passed / 1 inherited ignore; native
+feature set 787 passed / 1 inherited ignore. The final focused run selects and
+passes three tests covering warm ORT/native sessions, cold native generation and
+native prompt lookup. Full server library 392 passed / 2 inherited ignores;
+strict server and native-enabled engine all-target Clippy pass.

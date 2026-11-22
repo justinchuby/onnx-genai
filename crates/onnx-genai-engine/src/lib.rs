@@ -182,9 +182,9 @@ pub struct VmmArenaStats {
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
     AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, EncodedAudio,
-    GenerationBoundary, GenerationCancelled, GenerationControl, GenerationControlUnsupported,
-    GenerationStopReason, PipelineGenerateRequest, PipelineTensors, RowPlan, RowScopedState,
-    RowTable, StagedOutputCheckpoint, StagedOutputObservation, StagedOutputObservationError,
+    GenerationBoundary, GenerationCancelled, GenerationControl, GenerationStopReason,
+    PipelineGenerateRequest, PipelineTensors, RowPlan, RowScopedState, RowTable,
+    StagedOutputCheckpoint, StagedOutputObservation, StagedOutputObservationError,
     ToolCallStagedOutputObserver, WorkflowSessionCheckpoint, is_missing_required_input,
     validate_pipeline_backend_request,
 };

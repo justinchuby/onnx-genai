@@ -2450,15 +2450,7 @@ fn run_generation(
     let cancellation_events = events.clone();
     let generation_control =
         GenerationControl::from_cancellation_probe(move || cancellation_events.is_closed());
-    let specialized_speculation =
-        engine.candidate_tree_diagnostic().is_some() || engine.dflash_diagnostic().is_some();
-    let bound = bound.map(|request| {
-        if specialized_speculation {
-            request.with_generation_control(generation_control.clone())
-        } else {
-            request
-        }
-    });
+    let bound = bound.map(|request| request.with_generation_control(generation_control.clone()));
     let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
@@ -2484,29 +2476,18 @@ fn run_generation(
                 Some(&mut admitted),
                 Some(&mut callback),
             ),
-            (None, session) if specialized_speculation => {
-                let request = PipelineGenerateRequest::new(request)
-                    .with_generation_control(generation_control)
-                    .with_tool_call_policy(tool_call_policy);
-                engine.generate_with_pipeline_callbacks(
-                    match session {
-                        Some(session) => request.with_session_id(session.to_string()),
-                        None => request,
-                    },
-                    Some(&mut admitted),
-                    Some(&mut callback),
-                )
-            }
             (None, Some(session_id)) => engine.generate_in_session_with_tool_policy_callbacks(
                 session_id,
                 request,
                 tool_call_policy,
+                Some(generation_control),
                 Some(&mut admitted),
                 Some(&mut callback),
             ),
             (None, None) => engine.generate_with_tool_policy_callbacks(
                 request,
                 tool_call_policy,
+                Some(generation_control),
                 Some(&mut admitted),
                 Some(&mut callback),
             ),

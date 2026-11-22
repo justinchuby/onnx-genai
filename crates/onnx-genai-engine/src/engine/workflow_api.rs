@@ -247,13 +247,6 @@ impl Engine {
         // request that asked for none of it.
         let prompt_only = request.inputs.is_empty() && request.component_overrides.is_empty();
         if prompt_only && self.holds_decode_core() {
-            if request.generation_control.is_some() {
-                return Err(crate::pipeline::GenerationControlUnsupported {
-                    operation: "Engine::generate_with_pipeline_callbacks",
-                    runtime: "the fused decode backend",
-                }
-                .into());
-            }
             let tool_call_policy = request.tool_call_policy.clone();
             return match request.session_id.as_deref().and_then(|id| id.parse().ok()) {
                 Some(session) if self.sessions.contains_key(&session) => self
@@ -261,12 +254,14 @@ impl Engine {
                         session,
                         request.request,
                         tool_call_policy,
+                        request.generation_control,
                         on_admitted,
                         callback,
                     ),
                 _ => self.generate_with_tool_policy_callbacks(
                     request.request,
                     tool_call_policy,
+                    request.generation_control,
                     on_admitted,
                     callback,
                 ),

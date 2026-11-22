@@ -1956,6 +1956,7 @@ impl NativeDecodeSession {
             tokenizer,
             runtime,
             None,
+            None,
             callback,
         )
     }
@@ -1968,6 +1969,7 @@ impl NativeDecodeSession {
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
         runtime: &crate::pipeline::WorkflowRuntime,
+        control: Option<&crate::pipeline::GenerationControl>,
         staged_output_observer: Option<&mut crate::pipeline::ToolCallStagedOutputObserver>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -1990,6 +1992,7 @@ impl NativeDecodeSession {
             &mut state,
             prompt_tokens,
             GenerationRequest {
+                control,
                 options,
                 chain,
                 tokenizer,
@@ -2073,6 +2076,7 @@ impl NativeDecodeSession {
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
         runtime: &crate::pipeline::WorkflowRuntime,
+        control: Option<&crate::pipeline::GenerationControl>,
         staged_output_observer: Option<&mut crate::pipeline::ToolCallStagedOutputObserver>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -2088,6 +2092,7 @@ impl NativeDecodeSession {
                 chain,
                 tokenizer,
                 runtime,
+                control,
                 staged_output_observer,
                 callback,
             );
@@ -2119,6 +2124,7 @@ impl NativeDecodeSession {
             &mut state,
             prompt_tokens,
             GenerationRequest {
+                control,
                 options,
                 chain,
                 tokenizer,

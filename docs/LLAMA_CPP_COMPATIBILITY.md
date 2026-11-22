@@ -114,11 +114,14 @@ HTTP reader. Reconnect with `/v1/stream?conv_id=ID&from=BYTE_OFFSET`; DELETE can
 the producer. Retention defaults to 16 streams and 4 MiB per stream, with completed
 history expiring after five minutes. Old offsets fail explicitly once evicted.
 Requests without a conversation ID close their driver reader on disconnect.
-Mid-compute cancellation through the ordinary decoder is an outstanding engine
-follow-up: the engine now supports request-scoped cancellation between generic
-workflow nodes and at semantic commit, but fused decode still rejects that
-control and the server's ordinary path still needs wiring. Replay DELETE already removes the transport producer and retained
-bytes; that alone does not prove prompt termination inside every backend.
+The driver carries that cancellation authority into generic workflows and fused
+ORT/native decode. Execution observes cancellation between workflow nodes and
+after decoder forwards, aborts uncommitted state and releases scheduler capacity.
+An in-flight backend call completes before its next checkpoint. Cancellation
+races semantic commit atomically; after commit it affects delivery rather than
+rolling back durable state. Replay DELETE removes the producer and retained bytes.
+The real Chrome smoke verifies the frontend Stop request, worker release and
+cancelled-history removal, alongside active refresh and reader recovery.
 
 Native generation accepts text, token IDs, mixed text/token rows and prompt
 batches, including text-only `prompt_string` objects. Only a first text segment
@@ -216,6 +219,9 @@ then reloads while the producer is still active and must attach again without
 resubmitting generation. The final UI text must match the complete retained
 answer, with one generation POST and no browser runtime errors. No mocked
 inference or artificial network delay makes the generation appear active.
+A fresh page then starts a long request, verifies a worker is active, clicks
+Stop, checks the explicit DELETE response, waits for worker release and confirms
+the cancelled stream is no longer replayable.
 Temporary fixtures, proxy, Chrome and server processes are cleaned up, with
 bounded startup/observer waits. Append an optional screenshot path after the
 Playwright module path to save an image of the baseline chat. Coordinate this

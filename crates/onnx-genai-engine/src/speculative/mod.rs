@@ -1451,6 +1451,7 @@ impl SpeculativeProposer for DraftModelProposer<'_> {
 /// output accumulators (generated tokens, text, and log-probabilities), the
 /// sampling RNG, and the optional per-token callback.
 pub(crate) struct SpeculativeLoopState<'state, 'callback> {
+    pub(crate) control: Option<&'state crate::pipeline::GenerationControl>,
     pub(crate) session_id: SessionId,
     pub(crate) state: &'state mut EngineSession,
     pub(crate) options: &'state GenerateOptions,
@@ -1472,6 +1473,7 @@ pub(crate) struct SpeculativeLoopState<'state, 'callback> {
 /// what makes the speculative algorithm a *step inside* a declared workflow
 /// rather than a second loop beside one.
 pub(crate) struct SpeculativeBlock<'state, 'callback> {
+    control: Option<&'state crate::pipeline::GenerationControl>,
     session_id: SessionId,
     state: &'state mut EngineSession,
     options: &'state GenerateOptions,
@@ -1501,6 +1503,16 @@ struct SpeculativeBlockHost<'engine, 'state, 'callback> {
 impl crate::pipeline::WorkflowNodeHost for SpeculativeBlockHost<'_, '_, '_> {
     fn hosted_contracts(&self) -> &'static [&'static str] {
         crate::pipeline::generation::SPECULATIVE_BLOCK_CONTRACTS
+    }
+
+    fn observe_boundary(
+        &mut self,
+        boundary: crate::pipeline::GenerationBoundary,
+    ) -> anyhow::Result<()> {
+        if let Some(control) = self.block.control {
+            control.check(boundary)?;
+        }
+        Ok(())
     }
 
     fn execute_contract_node(
@@ -1691,6 +1703,7 @@ impl Engine {
         loop_state: SpeculativeLoopState<'_, '_>,
     ) -> anyhow::Result<GenerateResult> {
         let SpeculativeLoopState {
+            control,
             session_id,
             state,
             options,
@@ -1743,6 +1756,7 @@ impl Engine {
         let mut host = SpeculativeBlockHost {
             engine: self,
             block: SpeculativeBlock {
+                control,
                 session_id,
                 state,
                 options,
@@ -1813,6 +1827,7 @@ impl Engine {
         block: &mut SpeculativeBlock<'_, '_>,
     ) -> anyhow::Result<Option<GenerateResult>> {
         let SpeculativeBlock {
+            control: _,
             session_id,
             state,
             options,

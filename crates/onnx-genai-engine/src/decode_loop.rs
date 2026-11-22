@@ -593,6 +593,7 @@ mod tests {
             &mut fallback_state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -609,6 +610,7 @@ mod tests {
             &mut host_state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -647,6 +649,7 @@ mod tests {
                 &mut state,
                 &[],
                 crate::pipeline::generation::GenerationRequest {
+                    control: None,
                     options: &options,
                     chain: &chain,
                     tokenizer: &tokenizer,
@@ -691,6 +694,7 @@ mod tests {
             &mut na_state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -707,6 +711,7 @@ mod tests {
             &mut host_state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -755,6 +760,7 @@ mod tests {
             &mut state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -791,6 +797,7 @@ mod tests {
             &mut plain_state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -814,6 +821,7 @@ mod tests {
             &mut streamed_state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -887,6 +895,7 @@ mod tests {
             &mut state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -938,6 +947,7 @@ mod tests {
             &mut state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -983,6 +993,7 @@ mod tests {
             &mut state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,

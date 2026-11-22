@@ -912,6 +912,7 @@ impl Engine {
         &mut self,
         mut request: GenerateRequest,
         tool_call_policy: ToolCallPolicy,
+        control: Option<&crate::pipeline::GenerationControl>,
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -1010,7 +1011,12 @@ impl Engine {
         }
 
         let result = {
-            let mut stage_token = |token| staged_output.stage(token);
+            let mut stage_token = |token| {
+                if let Some(control) = control {
+                    control.check(crate::pipeline::GenerationBoundary::BeforeWorkflowNode)?;
+                }
+                staged_output.stage(token)
+            };
             // Speculation ON (implemented greedy prompt-lookup) → the native
             // speculative driver. Every other request stays on the untouched plain
             // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
@@ -1107,6 +1113,7 @@ impl Engine {
                     &chain,
                     tokenizer,
                     runtime,
+                    control,
                     tool_observer.as_mut(),
                     Some(&mut stage_token),
                 )
@@ -1116,6 +1123,9 @@ impl Engine {
             result.and_then(|mut result| {
                 result.budget_cap = budget_cap;
                 staged_output.validate(&result)?;
+                if let Some(control) = control {
+                    control.require_commit()?;
+                }
                 Ok(result)
             }),
             EngineDecodeBackend::Native,
@@ -1123,10 +1133,26 @@ impl Engine {
         let result = match result {
             Ok(result) => {
                 let _outcome = turn.commit()?;
+                if let Some(control) = control {
+                    control.finish_commit();
+                }
                 Ok(result)
             }
             Err(error) => {
-                match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                if let Some(control) = control {
+                    control.abort_commit();
+                }
+                match turn.abort(
+                    self,
+                    if error
+                        .downcast_ref::<crate::pipeline::GenerationCancelled>()
+                        .is_some()
+                    {
+                        crate::pipeline::TurnAbortReason::Cancellation
+                    } else {
+                        crate::pipeline::TurnAbortReason::ExecutionFailure
+                    },
+                ) {
                     Ok(_) => Err(error),
                     Err(rollback) => Err(error.context(format!(
                         "atomic native cold turn failed and its baseline restoration also \
@@ -1147,6 +1173,7 @@ impl Engine {
         &mut self,
         _request: GenerateRequest,
         _tool_call_policy: ToolCallPolicy,
+        _control: Option<&crate::pipeline::GenerationControl>,
         _admission_callback: Option<&mut dyn FnMut()>,
         _callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -1443,28 +1470,6 @@ impl Engine {
         Ok(result)
     }
 
-    /// Generate by interpreting every declared component from its artifact.
-    ///
-    /// The same drive the decode-core path uses, with no core: the interpreter
-    /// walks the same declared loop, honours the same bound and predicate, and
-    /// publishes the same `tokens` output. What it does not have is a fused
-    /// session to route the decode step to, so it invokes the component the
-    /// package names.
-    fn generate_interpreted_with_tool_policy(
-        &mut self,
-        request: GenerateRequest,
-        tool_call_policy: ToolCallPolicy,
-        on_admitted: Option<&mut dyn FnMut()>,
-        callback: Option<&mut GenerateTokenCallback<'_>>,
-    ) -> anyhow::Result<GenerateResult> {
-        self.generate_with_pipeline_callbacks(
-            crate::pipeline::PipelineGenerateRequest::new(request)
-                .with_tool_call_policy(tool_call_policy),
-            on_admitted,
-            callback,
-        )
-    }
-
     /// Admit a workflow-driven request through the scheduler.
     ///
     /// A workflow-driven request still shares this runtime's scheduler, and —
@@ -1474,7 +1479,7 @@ impl Engine {
     /// [`crate::engine::workflow_api::Engine::generate_with_pipeline_callbacks`]'s
     /// workflow branch — the one place every request that runs the declared
     /// workflow passes through, whether it arrived cold
-    /// ([`Self::generate_interpreted`]), through a continuing workflow session
+    /// ([`Self::generate_with_tool_policy_callbacks`]), through a continuing workflow session
     /// ([`Self::generate_in_workflow_session`]), or carrying tensors no prompt
     /// can express — this gives the path
     /// the same "reject at the door" guarantee
@@ -1722,6 +1727,7 @@ impl Engine {
         self.generate_with_tool_policy_callbacks(
             request,
             ToolCallPolicy::Disabled,
+            None,
             admission_callback,
             token_callback,
         )
@@ -1732,10 +1738,13 @@ impl Engine {
     /// When enabled, token callbacks are commit-only: protocol parsing and
     /// request-policy validation complete inside the semantic transaction
     /// before any generated output is delivered.
+    /// An optional control aborts provisional execution at workflow boundaries
+    /// and races semantic commit through the decoder's existing transaction.
     pub fn generate_with_tool_policy_callbacks(
         &mut self,
         request: GenerateRequest,
         tool_call_policy: ToolCallPolicy,
+        control: Option<crate::pipeline::GenerationControl>,
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -1749,9 +1758,11 @@ impl Engine {
         // interpreter invokes every declared component from the artifact the
         // package names — the same loop, the same emits, the same stop.
         if !self.holds_decode_core() {
-            return self.generate_interpreted_with_tool_policy(
+            let mut request = crate::pipeline::PipelineGenerateRequest::new(request)
+                .with_tool_call_policy(tool_call_policy);
+            request.generation_control = control;
+            return self.generate_with_pipeline_callbacks(
                 request,
-                tool_call_policy,
                 admission_callback,
                 token_callback,
             );
@@ -1769,6 +1780,7 @@ impl Engine {
                 let result = self.generate_native_cold_with_callback(
                     request,
                     tool_call_policy,
+                    control.as_ref(),
                     admission_callback,
                     token_callback,
                 );
@@ -1780,6 +1792,7 @@ impl Engine {
                 session_id,
                 request,
                 tool_call_policy,
+                control.as_ref(),
                 admission_callback,
                 token_callback,
             );
@@ -1790,6 +1803,7 @@ impl Engine {
                 return self.generate_native_cold_with_callback(
                     request,
                     tool_call_policy,
+                    control.as_ref(),
                     admission_callback,
                     token_callback,
                 );
@@ -1803,6 +1817,7 @@ impl Engine {
             Priority::Normal,
             None,
             tool_call_policy,
+            control,
             admission_callback,
             token_callback,
         );
@@ -1823,15 +1838,10 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        if self.holds_decode_core() {
-            return Err(crate::pipeline::GenerationControlUnsupported {
-                operation: "Engine::generate_with_control_callbacks",
-                runtime: "the fused decode backend",
-            }
-            .into());
-        }
-        self.generate_with_pipeline_callbacks(
-            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
+        self.generate_with_tool_policy_callbacks(
+            request,
+            ToolCallPolicy::Disabled,
+            Some(control),
             admission_callback,
             token_callback,
         )
@@ -1861,6 +1871,7 @@ impl Engine {
             ToolCallPolicy::Disabled,
             None,
             None,
+            None,
         )
     }
 
@@ -1878,6 +1889,7 @@ impl Engine {
             None,
             ToolCallPolicy::Disabled,
             None,
+            None,
             callback,
         )
     }
@@ -1894,6 +1906,7 @@ impl Engine {
             session_id,
             request,
             ToolCallPolicy::Disabled,
+            None,
             admission_callback,
             token_callback,
         )
@@ -1905,6 +1918,7 @@ impl Engine {
         session_id: SessionId,
         request: GenerateRequest,
         tool_call_policy: ToolCallPolicy,
+        control: Option<crate::pipeline::GenerationControl>,
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -1914,12 +1928,13 @@ impl Engine {
             Priority::Normal,
             None,
             tool_call_policy,
+            control,
             admission_callback,
             token_callback,
         )
     }
 
-    /// Continue an interpreted workflow session with request-scoped
+    /// Continue a session with request-scoped
     /// cancellation and transaction checkpoints.
     pub fn generate_in_session_with_control_callbacks(
         &mut self,
@@ -1929,16 +1944,11 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        if self.holds_decode_core() {
-            return Err(crate::pipeline::GenerationControlUnsupported {
-                operation: "Engine::generate_in_session_with_control_callbacks",
-                runtime: "the fused decode backend",
-            }
-            .into());
-        }
-        self.generate_in_workflow_session(
+        self.generate_in_session_with_tool_policy_callbacks(
             session_id,
-            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
+            request,
+            ToolCallPolicy::Disabled,
+            Some(control),
             admission_callback,
             token_callback,
         )
@@ -1966,6 +1976,7 @@ impl Engine {
             ToolCallPolicy::Disabled,
             None,
             None,
+            None,
         )
     }
 
@@ -1977,6 +1988,7 @@ impl Engine {
         priority: Priority,
         mut custom_sampler: Option<Box<dyn Sampler>>,
         tool_call_policy: ToolCallPolicy,
+        control: Option<crate::pipeline::GenerationControl>,
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -1992,10 +2004,12 @@ impl Engine {
                 "a package whose components the interpreter invokes declares its sampler; a \
                  caller-supplied one would replace a step the package states in its own graph"
             );
+            let mut request = crate::pipeline::PipelineGenerateRequest::new(request)
+                .with_tool_call_policy(tool_call_policy);
+            request.generation_control = control;
             return self.generate_in_workflow_session(
                 session_id,
-                crate::pipeline::PipelineGenerateRequest::new(request)
-                    .with_tool_call_policy(tool_call_policy),
+                request,
                 admission_callback,
                 callback,
             );
@@ -2012,6 +2026,7 @@ impl Engine {
                 session_id,
                 request,
                 tool_call_policy,
+                control.as_ref(),
                 admission_callback,
                 callback,
             );
@@ -2067,6 +2082,9 @@ impl Engine {
         self.last_speculative_stats = SpeculativeStats::default();
 
         let result = (|| -> anyhow::Result<GenerateResult> {
+            if let Some(control) = &control {
+                control.check(crate::pipeline::GenerationBoundary::BeforeWorkflowNode)?;
+            }
             let prefix_cache_hit_len =
                 self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
             let mut loop_state =
@@ -2079,6 +2097,7 @@ impl Engine {
                 && !has_custom_sampler
             {
                 return self.generate_speculative_loop(crate::speculative::SpeculativeLoopState {
+                    control: control.as_ref(),
                     session_id,
                     state: &mut state,
                     options: &options,
@@ -2126,6 +2145,7 @@ impl Engine {
                 &mut loop_state,
                 &prompt_tokens,
                 crate::pipeline::generation::GenerationRequest {
+                    control: control.as_ref(),
                     options: &options,
                     chain: &chain,
                     tokenizer,
@@ -2140,11 +2160,17 @@ impl Engine {
                 self.ensure_session_kv_current(session_id, &mut state)?;
             }
             result.budget_cap = budget_cap;
+            if let Some(control) = &control {
+                control.require_commit()?;
+            }
             Ok(result)
         });
         let result = match result {
             Ok(result) => {
                 let _outcome = turn.commit()?;
+                if let Some(control) = &control {
+                    control.finish_commit();
+                }
                 if !exceeded_context_limit(state.tokens.len(), max_context)
                     && let Err(error) =
                         self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())
@@ -2156,18 +2182,30 @@ impl Engine {
                 }
                 Ok(result)
             }
-            Err(error) => match turn.abort(
-                self,
-                session_id,
-                &mut state,
-                crate::pipeline::TurnAbortReason::ExecutionFailure,
-            ) {
-                Ok(_outcome) => Err(error),
-                Err(rollback) => Err(error.context(format!(
-                    "atomic decoder turn failed and its baseline restoration also failed: \
+            Err(error) => {
+                if let Some(control) = &control {
+                    control.abort_commit();
+                }
+                match turn.abort(
+                    self,
+                    session_id,
+                    &mut state,
+                    if error
+                        .downcast_ref::<crate::pipeline::GenerationCancelled>()
+                        .is_some()
+                    {
+                        crate::pipeline::TurnAbortReason::Cancellation
+                    } else {
+                        crate::pipeline::TurnAbortReason::ExecutionFailure
+                    },
+                ) {
+                    Ok(_outcome) => Err(error),
+                    Err(rollback) => Err(error.context(format!(
+                        "atomic decoder turn failed and its baseline restoration also failed: \
                      {rollback:#}"
-                ))),
-            },
+                    ))),
+                }
+            }
         };
         self.sessions.insert(session_id, state);
         self.scheduler.complete(session_id);
@@ -2238,6 +2276,7 @@ impl Engine {
                                 arrival.request.priority,
                                 None,
                                 ToolCallPolicy::Disabled,
+                                None,
                                 None,
                                 None,
                             )
@@ -3099,6 +3138,7 @@ impl Engine {
                     &mut backend,
                     &mut loop_state,
                     &crate::pipeline::generation::GenerationRequest {
+                        control: None,
                         options: &options,
                         chain: &chain,
                         tokenizer,
@@ -3233,6 +3273,7 @@ impl Engine {
                 &mut backend,
                 &mut loop_state,
                 &crate::pipeline::generation::GenerationRequest {
+                    control: None,
                     options: &active.options,
                     chain: &active.chain,
                     tokenizer,
@@ -3618,6 +3659,7 @@ impl Engine {
         session_id: SessionId,
         request: GenerateRequest,
         tool_call_policy: ToolCallPolicy,
+        control: Option<&crate::pipeline::GenerationControl>,
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -3819,7 +3861,12 @@ impl Engine {
             }
 
             let mut result = {
-                let mut stage_token = |token| staged_output.stage(token);
+                let mut stage_token = |token| {
+                    if let Some(control) = control {
+                        control.check(crate::pipeline::GenerationBoundary::BeforeWorkflowNode)?;
+                    }
+                    staged_output.stage(token)
+                };
                 // Borrowed before the mutable native-session borrow below.
                 let tokenizer = self
                     .tokenizer
@@ -3849,6 +3896,7 @@ impl Engine {
                     &chain,
                     tokenizer,
                     runtime,
+                    control,
                     tool_observer.as_mut(),
                     Some(&mut stage_token),
                 )?
@@ -3870,15 +3918,34 @@ impl Engine {
         })();
         let result = result.and_then(|result| {
             staged_output.validate(&result)?;
+            if let Some(control) = control {
+                control.require_commit()?;
+            }
             Ok(result)
         });
         let result = match result {
             Ok(result) => {
                 let _outcome = turn.commit()?;
+                if let Some(control) = control {
+                    control.finish_commit();
+                }
                 Ok(result)
             }
             Err(error) => {
-                match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                if let Some(control) = control {
+                    control.abort_commit();
+                }
+                match turn.abort(
+                    self,
+                    if error
+                        .downcast_ref::<crate::pipeline::GenerationCancelled>()
+                        .is_some()
+                    {
+                        crate::pipeline::TurnAbortReason::Cancellation
+                    } else {
+                        crate::pipeline::TurnAbortReason::ExecutionFailure
+                    },
+                ) {
                     Ok(_) => Err(error),
                     Err(rollback) => Err(error.context(format!(
                         "atomic native decoder turn failed and its baseline restoration also \
@@ -3963,6 +4030,91 @@ mod tests {
         assert!(generate_uses_scheduler(EngineDecodeBackend::Auto));
     }
 
+    fn assert_decoder_cancellation_preserves_session(
+        make_engine: impl Fn() -> anyhow::Result<Engine>,
+    ) -> anyhow::Result<()> {
+        use crate::pipeline::{GenerationBoundary, GenerationCancelled, GenerationControl};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut engine = make_engine()?;
+        let session = engine.create_session()?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+        request.options.max_new_tokens = 1;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        engine.generate_in_session(session, request.clone())?;
+        let baseline = engine.session_token_count(session)?;
+        request.options.max_new_tokens = 4;
+        let forwards = Arc::new(AtomicUsize::new(0));
+        let observed = forwards.clone();
+        let authority = GenerationControl::new();
+        let cancellation = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == GenerationBoundary::AfterDecoderForward
+                && observed.fetch_add(1, Ordering::SeqCst) + 1 == 2
+            {
+                assert!(cancellation.cancel());
+            }
+            Ok(())
+        });
+        let mut published = Vec::new();
+        let error = engine
+            .generate_in_session_with_control_callbacks(
+                session,
+                request.clone(),
+                control,
+                None,
+                Some(&mut |token| {
+                    published.push(token.token_id);
+                    Ok(())
+                }),
+            )
+            .expect_err("cancellation after the second real forward must abort");
+        assert!(
+            matches!(
+                error.downcast_ref::<GenerationCancelled>(),
+                Some(GenerationCancelled {
+                    boundary: GenerationBoundary::AfterDecoderForward,
+                })
+            ),
+            "{error:#}"
+        );
+        assert_eq!(forwards.load(Ordering::SeqCst), 2);
+        assert!(
+            published.is_empty(),
+            "aborted tokens must never reach the transport"
+        );
+        assert_eq!(engine.session_token_count(session)?, baseline);
+        assert_eq!(engine.scheduler.running_count(), 0);
+        let actual = engine.generate_in_session(session, request.clone())?;
+        let mut independent = make_engine()?;
+        let expected_session = independent.create_session()?;
+        let mut warm = request.clone();
+        warm.options.max_new_tokens = 1;
+        independent.generate_in_session(expected_session, warm)?;
+        let expected = independent.generate_in_session(expected_session, request)?;
+        assert_eq!(
+            actual.token_ids, expected.token_ids,
+            "retry must start from the committed baseline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_cancellation_stops_ort_decoder_and_restores_session() -> anyhow::Result<()> {
+        assert_decoder_cancellation_preserves_session(|| {
+            Engine::from_dir(
+                &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm"),
+                EngineConfig::default(),
+            )
+        })
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn request_cancellation_stops_native_decoder_and_restores_session() -> anyhow::Result<()> {
+        assert_decoder_cancellation_preserves_session(tiny_native_cold_engine)
+    }
+
     #[cfg(feature = "native-backend")]
     fn tiny_native_cold_engine() -> anyhow::Result<Engine> {
         let fixture =
@@ -3991,6 +4143,56 @@ mod tests {
             });
         }
         request
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn request_cancellation_stops_cold_native_and_prompt_lookup_without_publication()
+    -> anyhow::Result<()> {
+        use crate::pipeline::{GenerationBoundary, GenerationCancelled, GenerationControl};
+        for speculative in [false, true] {
+            let mut engine = tiny_native_cold_engine()?;
+            let mut request = tiny_native_cold_request(speculative);
+            request.options.cold_start = true;
+            let authority = GenerationControl::new();
+            let cancellation = authority.clone();
+            let boundary = if speculative {
+                GenerationBoundary::BeforeWorkflowNode
+            } else {
+                GenerationBoundary::AfterDecoderForward
+            };
+            let control = authority.with_checkpoint(move |observed| {
+                if observed == boundary {
+                    assert!(cancellation.cancel());
+                }
+                Ok(())
+            });
+            let mut published = Vec::new();
+            let error = engine
+                .generate_with_control_callbacks(
+                    request.clone(),
+                    control,
+                    None,
+                    Some(&mut |token| {
+                        published.push(token.token_id);
+                        Ok(())
+                    }),
+                )
+                .expect_err("cancelled cold generation must abort");
+            assert!(
+                error.downcast_ref::<GenerationCancelled>().is_some(),
+                "{error:#}"
+            );
+            assert!(published.is_empty());
+            assert_eq!(engine.scheduler.running_count(), 0);
+            let actual = engine.generate(request.clone())?;
+            let expected = tiny_native_cold_engine()?.generate(request)?;
+            assert_eq!(
+                actual.token_ids, expected.token_ids,
+                "cancelled cold state leaked into retry"
+            );
+        }
+        Ok(())
     }
 
     /// The callback the server passes here emits `DriverEvent::Token`
