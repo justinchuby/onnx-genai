@@ -1,0 +1,9 @@
+
+running 1 test
+test kernels::matmul::accelerate_gemm::tests::sgemm_nt_matches_f64_across_layouts_tails_and_offset_slices ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1984 filtered out; finished in 0.23s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-30635267f98d516a)
+APPLE_NT_NUMERICS cells=210 outputs=134400 nn_nt_bit_differences=5048 max_nt_abs_error_vs_f64=3.497700199e-6

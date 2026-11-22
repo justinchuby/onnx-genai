@@ -1133,9 +1133,9 @@ pub(crate) fn gemm_with_backend(
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         CpuBackend::Accelerate => {
             if m == 1 {
-                accelerate_gemm::neon_gemv_parallel(a, b, c, k, n);
+                accelerate_gemm::neon_gemv_parallel(a, b, c, k, n)?;
             } else {
-                accelerate_gemm::sgemm(a, b, c, m, k, n);
+                accelerate_gemm::sgemm(a, b, c, m, k, n)?;
             }
             Ok(())
         }
@@ -1153,6 +1153,8 @@ pub(crate) fn gemm_with_backend(
 /// keeping it in one place stops the two build configurations from drifting.
 pub(crate) fn nt_gemm_supported(backend: CpuBackend) -> bool {
     match backend {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        CpuBackend::Accelerate => true,
         #[cfg(feature = "mlas")]
         CpuBackend::Mlas => true,
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1165,12 +1167,12 @@ pub(crate) fn nt_gemm_supported(backend: CpuBackend) -> bool {
 }
 
 /// Transposed-B dense GEMM: `c[m,n] = a[m,k] @ b_nk[n,k]^T`, where `b_nk` is
-/// `[n, k]` row-major. **Bit-identical** to `gemm_with_backend(backend, a,
-/// b_kn, c, m, k, n)` on the `[k, n]` transpose `b_kn` of `b_nk`, for every
-/// backend [`nt_gemm_supported`] accepts — the property `MatMulNBits` prefill
-/// relies on to reuse its cached `[n, k]` dequant instead of building a
-/// transposed copy.
+/// `[n, k]` row-major. It computes the same matrix as NN on a KN transpose,
+/// while floating-point reduction order can differ by backend and operand layout.
+/// Numerical tests use an f64 oracle; layout equality alone is not a proof of
+/// bit-identical f32 outputs.
 ///
+/// * `Accelerate`: checked row-major CBLAS with transposed B and `ldb = k`.
 /// * `Mlas`: MLAS's cache-tiled SGEMM with `trans_b` (`ldb = k`) reads `b_nk`
 ///   as the transposed operand directly.
 /// * `SimdX86`: the native NT SGEMM ([`x86_sgemm::sgemm_simd_nt`]), which packs
@@ -1188,7 +1190,19 @@ pub(crate) fn gemm_nt_with_backend(
     k: usize,
     n: usize,
 ) -> Result<()> {
+    dispatch_ledger::record_with(|| {
+        dispatch_ledger::Observation::gemm(
+            dispatch_ledger::KernelFamily::MatMulF32,
+            ledger_backend(backend),
+            "f32",
+            m,
+            n,
+            k,
+        )
+    });
     match backend {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        CpuBackend::Accelerate => accelerate_gemm::sgemm_nt(a, b_nk, c, m, k, n),
         #[cfg(feature = "mlas")]
         CpuBackend::Mlas => {
             // C[m, n] = A[m, k] * B_nk[n, k]^T. `trans_b` with `ldb = k` reads
@@ -1203,7 +1217,7 @@ pub(crate) fn gemm_nt_with_backend(
             Ok(())
         }
         _ => {
-            // On a build with neither NT arm compiled in (e.g. aarch64 without
+            // On a target without an NT arm (e.g. non-Apple aarch64 without
             // `mlas`) none of the operands are read; bind them so the arch
             // gating does not turn every parameter into an unused variable.
             let _ = (a, b_nk, c, m, k, n);
@@ -3733,7 +3747,7 @@ fn matmul_dense_into_with_backend(
         if let Some(bt) = prepack.and_then(|p| p.transposed_b(b_dense, k, n)) {
             accelerate_gemm::neon_gemv_col_parallel(a_dense, bt, out, k, n);
         } else {
-            accelerate_gemm::neon_gemv_parallel(a_dense, b_dense, out, k, n);
+            accelerate_gemm::neon_gemv_parallel(a_dense, b_dense, out, k, n)?;
         }
         return Ok(());
     }

@@ -1,0 +1,23 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 41066, "load_before": [2.18994140625, 3.57373046875, 3.08349609375], "command": ["python3", "-"]}
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-30635267f98d516a)
+kernels::matmul::accelerate_gemm::tests::sgemm_layouts_handle_empty_axes_and_nonfinite_values: test
+kernels::matmul::accelerate_gemm::tests::sgemm_layouts_reject_bad_buffers_and_abi_dimensions_before_writing: test
+kernels::matmul::accelerate_gemm::tests::sgemm_matches_reference: test
+kernels::matmul::accelerate_gemm::tests::sgemm_nt_matches_f64_across_layouts_tails_and_offset_slices: test
+
+4 tests, 0 benchmarks
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-30635267f98d516a)
+kernels::matmul_nbits::tests::apple_dense_prefill_reuses_one_nk_expansion: test
+
+1 test, 0 benchmarks
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_session-deb36e47176402f7)
+executor::tests::apple_nbits_prefill_and_decode_share_one_dense_expansion: test
+
+1 test, 0 benchmarks
+
+{"wall_s": 0.8997686670045368, "cpu_s": 0.858727, "maxrss_bytes": 108314624, "load_after": [2.18994140625, 3.57373046875, 3.08349609375]}

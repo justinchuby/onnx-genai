@@ -1,0 +1,53 @@
+{
+  "source_commit": "d3b732e6135b0d43bc831d591adc1aeb97fd02dd",
+  "base": "b0eb22a69c8654e9460f59e2fcdb9c13b372f3da",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/accelerate_gemm.rs": "8e89559de05050df738fc9b077bdab0dcb434df3868186d6f7ff26c3618719b5",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs": "dab05043e9eb4e4ab1602671b970e929fcb2a45543f2e26ae21de97c7003c4a3",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_nbits.rs": "4ad8633063edd60f9add149c55737623e743e7e7f5516e5de5619166d5b66da0",
+    "crates/onnx-runtime-session/src/executor/tests.rs": "7d9caf4de0657b855111dfccb6377d9d7b0978ca2a5e1aee403b9aecba8f00a4",
+    "dispatch_manifest.toml": "41062e77a97246b474e33326a1c2a6867dc8f31860b886ab4ceaa5fe9e3375fc",
+    "crates/onnx-runtime-ep-cpu/src/dispatch_ledger.rs": "6e1d5de42afd7d0ad48009600c6738dce8feff63a5a401034f841f5aaa7139a7"
+  },
+  "scope": "Apple M1 Max ARM64 macOS; numerical error, ABI boundaries and retained-weight reuse, no latency/GPU/other-ISA/model-token claim",
+  "shared_host_lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "cargo_incremental": "0",
+  "ort": "existing cached ORT_ROOT",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "cargo_lock_sha256": "d84aae080dc08d740c9a44e02780a72c943716de13048d06110c9039bf6da54d",
+  "validation_counts": {
+    "native-cpu": {
+      "passed": 1966,
+      "ignored": 19
+    },
+    "native-session": {
+      "passed": 274,
+      "ignored": 0
+    },
+    "mlas-cpu": {
+      "passed": 1994,
+      "ignored": 33
+    },
+    "mlas-session": {
+      "passed": 275,
+      "ignored": 0
+    }
+  },
+  "numerical_records": {
+    "debug": {
+      "cells": 210,
+      "outputs": 134400,
+      "nn_nt_bit_differences": 5048,
+      "max_nt_abs_error_vs_f64": 3.497700199e-06
+    },
+    "release": {
+      "cells": 210,
+      "outputs": 134400,
+      "nn_nt_bit_differences": 5048,
+      "max_nt_abs_error_vs_f64": 3.497700199e-06
+    }
+  },
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "sdk_version": "27.0",
+  "sdk_metadata_source": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/SDKSettings.json"
+}

@@ -1,0 +1,7 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-30635267f98d516a)
+kernels::matmul_nbits::tests::dense_weight_shared_shapes_preserve_dynamic_metadata_and_denied_retention: test
+kernels::matmul_nbits::tests::dense_weight_shared_shapes_preserve_readers_reclaim_and_rebuild: test
+kernels::matmul_nbits::tests::dense_weight_shared_shapes_serialize_distinct_cold_builders: test
+
+3 tests, 0 benchmarks

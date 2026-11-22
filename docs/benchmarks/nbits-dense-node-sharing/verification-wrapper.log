@@ -1,0 +1,10 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 37480, "load_before": [1.44580078125, 1.8564453125, 2.17236328125], "command": ["python3", "/tmp/nxrt-nbits-dense-sharing-verify.py"]}
+PASS /tmp/nxrt-nbits-dense-sharing-native-cpu.tests.log
+PASS /tmp/nxrt-nbits-dense-sharing-native-cpu.clippy.log
+PASS /tmp/nxrt-nbits-dense-sharing-native-session.tests.log
+PASS /tmp/nxrt-nbits-dense-sharing-native-session.clippy.log
+PASS /tmp/nxrt-nbits-dense-sharing-mlas-cpu.tests.log
+PASS /tmp/nxrt-nbits-dense-sharing-mlas-cpu.clippy.log
+PASS /tmp/nxrt-nbits-dense-sharing-mlas-session.tests.log
+PASS /tmp/nxrt-nbits-dense-sharing-mlas-session.clippy.log
+{"wall_s": 146.99909391600522, "cpu_s": 507.97994600000004, "maxrss_bytes": 2613215232, "load_after": [5.74658203125, 3.71044921875, 2.89111328125]}
