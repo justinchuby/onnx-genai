@@ -1537,3 +1537,63 @@ and pass one test. The high-rank fallback control passes as well. Formatting and
 dispatch/platform/feature gates pass. The temporary baseline worktree, consumed
 insertion fragment and copied benchmark executables are removed; raw timing
 samples, metadata, validation drivers/logs and the stable host lock remain.
+
+
+### Panel identity survives conversion reclamation
+
+Optional SGEMM preparation now receives the typed DenseOperand through the
+shared compute helper. A converted f32 source uses a weak Arc-owner identity;
+borrowed original storage uses its complete logical layout. Weak identities
+retain only flat-vector control-block metadata. They do not pin source data or
+grants, allocate another identity object, scan caches, or consult a global
+counter. An ungoverned call-owned conversion declines optional retention and
+runs the existing unpacked arithmetic. The raw-slice packed-B interface is gone.
+
+The recycled-source control moves a Vec allocation out of its retired owner and
+into a new, fully funded conversion. This establishes the same buffer address
+on every allocator while allowing different owner identities. A test-only
+payload/grant extractor keeps the handoff conservative: the old grant remains
+live until the new grant funds the reused allocation. Old panel readers remain
+numerically valid independently of the new source and all bytes refund at the
+last relevant owner/reader drop.
+
+Both unchanged regressions fail numerically on parent c24ad9497 (with only the
+test fixture and test-only extractor injected). Recycled conversion storage
+incorrectly returns [0.375;4] instead of [1.125;4]; two half views with different
+strides over the same backing incorrectly return [15,18] instead of [6,15].
+Current controls pass, including a separate call-owned unpacked fallback case.
+
+Validation after preserving the original native slice compute interface:
+native CPU 1,988 passed / 20 ignored, optional-MLAS CPU 2,028 passed / 35 ignored;
+native/session 277 passed and MLAS/session 279 passed. Strict all-target Clippy
+passes for both CPU/session configurations. A forced-MLAS public-provider
+accounting control selects and passes one test: after cold preparation, 4,096
+warm executions still issue no accountant calls. The vector-only identity's
+three exact controls and strict CPU/MLAS Clippy also pass after narrowing its
+type so weak identity cannot accidentally retain a large inline payload.
+
+The first native before/after timing run was taken before coordination with the
+concurrent llama.cpp work. Its tiny retained governed median moved +10.1%, but
+the A/A arm moved +11.3% and the f32 control +9.7%, with much larger within-arm
+ranges. It is inconclusive and establishes neither a regression nor absence of
+one. All original data is retained. Subsequent heavy builds/tests and timing
+runs share the stable Darwin flock with the llama.cpp session; a busy lock
+returns status=busy/exit 75 without executing the command. Fresh coordinated
+measurement is kept separate from that earlier run.
+
+After both sessions acknowledged the shared lock and the llama.cpp session
+explicitly yielded a window, the fresh run held that same inode for its full
+74.92 seconds of release build plus six interleaved measurement processes.
+The retained tiny governed case is 256.48 ns [254.89–258.94] before and
+256.25 ns [255.37–256.49] after (three process medians, eleven rounds each).
+Its A/A arm moves -0.07% and f32 control -0.26%. The larger retained M=8 row
+moves +5.65% while its governed f32 control moves +5.62%, so it does not isolate
+a packing-identity cost or establish an all-workload no-regression claim.
+The callback invariant remains independently verified: 4,096 warm executions
+make zero further quota calls, including under forced optional MLAS.
+
+Coordination provenance and raw samples are separate from the earlier noisy
+run. The wrapper's busy branch was exercised against the other session's live
+lock and refused execution with exit 75. Release completion was verified from
+the terminal handle and final rusage before notifying the other session to
+resume; neither participant relies on an announcement as proof of ownership.

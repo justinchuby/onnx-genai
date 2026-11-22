@@ -1027,3 +1027,36 @@ contiguous-f32 control. It separates retained and transient policies, excludes
 warm-up, retains per-round samples, and reports both wall and process CPU time.
 The host-lock wrapper must cover the whole comparison. Zero warm callbacks are
 a structural invariant; timing alone cannot establish universal zero overhead.
+
+
+### Packed weights retain source identity without pinning source payloads
+
+An owned conversion buffer can leave its dense cache while a packed panel is
+still useful. Its allocation address is not a durable identity: the next
+conversion can reuse the same storage for different immutable source values.
+Keep the typed DenseOperand through the shared MatMul compute helper instead
+of erasing its ownership to a slice before optional SGEMM preparation.
+
+A materialized source now identifies its Arc owner through a weak key. The key
+reserves the owner's control block, so that identity address cannot be recycled
+while the cache entry lives. It keeps neither the vector's heap elements nor
+their Host grant alive. The identity type accepts flat-vector owners, whose
+payload allocation is separate from the control block. Live panel readers keep
+the independent packed payload and its own grant. Original borrowed sources
+use the complete logical-view key; this also fixes half-packing collisions
+between equal-size strided views of the same immutable backing storage.
+
+A call-owned, ungoverned conversion lacks a proven immutable identity and uses
+the existing unpacked computation. The old raw-slice packed-B interface is
+removed rather than retained as a compatibility path. No global identity
+counter, registry or cache scan is needed. The native production build adds no
+identity bookkeeping: weak identities are compiled with the optional reference
+packing consumer. The native build retains its original slice compute interface;
+the optional packing build carries typed ownership to its consumer.
+
+Controls explicitly move one conversion allocation into a new owner, establish
+identical data addresses without allocator assumptions, and verify different
+packed numerical results. They also verify that source grants retire while
+old panel readers remain valid, identical owners reuse a panel, full half-view
+identity separates layouts, and call-owned conversion falls through correctly.
+Legacy process-global transpose payload funding/lifetime policy remains work.

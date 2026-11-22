@@ -39,6 +39,8 @@ use super::check_arity;
 use super::half_gemm::{self, HalfFormat, MatrixLayout};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use super::half_gemv;
+#[cfg(feature = "mlas")]
+use super::weight_cache::WeightIdentity;
 use super::weight_cache::{GrantedWeight, WeightCache, WeightCacheKey, WeightLoad, WeightSpec};
 use super::weight_transpose::{self, WeightTransposeKey};
 use crate::CpuMemoryResources;
@@ -399,10 +401,17 @@ impl<const ELEMENT_BYTES: usize> WeightCacheKey for MatMulCopyKey<ELEMENT_BYTES>
 #[cfg(feature = "mlas")]
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct SgemmPackKey {
-    source: usize,
-    dtype: DataType,
+    source: SgemmPackSource,
     k: usize,
     n: usize,
+}
+#[cfg(feature = "mlas")]
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum SgemmPackSource {
+    // Borrowed initializer storage lives until the node owner is dropped.
+    Original(MatMulCopyKey<4>),
+    // Owned conversion buffers can retire/recycle independently of the panel.
+    Materialized(WeightIdentity),
 }
 #[cfg(feature = "mlas")]
 impl WeightCacheKey for SgemmPackKey {
@@ -421,6 +430,13 @@ fn sgemm_pack_plan(k: usize, n: usize) -> Result<mlas_sys::PackedBPlan> {
 /// A converted constant carries its Host grant through the executing reader;
 /// removing cache membership or dropping the kernel cannot revoke this payload.
 pub(super) struct DenseOperand<'a>(DenseOperandStorage<'a>);
+
+#[cfg(feature = "mlas")]
+impl<'a> From<Cow<'a, [f32]>> for DenseOperand<'a> {
+    fn from(values: Cow<'a, [f32]>) -> Self {
+        Self(DenseOperandStorage::Direct(values))
+    }
+}
 
 enum DenseOperandStorage<'a> {
     Direct(Cow<'a, [f32]>),
@@ -1010,8 +1026,7 @@ impl MatMulPrepack {
             )));
         }
         let key = SgemmPackKey {
-            source: view.data_ptr::<u16>() as usize,
-            dtype: view.dtype,
+            source: SgemmPackSource::Original(MatMulCopyKey::from_view(view)),
             k,
             n,
         };
@@ -1065,7 +1080,7 @@ impl MatMulPrepack {
     #[cfg(feature = "mlas")]
     fn packed_b(
         &self,
-        b: &[f32],
+        b: &DenseOperand<'_>,
         k: usize,
         n: usize,
     ) -> Result<Option<Arc<GrantedWeight<mlas_sys::PackedB>>>> {
@@ -1089,12 +1104,26 @@ impl MatMulPrepack {
                 }),
             });
         }
-        let key = SgemmPackKey {
-            source: b.as_ptr() as usize,
-            dtype: DataType::Float32,
-            k,
-            n,
+        let source = match &b.0 {
+            DenseOperandStorage::Funded(owner) => {
+                SgemmPackSource::Materialized(WeightIdentity::of(owner))
+            }
+            DenseOperandStorage::Direct(Cow::Borrowed(values)) => {
+                let stride = i64::try_from(n).map_err(|_| EpError::KernelFailed(format!(
+                    "MatMul MLAS constant B packing: N={n} cannot be represented as a logical row stride; use addressable B dimensions"
+                )))?;
+                SgemmPackSource::Original(MatMulCopyKey {
+                    source: values.as_ptr() as usize,
+                    dtype: DataType::Float32,
+                    shape: SmallVec::from_slice(&[k, n]),
+                    strides: SmallVec::from_slice(&[stride, 1]),
+                })
+            }
+            // A call-owned, ungoverned conversion has no immutable lifetime
+            // identity. Optional packing must use the unpacked route instead.
+            DenseOperandStorage::Direct(Cow::Owned(_)) => return Ok(None),
         };
+        let key = SgemmPackKey { source, k, n };
         if let Some(packed) = self.weights.packed_b.get(&key) {
             return Ok(Some(packed));
         }
@@ -3660,13 +3689,11 @@ pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
     if let Some(result) = try_matmul_half(a, b, &geom, CpuBackend::auto_detect())? {
         return Ok(result);
     }
-    matmul_dense_impl_with_geom(
-        to_dense_f32_widen("MatMul", a)?,
-        to_dense_f32_widen("MatMul", b)?,
-        &geom,
-        CpuBackend::auto_detect(),
-        None,
-    )
+    let a_dense = to_dense_f32_widen("MatMul", a)?;
+    let b_dense = to_dense_f32_widen("MatMul", b)?;
+    #[cfg(feature = "mlas")]
+    let b_dense = b_dense.into();
+    matmul_dense_impl_with_geom(a_dense, b_dense, &geom, CpuBackend::auto_detect(), None)
 }
 
 pub(crate) fn matmul_dense_prepacked(
@@ -3731,20 +3758,18 @@ fn matmul_dense_prepacked_with_backend(
 /// Geometry is pre-computed by the caller to avoid redundant derivation.
 fn matmul_dense_impl_with_geom(
     a_dense: impl AsRef<[f32]>,
-    b_dense: impl AsRef<[f32]>,
+    #[cfg(feature = "mlas")] b_dense: DenseOperand<'_>,
+    #[cfg(not(feature = "mlas"))] b_dense: impl AsRef<[f32]>,
     geom: &MatMulGeometry,
     backend: CpuBackend,
     prepack: Option<&MatMulPrepack>,
 ) -> Result<Vec<f32>> {
     let mut out = vec![0.0f32; geom.result_len];
-    matmul_dense_into_with_backend(
-        a_dense.as_ref(),
-        b_dense.as_ref(),
-        geom,
-        backend,
-        prepack,
-        &mut out,
-    )?;
+    #[cfg(feature = "mlas")]
+    let b = &b_dense;
+    #[cfg(not(feature = "mlas"))]
+    let b = b_dense.as_ref();
+    matmul_dense_into_with_backend(a_dense.as_ref(), b, geom, backend, prepack, &mut out)?;
     Ok(out)
 }
 
@@ -3841,12 +3866,15 @@ pub(crate) fn matmul_geometry(a: &TensorView, b: &TensorView) -> Result<MatMulGe
 /// the owned-vector wrapper and the direct-output fast path.
 fn matmul_dense_into_with_backend(
     a_dense: &[f32],
-    b_dense: &[f32],
+    #[cfg(feature = "mlas")] b_operand: &DenseOperand<'_>,
+    #[cfg(not(feature = "mlas"))] b_dense: &[f32],
     geom: &MatMulGeometry,
     backend: CpuBackend,
     prepack: Option<&MatMulPrepack>,
     out: &mut [f32],
 ) -> Result<()> {
+    #[cfg(feature = "mlas")]
+    let b_dense = b_operand.as_ref();
     if out.len() != geom.result_len {
         return Err(EpError::KernelFailed(format!(
             "MatMul: output buffer length {} does not match result length {}",
@@ -3875,7 +3903,7 @@ fn matmul_dense_into_with_backend(
     #[cfg(feature = "mlas")]
     let packed_b = if backend == CpuBackend::Mlas && geom.b_promoted_rank == 2 {
         prepack
-            .map(|prepack| prepack.packed_b(b_dense, k, n))
+            .map(|prepack| prepack.packed_b(b_operand, k, n))
             .transpose()?
             .flatten()
     } else {
@@ -4008,6 +4036,152 @@ fn broadcast_offset(bidx: &[usize], batch: &[usize], batch_strides: &[i64]) -> u
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn packed_sgemm_distinguishes_recycled_conversion_storage_without_pinning_it() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let panel_bytes = sgemm_pack_plan(3, 2).unwrap().owned_heap_bytes() as u64;
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 2 * panel_bytes + 72, 0));
+        let resources = CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut prepack = MatMulPrepack::new(resources.clone());
+        prepack.set_constant_inputs(&[false, true]);
+        // A bounded cache retires the source while the panel remains resident.
+        Arc::get_mut(&mut prepack.weights).unwrap().dense[1] =
+            WeightCache::new(resources.weight_memory().clone(), 24);
+        let original = Owned::f64(&[3, 2], &[0.5; 6]);
+        let original_view = original.view();
+        let first = prepack.dense(1, &original_view).unwrap();
+        let address = first.as_ptr();
+        let first_panel = prepack.packed_b(&first, 3, 2).unwrap().unwrap();
+        let dummy = Owned::f64(&[3, 2], &[0.75; 6]);
+        drop(prepack.dense(1, &dummy.view()).unwrap());
+        let DenseOperandStorage::Funded(owner) = first.0 else {
+            panic!("f64 must own a conversion");
+        };
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "panel identity must not pin the source payload or its grant"
+        );
+        let (recycled, old_grant) = Arc::try_unwrap(owner)
+            .unwrap_or_else(|_| panic!("retired conversion has no other payload owners"))
+            .test_into_parts();
+        // Move the allocation into a new conversion, establishing address reuse
+        // without depending on the system allocator returning the same address.
+        let next = Owned::f64(&[3, 2], &[1.5; 6]);
+        let next_view = next.view();
+        let key = MatMulCopyKey::<4>::from_view(&next_view);
+        let mut recycled = Some(recycled);
+        let loaded = prepack.weights.dense[1]
+            .load_group_owned(&[WeightSpec::cached(&key).unwrap()], |_| {
+                let mut values = recycled.take().expect("one conversion");
+                to_dense_f32_widen_into("recycled constant conversion", &next_view, &mut values)?;
+                Ok(values)
+            })
+            .unwrap();
+        let WeightLoad::Ready(mut loaded) = loaded else {
+            panic!("complete construction peak fits");
+        };
+        let second = DenseOperand(DenseOperandStorage::Funded(loaded.weights.remove(0)));
+        drop(old_grant); // The new owner now funds the reused allocation.
+        assert_eq!(
+            second.as_ptr(),
+            address,
+            "the recycled-address precondition must hold on every allocator"
+        );
+        assert_eq!(books.used(Tier::Host), 24 + panel_bytes);
+        let second_panel = prepack.packed_b(&second, 3, 2).unwrap().unwrap();
+        let mut output = [0.; 4];
+        gemm_packed(&[0.25; 6], second_panel.payload(), &mut output, 2, 3, 2).unwrap();
+        assert_eq!(
+            output, [1.125; 4],
+            "a recycled conversion address must not serve the previous weight's panel"
+        );
+        assert!(!Arc::ptr_eq(&first_panel, &second_panel));
+        let warm = prepack.packed_b(&second, 3, 2).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&warm, &second_panel));
+        assert_eq!(prepack.weights.packed_b.activity().1, 2);
+        assert_eq!(books.used(Tier::Host), 24 + 2 * panel_bytes);
+        drop(warm);
+        drop(prepack);
+        assert_eq!(books.used(Tier::Host), 24 + 2 * panel_bytes);
+        drop(second);
+        assert_eq!(
+            books.used(Tier::Host),
+            2 * panel_bytes,
+            "active panels do not keep retired conversion bytes charged"
+        );
+        gemm_packed(&[0.25; 6], first_panel.payload(), &mut output, 2, 3, 2).unwrap();
+        assert_eq!(
+            output, [0.375; 4],
+            "an old executing panel remains independently valid"
+        );
+        drop(first_panel);
+        drop(second_panel);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn packed_half_sgemm_keys_the_complete_original_view() {
+        let source = Owned::f16(&[24], &(1..=24).map(|n| n as f32).collect::<Vec<_>>());
+        let shape = [3, 2];
+        let first_strides = [4, 1];
+        let next_strides = [1, 3];
+        let mut first = source.view();
+        first.shape = &shape;
+        first.strides = &first_strides;
+        let mut next = first;
+        next.strides = &next_strides;
+        let mut prepack = MatMulPrepack::default();
+        prepack.set_constant_inputs(&[false, true]);
+        let original_panel = prepack.packed_b_from_half(&first, 3, 2).unwrap().unwrap();
+        let next_panel = prepack.packed_b_from_half(&next, 3, 2).unwrap().unwrap();
+        let mut output = [0.; 2];
+        gemm_packed(&[1.; 3], next_panel.payload(), &mut output, 1, 3, 2).unwrap();
+        assert_eq!(
+            output,
+            [6., 15.],
+            "different strides over one immutable source need different packed values"
+        );
+        assert!(!Arc::ptr_eq(&original_panel, &next_panel));
+        let warm = prepack.packed_b_from_half(&first, 3, 2).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&original_panel, &warm));
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn call_owned_conversion_uses_unpacked_sgemm_without_retaining_an_address_key() {
+        let mut prepack = MatMulPrepack::default();
+        prepack.set_constant_inputs(&[false, true]);
+        let b: DenseOperand<'_> = Cow::<[f32]>::Owned(vec![0.5; 6]).into();
+        assert!(
+            prepack.packed_b(&b, 3, 2).unwrap().is_none(),
+            "a call-owned conversion has no stable immutable source identity"
+        );
+        assert_eq!(prepack.weights.packed_b.stats(), (0, 0));
+        let a = Owned::f32(&[2, 3], &[0.25; 6]);
+        let weight = Owned::f32(&[3, 2], &[0.5; 6]);
+        let geometry = matmul_geometry(&a.view(), &weight.view()).unwrap();
+        let mut output = [0.; 4];
+        matmul_dense_into_with_backend(
+            &[0.25; 6],
+            &b,
+            &geometry,
+            CpuBackend::Mlas,
+            Some(&prepack),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output, [0.375; 4]);
+        assert_eq!(prepack.weights.packed_b.stats(), (0, 0));
+    }
 
     #[test]
     fn warm_provider_execution_never_calls_weight_accounting() {
@@ -6498,9 +6672,13 @@ mod tests {
             });
             // Arm 2: what every caller falls through to once the gate declines.
             let widen = median5(|| {
+                let a_dense = to_dense_f32_widen("MatMul", &av).unwrap();
+                let b_dense = to_dense_f32_widen("MatMul", &bv).unwrap();
+                #[cfg(feature = "mlas")]
+                let b_dense = b_dense.into();
                 let out = matmul_dense_impl_with_geom(
-                    to_dense_f32_widen("MatMul", &av).unwrap(),
-                    to_dense_f32_widen("MatMul", &bv).unwrap(),
+                    a_dense,
+                    b_dense,
                     &geom,
                     CpuBackend::auto_detect(),
                     None,
@@ -6994,7 +7172,7 @@ mod tests {
                 if half {
                     prepack.packed_b_from_half(&bits.view(), k, n)
                 } else {
-                    prepack.packed_b(&floats, k, n)
+                    prepack.packed_b(&Cow::Borrowed(floats.as_slice()).into(), k, n)
                 }
             };
             let reader = build(&prepack).unwrap().unwrap();
@@ -7075,7 +7253,7 @@ mod tests {
                             if half {
                                 prepack.packed_b_from_half(&bits.view(), 5, 3)
                             } else {
-                                prepack.packed_b(&floats, 5, 3)
+                                prepack.packed_b(&Cow::Borrowed(floats.as_slice()).into(), 5, 3)
                             }
                             .unwrap()
                             .unwrap()
@@ -7188,19 +7366,35 @@ mod tests {
     fn mlas_pack_failure_preserves_context_and_can_retry_before_warm_validation() {
         let mut prepack = MatMulPrepack::new(CpuMemoryResources::default());
         prepack.set_constant_inputs(&[false, true]);
-        let error = prepack.packed_b(&[], 5, 3).err().unwrap();
+        let error = prepack
+            .packed_b(&Cow::Borrowed([].as_slice()).into(), 5, 3)
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("MatMul MLAS constant B packing"));
         assert!(error.to_string().contains("expected 15"));
         assert!(prepack.weights.packed_b.test_first().is_none());
         let weight = [0.25; 15];
-        let first = prepack.packed_b(&weight, 5, 3).unwrap().unwrap().payload() as *const _;
-        let second = prepack.packed_b(&weight, 5, 3).unwrap().unwrap().payload() as *const _;
+        let first = prepack
+            .packed_b(&Cow::Borrowed(weight.as_slice()).into(), 5, 3)
+            .unwrap()
+            .unwrap()
+            .payload() as *const _;
+        let second = prepack
+            .packed_b(&Cow::Borrowed(weight.as_slice()).into(), 5, 3)
+            .unwrap()
+            .unwrap()
+            .payload() as *const _;
         assert_eq!(first, second);
         assert!(
-            prepack.packed_b(&[], 5, 3).is_err(),
+            prepack
+                .packed_b(&Cow::Borrowed([].as_slice()).into(), 5, 3)
+                .is_err(),
             "warm hits still validate source extent"
         );
-        let changed = prepack.packed_b(&weight, 3, 5).unwrap().unwrap();
+        let changed = prepack
+            .packed_b(&Cow::Borrowed(weight.as_slice()).into(), 3, 5)
+            .unwrap()
+            .unwrap();
         assert_eq!(changed.payload().dimensions(), (3, 5));
         assert_ne!(first, changed.payload() as *const _);
     }
