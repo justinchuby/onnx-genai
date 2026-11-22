@@ -17,7 +17,7 @@
 //! with no branches and no libm call.
 //!
 //! This module reproduces those approximations in safe-ish Rust over
-//! `core::arch::x86_64` intrinsics, so the default build (which does **not**
+//! architecture intrinsics (AVX2, plus NEON for Erf and exact GELU), so the default build (which does **not**
 //! enable the `mlas` feature) gets the same throughput.
 //!
 //! # Numerical contract
@@ -81,8 +81,8 @@
 //! # ISA dependence
 //!
 //! Dispatch is by runtime feature detection and only ever *adds* a path:
-//! without AVX2+FMA the caller's exact scalar closure is used unchanged, so no
-//! existing target regresses. As with ORT, this means results can differ by
+//! without an applicable AVX2+FMA or NEON path the exact scalar closure is used.
+//! As with ORT, this means results can differ by
 //! ~1e-7 relative between an AVX2 host and a non-AVX2 host. Tests therefore
 //! assert an error bound against an `f64` reference rather than bit equality.
 
@@ -822,6 +822,10 @@ where
     run_on_task_runtime(input, output, chunk, &body);
 }
 
+#[cfg(target_arch = "aarch64")]
+#[path = "simd_activations_neon.rs"]
+mod neon_erf;
+
 // ---------------------------------------------------------------------------
 // MLAS constants
 // ---------------------------------------------------------------------------
@@ -872,7 +876,7 @@ mod logistic_c {
 ///
 /// MLAS took the algorithm and coefficients from the "efficient faithfully
 /// rounded implementation of erff" reference cited at the top of that file.
-/// `x86_64`-only for the same reason as [`tanh_c`].
+/// Shared by the x86 AVX2 and ARM64 NEON implementations.
 ///
 /// The two polynomials split at `|x| = 0.921875`:
 ///
@@ -882,7 +886,7 @@ mod logistic_c {
 ///   `|x|` (again with the leading `1` folded into `BIG_P6_MINUS_ONE`), and
 ///   `exp` evaluated by the standard range-reduce/`2^k` scheme whose constants
 ///   follow.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod erf_c {
     /// `erf` is within half an ulp of `±1` past this, so MLAS clamps `|x|` here
     /// and lets the big-branch polynomial return exactly `1`.
@@ -1002,7 +1006,7 @@ const GELU_C: f32 = 0.044715;
 /// `1/√2`, the inner scale of exact GELU, rounded to `f32`. ORT's
 /// `Gelu(approximate="none")` CPU kernel scales by `M_SQRT1_2` in `float`
 /// before calling `MlasComputeErf`, so this matches its evaluation order.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const FRAC_1_SQRT_2_F32: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 // ---------------------------------------------------------------------------
@@ -1032,6 +1036,22 @@ pub(crate) fn vector_path_available() -> bool {
 ///
 /// `input` and `output` must have equal length; the caller guarantees it.
 macro_rules! dispatch {
+    ($input:expr, $output:expr, $scalar:expr, $vector:expr, $neon:path) => {{
+        #[cfg(target_arch = "aarch64")]
+        {
+            let input: &[f32] = $input;
+            let output: &mut [f32] = $output;
+            debug_assert_eq!(input.len(), output.len());
+            if input.len() >= SIMD_MIN_LEN && std::arch::is_aarch64_feature_detected!("neon") {
+                // Choose once for the entire slice, including short tail chunks.
+                // SAFETY: runtime detection above; map bounds every lane access.
+                run_chunked(input, output, |i, o| unsafe { $neon(i, o) });
+                return;
+            }
+        }
+        dispatch!($input, $output, $scalar, $vector);
+    }};
+
     ($input:expr, $output:expr, $scalar:expr, $vector:expr) => {{
         let input: &[f32] = $input;
         let output: &mut [f32] = $output;
@@ -1087,7 +1107,7 @@ macro_rules! dispatch {
 /// the FFI call and MLAS's own dispatch cost more than the arithmetic saved, so
 /// short tensors keep the scalar loop.
 macro_rules! dispatch_mlas {
-    ($input:expr, $output:expr, $scalar:expr, $vector:expr, $mlas:expr) => {{
+    ($input:expr, $output:expr, $scalar:expr, $vector:expr, $mlas:expr, $neon:path) => {{
         #[cfg(feature = "mlas")]
         {
             let input: &[f32] = $input;
@@ -1122,7 +1142,7 @@ macro_rules! dispatch_mlas {
                 $input.len(),
             )
         });
-        dispatch!($input, $output, $scalar, $vector)
+        dispatch!($input, $output, $scalar, $vector, $neon)
     }};
 }
 
@@ -1283,7 +1303,14 @@ pub(crate) fn exp_f32_slice(input: &[f32], output: &mut [f32]) {
 /// tolerance, and the alternative is making short tensors 20x slower to buy
 /// bit-stability nothing depends on.
 pub(crate) fn erf_f32_slice(input: &[f32], output: &mut [f32]) {
-    dispatch_mlas!(input, output, erf_scalar, erf_avx2, mlas_sys::compute_erf);
+    dispatch_mlas!(
+        input,
+        output,
+        erf_scalar,
+        erf_avx2,
+        mlas_sys::compute_erf,
+        neon_erf::erf
+    );
 }
 
 /// `Erf` on the native route only, whatever this build linked.
@@ -1293,7 +1320,7 @@ pub(crate) fn erf_f32_slice(input: &[f32], output: &mut [f32]) {
 /// against each other inside one process — the only way to measure or
 /// differentially test an absorption honestly.
 pub(crate) fn erf_f32_slice_native(input: &[f32], output: &mut [f32]) {
-    dispatch!(input, output, erf_scalar, erf_avx2);
+    dispatch!(input, output, erf_scalar, erf_avx2, neon_erf::erf);
 }
 
 /// `y = 0.5·x·(1 + erf(x/√2))`, the exact (`approximate="none"`) GELU.
@@ -1301,12 +1328,25 @@ pub(crate) fn erf_f32_slice_native(input: &[f32], output: &mut [f32]) {
 /// Fused rather than composed out of [`erf_f32_slice`] so the intermediate
 /// `x/√2` is never written to memory.
 pub(crate) fn erf_gelu_f32_slice(input: &[f32], output: &mut [f32]) {
-    dispatch_mlas!(input, output, erf_gelu_scalar, erf_gelu_avx2, erf_gelu_mlas);
+    dispatch_mlas!(
+        input,
+        output,
+        erf_gelu_scalar,
+        erf_gelu_avx2,
+        erf_gelu_mlas,
+        neon_erf::gelu
+    );
 }
 
 /// Exact `Gelu` on the native route only. See [`erf_f32_slice_native`].
 pub(crate) fn erf_gelu_f32_slice_native(input: &[f32], output: &mut [f32]) {
-    dispatch!(input, output, erf_gelu_scalar, erf_gelu_avx2);
+    dispatch!(
+        input,
+        output,
+        erf_gelu_scalar,
+        erf_gelu_avx2,
+        neon_erf::gelu
+    );
 }
 
 /// Exact `Gelu` on the MLAS reference route only (repair pass included), for
@@ -1545,6 +1585,15 @@ pub(crate) fn erf_gelu_bias_f32_slice(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    if input.len() >= SIMD_MIN_LEN && std::arch::is_aarch64_feature_detected!("neon") {
+        // Choose on whole tensor length, exactly as the un-biased native op.
+        // SAFETY: runtime NEON detection; the row mapper bounds every tail.
+        run_chunked_rows(input, output, width, |i, o| unsafe {
+            neon_erf::gelu_bias(i, bias, width, o)
+        });
+        return;
+    }
     run_chunked_rows(input, output, width, |i, o| {
         for (row_in, row_out) in i.chunks(width).zip(o.chunks_mut(width)) {
             for ((o, &v), &b) in row_out.iter_mut().zip(row_in).zip(bias) {
@@ -1761,8 +1810,8 @@ fn tanh_scalar(x: f32) -> f32 {
     x.tanh()
 }
 
-/// Correctly-rounded `erf`, the fallback when AVX2+FMA is absent. `libm::erf`
-/// is `f64`, so this is what makes the non-x86 path both exact and slow; see
+/// Correctly-rounded `erf`, the fallback when no vector path applies.
+/// `libm::erf` is `f64`; see
 /// [`erf_f32_slice`].
 #[inline]
 fn erf_scalar(x: f32) -> f32 {
@@ -5088,8 +5137,8 @@ mod mlas_ab {
             let cases: [(&str, fn(&[f32], &mut [f32]), fn(&[f32], &mut [f32])); 4] = [
                 ("Tanh", tanh_avx2_shim, tanh_mlas_ref),
                 ("Sigmoid", sigmoid_avx2_shim, sigmoid_mlas_ref),
-                ("Erf", erf_avx2_shim, mlas_sys::compute_erf),
-                ("GeluErf", erf_gelu_avx2_shim, erf_gelu_mlas),
+                ("Erf", erf_f32_slice_native, mlas_sys::compute_erf),
+                ("GeluErf", erf_gelu_f32_slice_native, erf_gelu_mlas),
             ];
             for (name, rust, mlas_fn) in cases {
                 let (a, b) = best_ns_pair(n, || rust(&x, &mut ours), || mlas_fn(&x, &mut mlas));
@@ -5157,6 +5206,16 @@ mod mlas_ab {
         let mut ours = vec![0.0f32; n];
         let mut mlas = vec![0.0f32; n];
 
+        let neon_erf_available = {
+            #[cfg(target_arch = "aarch64")]
+            {
+                std::arch::is_aarch64_feature_detected!("neon")
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                false
+            }
+        };
         #[allow(clippy::type_complexity)]
         let cases: [(
             &str,
@@ -5164,6 +5223,7 @@ mod mlas_ab {
             fn(&[f32], &mut [f32]),
             fn(f32) -> f32,
             f64,
+            bool,
         ); 4] = [
             (
                 "Tanh",
@@ -5171,6 +5231,7 @@ mod mlas_ab {
                 tanh_mlas_ref,
                 super::tests::tanh_ref,
                 super::tests::TANH_BOUND,
+                vector_path_available(),
             ),
             (
                 "Sigmoid",
@@ -5178,28 +5239,30 @@ mod mlas_ab {
                 sigmoid_mlas_ref,
                 super::tests::sigmoid_ref,
                 super::tests::SIGMOID_BOUND,
+                vector_path_available(),
             ),
             (
                 "Erf",
-                erf_avx2_shim,
+                erf_f32_slice_native,
                 mlas_sys::compute_erf,
                 super::tests::erf_ref,
                 super::tests::ERF_BOUND,
+                vector_path_available() || neon_erf_available,
             ),
             (
                 "GeluErf",
-                erf_gelu_avx2_shim,
+                erf_gelu_f32_slice_native,
                 erf_gelu_mlas,
                 super::tests::erf_gelu_ref,
                 super::tests::ERF_GELU_BOUND,
+                vector_path_available() || neon_erf_available,
             ),
         ];
         // A tolerance nothing exercises is a tolerance that proves nothing, so
         // record whether the strict half of this test ran at all.
         let mut special_comparisons = 0usize;
         let mut oracle_comparisons = 0usize;
-        let native_vector = vector_path_available();
-        for (name, rust, mlas_fn, oracle, bound) in cases {
+        for (name, rust, mlas_fn, oracle, bound, native_vector) in cases {
             let mut worst_scaled = [0.0f64; 2];
             let mut worst_ulps = 0u32;
             rust(&x, &mut ours);
@@ -5297,8 +5360,8 @@ mod mlas_ab {
         let cases: [(&str, fn(&[f32], &mut [f32]), fn(&[f32], &mut [f32])); 4] = [
             ("Tanh", tanh_avx2_shim, tanh_mlas_ref),
             ("Sigmoid", sigmoid_avx2_shim, sigmoid_mlas_ref),
-            ("Erf", erf_avx2_shim, mlas_sys::compute_erf),
-            ("GeluErf", erf_gelu_avx2_shim, erf_gelu_mlas),
+            ("Erf", erf_f32_slice_native, mlas_sys::compute_erf),
+            ("GeluErf", erf_gelu_f32_slice_native, erf_gelu_mlas),
         ];
         for (name, rust, mlas_fn) in cases {
             rust(&x, &mut ours);
@@ -5352,12 +5415,6 @@ mod mlas_ab {
     }
     fn sigmoid_avx2_shim(x: &[f32], y: &mut [f32]) {
         dispatch!(x, y, sigmoid_scalar, sigmoid_avx2)
-    }
-    fn erf_avx2_shim(x: &[f32], y: &mut [f32]) {
-        dispatch!(x, y, erf_scalar, erf_avx2)
-    }
-    fn erf_gelu_avx2_shim(x: &[f32], y: &mut [f32]) {
-        dispatch!(x, y, erf_gelu_scalar, erf_gelu_avx2)
     }
 }
 
