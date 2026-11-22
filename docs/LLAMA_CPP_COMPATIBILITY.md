@@ -54,6 +54,10 @@ rejected because these models execute in-process with explicit nxrt settings.
 - `max_tokens: -1` uses the configured server output cap; context limits still apply.
 - `seed: -1` selects an unseeded request; unsigned 64-bit seeds remain accepted.
 - `repeat_penalty` and `typ_p` map to the existing repetition/typical controls.
+- `logit_bias` accepts OpenAI token-ID objects and native `[token ID or text, bias]`
+  pairs. `false` bans a token; finite numbers add a bias before penalties and
+  constraints, including under greedy decoding. Unknown IDs and duplicate token
+  assignments are rejected. The processor disables incompatible device shortcuts.
 - `repeat_last_n: -1` uses full history; non-negative values select the repetition window.
 - `chat_template_kwargs` supplies template variables such as `enable_thinking`.
   Structural variables (`messages`, `tools`, generation prompt and BOS/EOS) cannot
@@ -68,7 +72,7 @@ rejected because these models execute in-process with explicit nxrt settings.
 
 The sampler pipeline is nxrt's existing fixed pipeline. Arbitrary `samplers`
 orders, dynamic temperature, thinking budgets, continuation of a final assistant
-message, logit bias and other unsupported active controls are rejected with an
+message and other unsupported active controls are rejected with an
 `invalid_request_error`. Neutral dynamic-temperature settings are accepted.
 Optional progress/control subscription fields from Llama Chat are accepted, but
 `/props.nxrt_capabilities` advertises resumable streams and reports realtime

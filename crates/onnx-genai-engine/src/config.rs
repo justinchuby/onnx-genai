@@ -1,6 +1,6 @@
 //! Public generation API types and configuration.
 
-use crate::logits::{StopSequence, TokenId};
+use crate::logits::{LogitBias, StopSequence, TokenId};
 use anyhow::Context as _;
 use onnx_genai_kv::{CachePriority, DEFAULT_CHUNK_SIZE, KvDType, LocalTieredConfig, SequenceId};
 use onnx_genai_metadata::{GenerationContract, GenerationDefaults};
@@ -1215,6 +1215,8 @@ pub struct GenerateOptions {
     pub frequency_penalty: f32,
     /// OpenAI-style presence penalty: logit[t] -= presence_penalty once if seen.
     pub presence_penalty: f32,
+    /// Explicit token biases applied before penalties, constraints and sampling.
+    pub logit_bias: std::collections::BTreeMap<TokenId, LogitBias>,
     /// Optional DRY n-gram repetition penalty.
     pub dry: Option<DryConfig>,
     /// Optional adaptive Mirostat sampler.
@@ -1280,6 +1282,7 @@ impl Default for GenerateOptions {
             repetition_window: None,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            logit_bias: Default::default(),
             dry: None,
             mirostat: None,
             xtc: None,
@@ -1332,6 +1335,25 @@ pub struct SamplingOverrides {
 }
 
 impl GenerateOptions {
+    /// Validate explicit token biases against the admitted model vocabulary.
+    pub fn validate_logit_bias(&self, tokenizer: &onnx_genai_ort::Tokenizer) -> anyhow::Result<()> {
+        for id in self.logit_bias.keys() {
+            anyhow::ensure!(
+                tokenizer.inner().id_to_token(*id).is_some(),
+                "logit_bias token id {id} is absent from the model vocabulary"
+            );
+        }
+        anyhow::ensure!(
+            self.logit_bias
+                .values()
+                .filter(|bias| matches!(bias, LogitBias::Ban))
+                .count()
+                < tokenizer.inner().get_vocab_size(true),
+            "logit_bias bans the entire model vocabulary; leave at least one token available"
+        );
+        Ok(())
+    }
+
     /// Whether `token` ends generation.
     ///
     /// The single place that question is answered, so the fast path, the
@@ -1558,6 +1580,15 @@ impl GenerateOptions {
         }
         if !self.presence_penalty.is_finite() {
             anyhow::bail!("presence_penalty must be finite");
+        }
+        for (id, bias) in &self.logit_bias {
+            if let LogitBias::Add(value) = bias
+                && !value.is_finite()
+            {
+                anyhow::bail!(
+                    "logit_bias[{id}] must be finite; use LogitBias::Ban to exclude a token"
+                );
+            }
         }
         if let Some(dry) = &self.dry {
             if !dry.multiplier.is_finite() || dry.multiplier < 0.0 {

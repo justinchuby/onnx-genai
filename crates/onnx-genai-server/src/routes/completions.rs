@@ -2068,6 +2068,69 @@ pub(super) fn build_generate_options_with_tokenizer(
     output_budget: usize,
 ) -> anyhow::Result<GenerateOptions> {
     let mut options = build_generate_options(request, output_budget);
+    if let Some(biases) = request.extensions.get("logit_bias") {
+        use onnx_genai_engine::logits::LogitBias;
+        let pairs: Vec<(serde_json::Value, serde_json::Value)> = match biases {
+            serde_json::Value::Object(object) => object.iter().map(|(key,value)| (serde_json::json!(key),value.clone())).collect(),
+            serde_json::Value::Array(items) => items.iter().enumerate().map(|(index,item)| {
+                let pair = item.as_array().filter(|pair| pair.len()==2).ok_or_else(|| anyhow::anyhow!("logit_bias[{index}] must be [token_id or text, finite bias or false]"))?;
+                Ok((pair[0].clone(),pair[1].clone()))
+            }).collect::<anyhow::Result<_>>()?,
+            _ => anyhow::bail!("logit_bias must be a token-id object or array of [token,bias] pairs"),
+        };
+        for (token, value) in pairs {
+            let bias = if value == false {
+                LogitBias::Ban
+            } else {
+                let value = value.as_f64().ok_or_else(|| {
+                    anyhow::anyhow!("logit_bias for {token} must be a finite number or false")
+                })?;
+                anyhow::ensure!(
+                    value.is_finite() && (value as f32).is_finite(),
+                    "logit_bias for {token} exceeds the finite float range"
+                );
+                LogitBias::Add(value as f32)
+            };
+            let ids = if let Some(id) = token.as_u64().and_then(|id| u32::try_from(id).ok()) {
+                vec![id]
+            } else if let Some(text) = token.as_str() {
+                if biases.is_object()
+                    && !text.is_empty()
+                    && text.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    vec![text.parse::<u32>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "logit_bias token id '{text}' exceeds the unsigned 32-bit token range"
+                        )
+                    })?]
+                } else {
+                    tokenizer
+                        .inner()
+                        .encode(text, false)
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "logit_bias text {text:?} could not be tokenized: {err}"
+                            )
+                        })?
+                        .get_ids()
+                        .to_vec()
+                }
+            } else {
+                anyhow::bail!("logit_bias token {token} must be an unsigned token id or text");
+            };
+            anyhow::ensure!(
+                !ids.is_empty(),
+                "logit_bias token {token} encodes to no tokens; provide nonempty text"
+            );
+            for id in ids {
+                anyhow::ensure!(
+                    options.logit_bias.insert(id, bias).is_none(),
+                    "logit_bias defines token id {id} more than once; combine its biases into one entry"
+                );
+            }
+        }
+    }
+    options.validate_logit_bias(tokenizer)?;
     if let Some(dry) = &mut options.dry {
         for (index, breaker) in request.dry_sequence_breakers.iter().enumerate() {
             let ids = tokenizer

@@ -47,6 +47,14 @@ pub(crate) fn build_processor_chain(
     let mut chain = ProcessorChain::new();
     let samples = !options.selects_greedily() || has_custom_sampler;
 
+    if !options.logit_bias.is_empty() {
+        if let Some(tokenizer) = tokenizer {
+            options.validate_logit_bias(tokenizer)?;
+        }
+        chain.add(Box::new(crate::logits::LogitBiasProcessor {
+            biases: options.logit_bias.clone(),
+        }));
+    }
     if options.repetition_penalty != 1.0 {
         chain.add(Box::new(RepetitionPenaltyProcessor {
             penalty: options.repetition_penalty,
@@ -848,4 +856,34 @@ fn terminal_token_ids(options: &GenerateOptions) -> Vec<TokenId> {
         ids.push(id);
     }
     ids
+}
+
+#[cfg(test)]
+mod logit_bias_tests {
+    use super::*;
+    use crate::logits::LogitBias;
+    #[test]
+    fn bias_changes_greedy_argmax_and_excludes_device_shortcuts() {
+        let options = GenerateOptions {
+            logit_bias: [(0, LogitBias::Ban), (2, LogitBias::Add(10.0))].into(),
+            ..GenerateOptions::default()
+        };
+        let chain = build_processor_chain(&options, None, false).unwrap();
+        assert!(!is_device_portable_chain(&chain));
+        let mut logits = vec![9.0, 3.0, 1.0];
+        chain.process(&mut logits, &ProcessorContext::default());
+        assert_eq!(logits, vec![f32::NEG_INFINITY, 3.0, 11.0]);
+        assert_eq!(crate::sampling::sample_greedy(&logits), 2);
+        let invalid = GenerateOptions {
+            logit_bias: [(0, LogitBias::Add(f32::NAN))].into(),
+            ..GenerateOptions::default()
+        };
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("logit_bias[0]")
+        );
+    }
 }

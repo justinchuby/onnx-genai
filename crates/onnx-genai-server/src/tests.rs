@@ -6538,6 +6538,41 @@ mod native_compat {
         assert!(json_body(response).await["input_tokens"].as_u64().unwrap() > 0);
     }
     #[tokio::test]
+    async fn logit_bias_controls_real_greedy_generation_and_validates_vocabulary() {
+        let router = app(tiny_state());
+        let target = fixture_tokenizer()
+            .inner()
+            .encode("world", false)
+            .unwrap()
+            .get_ids()[0];
+        let response = request(router.clone(), "/completion", json!({"prompt":"hello","n_predict":1,"temperature":0,"return_tokens":true,"logit_bias":{(target.to_string()):1000}})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["tokens"], json!([target]));
+        let response = request(router.clone(), "/completion", json!({"prompt":"hello","n_predict":1,"temperature":0,"return_tokens":true,"logit_bias":[["world",1000]]})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["tokens"], json!([target]));
+        for biases in [
+            json!({"999999":2}),
+            json!([[target, 2], [target, false]]),
+            json!([[target, true]]),
+        ] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":"hello","n_predict":1,"logit_bias":biases}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                json_body(response).await["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("logit_bias")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn alternate_protocols_use_real_generation_and_usage() {
         let router = app(tiny_state());
         for (path, body, protocol) in [

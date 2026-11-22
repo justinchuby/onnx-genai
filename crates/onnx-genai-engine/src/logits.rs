@@ -868,6 +868,32 @@ impl LogitProcessor for TemperatureProcessor {
     }
 }
 
+/// A finite additive bias or an explicit token exclusion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LogitBias {
+    Add(f32),
+    Ban,
+}
+
+pub struct LogitBiasProcessor {
+    pub biases: std::collections::BTreeMap<TokenId, LogitBias>,
+}
+impl LogitProcessor for LogitBiasProcessor {
+    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+        for (id, bias) in &self.biases {
+            if let Some(logit) = usize::try_from(*id).ok().and_then(|id| logits.get_mut(id)) {
+                match bias {
+                    LogitBias::Add(value) => *logit += value,
+                    LogitBias::Ban => *logit = f32::NEG_INFINITY,
+                }
+            }
+        }
+    }
+    fn name(&self) -> &str {
+        "logit_bias"
+    }
+}
+
 pub struct RepetitionPenaltyProcessor {
     pub penalty: f32,
     /// When `Some(n)`, only the most recent `n` tokens of the combined
