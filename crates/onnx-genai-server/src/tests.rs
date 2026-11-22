@@ -327,11 +327,14 @@ fn chat_sampling_controls_round_trip_into_generate_options() {
     assert_eq!(dry.allowed_length, 3);
     assert_eq!(
         dry.sequence_breakers,
-        fixture_tokenizer()
-            .inner()
-            .encode("hello", false)
-            .unwrap()
-            .get_ids()
+        vec![
+            fixture_tokenizer()
+                .inner()
+                .encode("hello", false)
+                .unwrap()
+                .get_ids()
+                .to_vec()
+        ]
     );
 
     let mirostat = options.mirostat.expect("Mirostat enabled");

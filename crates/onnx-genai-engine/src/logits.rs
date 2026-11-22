@@ -1000,7 +1000,8 @@ pub struct DryProcessor {
     pub multiplier: f32,
     pub base: f32,
     pub allowed_length: usize,
-    pub sequence_breakers: Vec<TokenId>,
+    pub sequence_breakers: Vec<Vec<TokenId>>,
+    pub window: Option<usize>,
 }
 
 impl LogitProcessor for DryProcessor {
@@ -1024,11 +1025,25 @@ impl LogitProcessor for DryProcessor {
             return;
         }
 
-        let breakers: HashSet<_> = self.sequence_breakers.iter().copied().collect();
+        let tokens = &tokens[tokens
+            .len()
+            .saturating_sub(self.window.unwrap_or(tokens.len()))..];
+        let mut boundary = vec![false; tokens.len()];
+        for breaker in self
+            .sequence_breakers
+            .iter()
+            .filter(|breaker| !breaker.is_empty())
+        {
+            for (start, window) in tokens.windows(breaker.len()).enumerate() {
+                if window == breaker {
+                    boundary[start..start + breaker.len()].fill(true);
+                }
+            }
+        }
         let mut penalties: HashMap<TokenId, f32> = HashMap::new();
         for continuation_index in 1..tokens.len() {
             let continuation = tokens[continuation_index];
-            if breakers.contains(&continuation) {
+            if boundary[continuation_index] {
                 continue;
             }
 
@@ -1039,8 +1054,8 @@ impl LogitProcessor for DryProcessor {
                 let historical = tokens[historical_index - 1];
                 let recent = tokens[recent_index - 1];
                 if historical != recent
-                    || breakers.contains(&historical)
-                    || breakers.contains(&recent)
+                    || boundary[historical_index - 1]
+                    || boundary[recent_index - 1]
                 {
                     break;
                 }
@@ -2472,6 +2487,7 @@ mod tests {
             base: 1.5,
             allowed_length: 2,
             sequence_breakers: vec![],
+            window: None,
         };
         let mut logits = vec![0.0; 5];
         processor.process(&mut logits, &context(vec![1, 2, 3], vec![1, 2]));
@@ -2489,6 +2505,7 @@ mod tests {
             base: 1.5,
             allowed_length: 2,
             sequence_breakers: vec![],
+            window: None,
         };
         let original = vec![1.0; 5];
 
@@ -2509,6 +2526,7 @@ mod tests {
             base: 1.5,
             allowed_length: 2,
             sequence_breakers: vec![],
+            window: None,
         }
         .process(&mut logits, &context(vec![1, 2, 3, 4], vec![1, 2, 3]));
         assert_eq!(logits[4], -3.0);
@@ -2524,6 +2542,7 @@ mod tests {
             base: 1.5,
             allowed_length: 2,
             sequence_breakers: vec![],
+            window: None,
         }
         .process(
             &mut unbroken,
@@ -2536,10 +2555,36 @@ mod tests {
             multiplier: 2.0,
             base: 1.5,
             allowed_length: 2,
-            sequence_breakers: vec![9],
+            sequence_breakers: vec![vec![9]],
+            window: None,
         }
         .process(&mut broken, &context(prompt_tokens, generated_tokens));
         assert!(broken.iter().all(|logit| *logit == 0.0));
+    }
+
+    #[test]
+    fn dry_multi_token_breakers_preserve_partial_matches_and_honor_history_window() {
+        let mut processor = DryProcessor {
+            multiplier: 2.0,
+            base: 1.5,
+            allowed_length: 2,
+            sequence_breakers: vec![vec![9, 8]],
+            window: None,
+        };
+        let history = vec![1, 9, 2, 3, 1, 9, 2];
+        let mut logits = vec![0.0; 10];
+        processor.process(&mut logits, &context(history.clone(), vec![]));
+        assert_eq!(logits[3], -3.0);
+        processor.window = Some(4);
+        let mut logits = vec![0.0; 10];
+        processor.process(&mut logits, &context(history, vec![]));
+        assert!(logits.iter().all(|value| *value == 0.0));
+        processor.window = None;
+        processor.process(
+            &mut logits,
+            &context(vec![1, 9, 8, 2, 3, 1, 9, 8, 2], vec![]),
+        );
+        assert!(logits.iter().all(|value| *value == 0.0));
     }
 
     #[test]
@@ -2551,6 +2596,7 @@ mod tests {
             base: 1.75,
             allowed_length: 2,
             sequence_breakers: vec![],
+            window: None,
         }
         .process(&mut logits, &context(vec![1, 2, 3], vec![1, 2]));
         assert_eq!(logits, original);

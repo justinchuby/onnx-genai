@@ -1579,7 +1579,8 @@ mod tests {
                 multiplier: 0.5,
                 base: 1.75,
                 allowed_length: 2,
-                sequence_breakers: vec![13],
+                sequence_breakers: vec![vec![13]],
+                window: None,
             }),
             mirostat: Some(crate::config::MirostatConfig {
                 tau: 5.0,

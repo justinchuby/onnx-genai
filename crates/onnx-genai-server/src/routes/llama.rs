@@ -219,7 +219,9 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
             "logit_bias" => value.is_object() || value.is_array(),
             "dynatemp_range" => value.as_f64() == Some(0.0),
             "dynatemp_exponent" => value.as_f64() == Some(1.0),
-            "dry_penalty_last_n" => request.dry_multiplier == 0.0 || value == -1,
+            "dry_penalty_last_n" => value
+                .as_i64()
+                .is_some_and(|n| n == -1 || usize::try_from(n).is_ok()),
             "backend_sampling" => value == false,
             "n" => value == 1,
             "user" => value.is_string(),

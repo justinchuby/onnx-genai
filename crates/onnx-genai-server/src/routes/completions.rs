@@ -1945,6 +1945,11 @@ fn build_generate_options(
             base: request.dry_base,
             allowed_length: request.dry_allowed_length,
             sequence_breakers: Vec::new(),
+            window: request
+                .extensions
+                .get("dry_penalty_last_n")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok()),
         }),
         mirostat: match request.mirostat {
             1 => Some(MirostatConfig {
@@ -2140,10 +2145,10 @@ pub(super) fn build_generate_options_with_tokenizer(
                     anyhow::anyhow!("dry_sequence_breakers[{index}] could not be tokenized: {err}")
                 })?;
             anyhow::ensure!(
-                ids.len() == 1,
-                "dry_sequence_breakers[{index}] must encode to one token on this backend; remove the breaker or disable DRY"
+                !ids.is_empty(),
+                "dry_sequence_breakers[{index}] encodes to no tokens; use a nonempty breaker"
             );
-            dry.sequence_breakers.push(ids.get_ids()[0]);
+            dry.sequence_breakers.push(ids.get_ids().to_vec());
         }
     }
     Ok(options)

@@ -1158,8 +1158,10 @@ pub struct DryConfig {
     pub base: f32,
     /// Repeated prefix length allowed before penalties begin.
     pub allowed_length: usize,
-    /// Tokens that stop matching across semantic sequence boundaries.
-    pub sequence_breakers: Vec<TokenId>,
+    /// Token sequences that stop matching across semantic boundaries.
+    pub sequence_breakers: Vec<Vec<TokenId>>,
+    /// Maximum recent history to inspect; None uses all prompt/generated tokens.
+    pub window: Option<usize>,
 }
 
 /// Mirostat feedback algorithm version.
@@ -1597,6 +1599,12 @@ impl GenerateOptions {
             if !dry.base.is_finite() || dry.base < 1.0 {
                 anyhow::bail!("dry base must be finite and at least 1");
             }
+            anyhow::ensure!(
+                dry.sequence_breakers
+                    .iter()
+                    .all(|breaker| !breaker.is_empty()),
+                "DRY sequence breakers must contain at least one token"
+            );
             if dry.allowed_length == 0 {
                 anyhow::bail!("dry allowed_length must be greater than zero");
             }

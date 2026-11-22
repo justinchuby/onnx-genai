@@ -76,12 +76,14 @@ pub(crate) fn build_processor_chain(
 
     if let Some(dry) = &options.dry
         && dry.multiplier > 0.0
+        && dry.window != Some(0)
     {
         chain.add(Box::new(DryProcessor {
             multiplier: dry.multiplier,
             base: dry.base,
             allowed_length: dry.allowed_length,
             sequence_breakers: dry.sequence_breakers.clone(),
+            window: dry.window,
         }));
     }
 
