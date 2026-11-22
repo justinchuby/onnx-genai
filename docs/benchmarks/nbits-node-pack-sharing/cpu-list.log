@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-30635267f98d516a)
+kernels::matmul_nbits::tests::native_pack_shared_shapes_keep_all_layouts_alive_and_reclaimable: test
+kernels::matmul_nbits::tests::native_pack_shared_shapes_keep_dynamic_metadata_uncached: test
+kernels::matmul_nbits::tests::native_pack_shared_shapes_serialize_distinct_cold_builders: test
+kernels::matmul_nbits::tests::native_pack_shared_state_rejects_foreign_sources_and_parameters: test
+
+4 tests, 0 benchmarks

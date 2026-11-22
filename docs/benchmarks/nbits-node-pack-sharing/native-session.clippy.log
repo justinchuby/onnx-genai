@@ -1,0 +1,14 @@
+    Checking serde_core v1.0.229
+   Compiling sha2 v0.10.9
+    Checking either v1.17.0
+    Checking rayon v1.12.0
+   Compiling onnx-genai-ort-sys v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-genai-ort/ort-sys)
+    Checking serde_json v1.0.151
+    Checking serde v1.0.229
+    Checking onnx-runtime-tracer v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-tracer)
+    Checking onnx-runtime-loader v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-loader)
+    Checking onnx-runtime-optimizer v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-optimizer)
+    Checking onnx-runtime-ep-api v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-ep-api)
+    Checking onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-ep-cpu)
+    Checking onnx-runtime-session v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-session)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.34s

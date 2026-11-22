@@ -1,0 +1,23 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 34639, "load_before": [1.99609375, 2.25927734375, 2.26171875], "command": ["cargo", "test", "--locked", "-p", "onnx-runtime-session", "--lib", "executor::tests::nbits_shape_variants_share_one_native_pack_within_the_session_node", "--", "--exact", "--nocapture"]}
+   Compiling onnx-runtime-session v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-session)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.31s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_session-deb36e47176402f7)
+
+running 1 test
+
+thread 'executor::tests::nbits_shape_variants_share_one_native_pack_within_the_session_node' (5423646) panicked at crates/onnx-runtime-session/src/executor/tests.rs:14079:9:
+assertion `left == right` failed: activation shape variants must share 36 wire bytes and 9 f32 scales
+  left: 144
+ right: 72
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test executor::tests::nbits_shape_variants_share_one_native_pack_within_the_session_node ... FAILED
+
+failures:
+
+failures:
+    executor::tests::nbits_shape_variants_share_one_native_pack_within_the_session_node
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 271 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p onnx-runtime-session --lib`
+{"wall_s": 5.071418792009354, "cpu_s": 8.431057, "maxrss_bytes": 797622272, "load_after": [2.31640625, 2.3212890625, 2.283203125]}

@@ -1,0 +1,4 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 36292, "load_before": [3.04541015625, 3.17626953125, 2.6943359375], "command": ["python3", "-"]}
+Selected cpu ['kernels::matmul_nbits::tests::native_pack_shared_shapes_keep_all_layouts_alive_and_reclaimable: test', 'kernels::matmul_nbits::tests::native_pack_shared_shapes_keep_dynamic_metadata_uncached: test', 'kernels::matmul_nbits::tests::native_pack_shared_shapes_serialize_distinct_cold_builders: test', 'kernels::matmul_nbits::tests::native_pack_shared_state_rejects_foreign_sources_and_parameters: test']
+Selected session ['executor::tests::nbits_shape_variants_share_one_native_pack_within_the_session_node: test']
+{"wall_s": 0.46063308298471384, "cpu_s": 0.43679, "maxrss_bytes": 108347392, "load_after": [3.04541015625, 3.17626953125, 2.6943359375]}
