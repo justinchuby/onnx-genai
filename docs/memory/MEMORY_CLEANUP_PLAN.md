@@ -1001,3 +1001,29 @@ Direct initializer predictions still count one immutable layout per operand;
 custom runtime views are not represented by WeightRef and rely on actual grants.
 This corrects materialized-copy identity, not transpose funding or native panel
 source-lifetime policy.
+
+
+### Keep derived-weight accounting out of steady cache hits
+
+A warm reader consumes the payload's existing grant. It must not request a
+sibling lease, return capacity or enter the accountant/pressure machinery merely
+because a kernel executes again. Ordinary MatMul dense and contiguous-half
+copies now use the existing single-entry cache lookup before the cold group
+builder, avoiding group result/status containers on the warm path. Their full
+logical-layout keys store common ranks inline; arbitrary ranks spill correctly
+rather than introducing a rank limit. LRU updates and live-reader protection
+remain in place, and the cold transactional builder is unchanged.
+
+A real public-provider MatMul control verifies a cold 24-byte dense grant
+(and the checked optional research SGEMM panel when that backend is active),
+4,096 warm executions with zero further claims, including zero-byte requests,
+or releases, and exact payload refunds at teardown. A retention-off control observes a claim and
+refund for every transient copy, so a disconnected observer cannot pass. Warm
+reuse does not remove admission for real allocations or hide transient costs.
+
+The `weight_admission_ab` release benchmark interleaves real kernel executions
+with local/governed resources, a duplicate local A/A arm, and an unaffected
+contiguous-f32 control. It separates retained and transient policies, excludes
+warm-up, retains per-round samples, and reports both wall and process CPU time.
+The host-lock wrapper must cover the whole comparison. Zero warm callbacks are
+a structural invariant; timing alone cannot establish universal zero overhead.

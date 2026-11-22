@@ -33,6 +33,7 @@ use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, broadcast_shapes, compute_contiguous_strides,
 };
 use rayon::prelude::*;
+use smallvec::SmallVec;
 
 use super::check_arity;
 use super::half_gemm::{self, HalfFormat, MatrixLayout};
@@ -372,8 +373,8 @@ fn dense_operand_cache_bytes(node: &Node, graph: &Graph, index: usize) -> u64 {
 struct MatMulCopyKey<const ELEMENT_BYTES: usize> {
     source: usize,
     dtype: DataType,
-    shape: Vec<usize>,
-    strides: Vec<i64>,
+    shape: SmallVec<[usize; 4]>,
+    strides: SmallVec<[i64; 4]>,
 }
 
 impl<const ELEMENT_BYTES: usize> MatMulCopyKey<ELEMENT_BYTES> {
@@ -381,8 +382,8 @@ impl<const ELEMENT_BYTES: usize> MatMulCopyKey<ELEMENT_BYTES> {
         Self {
             source: view.data_ptr::<u8>() as usize,
             dtype: view.dtype,
-            shape: view.shape.to_vec(),
-            strides: view.strides.to_vec(),
+            shape: SmallVec::from_slice(view.shape),
+            strides: SmallVec::from_slice(view.strides),
         }
     }
 }
@@ -707,6 +708,11 @@ impl MatMulPrepack {
         }
         validate_f32_widen_input("MatMul constant operand", view)?;
         let key = MatMulCopyKey::<4>::from_view(view);
+        if self.retain_caches
+            && let Some(hit) = self.weights.dense[index].get(&key)
+        {
+            return Ok(DenseOperand(DenseOperandStorage::Funded(hit)));
+        }
         let spec = if self.retain_caches {
             WeightSpec::cached(&key)?
         } else {
@@ -899,6 +905,11 @@ impl MatMulPrepack {
         }
         validate_f32_widen_input("MatMul constant f16 contiguous preparation", b_view)?;
         let key = MatMulCopyKey::<2>::from_view(b_view);
+        if self.retain_caches
+            && let Some(hit) = self.weights.contiguous_b_f16.get(&key)
+        {
+            return Ok(Some(hit));
+        }
         let spec = if self.retain_caches {
             WeightSpec::cached(&key)?
         } else {
@@ -3997,6 +4008,169 @@ fn broadcast_offset(bidx: &[usize], batch: &[usize], batch_strides: &[i64]) -> u
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    #[test]
+    fn warm_provider_execution_never_calls_weight_accounting() {
+        if retention_control_in_child(
+            "kernels::matmul::tests::warm_provider_execution_never_calls_weight_accounting",
+            None,
+        ) {
+            return;
+        }
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::NodeId;
+        use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseAccounting, LeaseLedger, LedgerGovernor, MemoryAuthorityId,
+            MemoryGovernor, MemoryLease,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Books {
+            governor: LedgerGovernor,
+            claims: AtomicUsize,
+            releases: AtomicUsize,
+        }
+        impl LeaseAccounting for Books {
+            fn authority_id(&self) -> Option<MemoryAuthorityId> {
+                Some(self.governor.authority_id(Tier::Host))
+            }
+            fn try_claim(
+                &self,
+                tier: Tier,
+                bytes: u64,
+                role: MemoryRole,
+            ) -> std::result::Result<(), MemoryError> {
+                self.claims.fetch_add(1, Ordering::Relaxed);
+                self.governor.ledger().try_claim(tier, bytes, role)
+            }
+            fn release(&self, tier: Tier, bytes: u64) {
+                self.releases.fetch_add(1, Ordering::Relaxed);
+                LeaseAccounting::release(self.governor.ledger().as_ref(), tier, bytes);
+            }
+        }
+        struct Governor(Arc<Books>);
+        impl MemoryGovernor for Governor {
+            fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
+                self.0.governor.authority_id(tier)
+            }
+            fn reserve(
+                &self,
+                tier: Tier,
+                bytes: u64,
+                role: MemoryRole,
+                holder: HolderId,
+            ) -> std::result::Result<MemoryLease, MemoryError> {
+                self.0.try_claim(tier, bytes, role)?;
+                Ok(MemoryLease::new(tier, bytes, role, holder, self.0.clone()))
+            }
+            fn available(&self, tier: Tier) -> u64 {
+                self.0.governor.available(tier)
+            }
+            fn used(&self, tier: Tier) -> u64 {
+                self.0.governor.used(tier)
+            }
+        }
+        for retained in [true, false] {
+            let books = Arc::new(Books {
+                governor: LedgerGovernor::new(LeaseLedger::new(0, 1024 * 1024, 0)),
+                claims: AtomicUsize::new(0),
+                releases: AtomicUsize::new(0),
+            });
+            // Research MLAS can also retain a native panel. Admit its checked
+            // size so repeated optional refusals cannot pollute a warm-hit test.
+            #[cfg(feature = "mlas")]
+            let panel_bytes = if retained && CpuBackend::auto_detect() == CpuBackend::Mlas {
+                sgemm_pack_plan(3, 2).unwrap().owned_heap_bytes() as u64
+            } else {
+                0
+            };
+            #[cfg(not(feature = "mlas"))]
+            let panel_bytes = 0u64;
+            let cold_claims = 1 + usize::from(panel_bytes != 0);
+            let source =
+                crate::DerivedWeightMemory::governed(&Governor(books.clone()), HolderId::new(13))
+                    .unwrap();
+            let resources = CpuMemoryResources::new(source, Default::default())
+                .unwrap()
+                .with_cache_retention(crate::CpuCacheRetention::new(retained));
+            let provider = crate::CpuExecutionProvider::with_resources(resources);
+            let node = Node::new(NodeId(0), "MatMul", vec![], vec![]);
+            let mut kernel = provider
+                .get_kernel(&node, &[vec![2, 3], vec![3, 2]], 17)
+                .unwrap();
+            kernel.set_constant_inputs(&[false, true]);
+            let a = Owned::f32(&[2, 3], &[0.25; 6]);
+            let b = Owned::f64(&[3, 2], &[0.5; 6]);
+            let mut output = Owned::zeros_f32(&[2, 2]);
+            let mut execute = || {
+                kernel
+                    .execute(&[a.view(), b.view()], &mut [output.view_mut()])
+                    .unwrap();
+                assert_eq!(output.to_f32(), [0.375; 4]);
+            };
+            let setup_claims = books.claims.load(Ordering::Relaxed);
+            assert_eq!(
+                setup_claims, 1,
+                "only the zero-byte source anchor is created during setup"
+            );
+            execute();
+            assert_eq!(
+                books.claims.load(Ordering::Relaxed),
+                setup_claims + cold_claims
+            );
+            assert_eq!(
+                books.releases.load(Ordering::Relaxed),
+                usize::from(!retained)
+            );
+            let repeats = if retained { 4096 } else { 32 };
+            for _ in 0..repeats {
+                execute();
+            }
+            assert_eq!(
+                books.claims.load(Ordering::Relaxed),
+                setup_claims + if retained { cold_claims } else { repeats + 1 }
+            );
+            assert_eq!(
+                books.releases.load(Ordering::Relaxed),
+                if retained { 0 } else { repeats + 1 },
+                "warm cached readers never return the owning payload's grant; transient controls must exercise the observer"
+            );
+            assert_eq!(
+                books.governor.used(Tier::Host),
+                if retained { 24 + panel_bytes } else { 0 }
+            );
+            drop(kernel);
+            drop(provider);
+            assert_eq!(books.governor.used(Tier::Host), 0);
+            assert_eq!(
+                books.releases.load(Ordering::Relaxed),
+                if retained { cold_claims } else { repeats + 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn copy_key_inline_layout_preserves_arbitrary_rank_fallback() {
+        let storage = Owned::f64(&[6], &[1., 2., 3., 4., 5., 6.]);
+        let shape = [1, 1, 1, 1, 2, 3];
+        let strides = [6, 6, 6, 6, 3, 1];
+        let mut view = storage.view();
+        view.shape = &shape;
+        view.strides = &strides;
+        let key = MatMulCopyKey::<4>::from_view(&view);
+        assert!(key.shape.spilled() && key.strides.spilled());
+        assert_eq!(key.weight_bytes().unwrap(), 24);
+        let matrix = storage.view();
+        let inline = MatMulCopyKey::<4>::from_view(&matrix);
+        assert!(!inline.shape.spilled() && !inline.strides.spilled());
+        let mut prepack = MatMulPrepack::default();
+        prepack.set_constant_inputs(&[true, false]);
+        let first = prepack.dense(0, &view).unwrap();
+        let next = prepack.dense(0, &view).unwrap();
+        assert_eq!(&*first, [1., 2., 3., 4., 5., 6.]);
+        assert_eq!(first.as_ptr(), next.as_ptr());
+    }
 
     #[test]
     fn materialized_constant_copies_distinguish_complete_logical_views() {

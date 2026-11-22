@@ -61,6 +61,7 @@ tracing-crate = { package = "tracing", version = "0.1", optional = true }
 thiserror = { workspace = true }
 half = { workspace = true }
 rayon = "1"
+smallvec = { workspace = true }
 libc = "0.2"
 # Pure-Rust libm (no FFI, no `cc`): supplies the correctly-rounded `erf` used by
 # the `Erf` op and the fused `Gelu` kernel. A polynomial approximation was ~1e-9
@@ -155,6 +156,10 @@ harness = false
 
 [[bench]]
 name = "bounded_expert_bench"
+harness = false
+
+[[bench]]
+name = "weight_admission_ab"
 harness = false
 
 [lints]

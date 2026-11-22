@@ -1476,3 +1476,64 @@ controls selected one test and passed before the old-version negative controls;
 the rebuilt full suites include both afterward. Consumed insertion fragments
 and the temporary baseline worktree are removed; validation drivers/logs and
 the stable host lock remain.
+
+
+### Derived-weight admission stays off warm cache hits
+
+Ordinary dense/half materialization uses a single cache lookup on a warm hit,
+with common-rank full-layout keys stored inline. It does not allocate group
+result/status containers or call the accountant. Cold fills retain the existing
+transactional group admission, serialized construction, reader lifetime and
+pressure reclamation. Higher ranks spill correctly; the inline capacity is no
+semantic rank restriction.
+
+A public-provider control counts every claim (including zero-byte requests)
+and release. After setup and the cold preparation, 4,096 real MatMul executions
+make no further accounting calls. The fixture admits any checked optional MLAS
+panel as well as the dense copy, so reference-backend admission failures cannot
+pollute a warm-hit measurement. Retention-off execution is an active control:
+each real transient allocation claims and refunds its bytes. Teardown refunds
+all retained payloads exactly once.
+
+The `weight_admission_ab` benchmark uses public factory/execute calls, rotated
+local/governed/A-A/f32-control arms, retained and transient policies, warm-up
+outside measurement, per-round samples, wall and process CPU time. On Apple
+M1 Max ARM64 macOS / Rust 1.98 / native Accelerate / one Rayon worker, three
+interleaved process pairs compare parent b0bf6f71e against this implementation.
+Each process contributes eleven rotated rounds. The stable Darwin host lock
+covers both builds and all six process runs. Numbers below are medians of the
+three process medians; brackets give their full range, in nanoseconds per call.
+
+| M,K,N | Policy | Governed before | Governed after |
+| --- | --- | --- | --- |
+| 1,16,16 | retained | 371.63 [370.52–372.18] | 256.76 [256.28–269.02] |
+| 1,128,256 | retained | 2213.30 [2211.08–2253.82] | 2078.89 [2039.26–2098.07] |
+| 8,128,256 | retained | 1482.05 [1477.93–1484.22] | 1361.20 [1353.46–1453.46] |
+| 1,16,16 | transient | 1058.90 [1056.08–1059.16] | 1023.58 [1018.27–1024.60] |
+| 1,128,256 | transient | 74640.66 [74592.97–74670.43] | 74597.33 [74556.19–74752.49] |
+| 8,128,256 | transient | 80850.41 [80842.14–80986.46] | 80977.30 [80883.47–81164.88] |
+
+The tiny retained case improves about 31%; its duplicate local arm improves
+similarly, while its governed f32 control moves about 1.4%. This supports a
+metadata-path improvement on that CPU/workload, not a model-wide speedup.
+Larger M=8 local A/A arms show substantial layout/scheduling variation, and a
+transient f32 control moves about 6%; those rows do not establish general
+speedups or regressions. All timing rows retain numerical output checks.
+
+Admission is not universally free: in the three current tiny transient runs,
+governed execution costs 14.83–19.13 ns (1.47–1.90%) more than local ownership,
+above that case's A/A difference. Warm hits have structurally zero accountant
+calls, but actual cold/transient allocations, pressure misses and final release
+still require truthful accounting. No CUDA, other-ISA, pressure-path or
+end-to-end LLM latency claim follows from this benchmark.
+
+Validation: full native CPU 1,988 passed / 20 ignored and session 277 passed;
+optional-MLAS CPU 2,025 passed / 35 ignored and session 279 passed. Strict
+all-target Clippy passes for both CPU/session configurations. After strengthening
+the callback observer to include zero-byte requests and admitting the checked
+research panel, the exact callback control and CPU Clippy pass again in both
+configurations; explicitly forced MLAS and Generic callback controls each select
+and pass one test. The high-rank fallback control passes as well. Formatting and
+dispatch/platform/feature gates pass. The temporary baseline worktree, consumed
+insertion fragment and copied benchmark executables are removed; raw timing
+samples, metadata, validation drivers/logs and the stable host lock remain.

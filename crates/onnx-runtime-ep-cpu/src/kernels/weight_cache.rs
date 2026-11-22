@@ -207,7 +207,7 @@ impl<K: WeightCacheKey, P: WeightPayload> WeightCache<K, P> {
         self.max_bytes
     }
 
-    #[cfg(feature = "mlas")]
+    /// A single warm reader needs no group containers or accounting callbacks.
     pub(super) fn get(&self, key: &K) -> Option<Arc<GrantedWeight<P>>> {
         let mut inner = self
             .inner
