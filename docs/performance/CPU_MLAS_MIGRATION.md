@@ -183,6 +183,32 @@ work. No shipped build reaches any of these.
 | `MlasComputeLogistic` for `Sigmoid` | same measurement as Tanh; the route was removed |
 | `MlasComputeActivation` (fused) | our fusions cover more op pairs and keep the epilogue native |
 
+### QLinearMatMul reference packing ownership
+
+Optional QLinearMatMul packed weights obtain their actual packed-buffer bytes
+from the provider's `DerivedWeightMemory` Host authority before allocation.
+The payload owns its grant; an active call keeps both alive independently of
+the kernel cache. Retention permission reserves no idle bytes. Temporary Host
+capacity refusal leaves construction retryable and executes the existing
+unpacked reference route; allocator/configuration errors propagate. First
+construction is serialized, and a different weight identity declines packing
+before allocating a discarded replacement. No arithmetic or ISA route changes.
+
+The regression `provider_qlinear_pack_owns_its_host_grant` executes through the
+provider registry: before this change the ARM64 macOS fixture retained a
+6,528-byte pack while the supplied Host ledger reported zero. The corrected
+path charges that payload, reuses its charge on a warm call, and releases it on
+last-owner drop. `qlinear_pack_capacity_refusal_retries_and_active_owner_keeps_grant`
+covers KV competition and retry with byte-identical outputs;
+`qlinear_pack_concurrent_builders_share_one_granted_payload` checks eight
+simultaneous builders obtain the same payload under a one-pack budget.
+
+The cache remains per kernel: prefill/decode instances can still hold separate
+packs, each charged independently. Cross-instance sharing and pressure-driven
+idle reclamation remain work; this does not graduate QLinearMatMul or retire
+its MLAS reference. The governed amount is the packed payload, not all transient
+operand/output or accumulator storage.
+
 ### Retired reference capabilities
 
 `Elementwise` is graduated. Add now always uses its existing native vDSP/dense
