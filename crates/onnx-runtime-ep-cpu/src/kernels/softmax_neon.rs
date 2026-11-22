@@ -15,7 +15,7 @@ static SOFTMAX_NEON_TEST_HITS: std::sync::atomic::AtomicUsize =
 /// NEON must be available. Arguments originate after subtracting the row max.
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn exp4(x: float32x4_t) -> float32x4_t {
+unsafe fn exp4<const NEUTRAL_SCALE: bool>(x: float32x4_t) -> float32x4_t {
     let one = vdupq_n_f32(1.0);
     let zero = vdupq_n_f32(0.0);
     let nan = vmvnq_u32(vceqq_f32(x, x));
@@ -40,7 +40,15 @@ unsafe fn exp4(x: float32x4_t) -> float32x4_t {
     let bias = vbslq_s32(subnormal, vdupq_n_s32(253), vdupq_n_s32(127));
     let power = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(ki, bias)));
     let y = vmulq_f32(p, power);
-    let y = vbslq_f32(subnormal, vmulq_n_f32(y, f32::MIN_POSITIVE), y);
+    // Select the scale BEFORE multiplying: ordinary lanes must not execute
+    // a discarded underflowing multiply. The compile-time false control is
+    // instantiated only in tests to retain the initial NEON mechanism.
+    let y = if NEUTRAL_SCALE {
+        let scale = vbslq_f32(subnormal, vdupq_n_f32(f32::MIN_POSITIVE), one);
+        vmulq_f32(y, scale)
+    } else {
+        vbslq_f32(subnormal, vmulq_n_f32(y, f32::MIN_POSITIVE), y)
+    };
     let y = vbslq_f32(underflow, zero, y);
     let quiet = vreinterpretq_f32_u32(vorrq_u32(
         vreinterpretq_u32_f32(x),
@@ -55,7 +63,8 @@ unsafe fn exp4(x: float32x4_t) -> float32x4_t {
 /// NEON must be available; src/dst cover d f32 elements and are identical or
 /// disjoint. Each vector load precedes its corresponding destination store.
 #[target_feature(enable = "neon")]
-pub(super) unsafe fn softmax_row(src: *const f32, dst: *mut f32, d: usize) {
+#[inline]
+unsafe fn softmax_row_impl<const NEUTRAL_SCALE: bool>(src: *const f32, dst: *mut f32, d: usize) {
     #[cfg(test)]
     SOFTMAX_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: all complete-vector and scalar accesses are bounded by d.
@@ -81,7 +90,7 @@ pub(super) unsafe fn softmax_row(src: *const f32, dst: *mut f32, d: usize) {
         let mut sums = vdupq_n_f32(0.0);
         i = 0;
         while i + 4 <= d {
-            let e = exp4(vsubq_f32(vld1q_f32(src.add(i)), vmax));
+            let e = exp4::<NEUTRAL_SCALE>(vsubq_f32(vld1q_f32(src.add(i)), vmax));
             vst1q_f32(dst.add(i), e);
             sums = vaddq_f32(sums, e);
             i += 4;
@@ -104,6 +113,20 @@ pub(super) unsafe fn softmax_row(src: *const f32, dst: *mut f32, d: usize) {
             *dst.add(i) *= inverse;
             i += 1;
         }
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn softmax_row(src: *const f32, dst: *mut f32, d: usize) {
+    // SAFETY: forward the caller's NEON and identical/disjoint row contract.
+    unsafe { softmax_row_impl::<true>(src, dst, d) };
+}
+
+#[cfg(all(test, feature = "mlas"))]
+fn initial_neon(src: &[f32], dst: &mut [f32], _n: usize, d: usize) {
+    for (input, output) in src.chunks(d).zip(dst.chunks_mut(d)) {
+        // SAFETY: NEON test host; disjoint equal-length complete rows.
+        unsafe { softmax_row_impl::<false>(input.as_ptr(), output.as_mut_ptr(), d) };
     }
 }
 
@@ -152,7 +175,21 @@ mod tests {
             });
             let mut output = [0.0; 4];
             // SAFETY: AArch64 NEON host, four initialized input/output lanes.
-            unsafe { vst1q_f32(output.as_mut_ptr(), exp4(vld1q_f32(input.as_ptr()))) };
+            unsafe { vst1q_f32(output.as_mut_ptr(), exp4::<true>(vld1q_f32(input.as_ptr()))) };
+            let mut initial = [0.0; 4];
+            // SAFETY: same four-lane contract, exact initial NEON control.
+            unsafe {
+                vst1q_f32(
+                    initial.as_mut_ptr(),
+                    exp4::<false>(vld1q_f32(input.as_ptr())),
+                )
+            };
+            assert!(
+                initial
+                    .iter()
+                    .zip(&output)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
             for (x, y) in input.into_iter().zip(output) {
                 let expected = f64::from(x).exp() as f32;
                 assert!(y >= 0.0 && y.is_finite());
@@ -182,7 +219,7 @@ mod tests {
                 input[lane] = value;
                 let mut output = [0.0; 4];
                 // SAFETY: equal initialized vectors on the NEON host.
-                unsafe { vst1q_f32(output.as_mut_ptr(), exp4(vld1q_f32(input.as_ptr()))) };
+                unsafe { vst1q_f32(output.as_mut_ptr(), exp4::<true>(vld1q_f32(input.as_ptr()))) };
                 if value.is_nan() {
                     assert_eq!(output[lane].to_bits(), value.to_bits() | 0x0040_0000);
                 } else if value == 0.0 {
@@ -336,13 +373,19 @@ mod tests {
         let arg = |name: &str, fallback| {
             std::env::var(name)
                 .map_or(Ok(fallback), |v| v.parse::<usize>())
-                .unwrap()
+                .unwrap_or_else(|error| panic!("{name} must be an unsigned integer: {error}"))
         };
         let width = arg("NXRT_SOFTMAX_BENCH_WIDTH", 1);
         let reps = arg("NXRT_SOFTMAX_BENCH_REPS", 21);
         let order = arg("NXRT_SOFTMAX_BENCH_ORDER", 0);
-        assert!([1, 4, 8].contains(&width));
-        assert!((1..=101).contains(&reps));
+        assert!(
+            [1, 4, 8].contains(&width),
+            "NXRT_SOFTMAX_BENCH_WIDTH must be 1, 4 or 8; got {width}"
+        );
+        assert!(
+            (1..=101).contains(&reps),
+            "NXRT_SOFTMAX_BENCH_REPS must be 1..101; got {reps}"
+        );
         crate::task_runtime::set_task_thread_budget(Some(width)).unwrap();
         assert_eq!(crate::task_runtime::width(), width);
         assert!(rayon::current_thread_index().is_none() && !crate::task_runtime::in_task());
@@ -372,6 +415,7 @@ mod tests {
                         0 => scalar_before,
                         1 | 2 => super::super::softmax_rows_serial_out_native,
                         3 => mlas_sys::compute_softmax,
+                        4 => initial_neon,
                         _ => unreachable!(),
                     };
                     if serial {
@@ -380,7 +424,7 @@ mod tests {
                         super::super::softmax_rows_with_kernel(input, out, n, d, kernel);
                     }
                 };
-                for arm in 0..4 {
+                for arm in 0..5 {
                     let before = crate::task_runtime::testing::counters();
                     run(arm, &mut output);
                     let after = crate::task_runtime::testing::counters();
@@ -422,8 +466,8 @@ mod tests {
                     }
                 }
                 for rep in 0..reps {
-                    for turn in 0..4 {
-                        let arm = (rep + turn + order) % 4;
+                    for turn in 0..5 {
+                        let arm = (rep + turn + order) % 5;
                         let start = Instant::now();
                         for _ in 0..iters {
                             run(arm, &mut output);

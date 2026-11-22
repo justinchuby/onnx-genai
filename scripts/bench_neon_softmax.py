@@ -30,7 +30,9 @@ FIELDS = [
     "wall_ns",
     "checksum",
 ]
-ARMS = {"0": "scalar_before", "1": "native", "2": "native_aa", "3": "mlas"}
+BASE_ARMS = {"0": "scalar_before", "1": "native", "2": "native_aa", "3": "mlas"}
+ARM_SCHEMAS = {1: BASE_ARMS, 2: BASE_ARMS | {"4": "neon_initial_before"}}
+
 LOCK = Path("/tmp/onnx-genai-hostlock-darwin.flock")
 
 
@@ -44,8 +46,12 @@ def sha(data):
 
 
 def analyze(raw, metadata):
+    schema = metadata["schema"]
+    require(schema in ARM_SCHEMAS, "unsupported diagnostic schema")
+    arm_labels = ARM_SCHEMAS[schema]
+    arm_count = len(arm_labels)
     require(
-        metadata["schema"] == 1 and metadata["arms"] == ARMS,
+        metadata["arms"] == arm_labels,
         "explicit diagnostic schema/arms differ",
     )
     require(sha(raw) == metadata["raw_sha256"], "raw CSV checksum differs")
@@ -92,7 +98,7 @@ def analyze(raw, metadata):
                 and axis in axes
                 and key not in checks
                 and width == receipt["width"]
-                and arm in range(4),
+                and arm in range(arm_count),
                 "duplicate or unexpected validation identity",
             )
             require(
@@ -112,7 +118,7 @@ def analyze(raw, metadata):
             )
             checks.add(key)
     require(
-        checks == {(*axis, a) for axis in axes for a in range(4)},
+        checks == {(*axis, a) for axis in axes for a in range(arm_count)},
         "missing full-buffer validation",
     )
     for n, d in SHAPES:
@@ -129,7 +135,7 @@ def analyze(raw, metadata):
             axis in axes
             and key not in seen
             and 0 <= row["rep"] < reps
-            and row["arm"] in range(4),
+            and row["arm"] in range(arm_count),
             "duplicate or unexpected sample identity",
         )
         require(
@@ -142,12 +148,18 @@ def analyze(raw, metadata):
             tokens.setdefault(token_key, row["checksum"]) == row["checksum"],
             "sample output tokens change",
         )
-        groups.setdefault(axis, {a: [] for a in range(4)})[row["arm"]].append(
+        groups.setdefault(axis, {a: [] for a in range(arm_count)})[row["arm"]].append(
             row["wall_ns"] / row["iters"]
         )
         seen.add(key)
     require(
-        seen == {(*axis, r, a) for axis in axes for r in range(reps) for a in range(4)},
+        seen
+        == {
+            (*axis, r, a)
+            for axis in axes
+            for r in range(reps)
+            for a in range(arm_count)
+        },
         "incomplete sample matrix",
     )
     cells = []
@@ -168,9 +180,22 @@ def analyze(raw, metadata):
         require(
             tokens[(n, d, 1)] == tokens[(n, d, 2)], "native A/A sample tokens differ"
         )
+    if schema == 2:
+        for cell in cells:
+            cell["initial_neon_over_native"] = (
+                cell["median_wall_ns"]["4"] / cell["median_wall_ns"]["1"]
+            )
+        for n, d in SHAPES:
+            require(
+                hashes[(n, d, 4)] == hashes[(n, d, 1)],
+                "initial/new NEON full hashes differ",
+            )
+            require(
+                tokens[(n, d, 4)] == tokens[(n, d, 1)], "initial/new NEON tokens differ"
+            )
     return {
-        "schema": 1,
-        "arms": ARMS,
+        "schema": schema,
+        "arms": arm_labels,
         "samples": len(seen),
         "validations": len(checks),
         "cells": cells,
@@ -240,8 +265,8 @@ def run(directory, binary, cargo_receipt, reps, sweeps):
         "freeze the entire checkout before measuring; commit or move pending source/artifact files",
     )
     metadata = {
-        "schema": 1,
-        "arms": ARMS,
+        "schema": 2,
+        "arms": ARM_SCHEMAS[2],
         "repetitions": reps,
         "sweeps": sweeps,
         "binary_sha256": sha(binary.read_bytes()),
