@@ -1547,8 +1547,10 @@ fn requantize_byte(accumulated: i32, scale: f32, zero: i32, dtype: DataType) -> 
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
-static QLINEAR_REQUANT_NEON_TEST_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    // Separate calling-thread witnesses for shared and per-row scale routes.
+    static QLINEAR_REQUANT_NEON_TEST_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
 
 /// Convert eight lanes at a time, returning the prefix length written. Tail
 /// elements use the same scalar contract on every target. No padding is read.
@@ -1558,9 +1560,11 @@ static QLINEAR_REQUANT_NEON_TEST_HITS: std::sync::atomic::AtomicUsize =
 /// must lie in the output dtype's range. The caller validates those properties.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn requantize_neon_prefix(
+unsafe fn requantize_neon_prefix<const RESCALE: bool>(
     accumulators: &[i32],
     scales: &[f32],
+    a_scale: f32,
+    y_scale: f32,
     zero: i32,
     signed: bool,
     bytes: &mut [u8],
@@ -1577,9 +1581,15 @@ unsafe fn requantize_neon_prefix(
         // of equal length; NEON is enabled by this function's contract.
         unsafe {
             let convert = |at: usize| {
+                let mut scale = vld1q_f32(scales.as_ptr().add(at));
+                if RESCALE {
+                    // Preserve the scalar association and both f32 rounding
+                    // steps. A reciprocal or reassociation changes output ties.
+                    scale = vdivq_f32(vmulq_f32(vdupq_n_f32(a_scale), scale), vdupq_n_f32(y_scale));
+                }
                 let values = vmulq_f32(
                     vcvtq_f32_s32(vld1q_s32(accumulators.as_ptr().add(at))),
-                    vld1q_f32(scales.as_ptr().add(at)),
+                    scale,
                 );
                 // Match Rust's NaN -> 0 conversion before clipping; propagating
                 // NaN through a platform min/max is not a portable substitute.
@@ -1615,10 +1625,53 @@ fn requantize_portable_row(
     }
 }
 
+#[inline]
+fn requantize_per_row_portable_row(
+    accumulators: &[i32],
+    b_scales: &[f32],
+    a_scale: f32,
+    y_scale: f32,
+    zero: i32,
+    dtype: DataType,
+    bytes: &mut [u8],
+) {
+    for ((&accumulated, &b_scale), byte) in accumulators.iter().zip(b_scales).zip(bytes) {
+        *byte = requantize_byte(accumulated, a_scale * b_scale / y_scale, zero, dtype);
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
+#[inline]
 fn requantize_neon_row(
     accumulators: &[i32],
     scales: &[f32],
+    zero: i32,
+    dtype: DataType,
+    bytes: &mut [u8],
+) {
+    requantize_neon_row_impl::<false>(accumulators, scales, 1.0, 1.0, zero, dtype, bytes);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn requantize_per_row_neon_row(
+    accumulators: &[i32],
+    b_scales: &[f32],
+    a_scale: f32,
+    y_scale: f32,
+    zero: i32,
+    dtype: DataType,
+    bytes: &mut [u8],
+) {
+    requantize_neon_row_impl::<true>(accumulators, b_scales, a_scale, y_scale, zero, dtype, bytes);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn requantize_neon_row_impl<const RESCALE: bool>(
+    accumulators: &[i32],
+    scales: &[f32],
+    a_scale: f32,
+    y_scale: f32,
     zero: i32,
     dtype: DataType,
     bytes: &mut [u8],
@@ -1635,19 +1688,45 @@ fn requantize_neon_row(
             // establish every precondition; ordinary ONNX zero points satisfy
             // the range check by their i8/u8 dtype.
             start = unsafe {
-                requantize_neon_prefix(accumulators, scales, zero, dtype == DataType::Int8, bytes)
+                requantize_neon_prefix::<RESCALE>(
+                    accumulators,
+                    scales,
+                    a_scale,
+                    y_scale,
+                    zero,
+                    dtype == DataType::Int8,
+                    bytes,
+                )
             };
             #[cfg(test)]
-            QLINEAR_REQUANT_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if start > 0 {
+                QLINEAR_REQUANT_NEON_TEST_HITS.with(|hits| {
+                    let mut counts = hits.get();
+                    counts[RESCALE as usize] += 1;
+                    hits.set(counts);
+                });
+            }
         }
     }
-    requantize_portable_row(
-        &accumulators[start..],
-        &scales[start..],
-        zero,
-        dtype,
-        &mut bytes[start..],
-    );
+    if RESCALE {
+        requantize_per_row_portable_row(
+            &accumulators[start..],
+            &scales[start..],
+            a_scale,
+            y_scale,
+            zero,
+            dtype,
+            &mut bytes[start..],
+        );
+    } else {
+        requantize_portable_row(
+            &accumulators[start..],
+            &scales[start..],
+            zero,
+            dtype,
+            &mut bytes[start..],
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1720,17 +1799,34 @@ fn requantize_rows(
                 requantize_portable_row(acc, &scales, y_zero_point, dtype, out);
             });
         }
-        None => apply_requantization_rows(products, destination, n, |row, acc, out| {
-            let a_scale = a_quant.at(a_batch, row).0;
-            for ((&accumulated, &b_scale), byte) in acc.iter().zip(b_scales).zip(out) {
-                *byte = requantize_byte(
-                    accumulated,
-                    a_scale * b_scale / y_scale,
+        None => {
+            #[cfg(target_arch = "aarch64")]
+            if n >= 8 {
+                apply_requantization_rows(products, destination, n, |row, acc, out| {
+                    requantize_per_row_neon_row(
+                        acc,
+                        b_scales,
+                        a_quant.at(a_batch, row).0,
+                        y_scale,
+                        y_zero_point,
+                        dtype,
+                        out,
+                    );
+                });
+                return Ok(());
+            }
+            apply_requantization_rows(products, destination, n, |row, acc, out| {
+                requantize_per_row_portable_row(
+                    acc,
+                    b_scales,
+                    a_quant.at(a_batch, row).0,
+                    y_scale,
                     y_zero_point,
                     dtype,
+                    out,
                 );
-            }
-        }),
+            });
+        }
     }
     Ok(())
 }
@@ -2025,11 +2121,10 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn shared_requantization_reaches_neon_for_native_rows() {
-        use std::sync::atomic::Ordering;
         if !std::arch::is_aarch64_feature_detected!("neon") {
             return;
         }
-        let before = QLINEAR_REQUANT_NEON_TEST_HITS.load(Ordering::Relaxed);
+        let before = QLINEAR_REQUANT_NEON_TEST_HITS.with(|hits| hits.get()[0]);
         let a_quant = QuantParams {
             scales: vec![0.5],
             zero_points: vec![0],
@@ -2050,7 +2145,292 @@ mod tests {
         )
         .unwrap();
         assert_eq!(actual, [2; 17]);
-        assert!(QLINEAR_REQUANT_NEON_TEST_HITS.load(Ordering::Relaxed) > before);
+        assert!(QLINEAR_REQUANT_NEON_TEST_HITS.with(|hits| hits.get()[0]) > before);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn per_row_requantization_reaches_neon_with_exact_tail_outputs() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let before = QLINEAR_REQUANT_NEON_TEST_HITS.with(|hits| hits.get()[1]);
+        let a_quant = QuantParams {
+            scales: vec![0.5, 2., 0.25],
+            zero_points: vec![0; 3],
+            axis_len: 3,
+            per_axis: true,
+        };
+        let mut backing = [0xa5; 53];
+        requantize_rows(
+            &[3; 51],
+            &a_quant,
+            0,
+            &[1.; 17],
+            17,
+            1.,
+            127,
+            DataType::Uint8,
+            &mut backing[1..52],
+        )
+        .unwrap();
+        assert_eq!((backing[0], backing[52]), (0xa5, 0xa5));
+        for (row, value) in [129u8, 133, 128].into_iter().enumerate() {
+            assert!(
+                backing[1 + row * 17..1 + (row + 1) * 17]
+                    .iter()
+                    .all(|&byte| byte == value)
+            );
+        }
+        assert!(
+            QLINEAR_REQUANT_NEON_TEST_HITS.with(|hits| hits.get()[1]) > before,
+            "native per-row scales must execute a vector block, not just the scalar loop"
+        );
+    }
+
+    #[test]
+    fn per_row_requantization_matches_scalar_for_tails_and_nonfinite_scales() {
+        let values = [
+            i32::MIN,
+            i32::MAX,
+            -16_777_217,
+            16_777_217,
+            -511,
+            511,
+            -5,
+            -3,
+            -1,
+            0,
+            1,
+            3,
+            5,
+            127,
+            255,
+        ];
+        let factors = [
+            0.,
+            -0.,
+            0.5,
+            -0.5,
+            1.5,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(0x7fa0_0001),
+        ];
+        for n in (0..=33).chain([65, 257]) {
+            let acc: Vec<_> = (0..n + 2).map(|i| values[i % values.len()]).collect();
+            for shift in 0..factors.len() {
+                let columns: Vec<_> = (0..n + 2)
+                    .map(|i| factors[(i + shift) % factors.len()])
+                    .collect();
+                for a_scale in [
+                    0.,
+                    -0.,
+                    0.003125,
+                    1.5,
+                    f32::MIN_POSITIVE,
+                    f32::MAX,
+                    f32::INFINITY,
+                    f32::NAN,
+                ] {
+                    for y_scale in [
+                        1.,
+                        0.0625,
+                        0.,
+                        -0.,
+                        f32::MIN_POSITIVE,
+                        f32::from_bits(1),
+                        f32::MAX,
+                        f32::INFINITY,
+                        f32::NAN,
+                    ] {
+                        for (dtype, zeros) in [
+                            (DataType::Int8, [-128, -1, 0, 127]),
+                            (DataType::Uint8, [0, 1, 128, 255]),
+                        ] {
+                            for zero in zeros.into_iter().chain([i32::MIN, i32::MAX]) {
+                                let mut out = vec![0xa5; n + 2];
+                                #[cfg(target_arch = "aarch64")]
+                                requantize_per_row_neon_row(
+                                    &acc[1..n + 1],
+                                    &columns[1..n + 1],
+                                    a_scale,
+                                    y_scale,
+                                    zero,
+                                    dtype,
+                                    &mut out[1..n + 1],
+                                );
+                                #[cfg(not(target_arch = "aarch64"))]
+                                requantize_per_row_portable_row(
+                                    &acc[1..n + 1],
+                                    &columns[1..n + 1],
+                                    a_scale,
+                                    y_scale,
+                                    zero,
+                                    dtype,
+                                    &mut out[1..n + 1],
+                                );
+                                assert_eq!((out[0], out[n + 1]), (0xa5, 0xa5));
+                                for i in 0..n {
+                                    let expected = requantization_oracle(
+                                        acc[i + 1],
+                                        a_scale * columns[i + 1] / y_scale,
+                                        zero,
+                                        dtype,
+                                    );
+                                    assert_eq!(
+                                        out[i + 1],
+                                        expected,
+                                        "n={n} i={i} a={a_scale:?} y={y_scale:?} zero={zero} dtype={dtype:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn per_row_requantization_preserves_scale_association_at_rounding_boundaries() {
+        for (a_bits, b_bits, y_bits, acc) in [
+            (1080352412, 1168457022, 1329431408, 10677323),
+            (1153449446, 982523135, 1221068150, 15383253),
+        ] {
+            let a = f32::from_bits(a_bits);
+            let b = f32::from_bits(b_bits);
+            let y = f32::from_bits(y_bits);
+            let expected = requantization_oracle(acc, a * b / y, 0, DataType::Uint8);
+            assert_eq!(expected, 63);
+            if acc == 10677323 {
+                assert_eq!(
+                    requantization_oracle(acc, (a * b) * (1. / y), 0, DataType::Uint8),
+                    64,
+                    "reciprocal control must distinguish the output"
+                );
+                assert_eq!(
+                    (((acc as f32 * a) * b / y).round_ties_even() as i64).clamp(0, 255),
+                    64,
+                    "accumulator-first control must distinguish the output"
+                );
+            } else {
+                assert_eq!(
+                    requantization_oracle(acc, a * (b / y), 0, DataType::Uint8),
+                    64,
+                    "reassociation control must distinguish the output"
+                );
+            }
+            let mut out = [0; 17];
+            #[cfg(target_arch = "aarch64")]
+            requantize_per_row_neon_row(&[acc; 17], &[b; 17], a, y, 0, DataType::Uint8, &mut out);
+            #[cfg(not(target_arch = "aarch64"))]
+            requantize_per_row_portable_row(
+                &[acc; 17],
+                &[b; 17],
+                a,
+                y,
+                0,
+                DataType::Uint8,
+                &mut out,
+            );
+            assert_eq!(out, [expected; 17]);
+        }
+    }
+
+    /// Direct synchronous row epilogue comparison; no GEMM/model/pool claim.
+    /// Retain every rotating portable/native-A/native-B sample and its output
+    /// checksum. Test-only TLS witness bookkeeping is included in native arms.
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    #[ignore = "manual per-row epilogue diagnostic; run under the host lock"]
+    fn bench_per_row_requantization_neon_ab() {
+        fn cpu_seconds() -> f64 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            // SAFETY: getrusage initializes the writable object on success.
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: successful getrusage initialized usage.
+            let usage = unsafe { usage.assume_init() };
+            (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
+                + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 * 1e-6
+        }
+        use std::hint::black_box;
+        use std::time::Instant;
+        assert!(std::arch::is_aarch64_feature_detected!("neon"));
+        for n in [7, 8, 9, 17, 65, 257, 2048] {
+            for dtype in [DataType::Int8, DataType::Uint8] {
+                let acc: Vec<_> = (0..n)
+                    .map(|i| (i as i32 * 7919) % 65_537 - 32_768)
+                    .collect();
+                let scales: Vec<_> = (0..n).map(|i| (i % 7 + 1) as f32 / 4096.).collect();
+                let zero = if dtype == DataType::Int8 { -7 } else { 137 };
+                let (a, y) = (0.375, 0.625);
+                let expected: Vec<_> = acc
+                    .iter()
+                    .zip(&scales)
+                    .map(|(&v, &b)| requantization_oracle(v, a * b / y, zero, dtype))
+                    .collect();
+                assert!(
+                    expected.windows(2).any(|pair| pair[0] != pair[1]),
+                    "the fixture must not collapse to one clamped byte"
+                );
+                let checksum = expected.iter().fold(0xcbf29ce484222325u64, |hash, &value| {
+                    (hash ^ u64::from(value)).wrapping_mul(0x100000001b3)
+                });
+                let mut buffers = [vec![0; n], vec![0; n], vec![0; n]];
+                let iterations = (2_000_000 / n).max(1);
+                let before = QLINEAR_REQUANT_NEON_TEST_HITS.with(|hits| hits.get()[1]);
+                for repetition in 0..21 {
+                    for offset in 0..3 {
+                        let arm = (repetition + offset) % 3;
+                        let kernel = if arm == 0 || n < 8 {
+                            requantize_per_row_portable_row
+                        } else {
+                            requantize_per_row_neon_row
+                        };
+                        let run = |out: &mut [u8]| {
+                            kernel(
+                                black_box(&acc),
+                                black_box(&scales),
+                                black_box(a),
+                                black_box(y),
+                                zero,
+                                dtype,
+                                out,
+                            )
+                        };
+                        run(&mut buffers[arm]);
+                        assert_eq!(buffers[arm], expected);
+                        let cpu = cpu_seconds();
+                        let wall = Instant::now();
+                        for _ in 0..iterations {
+                            run(black_box(&mut buffers[arm]));
+                        }
+                        let wall_ns = wall.elapsed().as_nanos();
+                        let cpu_ns = (cpu_seconds() - cpu) * 1e9;
+                        assert!(wall_ns > 0 && cpu_ns > 0.);
+                        assert_eq!(buffers[arm], expected);
+                        println!(
+                            "QRE_SAMPLE,1,{n},{dtype:?},{repetition},{arm},{iterations},{cpu_ns:.0},{wall_ns},{checksum}"
+                        );
+                    }
+                }
+                let hits = QLINEAR_REQUANT_NEON_TEST_HITS.with(|counts| counts.get()[1]) - before;
+                assert_eq!(
+                    hits > 0,
+                    n >= 8,
+                    "the selected native arm must actually execute vectors"
+                );
+                println!("QRE_WITNESS,1,{n},{dtype:?},{hits}");
+            }
+        }
     }
 
     /// Same-process row epilogue diagnostic, not a GEMM or end-to-end claim.
