@@ -4947,8 +4947,8 @@ fn mlas_sqnbit_packed_b_cache_bytes(
 /// estimate; zero does not imply a zero-copy execution. MLAS packs share the
 /// `MLAS_PACKED_DECODE_INSTANTIATIONS` count. F32 NK cache entries share the
 /// executor node's immutable state across shape variants; policy/physical
-/// refusal may retain none. Active evicted payloads keep their own Host grants,
-/// not this estimate, authorize their actual live bytes.
+/// refusal may retain none. Active evicted payloads keep their own Host grants.
+/// Those grants, not this estimate, authorize their actual live bytes.
 #[allow(clippy::too_many_arguments)]
 pub fn planned_nbits_node_retained_bytes(
     bits: usize,

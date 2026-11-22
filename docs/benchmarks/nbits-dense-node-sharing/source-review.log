@@ -1,0 +1,6 @@
+Baseline: 32f603670b893b0d8db27547ce73b96085b9f700
+Validated implementation source SHA256: 4a8520e53de471b4a2dc084a7d380176396deee29ddfc2d23acd3b6c1250a5b9
+UNCHANGED: execute/capability hooks (normalize Rustdoc, whitespace and optional trailing commas)
+UNCHANGED: preparation/numerical/planner implementation (normalize Rustdoc, whitespace and optional trailing commas)
+UNCHANGED: dense_weight_cache.rs
+Publication delta: one Rustdoc sentence only; restoring that exact sentence matches the validated implementation source byte-for-byte.

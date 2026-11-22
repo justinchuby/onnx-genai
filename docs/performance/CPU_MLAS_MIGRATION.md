@@ -903,7 +903,12 @@ exact immutable grant source; separate nodes/sessions keep separate state.
 The active-reader and idle-pressure lifetimes remain unchanged. The
 [host regression](../benchmarks/NBITS_NODE_PACK_SHARING.md) checks a real
 executor, all eight native layout slots and independent concurrent builders.
-Dense f32 caches and the MLAS research memo/store owners remain separate work.
+F32 NK expansions now share that node state too, including the existing dense
+cache and its cold-fill gate. Adoption additionally requires the same immutable
+dense-byte limit, so a disabled or smaller retention policy cannot inherit a
+larger cache. The [dense ownership regression](../benchmarks/NBITS_DENSE_NODE_SHARING.md)
+checks three actual executor shape variants, session isolation, pressure and
+concurrent builders. The MLAS research memo/store owners remain separate work.
 
 ## Reference reachability and numerical comparisons
 

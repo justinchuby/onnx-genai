@@ -701,3 +701,25 @@ shape variants, output bytes, session isolation, all eight slot lifetimes and
 concurrent cold builders. This is a node ownership change, not a throughput or
 GPU execution result. Other scratch/activation accounting, physical capacity
 relationships and CUDA asynchronous validation remain open.
+
+
+### NBits dense expansions share node ownership
+
+The NBits constant-state payload now carries its f32 NK cache as well as the
+native compact layout slots. Its existing cache object owns the cold-fill gate,
+pressure enrollment, payloads and grants; sharing an `Arc` to that object
+removes shape-local duplication without creating a second cache authority.
+The immutable dense-byte retention limit is part of the same resolved sharing
+parameters. A different limit, including disabled retention, cannot adopt a
+foreign policy even when the grant source and preparation attributes match.
+
+[Host validation](../benchmarks/NBITS_DENSE_NODE_SHARING.md) uses a real
+unknown-rank ONNX input to exercise vector, matrix and batched-vector shapes on
+every backend without assuming transposed-B GEMM support. Complete outputs and
+Host ledger charges distinguish one retained expansion from duplicate copies.
+Factory-level tests cover a warm state exported after filling, producer teardown,
+active readers, idle reclaim/rebuild and concurrent distinct cold builders under
+a single-payload quota. Mutable group indices and zero retention keep execution
+transient, with fresh numerical outputs and no retained charge. Dense arithmetic,
+placement, decoding, compact formats and optional MLAS memo/store policy remain
+unchanged. No memory prediction substitutes for live payload grants.
