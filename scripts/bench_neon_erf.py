@@ -32,6 +32,19 @@ FIELDS = [
 ]
 LOCK = Path("/tmp/onnx-genai-hostlock-darwin.flock")
 
+# Historical result formats are explicit measurement schemas, not runtime API
+# aliases. Never infer an arm's meaning from its position or row count.
+ARM_SCHEMAS = {
+    1: {"0": "scalar_before", "1": "native", "2": "native_aa", "3": "mlas"},
+    2: {
+        "0": "scalar_before",
+        "1": "native",
+        "2": "native_aa",
+        "3": "mlas",
+        "4": "neon_guarded_before",
+    },
+}
+
 
 def require(value, message):
     if not value:
@@ -43,7 +56,14 @@ def sha(data):
 
 
 def analyze(raw, metadata):
-    require(metadata["schema"] == 1, "unsupported diagnostic schema")
+    schema = metadata["schema"]
+    require(schema in ARM_SCHEMAS, "unsupported diagnostic schema")
+    arm_labels = ARM_SCHEMAS[schema]
+    arm_count = len(arm_labels)
+    if schema == 2:
+        require(
+            metadata["arms"] == arm_labels, "explicit arm identities differ from schema"
+        )
     require(sha(raw) == metadata["raw_sha256"], "raw CSV checksum differs")
     reps, sweeps = metadata["repetitions"], metadata["sweeps"]
     require(1 <= reps <= 101 and 1 <= sweeps <= 9, "invalid repetition/sweep limits")
@@ -69,6 +89,14 @@ def analyze(raw, metadata):
     )
     checks, hashes = set(), {}
     for receipt in receipts:
+        if schema == 2:
+            modes = receipt["fpcr"]
+            require(
+                len(modes) == 2
+                and modes[0] == modes[1]
+                and modes[0] & ((1 << 1) | (3 << 22) | (1 << 24) | (1 << 25)) == 0,
+                "FPCR proof/measurement mode differs from standard IEEE mode",
+            )
         for line in receipt["validations"]:
             prefix, width, mode, op, n, arm, digest, error, dispatched, worker_tasks = (
                 line.split(",")
@@ -86,7 +114,7 @@ def analyze(raw, metadata):
                 and key not in checks
                 and key[:-1] in axes
                 and width == receipt["width"]
-                and arm in range(4),
+                and arm in range(arm_count),
                 "invalid validation identity",
             )
             require(
@@ -108,7 +136,7 @@ def analyze(raw, metadata):
             )
             checks.add(key)
     require(
-        checks == {(*axis, arm) for axis in axes for arm in range(4)},
+        checks == {(*axis, arm) for axis in axes for arm in range(arm_count)},
         "missing full-buffer validation",
     )
     for op, n in itertools.product(("erf", "gelu"), LENGTHS):
@@ -128,7 +156,7 @@ def analyze(raw, metadata):
             axis in axes
             and key not in seen
             and 0 <= row["rep"] < reps
-            and row["arm"] in range(4),
+            and row["arm"] in range(arm_count),
             "duplicate or unexpected sample identity",
         )
         require(
@@ -142,16 +170,16 @@ def analyze(raw, metadata):
             "sample output token differs across repetitions",
         )
         seen.add(key)
-        groups.setdefault(axis, {arm: [] for arm in range(4)})[row["arm"]].append(
-            row["wall_ns"] / row["iters"]
-        )
+        groups.setdefault(axis, {arm: [] for arm in range(arm_count)})[
+            row["arm"]
+        ].append(row["wall_ns"] / row["iters"])
     require(
         seen
         == {
             (*axis, rep, arm)
             for axis in axes
             for rep in range(reps)
-            for arm in range(4)
+            for arm in range(arm_count)
         },
         "incomplete sample matrix",
     )
@@ -169,15 +197,27 @@ def analyze(raw, metadata):
                 "mlas_over_native": medians["3"] / medians["1"],
             }
         )
+        if schema == 2:
+            cells[-1]["guarded_before_over_native"] = medians["4"] / medians["1"]
     for op, n in itertools.product(("erf", "gelu"), LENGTHS):
         require(
             tokens[(op, n, 1)] == tokens[(op, n, 2)], "native A/A sample tokens differ"
         )
+    if schema == 2:
+        for op, n in itertools.product(("erf", "gelu"), LENGTHS):
+            require(
+                hashes[(op, n, 4)] == hashes[(op, n, 1)],
+                "guarded before/native full output hashes differ",
+            )
+            require(
+                tokens[(op, n, 4)] == tokens[(op, n, 1)],
+                "guarded before/native output tokens differ",
+            )
     return {
-        "schema": 1,
+        "schema": schema,
         "samples": len(seen),
         "validations": len(checks),
-        "arms": {"0": "scalar_before", "1": "native", "2": "native_aa", "3": "mlas"},
+        "arms": arm_labels,
         "cells": cells,
     }
 
@@ -238,7 +278,8 @@ def run(directory, binary, cargo_receipt, reps, sweeps):
         capture_output=True,
     )
     metadata = {
-        "schema": 1,
+        "schema": 2,
+        "arms": ARM_SCHEMAS[2],
         "repetitions": reps,
         "sweeps": sweeps,
         "binary_sha256": sha(binary.read_bytes()),
@@ -295,6 +336,11 @@ def run(directory, binary, cargo_receipt, reps, sweeps):
                     for line in err_path.read_text().splitlines()
                     if line.startswith("NEON_ERF_VALIDATE,")
                 ]
+                fpcr = [
+                    int(line.split(",")[1])
+                    for line in err_path.read_text().splitlines()
+                    if line.startswith("NEON_ERF_FPCR,")
+                ]
                 receipt = {
                     "sweep": sweep,
                     "width": width,
@@ -307,6 +353,7 @@ def run(directory, binary, cargo_receipt, reps, sweeps):
                     "load_after": os.getloadavg(),
                     "command": command,
                     "validations": validations,
+                    "fpcr": fpcr,
                 }
                 metadata["receipts"].append(receipt)
                 (directory / "metadata.json").write_text(

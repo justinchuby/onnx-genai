@@ -10,6 +10,24 @@ static ERF_NEON_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 #[cfg(test)]
 static GELU_NEON_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+fn proof_fpcr() -> u64 {
+    let value: u64;
+    // SAFETY: reading the AArch64 floating-point control register has no side
+    // effects and does not change the caller's floating-point environment.
+    unsafe {
+        std::arch::asm!("mrs {value}, fpcr", value=out(reg) value,
+        options(nomem, nostack, preserves_flags))
+    };
+    // All these polynomials use the standard rounding/subnormal/NaN mode.
+    let changed = value & ((1 << 1) | (3 << 22) | (1 << 24) | (1 << 25));
+    assert_eq!(
+        changed, 0,
+        "NEON proof requires standard IEEE FPCR mode; restore rounding, subnormal and NaN controls (FPCR={value:#x})"
+    );
+    value
+}
+
 /// Arguments are finite and clamped to the shared Erf exp polynomial's band.
 #[inline]
 #[target_feature(enable = "neon")]
@@ -32,14 +50,21 @@ unsafe fn exp_reduced(x: float32x4_t) -> float32x4_t {
 
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn erf_lanes(x: float32x4_t) -> float32x4_t {
-    // Mask NaNs before range reduction. Their result is explicitly quieted
-    // from the original input below, retaining payload/sign on every lane.
+unsafe fn erf_lanes<const EXPLICIT_NAN_REPAIR: bool>(x: float32x4_t) -> float32x4_t {
+    // In the standard IEEE FP mode, FMIN propagates/quietens NaNs (unlike
+    // FMINNM). The small-branch
+    // polynomial keeps that payload, ordered split comparison selects it,
+    // and the final sign OR restores the input sign. Inactive big-branch
+    // lanes are still zeroed before exp range reduction.
+    // The compile-time control retains the previous explicit repair only for
+    // same-binary tests/measurement; production instantiates false exclusively.
     let ordered = vceqq_f32(x, x);
-    let abs = vminq_f32(
-        vabsq_f32(vbslq_f32(ordered, x, vdupq_n_f32(0.0))),
-        vdupq_n_f32(erf_c::UPPER_ABS_RANGE),
-    );
+    let value = if EXPLICIT_NAN_REPAIR {
+        vbslq_f32(ordered, x, vdupq_n_f32(0.0))
+    } else {
+        x
+    };
+    let abs = vminq_f32(vabsq_f32(value), vdupq_n_f32(erf_c::UPPER_ABS_RANGE));
     let sq = vmulq_f32(abs, abs);
     let small = vfmaq_f32(
         vdupq_n_f32(erf_c::SMALL_P1),
@@ -80,14 +105,18 @@ unsafe fn erf_lanes(x: float32x4_t) -> float32x4_t {
     let magnitude = vbslq_f32(split, big, small);
     let sign = vandq_u32(vreinterpretq_u32_f32(x), vdupq_n_u32(0x8000_0000));
     let result = vreinterpretq_f32_u32(vorrq_u32(vreinterpretq_u32_f32(magnitude), sign));
-    vbslq_f32(ordered, result, vaddq_f32(x, x))
+    if EXPLICIT_NAN_REPAIR {
+        vbslq_f32(ordered, result, vaddq_f32(x, x))
+    } else {
+        result
+    }
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn gelu_lanes(x: float32x4_t) -> float32x4_t {
+unsafe fn gelu_lanes<const EXPLICIT_NAN_REPAIR: bool>(x: float32x4_t) -> float32x4_t {
     // SAFETY: caller establishes NEON; every lane is handled by erf_lanes.
-    let e = unsafe { erf_lanes(vmulq_n_f32(x, FRAC_1_SQRT_2_F32)) };
+    let e = unsafe { erf_lanes::<EXPLICIT_NAN_REPAIR>(vmulq_n_f32(x, FRAC_1_SQRT_2_F32)) };
     let y = vmulq_f32(vmulq_n_f32(x, 0.5), vaddq_f32(vdupq_n_f32(1.0), e));
     vbslq_f32(
         vceqq_f32(x, vdupq_n_f32(f32::NEG_INFINITY)),
@@ -135,7 +164,7 @@ pub(super) unsafe fn erf(input: &[f32], output: &mut [f32]) {
     #[cfg(test)]
     ERF_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: caller establishes NEON; map checks lengths and bounds all accesses.
-    unsafe { map(input, output, |x| erf_lanes(x)) };
+    unsafe { map(input, output, |x| erf_lanes::<false>(x)) };
 }
 
 #[target_feature(enable = "neon")]
@@ -143,7 +172,24 @@ pub(super) unsafe fn gelu(input: &[f32], output: &mut [f32]) {
     #[cfg(test)]
     GELU_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: caller establishes NEON; map checks lengths and bounds all accesses.
-    unsafe { map(input, output, |x| gelu_lanes(x)) };
+    unsafe { map(input, output, |x| gelu_lanes::<false>(x)) };
+}
+
+// Kept out of non-test builds. Both controls retain the same hit-counter
+// bookkeeping as the native arm, so it cannot explain their timing difference.
+#[cfg(test)]
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn erf_guarded_before(input: &[f32], output: &mut [f32]) {
+    ERF_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: caller establishes NEON; map bounds every lane and checks lengths.
+    unsafe { map(input, output, |x| erf_lanes::<true>(x)) };
+}
+#[cfg(test)]
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn gelu_guarded_before(input: &[f32], output: &mut [f32]) {
+    GELU_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: same feature, length, and mapper contract as the native arm.
+    unsafe { map(input, output, |x| gelu_lanes::<true>(x)) };
 }
 
 /// Fused bias add and exact GELU, with no full-sized intermediate allocation.
@@ -183,7 +229,7 @@ pub(super) unsafe fn gelu_bias(input: &[f32], bias: &[f32], width: usize, output
                 if phase >= width {
                     phase -= width;
                 }
-                gelu_lanes(vaddq_f32(x, b))
+                gelu_lanes::<false>(vaddq_f32(x, b))
             })
         };
         return;
@@ -197,7 +243,7 @@ pub(super) unsafe fn gelu_bias(input: &[f32], bias: &[f32], width: usize, output
                     vld1q_f32(row.as_ptr().add(i)),
                     vld1q_f32(bias.as_ptr().add(i)),
                 );
-                vst1q_f32(result.as_mut_ptr().add(i), gelu_lanes(x));
+                vst1q_f32(result.as_mut_ptr().add(i), gelu_lanes::<false>(x));
             }
         }
         let tail = row.len() - body;
@@ -210,7 +256,7 @@ pub(super) unsafe fn gelu_bias(input: &[f32], bias: &[f32], width: usize, output
             unsafe {
                 vst1q_f32(
                     x.as_mut_ptr(),
-                    gelu_lanes(vaddq_f32(vld1q_f32(x.as_ptr()), vld1q_f32(b.as_ptr()))),
+                    gelu_lanes::<false>(vaddq_f32(vld1q_f32(x.as_ptr()), vld1q_f32(b.as_ptr()))),
                 )
             };
             result[body..].copy_from_slice(&x[..tail]);
@@ -440,12 +486,125 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn native_neon_nan_propagation_preserves_every_nan_payload_and_sign() {
+        eprintln!("NEON NaN proof FPCR={:#x}", proof_fpcr());
+        const CHUNK: usize = 4096;
+        let mut input = vec![0.0f32; CHUNK];
+        let mut native = vec![0.0f32; CHUNK];
+        let mut before = vec![0.0f32; CHUNK];
+        let mut checked = 0usize;
+        for sign in [0u32, 0x8000_0000] {
+            for start in (1u32..=0x007f_ffff).step_by(CHUNK) {
+                let n = CHUNK.min((0x0080_0000 - start) as usize);
+                for (i, x) in input[..n].iter_mut().enumerate() {
+                    *x = f32::from_bits(sign | 0x7f80_0000 | (start + i as u32));
+                }
+                for op in 0..2 {
+                    // SAFETY: AArch64 test host supports NEON, all slices match.
+                    unsafe {
+                        if op == 0 {
+                            erf(&input[..n], &mut native[..n]);
+                            erf_guarded_before(&input[..n], &mut before[..n]);
+                        } else {
+                            gelu(&input[..n], &mut native[..n]);
+                            gelu_guarded_before(&input[..n], &mut before[..n]);
+                        }
+                    }
+                    for i in 0..n {
+                        let expected = input[i].to_bits() | 0x0040_0000;
+                        assert_eq!(
+                            native[i].to_bits(),
+                            expected,
+                            "op={op}, input={:08x}",
+                            input[i].to_bits()
+                        );
+                        assert_eq!(before[i].to_bits(), expected);
+                    }
+                }
+                checked += n;
+            }
+        }
+        assert_eq!(checked, 2 * 0x007f_ffff);
+    }
+
+    #[test]
+    fn native_neon_nan_guard_removal_keeps_finite_and_tail_bits() {
+        let mut input: Vec<f32> = (0..400_003)
+            .map(|i| -6.0 + 12.0 * i as f32 / 400_002.0)
+            .collect();
+        let mut seed = 0x9812_abcd_u32;
+        for _ in 0..1_000_003 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            input.push(f32::from_bits(seed));
+        }
+        input.extend([
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::MIN,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+        ]);
+        for op in 0..2 {
+            let mut expected = vec![0.0; input.len()];
+            let mut actual = vec![0.0; input.len()];
+            // SAFETY: NEON on this AArch64 host; mapper bounds all lanes.
+            unsafe {
+                if op == 0 {
+                    erf_guarded_before(&input, &mut expected);
+                    erf(&input, &mut actual);
+                } else {
+                    gelu_guarded_before(&input, &mut expected);
+                    gelu(&input, &mut actual);
+                }
+            }
+            assert!(
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "op={op}: before/after output bits differ"
+            );
+            for n in 0..=67 {
+                for offset in 0..4 {
+                    let mut tail = vec![-12345.5; n + 8];
+                    // SAFETY: initialized equal-sized slices, including every tail.
+                    unsafe {
+                        if op == 0 {
+                            erf(&input[offset..offset + n], &mut tail[4..4 + n]);
+                        } else {
+                            gelu(&input[offset..offset + n], &mut tail[4..4 + n]);
+                        }
+                    }
+                    assert!(
+                        tail[4..4 + n]
+                            .iter()
+                            .zip(&expected[offset..offset + n])
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                    );
+                    assert!(
+                        tail[..4]
+                            .iter()
+                            .chain(&tail[4 + n..])
+                            .all(|&x| x == -12345.5)
+                    );
+                }
+            }
+        }
+    }
+
     /// Same-process wall-only comparison. Production uses native; MLAS and the
     /// exact former scalar body are explicit controls, never runtime toggles.
     #[cfg(feature = "mlas")]
     #[test]
     #[ignore = "wall diagnostic; run explicitly under the shared host lock"]
     fn neon_erf_wall_ab() {
+        eprintln!("NEON_ERF_FPCR,{}", proof_fpcr());
         use std::hint::black_box;
         use std::time::Instant;
         let argument = |name: &str, default: usize| {
@@ -501,8 +660,10 @@ mod tests {
                                     (1, 1 | 2) => erf_gelu_f32_slice_native(input, out),
                                     (0, 3) => super::super::erf_f32_slice(input, out),
                                     (1, 3) => super::super::erf_gelu_f32_slice(input, out),
+                                    (0, 4) => super::super::erf_guarded_before_native(input, out),
+                                    (1, 4) => super::super::gelu_guarded_before_native(input, out),
                                     _ => unreachable!(
-                                        "the wall diagnostic has two operations and four arms"
+                                        "the wall diagnostic has two operations and five arms"
                                     ),
                                 }
                             };
@@ -512,7 +673,7 @@ mod tests {
                                 kernel();
                             }
                         };
-                        for arm in 0..4 {
+                        for arm in 0..5 {
                             let before = super::super::PARALLEL_DISPATCHES.with(|c| c.get());
                             let tasks_before = crate::task_runtime::testing::counters();
                             run(arm, &mut output);
@@ -569,8 +730,8 @@ mod tests {
                             }
                         }
                         for rep in 0..reps {
-                            for order in 0..4 {
-                                let arm = (rep + order + order_offset) % 4;
+                            for order in 0..5 {
+                                let arm = (rep + order + order_offset) % 5;
                                 let start = Instant::now();
                                 for _ in 0..iters {
                                     run(arm, &mut output);
@@ -595,5 +756,6 @@ mod tests {
                 }
             }
         }
+        eprintln!("NEON_ERF_FPCR,{}", proof_fpcr());
     }
 }

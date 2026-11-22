@@ -1400,6 +1400,27 @@ pub(crate) fn leaky_relu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32
     }
 }
 
+#[cfg(all(test, feature = "mlas", target_arch = "aarch64"))]
+fn erf_guarded_before_native(input: &[f32], output: &mut [f32]) {
+    dispatch!(
+        input,
+        output,
+        erf_scalar,
+        erf_avx2,
+        neon_erf::erf_guarded_before
+    );
+}
+#[cfg(all(test, feature = "mlas", target_arch = "aarch64"))]
+fn gelu_guarded_before_native(input: &[f32], output: &mut [f32]) {
+    dispatch!(
+        input,
+        output,
+        erf_gelu_scalar,
+        erf_gelu_avx2,
+        neon_erf::gelu_guarded_before
+    );
+}
+
 // Historical ARM64 bodies used only by the same-binary absorption diagnostic.
 // Keep generic scheduler instantiations here: the codegen-locality guard is
 // load-bearing for unrelated activation hot loops.
