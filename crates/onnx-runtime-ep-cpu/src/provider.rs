@@ -317,6 +317,7 @@ impl ExecutionProvider for CpuExecutionProvider {
     fn prepare_static_constants(
         &self,
         node: &Node,
+        constant_inputs: &[bool],
         constants: &[Option<onnx_runtime_ep_api::KernelConstantInput<'_>>],
     ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>> {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -325,16 +326,17 @@ impl ExecutionProvider for CpuExecutionProvider {
                 || (node.domain == "com.microsoft" && node.op_type == "FusedMatMulBias"))
         {
             let mut prepack = crate::kernels::matmul::MatMulPrepack::new(self.resources.clone());
-            prepack.set_constant_inputs(&[false, constants.get(1).is_some_and(Option::is_some)]);
+            prepack.set_constant_inputs(constant_inputs);
             prepack.prepare_constants(constants);
             if prepack.has_prepared_transpose() {
-                return Ok(Some(std::sync::Arc::new(prepack)));
+                return Ok(prepack.shareable_constant_state());
             }
         }
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let _ = (
             self.resources.cache_retention().is_admitted(),
             node,
+            constant_inputs,
             constants,
         );
         Ok(None)

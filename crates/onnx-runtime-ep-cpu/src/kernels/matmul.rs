@@ -5082,18 +5082,24 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn constant_preparation_warms_transpose_only_for_own_admitted_provider() {
+        if retention_control_in_child(
+            "kernels::matmul::tests::constant_preparation_warms_transpose_only_for_own_admitted_provider",
+            None,
+        ) {
+            return;
+        }
         use onnx_runtime_ep_api::{ExecutionProvider, KernelConstantInput};
         use onnx_runtime_ir::NodeId;
         let node = Node::new(NodeId(0), "MatMul", vec![], vec![]);
-        for admitted in [false, true] {
-            let provider = crate::CpuExecutionProvider::with_resources(
-                crate::CpuMemoryResources::default()
-                    .with_cache_retention(crate::CpuCacheRetention::new(admitted)),
-            );
+        for (admitted, constant_a) in [(false, false), (true, false), (true, true)] {
+            let resources = crate::CpuMemoryResources::default()
+                .with_cache_retention(crate::CpuCacheRetention::new(admitted));
+            let provider = crate::CpuExecutionProvider::with_resources(resources.clone());
             let b = Owned::f16(&[5, 7], &[0.25; 35]);
             let state = provider
                 .prepare_static_constants(
                     &node,
+                    &[constant_a, true],
                     &[
                         None,
                         Some(KernelConstantInput {
@@ -5106,8 +5112,22 @@ mod tests {
                 .unwrap();
             assert_eq!(state.is_some(), admitted);
             if let Some(state) = state {
-                let prepack = state.downcast_ref::<MatMulPrepack>().unwrap();
+                let prepack = state.downcast_ref::<SharedMatMulWeights>().unwrap();
                 assert!(prepack.weights.transposed_b_f16.get().is_some());
+                let weights = prepack.weights.clone();
+                let mut runtime = MatMulKernel {
+                    prepack: MatMulPrepack::new(resources),
+                    flops: None,
+                };
+                runtime.set_constant_inputs(&[constant_a, true]);
+                assert!(runtime.adopt_shareable_constant_state(state).unwrap());
+                assert!(Arc::ptr_eq(&runtime.prepack.weights, &weights));
+                let a = Owned::f16(&[1, 5], &[0.5; 5]);
+                let mut out = Owned::zeros_f32(&[1, 7]);
+                runtime
+                    .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                    .unwrap();
+                assert_eq!(out.to_f32(), vec![0.625; 7]);
             }
         }
     }

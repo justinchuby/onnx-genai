@@ -1027,7 +1027,7 @@ impl Drop for Executor {
         // only this executor's owners before freeing their source buffers;
         // clearing the shared store would discard another session's prewarm.
         self.cache.entries.clear();
-        self.static_constant_states.clear();
+        self.cache.static_constant_states.clear();
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {
             if safe_to_release {
