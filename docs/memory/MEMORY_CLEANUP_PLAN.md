@@ -723,3 +723,20 @@ a single-payload quota. Mutable group indices and zero retention keep execution
 transient, with fresh numerical outputs and no retained charge. Dense arithmetic,
 placement, decoding, compact formats and optional MLAS memo/store policy remain
 unchanged. No memory prediction substitutes for live payload grants.
+
+
+### Apple dense prefill reuses NK ownership
+
+The native Apple backend now implements transposed-B GEMM, so dense NBits
+prefill can consume the same granted NK expansion that decode and node shape
+variants already share. Its capability predicate is the existing NT rule,
+not a model-specific gate. The cache ceiling and physical grant continue to
+control retention and admission; the existing fallbacks remain on refusal.
+Actual executor tests cover symbolic prefill/decode row counts and separate
+sessions, and a kernel test checks that warm prefill builds only once.
+
+[Validation](../benchmarks/APPLE_NT_GEMM.md) explicitly records NN/NT floating-point
+reduction differences and f64-oracle error bounds. No token-equivalence, GPU
+behavior or throughput claim follows. The shared BLAS boundary validates buffer
+extents and ABI dimensions before unsafe entry; pure native GEMV keeps usize
+shape extents. Memory placement and grant/reclaim algorithms are unchanged.

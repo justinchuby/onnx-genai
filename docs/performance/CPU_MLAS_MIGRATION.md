@@ -127,9 +127,9 @@ Measured, Linux x86-64, release, 200 M calls:
 
 That is ~2 cycles. The smallest GEMM in our own bench suite (`1×256×256`) takes
 ~17,000 ns, so one recording site is **0.005%** of the cheapest operation it
-observes. There are three sites in total (`matmul::gemm_with_backend`, the
-`dispatch_mlas!` macro in `simd_activations.rs`, and softmax's
-`record_softmax_route`), all per-call rather than per-element.
+observes. Production callers are NN and NT GEMM dispatch, the activation
+routes, and softmax. Each records per invocation rather than per element;
+the source-level guard counts every lazy call and rejects eager recording.
 
 Current plan, condensed. `Native-over-MLAS` means our kernel owns the
 structure — blocking, threading, fusion, special-value handling — and calls MLAS
@@ -989,3 +989,28 @@ Carried forward from [`ABSORBING_MLAS.md`](ABSORBING_MLAS.md), unchanged:
   cannot afford it. A technique that allocates nothing is available everywhere.
 - **A numerical change shipped as a performance change is how a correctness
   regression enters unnoticed.**
+
+
+## Apple transposed-B dense prefill
+
+The Apple native backend now exposes checked Accelerate NT SGEMM, reading
+`B[N,K]` directly through the same NT capability predicate used by x86 and the
+optional MLAS reference. Eligible grouped/dense NBits prefill reuses its granted
+NK expansion across calls and activation shapes instead of rebuilding a KN
+transpose for every prefill. Refusal and zero-retention behavior still follow
+the existing cache, grant and row/KN fallback policies. NN and NT now both record
+through the existing lazy dispatch ledger.
+
+NN and NT may use different floating-point reductions. Equal matrix layouts do
+not establish bit identity, and the old universal bit-identity comments are
+removed. The [Apple NT evidence](../benchmarks/APPLE_NT_GEMM.md) records finite
+f64-oracle bounds, actual NN/NT bit differences, offset/tail cases, a nonfinite
+smoke test and real executor prefill/decode reuse. This is a numerical backend
+extension, not a claim of unchanged model token IDs or measured throughput.
+
+The common NN/NT BLAS boundary validates exact extents, checked products and
+signed 32-bit ABI dimensions, handles zero axes without entering BLAS, and
+returns actionable errors. Its validated operand type also serves GEMV; ABI
+limits are enforced only for BLAS, preserving the native large-GEMV usize
+extent domain. The optional MLAS reference is unchanged and no family is
+thereby graduated.

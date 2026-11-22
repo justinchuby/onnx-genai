@@ -1,0 +1,13 @@
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-ep-cpu)
+    Finished `release` profile [optimized] target(s) in 2m 25s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-a26db3a5d89b84f9)
+
+running 4 tests
+test kernels::matmul::accelerate_gemm::tests::sgemm_layouts_handle_empty_axes_and_nonfinite_values ... ok
+test kernels::matmul::accelerate_gemm::tests::sgemm_matches_reference ... ok
+test kernels::matmul::accelerate_gemm::tests::sgemm_layouts_reject_bad_buffers_and_abi_dimensions_before_writing ... ok
+APPLE_NT_NUMERICS cells=210 outputs=134400 nn_nt_bit_differences=5048 max_nt_abs_error_vs_f64=3.497700199e-6
+test kernels::matmul::accelerate_gemm::tests::sgemm_nt_matches_f64_across_layouts_tails_and_offset_slices ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1981 filtered out; finished in 0.02s
+

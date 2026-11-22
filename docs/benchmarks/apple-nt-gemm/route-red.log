@@ -1,0 +1,21 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 39257, "load_before": [1.669921875, 2.015625, 2.32421875], "command": ["cargo", "test", "--locked", "-p", "onnx-runtime-ep-cpu", "--lib", "kernels::matmul_nbits::tests::apple_dense_prefill_reuses_one_nk_expansion", "--", "--exact", "--nocapture"]}
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-ep-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.45s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-30635267f98d516a)
+
+running 1 test
+
+thread 'kernels::matmul_nbits::tests::apple_dense_prefill_reuses_one_nk_expansion' (5487683) panicked at crates/onnx-runtime-ep-cpu/src/kernels/matmul_nbits.rs:13066:13:
+Apple prefill must use the retained NK expansion rather than rebuilding KN
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test kernels::matmul_nbits::tests::apple_dense_prefill_reuses_one_nk_expansion ... FAILED
+
+failures:
+
+failures:
+    kernels::matmul_nbits::tests::apple_dense_prefill_reuses_one_nk_expansion
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1981 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p onnx-runtime-ep-cpu --lib`
+{"wall_s": 19.302409333002288, "cpu_s": 36.442017, "maxrss_bytes": 2471542784, "load_after": [1.8427734375, 2.0302734375, 2.322265625]}

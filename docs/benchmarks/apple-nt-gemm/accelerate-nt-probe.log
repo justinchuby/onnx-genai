@@ -1,0 +1,3 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 39075, "load_before": [1.88037109375, 2.3583984375, 2.49560546875], "command": ["/tmp/nxrt-accelerate-nt-probe"]}
+{"cells":210,"values":134400,"nn_nt_bit_differences":5046,"max_nt_abs_error_vs_f64":3.4977002e-06}
+{"wall_s": 0.20684645799337886, "cpu_s": 0.022924, "maxrss_bytes": 7667712, "load_after": [1.88037109375, 2.3583984375, 2.49560546875]}
