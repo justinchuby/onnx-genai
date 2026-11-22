@@ -31,6 +31,19 @@ static CONV_NEON_DEPTHWISE_TEST_HITS: std::sync::atomic::AtomicUsize =
 static CONV_SCALAR_REF_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+// Aggregate counters above prove coverage across the process. Exclusion tests
+// need the actual caller's selection, isolated from other concurrent tests.
+#[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppleConvDispatch {
+    Bnns,
+    PointwiseGemm,
+}
+#[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+thread_local! {
+    static APPLE_CONV_LAST_DISPATCH: std::cell::Cell<Option<AppleConvDispatch>> = const { std::cell::Cell::new(None) };
+}
+
 #[derive(Clone, Copy)]
 enum AutoPad {
     NotSet,
@@ -337,6 +350,8 @@ impl Kernel for ConvKernel {
                     )
                 {
                     CONV_BNNS_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(test)]
+                    APPLE_CONV_LAST_DISPATCH.with(|route| route.set(Some(AppleConvDispatch::Bnns)));
                     write_dense_f32_narrow(OP, &mut outputs[0], &result)?;
                     record_conv_metrics(inputs, outputs, self);
                     return Ok(());
@@ -386,6 +401,9 @@ impl Kernel for ConvKernel {
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             if skip_bnns_for_pointwise_1x1(eff_w_shape, eff_out_shape) {
                 CONV_POINTWISE_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                APPLE_CONV_LAST_DISPATCH
+                    .with(|route| route.set(Some(AppleConvDispatch::PointwiseGemm)));
             }
             if self.group == 1 {
                 im2col_gemm_execute(
@@ -1787,8 +1805,7 @@ mod tests {
         // Apple-only: on other platforms there is no BNNS to avoid, so the
         // assertion would be vacuous.
         let before = super::CONV_POINTWISE_GEMM_TEST_HITS.load(Ordering::Relaxed);
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let before_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        super::APPLE_CONV_LAST_DISPATCH.with(|route| route.set(None));
 
         // Shape: [1, 256, 7, 7] × [128, 256, 1, 1]
         // weight_elems = 256*128 = 32768 > 16384 (L1)
@@ -1818,14 +1835,32 @@ mod tests {
             after > before,
             "1×1 pointwise conv at small spatial did not reach the direct GEMM path"
         );
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            let after_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
-            assert_eq!(
-                after_bnns, before_bnns,
-                "1×1 pointwise conv at small spatial incorrectly reached BNNS (should use GEMM)"
+        // Deliberately run a real BNNS convolution on another thread. This
+        // deterministically invalidates a global "BNNS did not increment"
+        // assertion without affecting the caller's actual pointwise selection.
+        std::thread::spawn(|| {
+            let _ = run(
+                &[1, 3, 8, 8],
+                &[1.0; 3 * 8 * 8],
+                &[16, 3, 3, 3],
+                &[0.01; 16 * 3 * 3 * 3],
+                Some(&[0.0; 16]),
+                &[1, 16, 6, 6],
+                &[],
             );
-        }
+            assert_eq!(
+                super::APPLE_CONV_LAST_DISPATCH.with(std::cell::Cell::get),
+                Some(super::AppleConvDispatch::Bnns),
+                "interference control must execute BNNS"
+            );
+        })
+        .join()
+        .expect("BNNS interference-control thread panicked");
+        assert_eq!(
+            super::APPLE_CONV_LAST_DISPATCH.with(std::cell::Cell::get),
+            Some(super::AppleConvDispatch::PointwiseGemm),
+            "caller's 1x1 pointwise convolution must select GEMM regardless of other threads' BNNS work"
+        );
     }
 
     #[test]
