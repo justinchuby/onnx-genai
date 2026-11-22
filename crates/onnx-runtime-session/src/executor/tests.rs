@@ -14112,6 +14112,128 @@ fn nbits_shape_variants_share_one_native_pack_within_the_session_node() {
 }
 
 #[test]
+fn matmul_shape_variants_share_node_weights_without_crossing_nodes_or_sessions() {
+    use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
+    use onnx_runtime_memory_governor::{
+        HolderId, LeaseLedger, LedgerGovernor, MemoryAuthorityId, MemoryGovernor, MemoryLease,
+    };
+    struct FixedBooks(LedgerGovernor);
+    impl MemoryGovernor for FixedBooks {
+        fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
+            self.0.authority_id(tier)
+        }
+        fn reserve(
+            &self,
+            tier: Tier,
+            bytes: u64,
+            role: MemoryRole,
+            holder: HolderId,
+        ) -> std::result::Result<MemoryLease, MemoryError> {
+            self.0.reserve(tier, bytes, role, holder)
+        }
+        fn used(&self, tier: Tier) -> u64 {
+            self.0.used(tier)
+        }
+        fn available(&self, tier: Tier) -> u64 {
+            self.0.available(tier)
+        }
+    }
+    for nodes in [1usize, 2] {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 24);
+        let a = graph.create_named_value("a", DataType::Float64, vec![]);
+        graph.mark_value_shape_unknown(a);
+        graph.add_input(a);
+        let b = graph.create_named_value("b", DataType::Float64, static_shape([3, 2]));
+        graph.initializers.insert(
+            b,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Float64,
+                vec![3, 2],
+                [0.5f64.to_le_bytes(); 6].concat(),
+            )),
+        );
+        for index in 0..nodes {
+            let y = graph.create_named_value(format!("y{index}"), DataType::Float64, vec![]);
+            graph.mark_value_shape_unknown(y);
+            graph.add_output(y);
+            graph.insert_node(Node::new(
+                NodeId(index as u32),
+                "MatMul",
+                vec![Some(a), Some(b)],
+                vec![y],
+            ));
+        }
+        let expected = 24 * nodes as u64;
+        assert_eq!(
+            onnx_runtime_ep_cpu::matmul_dense_cache_predicted_bytes(&graph),
+            expected
+        );
+        // Enough for four node/session owners, too small for an optional native
+        // SGEMM panel. No pressure registration can hide duplicate preparation
+        // or let a denied optional pack evict another node's idle dense payload.
+        let books = FixedBooks(LedgerGovernor::new(LeaseLedger::new(0, 96, 0)));
+        let memory =
+            onnx_runtime_ep_cpu::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap();
+        let resources =
+            onnx_runtime_ep_cpu::CpuMemoryResources::new(memory, Default::default()).unwrap();
+        let cpu: Arc<dyn ExecutionProvider> =
+            Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+        let mut executor = Executor::build(
+            graph.clone(),
+            Arc::new(WeightStore::new()),
+            cpu.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(books.used(Tier::Host), 0);
+        for m in [3, 1, 5, 2, 4, 1] {
+            let input = Tensor::from_raw(
+                DataType::Float64,
+                vec![m, 3],
+                &vec![0.25f64.to_le_bytes(); m * 3].concat(),
+            )
+            .unwrap();
+            let outputs = executor.run(&[("a", &input)]).unwrap();
+            assert_eq!(outputs.len(), nodes);
+            for output in &outputs {
+                assert_eq!(output.shape, [m, 2]);
+                assert_eq!(
+                    output.as_bytes(),
+                    vec![0.375f64.to_le_bytes(); m * 2].concat()
+                );
+            }
+            assert_eq!(
+                books.used(Tier::Host),
+                expected,
+                "activation shape changes cannot multiply node-owned weights"
+            );
+        }
+        assert!(
+            executor.cache.stats().entries >= 2 * nodes,
+            "the fixture must compile multiple shape variants per node"
+        );
+        let mut peer = Executor::build(graph, Arc::new(WeightStore::new()), cpu, None).unwrap();
+        let input = Tensor::from_raw(
+            DataType::Float64,
+            vec![1, 3],
+            &[0.25f64.to_le_bytes(); 3].concat(),
+        )
+        .unwrap();
+        assert_eq!(peer.run(&[("a", &input)]).unwrap().len(), nodes);
+        assert_eq!(
+            books.used(Tier::Host),
+            2 * expected,
+            "sessions must own separate node preparations"
+        );
+        drop(executor);
+        assert_eq!(books.used(Tier::Host), expected);
+        drop(peer);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+}
+
+#[test]
 fn nbits_shape_variants_share_one_dense_weight_within_the_session_node() {
     use onnx_runtime_memory_api::Tier;
     use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};

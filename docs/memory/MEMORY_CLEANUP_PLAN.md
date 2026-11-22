@@ -810,8 +810,7 @@ The three old-behavior regressions demonstrate the bypass independently. New
 bounded real-kernel controls check both verdicts and unchanged expected results,
 while avoiding shared test-counter interference. This is retention enforcement,
 not physical Host funding by itself. Ordinary f32 constant materialization now
-joins Host admission below, followed by native half-copy payloads. SGEMM panels join Host admission below; transposes and shared-node ownership
-for ordinary MatMul remain work.
+joins Host admission below, followed by native half-copy payloads. SGEMM panels join Host admission below; transposes remain work; ordinary node ownership is consolidated below.
 
 
 ### Ordinary constant materialization joins the Host authority
@@ -833,8 +832,7 @@ forging an uncharged materialized constant through the preparation API.
 Address-keyed legacy transpose memos retain their converted source reader until
 their key retires, preventing source-address recycling after pressure. This pins
 those dependencies; funding/reclaiming transpose payloads themselves remains
-separate, as do activation/output scratch and shared-node ownership of ordinary MatMul
-preparations. Native contiguous-half copies and SGEMM panels are funded below.
+separate, as do activation/output scratch and ordinary node ownership is consolidated below. Native contiguous-half copies and SGEMM panels are funded below.
 
 The same provider-level test fails against the parent implementation with Host
 usage 0 versus 24 expected bytes. New factory, active-reader, capacity/refusal,
@@ -865,8 +863,8 @@ usage 0 versus 306 expected bytes. Controls cover both retention verdicts,
 negative strides/offsets, concurrent construction, active-reader protection,
 KV eviction/refusal/retry, final refund, invalid host sources and empty layouts.
 This step funds the native contiguous copy only. Ordinary SGEMM panel funding
-follows below; transpose payloads, shape-variant sharing and activation/output
-scratch remain work.
+follows below; transpose payloads, activation/output scratch remain work; shape-variant ownership is consolidated
+below.
 
 
 ### Check SGEMM panel allocation geometry before funding it
@@ -923,6 +921,41 @@ and actual construction failures remain contextual typed errors.
 
 This closes actual funding for ordinary SGEMM panel payloads and their half
 conversion peak. It does not fund unrelated activation/output/workspace scratch,
-legacy transpose payloads, or add shared ownership across MatMul shape variants.
+legacy transpose payloads, and adds no shape sharing by itself; the next step consolidates node ownership.
 Forecast changes are not a substitute for these actual grants; future resident
 planning can use the checked native layout query.
+
+
+### One preparation owner per ordinary MatMul node
+
+`MatMulPrepack` keeps each kernel's retention/constant policy and grant source,
+while one Arc-owned `MatMulWeights` holds its derived preparations. MatMul, Gemm,
+FusedMatMulBias and FusedGemm expose/adopt that owner through the existing
+node-scoped Kernel constant-state interface. The executor already exchanges this
+state when compiling shape variants, so its generic cache needs no op-specific
+logic. Shape-specific geometry, attributes and FLOP metadata stay on the kernel.
+
+Adoption verifies immutable operand flags and the exact DerivedWeightMemory
+source. A different grant source is an error, including a distinct holder on the
+same Host ledger. Retention-off and runtime-only variants export/adopt no state;
+unrecognized state is declined. Each new node/session starts with its own owner,
+even when it uses the same provider and original initializer.
+
+Dense f32 copies, contiguous half copies, native SGEMM panels and existing
+transpose memos now survive an individual shape kernel's eviction under this
+owner. Installed global transpose keys retire at the last node-owner drop; an
+executing funded reader still keeps its payload/grant alive independently. The
+legacy transpose payloads themselves still need actual grants and reclamation.
+
+Dense-materialization prediction counts each constant non-f32 operand once per
+node. Remove the fixed prefill/decode shape multiplier. Required bytes follow
+the retained ownership unit and stay constant as activation shapes vary. The
+estimate still excludes native panels, transpose payloads and other scratch,
+and same-half paths may retain less; actual required copies remain governed.
+
+Public factory controls cover all four consumers and both constant operand
+slots under one-payload capacity with pressure reclamation unavailable. The
+real executor control varies activation widths, shares within a node, keeps
+distinct nodes/sessions separate, and verifies final refunds. It also disables
+pressure reclamation so denied optional reference packs cannot distort the
+resident-copy measurement on different CPU backends.
