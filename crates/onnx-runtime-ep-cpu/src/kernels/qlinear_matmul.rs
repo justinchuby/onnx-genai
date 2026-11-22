@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use super::{check_arity, qgemm_native, to_dense_bytes, write_dense_bytes};
 use crate::DerivedWeightMemory;
 #[cfg(feature = "mlas")]
-use crate::resources::{DerivedWeightGrant, WeightAdmission};
+use crate::resources::{DerivedWeightGrant, IdleWeightCache, WeightAdmission};
 use crate::strided::numel;
 use std::borrow::Cow;
 #[cfg(feature = "mlas")]
@@ -27,6 +27,48 @@ struct CachedQgemmPack {
     key: QgemmPackKey,
     // None records a reference layout refusal, never a temporary capacity refusal.
     packed: Option<Arc<GrantedQgemmPack>>,
+}
+
+/// Admission may synchronously ask this cache to reclaim, so the builder lock
+/// is independent of the state lock and callbacks only acquire the latter.
+#[cfg(feature = "mlas")]
+#[derive(Default)]
+struct QgemmPackCache {
+    slot: Mutex<Option<CachedQgemmPack>>,
+    build: Mutex<()>,
+}
+
+#[cfg(feature = "mlas")]
+impl QgemmPackCache {
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, Option<CachedQgemmPack>>> {
+        self.slot.lock().map_err(|_| EpError::KernelFailed(
+            "QLinearMatMul packed-weight cache lock was poisoned; recreate the CPU kernel before retrying".into()
+        ))
+    }
+}
+
+#[cfg(feature = "mlas")]
+impl IdleWeightCache for QgemmPackCache {
+    fn reclaim_idle(&self, want: usize) -> Result<usize> {
+        if want == 0 {
+            return Ok(0);
+        }
+        let retired = {
+            let mut slot = self.state()?;
+            let idle = slot
+                .as_ref()
+                .and_then(|cached| cached.packed.as_ref())
+                .is_some_and(|packed| Arc::strong_count(packed) == 1);
+            if idle { slot.take() } else { None }
+        };
+        let bytes = retired
+            .as_ref()
+            .and_then(|cached| cached.packed.as_ref())
+            .map_or(0, |payload| payload.packed.owned_heap_bytes());
+        // Release payload and its external accounting only after unlocking.
+        drop(retired);
+        Ok(bytes)
+    }
 }
 
 /// Borrow a tensor's bytes when they are already dense, copy them when they are
@@ -341,7 +383,7 @@ pub struct QLinearMatMulKernel {
     /// One constant weight pack; construction is serialized before allocation.
     /// Active calls own an Arc, so its grant follows the payload's last owner.
     #[cfg(feature = "mlas")]
-    packed_b: Mutex<Option<CachedQgemmPack>>,
+    packed_b: Arc<QgemmPackCache>,
     #[cfg(feature = "mlas")]
     weight_memory: DerivedWeightMemory,
 }
@@ -383,11 +425,17 @@ impl QLinearMatMulKernel {
     fn new(retain_caches: bool, weight_memory: DerivedWeightMemory) -> Self {
         #[cfg(not(feature = "mlas"))]
         let _ = weight_memory;
+        #[cfg(feature = "mlas")]
+        let packed_b = Arc::new(QgemmPackCache::default());
+        #[cfg(feature = "mlas")]
+        if retain_caches {
+            weight_memory.register_idle_cache(&packed_b);
+        }
         Self {
             retain_caches,
             constant_inputs: [false; 8],
             #[cfg(feature = "mlas")]
-            packed_b: Mutex::new(None),
+            packed_b,
             #[cfg(feature = "mlas")]
             weight_memory,
         }
@@ -432,16 +480,14 @@ impl QLinearMatMulKernel {
     /// only to feed the packer.
     #[cfg(feature = "mlas")]
     fn pack_lookup(&self, key: QgemmPackKey) -> Result<Option<Arc<GrantedQgemmPack>>> {
-        let cache = self.packed_b.lock().map_err(|_| EpError::KernelFailed(
-            "QLinearMatMul packed-weight cache lock was poisoned; recreate the CPU kernel before retrying".into()
-        ))?;
+        let cache = self.packed_b.state()?;
         Ok(cache
             .as_ref()
             .filter(|cached| cached.key == key)
             .and_then(|cached| cached.packed.clone()))
     }
 
-    /// Serialize the first construction, then keep its grant with the payload.
+    /// Serialize construction, then keep its grant with the payload.
     /// A capacity refusal leaves the slot empty so a later call can retry.
     /// A different weight never builds a throwaway pack or uses the cached one.
     #[cfg(feature = "mlas")]
@@ -453,15 +499,20 @@ impl QLinearMatMulKernel {
         if key.k.checked_mul(key.n) != Some(b_bytes.len()) {
             return Ok(None);
         }
-        let mut cache = self.packed_b.lock().map_err(|_| EpError::KernelFailed(
-            "QLinearMatMul packed-weight cache lock was poisoned; recreate the CPU kernel before retrying".into()
+        let _build = self.packed_b.build.lock().map_err(|_| EpError::KernelFailed(
+            "QLinearMatMul packed-weight construction lock was poisoned; recreate the CPU kernel before retrying".into()
         ))?;
-        if let Some(cached) = cache.as_ref() {
-            return Ok((cached.key == key).then(|| cached.packed.clone()).flatten());
+        {
+            let cache = self.packed_b.state()?;
+            if let Some(cached) = cache.as_ref() {
+                return Ok((cached.key == key).then(|| cached.packed.clone()).flatten());
+            }
         }
+        // No state lock spans admission: the Host authority can synchronously
+        // reclaim this cache as well as another kernel's idle weight.
         let Some(bytes) = mlas_sys::qgemm_pack_b_size(key.n, key.k, key.a_signed, key.b_signed)
         else {
-            *cache = Some(CachedQgemmPack { key, packed: None });
+            *self.packed_b.state()? = Some(CachedQgemmPack { key, packed: None });
             return Ok(None);
         };
         let grant = match self.weight_memory.try_grant(bytes)? {
@@ -484,7 +535,7 @@ impl QLinearMatMulKernel {
                 key.k, key.n
             )));
         }
-        *cache = Some(CachedQgemmPack {
+        *self.packed_b.state()? = Some(CachedQgemmPack {
             key,
             packed: packed.clone(),
         });
@@ -3278,7 +3329,7 @@ mod tests {
     fn qlinear_pack_state(kernel: &QLinearMatMulKernel) -> Option<bool> {
         kernel
             .packed_b
-            .lock()
+            .state()
             .unwrap()
             .as_ref()
             .map(|slot| slot.packed.is_some())
@@ -3432,7 +3483,7 @@ mod tests {
             "refused and admitted routes must agree bitwise"
         );
         assert_eq!(qlinear_pack_state(&kernel), Some(true));
-        let key = kernel.packed_b.lock().unwrap().as_ref().unwrap().key;
+        let key = kernel.packed_b.state().unwrap().as_ref().unwrap().key;
         let live = kernel.pack_lookup(key).unwrap().unwrap();
         assert_eq!(live.packed.owned_heap_bytes(), bytes);
         drop(kernel);
@@ -3508,6 +3559,141 @@ mod tests {
         drop(kernel);
         assert_eq!(governor.used(Tier::Host), bytes as u64);
         drop(owners);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn qlinear_pack_pressure_reclaims_idle_without_deadlocking_builders() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let name = "kernels::qlinear_matmul::tests::qlinear_pack_pressure_child";
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--ignored", "--nocapture"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !timed_out,
+            "{name} deadlocked during Host pressure; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(
+            output.status.success() && stdout.contains(&format!("test {name} ... ok")),
+            "the named pressure child must run and pass; stdout={stdout}; stderr={stderr}"
+        );
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    #[ignore = "run by the bounded pressure parent to detect admission/reclaim deadlocks"]
+    fn qlinear_pack_pressure_child() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let fixture = pack_fixture(3, 64, 96, 9);
+        let bytes = mlas_sys::qgemm_pack_b_size(96, 64, false, false).unwrap();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+        let memory = crate::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        assert!(memory.supports_pressure_reclaim());
+        // Register the builder before the donor. Its own empty cache must be
+        // visited while admission holds the construction lock, without deadlock.
+        let mut builder = QLinearMatMulKernel::new(true, memory.clone());
+        let mut donor = QLinearMatMulKernel::new(true, memory);
+        for kernel in [&mut builder, &mut donor] {
+            kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        }
+        let reference = run_with(&donor, &fixture);
+        assert_eq!(qlinear_pack_state(&donor), Some(true));
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        let unrelated = LedgerGovernor::new(LeaseLedger::new(0, 0, 0));
+        assert!(
+            unrelated
+                .reserve(Tier::Host, 1, MemoryRole::KvCache, HolderId::new(7))
+                .is_err()
+        );
+        assert_eq!(
+            qlinear_pack_state(&donor),
+            Some(true),
+            "another authority must not evict this cache"
+        );
+        // The first pressure request visits the builder's empty cache before
+        // the donor. This constructs the self-callback case, before any round-
+        // robin snapshot advances the source's cursor.
+        eprintln!("pressure child: entering self-cache admission");
+        assert_eq!(run_with(&builder, &fixture).bytes, reference.bytes);
+        assert!(qlinear_pack_state(&donor).is_none());
+        assert_eq!(qlinear_pack_state(&builder), Some(true));
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        assert_eq!(builder.packed_b.reclaim_idle(0).unwrap(), 0);
+        assert_eq!(qlinear_pack_state(&builder), Some(true));
+        let kv = governor
+            .reserve(
+                Tier::Host,
+                bytes as u64,
+                MemoryRole::KvCache,
+                HolderId::new(7),
+            )
+            .expect("ordinary Host KV reserve must reclaim the idle packed weight");
+        assert!(qlinear_pack_state(&builder).is_none());
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        assert_eq!(run_with(&builder, &fixture).bytes, reference.bytes);
+        assert!(qlinear_pack_state(&builder).is_none());
+        drop(kv);
+        assert_eq!(run_with(&builder, &fixture).bytes, reference.bytes);
+        assert_eq!(qlinear_pack_state(&builder), Some(true));
+        let key = QgemmPackKey {
+            addr: fixture.b.bytes.as_ptr() as usize,
+            k: 64,
+            n: 96,
+            a_signed: false,
+            b_signed: false,
+            flip_b: false,
+        };
+        let active = builder.pack_lookup(key).unwrap().unwrap();
+        assert!(
+            governor
+                .reserve(Tier::Host, 1, MemoryRole::KvCache, HolderId::new(7))
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &active,
+            &builder.pack_lookup(key).unwrap().unwrap()
+        ));
+        drop(active);
+        assert_eq!(run_with(&donor, &fixture).bytes, reference.bytes);
+        assert!(qlinear_pack_state(&builder).is_none());
+        assert_eq!(qlinear_pack_state(&donor), Some(true));
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        let mut kv = governor
+            .reserve(Tier::Host, 0, MemoryRole::KvCache, HolderId::new(7))
+            .unwrap();
+        kv.grow(bytes as u64)
+            .expect("Host KV growth must also reclaim an idle pack");
+        assert!(qlinear_pack_state(&donor).is_none());
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(kv);
+        let builder_weak = Arc::downgrade(&builder.packed_b);
+        let donor_weak = Arc::downgrade(&donor.packed_b);
+        drop(builder);
+        drop(donor);
+        assert!(
+            builder_weak.upgrade().is_none() && donor_weak.upgrade().is_none(),
+            "pressure registration must not retain dead kernel caches"
+        );
         assert_eq!(governor.used(Tier::Host), 0);
     }
 
