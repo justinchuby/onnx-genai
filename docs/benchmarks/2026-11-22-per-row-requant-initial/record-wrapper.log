@@ -1,0 +1,9 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 30233, "load_before": [1.83447265625, 1.87158203125, 2.0107421875], "command": ["python3", "/tmp/nxrt-per-row-requant-final-pipeline.py"]}
+PASS /tmp/nxrt-per-row-requant-bench-list.log
+PASS /tmp/nxrt-per-row-requant-bench.log
+DIAGNOSTIC RECORDED
+PASS /tmp/nxrt-per-row-requant-native.tests.log
+PASS /tmp/nxrt-per-row-requant-mlas.tests.log
+PASS /tmp/nxrt-per-row-requant-native-release.allocations.log
+PASS /tmp/nxrt-per-row-requant-mlas-debug.allocations.log
+{"wall_s": 302.360635457997, "cpu_s": 615.358224, "maxrss_bytes": 4004478976, "load_after": [3.5400390625, 3.41650390625, 2.68505859375]}

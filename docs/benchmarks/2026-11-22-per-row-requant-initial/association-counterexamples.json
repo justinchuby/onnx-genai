@@ -1,0 +1,32 @@
+{
+  "reciprocal": {
+    "a_bits": 1080352412,
+    "b_bits": 1168457022,
+    "y_bits": 1329431408,
+    "acc": 10677323,
+    "expected": 63,
+    "alternative": 64,
+    "expected_float": 63.499996185302734,
+    "alternative_float": 63.5
+  },
+  "accumulate_first": {
+    "a_bits": 1080352412,
+    "b_bits": 1168457022,
+    "y_bits": 1329431408,
+    "acc": 10677323,
+    "expected": 63,
+    "alternative": 64,
+    "expected_float": 63.499996185302734,
+    "alternative_float": 63.5
+  },
+  "reassociate": {
+    "a_bits": 1153449446,
+    "b_bits": 982523135,
+    "y_bits": 1221068150,
+    "acc": 15383253,
+    "expected": 63,
+    "alternative": 64,
+    "expected_float": 63.499996185302734,
+    "alternative_float": 63.500003814697266
+  }
+}

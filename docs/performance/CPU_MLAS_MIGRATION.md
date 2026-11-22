@@ -309,6 +309,21 @@ RSS bounds. The regression removes batch-wise compensation churn. AVX2 retains
 its independent A-pair and B-panel scratch. No latency or end-to-end throughput
 claim follows from removing the sum buffer.
 
+Native ARM64 per-row activation-scale requantization now uses the shared
+8-lane NEON NaN/clamp/ties-to-even/pack core, forming `(a_scale * b_scale) /
+y_scale` in registers with separate multiply/divide steps. Short rows and tails
+remain portable, with no temporary scale vector. A mode-specific calling-thread
+witness prevents shared-scale or concurrent tests from satisfying the per-row
+coverage check. Positive finite rounding-boundary counterexamples, nonfinite/
+subnormal scales, offset slices, saturation, batches and parallel rows preserve
+output bytes. The [M1 Max serial-row diagnostic](../benchmarks/2026-11-22-per-row-requant.md)
+retains 2,646 samples over three independent process sweeps: 42/42 CPU and
+42/42 wall A/A cells qualify. The initial candidate’s failed cell remains in
+its separately archived corpus. Qualified widths 65–2048 show CPU portable/native
+ratios 1.549–1.859; shorter widths offer smaller gains. Test-only witness bookkeeping is included
+in native timings. These row measurements establish neither GEMM/model gains
+nor family graduation; the optional reference remains.
+
 Native SiLU shares the runtime chunk scheduler with host-pool preference and
 nested-pool avoidance. ARM64 retains its exp polynomial and stable scalar
 formula, but records exact exceptional-lane positions in four u32 masks.

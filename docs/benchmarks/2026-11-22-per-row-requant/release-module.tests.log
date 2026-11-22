@@ -1,0 +1,31 @@
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-a26db3a5d89b84f9)
+
+running 24 tests
+test kernels::qlinear_matmul::tests::bench_per_row_requantization_neon_ab ... ignored, manual per-row epilogue diagnostic; run under the host lock
+test kernels::qlinear_matmul::tests::bench_requantization_neon_ab ... ignored, manual row epilogue measurement; run explicitly under the host lock
+test kernels::qlinear_matmul::tests::per_row_requantization_preserves_scale_association_at_rounding_boundaries ... ok
+test kernels::qlinear_matmul::tests::per_row_requantization_reaches_neon_with_exact_tail_outputs ... ok
+test kernels::qlinear_matmul::tests::qlinear_matmul_int8_per_column_scales_matches_reference ... ok
+test kernels::qlinear_matmul::tests::qlinear_matmul_batched_per_row_and_per_column_broadcasts_match_reference ... ok
+test kernels::qlinear_matmul::tests::qlinear_matmul_batched_per_tensor_uint8_matches_reference ... ok
+test kernels::qlinear_matmul::tests::a_finite_scale_past_the_i64_range_saturates_on_the_scalar_loop ... ok
+test kernels::qlinear_matmul::tests::a_batched_call_lands_every_batch_at_its_own_offset_in_place ... ok
+test kernels::qlinear_matmul::tests::a_contiguous_output_is_written_in_place_and_a_strided_one_is_staged ... ok
+test kernels::qlinear_matmul::tests::qlinear_matmul_rejects_mismatched_scale_and_zero_point_shapes ... ok
+test kernels::qlinear_matmul::tests::qlinear_matmul_rounds_ties_to_even_and_saturates_int8 ... ok
+test kernels::qlinear_matmul::tests::qlinear_matmul_uint8_per_tensor_matches_dequant_matmul_requant_reference ... ok
+test kernels::qlinear_matmul::tests::qlinear_matmul_uint8_per_row_a_scales_matches_reference ... ok
+test kernels::qlinear_matmul::tests::qlinear_matmul_zero_width_output_is_empty_not_a_panic ... ok
+test kernels::qlinear_matmul::tests::shared_requantization_reaches_neon_for_native_rows ... ok
+test kernels::qlinear_matmul::tests::qlinear_matmul_is_deterministic_across_repeated_runs ... ok
+test kernels::qlinear_matmul::tests::provider_cache_retention_decline_preserves_peer_parked_scratch ... ok
+test kernels::qlinear_matmul::tests::qlinear_matmul_overflowing_accumulator_matches_the_previous_loop ... ok
+test kernels::qlinear_matmul::tests::shared_requantization_is_byte_exact_for_tails_and_extreme_values ... ok
+test kernels::qlinear_matmul::tests::per_row_requantization_matches_scalar_for_tails_and_nonfinite_scales ... ok
+test kernels::qlinear_matmul::tests::requantization_rows_preserve_batch_scales_and_parallel_results ... ok
+test kernels::qlinear_matmul::tests::the_parked_accumulator_is_bounded_process_wide_not_per_thread ... ok
+test kernels::qlinear_matmul::tests::qlinear_matmul_reordered_accumulation_is_bit_identical ... ok
+
+test result: ok. 22 passed; 0 failed; 2 ignored; 0 measured; 1950 filtered out; finished in 0.07s
+
