@@ -1400,6 +1400,27 @@ pub(crate) fn leaky_relu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32
     }
 }
 
+// Historical ARM64 bodies used only by the same-binary absorption diagnostic.
+// Keep generic scheduler instantiations here: the codegen-locality guard is
+// load-bearing for unrelated activation hot loops.
+#[cfg(all(test, feature = "mlas", target_arch = "aarch64"))]
+fn erf_scalar_before(input: &[f32], output: &mut [f32]) {
+    run_chunked(input, output, |i, o| {
+        for (o, &x) in o.iter_mut().zip(i) {
+            *o = erf_scalar(x);
+        }
+    });
+}
+
+#[cfg(all(test, feature = "mlas", target_arch = "aarch64"))]
+fn erf_gelu_scalar_before(input: &[f32], output: &mut [f32]) {
+    run_chunked(input, output, |i, o| {
+        for (o, &x) in o.iter_mut().zip(i) {
+            *o = erf_gelu_scalar(x);
+        }
+    });
+}
+
 /// `y = HardSigmoid(x, alpha, beta)`.
 pub(crate) fn hard_sigmoid_f32_slice(input: &[f32], output: &mut [f32], alpha: f32, beta: f32) {
     debug_assert_eq!(input.len(), output.len());

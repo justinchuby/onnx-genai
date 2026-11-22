@@ -495,16 +495,8 @@ mod tests {
                                 let input = black_box(input.as_slice());
                                 let out = black_box(out);
                                 match (op_index, arm) {
-                                    (0, 0) => super::super::run_chunked(input, out, |i, o| {
-                                        for (o, &x) in o.iter_mut().zip(i) {
-                                            *o = erf_scalar(x);
-                                        }
-                                    }),
-                                    (1, 0) => super::super::run_chunked(input, out, |i, o| {
-                                        for (o, &x) in o.iter_mut().zip(i) {
-                                            *o = erf_gelu_scalar(x);
-                                        }
-                                    }),
+                                    (0, 0) => super::super::erf_scalar_before(input, out),
+                                    (1, 0) => super::super::erf_gelu_scalar_before(input, out),
                                     (0, 1 | 2) => erf_f32_slice_native(input, out),
                                     (1, 1 | 2) => erf_gelu_f32_slice_native(input, out),
                                     (0, 3) => super::super::erf_f32_slice(input, out),
