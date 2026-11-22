@@ -219,6 +219,15 @@ description = "2D undilated MaxPool dispatches to BNNS pooling on Apple Silicon"
 
 [[claim]]
 op = "Add"
+variant = "native_dense_suffix_broadcast"
+platform = "all"
+minimum_tier = "tier3"
+counter = "ADD_DENSE_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/add.rs"
+description = "Suffix-broadcast Add uses the shared native dense walk in both default and optional MLAS builds; no MLAS Add route remains"
+
+[[claim]]
+op = "Add"
 variant = "contiguous_f32"
 platform = "aarch64-apple-darwin"
 minimum_tier = "tier2"

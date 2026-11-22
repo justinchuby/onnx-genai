@@ -567,15 +567,6 @@ extern "C" void mlas_compute_silu(
     MlasComputeSilu(input, output, n);
 }
 
-extern "C" void mlas_eltwise_add(
-    const float* left,
-    const float* right,
-    float* output,
-    size_t n)
-{
-    MlasEltwiseAdd<float>(left, right, output, n);
-}
-
 extern "C" void mlas_compute_activation(
     int kind,
     float minimum,

@@ -130,7 +130,6 @@ fn main() {
             "qkv_quant_kernel_neon.cpp",
             "hgemm_kernel_neon.cpp",
             "softmax_kernel_neon.cpp",
-            "eltwise_kernel_neon.cpp",
         ];
         // Upstream MLAS intentionally leaves fp16 NEON helpers disabled on
         // Apple ARM64, so these TUs reference undeclared MlasLoad/StoreFloat16x8.
@@ -143,7 +142,6 @@ fn main() {
                 "rotary_embedding_kernel_neon_fp16.cpp",
                 "halfgemm_kernel_neon_fp16.cpp",
                 "softmax_kernel_neon_fp16.cpp",
-                "eltwise_kernel_neon_fp16.cpp",
             ]);
         }
         generic.extend(arm64_sources.iter().map(|f| p.lib.join(f)));

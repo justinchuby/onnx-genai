@@ -653,7 +653,7 @@ Return Value:
     this->RopeDispatch = &MlasRopeDispatchNeon;
     this->HGemmDispatch = &MlasHGemmDispatchNeon;
     this->SoftmaxDispatch = &MlasSoftmaxDispatchNeon;
-    this->EltwiseDispatch = &MlasEltwiseDispatchNeon;
+    // nxrt-mlas-add-retirement: Add-only dispatch no longer belongs to MLAS.
     this->KVQuantGemmDispatch = &MlasKVQuantGemmDispatchNeon;
 
 #if defined(MLAS_USE_ARM_NEON_NCHWC)
