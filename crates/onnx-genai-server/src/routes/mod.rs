@@ -52,8 +52,10 @@ mod completions;
 mod images;
 pub(crate) mod llama;
 mod multimodal;
+pub(crate) mod native;
 mod sessions;
 mod speech;
+pub(crate) mod transports;
 
 #[cfg(feature = "metrics")]
 pub(crate) use admin::prometheus_metrics;
@@ -457,7 +459,7 @@ impl ApiError {
     }
 
     /// A request the loaded package cannot serve, and no retry will change.
-    fn invalid_request(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
@@ -466,7 +468,7 @@ impl ApiError {
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
@@ -484,7 +486,7 @@ impl ApiError {
         }
     }
 
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
@@ -504,7 +506,7 @@ impl ApiError {
 
     /// The request conflicts with the state or the capability of what is
     /// loaded.
-    fn conflict(message: impl Into<String>) -> Self {
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
@@ -513,7 +515,7 @@ impl ApiError {
         }
     }
 
-    fn too_many_requests(message: impl Into<String>) -> Self {
+    pub(crate) fn too_many_requests(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),

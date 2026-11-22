@@ -51,7 +51,7 @@ pub(crate) async fn props(
     {
         return Ok(Json(json!({
             "role": "router", "ui": true, "ui_settings": {},
-            "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": false, "resumable_streams": false},
+            "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": false, "resumable_streams": true},
             "cors_proxy_enabled": false, "endpoint_slots": false,
             "endpoint_props": false, "endpoint_metrics": cfg!(feature = "metrics"),
             "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION"))
@@ -98,7 +98,7 @@ pub(crate) async fn props(
         "cors_proxy_enabled": false,
         "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION")),
         "nxrt_capabilities": {
-            "resumable_streams": false, "reasoning_control": false,
+            "resumable_streams": true, "reasoning_control": false,
             "tools": handle.tool_protocol.is_some(), "custom_sampler_order": false
         }
     })))
@@ -215,7 +215,7 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
             // These opt into optional progress/control facilities, not a different decoding algorithm.
             "reasoning_control" | "return_progress" | "timings_per_token" => value.is_boolean(),
             "sse_ping_interval" => value.as_f64().is_some_and(|n| n >= 0.0),
-            "cache_prompt" => value == true,
+            "cache_prompt" | "ignore_eos" => value.is_boolean(),
             "dynatemp_range" => value.as_f64() == Some(0.0),
             "dynatemp_exponent" => value.as_f64() == Some(1.0),
             "dry_penalty_last_n" => request.dry_multiplier == 0.0 || value == -1,
@@ -315,4 +315,41 @@ pub(crate) async fn model_events(State(state): State<AppState>) -> Result<Respon
     Ok(Sse::new(ReceiverStream::new(rx))
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response())
+}
+
+/// Count the exact text prompt rendered for inference, without spending a generation.
+pub(crate) async fn input_tokens(
+    State(state): State<AppState>,
+    ApiJson(request): ApiJson<ChatCompletionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({"input_tokens": count_input_tokens(&state, &request).await?}),
+    ))
+}
+
+pub(super) async fn count_input_tokens(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+) -> Result<usize, ApiError> {
+    validate_extensions(request)?;
+    if !request.image_urls().is_empty() || !request.input_audio().is_empty() {
+        return Err(ApiError::invalid_request(
+            "input token counting for media requires expanded model preprocessing; use text-only messages for this endpoint",
+        ));
+    }
+    let handle = resolve_model(&state.registry, &request.model).await?;
+    let prompt = super::completions::render_model_prompt(
+        request,
+        &handle,
+        state.config.default_reasoning_effort,
+    )
+    .map_err(|err| {
+        ApiError::invalid_request(format!("input token prompt rendering failed: {err}"))
+    })?;
+    let count = handle
+        .tokenizer
+        .encode(&prompt)
+        .map_err(|err| ApiError::invalid_request(format!("input tokenization failed: {err}")))?
+        .len();
+    Ok(count)
 }

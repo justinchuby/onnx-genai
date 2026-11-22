@@ -385,6 +385,7 @@ fn parse_native_cuda_device(_index: Option<u32>) -> Result<NativeDecodeDevice, S
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) registry: ModelRegistry,
+    pub(crate) replays: crate::replay::ReplayRegistry,
     pub(crate) sessions: SessionRegistry,
     pub(crate) config: ServerConfig,
 }
@@ -427,6 +428,10 @@ pub struct ServerConfig {
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
     pub max_output_tokens: usize,
+    /// Maximum retained/live resumable generations; payload storage is allocated lazily.
+    pub max_replay_streams: usize,
+    /// Maximum retained SSE bytes per conversation (older prefixes are evicted).
+    pub replay_buffer_bytes: usize,
     /// Reasoning effort applied when a request omits `reasoning_effort`
     /// (`--default-reasoning-effort`). `None` leaves the model's own default in
     /// place, which for a reasoning model is often maximal — enough for an
@@ -470,6 +475,8 @@ impl Default for ServerConfig {
         Self {
             node_id: default_node_id(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            max_replay_streams: 16,
+            replay_buffer_bytes: 4 * 1024 * 1024,
             default_reasoning_effort: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
@@ -486,6 +493,20 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     fn validate(self) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.max_replay_streams > 0,
+            "max_replay_streams must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.replay_buffer_bytes > 0,
+            "replay_buffer_bytes must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.max_replay_streams
+                .checked_mul(self.replay_buffer_bytes)
+                .is_some(),
+            "max_replay_streams * replay_buffer_bytes overflows the host address range; reduce the replay cache limits"
+        );
         if self.node_id.trim().is_empty() {
             anyhow::bail!("node_id must not be empty");
         }
@@ -532,6 +553,10 @@ impl AppState {
         let registry = ModelRegistry::from_specs(std::slice::from_ref(&spec), config.clone())?;
         Ok(Self {
             registry,
+            replays: crate::replay::ReplayRegistry::new(
+                config.max_replay_streams,
+                config.replay_buffer_bytes,
+            ),
             sessions: SessionRegistry::new(config.max_sessions),
             config,
         })
@@ -552,6 +577,10 @@ impl AppState {
         let registry = ModelRegistry::from_specs(&specs, config.clone())?;
         Ok(Self {
             registry,
+            replays: crate::replay::ReplayRegistry::new(
+                config.max_replay_streams,
+                config.replay_buffer_bytes,
+            ),
             sessions: SessionRegistry::new(config.max_sessions),
             config,
         })

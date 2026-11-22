@@ -1,3 +1,4 @@
+use onnx_genai_engine::FinishReason;
 use std::convert::Infallible;
 
 use anyhow::Context;
@@ -35,6 +36,8 @@ pub(crate) struct ChatCompletionChunk {
     created: u64,
     model: String,
     choices: Vec<ChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nxrt_prompt_tokens: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,6 +46,8 @@ pub(crate) struct ChunkChoice {
     delta: Delta,
     logprobs: Option<ChatLogprobs>,
     finish_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_sequence: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -341,9 +346,15 @@ pub(crate) fn completion_done_chunk(
     }
 }
 
-pub(crate) fn role_chunk(id: &str, created: u64, model: &str) -> ChatCompletionChunk {
+pub(crate) fn role_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    prompt_tokens: usize,
+) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
+        nxrt_prompt_tokens: Some(prompt_tokens),
         object: "chat.completion.chunk",
         created,
         model: model.to_string(),
@@ -357,6 +368,7 @@ pub(crate) fn role_chunk(id: &str, created: u64, model: &str) -> ChatCompletionC
             },
             logprobs: None,
             finish_reason: None,
+            stop_sequence: None,
         }],
     }
 }
@@ -370,6 +382,7 @@ pub(crate) fn content_chunk(
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
+        nxrt_prompt_tokens: None,
         object: "chat.completion.chunk",
         created,
         model: model.to_string(),
@@ -383,6 +396,7 @@ pub(crate) fn content_chunk(
             },
             logprobs,
             finish_reason: None,
+            stop_sequence: None,
         }],
     }
 }
@@ -396,6 +410,7 @@ pub(crate) fn reasoning_chunk(
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
+        nxrt_prompt_tokens: None,
         object: "chat.completion.chunk",
         created,
         model: model.to_string(),
@@ -409,6 +424,7 @@ pub(crate) fn reasoning_chunk(
             },
             logprobs: None,
             finish_reason: None,
+            stop_sequence: None,
         }],
     }
 }
@@ -465,6 +481,7 @@ fn tool_call_delta_chunk(
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
+        nxrt_prompt_tokens: None,
         object: "chat.completion.chunk",
         created,
         model: model.to_string(),
@@ -478,6 +495,7 @@ fn tool_call_delta_chunk(
             },
             logprobs: None,
             finish_reason: None,
+            stop_sequence: None,
         }],
     }
 }
@@ -490,6 +508,7 @@ pub(crate) fn done_chunk(
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
+        nxrt_prompt_tokens: None,
         object: "chat.completion.chunk",
         created,
         model: model.to_string(),
@@ -498,8 +517,32 @@ pub(crate) fn done_chunk(
             delta: Delta::default(),
             logprobs: None,
             finish_reason: Some(finish_reason),
+            stop_sequence: None,
         }],
     }
+}
+
+pub(crate) fn done_chunk_with_stop(
+    id: &str,
+    created: u64,
+    model: &str,
+    reason: &FinishReason,
+    stops: &[String],
+) -> ChatCompletionChunk {
+    let mut chunk = done_chunk(
+        id,
+        created,
+        model,
+        match reason {
+            FinishReason::MaxTokens | FinishReason::Length => "length",
+            FinishReason::ToolCalls => "tool_calls",
+            _ => "stop",
+        },
+    );
+    if let FinishReason::StopSequence { index } = reason {
+        chunk.choices[0].stop_sequence = stops.get(*index).cloned();
+    }
+    chunk
 }
 
 #[cfg(test)]

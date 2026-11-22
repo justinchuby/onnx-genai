@@ -6441,3 +6441,223 @@ mod llama_router_compat {
         );
     }
 }
+
+mod native_compat {
+    use super::*;
+    async fn request(router: axum::Router, path: &str, body: Value) -> axum::response::Response {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn native_completion_aliases_return_real_counts_tokens_and_stop_state() {
+        let router = app(tiny_state());
+        for path in ["/completion", "/completions"] {
+            let response = request(
+                router.clone(),
+                path,
+                json!({"prompt":"hello","n_predict":2,"temperature":0,"return_tokens":true}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["stop"], true);
+            assert_eq!(body["model"], "tiny-llm");
+            assert!(body["content"].is_string());
+            assert_eq!(
+                body["tokens"].as_array().unwrap().len(),
+                body["tokens_predicted"].as_u64().unwrap() as usize
+            );
+            assert!(body["tokens_evaluated"].as_u64().unwrap() > 0);
+        }
+    }
+    #[tokio::test]
+    async fn native_stream_ends_with_stop_and_supports_exact_prompt_token_ids() {
+        let router = app(tiny_state());
+        let tokens = fixture_tokenizer().encode("hello").unwrap();
+        let response = request(
+            router,
+            "/completion",
+            json!({"prompt":tokens,"n_predict":2,"stream":true,"return_tokens":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let events = sse_json_events(&bytes);
+        assert_eq!(events.last().unwrap()["stop"], true);
+        assert!(events.iter().any(|event| event["stop"] == false));
+        assert!(!std::str::from_utf8(&bytes).unwrap().contains("[DONE]"));
+    }
+    #[tokio::test]
+    async fn native_errors_and_token_count_are_actionable() {
+        let router = app(tiny_state());
+        for (body, field) in [
+            (json!({"prompt":[999999],"n_predict":1}), "token id"),
+            (
+                json!({"prompt":"hello","n_predict":1,"max_tokens":1}),
+                "not both",
+            ),
+        ] {
+            let response = request(router.clone(), "/completion", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                json_body(response).await["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(field)
+            );
+        }
+        let response = request(
+            router.clone(),
+            "/infill",
+            json!({"input_prefix":"hello","input_suffix":"world","n_predict":1}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("FIM")
+        );
+        let response = request(
+            router,
+            "/v1/chat/completions/input_tokens",
+            json!({"messages":[{"role":"user","content":"hello"}]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(json_body(response).await["input_tokens"].as_u64().unwrap() > 0);
+    }
+    #[tokio::test]
+    async fn alternate_protocols_use_real_generation_and_usage() {
+        let router = app(tiny_state());
+        for (path, body, protocol) in [
+            (
+                "/v1/responses",
+                json!({"input":"hello","max_output_tokens":2,"temperature":0}),
+                "response",
+            ),
+            (
+                "/v1/messages",
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":2,"temperature":0}),
+                "message",
+            ),
+        ] {
+            let response = request(router.clone(), path, body.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let result = json_body(response).await;
+            assert!(result["usage"]["input_tokens"].as_u64().unwrap() > 0);
+            assert!(result["usage"]["output_tokens"].as_u64().unwrap() > 0);
+            assert_eq!(
+                result[if protocol == "response" {
+                    "object"
+                } else {
+                    "type"
+                }],
+                protocol
+            );
+            let mut streaming = body;
+            streaming["stream"] = json!(true);
+            let response = request(router.clone(), path, streaming).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let events = sse_json_events(&bytes);
+            assert!(
+                !events.iter().any(|event| event["type"] == "error"),
+                "{events:?}"
+            );
+            assert!(
+                events.iter().any(|event| event["type"]
+                    == if protocol == "response" {
+                        "response.completed"
+                    } else {
+                        "message_stop"
+                    })
+                    || events
+                        .iter()
+                        .any(|event| event["type"] == "response.incomplete")
+            );
+        }
+        for (path, body) in [
+            ("/v1/responses/input_tokens", json!({"input":"hello"})),
+            (
+                "/v1/messages/count_tokens",
+                json!({"messages":[{"role":"user","content":"hello"}]}),
+            ),
+        ] {
+            let response = request(router.clone(), path, body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(json_body(response).await["input_tokens"].as_u64().unwrap() > 0);
+        }
+    }
+    #[tokio::test]
+    async fn conversation_replay_http_contract_is_byte_exact_and_non_enumerable() {
+        let router = app(tiny_state());
+        let response = router.clone().oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE,"application/json").header("x-conversation-id","known::tiny-llm")
+            .body(Body::from(json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":2,"stream":true}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let original = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/stream?conv_id=known::tiny-llm&from=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            original
+        );
+        let response = request(
+            router.clone(),
+            "/v1/streams/lookup",
+            json!({"conversation_ids":["unknown"]}),
+        )
+        .await;
+        assert_eq!(json_body(response).await, json!([]));
+        let response = request(
+            router.clone(),
+            "/v1/streams/lookup",
+            json!({"conversation_ids":["known"]}),
+        )
+        .await;
+        let body = json_body(response).await;
+        assert_eq!(body[0]["conversation_id"], "known::tiny-llm");
+        assert_eq!(body[0]["is_done"], true);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/stream?conv_id=known::tiny-llm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/stream?conv_id=known::tiny-llm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}

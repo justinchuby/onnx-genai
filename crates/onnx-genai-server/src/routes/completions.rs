@@ -57,6 +57,7 @@ pub(crate) async fn embeddings(
             }
             all
         }
+        EmbeddingInput::Tokens(tokens) => vec![tokens],
         EmbeddingInput::TokenArrays(arrays) => arrays,
     };
 
@@ -127,6 +128,7 @@ fn validate_embedding_request(
             }
             Ok(())
         }
+        EmbeddingInput::Tokens(tokens) => validate_tokens(tokens),
         EmbeddingInput::TokenArrays(inputs) => {
             if inputs.is_empty() {
                 return Err(ApiError::bad_request(
@@ -488,11 +490,18 @@ async fn run_chat_completion(
     };
 
     let mut workflow_outputs = Vec::new();
+    let mut stop_sequence = None;
     let (content, tool_calls, completion_tokens, finish_reason, logprobs, reasoning) = match result
     {
         Ok(collected) => {
             workflow_outputs = collected.publications;
             let result = collected.result;
+            if let FinishReason::StopSequence { index } = &result.finish_reason {
+                stop_sequence = request
+                    .stop
+                    .as_ref()
+                    .and_then(|stop| stop.clone().into_texts().get(*index).cloned());
+            }
             let default_finish_reason = finish_reason_label(&result.finish_reason);
             let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
                 .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
@@ -542,6 +551,7 @@ async fn run_chat_completion(
                 name: None,
             },
             finish_reason,
+            stop_sequence,
             logprobs,
         }],
         usage: Some(Usage {
@@ -655,7 +665,7 @@ async fn stream_chat_completion(
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
 
     tokio::spawn(async move {
-        send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
+        send_stream_chunk(&tx, role_chunk(&id, created, &model, prompt_tokens)).await?;
 
         if request.has_tool_context() {
             return stream_declared_tool_chat_completion(
@@ -739,11 +749,12 @@ async fn stream_chat_completion(
                     .await?;
                     send_stream_chunk(
                         &tx,
-                        done_chunk(
+                        crate::sse::done_chunk_with_stop(
                             &id,
                             created,
                             &model,
-                            finish_reason_label(&result.finish_reason),
+                            &result.finish_reason,
+                            &user_stop_sequences,
                         ),
                     )
                     .await?;
@@ -755,11 +766,12 @@ async fn stream_chat_completion(
                     }
                     send_stream_chunk(
                         &tx,
-                        done_chunk(
+                        crate::sse::done_chunk_with_stop(
                             &id,
                             created,
                             &model,
-                            finish_reason_label(&result.finish_reason),
+                            &result.finish_reason,
+                            &user_stop_sequences,
                         ),
                     )
                     .await?;
@@ -785,11 +797,12 @@ async fn stream_chat_completion(
                     }
                     send_stream_chunk(
                         &tx,
-                        done_chunk(
+                        crate::sse::done_chunk_with_stop(
                             &id,
                             created,
                             &model,
-                            finish_reason_label(&result.finish_reason),
+                            &result.finish_reason,
+                            &user_stop_sequences,
                         ),
                     )
                     .await?;
@@ -920,11 +933,12 @@ async fn stream_declared_tool_chat_completion(
                 .await?;
                 send_stream_chunk(
                     tx,
-                    done_chunk(
+                    crate::sse::done_chunk_with_stop(
                         id,
                         created,
                         model,
-                        finish_reason_label(&result.finish_reason),
+                        &result.finish_reason,
+                        user_stop_sequences,
                     ),
                 )
                 .await?;
@@ -935,11 +949,12 @@ async fn stream_declared_tool_chat_completion(
                 }
                 send_stream_chunk(
                     tx,
-                    done_chunk(
+                    crate::sse::done_chunk_with_stop(
                         id,
                         created,
                         model,
-                        finish_reason_label(&result.finish_reason),
+                        &result.finish_reason,
+                        user_stop_sequences,
                     ),
                 )
                 .await?;
@@ -981,7 +996,7 @@ async fn stream_declared_tool_chat_completion(
     Ok(())
 }
 
-async fn await_driver_admission(
+pub(super) async fn await_driver_admission(
     admission: oneshot::Receiver<Result<(), DriverFailure>>,
 ) -> Result<(), ApiError> {
     match admission.await {
@@ -1182,7 +1197,7 @@ fn prepare_audio_generate_request(
     })
 }
 
-fn validate_request(
+pub(super) fn validate_request(
     request: &ChatCompletionRequest,
     config: &ServerConfig,
 ) -> Result<(), ApiError> {
@@ -1332,7 +1347,7 @@ fn validate_completion_request(
 /// that named none asked for whatever fits, so its budget shrinks to the
 /// context the prompt left behind rather than turning into a rejection — the
 /// server's cap is a ceiling on generosity, not a reservation the caller made.
-fn admit_output_budget(
+pub(super) fn admit_output_budget(
     request: &ChatCompletionRequest,
     prompt_tokens: usize,
     budget: usize,
@@ -1915,6 +1930,16 @@ fn build_generate_options(
         presence_penalty: request.presence_penalty,
         greedy: request.temperature == Some(0.0) || !stochastic_sampling_requested,
         seed: request.seed,
+        cold_start: request
+            .extensions
+            .get("cache_prompt")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false),
+        stop_on_eos: request
+            .extensions
+            .get("ignore_eos")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true),
         dry: (request.dry_multiplier > 0.0).then(|| DryConfig {
             multiplier: request.dry_multiplier,
             base: request.dry_base,
@@ -1978,7 +2003,7 @@ fn apply_tool_output_constraint(
 /// cannot express "unspecified", so the API defaults win over any model-declared
 /// temperature/top_p/top_k, and only the greedy (do_sample) decision defers to
 /// the model.
-fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides {
+pub(super) fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides {
     let requests_sampling = request.temperature.is_some_and(|t| t > 0.0)
         || request.seed.is_some()
         || request.top_k > 0
@@ -2037,7 +2062,7 @@ fn response_format_constraint(request: &ChatCompletionRequest) -> Option<Generat
     }
 }
 
-fn build_generate_options_with_tokenizer(
+pub(super) fn build_generate_options_with_tokenizer(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
     output_budget: usize,

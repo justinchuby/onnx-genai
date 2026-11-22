@@ -38,6 +38,7 @@ pub struct EmbeddingRequest {
 pub enum EmbeddingInput {
     String(String),
     Strings(Vec<String>),
+    Tokens(Vec<u32>),
     TokenArrays(Vec<Vec<u32>>),
 }
 
@@ -657,6 +658,8 @@ pub struct ChatChoice {
     pub index: usize,
     pub message: ChatMessage,
     pub finish_reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequence: Option<String>,
     pub logprobs: Option<ChatLogprobs>,
 }
 

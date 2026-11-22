@@ -65,6 +65,14 @@ pub struct ServeArgs {
     #[arg(long, env = "ONNX_GENAI_MAX_OUTPUT_TOKENS", default_value_t = 4096)]
     pub max_output_tokens: usize,
 
+    /// Maximum active/retained resumable generations (X-Conversation-Id).
+    #[arg(long, default_value_t = 16)]
+    pub max_replay_streams: usize,
+
+    /// Maximum retained SSE bytes per conversation; older prefixes are evicted.
+    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    pub replay_buffer_bytes: usize,
+
     /// Reasoning effort applied when a request omits `reasoning_effort`.
     ///
     /// Reasoning models pick their own default when the template receives no
@@ -153,6 +161,8 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
     ServerConfig {
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
+        max_replay_streams: args.max_replay_streams,
+        replay_buffer_bytes: args.replay_buffer_bytes,
         default_reasoning_effort: args.default_reasoning_effort,
         max_sessions: args.max_sessions,
         max_queue_depth: args.max_queue_depth,

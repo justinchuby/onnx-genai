@@ -34,6 +34,7 @@ mod metrics;
 mod models_config;
 pub mod multimodal;
 mod registry;
+mod replay;
 mod routes;
 pub mod runtime_args;
 mod session;
@@ -73,6 +74,23 @@ pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/health", get(routes::health))
         .route("/v1/health", get(routes::health))
+        .route("/v1/responses", post(routes::transports::responses))
+        .route("/responses", post(routes::transports::responses))
+        .route("/v1/messages", post(routes::transports::messages))
+        .route(
+            "/v1/messages/count_tokens",
+            post(routes::transports::messages_tokens),
+        )
+        .route(
+            "/v1/responses/input_tokens",
+            post(routes::transports::responses_tokens),
+        )
+        .route(
+            "/responses/input_tokens",
+            post(routes::transports::responses_tokens),
+        )
+        .route("/v1/stream", get(replay::get).delete(replay::delete))
+        .route("/v1/streams/lookup", post(replay::lookup))
         .route(
             "/models",
             get(routes::models)
@@ -90,6 +108,19 @@ pub fn app(state: AppState) -> Router {
             "/props",
             get(routes::llama::props).post(routes::llama::disabled_feature),
         )
+        .route(
+            "/v1/chat/completions/input_tokens",
+            post(routes::llama::input_tokens),
+        )
+        .route(
+            "/chat/completions/input_tokens",
+            post(routes::llama::input_tokens),
+        )
+        .route("/completion", post(routes::native::completions))
+        .route("/completions", post(routes::native::completions))
+        .route("/infill", post(routes::native::infill))
+        .route("/embedding", post(routes::native::embeddings))
+        .route("/embeddings", post(routes::native::embeddings))
         .route("/tokenize", post(routes::llama::tokenize))
         .route("/detokenize", post(routes::llama::detokenize))
         .route("/apply-template", post(routes::llama::apply_template))
@@ -162,9 +193,11 @@ pub fn app(state: AppState) -> Router {
     }
     #[cfg(feature = "metrics")]
     let router = router.route("/metrics", get(routes::prometheus_metrics));
+    let replays = state.replays.clone();
     router
         .fallback(webui::serve)
         .with_state(state)
+        .layer(middleware::from_fn_with_state(replays, replay::intercept))
         .layer(middleware::from_fn(trace_request))
 }
 

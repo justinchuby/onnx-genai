@@ -27,6 +27,13 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/v1/chat/completions`, `/chat/completions` | Buffered/streaming text, tools, reasoning, declared image/audio inputs |
 | POST | `/v1/completions` | Existing OpenAI text/FIM completion contract |
 | POST | `/v1/embeddings` | Existing OpenAI embedding contract |
+| POST | `/completion`, `/completions`, `/infill` | Native buffered/streaming completion, raw text/token IDs, declared FIM metadata |
+| POST | `/embedding`, `/embeddings` | Native pooled embeddings with requested normalization |
+| POST | `/v1/responses`, `/responses` | Responses wire adapter over admitted chat generation |
+| POST | `/v1/messages` | Anthropic Messages wire adapter over admitted chat generation |
+| POST | `/v1/chat/completions/input_tokens`, `/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/responses/input_tokens`, `/v1/messages/count_tokens` | Text prompt token counts from the inference renderer |
+| GET, DELETE | `/v1/stream` | Byte-offset replay or explicit producer cancellation by `conv_id` |
+| POST | `/v1/streams/lookup` | Lookup only requested conversation IDs, including model-qualified IDs |
 | POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Existing multipart transcription contract |
 | POST | `/v1/audio/speech`, `/audio/speech` | Existing speech contract |
 | GET | `/models/sse` | Initial state and changes to committed model load status; one-second polling, no invented progress |
@@ -64,20 +71,34 @@ orders, dynamic temperature, thinking budgets, continuation of a final assistant
 message, logit bias and other unsupported active controls are rejected with an
 `invalid_request_error`. Neutral dynamic-temperature settings are accepted.
 Optional progress/control subscription fields from Llama Chat are accepted, but
-`/props.nxrt_capabilities` states that realtime reasoning control and resumable
-streams are unavailable. Per-token timing/progress events are not promised.
-A dropped streaming connection cancels the driver receiver; Stop works by
-aborting that connection. A refresh cannot reconnect to an abandoned generation.
+`/props.nxrt_capabilities` advertises resumable streams and reports realtime
+reasoning control as unavailable. Per-token timing/progress events are not promised.
+An SSE request with `X-Conversation-Id` retains generation independently of its
+HTTP reader. Reconnect with `/v1/stream?conv_id=ID&from=BYTE_OFFSET`; DELETE cancels
+the producer. Retention defaults to 16 streams and 4 MiB per stream, with completed
+history expiring after five minutes. Old offsets fail explicitly once evicted.
+Requests without a conversation ID retain disconnect-cancels behavior.
+
+Native generation accepts one text prompt or one token-ID row. Prompt batches,
+`n_predict=0`, and infill extra files require further engine support. Native
+embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
+remain zero. Token-counting routes currently reject media because expanded media
+tokens must be counted after model preprocessing. Anthropic streaming receives
+the actual admitted prompt count (including media/session expansion) from the
+shared chat transaction, carried in its first chunk as `nxrt_prompt_tokens`.
+
+Responses and Messages share the chat tool/package capability checks. Stateful
+Responses continuation/storage, hosted tools and explicit thinking budgets are
+rejected. Streaming adapters preserve reasoning, tool argument deltas, usage and
+termination, and report upstream stream failures as errors.
 
 ## Remaining differences
 
 This is a functional Llama Chat integration, not a claim of complete llama-server
 parity. These upstream protocols are still unimplemented:
 
-- Native `/completion`, `/completions`, `/embedding`, `/embeddings`, `/infill`.
-- Responses and Anthropic Messages, their token-counting routes, and chat token counting.
 - Reranking, `/tts`, realtime audio/WebSocket inference and `/v1/systemone`.
-- Slot save/restore, LoRA hot swapping, resumable streams and reasoning control.
+- Slot save/restore, LoRA hot swapping and realtime reasoning control.
 - GGUF/Hugging Face model downloads and deletion.
 
 `/tools`, `/cors-proxy`, model download/delete and mutable `/props` return
