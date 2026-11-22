@@ -46,7 +46,7 @@ alternate protocols and their streamed usage; synthetic stream tests pin reasoni
 tool indices and incomplete-stream rejection.
 
 This milestone does not check off the full rows above: active-generation browser refresh/reconnect,
-native batching/prefill-only, timing/progress, additional
+native prefill-only, timing/progress, additional
 sampling and runtime-backed state/adapter work still need completion.
 
 Sampling follow-up: `logit_bias` now lowers OpenAI objects and native token/text
@@ -107,3 +107,19 @@ Reranking checkpoint: full server library 379 passed / 2 inherited ignores;
 metadata library 76 passed; both real engine ranking tests passed, including
 invalid score rejection. Strict server all-target Clippy and pinned asset checks
 pass. PR remains draft while the remaining compatibility work continues.
+
+Native-input follow-up: `/tokenize` and native completions share mixed text/token
+encoding with the pinned first-segment special-token policy and token vocabulary
+validation. Native completion batches are bounded, fully validated before any
+inference and executed sequentially through normal admission. Buffered arrays and
+SSE retain input indices; a disconnect or failed stream never submits later
+prompts. Native streaming now uses the tokenizer's incremental decoder and checks
+its published prefix against the final result, fixing missing word separators.
+HTTP tests compare mixed and explicit-token inference and buffered/streamed batch
+text; lifecycle tests exercise explicit completion, failure and disconnect.
+
+Native-input validation: full server library 384 passed / 2 inherited ignores,
+then all 24 selected native tests passed after the final stop-text and UTF-8
+regressions; strict all-target Clippy passes. The complete metadata test suite,
+including integration tests and the exhaustive workflow matrix, passes. The CI
+classification omission from the ranking fixture is fixed in the same branch.

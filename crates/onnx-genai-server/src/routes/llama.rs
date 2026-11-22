@@ -110,7 +110,7 @@ pub(crate) async fn props(
 pub(crate) struct TokenizeRequest {
     #[serde(default)]
     model: String,
-    content: String,
+    content: super::prompt::MixedPrompt,
     #[serde(default)]
     add_special: bool,
     #[serde(default)]
@@ -124,20 +124,13 @@ pub(crate) async fn tokenize(
     ApiJson(request): ApiJson<TokenizeRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
-    let encoding = handle
-        .tokenizer
-        .encode_with_options(
-            &request.content,
-            onnx_genai_ort::TokenizationOptions {
-                add_special: request.add_special,
-                parse_special: request.parse_special.unwrap_or(true),
-            },
-        )
-        .map_err(|err| {
-            ApiError::invalid_request(format!(
-                "content tokenization failed: {err}; check the model tokenizer.json"
-            ))
-        })?;
+    let encoding = request.content.encode(
+        &handle.tokenizer,
+        onnx_genai_ort::TokenizationOptions {
+            add_special: request.add_special,
+            parse_special: request.parse_special.unwrap_or(true),
+        },
+    )?;
     let tokens: Vec<Value> = if request.with_pieces {
         let pieces = onnx_genai_engine::tokenization::token_pieces(&handle.tokenizer, &encoding)
             .map_err(|err| {

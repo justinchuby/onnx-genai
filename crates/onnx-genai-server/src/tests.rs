@@ -6495,6 +6495,137 @@ mod native_compat {
         }
     }
     #[tokio::test]
+    async fn native_mixed_tokens_follow_first_segment_special_policy_and_generate() {
+        let router = app(tiny_state());
+        for (input, expected) in [
+            (json!(["hello", 5]), json!([2, 4, 3, 5])),
+            (json!([2, "hello", 5]), json!([2, 4, 5])),
+            (json!([4, "world"]), json!([4, 5])),
+        ] {
+            let response = request(
+                router.clone(),
+                "/tokenize",
+                json!({"content":input,"add_special":true}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["tokens"], expected);
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":input,"n_predict":2,"temperature":0,"return_tokens":true}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let actual = json_body(response).await;
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":expected,"n_predict":2,"temperature":0,"return_tokens":true}),
+            )
+            .await;
+            let explicit = json_body(response).await;
+            assert_eq!(actual["tokens"], explicit["tokens"]);
+            assert_eq!(actual["content"], explicit["content"]);
+            assert_eq!(
+                actual["tokens_evaluated"],
+                expected.as_array().unwrap().len()
+            );
+        }
+        for invalid in [
+            json!([4, -1]),
+            json!([4, 1.5]),
+            json!([4, true]),
+            json!([4, 4294967296u64]),
+        ] {
+            for path in ["/tokenize", "/completion"] {
+                let body = if path == "/tokenize" {
+                    json!({"content":invalid})
+                } else {
+                    json!({"prompt":invalid,"n_predict":1})
+                };
+                let response = request(router.clone(), path, body).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert!(
+                    json_body(response).await["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("input[1]")
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn native_prompt_batches_preserve_indices_for_buffered_and_streamed_results() {
+        let router = app(tiny_state());
+        let prompts = json!(["hello", [2, "world", 3], [4, 5], {"prompt_string":"hello", "multimodal_data":[]}]);
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":prompts,"n_predict":2,"temperature":0,"return_tokens":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let buffered = json_body(response).await;
+        assert_eq!(buffered.as_array().unwrap().len(), 4);
+        let response = request(router.clone(), "/completion",
+            json!({"prompt":prompts,"n_predict":2,"temperature":0,"return_tokens":true,"stream":true})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let events = sse_json_events(&bytes);
+        for index in 0..4 {
+            assert_eq!(buffered[index]["index"], index);
+            let rows: Vec<_> = events.iter().filter(|row| row["index"] == index).collect();
+            let final_row = rows.last().unwrap();
+            assert_eq!(final_row["stop"], true);
+            assert_eq!(
+                final_row["tokens_evaluated"],
+                buffered[index]["tokens_evaluated"]
+            );
+            let text = rows
+                .iter()
+                .map(|row| row["content"].as_str().unwrap())
+                .collect::<String>();
+            assert_eq!(text, buffered[index]["content"].as_str().unwrap());
+        }
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":["hello"],"n_predict":1}),
+        )
+        .await;
+        assert!(json_body(response).await.is_object());
+        for invalid in [
+            json!([]),
+            json!(["hello", [999999]]),
+            json!({"prompt_string":"hello","multimodal_data":["AAAA"]}),
+            json!({"prompt_string":"hello","typo":true}),
+        ] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":invalid,"n_predict":1,"stream":true}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let mut state = tiny_state();
+        state.config.max_completion_prompts = std::num::NonZeroUsize::new(1).unwrap();
+        let response = request(
+            app(state),
+            "/completion",
+            json!({"prompt":["hello","world"],"n_predict":1}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--max-completion-prompts")
+        );
+    }
+    #[tokio::test]
     async fn native_stream_ends_with_stop_and_supports_exact_prompt_token_ids() {
         let router = app(tiny_state());
         let tokens = fixture_tokenizer().encode("hello").unwrap();
@@ -6510,6 +6641,27 @@ mod native_compat {
         assert_eq!(events.last().unwrap()["stop"], true);
         assert!(events.iter().any(|event| event["stop"] == false));
         assert!(!std::str::from_utf8(&bytes).unwrap().contains("[DONE]"));
+    }
+    #[tokio::test]
+    async fn native_stop_text_is_omitted_from_buffered_and_streamed_content() {
+        let router = app(tiny_state());
+        for stream in [false, true] {
+            let response=request(router.clone(),"/completion",json!({
+                "prompt":"hello","n_predict":4,"temperature":0,"logit_bias":{"22":100},"stop":["tok22"],"stream":stream
+            })).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            if stream {
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let events = sse_json_events(&bytes);
+                assert_eq!(events.last().unwrap()["stop_type"], "word");
+                assert!(events.iter().all(|event| event["content"] == ""));
+            } else {
+                let body = json_body(response).await;
+                assert_eq!(body["stop_type"], "word");
+                assert_eq!(body["content"], "");
+                assert_eq!(body["tokens_predicted"], 1);
+            }
+        }
     }
     #[tokio::test]
     async fn native_errors_and_token_count_are_actionable() {
@@ -6765,9 +6917,37 @@ mod native_compat {
             body["tokens"],
             json!([{"id":4,"piece":[195]},{"id":5,"piece":[169]}])
         );
-        let response = request(router, "/detokenize", json!({"tokens":[4,5]})).await;
+        let response = request(router.clone(), "/detokenize", json!({"tokens":[4,5]})).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(json_body(response).await["content"], "é");
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({
+                "prompt":[2,4,3],"n_predict":2,"temperature":0,"logit_bias":{"4":100}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let expected = json_body(response).await;
+        assert!(!expected["content"].as_str().unwrap().is_empty());
+        let response = request(
+            router,
+            "/completion",
+            json!({
+                "prompt":[2,4,3],"n_predict":2,"temperature":0,"logit_bias":{"4":100},"stream":true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let events = sse_json_events(&bytes);
+        assert_eq!(events.last().unwrap()["stop"], true);
+        let text = events
+            .iter()
+            .map(|event| event["content"].as_str().unwrap())
+            .collect::<String>();
+        assert_eq!(text, expected["content"].as_str().unwrap());
     }
 
     #[tokio::test]

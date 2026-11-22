@@ -90,8 +90,17 @@ the producer. Retention defaults to 16 streams and 4 MiB per stream, with comple
 history expiring after five minutes. Old offsets fail explicitly once evicted.
 Requests without a conversation ID retain disconnect-cancels behavior.
 
-Native generation accepts one text prompt or one token-ID row. Prompt batches,
-`n_predict=0`, and infill extra files require further engine support. Native
+Native generation accepts text, token IDs, mixed text/token rows and prompt
+batches, including text-only `prompt_string` objects. Only a first text segment
+receives inserted special tokens; explicit IDs are vocabulary-checked. Batches
+are fully prepared before inference, execute sequentially through ordinary driver
+admission, and retain input indices in buffered results and SSE. A single result
+is an object; multiple buffered results form an array. The default limit is 128
+prompts (`--max-completion-prompts`). Disconnects and stream failures prevent
+submission of later prompts. Native streams decode incrementally and verify the
+published prefix against the final model text.
+`n_predict=0`, native multimodal prompt objects and infill extra files still
+require further engine support. Native
 embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
 remain zero. Token-counting routes use the same prompt renderer and declared media expansion
 as generation. They validate attachments and tool capability without executing a

@@ -428,6 +428,8 @@ pub struct ServerConfig {
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
     pub max_output_tokens: usize,
+    /// Maximum native completion prompts admitted by one request.
+    pub max_completion_prompts: std::num::NonZeroUsize,
     /// Per query/document pair input budget for non-generative scoring.
     pub max_rerank_input_tokens: std::num::NonZeroUsize,
     /// Maximum document count in one scoring request.
@@ -479,6 +481,8 @@ impl Default for ServerConfig {
         Self {
             node_id: default_node_id(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            max_completion_prompts: std::num::NonZeroUsize::new(128)
+                .expect("positive native prompt budget"),
             max_rerank_input_tokens: std::num::NonZeroUsize::new(8192)
                 .expect("positive default reranking token budget"),
             max_rerank_documents: std::num::NonZeroUsize::new(128)
