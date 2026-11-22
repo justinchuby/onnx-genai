@@ -218,32 +218,77 @@ fn deserialize_seed<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::E
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// Legacy completion wire fields plus the common generation controls.
+#[derive(Debug)]
 pub struct CompletionRequest {
-    pub model: String,
     pub prompt: String,
-    #[serde(default)]
     pub suffix: Option<String>,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
-    /// Absent when the caller left sampling to the model.
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    /// Absent when the caller left sampling to the model.
-    #[serde(default)]
-    pub top_p: Option<f32>,
-    #[serde(default)]
-    pub min_p: f32,
-    #[serde(default)]
-    pub frequency_penalty: f32,
-    #[serde(default)]
-    pub presence_penalty: f32,
-    #[serde(default)]
-    pub stream: bool,
-    #[serde(default)]
-    pub stop: Option<StopInput>,
-    #[serde(default)]
     pub logprobs: Option<usize>,
+    pub sampling: ChatCompletionRequest,
+}
+impl<'de> Deserialize<'de> for CompletionRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut body = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let prompt = body.remove("prompt").and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(||D::Error::custom("prompt is required and must be text for /v1/completions; use native /completion for mixed token/text batches"))?;
+        let suffix = body
+            .remove("suffix")
+            .map(serde_json::from_value::<Option<String>>)
+            .transpose()
+            .map_err(D::Error::custom)?
+            .flatten();
+        let logprobs = body
+            .remove("logprobs")
+            .map(serde_json::from_value::<Option<usize>>)
+            .transpose()
+            .map_err(|error| {
+                D::Error::custom(format!(
+                    "logprobs must be a non-negative integer or null: {error}"
+                ))
+            })?
+            .flatten();
+        for field in [
+            "messages",
+            "top_logprobs",
+            "chat_template_kwargs",
+            "add_generation_prompt",
+        ] {
+            if body.contains_key(field) {
+                return Err(D::Error::custom(format!(
+                    "{field} is not a raw text completion field; use /v1/chat/completions for chat rendering and use integer logprobs for legacy token probabilities"
+                )));
+            }
+        }
+        if let Some(echo) = body.remove("echo")
+            && echo != false
+        {
+            return Err(D::Error::custom(
+                "echo=true is unsupported; omit echo or send false to return only generated text",
+            ));
+        }
+        body.insert(
+            "messages".into(),
+            serde_json::json!([{"role":"user","content":""}]),
+        );
+        body.insert("logprobs".into(), serde_json::json!(logprobs.is_some()));
+        if let Some(count) = logprobs {
+            body.insert("top_logprobs".into(), serde_json::json!(count));
+        }
+        let sampling: ChatCompletionRequest =
+            serde_path_to_error::deserialize(serde_json::Value::Object(body))
+                .map_err(D::Error::custom)?;
+        if sampling.has_tool_context() || sampling.reasoning_effort.is_some() {
+            return Err(D::Error::custom(
+                "tools and reasoning_effort require /v1/chat/completions; raw completions do not render a chat template",
+            ));
+        }
+        Ok(Self {
+            prompt,
+            suffix,
+            logprobs,
+            sampling,
+        })
+    }
 }
 
 /// How much a reasoning model should think before answering, in OpenAI's
@@ -722,9 +767,6 @@ pub struct CompletionLogprobs {
     pub text_offset: Vec<usize>,
 }
 
-fn default_max_tokens() -> usize {
-    256
-}
 fn default_typical_p() -> f32 {
     1.0
 }

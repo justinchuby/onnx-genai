@@ -135,10 +135,22 @@ reports an actionable non-monotonic-decoder error instead of retracting bytes.
 Native transport consumes those canonical text events without decoding again.
 The full engine library passed 611 tests, with one existing external FIM-model
 ignore. OpenAI chat/completion HTTP tests compare streamed and buffered text,
-including tokenizer-inserted spaces. Legacy OpenAI completion request fields
-and default-model behavior still require the native/chat parity follow-up.
+including tokenizer-inserted spaces. Legacy OpenAI completion prompt batching remains a follow-up; generation-control
+and default-model parity is covered below.
 
 Engine-text checks: strict engine/server all-target Clippy, all 71 CLI library
 tests and the 291-asset provenance check pass. The server regression run covered
 the complete library; its new fixture-specific output assertion was corrected
 to compare actual buffered/streamed results and then passed independently.
+
+Legacy-completion follow-up: `/v1/completions` now lowers its wire-only prompt,
+suffix and integer logprobs into the common chat/native generation parameters.
+It no longer drops seed, logit_bias or other sampling fields. Default-model
+resolution, output/context admission, model defaults, stop visibility and opt-in
+streamed usage share the existing implementations. Unsupported controls fail
+explicitly, and wrapper deserialization preserves parameter paths in errors.
+Real ONNX HTTP tests force a non-default token with bias, verify exact buffered/
+streamed usage and text, terminate on a declared stop with max_tokens=-1, and
+exercise malformed and unknown fields. Full server: 388 passed / 2 inherited
+ignores; all 27 native/alternate protocol tests and strict all-target Clippy pass
+after the error-path and source-order lint fixes.

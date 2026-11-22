@@ -223,7 +223,7 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
         };
         if !accepted {
             return Err(ApiError::invalid_request(format!(
-                "chat request field '{key}' value {value} is unsupported; remove it or use a supported setting (see /props)"
+                "generation request field '{key}' value {value} is unsupported; remove it or use a supported setting (see /props)"
             )));
         }
     }

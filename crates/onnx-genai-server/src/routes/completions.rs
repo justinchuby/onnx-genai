@@ -4,10 +4,11 @@ use crate::tool_protocol::{self, ToolOutputConstraint, ToolProtocol};
 pub(crate) async fn completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    ApiJson(request): ApiJson<CompletionRequest>,
+    ApiJson(mut request): ApiJson<CompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let handle = resolve_model(&state.registry, &request.model).await?;
     validate_completion_request(&request, &state.config)?;
+    let handle = resolve_model(&state.registry, &request.sampling.model).await?;
+    request.sampling.model = handle.id.clone();
     let session_id = session_id_from_headers(&headers)?;
     if request.suffix.is_some() && handle.fim_config.is_none() {
         return Err(ApiError::invalid_request(
@@ -20,7 +21,7 @@ pub(crate) async fn completions(
         ));
     }
 
-    if request.stream {
+    if request.sampling.stream {
         Ok(stream_completion(state, handle, request, session_id)
             .await?
             .into_response())
@@ -151,10 +152,16 @@ async fn run_completion(
 ) -> Result<CompletionResponse, ApiError> {
     let id = text_completion_id();
     let created = now_unix();
-    let model = request.model.clone();
+    let model = request.sampling.model.clone();
     let requested_logprobs = request.logprobs;
+    let user_stop_sequences = request
+        .sampling
+        .stop
+        .clone()
+        .map(StopInput::into_texts)
+        .unwrap_or_default();
     let tokenizer = handle.tokenizer.clone();
-    let prepared = prepare_completion(&request, &handle)?;
+    let mut prepared = prepare_completion(&request, &handle, state.config.max_output_tokens)?;
     let conversational =
         conversational_session_id(&prepared.generation, client_session_id.as_deref());
     // Before the first driver round trip, so a second turn on a live session is
@@ -162,7 +169,15 @@ async fn run_completion(
     let lease = lease_bound_session(&handle, &state.sessions, conversational)?;
     let carried_tokens = carried_session_tokens(&handle, lease.as_ref()).await?;
     let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
-    enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
+    let output_budget = admit_output_budget(
+        &request.sampling,
+        prompt_tokens,
+        request
+            .sampling
+            .output_budget(state.config.max_output_tokens),
+        handle.model_max_context,
+    )?;
+    prepared.generation.options_mut().max_new_tokens = output_budget;
     let session = open_session_after_admission(&state, &handle, conversational, lease).await?;
     let generation = submit_completion(&handle, prepared.generation, session).await?;
     let collected = collect_generation_with_publications(generation.events)
@@ -180,7 +195,7 @@ async fn run_completion(
         created,
         model,
         choices: vec![CompletionChoice {
-            text: result.text,
+            text: text_before_stop(&result.text, &user_stop_sequences).to_owned(),
             index: 0,
             finish_reason: finish_reason_label(&result.finish_reason),
             logprobs,
@@ -202,15 +217,17 @@ async fn stream_completion(
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
     let id = text_completion_id();
     let created = now_unix();
-    let model = request.model.clone();
+    let model = request.sampling.model.clone();
     let requested_logprobs = request.logprobs;
+    let include_usage = request.sampling.stream_options.include_usage;
     let tokenizer = handle.tokenizer.clone();
     let user_stop_sequences = request
+        .sampling
         .stop
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
-    let prepared = prepare_completion(&request, &handle)?;
+    let mut prepared = prepare_completion(&request, &handle, state.config.max_output_tokens)?;
     let conversational =
         conversational_session_id(&prepared.generation, client_session_id.as_deref());
     // Before the first driver round trip, so a second turn on a live session is
@@ -218,7 +235,15 @@ async fn stream_completion(
     let lease = lease_bound_session(&handle, &state.sessions, conversational)?;
     let carried_tokens = carried_session_tokens(&handle, lease.as_ref()).await?;
     let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
-    enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
+    let output_budget = admit_output_budget(
+        &request.sampling,
+        prompt_tokens,
+        request
+            .sampling
+            .output_budget(state.config.max_output_tokens),
+        handle.model_max_context,
+    )?;
+    prepared.generation.options_mut().max_new_tokens = output_budget;
     let session = open_session_after_admission(&state, &handle, conversational, lease).await?;
     let generation = submit_completion(&handle, prepared.generation, session).await?;
     await_driver_admission(generation.admission).await?;
@@ -267,6 +292,7 @@ async fn stream_completion(
 
         match result {
             Ok(result) => {
+                let completion_tokens = result.token_ids.len();
                 if let Some(requested_logprobs) = requested_logprobs {
                     send_completion_logprob_chunks(
                         &tx,
@@ -280,7 +306,13 @@ async fn stream_completion(
                 } else if !emitted_text && !result.text.is_empty() {
                     send_completion_stream_chunk(
                         &tx,
-                        completion_chunk(&id, created, &model, result.text, None),
+                        completion_chunk(
+                            &id,
+                            created,
+                            &model,
+                            text_before_stop(&result.text, &user_stop_sequences).to_owned(),
+                            None,
+                        ),
                     )
                     .await?;
                 } else if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
@@ -303,6 +335,24 @@ async fn stream_completion(
                     ),
                 )
                 .await?;
+                if include_usage {
+                    let usage = CompletionResponse {
+                        id: id.clone(),
+                        object: "text_completion",
+                        created,
+                        model: model.clone(),
+                        choices: Vec::new(),
+                        usage: Usage {
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens: prompt_tokens + completion_tokens,
+                        },
+                        workflow_outputs: Vec::new(),
+                    };
+                    tx.send(Ok(Event::default().data(serde_json::to_string(&usage)?)))
+                        .await
+                        .context("completion usage receiver closed")?;
+                }
             }
             Err(err) => {
                 let error = generation_failure(err);
@@ -1313,32 +1363,6 @@ fn validate_completion_request(
     request: &CompletionRequest,
     config: &ServerConfig,
 ) -> Result<(), ApiError> {
-    if request.max_tokens == 0 {
-        return Err(ApiError::invalid_request(
-            "max_tokens must be greater than zero",
-        ));
-    }
-    if request.max_tokens > config.max_output_tokens {
-        return Err(ApiError::invalid_request(format!(
-            "max_tokens must be less than or equal to the server cap of {}",
-            config.max_output_tokens
-        )));
-    }
-    validate_sampling_range(request.temperature, "temperature")?;
-    validate_sampling_range(request.top_p, "top_p")?;
-    if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
-        return Err(ApiError::invalid_request(
-            "min_p must be finite and between 0 and 1",
-        ));
-    }
-    if !request.frequency_penalty.is_finite() {
-        return Err(ApiError::invalid_request(
-            "frequency_penalty must be finite",
-        ));
-    }
-    if !request.presence_penalty.is_finite() {
-        return Err(ApiError::invalid_request("presence_penalty must be finite"));
-    }
     if request
         .logprobs
         .is_some_and(|count| count > MAX_COMPLETION_LOGPROBS)
@@ -1347,6 +1371,8 @@ fn validate_completion_request(
             "logprobs must be between 0 and {MAX_COMPLETION_LOGPROBS}"
         )));
     }
+    validate_request(&request.sampling, config)?;
+    super::llama::validate_extensions(&request.sampling)?;
     Ok(())
 }
 
@@ -1697,14 +1723,22 @@ pub fn build_generate_request_with_protocol(
 pub(crate) fn prepare_completion(
     request: &CompletionRequest,
     handle: &ModelHandle,
+    output_cap: usize,
 ) -> Result<PreparedCompletion, ApiError> {
-    let mut options = build_completion_options(request);
+    let mut options = build_generate_options_with_tokenizer(
+        &request.sampling,
+        &handle.tokenizer,
+        request.sampling.output_budget(output_cap),
+    )
+    .map_err(|error| {
+        ApiError::invalid_request(format!("invalid completion generation controls: {error:#}"))
+    })?;
     options.max_context = handle.model_max_context;
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
     options.resolve_sampling_defaults(
         handle.generation_defaults.as_ref(),
-        &completion_sampling_overrides(request),
+        &chat_sampling_overrides(&request.sampling),
     );
     if let Some(suffix) = request.suffix.as_ref() {
         let fim_config = handle
@@ -1778,46 +1812,6 @@ fn tokenize_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<usize, ApiErro
         .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))
 }
 
-fn build_completion_options(request: &CompletionRequest) -> GenerateOptions {
-    let mut options = GenerateOptions {
-        max_new_tokens: request.max_tokens,
-        temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
-        top_p: request.top_p.unwrap_or(NEUTRAL_SAMPLING),
-        min_p: request.min_p,
-        frequency_penalty: request.frequency_penalty,
-        presence_penalty: request.presence_penalty,
-        top_logprobs: request.logprobs,
-        ..GenerateOptions::default()
-    };
-    if let Some(stop) = request.stop.clone() {
-        options.stop_sequences = stop.into_sequences();
-    }
-    options
-}
-
-/// The caller's *explicit* sampling selections for a text completion, feeding
-/// [`GenerateOptions::resolve_sampling_defaults`].
-///
-/// Completions historically decoded greedily by default. `temperature: 0`
-/// keeps that as an explicit greedy request; `min_p > 0` (the only stochastic
-/// knob the completions schema exposes) is an explicit request to sample.
-/// Otherwise the greedy decision is deferred (`None`) so a model that declares
-/// `do_sample: true` samples instead of looping under forced greedy.
-fn completion_sampling_overrides(request: &CompletionRequest) -> SamplingOverrides {
-    let greedy = if request.temperature == Some(0.0) {
-        Some(true)
-    } else if request.min_p > 0.0 {
-        Some(false)
-    } else {
-        None
-    };
-    SamplingOverrides {
-        greedy,
-        temperature: request.temperature,
-        top_p: request.top_p,
-        top_k: None,
-    }
-}
 /// The text spelling of this model's image placeholder, if it declares one.
 ///
 /// Decoded from the declared token id rather than hardcoded, so the prompt
@@ -3116,14 +3110,14 @@ mod sampling_resolution_tests {
         let request: CompletionRequest =
             serde_json::from_value(json!({ "model": "m", "prompt": "hi" })).unwrap();
         let mut options = GenerateOptions {
-            temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
-            top_p: request.top_p.unwrap_or(NEUTRAL_SAMPLING),
+            temperature: request.sampling.temperature.unwrap_or(NEUTRAL_SAMPLING),
+            top_p: request.sampling.top_p.unwrap_or(NEUTRAL_SAMPLING),
             ..GenerateOptions::default()
         };
         assert!(options.greedy, "completions default to greedy");
         options.resolve_sampling_defaults(
             Some(&declared(Some(true), Some(0.6))),
-            &completion_sampling_overrides(&request),
+            &chat_sampling_overrides(&request.sampling),
         );
         assert!(!options.greedy, "model do_sample=true must disable greedy");
         assert_eq!(

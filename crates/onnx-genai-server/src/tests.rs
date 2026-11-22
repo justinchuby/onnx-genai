@@ -2572,7 +2572,7 @@ fn completion_suffix_maps_to_fim_generation() {
     }))
     .unwrap();
 
-    let prepared = prepare_completion(&request, &handle).unwrap();
+    let prepared = prepare_completion(&request, &handle, 4096).unwrap();
     match prepared.generation {
         CompletionGeneration::Fim {
             prefix,
@@ -6706,6 +6706,95 @@ mod native_compat {
                 })
                 .collect::<String>();
             assert_eq!(text, expected, "{path}");
+        }
+    }
+    #[tokio::test]
+    async fn legacy_completion_uses_common_sampling_defaults_biases_and_stream_usage() {
+        let router = app(tiny_state());
+        let body = json!({"prompt":"hello","temperature":0,"max_tokens":2,
+            "seed":7,"top_k":8,"typ_p":0.9,"repeat_penalty":1.1,
+            "repeat_last_n":-1,"logit_bias":{"5":100},"echo":false});
+        let response = request(router.clone(), "/v1/completions", body.clone()).await;
+        let status = response.status();
+        let buffered = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{buffered}");
+        assert_eq!(buffered["model"], "tiny-llm");
+        assert_eq!(buffered["choices"][0]["text"], "world world");
+        assert_eq!(buffered["usage"]["completion_tokens"], 2);
+        let mut streamed = body;
+        streamed["stream"] = json!(true);
+        streamed["stream_options"] = json!({"include_usage":true});
+        let response = request(router.clone(), "/v1/completions", streamed).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let events = sse_json_events(&bytes);
+        let usage = events.last().unwrap();
+        assert_eq!(usage["model"], "tiny-llm");
+        assert_eq!(usage["choices"], json!([]));
+        assert_eq!(usage["usage"], buffered["usage"]);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|row| row["choices"][0]["text"].as_str())
+                .collect::<String>(),
+            "world world"
+        );
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .ends_with("data: [DONE]\n\n")
+        );
+        // -1 leaves only the server/context cap, rather than failing usize parsing.
+        let response=request(router.clone(),"/v1/completions",json!({
+            "prompt":"hello","temperature":0,"max_tokens":-1,"logit_bias":{"5":100},"stop":["world"]
+        })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["choices"][0]["text"], "");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["completion_tokens"], 1);
+        let response=request(router,"/v1/completions",json!({
+            "prompt":"hello","temperature":0,"max_tokens":2,"logit_bias":{"5":100},"stop":["world"],"stream":true
+        })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(
+            sse_json_events(&bytes)
+                .iter()
+                .filter_map(|row| row["choices"][0]["text"].as_str())
+                .collect::<String>(),
+            ""
+        );
+    }
+    #[tokio::test]
+    async fn legacy_completion_rejects_dropped_controls_and_invalid_common_sampling() {
+        let router = app(tiny_state());
+        for (control, field) in [
+            (json!({"samplers":["temperature"]}), "samplers"),
+            (json!({"misspelled_control":true}), "misspelled_control"),
+            (json!({"logit_bias":{"999999":100}}), "token"),
+            (json!({"seed":-2}), "seed"),
+            (json!({"seed":true}), "seed"),
+            (json!({"temperature":"warm"}), "temperature"),
+            (json!({"echo":true}), "echo"),
+            (
+                json!({"chat_template_kwargs":{"x":true}}),
+                "chat_template_kwargs",
+            ),
+            (json!({"logprobs":true}), "logprobs"),
+        ] {
+            let mut body = json!({"prompt":"hello","max_tokens":1});
+            body.as_object_mut()
+                .unwrap()
+                .extend(control.as_object().unwrap().clone());
+            let response = request(router.clone(), "/v1/completions", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+            let body = json_body(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(
+                body["error"]["message"].as_str().unwrap().contains(field),
+                "{body}"
+            );
         }
     }
     #[tokio::test]

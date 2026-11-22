@@ -74,8 +74,8 @@ fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, Ap
             return Err(ApiError::invalid_request("send json_schema or response_format, not both"));
     }
     body.insert("messages".into(), json!([{"role":"user","content":""}]));
-    let sampling: ChatCompletionRequest =
-        serde_json::from_value(Value::Object(body)).map_err(|err| {
+    let sampling: ChatCompletionRequest = serde_path_to_error::deserialize(Value::Object(body))
+        .map_err(|err| {
             ApiError::invalid_request(format!(
                 "invalid native generation parameters: {err}; use the fields advertised by /props"
             ))
@@ -418,7 +418,8 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                         index,
                         &stops,
                     );
-                    let Some(tail) = visible_text(&result.text, &stops).strip_prefix(&published)
+                    let Some(tail) =
+                        text_before_stop(&result.text, &stops).strip_prefix(&published)
                     else {
                         let _ = tx.send(Ok(Event::default().event("error").data(json!({
                             "error":{"message":"native tokenizer's final text does not preserve the published stream prefix; repair its incremental decoder or retry with stream=false","type":"server_error","code":500},"index":index
@@ -464,15 +465,6 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
         completed: outcome,
     })
 }
-fn visible_text<'a>(text: &'a str, stops: &[String]) -> &'a str {
-    let cutoff = stops
-        .iter()
-        .filter(|stop| !stop.is_empty())
-        .filter_map(|stop| text.find(stop))
-        .min()
-        .unwrap_or(text.len());
-    &text[..cutoff]
-}
 fn final_value(
     model: &str,
     prompt_tokens: usize,
@@ -487,7 +479,7 @@ fn final_value(
         FinishReason::StopSequence { .. } => "word",
         FinishReason::EosToken | FinishReason::ToolCalls => "eos",
     };
-    json!({"content":visible_text(&result.text, stops),"tokens":if return_tokens && !streaming { result.token_ids.clone() } else {vec![]},
+    json!({"content":text_before_stop(&result.text, stops),"tokens":if return_tokens && !streaming { result.token_ids.clone() } else {vec![]},
         "stop":true,"index":index,"model":model,"tokens_predicted":result.token_ids.len(),
         "tokens_evaluated":prompt_tokens,"tokens_cached":result.prefix_cache_hit_len,
         "stop_type":stop_type,"truncated":matches!(result.finish_reason, FinishReason::Length)})

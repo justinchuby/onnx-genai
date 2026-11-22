@@ -100,7 +100,7 @@ fn array(value: Value, field: &str) -> Result<Vec<Value>, ApiError> {
         .ok_or_else(|| ApiError::invalid_request(format!("{field} must be an array")))
 }
 fn chat(body: Map<String, Value>) -> Result<ChatCompletionRequest, ApiError> {
-    serde_json::from_value(Value::Object(body)).map_err(|err| {
+    serde_path_to_error::deserialize(Value::Object(body)).map_err(|err| {
         ApiError::invalid_request(format!(
             "invalid generation request: {err}; check messages, tools and sampling fields"
         ))

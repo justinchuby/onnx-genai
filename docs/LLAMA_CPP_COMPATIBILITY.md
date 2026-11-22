@@ -25,7 +25,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/detokenize` | `tokens`, optional `model`; preserves special tokens, rejects absent vocabulary IDs |
 | POST | `/apply-template` | Chat request fields; same prompt renderer as chat inference |
 | POST | `/v1/chat/completions`, `/chat/completions` | Buffered/streaming text, tools, reasoning, declared image/audio inputs |
-| POST | `/v1/completions` | Existing OpenAI text/FIM completion contract |
+| POST | `/v1/completions` | OpenAI text/FIM completion with shared generation controls, default model and optional stream usage |
 | POST | `/v1/embeddings` | Existing OpenAI embedding contract |
 | POST | `/completion`, `/completions`, `/infill` | Native buffered/streaming completion, bounded text/token/mixed batches, declared FIM metadata |
 | POST | `/embedding`, `/embeddings` | Native pooled embeddings with requested normalization |
@@ -77,6 +77,17 @@ rejected because these models execute in-process with explicit nxrt settings.
   token sequences. Matching does not cross complete breakers; partial sequences
   remain ordinary history. `dry_penalty_last_n` bounds prompt/generated history,
   with -1 for full history and 0 to disable DRY.
+
+Legacy `/v1/completions` uses the same generation-control parser, validation,
+token biases, model sampling defaults and context admission as chat/native
+completion. Its `model` is optional and responses report the resolved model ID.
+It retains integer `logprobs` (0..5), accepts `echo=false`, and emits true usage
+before `[DONE]` when `stream_options.include_usage=true`. Text output omits stop
+strings in both buffered and streaming modes. Unknown controls are rejected;
+chat-template fields and tools require the chat endpoint. The default output
+budget follows the configured cap and remaining context; `max_tokens=-1` leaves
+that limit to the server. This endpoint currently accepts one text prompt;
+native `/completion` additionally accepts mixed and batched prompts.
 
 The sampler pipeline is nxrt's existing fixed pipeline. Arbitrary `samplers`
 orders, dynamic temperature, thinking budgets, continuation of a final assistant

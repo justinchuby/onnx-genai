@@ -273,6 +273,16 @@ pub(crate) fn buffered_workflow_publication(
 
 /// Render the same semantic record for an SSE data field. Delivery failure from
 /// the caller of this function cannot change the already committed envelope.
+pub(crate) fn text_before_stop<'a>(text: &'a str, stops: &[String]) -> &'a str {
+    let cutoff = stops
+        .iter()
+        .filter(|stop| !stop.is_empty())
+        .filter_map(|stop| text.find(stop))
+        .min()
+        .unwrap_or(text.len());
+    &text[..cutoff]
+}
+
 #[cfg(test)]
 pub(crate) fn sse_workflow_publication_data(
     publication: &WorkflowOutputPublication,
