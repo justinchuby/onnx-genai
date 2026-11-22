@@ -41,7 +41,7 @@ use super::int4_nibble;
 use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_f32};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
-use crate::resources::{DerivedWeightGrant, WeightAdmission};
+use crate::resources::{DerivedWeightGrant, IdleWeightCache, WeightAdmission};
 use crate::strided::numel;
 use crate::{CpuMemoryResources, DerivedWeightMemory};
 
@@ -693,16 +693,16 @@ pub struct MatMulNBitsKernel {
     weight_prepacked: bool,
     constant_inputs: [bool; 5],
     dense_weights: DenseWeightCache<NBitsDenseKey>,
-    int8_weight: OnceLock<PreparedWeight<Int8Weight>>,
-    packed_int4_weight: OnceLock<PreparedWeight<PackedInt4Weight>>,
-    packed_int4_n16_weight: OnceLock<PreparedWeight<PackedN16SdotWeight>>,
-    packed_kai_qsi4_weight: OnceLock<PreparedWeight<PackedKaiSdotWeight>>,
-    packed_nbits_weight: OnceLock<PreparedWeight<PackedNBitsWeight>>,
+    int8_weight: NativeWeightCache<Int8Weight>,
+    packed_int4_weight: NativeWeightCache<PackedInt4Weight>,
+    packed_int4_n16_weight: NativeWeightCache<PackedN16SdotWeight>,
+    packed_kai_qsi4_weight: NativeWeightCache<PackedKaiSdotWeight>,
+    packed_nbits_weight: NativeWeightCache<PackedNBitsWeight>,
     weight_memory: DerivedWeightMemory,
     native_pack_fill: std::sync::Mutex<()>,
-    packed_u8_weight: OnceLock<PreparedWeight<PackedU8Weight>>,
-    packed_u8_n16_weight: OnceLock<PreparedWeight<PackedN16SdotWeight>>,
-    packed_kai_qsi8_weight: OnceLock<PreparedWeight<PackedKaiSdotWeight>>,
+    packed_u8_weight: NativeWeightCache<PackedU8Weight>,
+    packed_u8_n16_weight: NativeWeightCache<PackedN16SdotWeight>,
+    packed_kai_qsi8_weight: NativeWeightCache<PackedKaiSdotWeight>,
     #[cfg(feature = "mlas")]
     mlas_shards: OnceLock<Option<Arc<Vec<Option<MlasShard>>>>>,
     #[cfg(feature = "mlas")]
@@ -1417,6 +1417,7 @@ struct PackedNBitsWeight {
 /// Declaration order frees all payload buffers before returning capacity.
 struct PreparedWeight<T> {
     weight: T,
+    bytes: usize,
     _grant: DerivedWeightGrant,
 }
 impl<T> std::ops::Deref for PreparedWeight<T> {
@@ -1426,12 +1427,61 @@ impl<T> std::ops::Deref for PreparedWeight<T> {
     }
 }
 
-/// A cached borrow or a call-owned preparation always keeps its funding alive.
-enum PreparedWeightRef<'a, T> {
-    Cached(&'a PreparedWeight<T>),
+/// A kernel's immutable native layout slot. Readers own the payload so idle
+/// eviction never returns funding while a matrix multiplication still uses it.
+struct NativeWeightCache<T> {
+    inner: Arc<std::sync::Mutex<Option<Arc<PreparedWeight<T>>>>>,
+}
+impl<T: Send + Sync + 'static> NativeWeightCache<T> {
+    fn new(memory: &DerivedWeightMemory) -> Self {
+        let inner = Arc::new(std::sync::Mutex::new(None));
+        memory.register_idle_cache(&inner);
+        Self { inner }
+    }
+    fn get(&self) -> Option<Arc<PreparedWeight<T>>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    fn insert(&self, weight: Arc<PreparedWeight<T>>) {
+        let old = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(weight);
+        // Returning grants can call an external accountant; never do so under
+        // the cache lock, including when replacing an entry in a cold fill.
+        drop(old);
+    }
+}
+impl<T: Send + Sync> IdleWeightCache for std::sync::Mutex<Option<Arc<PreparedWeight<T>>>> {
+    fn reclaim_idle(&self, want: usize) -> Result<usize> {
+        let retired = {
+            let mut slot = self
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if want == 0
+                || slot
+                    .as_ref()
+                    .is_none_or(|weight| Arc::strong_count(weight) != 1)
+            {
+                return Ok(0);
+            }
+            slot.take()
+        };
+        let bytes = retired.as_ref().map_or(0, |weight| weight.bytes);
+        drop(retired);
+        Ok(bytes)
+    }
+}
+
+/// A shared cached reader or call-owned preparation keeps its funding alive.
+enum PreparedWeightRef<T> {
+    Cached(Arc<PreparedWeight<T>>),
     Owned(PreparedWeight<T>),
 }
-impl<T> std::ops::Deref for PreparedWeightRef<'_, T> {
+impl<T> std::ops::Deref for PreparedWeightRef<T> {
     type Target = T;
     fn deref(&self) -> &T {
         match self {
@@ -1453,7 +1503,7 @@ enum NativePackLayout {
 
 /// A payload's Rust type fixes its physical layout and preparation recipe.
 /// Admission cannot accidentally charge a compact layout for an expanded pack.
-trait NativePackedWeight: Sized {
+trait NativePackedWeight: Sized + Send + Sync + 'static {
     const LAYOUT: NativePackLayout;
     fn build(
         kernel: &MatMulNBitsKernel,
@@ -1562,7 +1612,7 @@ struct PackedNBitsView<'a> {
 /// Ownership is necessary only when conversion or explicit placement requires it.
 enum PackedNBitsOperand<'a> {
     View(PackedNBitsView<'a>),
-    Prepared(PreparedWeightRef<'a, PackedNBitsWeight>),
+    Prepared(PreparedWeightRef<PackedNBitsWeight>),
 }
 
 impl PackedNBitsOperand<'_> {
@@ -1855,16 +1905,16 @@ impl KernelFactory for MatMulNBitsFactory {
                     0
                 },
             ),
-            int8_weight: OnceLock::new(),
-            packed_int4_weight: OnceLock::new(),
-            packed_int4_n16_weight: OnceLock::new(),
-            packed_kai_qsi4_weight: OnceLock::new(),
-            packed_nbits_weight: OnceLock::new(),
+            int8_weight: NativeWeightCache::new(self.resources.weight_memory()),
+            packed_int4_weight: NativeWeightCache::new(self.resources.weight_memory()),
+            packed_int4_n16_weight: NativeWeightCache::new(self.resources.weight_memory()),
+            packed_kai_qsi4_weight: NativeWeightCache::new(self.resources.weight_memory()),
+            packed_nbits_weight: NativeWeightCache::new(self.resources.weight_memory()),
             weight_memory: self.resources.weight_memory().clone(),
             native_pack_fill: std::sync::Mutex::new(()),
-            packed_u8_weight: OnceLock::new(),
-            packed_u8_n16_weight: OnceLock::new(),
-            packed_kai_qsi8_weight: OnceLock::new(),
+            packed_u8_weight: NativeWeightCache::new(self.resources.weight_memory()),
+            packed_u8_n16_weight: NativeWeightCache::new(self.resources.weight_memory()),
+            packed_kai_qsi8_weight: NativeWeightCache::new(self.resources.weight_memory()),
             #[cfg(feature = "mlas")]
             mlas_owned: MlasPackedOwnership::default(),
             #[cfg(feature = "mlas")]
@@ -2663,14 +2713,14 @@ impl MatMulNBitsKernel {
         )?))
     }
 
-    fn load_native_weight<'a, T: NativePackedWeight>(
-        &'a self,
-        cache: &'a OnceLock<PreparedWeight<T>>,
+    fn load_native_weight<T: NativePackedWeight>(
+        &self,
+        cache: &NativeWeightCache<T>,
         retain: bool,
         packed: &TensorView,
         scales: &TensorView,
         zero_points: Option<&TensorView>,
-    ) -> Result<PreparedWeightRef<'a, T>> {
+    ) -> Result<PreparedWeightRef<T>> {
         if !retain {
             return self
                 .prepare_native_weight(packed, scales, zero_points)
@@ -2679,8 +2729,8 @@ impl MatMulNBitsKernel {
         if let Some(weight) = cache.get() {
             return Ok(PreparedWeightRef::Cached(weight));
         }
-        // No data/accounting lock is held. Pressure callbacks never take this
-        // cold-fill gate. All native packs share the same admission mechanism.
+        // Pressure callbacks take only the payload lock, never this fill gate.
+        // Admission and construction cannot run under a payload/accounting lock.
         let _fill = self
             .native_pack_fill
             .lock()
@@ -2688,10 +2738,11 @@ impl MatMulNBitsKernel {
         if let Some(weight) = cache.get() {
             return Ok(PreparedWeightRef::Cached(weight));
         }
-        let _ = cache.set(self.prepare_native_weight(packed, scales, zero_points)?);
-        Ok(PreparedWeightRef::Cached(cache.get().expect(
-            "serialized native weight preparation initialized the cache",
-        )))
+        let weight = Arc::new(self.prepare_native_weight(packed, scales, zero_points)?);
+        cache.insert(Arc::clone(&weight));
+        // Keep a reader before publishing: pressure cannot remove a new pack
+        // between installation and the executing caller taking ownership.
+        Ok(PreparedWeightRef::Cached(weight))
     }
 
     fn prepare_native_weight<T: NativePackedWeight>(
@@ -2712,6 +2763,7 @@ impl MatMulNBitsKernel {
         let owned = grant.split_off(bytes)?;
         Ok(PreparedWeight {
             weight,
+            bytes,
             _grant: owned,
         })
     }
@@ -12895,6 +12947,95 @@ mod tests {
     }
 
     #[test]
+    fn native_pack_pressure_preserves_readers_reclaims_idle_and_rebuilds() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        fn check<T: NativePackedWeight>(
+            bits: usize,
+            slot: impl Fn(&MatMulNBitsKernel) -> &NativeWeightCache<T>,
+        ) {
+            let (k, n, block) = (16, 1, 16);
+            let b = Owned::u8(&[n, 1, block * bits / 8], &vec![0x39; block * bits / 8]);
+            let scales = Owned::f32(&[n, 1], &[0.125]);
+            let mut sizing = test_kernel(k, n, block);
+            sizing.bits = bits;
+            let (bytes, peak) = sizing
+                .native_preparation_bytes(T::LAYOUT, &b.view(), &scales.view(), None, false)
+                .unwrap();
+            let (governor, resources) = governed_dense_resources(peak, 0);
+            let owner = MatMulNBitsFactory::new(resources)
+                .create(&governed_dense_node(k, n, bits, block), &[])
+                .unwrap();
+            let kernel = owner.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+            let active = kernel
+                .load_native_weight(slot(kernel), true, &b.view(), &scales.view(), None)
+                .unwrap();
+            assert_eq!(governor.used(Tier::Host), bytes as u64);
+            let active_pressure = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        governor.reserve(
+                            Tier::Host,
+                            peak as u64,
+                            MemoryRole::KvCache,
+                            HolderId::new(2),
+                        )
+                    })
+                    .join()
+                    .unwrap()
+            });
+            assert!(
+                matches!(
+                    active_pressure,
+                    Err(onnx_runtime_memory_api::MemoryError::TierExhausted { .. })
+                ),
+                "another thread's pressure must not remove a pack held by an executing reader"
+            );
+            let warm = kernel
+                .load_native_weight(slot(kernel), true, &b.view(), &scales.view(), None)
+                .unwrap();
+            assert!(std::ptr::eq::<T>(&*active, &*warm));
+            drop(warm);
+            drop(active);
+            let kv = governor
+                .reserve(
+                    Tier::Host,
+                    peak as u64,
+                    MemoryRole::KvCache,
+                    HolderId::new(2),
+                )
+                .unwrap();
+            assert!(
+                slot(kernel).get().is_none(),
+                "the supplying authority must reclaim an idle native pack"
+            );
+            assert_eq!(governor.used(Tier::Host), peak as u64);
+            drop(kv);
+            assert_eq!(governor.used(Tier::Host), 0);
+            let rebuilt = kernel
+                .load_native_weight(slot(kernel), true, &b.view(), &scales.view(), None)
+                .unwrap();
+            assert_eq!(governor.used(Tier::Host), bytes as u64);
+            drop(owner);
+            assert_eq!(
+                governor.used(Tier::Host),
+                bytes as u64,
+                "kernel destruction must not refund a pack still held by a caller"
+            );
+            drop(rebuilt);
+            assert_eq!(governor.used(Tier::Host), 0);
+        }
+        check::<Int8Weight>(4, |k| &k.int8_weight);
+        check::<PackedInt4Weight>(4, |k| &k.packed_int4_weight);
+        check::<PackedNBitsWeight>(4, |k| &k.packed_nbits_weight);
+        check::<PackedU8Weight>(8, |k| &k.packed_u8_weight);
+        check::<PackedN16SdotWeight>(4, |k| &k.packed_int4_n16_weight);
+        check::<PackedN16SdotWeight>(8, |k| &k.packed_u8_n16_weight);
+        check::<PackedKaiSdotWeight>(4, |k| &k.packed_kai_qsi4_weight);
+        check::<PackedKaiSdotWeight>(8, |k| &k.packed_kai_qsi8_weight);
+    }
+
+    #[test]
     fn native_pack_grants_match_real_payloads_and_bound_transformation_peaks() {
         use onnx_runtime_memory_api::{MemoryRole, Tier};
         use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
@@ -12916,7 +13057,7 @@ mod tests {
                 for capacity in [peak - 1, peak] {
                     let (governor, resources) = governed_dense_resources(capacity, 0);
                     kernel.weight_memory = resources.weight_memory().clone();
-                    let cache = OnceLock::<PreparedWeight<T>>::new();
+                    let cache = NativeWeightCache::<T>::new(resources.weight_memory());
                     let value = kernel.load_native_weight(&cache, retain, packed, scales, points);
                     if capacity < peak {
                         assert!(matches!(
@@ -13169,7 +13310,7 @@ mod tests {
             let (governor, resources) = governed_dense_resources(capacity, 0);
             let mut kernel = test_kernel(16, 1, 16);
             kernel.weight_memory = resources.weight_memory().clone();
-            let cache = OnceLock::<PreparedWeight<Broken>>::new();
+            let cache = NativeWeightCache::<Broken>::new(resources.weight_memory());
             let failure = kernel
                 .load_native_weight(&cache, true, &b.view(), &scales.view(), None)
                 .err()
@@ -13679,16 +13820,16 @@ mod tests {
             weight_prepacked: false,
             constant_inputs: [false; 5],
             dense_weights: DenseWeightCache::default(),
-            int8_weight: OnceLock::new(),
-            packed_u8_weight: OnceLock::new(),
-            packed_int4_weight: OnceLock::new(),
-            packed_int4_n16_weight: OnceLock::new(),
-            packed_kai_qsi4_weight: OnceLock::new(),
-            packed_nbits_weight: OnceLock::new(),
+            int8_weight: NativeWeightCache::new(&DerivedWeightMemory::default()),
+            packed_u8_weight: NativeWeightCache::new(&DerivedWeightMemory::default()),
+            packed_int4_weight: NativeWeightCache::new(&DerivedWeightMemory::default()),
+            packed_int4_n16_weight: NativeWeightCache::new(&DerivedWeightMemory::default()),
+            packed_kai_qsi4_weight: NativeWeightCache::new(&DerivedWeightMemory::default()),
+            packed_nbits_weight: NativeWeightCache::new(&DerivedWeightMemory::default()),
             weight_memory: DerivedWeightMemory::default(),
             native_pack_fill: std::sync::Mutex::new(()),
-            packed_u8_n16_weight: OnceLock::new(),
-            packed_kai_qsi8_weight: OnceLock::new(),
+            packed_u8_n16_weight: NativeWeightCache::new(&DerivedWeightMemory::default()),
+            packed_kai_qsi8_weight: NativeWeightCache::new(&DerivedWeightMemory::default()),
             #[cfg(feature = "mlas")]
             mlas_owned: MlasPackedOwnership::default(),
             #[cfg(feature = "mlas")]
@@ -14165,32 +14306,32 @@ mod tests {
     /// route: MLAS SQNBit (`mlas_shards` or serialized `mlas_packed`) when
     /// available, otherwise the hand GEMV/int8 caches. Returning a raw address
     /// lets tests assert the cache is *reused* (stable) across calls, not merely
-    /// populated. Compact packs stay in their OnceLock; f32 payloads keep a
-    /// stable Arc allocation while retained in the owned dense cache.
+    /// populated. Native packs and f32 payloads keep stable Arc allocations
+    /// while retained, and may be rebuilt after pressure evicts an idle slot.
     fn prepack_cache_ptr(kernel: &MatMulNBitsKernel) -> Option<*const ()> {
         if let Some(w) = cached_dense_weight(kernel) {
             return Some(Arc::as_ptr(&w).cast());
         }
         if let Some(w) = kernel.int8_weight.get() {
-            return Some(w as *const _ as *const ());
+            return Some(Arc::as_ptr(&w).cast());
         }
         if let Some(w) = kernel.packed_int4_weight.get() {
-            return Some(w as *const _ as *const ());
+            return Some(Arc::as_ptr(&w).cast());
         }
         if let Some(w) = kernel.packed_int4_n16_weight.get() {
-            return Some(w as *const _ as *const ());
+            return Some(Arc::as_ptr(&w).cast());
         }
         if let Some(w) = kernel.packed_kai_qsi4_weight.get() {
-            return Some(w as *const _ as *const ());
+            return Some(Arc::as_ptr(&w).cast());
         }
         if let Some(w) = kernel.packed_nbits_weight.get() {
-            return Some(w as *const _ as *const ());
+            return Some(Arc::as_ptr(&w).cast());
         }
         if let Some(w) = kernel.packed_u8_n16_weight.get() {
-            return Some(w as *const _ as *const ());
+            return Some(Arc::as_ptr(&w).cast());
         }
         if let Some(w) = kernel.packed_kai_qsi8_weight.get() {
-            return Some(w as *const _ as *const ());
+            return Some(Arc::as_ptr(&w).cast());
         }
         #[cfg(feature = "mlas")]
         if let Some(w) = kernel.mlas_shards.get() {

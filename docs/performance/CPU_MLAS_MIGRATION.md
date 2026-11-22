@@ -732,9 +732,26 @@ Half/bfloat scales and strided inputs still require preparation. Constants
 reuse that prepared allocation; dynamic inputs own it only during execution.
 An active NUMA/SPMD placement scope also retains the existing first-touch
 preparation, even on a pool with one node. Layout-transforming int4/int8 packs
-are separate work and are not made borrowed by this change. The compact owned
-packs still need governor admission and pressure reclamation; the f32 expansion
-cache's owned Host grants do not govern these other allocations.
+are separate work and are not made borrowed by this change. All eight native
+prepared-pack slots now own Host grants covering their retained buffers; build
+admission also covers simultaneous conversion/placement sources. Their typed
+cache registers with the same authority pressure mechanism as dense expansions.
+An executing call holds an `Arc` to its pack: pressure evicts only a slot with no
+external readers, drops its buffers and grant outside the cache lock, and the
+next call can rebuild under fresh admission. Destroying the kernel does not
+refund a pack still held by a caller. The normal cache read takes a short mutex
+and clones an `Arc`; it allocates or copies no weight data. The existing separate
+cold-fill gate remains, so memory admission and construction do not run under a
+payload lock. This is a lifecycle change, not a throughput claim.
+
+`native_pack_pressure_preserves_readers_reclaims_idle_and_rebuilds` exercises all
+eight factory-wired slots using real Host/KV reservations, including pressure
+from another thread. Existing native-pack tests continue to verify payload and
+conversion-peak byte accounting, refusal before construction, failed-builder
+refund, warm reuse, dynamic call ownership, and the actual selected operator
+cache. Compact borrowing and numerical kernels are unchanged. Native packs are
+still kernel-local; cross-kernel sharing and pressure eviction of the remaining
+MLAS research memo/store owners are separate work.
 
 ## Reference reachability and numerical comparisons
 
