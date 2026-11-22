@@ -982,3 +982,81 @@ constant preparation or retained operand conversion. Allocation still follows
 storage presence; view dispatch keeps its existing immutable-source path. Static
 and runtime flag disagreement declines static adoption and prepares normally.
 This does not redesign view provenance or fund legacy transpose payloads.
+
+
+### Materialized operand identity includes logical layout
+
+Immutable backing bytes can feed runtime views with different logical layouts.
+The former dense-f32 and contiguous-half keys used only address/type/element
+count, so equal-size views at the same origin could reuse a stale copy. Both
+now use one typed copy key containing effective source address (including byte
+offset), source dtype, full shape and signed element strides. Output element
+width is a type parameter; payload bytes still use checked shape arithmetic.
+No compatibility key or alternate classification remains.
+
+The existing node owner and WeightCache admission/pressure/reader rules remain
+in force. Distinct views own distinct funded copies; repeated identical views
+reuse the same allocation, including after owner adoption by a sibling kernel.
+Direct initializer predictions still count one immutable layout per operand;
+custom runtime views are not represented by WeightRef and rely on actual grants.
+This corrects materialized-copy identity, not transpose funding or native panel
+source-lifetime policy.
+
+
+### Keep derived-weight accounting out of steady cache hits
+
+A warm reader consumes the payload's existing grant. It must not request a
+sibling lease, return capacity or enter the accountant/pressure machinery merely
+because a kernel executes again. Ordinary MatMul dense and contiguous-half
+copies now use the existing single-entry cache lookup before the cold group
+builder, avoiding group result/status containers on the warm path. Their full
+logical-layout keys store common ranks inline; arbitrary ranks spill correctly
+rather than introducing a rank limit. LRU updates and live-reader protection
+remain in place, and the cold transactional builder is unchanged.
+
+A real public-provider MatMul control verifies a cold 24-byte dense grant
+(and the checked optional research SGEMM panel when that backend is active),
+4,096 warm executions with zero further claims, including zero-byte requests,
+or releases, and exact payload refunds at teardown. A retention-off control observes a claim and
+refund for every transient copy, so a disconnected observer cannot pass. Warm
+reuse does not remove admission for real allocations or hide transient costs.
+
+The `weight_admission_ab` release benchmark interleaves real kernel executions
+with local/governed resources, a duplicate local A/A arm, and an unaffected
+contiguous-f32 control. It separates retained and transient policies, excludes
+warm-up, retains per-round samples, and reports both wall and process CPU time.
+The host-lock wrapper must cover the whole comparison. Zero warm callbacks are
+a structural invariant; timing alone cannot establish universal zero overhead.
+
+
+### Packed weights retain source identity without pinning source payloads
+
+An owned conversion buffer can leave its dense cache while a packed panel is
+still useful. Its allocation address is not a durable identity: the next
+conversion can reuse the same storage for different immutable source values.
+Keep the typed DenseOperand through the shared MatMul compute helper instead
+of erasing its ownership to a slice before optional SGEMM preparation.
+
+A materialized source now identifies its Arc owner through a weak key. The key
+reserves the owner's control block, so that identity address cannot be recycled
+while the cache entry lives. It keeps neither the vector's heap elements nor
+their Host grant alive. The identity type accepts flat-vector owners, whose
+payload allocation is separate from the control block. Live panel readers keep
+the independent packed payload and its own grant. Original borrowed sources
+use the complete logical-view key; this also fixes half-packing collisions
+between equal-size strided views of the same immutable backing storage.
+
+A call-owned, ungoverned conversion lacks a proven immutable identity and uses
+the existing unpacked computation. The old raw-slice packed-B interface is
+removed rather than retained as a compatibility path. No global identity
+counter, registry or cache scan is needed. The native production build adds no
+identity bookkeeping: weak identities are compiled with the optional reference
+packing consumer. The native build retains its original slice compute interface;
+the optional packing build carries typed ownership to its consumer.
+
+Controls explicitly move one conversion allocation into a new owner, establish
+identical data addresses without allocator assumptions, and verify different
+packed numerical results. They also verify that source grants retire while
+old panel readers remain valid, identical owners reuse a panel, full half-view
+identity separates layouts, and call-owned conversion falls through correctly.
+Legacy process-global transpose payload funding/lifetime policy remains work.
