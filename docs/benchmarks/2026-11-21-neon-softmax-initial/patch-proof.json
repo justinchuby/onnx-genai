@@ -1,0 +1,8 @@
+{
+  "base": "a584e1544f6a7d7ec1f10f6dc54d40c90f174918",
+  "candidate": "0569b131866041d882e5d22d4f9ce146ac500123",
+  "patch_sha256": "e6fde048e85ac1842532fc8dd47a44683321be673b132b47ba7ff8710ce9fcdb",
+  "applied_tree": "6489e232435f42216aa37f66ffd117a0b1968466",
+  "measured_tree": "6489e232435f42216aa37f66ffd117a0b1968466",
+  "equal": true
+}

@@ -1,0 +1,88 @@
+[
+  {
+    "control": "raw_checksum",
+    "rejected": true,
+    "reason": "raw CSV checksum differs"
+  },
+  {
+    "control": "duplicate_identity",
+    "rejected": true,
+    "reason": "duplicate or unexpected sample identity"
+  },
+  {
+    "control": "wrong_shape_same_count",
+    "rejected": true,
+    "reason": "duplicate or unexpected sample identity"
+  },
+  {
+    "control": "wrong_batch",
+    "rejected": true,
+    "reason": "sample work batch differs"
+  },
+  {
+    "control": "wrong_explicit_arm_identity",
+    "rejected": true,
+    "reason": "explicit diagnostic schema/arms differ"
+  },
+  {
+    "control": "nonstandard_subnormal_mode",
+    "rejected": true,
+    "reason": "FPCR mode differs from standard IEEE mode"
+  },
+  {
+    "control": "missing_validation",
+    "rejected": true,
+    "reason": "missing full-buffer validation"
+  },
+  {
+    "control": "no_actual_worker_participation",
+    "rejected": true,
+    "reason": "actual worker participation differs"
+  },
+  {
+    "control": "changed_native_aa_full_hash",
+    "rejected": true,
+    "reason": "native A/A full hashes differ"
+  },
+  {
+    "control": "changed_native_aa_token",
+    "rejected": true,
+    "reason": "native A/A sample tokens differ"
+  },
+  {
+    "control": "changed_initial_neon_full_hash",
+    "rejected": true,
+    "reason": "selected before/native full hashes differ"
+  },
+  {
+    "control": "changed_initial_neon_token",
+    "rejected": true,
+    "reason": "selected before/native tokens differ"
+  },
+  {
+    "control": "wrong_native_row_seam",
+    "rejected": true,
+    "reason": "native NEON row seam differs"
+  },
+  {
+    "control": "changed_short_scalar_full_hash",
+    "rejected": true,
+    "reason": "selected before/native full hashes differ"
+  },
+  {
+    "control": "changed_short_scalar_token",
+    "rejected": true,
+    "reason": "selected before/native tokens differ"
+  },
+  {
+    "control": "changed_summary",
+    "rejected": true,
+    "reason": "saved results differ from raw-data reanalysis"
+  },
+  {
+    "control": "synthetic_bad_aa_retained_and_flagged",
+    "rejected": false,
+    "unqualified": true,
+    "samples_retained": 11340
+  }
+]

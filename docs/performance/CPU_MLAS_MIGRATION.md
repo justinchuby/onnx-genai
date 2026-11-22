@@ -280,6 +280,17 @@ samples remain reproducible; production retains the single-vector loop. Generate
 GELU code has a larger stack frame and more spills, so simple unrolling is not
 an evidence-backed next step for this implementation.
 
+ARM64 contiguous native Softmax now uses a four-lane NEON max/exp/sum/normalize
+core from eight elements onward, sharing the AVX2 polynomial coefficients while
+preserving gradual underflow and the original scalar short-row path. Both
+in-place and disjoint outputs share one row core. The
+[M1 Max experiment](../benchmarks/2026-11-21-neon-softmax.md) retains all three
+mechanisms and 31752 samples; 107/108 final A/A cells qualify. Qualified large
+cases are 2.25–2.77x faster than the former scalar body, but MLAS still wins
+those comparisons. This closes the ARM64 scalar-exp capability gap without
+graduating Softmax or removing its optional reference. Other ISAs, model
+throughput, and CPU-cost improvements are not inferred.
+
 The generic native Pool window walker now reuses four rank-sized coordinate
 buffers and a row-major cursor, preserving sum order and both MaxPool index
 orders. Unrequested index output is no longer staged. The

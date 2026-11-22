@@ -52,12 +52,12 @@
   {
     "control": "changed_initial_neon_full_hash",
     "rejected": true,
-    "reason": "initial/new NEON full hashes differ"
+    "reason": "selected before/native full hashes differ"
   },
   {
     "control": "changed_initial_neon_token",
     "rejected": true,
-    "reason": "initial/new NEON tokens differ"
+    "reason": "selected before/native tokens differ"
   },
   {
     "control": "changed_summary",
