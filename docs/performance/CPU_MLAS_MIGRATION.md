@@ -908,7 +908,7 @@ cache and its cold-fill gate. Adoption additionally requires the same immutable
 dense-byte limit, so a disabled or smaller retention policy cannot inherit a
 larger cache. The [dense ownership regression](../benchmarks/NBITS_DENSE_NODE_SHARING.md)
 checks three actual executor shape variants, session isolation, pressure and
-concurrent builders. The MLAS research layouts now share explicit node-scoped state as described below; their per-kernel warm memos remain separate and retain active payloads.
+concurrent builders. The MLAS research layouts now share explicit node-scoped state and participate in Host pressure reclamation as described below.
 
 ## Reference reachability and numerical comparisons
 
@@ -1063,8 +1063,8 @@ and a real executor running three activation shapes plus an independent session.
 The executor test reruns the survivor after peer teardown and checks warm charges
 and complete final refund. This changes ownership only; it does not change packed
 arithmetic, claim performance parity, graduate a family or remove the remaining
-optional reference dependency. Idle pressure eviction of these reference memos
-and layout maps remains outstanding; native caches already support it.
+optional reference dependency. Reference maps now support idle pressure eviction
+through the same Host authority, as described below.
 
 Validation on Apple M1 Max / ARM64 macOS, Rust 1.98, using cached ORT headers
 and libraries: native CPU 1,969 passed / 20 ignored, native session 274 passed;
@@ -1076,3 +1076,98 @@ MLAS all-target Clippy checks passed again. The qualification did not skip the
 session control on this host. Rust formatting, dispatch manifest/reachability,
 platform naming and feature-gate coverage checks pass. These are correctness and
 ownership results, with no CUDA execution or new performance measurement.
+
+
+### Idle pressure reclaims SQNBit reference layouts
+
+The node's MLAS layout maps now register weakly with the supplying
+`DerivedWeightMemory` pressure domain. Redundant per-kernel strong `OnceLock`
+memos are removed. Every executing call clones its layout `Arc` while holding
+the corresponding map lock, which is also the lock used to decide whether an
+entry is idle. Pressure removes only entries whose sole strong owner is that
+map, releases all map locks, then drops payloads and refunds their grants. It
+never takes a cold-fill gate; a build can safely trigger pressure on its own
+empty map. Full-width and sharded entries account for their actual packed and
+retained metadata bytes; MLAS workspace/scratch remains outside this scope.
+
+After eviction, standard wire inputs can use the established native fallback
+while Host capacity is occupied, then rebuild under fresh admission. Serialized
+MLAS bytes retain their existing actionable capacity failure and retry because
+they cannot be interpreted as ONNX wire weights. Active readers retain their
+grants even after the node owner drops. The weak pressure registration does not
+keep a retired node alive and follows adopted node state after its builder drops.
+
+Contiguous immutable operands use complete operand-address layout keys inside
+the node owner. Noncontiguous immutable operands use an explicit `NodeConstant`
+source variant, so deleting the memo does not sacrifice their preparation reuse.
+This logical slot relies on the existing constant-input contract and explicit
+node adoption; dynamic operands never enter it, and no cross-node address lookup
+is restored. Warm lookups respect the current call's sharded/full-width decision
+and cannot bypass the asymmetric M=1 numerical guard.
+
+A bounded subprocess regression drives real factory-created kernels through
+sharded, full-width, serialized and strided-scale layouts. It verifies self-cache
+admission, another node's idle donation, zero-pressure no-op, unrelated authority
+isolation, warm MLAS execution while a reader holds the existing payload,
+active-reader refusal, cross-thread KV reservation and growth, fallback/refusal
+and retry, source-owner retirement and final grant refund. Standard-wire cases
+also race four execute readers against repeated Host pressure. Grant/refund
+callbacks are checked outside map and gate-registry locks. This is lifecycle
+validation, not a performance or graduation claim.
+
+Validated on Apple M1 Max / ARM64 macOS with Rust 1.98 and the cached ORT root:
+native CPU 1,969 passed / 20 ignored, native session 274 passed; optional-MLAS
+CPU 1,998 passed / 35 ignored, optional-MLAS session 276 passed. Strict all-target
+Clippy passes for both crates in both configurations. The bounded pressure
+parent is a passing ordinary test; it explicitly launches the named ignored
+child and checks its success, so that child is not uncovered by the aggregate
+ignored count. After adding warm prefill/unscoped-decode layout switching under
+a one-pack budget, the parent selected one test and passed again, with explicit
+markers proving all four layouts ran on this host; final CPU MLAS all-target
+Clippy also passed again. Formatting and dispatch/reachability/platform/feature
+coverage checks pass. No other ISA's execution or CUDA behavior is established.
+
+
+### MatMul preparation obeys the captured retention verdict
+
+Ordinary SGEMM packing is retained derived-weight state. The shared
+`MatMulPrepack` f32 and once-widened-f16 MLAS packing entries now require both
+constant B and an admitting retention verdict. Previously these two entries
+looked only at constant-input status, so a provider configured to retain nothing
+could still keep a packed panel. Declined calls take the existing unpacked/half
+computation paths; admitted calls keep their existing packed reuse. MatMul,
+Gemm and FusedMatMulBias consume these same preparation entries.
+
+Native noncontiguous f16 preparation had the same retention gap. Its private
+API now returns `Cow<[u16]>`: an admitted cache lends its existing copy, while a
+declined call owns a temporary dense-half copy until computation finishes. It
+must not return `None` merely because retention is declined: the existing
+constant-weight rescue branch still needs actual operands to compute. The BNNS
+column-major zero-copy route remains unchanged. This makes the temporary
+lifetime explicit without changing the arithmetic primitives.
+
+Three regressions fail on their corresponding old behavior: retained f32 pack,
+retained widened-f16 pack, and retained strided-f16 copy despite decline. Final
+controls exercise both verdicts, repeated calls, changed activations and admitted
+reuse. The strided control also executes the Apple rescue path and checks that
+decline produces the expected result without filling either persistent half or
+dense-f32 storage. Their short dyadic corpus is exactly representable; its exact
+comparisons do not establish broad packed/unpacked bit identity or model token
+parity. Named bounded child processes keep these new real-kernel calls from
+perturbing existing libtest-wide platform dispatch observations.
+
+This closes a retention-policy bypass. It does not yet fund the ordinary
+SGEMM packed panels, half copies or existing MatMul transpose/dense caches with
+the physical Host authority, make them node-shared/pressure-reclaimable, or
+establish a performance improvement. Those ownership/admission steps remain
+separate from the already governed native/NBits/QLinearMatMul/expert caches.
+
+Validation on Apple M1 Max / ARM64 macOS with Rust 1.98 and cached ORT:
+native CPU 1,970 passed / 20 ignored and session 274 passed; optional-MLAS CPU
+2,001 passed / 35 ignored and session 276 passed. Both crates/configurations
+pass strict all-target Clippy. After isolating all new execution controls from
+shared platform probe counters, the final `honors_retention` filter selected
+three tests and all passed again; final MLAS CPU all-target Clippy also passed.
+Formatting and dispatch manifest/reachability/platform/feature checks pass.
+These results establish the tested retention behavior, not physical allocation
+limits, production speed, full-model numerics or another ISA's execution.

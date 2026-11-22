@@ -844,8 +844,9 @@ impl MatMulPrepack {
     /// When a model stores a weight matrix with non-row-major strides (e.g.
     /// the lm_head vocab projection stored column-major), `try_matmul_half`
     /// skips it because BNNS requires contiguous input.  This method
-    /// materialises the contiguous K×N row-major copy once and caches it
-    /// for the session lifetime, so subsequent prefill calls avoid both:
+    /// materialises a contiguous K×N row-major copy. When retention is admitted,
+    /// it caches that copy for the session; otherwise the caller owns a transient.
+    /// Admitted subsequent prefill calls avoid both:
     ///   - the element-by-element `to_dense_f32_widen` (~1 s at 136 M elements)
     ///   - the 2× memory of f16→f32 widening
     ///
@@ -856,12 +857,12 @@ impl MatMulPrepack {
         not(any(target_os = "macos", target_os = "ios")),
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
-    pub(crate) fn contiguous_b_f16(&self, b_view: &TensorView) -> Option<&[u16]> {
+    pub(crate) fn contiguous_b_f16(&self, b_view: &TensorView) -> Option<Cow<'_, [u16]>> {
         use onnx_runtime_ir::DataType;
         if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || b_view.is_contiguous() {
             return None; // already contiguous or not cacheable
         }
-        let cached = self.contiguous_b_f16.get_or_init(|| {
+        let build = || {
             let numel = b_view.numel();
             let shape = b_view.shape;
             let strides = b_view.strides;
@@ -913,14 +914,20 @@ impl MatMulPrepack {
                     }
                 }
             }
-            Arc::new(out)
-        });
-        (cached.len() == b_view.numel()).then(|| cached.as_slice())
+            out
+        };
+        if !self.retain_caches {
+            return Some(Cow::Owned(build()));
+        }
+        let cached = self.contiguous_b_f16.get_or_init(|| Arc::new(build()));
+        (cached.len() == b_view.numel()).then(|| Cow::Borrowed(cached.as_slice()))
     }
 
     /// MLAS-packed B built by widening a constant f16 weight to f32 once.
     ///
-    /// Returns `None` for a non-constant B: an activation would have to be
+    /// Returns `None` when retention is declined or B is non-constant.
+    /// Packing retains a derived weight, so it follows the same immutable
+    /// retention verdict as densification. An activation would have to be
     /// re-widened and re-packed on every call, which is the cost this exists to
     /// remove, and caching it would be wrong the moment the activation changed.
     #[cfg(feature = "mlas")]
@@ -930,7 +937,7 @@ impl MatMulPrepack {
         k: usize,
         n: usize,
     ) -> Result<Option<&mlas_sys::PackedB>> {
-        if !self.constant_inputs[1] {
+        if !self.retain_caches || !self.constant_inputs[1] {
             return Ok(None);
         }
         // Defence in depth, mirroring `transposed_b`: a memo is only served
@@ -974,7 +981,7 @@ impl MatMulPrepack {
 
     #[cfg(feature = "mlas")]
     fn packed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&mlas_sys::PackedB> {
-        self.constant_inputs[1].then(|| {
+        (self.retain_caches && self.constant_inputs[1]).then(|| {
             self.packed_b
                 .get_or_init(|| mlas_sys::PackedB::new(n, k, b))
         })
@@ -2553,7 +2560,8 @@ impl MatMulKernel {
         // a 272 MB strided copy that previously cost ~280 ms.
         //
         // For non-column-major non-contiguous layouts, fall back to the
-        // contiguous copy path (cached via OnceLock).
+        // contiguous copy path (cached when retention is admitted, otherwise
+        // owned only by this call).
         //
         // The `constant_inputs[1]` guard is essential: non-constant activations
         // (e.g. a Transpose view of another op's output) must NOT enter this
@@ -2603,7 +2611,7 @@ impl MatMulKernel {
                             half_gemm_tile(
                                 HalfFormat::F16,
                                 a_bits,
-                                b_contig,
+                                &b_contig,
                                 &mut out,
                                 geom.m,
                                 geom.k,
@@ -2612,15 +2620,16 @@ impl MatMulKernel {
                         }
                     }
                 } else if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view) {
-                    // Non-column-major or batched: use cached contiguous copy
+                    // Non-column-major or batched: use the prepared copy,
+                    // borrowing the cache or owning a temporary until compute ends.
                     if trivial_batch {
                         if !accelerate_gemm::bnns_matmul_f16(
-                            a_bits, b_contig, &mut out, geom.m, geom.k, geom.n,
+                            a_bits, &b_contig, &mut out, geom.m, geom.k, geom.n,
                         ) {
                             half_gemm_tile(
                                 HalfFormat::F16,
                                 a_bits,
-                                b_contig,
+                                &b_contig,
                                 &mut out,
                                 geom.m,
                                 geom.k,
@@ -2628,7 +2637,7 @@ impl MatMulKernel {
                             );
                         }
                     } else {
-                        bnns_half_dense_into(a_bits, b_contig, &geom, &mut out);
+                        bnns_half_dense_into(a_bits, &b_contig, &geom, &mut out);
                     }
                 }
             }
@@ -5449,6 +5458,188 @@ mod tests {
             }
             assert!(kernel.prepack.packed_b.get().is_some());
         }
+    }
+
+    /// Run real-kernel controls alone: platform dispatch counters are shared
+    /// by the existing libtest process and negative guards observe their deltas.
+    fn retention_control_in_child(name: &str) -> bool {
+        const CHILD: &str = "NXRT_TEST_MATMUL_RETENTION_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !timed_out
+                && output.status.success()
+                && stdout.contains(&format!("test {name} ... ok")),
+            "named retention child must run and pass; timed_out={timed_out}; stdout={stdout}; stderr={stderr}"
+        );
+        true
+    }
+
+    #[test]
+    fn strided_half_preparation_honors_retention() {
+        if retention_control_in_child(
+            "kernels::matmul::tests::strided_half_preparation_honors_retention",
+        ) {
+            return;
+        }
+        let (m, k, n) = (3usize, 17usize, 9usize);
+        let weights: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 / 32.).collect();
+        let backing: Vec<f32> = weights.iter().flat_map(|&value| [value, -99.]).collect();
+        let storage = Owned::f16(&[k, 2 * n], &backing);
+        let shape = [k, n];
+        let strides = [(2 * n) as i64, 2];
+        let mut b = storage.view();
+        b.shape = &shape;
+        b.strides = &strides;
+        let expected_bits: Vec<u16> = weights
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect();
+        for admitted in [false, true] {
+            let mut kernel = MatMulKernel::with_cache_retention(admitted);
+            kernel.set_constant_inputs(&[false, true]);
+            for _ in 0..3 {
+                let prepared = kernel.prepack.contiguous_b_f16(&b).unwrap();
+                assert_eq!(&*prepared, &expected_bits);
+                assert_eq!(
+                    kernel.prepack.contiguous_b_f16.get().is_some(),
+                    admitted,
+                    "noncontiguous f16 copying must follow retention permission"
+                );
+            }
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                let values: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 / 16.).collect();
+                let a = Owned::f16(&[m, k], &values);
+                let mut output = Owned::zeros_f32(&[m, n]);
+                kernel
+                    .execute_with_backend(
+                        &[a.view(), b],
+                        &mut [output.view_mut()],
+                        CpuBackend::Accelerate,
+                    )
+                    .unwrap();
+                let expected: Vec<f32> = (0..m * n)
+                    .map(|i| {
+                        (0..k)
+                            .map(|j| values[i / n * k + j] * weights[j * n + i % n])
+                            .sum()
+                    })
+                    .collect();
+                assert_eq!(
+                    output.to_f32(),
+                    expected,
+                    "declining reuse must not turn the rescue output into zeros"
+                );
+                assert_eq!(kernel.prepack.contiguous_b_f16.get().is_some(), admitted);
+                assert_eq!(kernel.prepack.dense_live_bytes(), 0);
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            let _ = m;
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    fn assert_mlas_pack_retention(dtype: DataType) {
+        let (m, k, n) = (3usize, 17usize, 9usize);
+        let weights: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 / 32.).collect();
+        let b = match dtype {
+            DataType::Float32 => Owned::f32(&[k, n], &weights),
+            DataType::Float16 => Owned::f16(&[k, n], &weights),
+            _ => unreachable!("this fixture exercises the two MLAS packing sources"),
+        };
+        for admitted in [false, true] {
+            let mut kernel = MatMulKernel::with_cache_retention(admitted);
+            kernel.set_constant_inputs(&[false, true]);
+            for step in 0..3 {
+                let values: Vec<f32> = (0..m * k).map(|i| ((i + step) % 7) as f32 / 16.).collect();
+                let a = match dtype {
+                    DataType::Float32 => Owned::f32(&[m, k], &values),
+                    _ => Owned::f16(&[m, k], &values),
+                };
+                let mut output = Owned::zeros_f32(&[m, n]);
+                kernel
+                    .execute_with_backend(
+                        &[a.view(), b.view()],
+                        &mut [output.view_mut()],
+                        CpuBackend::Mlas,
+                    )
+                    .unwrap();
+                // All products and their short sums are exactly representable
+                // dyadics. Exact equality here makes no broad NN/packed promise.
+                let expected: Vec<f32> = (0..m * n)
+                    .map(|i| {
+                        (0..k)
+                            .map(|j| values[i / n * k + j] * weights[j * n + i % n])
+                            .sum()
+                    })
+                    .collect();
+                assert_eq!(
+                    output.to_f32(),
+                    expected,
+                    "dtype={dtype:?}, admitted={admitted}, step={step}"
+                );
+                assert_eq!(
+                    kernel.prepack.packed_b.get().is_some(),
+                    admitted && dtype == DataType::Float32,
+                    "dtype={dtype:?}: f32 packed allocation must follow retention permission"
+                );
+                assert_eq!(
+                    kernel
+                        .prepack
+                        .packed_b_from_half
+                        .get()
+                        .is_some_and(Option::is_some),
+                    admitted && dtype == DataType::Float16,
+                    "dtype={dtype:?}: once-widened packed allocation must follow retention permission"
+                );
+                if !admitted {
+                    assert_eq!(kernel.prepack.dense_live_bytes(), 0);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_f32_packing_honors_retention() {
+        if retention_control_in_child("kernels::matmul::tests::mlas_f32_packing_honors_retention") {
+            return;
+        }
+        assert_mlas_pack_retention(DataType::Float32);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_f16_packing_honors_retention() {
+        if retention_control_in_child("kernels::matmul::tests::mlas_f16_packing_honors_retention") {
+            return;
+        }
+        assert_mlas_pack_retention(DataType::Float16);
     }
 
     #[cfg(feature = "mlas")]
