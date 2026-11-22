@@ -250,6 +250,17 @@ route remains; other hardware/ISA and global graduation work are outstanding.
 The CPU crate retains the absorbed SIMD coefficients' complete MIT notice in
 `MLAS_LICENSE`, independently of eventual vendor/reference removal.
 
+ARM64 native Erf and exact GELU now share the existing AVX2 coefficient set and
+use four-lane NEON, including partial tails and fused BiasGelu. Runtime feature
+detection and the existing short-slice scalar seam remain. The
+[M1 Max absorption diagnostic](../benchmarks/2026-11-21-neon-erf.md) retains 15120
+samples across 180 cells with native A/A ratios 0.994–1.010. It measures 14–18×
+less wall time for Erf and 12–14× for exact GELU than the former scalar bodies,
+but MLAS remains faster in most cells. This closes the ARM64 scalar capability
+gap without graduating the family or removing its optional reference. BiasGelu
+bitwise consistency is tested; its latency and end-to-end models were not
+measured. The existing numerical bounds and NaN/signed-zero policies remain.
+
 Generic f32 GEMM's thin-M column-parallel path now borrows the original B
 stride and caller-owned output rows. It retains the same scalar register tiles
 and K-panel accumulation order, replacing full B/output element copies with
