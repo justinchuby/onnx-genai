@@ -396,21 +396,11 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
     tokio::spawn(async move {
         let mut stop_buffer = StopBoundaryBuffer::new(stops.clone());
         let mut published = String::new();
-        let mut decoder = handle.tokenizer.inner().decode_stream(true);
         loop {
             let event = tokio::select! { _ = tx.closed() => break, event = source.recv() => event };
             let value = match event {
                 Some(DriverEvent::Token(token)) => {
-                    let text = match decoder.step(token.token_id) {
-                        Ok(text) => text.unwrap_or_default(),
-                        Err(error) => {
-                            let _ = tx.send(Ok(Event::default().event("error").data(json!({
-                                "error":{"message":format!("native token stream decoding failed: {error}; repair the package tokenizer decoder"),"type":"server_error","code":500},"index":index
-                            }).to_string()))).await;
-                            break;
-                        }
-                    };
-                    let content = stop_buffer.push(&text);
+                    let content = stop_buffer.push(&token.text);
                     published.push_str(&content);
                     if matches!(token.finish_reason, Some(FinishReason::StopSequence { .. })) {
                         stop_buffer.pending.clear();

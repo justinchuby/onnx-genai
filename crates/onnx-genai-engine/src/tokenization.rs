@@ -4,6 +4,95 @@ use llguidance::toktrie::TokTrie;
 use onnx_genai_ort::Tokenizer;
 use tokenizers::decoders::DecoderWrapper;
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "incremental token decoding changed an already published prefix; use buffered output or repair the package tokenizer decoder"
+)]
+struct NonMonotonicText;
+
+/// Request-local incremental detokenization state. Retains the decoder's
+/// necessary lookbehind rather than repeatedly decoding the whole generation.
+#[derive(Default)]
+pub(crate) struct TokenTextDecoder {
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
+}
+impl TokenTextDecoder {
+    pub(crate) fn step(&mut self, tokenizer: &Tokenizer, id: u32) -> anyhow::Result<String> {
+        tokenizers::tokenizer::step_decode_stream(
+            tokenizer.inner(), id, true, &mut self.ids, &mut self.prefix, &mut self.prefix_index,
+        ).map(|text| text.unwrap_or_default()).map_err(|error| {
+            if error.is::<tokenizers::tokenizer::DecodeStreamError>() {
+                anyhow::Error::new(NonMonotonicText)
+            } else {
+                anyhow::anyhow!("incremental decoding of token {id} failed: {error}; repair the package tokenizer decoder or its token vocabulary")
+            }
+        })
+    }
+    /// Emit pending bytes at the terminal boundary, including the tokenizer's
+    /// replacement text for an incomplete final UTF-8 sequence.
+    pub(crate) fn finish(&mut self, tokenizer: &Tokenizer) -> anyhow::Result<String> {
+        let decoded = tokenizer
+            .decode(&self.ids)
+            .context("decode pending terminal token text")?;
+        let tail = decoded
+            .strip_prefix(&self.prefix)
+            .ok_or(NonMonotonicText)?
+            .to_owned();
+        self.prefix = decoded;
+        self.prefix_index = self.ids.len();
+        Ok(tail)
+    }
+}
+
+/// Decode a committed token batch with the same boundaries as live generation.
+pub(crate) fn token_texts(
+    tokenizer: Option<&Tokenizer>,
+    ids: &[u32],
+) -> anyhow::Result<Vec<String>> {
+    let Some(tokenizer) = tokenizer else {
+        return Ok(vec![String::new(); ids.len()]);
+    };
+    // Staged output knows the final text before publishing any callback. A
+    // decoder may revise an earlier prefix (e.g. an invalid final byte run);
+    // defer that batch's text to its last token instead of publishing a prefix
+    // that the immutable final result would later have to retract.
+    let final_text = tokenizer.decode(ids)?;
+    let attempt = || -> anyhow::Result<Vec<String>> {
+        let mut decoder = TokenTextDecoder::default();
+        let mut offset = 0;
+        let mut pieces = Vec::with_capacity(ids.len());
+        for id in ids {
+            let piece = decoder.step(tokenizer, *id)?;
+            ensure!(
+                final_text
+                    .get(offset..)
+                    .is_some_and(|rest| rest.starts_with(&piece)),
+                NonMonotonicText
+            );
+            offset += piece.len();
+            pieces.push(piece);
+        }
+        if let Some(last) = pieces.last_mut() {
+            last.push_str(&decoder.finish(tokenizer)?);
+        }
+        ensure!(pieces.concat() == final_text, NonMonotonicText);
+        Ok(pieces)
+    };
+    match attempt() {
+        Ok(pieces) => Ok(pieces),
+        Err(error) if error.is::<NonMonotonicText>() => {
+            let mut pieces = vec![String::new(); ids.len()];
+            if let Some(last) = pieces.last_mut() {
+                *last = final_text;
+            }
+            Ok(pieces)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn has_byte_decoder(decoder: &DecoderWrapper) -> bool {
     match decoder {
         DecoderWrapper::ByteFallback(_) | DecoderWrapper::ByteLevel(_) => true,
@@ -99,6 +188,36 @@ mod tests {
         let path = scratch.path().join("tokenizer.json");
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         Tokenizer::from_file(path).unwrap()
+    }
+    #[test]
+    fn incremental_text_preserves_unicode_boundaries_and_terminal_fragments() {
+        for byte_level in [false, true] {
+            let tokenizer = tokenizer(byte_level);
+            let mut decoder = TokenTextDecoder::default();
+            assert_eq!(decoder.step(&tokenizer, 4).unwrap(), "");
+            assert_eq!(decoder.step(&tokenizer, 5).unwrap(), "é");
+            assert_eq!(decoder.finish(&tokenizer).unwrap(), "");
+            if !byte_level {
+                decoder.step(&tokenizer, 4).unwrap();
+                let error = decoder.finish(&tokenizer).unwrap_err();
+                assert!(error.is::<NonMonotonicText>());
+            }
+            for ids in [vec![4], vec![4, 4], vec![4, 5, 4], vec![4, 5, 16]] {
+                let chunks = token_texts(Some(&tokenizer), &ids).unwrap_or_else(|error| {
+                    panic!("byte_level={byte_level} ids={ids:?}: {error:#}")
+                });
+                assert_eq!(chunks.concat(), tokenizer.decode(&ids).unwrap(), "{ids:?}");
+            }
+        }
+        let tokenizer = Tokenizer::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            token_texts(Some(&tokenizer), &[22, 22]).unwrap(),
+            vec!["tok22", " tok22"]
+        );
     }
     #[test]
     fn byte_codecs_preserve_utf8_fragments_and_literal_ff_without_special_framing() {

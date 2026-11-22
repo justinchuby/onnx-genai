@@ -17,6 +17,7 @@ use onnx_genai_ort::Tokenizer;
 pub(crate) struct DecodeLoopState {
     pub(crate) generated_tokens: Vec<TokenId>,
     pub(crate) generated_text: String,
+    pub(crate) text_decoder: crate::tokenization::TokenTextDecoder,
     pub(crate) step: usize,
     pub(crate) prefix_cache_hit_len: usize,
     pub(crate) logprobs: Option<Vec<TokenLogprob>>,
@@ -46,6 +47,7 @@ impl DecodeLoopState {
         Self {
             generated_tokens: Vec::new(),
             generated_text: String::new(),
+            text_decoder: Default::default(),
             step: 0,
             prefix_cache_hit_len,
             logprobs: top_logprobs.map(|_| Vec::new()),
@@ -267,36 +269,37 @@ pub(crate) fn commit_selected_token(
     // decodes exactly as often as an untraced one.
     let mut commit_span = onnx_genai_ort::prof_span!("loop.commit_selected_token");
     commit_span.set_arg("token_id", token_id);
-    let token_text = if callback.is_some() || !chain.is_empty() {
+    let decode_text = callback.is_some() || !chain.is_empty();
+    let mut token_text = if decode_text {
         let _span = onnx_genai_ort::prof_span!("loop.detokenize");
-        tokenizer
-            .decode(&[token_id])
-            .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {e}"))?
+        state.text_decoder.step(tokenizer, token_id)?
     } else {
         String::new()
     };
     if !token_text.is_empty() {
         commit_span.set_arg("token", token_text.clone());
     }
-    if !chain.is_empty() {
-        state.generated_text.push_str(&token_text);
-    }
-    let finish_reason = if chain.is_empty() {
-        // Same question, same answer as the processor path below: a model with
-        // several end tokens must stop on any of them whether or not a
-        // processor chain happens to be configured.
-        options
-            .terminates(token_id)
-            .then_some(FinishReason::EosToken)
+    state.generated_text.push_str(&token_text);
+    let mut context = if chain.is_empty() {
+        ProcessorContext::default()
     } else {
-        let context = ProcessorContext {
+        ProcessorContext {
             prompt_tokens: prompt_tokens.to_vec(),
             generated_tokens: state.generated_tokens.clone(),
             generated_text: state.generated_text.clone(),
             step: state.step,
-        };
-        finish_reason_after_token(token_id, options, chain, &context)
+        }
     };
+    let mut finish_reason = finish_reason_after_token(token_id, options, chain, &context);
+    if decode_text && (finish_reason.is_some() || state.step + 1 >= options.max_new_tokens) {
+        let tail = state.text_decoder.finish(tokenizer)?;
+        state.generated_text.push_str(&tail);
+        token_text.push_str(&tail);
+        if !tail.is_empty() && finish_reason.is_none() && !chain.is_empty() {
+            context.generated_text.push_str(&tail);
+            finish_reason = finish_reason_after_token(token_id, options, chain, &context);
+        }
+    }
     if let Some(callback) = callback {
         callback(GenerateToken {
             token_id,
@@ -523,6 +526,49 @@ mod tests {
             .collect())
     }
 
+    #[test]
+    fn text_stop_uses_incremental_sequence_text_instead_of_isolated_tokens() -> anyhow::Result<()> {
+        let tokenizer = tokenizer()?;
+        let options = GenerateOptions {
+            max_new_tokens: 8,
+            stop_sequences: vec![crate::logits::StopSequence::Text("tok22 tok22".into())],
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, Some(&tokenizer), false)?;
+        let mut state = DecodeLoopState::new(0, None, None);
+        let mut chunks = Vec::new();
+        let mut callback = |token: GenerateToken| {
+            chunks.push(token.text);
+            Ok(())
+        };
+        assert_eq!(
+            commit_selected_token(
+                &mut state,
+                &[],
+                22,
+                &options,
+                &chain,
+                &tokenizer,
+                Some(&mut callback)
+            )?,
+            None
+        );
+        assert_eq!(
+            commit_selected_token(
+                &mut state,
+                &[],
+                22,
+                &options,
+                &chain,
+                &tokenizer,
+                Some(&mut callback)
+            )?,
+            Some(FinishReason::StopSequence { index: 0 })
+        );
+        assert_eq!(state.generated_text, "tok22 tok22");
+        assert_eq!(chunks.concat(), state.generated_text);
+        Ok(())
+    }
     #[test]
     fn sampled_fastpath_error_falls_back_to_seeded_host_sampling() -> anyhow::Result<()> {
         let canonical = canonical_runtime();

@@ -27,8 +27,9 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/v1/chat/completions`, `/chat/completions` | Buffered/streaming text, tools, reasoning, declared image/audio inputs |
 | POST | `/v1/completions` | Existing OpenAI text/FIM completion contract |
 | POST | `/v1/embeddings` | Existing OpenAI embedding contract |
-| POST | `/completion`, `/completions`, `/infill` | Native buffered/streaming completion, raw text/token IDs, declared FIM metadata |
+| POST | `/completion`, `/completions`, `/infill` | Native buffered/streaming completion, bounded text/token/mixed batches, declared FIM metadata |
 | POST | `/embedding`, `/embeddings` | Native pooled embeddings with requested normalization |
+| POST | `/rerank`, `/reranking`, `/v1/rerank`, `/v1/reranking` | Declared token-pair scoring workflow with Jina/TEI response shapes |
 | POST | `/v1/responses`, `/responses` | Responses wire adapter over admitted chat generation |
 | POST | `/v1/messages` | Anthropic Messages wire adapter over admitted chat generation |
 | POST | `/v1/chat/completions/input_tokens`, `/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/responses/input_tokens`, `/v1/messages/count_tokens` | Input token counts from the shared inference preparation path |
@@ -99,6 +100,13 @@ is an object; multiple buffered results form an array. The default limit is 128
 prompts (`--max-completion-prompts`). Disconnects and stream failures prevent
 submission of later prompts. Native streams decode incrementally and verify the
 published prefix against the final model text.
+Token event text comes from one engine incremental decoder across ordinary,
+scheduled and speculative generation. Text-based stop checks see decoded
+sequence text, including tokenizer-inserted separators, and can actually stop
+before the output budget. Committed callback batches verify their full decoded
+text before publishing; a decoder that revises a prior prefix defers that batch's
+text to its last token. Live callbacks cannot retract published bytes and report
+an explicit error if a decoder changes them.
 `n_predict=0`, native multimodal prompt objects and infill extra files still
 require further engine support. Native
 embedding normalization supports -1, 0 and positive integer p-norms; zero vectors

@@ -205,10 +205,11 @@ impl DecoderTurnParticipant {
         let Some(callback) = callback else {
             return Ok(());
         };
-        for (index, token_id) in result.token_ids.iter().copied().enumerate() {
+        let pieces = crate::tokenization::token_texts(Some(tokenizer), &result.token_ids)?;
+        for (index, (token_id, text)) in result.token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
                 token_id,
-                text: tokenizer.decode(&[token_id])?,
+                text,
                 finish_reason: (index + 1 == result.token_ids.len())
                     .then(|| result.finish_reason.clone()),
             })?;
@@ -2086,6 +2087,7 @@ impl Engine {
                     prefix_cache_hit_len,
                     generated_tokens: &mut loop_state.generated_tokens,
                     generated_text: &mut loop_state.generated_text,
+                    text_decoder: &mut loop_state.text_decoder,
                     generated_logprobs: &mut loop_state.logprobs,
                     rng: &mut loop_state.rng,
                     callback: None,
@@ -3164,6 +3166,7 @@ impl Engine {
             prefix_cache_hit_len,
             generated_tokens: loop_state.generated_tokens,
             generated_text: loop_state.generated_text,
+            text_decoder: loop_state.text_decoder,
             logprobs: loop_state.logprobs,
             budget_cap: None,
             step: loop_state.step,
@@ -3179,6 +3182,7 @@ impl Engine {
         let mut loop_state = DecodeLoopState {
             generated_tokens: std::mem::take(&mut active.generated_tokens),
             generated_text: std::mem::take(&mut active.generated_text),
+            text_decoder: std::mem::take(&mut active.text_decoder),
             logprobs: active.logprobs.take(),
             step: active.step,
             prefix_cache_hit_len: active.prefix_cache_hit_len,
@@ -3275,6 +3279,7 @@ impl Engine {
         };
         active.generated_tokens = loop_state.generated_tokens;
         active.generated_text = loop_state.generated_text;
+        active.text_decoder = loop_state.text_decoder;
         active.logprobs = loop_state.logprobs;
         active.step = loop_state.step;
         active.rng = loop_state.rng;

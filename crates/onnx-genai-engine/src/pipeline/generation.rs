@@ -491,6 +491,12 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             "the generation loop applied its token policy before any decoder forward pass \
              produced logits",
         )?;
+        let wants_callback = self.callback.is_some();
+        let mut committed_event = None;
+        let mut capture = |event: crate::config::GenerateToken| {
+            committed_event = Some(event);
+            Ok(())
+        };
         let (token, mut reason) = select_and_commit_step(
             self.backend,
             self.state,
@@ -498,7 +504,11 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             self.chain,
             self.tokenizer,
             forward,
-            None,
+            if wants_callback {
+                Some(&mut capture)
+            } else {
+                None
+            },
         )?;
         // The context bound is a stop like any other, decided by the policy that
         // just committed a token: the next iteration is the one that could not
@@ -506,18 +516,17 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
         // what lets `continue_when` remain the single liveness predicate.
         if reason.is_none() && reached_context_limit(self.backend.context_len(), self.max_context) {
             reason = Some(FinishReason::Length);
+            let tail = self.state.text_decoder.finish(self.tokenizer)?;
+            self.state.generated_text.push_str(&tail);
+            if let Some(event) = committed_event.as_mut() {
+                event.text.push_str(&tail);
+            }
         }
         self.finish = reason.clone();
         if let Some(callback) = self.callback.as_deref_mut() {
-            let text = self
-                .tokenizer
-                .decode(&[token])
-                .map_err(|error| anyhow::anyhow!("failed to detokenize token {token}: {error}"))?;
-            callback(crate::config::GenerateToken {
-                token_id: token,
-                text,
-                finish_reason: reason.clone(),
-            })?;
+            let mut event = committed_event.context("generation policy omitted its committed token event; repair the decode policy callback")?;
+            event.finish_reason = reason.clone();
+            callback(event)?;
         }
         self.publish_policy_outputs(request, token, reason.is_some())
     }
@@ -910,11 +919,8 @@ pub(crate) fn run_declared_generation(
     // here would double every token a server streamed.
     let already_streamed = core.as_deref().is_some_and(GenerationCore::streams_tokens);
     if let (Some(callback), false) = (callback.as_mut(), already_streamed) {
-        for (index, token_id) in token_ids.iter().copied().enumerate() {
-            let token_text = tokenizer
-                .map(|tokenizer| tokenizer.decode(&[token_id]))
-                .transpose()?
-                .unwrap_or_default();
+        let pieces = crate::tokenization::token_texts(tokenizer, &token_ids)?;
+        for (index, (token_id, token_text)) in token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
                 token_id,
                 text: token_text,

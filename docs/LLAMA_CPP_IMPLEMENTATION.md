@@ -123,3 +123,22 @@ then all 24 selected native tests passed after the final stop-text and UTF-8
 regressions; strict all-target Clippy passes. The complete metadata test suite,
 including integration tests and the exhaustive workflow matrix, passes. The CI
 classification omission from the ranking fixture is fixed in the same branch.
+
+Engine-text follow-up: the shared token commit path retains request-local
+incremental decoder state through ordinary, scheduled and speculative generation.
+Stop processors now see sequence text with real word separators, and a real
+HTTP regression verifies a multi-token text stop terminates at token two.
+Post-commit callback publication uses one text-batch decoder across the engine,
+workflow replay, candidate-tree and DFlash paths. Staged batches preserve the
+exact full decode even when malformed final bytes revise a prefix; live output
+reports an actionable non-monotonic-decoder error instead of retracting bytes.
+Native transport consumes those canonical text events without decoding again.
+The full engine library passed 611 tests, with one existing external FIM-model
+ignore. OpenAI chat/completion HTTP tests compare streamed and buffered text,
+including tokenizer-inserted spaces. Legacy OpenAI completion request fields
+and default-model behavior still require the native/chat parity follow-up.
+
+Engine-text checks: strict engine/server all-target Clippy, all 71 CLI library
+tests and the 291-asset provenance check pass. The server regression run covered
+the complete library; its new fixture-specific output assertion was corrected
+to compare actual buffered/streamed results and then passed independently.

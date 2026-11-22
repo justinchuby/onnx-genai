@@ -1459,6 +1459,7 @@ pub(crate) struct SpeculativeLoopState<'state, 'callback> {
     pub(crate) prefix_cache_hit_len: usize,
     pub(crate) generated_tokens: &'state mut Vec<TokenId>,
     pub(crate) generated_text: &'state mut String,
+    pub(crate) text_decoder: &'state mut crate::tokenization::TokenTextDecoder,
     pub(crate) generated_logprobs: &'state mut Option<Vec<crate::config::TokenLogprob>>,
     pub(crate) rng: &'state mut SamplingRng,
     pub(crate) callback: Option<&'state mut GenerateTokenCallback<'callback>>,
@@ -1479,6 +1480,7 @@ pub(crate) struct SpeculativeBlock<'state, 'callback> {
     prefix_cache_hit_len: usize,
     generated_tokens: &'state mut Vec<TokenId>,
     generated_text: &'state mut String,
+    text_decoder: &'state mut crate::tokenization::TokenTextDecoder,
     generated_logprobs: &'state mut Option<Vec<crate::config::TokenLogprob>>,
     rng: &'state mut SamplingRng,
     callback: Option<&'state mut GenerateTokenCallback<'callback>>,
@@ -1697,6 +1699,7 @@ impl Engine {
             prefix_cache_hit_len,
             generated_tokens,
             generated_text,
+            text_decoder,
             generated_logprobs,
             rng,
             callback,
@@ -1748,6 +1751,7 @@ impl Engine {
                 prefix_cache_hit_len,
                 generated_tokens,
                 generated_text,
+                text_decoder,
                 generated_logprobs,
                 rng,
                 callback,
@@ -1817,6 +1821,7 @@ impl Engine {
             prefix_cache_hit_len,
             generated_tokens,
             generated_text,
+            text_decoder,
             generated_logprobs,
             rng,
             callback,
@@ -1956,6 +1961,7 @@ impl Engine {
             state,
             generated_tokens,
             generated_text,
+            text_decoder,
             generated_logprobs,
             commit_tokens,
             commit_logprobs,
@@ -2489,6 +2495,7 @@ impl Engine {
         state: &mut EngineSession,
         generated_tokens: &mut Vec<TokenId>,
         generated_text: &mut String,
+        text_decoder: &mut crate::tokenization::TokenTextDecoder,
         generated_logprobs: &mut Option<Vec<crate::config::TokenLogprob>>,
         commit_tokens: Vec<TokenId>,
         commit_logprobs: Option<Vec<crate::config::TokenLogprob>>,
@@ -2517,6 +2524,7 @@ impl Engine {
             let mut commit_state = DecodeLoopState {
                 generated_tokens: std::mem::take(generated_tokens),
                 generated_text: std::mem::take(generated_text),
+                text_decoder: std::mem::take(text_decoder),
                 step: *step,
                 prefix_cache_hit_len,
                 logprobs: generated_logprobs.take(),
@@ -2539,6 +2547,7 @@ impl Engine {
             )?;
             *generated_tokens = commit_state.generated_tokens;
             *generated_text = commit_state.generated_text;
+            *text_decoder = commit_state.text_decoder;
             *generated_logprobs = commit_state.logprobs;
             *step = commit_state.step;
             if let Some(finish_reason) = finish_reason {

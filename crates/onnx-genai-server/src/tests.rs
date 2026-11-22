@@ -6645,22 +6645,67 @@ mod native_compat {
     #[tokio::test]
     async fn native_stop_text_is_omitted_from_buffered_and_streamed_content() {
         let router = app(tiny_state());
-        for stream in [false, true] {
-            let response=request(router.clone(),"/completion",json!({
-                "prompt":"hello","n_predict":4,"temperature":0,"logit_bias":{"22":100},"stop":["tok22"],"stream":stream
+        for (stop, count) in [("tok22", 1), ("tok22 tok22", 2)] {
+            for stream in [false, true] {
+                let response=request(router.clone(),"/completion",json!({
+                "prompt":"hello","n_predict":4,"temperature":0,"logit_bias":{"22":100},"stop":[stop],"stream":stream
             })).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            if stream {
-                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-                let events = sse_json_events(&bytes);
-                assert_eq!(events.last().unwrap()["stop_type"], "word");
-                assert!(events.iter().all(|event| event["content"] == ""));
-            } else {
-                let body = json_body(response).await;
-                assert_eq!(body["stop_type"], "word");
-                assert_eq!(body["content"], "");
-                assert_eq!(body["tokens_predicted"], 1);
+                assert_eq!(response.status(), StatusCode::OK);
+                if stream {
+                    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    let events = sse_json_events(&bytes);
+                    assert_eq!(events.last().unwrap()["stop_type"], "word");
+                    assert_eq!(events.last().unwrap()["tokens_predicted"], count);
+                    assert!(events.iter().all(|event| event["content"] == ""));
+                } else {
+                    let body = json_body(response).await;
+                    assert_eq!(body["stop_type"], "word");
+                    assert_eq!(body["content"], "");
+                    assert_eq!(body["tokens_predicted"], count);
+                }
             }
+        }
+    }
+    #[tokio::test]
+    async fn canonical_stream_text_matches_buffered_chat_and_completion_decoding() {
+        let router = app(tiny_state());
+        for path in ["/v1/chat/completions", "/v1/completions"] {
+            let mut body = json!({"model":"tiny-llm","temperature":0,"max_tokens":2});
+            if path.contains("chat") {
+                body["messages"] = json!([{"role":"user","content":"hello"}]);
+            } else {
+                body["prompt"] = json!("hello");
+            }
+            let response = request(router.clone(), path, body.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let buffered = json_body(response).await;
+            let expected = if path.contains("chat") {
+                buffered["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap()
+            } else {
+                buffered["choices"][0]["text"].as_str().unwrap()
+            };
+            assert!(
+                expected.contains(' '),
+                "fixture must exercise decoder-inserted spacing: {path}: {expected:?}"
+            );
+            body["stream"] = json!(true);
+            let response = request(router.clone(), path, body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let events = sse_json_events(&bytes);
+            let text = events
+                .iter()
+                .filter_map(|event| {
+                    if path.contains("chat") {
+                        event["choices"][0]["delta"]["content"].as_str()
+                    } else {
+                        event["choices"][0]["text"].as_str()
+                    }
+                })
+                .collect::<String>();
+            assert_eq!(text, expected, "{path}");
         }
     }
     #[tokio::test]

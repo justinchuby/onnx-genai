@@ -1935,6 +1935,9 @@ pub struct TokenLogprob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateToken {
     pub token_id: TokenId,
+    /// Incrementally decoded text, including required decoder lookbehind.
+    /// May be empty while a UTF-8 sequence is incomplete; terminal delivery
+    /// includes any pending text. Staged output may defer a changing prefix.
     pub text: String,
     pub finish_reason: Option<FinishReason>,
 }
