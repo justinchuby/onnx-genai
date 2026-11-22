@@ -113,7 +113,11 @@ An SSE request with `X-Conversation-Id` retains generation independently of its
 HTTP reader. Reconnect with `/v1/stream?conv_id=ID&from=BYTE_OFFSET`; DELETE cancels
 the producer. Retention defaults to 16 streams and 4 MiB per stream, with completed
 history expiring after five minutes. Old offsets fail explicitly once evicted.
-Requests without a conversation ID retain disconnect-cancels behavior.
+Requests without a conversation ID close their driver reader on disconnect.
+Mid-compute cancellation through the ordinary decoder is an outstanding engine
+follow-up: its GenerationControl surface currently rejects non-specialized
+execution. Replay DELETE already removes the transport producer and retained
+bytes; that alone does not prove prompt termination inside every backend.
 
 Native generation accepts text, token IDs, mixed text/token rows and prompt
 batches, including text-only `prompt_string` objects. Only a first text segment
@@ -201,7 +205,17 @@ behavior; they are not representative language models or performance benchmarks.
 
 For a browser smoke test, build the server, install Playwright in a temporary
 Node environment, then run `node scripts/test_llama_chat.mjs /absolute/path/to/playwright/index.mjs`.
-The script starts a tiny-fixture server on port 18080, sends a message through
-the actual UI, verifies the answer and persisted conversation, then shuts down
-Chrome and the server. Append an optional screenshot path after the Playwright module path to save an image. Coordinate
-this inference workload with other sessions using the shared host lock.
+The script uses loopback ports 18080–18082. It first verifies chat, persistence
+and byte-exact completed replay. It then builds a temporary long-context version
+of the same fixture by repeating its declared position table and updating the
+matching shape/context metadata, with explicit size bounds. During a real
+16,384-token ONNX generation, a fault proxy disconnects the first browser reader;
+the frontend must automatically resume from a nonzero byte offset. The page
+then reloads while the producer is still active and must attach again without
+resubmitting generation. The final UI text must match the complete retained
+answer, with one generation POST and no browser runtime errors. No mocked
+inference or artificial network delay makes the generation appear active.
+Temporary fixtures, proxy, Chrome and server processes are cleaned up, with
+bounded startup/observer waits. Append an optional screenshot path after the
+Playwright module path to save an image of the baseline chat. Coordinate this
+inference workload with other sessions using the shared host lock.

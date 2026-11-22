@@ -45,8 +45,8 @@ through the admitted engine driver. A real tiny-model HTTP test covers both
 alternate protocols and their streamed usage; synthetic stream tests pin reasoning,
 tool indices and incomplete-stream rejection.
 
-This milestone does not check off the full rows above: active-generation browser refresh/reconnect,
-native prefill-only, timing/progress, additional
+This milestone does not check off the full rows above: ordinary-decoder
+mid-compute cancellation, native prefill-only, timing/progress, additional
 sampling and runtime-backed state/adapter work still need completion.
 
 Sampling follow-up: `logit_bias` now lowers OpenAI objects and native token/text
@@ -84,8 +84,8 @@ Explicit API errors now carry numeric HTTP code and native request/not-found/
 permission classifications. Messages errors include the Anthropic envelope even
 for JSON extraction failures, retain retry headers, and late SSE errors preserve
 the original status/category across adapters. Full server: 375 passed, 2 inherited
-ignores; strict all-target Clippy passes. The active-generation browser reconnect
-scenario still needs work.
+ignores; strict all-target Clippy passes. Active-generation browser reconnect
+is now verified by the browser milestone below.
 
 Byte-piece follow-up: native with_pieces now preserves incomplete UTF-8 using
 byte arrays. The existing byte vocabulary adapter is invoked once per requested
@@ -179,3 +179,21 @@ existing shape.
 OpenAI-batch validation: full server library 392 passed / 2 inherited ignores.
 After the final model-snapshot and publication-ownership checks, all 29 selected
 native/alternate-protocol tests and strict all-target Clippy pass.
+
+Active-browser milestone: the real Chrome smoke now covers an initial reader
+disconnection followed by automatic replay from a nonzero byte offset, then
+a page reload while the same server producer remains active. A temporary,
+bounded extension of the tiny fixture's position table permits real 16,384-token
+ONNX generation without changing runtime behavior or delaying the network.
+The frontend makes exactly one generation POST, automatically issues two replay
+requests, renders the complete retained answer and reports no runtime errors.
+The final script passed, including subprocess/proxy/fixture cleanup. Existing
+HTTP/unit checks cover byte boundaries, reader admission, replacement, history
+limits and expiry.
+
+Cancellation audit follow-up: the server creates a receiver-closure probe but
+currently attaches GenerationControl only to specialized speculative paths; the
+engine explicitly rejects that control for ordinary decode and non-specialized
+workflows. DELETE already cancels transport retention, but true mid-compute
+cancellation/worker release still needs implementation and executable Stop tests.
+The complete resumable-generation delivery row therefore remains unchecked.
