@@ -4,6 +4,11 @@ Measured on Apple M1 Max (10 physical/logical cores, 32 GiB), macOS 27.0.1
 arm64, rustc 1.98.0, release defaults, `mlas` enabled, debug info and incremental
 compilation disabled. No CUDA, non-Apple ISA or whole-model claim.
 
+This is a historical baseline. The later [repair-set implementation and
+measurements](2026-11-21-silu-density-repair.md) supersede its ordinary-vector
+performance conclusion. The numerical counterexample and raw baseline data
+remain valid and reproducible.
+
 ## Decision
 
 Keep the existing native exp-based implementation and the MLAS research route.
