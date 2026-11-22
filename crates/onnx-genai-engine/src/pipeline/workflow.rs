@@ -266,6 +266,7 @@ pub(crate) struct WorkflowPerformanceCounters {
 /// execution retains those inputs while discarding transient SSA and emit values.
 pub struct WorkflowExecutionPlan<'a> {
     engine: &'a WorkflowRuntime,
+    generation_control: Option<GenerationControl>,
     values: PipelineTensors,
     input_aliases: HashMap<String, String>,
     initial_symbols: HashMap<String, i64>,
@@ -989,17 +990,20 @@ impl<'a> WorkflowExecutionPlan<'a> {
 
     pub(super) fn new_candidate_tree_driver(
         engine: &'a WorkflowRuntime,
-        request: PipelineGenerateRequest,
+        mut request: PipelineGenerateRequest,
     ) -> anyhow::Result<Self> {
         engine.require_execution_admitted()?;
+        // The specialized host owns its control's semantic commit race.
+        request.generation_control = None;
         Self::new_hosted(engine, request, &[])
     }
 
     pub(super) fn new_dflash_driver(
         engine: &'a WorkflowRuntime,
-        request: PipelineGenerateRequest,
+        mut request: PipelineGenerateRequest,
     ) -> anyhow::Result<Self> {
         engine.require_execution_admitted()?;
+        request.generation_control = None;
         Self::new_hosted(engine, request, &[])
     }
 
@@ -1028,6 +1032,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         engine.require_execution_admitted()?;
         let PipelineGenerateRequest {
             request,
+            generation_control,
             inputs,
             session_id,
             component_overrides,
@@ -1175,6 +1180,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             .collect();
         Ok(Self {
             engine,
+            generation_control,
             values,
             input_aliases,
             initial_symbols,
@@ -1286,6 +1292,27 @@ impl<'a> WorkflowExecutionPlan<'a> {
     /// transform an output uses this rather than discovering a bad output after
     /// the state/effect/output write set has committed.
     pub(crate) fn execute_retained_with_host_before_commit(
+        &mut self,
+        host: &mut Option<&mut dyn WorkflowNodeHost>,
+        before_commit: impl FnOnce(
+            &PipelineTensors,
+            &BTreeMap<String, Vec<String>>,
+            bool,
+        ) -> anyhow::Result<()>,
+    ) -> anyhow::Result<(PipelineTensors, BTreeMap<String, Vec<String>>)> {
+        let control = self.generation_control.clone();
+        if let Some(control) = control.as_ref() {
+            let mut controlled = ControlledWorkflowHost {
+                inner: host,
+                control,
+            };
+            self.execute_controlled_pass(&mut Some(&mut controlled), before_commit)
+        } else {
+            self.execute_controlled_pass(host, before_commit)
+        }
+    }
+
+    fn execute_controlled_pass(
         &mut self,
         host: &mut Option<&mut dyn WorkflowNodeHost>,
         before_commit: impl FnOnce(
@@ -1479,7 +1506,11 @@ impl<'a> WorkflowExecutionPlan<'a> {
             let outcome = abort_workflow_turn(
                 &mut publication_journal,
                 &mut transaction,
-                TurnAbortReason::ExecutionFailure,
+                if error.downcast_ref::<GenerationCancelled>().is_some() {
+                    TurnAbortReason::Cancellation
+                } else {
+                    TurnAbortReason::ExecutionFailure
+                },
             )
             .context("failed to resolve the workflow turn after begin_turn failed")?;
             publish_terminal_transaction_outcome(host, &outcome);
@@ -1581,7 +1612,11 @@ impl<'a> WorkflowExecutionPlan<'a> {
             let outcome = abort_workflow_turn(
                 &mut publication_journal,
                 &mut transaction,
-                TurnAbortReason::ExecutionFailure,
+                if error.downcast_ref::<GenerationCancelled>().is_some() {
+                    TurnAbortReason::Cancellation
+                } else {
+                    TurnAbortReason::ExecutionFailure
+                },
             )
             .context("failed to resolve the workflow turn after execution failed")?;
             if let Some(host) = host.as_deref_mut() {
@@ -1777,7 +1812,11 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 let outcome = abort_workflow_turn(
                     &mut publication_journal,
                     &mut transaction,
-                    TurnAbortReason::CommitFailure,
+                    if error.downcast_ref::<GenerationCancelled>().is_some() {
+                        TurnAbortReason::Cancellation
+                    } else {
+                        TurnAbortReason::CommitFailure
+                    },
                 )
                 .context("failed to resolve the workflow turn after commit preparation failed")?;
                 if let Some(host) = host.as_deref_mut() {
@@ -1979,6 +2018,128 @@ pub(crate) trait WorkflowNodeHost {
     fn execute_contract_node(&mut self, request: WorkflowNodeRequest<'_>) -> anyhow::Result<bool>;
 }
 
+/// Adds request cancellation without taking execution or publication authority
+/// away from an existing node host. The generic transaction remains the sole
+/// owner of the commit/abort outcome.
+struct ControlledWorkflowHost<'a, 'b> {
+    inner: &'a mut Option<&'b mut dyn WorkflowNodeHost>,
+    control: &'a GenerationControl,
+}
+
+impl WorkflowNodeHost for ControlledWorkflowHost<'_, '_> {
+    fn hosted_contracts(&self) -> &'static [&'static str] {
+        self.inner
+            .as_deref()
+            .map_or(&[], WorkflowNodeHost::hosted_contracts)
+    }
+
+    fn hosts_invocation(
+        &self,
+        component: &str,
+        inputs: &BTreeMap<String, String>,
+        outputs: &BTreeMap<String, String>,
+    ) -> bool {
+        self.inner
+            .as_deref()
+            .is_some_and(|host| host.hosts_invocation(component, inputs, outputs))
+    }
+
+    fn begin_turn(&mut self, turn: &TurnTransaction) -> anyhow::Result<()> {
+        self.observe_boundary(GenerationBoundary::BeforeWorkflowNode)?;
+        if let Some(host) = self.inner.as_deref_mut() {
+            host.begin_turn(turn)?;
+        }
+        Ok(())
+    }
+
+    fn observe_boundary(&mut self, boundary: GenerationBoundary) -> anyhow::Result<()> {
+        if self.control.observe(boundary)? {
+            return Err(GenerationCancelled { boundary }.into());
+        }
+        if let Some(host) = self.inner.as_deref_mut() {
+            host.observe_boundary(boundary)?;
+        }
+        Ok(())
+    }
+
+    fn before_turn_commit(&mut self, turn: &TurnTransaction) -> anyhow::Result<()> {
+        if let Some(host) = self.inner.as_deref_mut() {
+            host.before_turn_commit(turn)?;
+        }
+        if !self.control.begin_commit()? {
+            return Err(GenerationCancelled {
+                boundary: GenerationBoundary::BeforeSemanticCommit,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn supports_provisional_output_publications(&self) -> bool {
+        self.inner
+            .as_deref()
+            .is_some_and(WorkflowNodeHost::supports_provisional_output_publications)
+    }
+
+    fn publish_provisional_output_publications(
+        &mut self,
+        publications: &[WorkflowOutputPublication],
+    ) -> anyhow::Result<()> {
+        self.inner
+            .as_deref_mut()
+            .context("provisional workflow output requires its declared transport host")?
+            .publish_provisional_output_publications(publications)
+    }
+
+    fn publish_transaction_outcome(
+        &mut self,
+        publication: &WorkflowOutputPublication,
+    ) -> anyhow::Result<()> {
+        if let Some(host) = self.inner.as_deref_mut() {
+            host.publish_transaction_outcome(publication)?;
+        }
+        Ok(())
+    }
+
+    fn turn_committed(&mut self, outcome: TurnTransactionOutcome) {
+        self.control.finish_commit();
+        if let Some(host) = self.inner.as_deref_mut() {
+            host.turn_committed(outcome);
+        }
+    }
+
+    fn turn_aborted(&mut self, outcome: TurnTransactionOutcome) {
+        self.control.abort_commit();
+        if let Some(host) = self.inner.as_deref_mut() {
+            host.turn_aborted(outcome);
+        }
+    }
+
+    fn loop_host_outcome(&self) -> WorkflowLoopHostOutcome {
+        self.inner.as_deref().map_or(
+            WorkflowLoopHostOutcome::Continue,
+            WorkflowNodeHost::loop_host_outcome,
+        )
+    }
+
+    fn observe_staged_generation_tokens(
+        &mut self,
+        tokens: &[crate::TokenId],
+    ) -> anyhow::Result<()> {
+        if let Some(host) = self.inner.as_deref_mut() {
+            host.observe_staged_generation_tokens(tokens)?;
+        }
+        Ok(())
+    }
+
+    fn execute_contract_node(&mut self, request: WorkflowNodeRequest<'_>) -> anyhow::Result<bool> {
+        match self.inner.as_deref_mut() {
+            Some(host) => host.execute_contract_node(request),
+            None => Ok(false),
+        }
+    }
+}
+
 /// Move a journal's newly created provisional envelopes across a host boundary
 /// without making the host a second output authority.
 fn publish_pending_provisional_publications(
@@ -2074,6 +2235,9 @@ impl WorkflowRuntime {
         telemetry: &mut WorkflowRunTelemetry,
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<()> {
+        if let Some(host) = host.as_deref_mut() {
+            host.observe_boundary(GenerationBoundary::BeforeWorkflowNode)?;
+        }
         match node {
             WorkflowNode::Sequence { nodes } => {
                 for node in nodes {
@@ -7118,6 +7282,7 @@ steps:
         provisional: Vec<(String, String, OutputFinality)>,
         terminal: Vec<&'static str>,
         abort_streams: Vec<OutputStreamBaseline>,
+        cancel_after_body: Option<(usize, GenerationControl)>,
     }
 
     impl WorkflowNodeHost for LifecycleHost {
@@ -7185,6 +7350,12 @@ steps:
                 "setup" => self.setup_runs += 1,
                 "body" => self.body_runs += 1,
                 component => anyhow::bail!("unexpected lifecycle component '{component}'"),
+            }
+            if request.component == "body"
+                && let Some((after, control)) = &self.cancel_after_body
+                && self.body_runs == *after
+            {
+                assert!(control.cancel());
             }
             let input = request
                 .inputs
@@ -7613,6 +7784,88 @@ steps:
     }
 
     #[test]
+    fn generic_generation_control_aborts_between_nodes_and_retracts_provisional_output()
+    -> anyhow::Result<()> {
+        let runtime = test_runtime(provisional_lifecycle_workflow());
+        let control = GenerationControl::new();
+        let mut plan = WorkflowExecutionPlan::new_hosted(
+            &runtime,
+            lifecycle_request(1, 100).with_generation_control(control.clone()),
+            &["test.loop.lifecycle"],
+        )?;
+        let mut lifecycle = LifecycleHost {
+            supports_publication: true,
+            cancel_after_body: Some((2, control)),
+            ..Default::default()
+        };
+        let error = plan
+            .execute_retained_with_host(&mut Some(&mut lifecycle))
+            .err()
+            .context("cancelled generation unexpectedly completed")?;
+        assert!(matches!(
+            error.downcast_ref::<GenerationCancelled>(),
+            Some(GenerationCancelled {
+                boundary: GenerationBoundary::BeforeWorkflowNode,
+            })
+        ));
+        assert_eq!(lifecycle.setup_runs, 1);
+        assert_eq!(
+            lifecycle.body_runs, 2,
+            "cancellation must stop the remaining 98 iterations"
+        );
+        assert_eq!(lifecycle.provisional.len(), 1);
+        assert_eq!(lifecycle.terminal, ["abort"]);
+        assert!(runtime.worker.session_state.borrow().is_empty());
+        assert!(runtime.worker.session_outputs.borrow().is_empty());
+        assert!(runtime.worker.last_output_publications.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn generic_generation_control_owns_the_commit_race() -> anyhow::Result<()> {
+        for cancel_at_commit in [false, true] {
+            let runtime = test_runtime(provisional_lifecycle_workflow());
+            let authority = GenerationControl::new();
+            let cancellation = authority.clone();
+            let control = authority.clone().with_checkpoint(move |boundary| {
+                if cancel_at_commit && boundary == GenerationBoundary::BeforeSemanticCommit {
+                    assert!(cancellation.cancel());
+                }
+                Ok(())
+            });
+            let mut plan = WorkflowExecutionPlan::new_hosted(
+                &runtime,
+                lifecycle_request(1, 2).with_generation_control(control),
+                &["test.loop.lifecycle"],
+            )?;
+            let mut lifecycle = LifecycleHost {
+                supports_publication: true,
+                ..Default::default()
+            };
+            let result = plan.execute_retained_with_host(&mut Some(&mut lifecycle));
+            if cancel_at_commit {
+                assert!(matches!(
+                    result
+                        .err()
+                        .and_then(|error| error.downcast::<GenerationCancelled>().ok()),
+                    Some(GenerationCancelled {
+                        boundary: GenerationBoundary::BeforeSemanticCommit,
+                    })
+                ));
+                assert_eq!(lifecycle.terminal, ["abort"]);
+            } else {
+                result?;
+                assert_eq!(lifecycle.terminal, ["commit"]);
+                assert!(
+                    !authority.cancel(),
+                    "committed state cannot be cancelled retroactively"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn generic_provisional_transport_observes_revisions_then_exact_terminal_outcome()
     -> anyhow::Result<()> {
         let runtime = test_runtime(provisional_lifecycle_workflow());
@@ -7947,6 +8200,47 @@ steps:
             committed.to_vec_i64()?,
             vec![22],
             "the next turn restores once, then each sequential loop carries the preceding update"
+        );
+        drop(state);
+
+        let authority = GenerationControl::new();
+        let cancel = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == GenerationBoundary::BeforeSemanticCommit {
+                assert!(cancel.cancel());
+            }
+            Ok(())
+        });
+        let request = PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(
+            Vec::new(),
+        )))
+        .with_input("seed", Value::from_slice_i64(&[100], &[1])?)
+        .with_session_id("two-phase")
+        .with_generation_control(control);
+        let mut cancelled =
+            WorkflowExecutionPlan::new_hosted(&runtime, request, &["test.state.advance"])?;
+        let error = cancelled
+            .execute_retained_with_host(&mut Some(&mut host))
+            .err()
+            .context("cancelled session turn unexpectedly committed")?;
+        assert!(error.downcast_ref::<GenerationCancelled>().is_some());
+        assert_eq!(
+            runtime
+                .worker
+                .session_state
+                .borrow()
+                .get(&("two-phase".to_string(), "accumulator".to_string()))
+                .context("cancelled turn lost the prior committed state")?
+                .to_vec_i64()?,
+            vec![22]
+        );
+        assert_eq!(
+            runtime
+                .worker
+                .session_turn_versions
+                .borrow()
+                .get("two-phase"),
+            Some(&2)
         );
         Ok(())
     }

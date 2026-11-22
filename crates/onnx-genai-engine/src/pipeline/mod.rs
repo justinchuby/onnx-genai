@@ -94,6 +94,7 @@ const GENERATION_COMMITTED: u8 = 3;
 /// cancellation or a caller-provided execution guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationBoundary {
+    BeforeWorkflowNode,
     AfterLoopSetup,
     BeforeProposer,
     AfterProposer,
@@ -118,6 +119,7 @@ pub struct GenerationControlUnsupported {
 impl std::fmt::Display for GenerationBoundary {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::BeforeWorkflowNode => "before workflow node execution",
             Self::AfterLoopSetup => "after loop setup",
             Self::BeforeProposer => "before proposer execution",
             Self::AfterProposer => "after proposer execution",
@@ -129,6 +131,14 @@ impl std::fmt::Display for GenerationBoundary {
             Self::BeforeOutputPublication => "before output publication",
         })
     }
+}
+
+/// Cancellation before a generic workflow transaction commits. The workflow
+/// resolves its provisional state and outputs through the ordinary abort path.
+#[derive(Debug, thiserror::Error)]
+#[error("generation cancelled {boundary}; the provisional workflow turn was aborted")]
+pub struct GenerationCancelled {
+    pub boundary: GenerationBoundary,
 }
 
 /// Request-scoped cancellation and deterministic transaction checkpoints.

@@ -115,8 +115,9 @@ the producer. Retention defaults to 16 streams and 4 MiB per stream, with comple
 history expiring after five minutes. Old offsets fail explicitly once evicted.
 Requests without a conversation ID close their driver reader on disconnect.
 Mid-compute cancellation through the ordinary decoder is an outstanding engine
-follow-up: its GenerationControl surface currently rejects non-specialized
-execution. Replay DELETE already removes the transport producer and retained
+follow-up: the engine now supports request-scoped cancellation between generic
+workflow nodes and at semantic commit, but fused decode still rejects that
+control and the server's ordinary path still needs wiring. Replay DELETE already removes the transport producer and retained
 bytes; that alone does not prove prompt termination inside every backend.
 
 Native generation accepts text, token IDs, mixed text/token rows and prompt

@@ -192,8 +192,23 @@ HTTP/unit checks cover byte boundaries, reader admission, replacement, history
 limits and expiry.
 
 Cancellation audit follow-up: the server creates a receiver-closure probe but
-currently attaches GenerationControl only to specialized speculative paths; the
-engine explicitly rejects that control for ordinary decode and non-specialized
-workflows. DELETE already cancels transport retention, but true mid-compute
+currently attaches GenerationControl only to specialized speculative paths.
+DELETE already cancels transport retention, but true mid-compute
 cancellation/worker release still needs implementation and executable Stop tests.
 The complete resumable-generation delivery row therefore remains unchecked.
+
+Generic-workflow cancellation: the engine accepts GenerationControl for declared
+workflow execution, checks it before each authored node and resolves the atomic
+commit race before semantic publication. A forwarding host preserves the original
+node executor, tool observer and provisional output transport; cancellation uses
+the existing transaction abort path. Specialized drivers retain their own control
+authority rather than competing with a second commit owner. Tests cancel after
+two real hosted loop iterations, retract a prior provisional revision, cover both
+commit-race outcomes, and preserve a previously committed session value/version.
+Fused decoder propagation and the server's ordinary receiver-closure wiring
+remain outstanding; this milestone does not claim frontend Stop is complete.
+
+Generic-cancellation validation: full engine library 613 passed / 1 inherited
+ignore; full server library 392 passed / 2 inherited ignores. Final focused
+checks selected and passed both cancellation tests plus the session-baseline
+regression. Strict all-target Clippy passes for both engine and server.

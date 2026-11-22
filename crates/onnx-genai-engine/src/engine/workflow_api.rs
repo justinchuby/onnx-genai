@@ -239,19 +239,6 @@ impl Engine {
         // Fail closed on the exact declared protocol before scheduler
         // admission, workflow session binding, or specialized driver state.
         let _ = self.tool_call_observer(&request.tool_call_policy)?;
-        if request.generation_control.is_some()
-            && self
-                .workflow_runtime()
-                .candidate_tree_diagnostic()
-                .is_none()
-            && self.workflow_runtime().dflash_diagnostic().is_none()
-        {
-            return Err(crate::pipeline::GenerationControlUnsupported {
-                operation: "Engine::generate_with_pipeline_callbacks",
-                runtime: "a workflow without a specialized speculative driver",
-            }
-            .into());
-        }
         // A request that binds no tensors is a prompt, and a prompt is served
         // by the ordinary entry point — which admits through the scheduler,
         // reuses a cached prefix, and routes the declared decode step to the
@@ -260,6 +247,13 @@ impl Engine {
         // request that asked for none of it.
         let prompt_only = request.inputs.is_empty() && request.component_overrides.is_empty();
         if prompt_only && self.holds_decode_core() {
+            if request.generation_control.is_some() {
+                return Err(crate::pipeline::GenerationControlUnsupported {
+                    operation: "Engine::generate_with_pipeline_callbacks",
+                    runtime: "the fused decode backend",
+                }
+                .into());
+            }
             let tool_call_policy = request.tool_call_policy.clone();
             return match request.session_id.as_deref().and_then(|id| id.parse().ok()) {
                 Some(session) if self.sessions.contains_key(&session) => self
