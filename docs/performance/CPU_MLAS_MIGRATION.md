@@ -234,6 +234,20 @@ Ordered by *decode-path impact × distance from parity*, which is also
    #1104 absorbed int4 acc0 decode (1.36× / 1.56×); prefill is the remainder,
    and `MoE` follows it.
 
+Native SiLU now shares the runtime's existing chunk scheduler, including host
+pool preference and nested-pool avoidance. The ARM64 exp-based SIMD kernel is
+restricted to the validated finite `[-18, 18]` band; outside it, bounded blocks
+use the existing stable scalar formula, preserving the staged f32 negative tail
+and special-value semantics instead of relying on a clamped `exp(-x)`.
+This absorbs correction/blocking/scheduling structure, not the remaining MLAS
+inner primitive. [M1 Max measurements and the rejected rational candidate](../benchmarks/2026-11-21-silu-native.md)
+show that ordinary native long vectors still lag, while a direct MLAS rational
+port exceeds the existing independent native error budget near `x=-16.435`.
+The exp-based native implementation and all accuracy guards stay intact.
+The MLAS research route remains; this does not graduate SiLU. The CPU crate
+retains the absorbed coefficients' complete MIT notice in `MLAS_LICENSE`,
+independently of the eventual removal of the vendor/reference crate.
+
 Generic f32 GEMM's thin-M column-parallel path now borrows the original B
 stride and caller-owned output rows. It retains the same scalar register tiles
 and K-panel accumulation order, replacing full B/output element copies with

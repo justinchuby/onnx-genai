@@ -2,6 +2,10 @@
 //! `Sigmoid`, `Erf`, `Gelu` in both its exact and tanh forms, `FastGelu`,
 //! `QuickGelu`, `BiasGelu`).
 //!
+//! The MLAS-derived algorithms and coefficients retain Microsoft's MIT
+//! copyright and permission notice in this crate's `MLAS_LICENSE`, independently
+//! of the optional reference/vendor crate.
+//!
 //! # Why this exists
 //!
 //! The scalar kernels evaluate one `libm` transcendental per element. On this
@@ -743,7 +747,6 @@ fn note_parallel_dispatch() {
 /// Takes a `fn` pointer rather than `impl Fn` on purpose: every caller shares
 /// one instantiation, and that instantiation lives in this module. See
 /// `clip_chunked` for why that matters.
-#[cfg(feature = "mlas")]
 pub(crate) fn run_chunked_fn(input: &[f32], output: &mut [f32], body: fn(&[f32], &mut [f32])) {
     run_chunked(input, output, body);
 }
@@ -6173,6 +6176,10 @@ mod host_pool_split {
 
     #[test]
     fn unary_kernels_match_the_unsplit_result() {
+        assert_same(
+            "native_silu",
+            super::super::activations::silu_native_f32_slice,
+        );
         assert_same("tanh", tanh_f32_slice);
         assert_same("sqrt", sqrt_f32_slice);
         assert_same("sigmoid", sigmoid_f32_slice);

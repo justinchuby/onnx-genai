@@ -176,12 +176,11 @@ fn silu_f64(x: f64) -> f64 {
     }
 }
 
-/// Inputs whose magnitude exceeds this bound (or that are non-finite) fall
-/// outside MLAS's internal logistic clamp of `[-18, 18]`, so SiLU must be
-/// recomputed accurately for them. Inside the bound the MLAS approximation is
-/// the same routine ORT uses and is accurate.
-#[cfg(feature = "mlas")]
-const SILU_MLAS_SAFE_BOUND: f32 = 18.0;
+/// Both SIMD approximations are validated on this finite input band. Outside
+/// it, use the stable scalar formula: MLAS clamps its logistic input and the
+/// native exp(-x) reconstruction would otherwise distort negative tails.
+#[cfg(any(feature = "mlas", target_arch = "aarch64"))]
+const SILU_APPROX_SAFE_BOUND: f32 = 18.0;
 
 pub struct ActivationKernel {
     activation: Activation,
@@ -425,25 +424,24 @@ fn contiguous_f32(
 
 /// SiLU (`x * sigmoid(x)`) over equal-length contiguous f32 slices.
 ///
-/// With the `mlas` feature this uses MLAS's fused one-pass SiLU, including its
-/// AVX-512F runtime path. Without `mlas` we keep the scalar reference.
-/// On aarch64 without `mlas`, a NEON-vectorized path processes 4 floats at a
-/// time using a Cephes-style exp polynomial (~28 ULP worst-case on [-87, 88]).
-/// Elements per MLAS + correction block.
+/// Both native and research implementations share the runtime chunk scheduler.
+/// Native aarch64 uses NEON within a bounded numerical band and the stable
+/// scalar formula outside it; other native CPUs use the scalar formula.
+/// Elements per computation + correction block.
 ///
 /// 8192 f32 = 32 KiB, so a block and its input both stay inside L2 and the
-/// correction scan reads what MLAS just touched rather than making a second
+/// correction scan reads what the kernel just touched rather than making a second
 /// trip to DRAM.
-#[cfg(feature = "mlas")]
+#[cfg(any(feature = "mlas", target_arch = "aarch64"))]
 const SILU_CORRECTION_BLOCK: usize = 8192;
 
 /// MLAS's fused SiLU with its out-of-band results corrected, blocked so the
 /// correction stays in cache.
 ///
 /// MLAS's SIMD SiLU clamps its logistic input to [-18, 18] internally, so
-/// out-of-range or non-finite results need correction: `SiLU(-1e30)` would
-/// leak `sigmoid(-18) ~= 1.5e-8` instead of decaying to 0, and
-/// `SiLU(+/-Inf)`/`SiLU(NaN)` would be corrupted.
+/// out-of-range or non-finite results need correction. Saturating the sigmoid
+/// before multiplying loses the finite negative tail; non-finite products
+/// also need the explicit scalar semantics.
 ///
 /// Whether a correction is needed depends only on the *input*, so the common
 /// all-in-band path never reads or writes the output a second time: a
@@ -460,11 +458,11 @@ fn silu_mlas_corrected(input: &[f32], output: &mut [f32]) {
         mlas_sys::compute_silu(xs, ys);
         let mut needs_correction = 0u32;
         for &x in xs {
-            needs_correction |= u32::from(!x.is_finite() || x.abs() > SILU_MLAS_SAFE_BOUND);
+            needs_correction |= u32::from(!x.is_finite() || x.abs() > SILU_APPROX_SAFE_BOUND);
         }
         if needs_correction != 0 {
             for (o, &i) in ys.iter_mut().zip(xs) {
-                if !i.is_finite() || i.abs() > SILU_MLAS_SAFE_BOUND {
+                if !i.is_finite() || i.abs() > SILU_APPROX_SAFE_BOUND {
                     *o = silu(i);
                 }
             }
@@ -477,24 +475,38 @@ pub(crate) fn silu_f32_slice(input: &[f32], output: &mut [f32]) {
     {
         crate::kernels::simd_activations::run_chunked_fn(input, output, silu_mlas_corrected);
     }
-    #[cfg(all(not(feature = "mlas"), target_arch = "aarch64"))]
+    #[cfg(not(feature = "mlas"))]
+    silu_native_f32_slice(input, output);
+}
+
+/// Retain a directly testable native route even in differential research builds.
+#[cfg(any(not(feature = "mlas"), test))]
+pub(super) fn silu_native_f32_slice(input: &[f32], output: &mut [f32]) {
+    crate::kernels::simd_activations::run_chunked_fn(input, output, silu_native_chunk);
+}
+
+#[cfg(any(not(feature = "mlas"), test))]
+fn silu_native_chunk(input: &[f32], output: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    for (xs, ys) in input
+        .chunks(SILU_CORRECTION_BLOCK)
+        .zip(output.chunks_mut(SILU_CORRECTION_BLOCK))
     {
-        silu_f32_neon(input, output);
+        silu_f32_neon(xs, ys);
     }
-    #[cfg(all(not(feature = "mlas"), not(target_arch = "aarch64")))]
-    {
-        for (output, &input) in output.iter_mut().zip(input) {
-            *output = silu(input);
-        }
+    #[cfg(not(target_arch = "aarch64"))]
+    for (output, &input) in output.iter_mut().zip(input) {
+        *output = silu(input);
     }
 }
 
 /// NEON-vectorized SiLU: `x / (1 + exp(-x))`, processing 4 floats per iteration.
 ///
 /// Uses a Cephes-style exp polynomial with Cody-Waite range reduction. Measured
-/// worst-case error ~28 ULP on the normal f32 range ([-87, 88]). Non-finite and
-/// extreme values are handled by clamping and the scalar fallback for the tail.
-#[cfg(all(not(feature = "mlas"), target_arch = "aarch64"))]
+/// worst-case exp error ~28 ULP on the normal f32 range. Use this
+/// approximation only for finite |x| <= 18: outside that band the stable
+/// scalar formula preserves negative subnormal tails and positive limits.
+#[cfg(all(target_arch = "aarch64", any(not(feature = "mlas"), test)))]
 fn silu_f32_neon(input: &[f32], output: &mut [f32]) {
     use std::arch::aarch64::*;
 
@@ -551,21 +563,18 @@ fn silu_f32_neon(input: &[f32], output: &mut [f32]) {
             let denom = vaddq_f32(one, exp_neg_x);
             let result = vdivq_f32(x, denom);
 
-            // Handle non-finite: if |x| > 87, use a simpler formula.
-            // For very negative x: silu(x) ≈ 0. For very positive x: silu(x) ≈ x.
-            // The clamping + polynomial already handles this correctly for normal
-            // values, but NaN/Inf need the scalar path. Those are rare enough that
-            // we skip vectorized NaN handling and correct in the tail.
+            // Repair values outside the validated numerical band below;
+            // clamping protects the speculative SIMD exponent reconstruction.
             vst1q_f32(output.as_mut_ptr().add(i), result);
             i += 4;
         }
     }
 
-    // Fix up non-finite values and handle the scalar tail.
-    // Re-check the NEON-computed region for non-finite inputs and recompute those.
+    // Keep corrections local to the caller's bounded block. In particular,
+    // exp(-x) overflows for negative tails where x*exp(x) is still nonzero.
     let neon_end = i;
     for j in 0..neon_end {
-        if !input[j].is_finite() {
+        if !input[j].is_finite() || input[j].abs() > SILU_APPROX_SAFE_BOUND {
             output[j] = silu(input[j]);
         }
     }
@@ -1158,7 +1167,7 @@ mod silu_parallel {
     fn reference(input: &[f32], output: &mut [f32]) {
         mlas_sys::compute_silu(input, output);
         for (o, &i) in output.iter_mut().zip(input) {
-            if !i.is_finite() || i.abs() > SILU_MLAS_SAFE_BOUND {
+            if !i.is_finite() || i.abs() > SILU_APPROX_SAFE_BOUND {
                 *o = silu(i);
             }
         }
@@ -1312,6 +1321,267 @@ mod silu_bench {
             }
             let (s, p) = (ser * 1e6, par * 1e6);
             println!("{n}\t{s:.1}\t{p:.1}\t{:.2}x", s / p);
+        }
+    }
+
+    /// Same-process, rotating MLAS/native/repeated-native diagnostic. Timers
+    /// include synchronous kernel calls and scheduler work, exclude allocation,
+    /// validation, warmup and printing. CPU time includes every process thread.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual SiLU diagnostic; run in release under the host lock"]
+    fn silu_native_vs_mlas_rotating() {
+        use crate::kernels::simd_activations::{PAR_MIN_LEN, parallel_dispatches};
+        use std::hint::black_box;
+
+        fn cpu_seconds() -> f64 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            // SAFETY: getrusage initializes the writable rusage on success.
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                0,
+                "SiLU diagnostic cannot read process CPU time"
+            );
+            // SAFETY: successful getrusage initialized usage.
+            let usage = unsafe { usage.assume_init() };
+            (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
+                + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 * 1e-6
+        }
+        fn mode<T>(serial: bool, body: impl FnOnce() -> T) -> T {
+            if serial { serial_scope(body) } else { body() }
+        }
+        let width = crate::task_runtime::testing::pool_width();
+        assert_eq!(width, crate::task_runtime::width());
+        type SliceKernel = fn(&[f32], &mut [f32]);
+        let runs: [SliceKernel; 3] = [silu_f32_slice, silu_native_f32_slice, silu_native_f32_slice];
+        println!("SILU_CSV,width,mode,pattern,n,rep,order,arm,iters,cpu_ns,wall_ns");
+        for serial in [true, false] {
+            for pattern in ["in_band", "sparse_repairs", "dense_negative_tail"] {
+                for n in [3usize, 17, 4096, 65537, 1048581] {
+                    let input: Vec<f32> = (0..n)
+                        .map(|i| {
+                            let ordinary = ((i % 2003) as f32 - 1000.0) / 83.0;
+                            match pattern {
+                                "sparse_repairs" if i % 31 == 0 => [
+                                    -103.0,
+                                    -90.0,
+                                    -50.0,
+                                    -18.000002,
+                                    18.000002,
+                                    f32::MIN,
+                                    f32::MAX,
+                                    f32::NEG_INFINITY,
+                                    f32::INFINITY,
+                                    f32::NAN,
+                                    -0.0,
+                                ][(i / 31) % 11],
+                                "dense_negative_tail" => -20.0 - (i % 8401) as f32 / 100.0,
+                                _ => ordinary,
+                            }
+                        })
+                        .collect();
+                    let mut buffers: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0; n]);
+                    for (arm, run) in runs.iter().enumerate() {
+                        let before = parallel_dispatches();
+                        for _ in 0..4 {
+                            mode(serial, || run(&input, &mut buffers[arm]));
+                        }
+                        if !serial && width > 1 && n >= PAR_MIN_LEN {
+                            assert!(
+                                parallel_dispatches() > before,
+                                "arm={arm} n={n}: diagnostic did not reach parallel dispatch"
+                            );
+                        }
+                        for (&x, &got) in input.iter().zip(&buffers[arm]) {
+                            if x.is_nan() {
+                                assert!(got.is_nan());
+                            } else if !x.is_finite() || x.abs() > SILU_APPROX_SAFE_BOUND || x == 0.0
+                            {
+                                assert_eq!(got.to_bits(), silu(x).to_bits(), "arm={arm} x={x}");
+                            } else {
+                                let x = x as f64;
+                                let want = x / (1.0 + (-x).exp());
+                                assert!(
+                                    (got as f64 - want).abs() <= 2e-6 * want.abs().max(1.0),
+                                    "arm={arm} x={x}: got {got}, want {want}"
+                                );
+                            }
+                        }
+                    }
+                    let iters = (1usize << 20).div_ceil(n).clamp(1, 16384);
+                    for rep in 0..21 {
+                        for order in 0..3 {
+                            let arm = (rep + order) % 3;
+                            let (cpu, wall) = mode(serial, || {
+                                let cpu = cpu_seconds();
+                                let started = Instant::now();
+                                for _ in 0..iters {
+                                    black_box(runs[arm])(
+                                        black_box(&input),
+                                        black_box(&mut buffers[arm]),
+                                    );
+                                    black_box(&buffers[arm]);
+                                }
+                                let wall = started.elapsed().as_secs_f64();
+                                (cpu_seconds() - cpu, wall)
+                            });
+                            println!(
+                                "SILU_CSV,{width},{},{pattern},{n},{rep},{order},{},{iters},{:.3},{:.3}",
+                                if serial { "serial" } else { "runtime" },
+                                ["mlas", "native", "native_aa"][arm],
+                                cpu * 1e9 / iters as f64,
+                                wall * 1e9 / iters as f64
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Native SiLU must satisfy the same numerical and scheduling contract as the
+/// research route, including when both are compiled into one differential build.
+#[cfg(test)]
+mod native_silu_contract {
+    use super::*;
+    use crate::kernels::simd_activations::{PAR_MIN_LEN, parallel_dispatches, serial_scope};
+
+    fn values(n: usize) -> Vec<f32> {
+        let edges = [
+            -104.0,
+            -103.0,
+            -100.0,
+            -90.0,
+            -88.7,
+            -88.0,
+            -87.5,
+            -87.0,
+            -80.0,
+            -50.0,
+            -20.0,
+            -18.000002,
+            -18.0,
+            18.0,
+            18.000002,
+            50.0,
+            f32::MIN,
+            f32::MAX,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            -0.0,
+            0.0,
+            -f32::from_bits(1),
+            f32::from_bits(1),
+            f32::NAN,
+        ];
+        (0..n).map(|i| edges[i % edges.len()]).collect()
+    }
+
+    #[test]
+    fn native_silu_preserves_tails_special_values_and_lane_positions() {
+        // Rotation puts every boundary in every SIMD lane and scalar tail.
+        for n in [0, 1, 3, 4, 7, 8, 17, 8191, 8192, 8193] {
+            for rotation in 0..4 {
+                let mut input = values(n + rotation);
+                input.drain(..rotation);
+                let mut storage = vec![123.0; n + 2];
+                serial_scope(|| {
+                    // Default builds exercise the actual selected entry point;
+                    // research builds exercise native alongside the MLAS route.
+                    #[cfg(not(feature = "mlas"))]
+                    silu_f32_slice(&input, &mut storage[1..n + 1]);
+                    #[cfg(feature = "mlas")]
+                    silu_native_f32_slice(&input, &mut storage[1..n + 1]);
+                });
+                assert_eq!(storage[0], 123.0);
+                assert_eq!(storage[n + 1], 123.0);
+                for (&x, &got) in input.iter().zip(&storage[1..n + 1]) {
+                    if x.is_nan() {
+                        assert!(got.is_nan());
+                    } else if !x.is_finite() || x.abs() > 18.0 || x == 0.0 {
+                        // Contract: staged f64 exp rounded to f32, followed by
+                        // stable f32 arithmetic, matching the existing scalar EP.
+                        let want = if x >= 0.0 {
+                            x / (1.0 + (-(x as f64)).exp() as f32)
+                        } else if x == f32::NEG_INFINITY {
+                            0.0
+                        } else {
+                            let e = (x as f64).exp() as f32;
+                            (x * e) / (1.0 + e)
+                        };
+                        assert_eq!(got.to_bits(), want.to_bits(), "n={n} x={x}");
+                    } else {
+                        let x64 = x as f64;
+                        let want = x64 / (1.0 + (-x64).exp());
+                        assert!(
+                            (got as f64 - want).abs() <= 2e-6 * want.abs().max(1.0),
+                            "n={n} x={x}: got {got}, want {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_silu_dense_band_agrees_with_independent_f64_formula() {
+        let input: Vec<_> = (0..=36000).map(|i| i as f32 / 1000.0 - 18.0).collect();
+        let mut output = vec![0.0; input.len()];
+        silu_native_f32_slice(&input, &mut output);
+        for (&x, &got) in input.iter().zip(&output) {
+            let x = x as f64;
+            let want = x / (1.0 + (-x).exp());
+            assert!(
+                (got as f64 - want).abs() <= 2e-6 * want.abs().max(1.0),
+                "x={x}: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_silu_parallel_dispatch_is_reachable_and_bit_invariant() {
+        let input = values(PAR_MIN_LEN + 4101);
+        let mut reference = vec![0.0; input.len()];
+        serial_scope(|| silu_native_f32_slice(&input, &mut reference));
+        let mut parallel = vec![0.0; input.len()];
+        let before = parallel_dispatches();
+        silu_native_f32_slice(&input, &mut parallel);
+        if crate::task_runtime::width() > 1 {
+            assert!(
+                parallel_dispatches() > before,
+                "native SiLU must reach the scheduler"
+            );
+        }
+        for (&got, &want) in parallel.iter().zip(&reference) {
+            if want.is_nan() {
+                assert!(got.is_nan());
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits());
+            }
+        }
+        for width in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap();
+            let mut output = vec![0.0; input.len()];
+            pool.install(|| {
+                let before = parallel_dispatches();
+                silu_native_f32_slice(&input, &mut output);
+                assert_eq!(
+                    parallel_dispatches(),
+                    before,
+                    "nested Rayon calls must remain serial"
+                );
+            });
+            for (i, (&got, &want)) in output.iter().zip(&reference).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan());
+                } else {
+                    assert_eq!(got.to_bits(), want.to_bits(), "pool={width} index={i}");
+                }
+            }
         }
     }
 }
