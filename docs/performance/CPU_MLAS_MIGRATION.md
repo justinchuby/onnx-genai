@@ -203,10 +203,22 @@ covers KV competition and retry with byte-identical outputs;
 `qlinear_pack_concurrent_builders_share_one_granted_payload` checks eight
 simultaneous builders obtain the same payload under a one-pack budget.
 
-The cache remains per kernel: prefill/decode instances can still hold separate
-packs, each charged independently. Each cache enrolls weakly in the same Host
-pressure domain. Ordinary KV reservation/growth and another weight admission
-can evict its entire idle packed payload; active Arc owners prevent eviction.
+The existing executor constant-state seam shares one cache across activation
+shape variants of the same session node. Adoption requires the same immutable
+grant source, constant B and admitted retention; even independently constructed
+sources over the same Host books/holder cannot exchange caches. Different
+nodes and sessions retain their own state. The session's node prediction uses
+the largest possible signedness layout for one logical B matrix, including
+sign-domain translation, vector B and leading unit dimensions; no fixed count
+of prefill/decode copies remains. Prediction and packing share the same matrix
+shape rule. Overridable initializers and distinct weight batches are excluded.
+The real executor regression previously charged 6,528 then 13,056 bytes when
+activation shape changed; it now retains one pack across three shapes and
+checks separate-session charges and complete release on drop.
+
+Each shared cache enrolls weakly in the same Host pressure domain. Ordinary KV
+reservation/growth and another weight admission can evict its entire idle
+packed payload; active Arc owners prevent eviction.
 Reclamation removes the entry under its state lock and releases the payload
 and grant after unlocking. Construction is serialized separately, so admission
 can synchronously visit the requesting cache without deadlocking. An evicted
@@ -217,8 +229,11 @@ and growth, active-owner exclusion, zero-pressure no-op, unrelated authorities,
 rebuild and weak registration lifetime. The old implementation fails the idle
 KV-reservation case; a deliberate admission-under-state-lock fault is rejected
 by the named parent after its child reaches self-cache admission and times out.
-Cross-instance sharing remains work; this does not graduate QLinearMatMul or
-retire its MLAS reference. The governed amount is the packed payload, not all
+The shared-source policy/lifetime tests cover adoption, idle reclamation after
+the originating kernel drops, rebuilding, and an active payload outliving the
+remaining kernel. Eight concurrent shape-kernel builders share one granted
+payload under a one-pack budget. This does not graduate QLinearMatMul or retire
+its MLAS reference. The governed amount is the packed payload, not all
 transient operand/output or accumulator storage.
 
 ### Retired reference capabilities
@@ -271,6 +286,28 @@ Ordered by *decode-path impact × distance from parity*, which is also
 6. **Quantization / `MatMulNBits` prefill / `MoE`.** Highest value, most work.
    #1104 absorbed int4 acc0 decode (1.36× / 1.56×); prefill is the remainder,
    and `MoE` follows it.
+
+Native byte-GEMM column-zero-point compensation consumes each A row sum where
+it is used, rather than allocating an m-element sum buffer for every batch.
+An all-zero B zero-point vector skips that compensation entirely. The raw dot
+kernel, ISA selection, threading and each K-reduction order remain unchanged;
+all arithmetic is still wrapping i32. Seeded-accumulator tests cover zero,
+sparse/extreme and mixed column offsets against the integer oracle.
+`qgemm_compensation_allocation` observes actual serial ARM64 QLinearMatMul
+execute calls with per-row A quantization, which cannot select MLAS even in a
+reference build. It checks that allocation count does not grow with batch
+count, using a positive allocator control and every output byte. Caller-owned
+inputs/output and factory setup are excluded, with one unobserved warm call.
+For the ARM64 fixture, the old zero-B-offset implementation requests 25, 26,
+and 41 allocations for 1, 2 and 17 batches in both debug and release. The new
+implementation requests 24 in every cell for B offsets 0 and 1, in debug and
+release with and without the optional reference. The reduction is one allocation
+per native GEMM batch, with no retained replacement buffer.
+These are calling-thread allocation-call counts for complete serial executes,
+including remaining parameter/geometry storage, rather than allocated-byte or
+RSS bounds. The regression removes batch-wise compensation churn. AVX2 retains
+its independent A-pair and B-panel scratch. No latency or end-to-end throughput
+claim follows from removing the sum buffer.
 
 Native SiLU shares the runtime chunk scheduler with host-pool preference and
 nested-pool avoidance. ARM64 retains its exp polynomial and stable scalar

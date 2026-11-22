@@ -243,6 +243,17 @@ impl DerivedWeightMemory {
             .is_some_and(|owner| owner._registration.is_some())
     }
 
+    /// Shared kernel preparation must retain the exact grant source, including
+    /// its holder/pressure domain, rather than merely using the same Host books.
+    #[cfg(feature = "mlas")]
+    pub(crate) fn shares_source_with(&self, other: &Self) -> bool {
+        match (&self.owner, &other.owner) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+
     pub(crate) fn register_idle_cache<T: IdleWeightCache + 'static>(&self, cache: &Arc<T>) {
         let Some(owner) = &self.owner else {
             return;

@@ -29,6 +29,14 @@ struct CachedQgemmPack {
     packed: Option<Arc<GrantedQgemmPack>>,
 }
 
+/// Erased by the existing executor seam, which shares only within one node.
+/// Keep the immutable source beside the cache so adoption can verify ownership.
+#[cfg(feature = "mlas")]
+struct SharedQgemmPackState {
+    cache: Arc<QgemmPackCache>,
+    memory: DerivedWeightMemory,
+}
+
 /// Admission may synchronously ask this cache to reclaim, so the builder lock
 /// is independent of the state lock and callbacks only acquire the latter.
 #[cfg(feature = "mlas")]
@@ -231,29 +239,12 @@ pub fn qlinear_packed_b_live_bytes() -> u64 {
     }
 }
 
-/// How many times a shape-keyed kernel cache materializes each `packed_b`.
-///
-/// The executor's kernel cache is keyed by `(node, resolved_input_shapes)`, so
-/// an autoregressive decoder compiles a `QLinearMatMul` node once for the
-/// prefill shape (`m > 1`) and once for the decode shape (`m == 1`), each a
-/// separate `QLinearMatMulKernel` holding its own `packed_b`. Both pack the same
-/// constant `B`, so the session holds two packed copies, not one -- the same
-/// shape-keyed multiplier #1051 corrected for the MLAS SQNBit buffer. Counting
-/// one copy would under-report by 2x, the dangerous direction for an admission
-/// gate; a prefill-only run holds one copy, so this over-estimates there, which
-/// only makes the gate decline sooner (safe).
-#[cfg(feature = "mlas")]
-const QLINEAR_PACKED_B_DECODE_INSTANTIATIONS: u64 = 2;
-
-/// Predicted resident bytes the constant-`B` pre-packs will hold for `graph`,
-/// for the memory plan to fold into its resident total (#1056).
-///
-/// For each `QLinearMatMul` whose `B` (input index 3) is a rank-2 constant
-/// initializer, this is the exact MLAS packed size for that `k x n` weight times
-/// [`QLINEAR_PACKED_B_DECODE_INSTANTIATIONS`]. `A`'s signedness is not a
-/// graph-static property (it is an activation), so the size is taken as the max
-/// over both `a_signed` possibilities -- the over-predicting (safe) direction.
-/// Zero without the `mlas` feature, where nothing is ever packed.
+/// Predicted resident packed-B bytes for `graph` under the session's node-scoped
+/// constant-state sharing. Activation shape variants share one cache entry;
+/// distinct graph nodes remain independent. A cache retains at most one layout,
+/// so bound it by the largest signedness layout, including exact sign-domain
+/// translation, rather than multiplying by a fixed number of shape variants.
+/// Zero without the optional MLAS research reference.
 pub fn qlinear_packed_b_predicted_bytes(graph: &Graph) -> u64 {
     #[cfg(not(feature = "mlas"))]
     {
@@ -270,10 +261,18 @@ pub fn qlinear_packed_b_predicted_bytes(graph: &Graph) -> u64 {
     }
 }
 
-/// Per-node contribution to [`qlinear_packed_b_predicted_bytes`]. Mirrors the
-/// packing condition in [`QLinearMatMulKernel::pack_key`]: a constant, rank-2
-/// `B`. The batched-`B` decline is not visible from a rank-2 initializer, so it
-/// need not be re-checked here.
+/// One logical B matrix: a vector is K×1, and leading unit dimensions do
+/// not create distinct weight batches. Shared by admission prediction and use.
+#[cfg(feature = "mlas")]
+fn single_matrix_shape(shape: &[usize]) -> Option<(usize, usize)> {
+    match shape {
+        [k] => Some((*k, 1)),
+        [batch @ .., k, n] if batch.iter().all(|&dimension| dimension == 1) => Some((*k, *n)),
+        _ => None,
+    }
+}
+
+/// Per-node contribution, using the same single-matrix rule as pack lookup.
 #[cfg(feature = "mlas")]
 fn node_qlinear_packed_b_bytes(node: &Node, graph: &Graph) -> u64 {
     if !node.is_default_domain() || node.op_type != "QLinearMatMul" {
@@ -282,24 +281,24 @@ fn node_qlinear_packed_b_bytes(node: &Node, graph: &Graph) -> u64 {
     let Some(Some(b_value)) = node.inputs.get(3).copied() else {
         return 0;
     };
+    if !graph.is_constant_initializer(b_value) {
+        return 0;
+    }
     let Some(weight) = graph.initializers.get(&b_value) else {
         return 0;
     };
-    let dims = weight.dims();
-    if dims.len() != 2 {
+    if !is_quantized(weight.dtype()) {
         return 0;
     }
-    let (k, n) = (dims[0], dims[1]);
-    let b_signed = weight.dtype() == DataType::Int8;
-    // A is an activation, so its signedness is unknown here; the packed size can
-    // differ with it, so take the larger of the two -- the safe (over-predicting)
-    // direction per #1056.
-    let packed = [false, true]
+    let Some((k, n)) = single_matrix_shape(weight.dims()) else {
+        return 0;
+    };
+    [false, true]
         .into_iter()
-        .filter_map(|a_signed| mlas_sys::qgemm_pack_b_size(n, k, a_signed, b_signed))
+        .flat_map(|a_signed| [false, true].map(|b_signed| (a_signed, b_signed)))
+        .filter_map(|(a_signed, b_signed)| mlas_sys::qgemm_pack_b_size(n, k, a_signed, b_signed))
         .max()
-        .unwrap_or(0) as u64;
-    packed.saturating_mul(QLINEAR_PACKED_B_DECODE_INSTANTIATIONS)
+        .unwrap_or(0) as u64
 }
 
 #[cfg(test)]
@@ -460,7 +459,7 @@ impl QLinearMatMulKernel {
         if !self.constant_inputs[3] {
             return None;
         }
-        if geometry.b_batch.iter().any(|&dimension| dimension != 1) {
+        if single_matrix_shape(b.shape) != Some((geometry.k, geometry.n)) {
             return None;
         }
         Some(QgemmPackKey {
@@ -720,6 +719,36 @@ impl Kernel for QLinearMatMulKernel {
         for (index, is_constant) in self.constant_inputs.iter_mut().enumerate() {
             *is_constant = constant_inputs.get(index).copied().unwrap_or(false);
         }
+    }
+
+    #[cfg(feature = "mlas")]
+    fn shareable_constant_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        (self.retain_caches && self.constant_inputs[3]).then(|| {
+            Arc::new(SharedQgemmPackState {
+                cache: self.packed_b.clone(),
+                memory: self.weight_memory.clone(),
+            }) as Arc<dyn std::any::Any + Send + Sync>
+        })
+    }
+
+    #[cfg(feature = "mlas")]
+    fn adopt_shareable_constant_state(
+        &mut self,
+        state: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<bool> {
+        let Ok(shared) = Arc::downcast::<SharedQgemmPackState>(state) else {
+            return Ok(false);
+        };
+        if !self.retain_caches || !self.constant_inputs[3] {
+            return Ok(false);
+        }
+        if !self.weight_memory.shares_source_with(&shared.memory) {
+            return Err(EpError::KernelFailed(
+                "QLinearMatMul cannot adopt a pack from a different derived-weight grant source; construct this node's shape variants from clones of the same CpuMemoryResources".into()
+            ));
+        }
+        self.packed_b = shared.cache.clone();
+        Ok(true)
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -3518,7 +3547,23 @@ mod tests {
         let bytes = mlas_sys::qgemm_pack_b_size(96, 64, false, false).unwrap();
         let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
         let memory = crate::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
-        let kernel = QLinearMatMulKernel::new(true, memory);
+        let mut kernel = QLinearMatMulKernel::new(true, memory.clone());
+        let constant = [false, false, false, true, false, false, false, false];
+        kernel.set_constant_inputs(&constant);
+        let shared = kernel.shareable_constant_state().unwrap();
+        let builders: Vec<_> = (0..8)
+            .map(|_| {
+                let mut builder = QLinearMatMulKernel::new(true, memory.clone());
+                builder.set_constant_inputs(&constant);
+                assert!(
+                    builder
+                        .adopt_shareable_constant_state(shared.clone())
+                        .unwrap()
+                );
+                builder
+            })
+            .collect();
+        drop(shared);
         let key = QgemmPackKey {
             addr: fixture.b.bytes.as_ptr() as usize,
             k: 64,
@@ -3529,11 +3574,12 @@ mod tests {
         };
         let barrier = std::sync::Barrier::new(8);
         let owners = std::thread::scope(|scope| {
-            let threads: Vec<_> = (0..8)
-                .map(|_| {
+            let threads: Vec<_> = builders
+                .iter()
+                .map(|builder| {
                     scope.spawn(|| {
                         barrier.wait();
-                        kernel.pack_build(key, &fixture.b.bytes).unwrap().unwrap()
+                        builder.pack_build(key, &fixture.b.bytes).unwrap().unwrap()
                     })
                 })
                 .collect();
@@ -3556,6 +3602,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(builders);
         drop(kernel);
         assert_eq!(governor.used(Tier::Host), bytes as u64);
         drop(owners);
@@ -3695,6 +3742,212 @@ mod tests {
             "pressure registration must not retain dead kernel caches"
         );
         assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn shared_qlinear_state_keeps_source_policy_and_lifetime() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let fixture = pack_fixture(3, 64, 96, 11);
+        let bytes = mlas_sys::qgemm_pack_b_size(96, 64, false, false).unwrap();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+        let memory = DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        let mut first = QLinearMatMulKernel::new(true, memory.clone());
+        let mut second = QLinearMatMulKernel::new(true, memory);
+        for kernel in [&mut first, &mut second] {
+            kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        }
+        let expected = run_with(&first, &fixture);
+        assert!(
+            second
+                .adopt_shareable_constant_state(first.shareable_constant_state().unwrap())
+                .unwrap()
+        );
+        assert!(Arc::ptr_eq(&first.packed_b, &second.packed_b));
+        assert_eq!(run_with(&second, &fixture).bytes, expected.bytes);
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(first);
+        let kv = governor
+            .reserve(
+                Tier::Host,
+                bytes as u64,
+                MemoryRole::KvCache,
+                HolderId::new(7),
+            )
+            .unwrap();
+        assert!(
+            qlinear_pack_state(&second).is_none(),
+            "shared cache registration must survive its originating kernel"
+        );
+        drop(kv);
+        assert_eq!(run_with(&second, &fixture).bytes, expected.bytes);
+        let key = QgemmPackKey {
+            addr: fixture.b.bytes.as_ptr() as usize,
+            k: 64,
+            n: 96,
+            a_signed: false,
+            b_signed: false,
+            flip_b: false,
+        };
+        let live = second.pack_lookup(key).unwrap().unwrap();
+        drop(second);
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(live);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn shared_qlinear_state_rejects_foreign_sources_and_respects_retention() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, 1 << 20, 0));
+        let other = LedgerGovernor::new(LeaseLedger::new(0, 1 << 20, 0));
+        let memory = DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        let constant = [false, false, false, true, false, false, false, false];
+        let mut producer = QLinearMatMulKernel::new(true, memory.clone());
+        producer.set_constant_inputs(&constant);
+        let state = producer.shareable_constant_state().unwrap();
+        for source in [
+            DerivedWeightMemory::default(),
+            DerivedWeightMemory::governed(&other, HolderId::new(13)).unwrap(),
+            DerivedWeightMemory::governed(&governor, HolderId::new(14)).unwrap(),
+            DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+        ] {
+            let mut receiver = QLinearMatMulKernel::new(true, source);
+            receiver.set_constant_inputs(&constant);
+            let error = receiver
+                .adopt_shareable_constant_state(state.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("QLinearMatMul")
+                    && error.contains("grant source")
+                    && error.contains("CpuMemoryResources"),
+                "{error}"
+            );
+            assert!(!Arc::ptr_eq(&receiver.packed_b, &producer.packed_b));
+        }
+        for (retention, constants) in [(false, constant), (true, [false; 8])] {
+            let mut receiver = QLinearMatMulKernel::new(retention, memory.clone());
+            receiver.set_constant_inputs(&constants);
+            assert!(receiver.shareable_constant_state().is_none());
+            assert!(
+                !receiver
+                    .adopt_shareable_constant_state(state.clone())
+                    .unwrap()
+            );
+            assert!(!Arc::ptr_eq(&receiver.packed_b, &producer.packed_b));
+        }
+        let mut receiver = QLinearMatMulKernel::new(true, memory);
+        receiver.set_constant_inputs(&constant);
+        assert!(
+            !receiver
+                .adopt_shareable_constant_state(Arc::new(7usize))
+                .unwrap()
+        );
+        assert!(receiver.adopt_shareable_constant_state(state).unwrap());
+        assert!(Arc::ptr_eq(&receiver.packed_b, &producer.packed_b));
+        assert_eq!(
+            governor.used(Tier::Host),
+            0,
+            "sharing an empty state must reserve no payload"
+        );
+        assert_eq!(other.used(Tier::Host), 0);
+        let mut local = QLinearMatMulKernel::default();
+        let mut local_peer = QLinearMatMulKernel::default();
+        local.set_constant_inputs(&constant);
+        local_peer.set_constant_inputs(&constant);
+        assert!(
+            local_peer
+                .adopt_shareable_constant_state(local.shareable_constant_state().unwrap())
+                .unwrap()
+        );
+        assert!(Arc::ptr_eq(&local.packed_b, &local_peer.packed_b));
+        assert!(
+            receiver
+                .adopt_shareable_constant_state(local.shareable_constant_state().unwrap())
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn qlinear_prediction_covers_single_matrix_shapes_and_declines_distinct_batches() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let mut observed_pack = false;
+        for shape in [
+            vec![64],
+            vec![64, 96],
+            vec![1, 64, 96],
+            vec![1, 1, 64, 96],
+            vec![2, 64, 96],
+        ] {
+            let n = if shape.len() == 1 { 1 } else { 96 };
+            let mut fixture = pack_fixture(3, 64, n, 5);
+            fixture.b = Owned::u8(&shape, &vec![129; shape.iter().product()]);
+            let mut graph = Graph::new();
+            let b = graph.create_named_value(
+                "b",
+                DataType::Uint8,
+                shape.iter().map(|&d| Dim::Static(d)).collect(),
+            );
+            graph.set_initializer(
+                b,
+                onnx_runtime_ir::WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                    DataType::Uint8,
+                    shape.clone(),
+                    fixture.b.bytes.clone(),
+                )),
+            );
+            let mut node = Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "QLinearMatMul",
+                vec![None, None, None, Some(b)],
+                vec![],
+            );
+            let predicted = node_qlinear_packed_b_bytes(&node, &graph);
+            let governor = LedgerGovernor::new(LeaseLedger::new(0, 1 << 20, 0));
+            let mut kernel = QLinearMatMulKernel::new(
+                true,
+                DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+            );
+            kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+            let output_shape = Geometry::new(&fixture.a.shape, &fixture.b.shape)
+                .unwrap()
+                .output_shape;
+            let mut output = Owned::zeros(DataType::Uint8, &output_shape);
+            run_into(&kernel, &fixture, &mut output);
+            let mut reference = Owned::zeros(DataType::Uint8, &output_shape);
+            run_into(&QLinearMatMulKernel::default(), &fixture, &mut reference);
+            assert_eq!(output.bytes, reference.bytes);
+            let actual = governor.used(Tier::Host);
+            assert!(
+                predicted >= actual,
+                "shape={shape:?} prediction={predicted} actual={actual}"
+            );
+            if shape[0] == 2 {
+                assert_eq!(predicted, 0);
+                assert!(qlinear_pack_state(&kernel).is_none());
+            } else if qlinear_pack_state(&kernel) == Some(true) {
+                assert!(actual > 0);
+                observed_pack = true;
+            }
+            graph.add_input(b);
+            assert_eq!(
+                node_qlinear_packed_b_bytes(&node, &graph),
+                0,
+                "overridable initializers are not immutable weights"
+            );
+            node.domain = "custom".into();
+            assert_eq!(node_qlinear_packed_b_bytes(&node, &graph), 0);
+        }
+        assert!(
+            observed_pack,
+            "the bound must be checked against an actual packed allocation"
+        );
     }
 
     /// A constant weight must be packed exactly once and then reused, and the
