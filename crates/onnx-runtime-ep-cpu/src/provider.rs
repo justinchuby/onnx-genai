@@ -42,6 +42,12 @@ pub struct CpuExecutionProvider {
     initialized: bool,
     registry: OpRegistry,
     resources: CpuMemoryResources,
+    local_workspace: std::sync::OnceLock<
+        std::result::Result<
+            onnx_runtime_memory_governor::HostWorkspacePool,
+            std::sync::Arc<onnx_runtime_memory_governor::WorkspacePoolError>,
+        >,
+    >,
     /// Where this EP's buffers come from.
     ///
     /// The same `DeviceAllocator` contract the ONNX Runtime side uses, so an
@@ -112,11 +118,14 @@ impl CpuExecutionProvider {
             initialized: false,
             registry: build_cpu_registry_with_resources(resources.clone()),
             resources,
+            local_workspace: std::sync::OnceLock::new(),
             memory: default_cpu_memory(),
         }
     }
 
-    /// Take buffers from `memory` instead of the system allocator.
+    /// Take ordinary tensor buffers from `memory` instead of the system allocator.
+    /// Workspace backing is explicitly supplied by CpuMemoryResources; its pool
+    /// owns the managed charge and must not stack on this allocator's idle cache.
     ///
     /// The same `DeviceAllocator` a caller installs on the ONNX Runtime side.
     /// That is the point of the contract living in a crate both backends
@@ -134,6 +143,25 @@ impl CpuExecutionProvider {
         let mut ep = Self::with_resources(resources);
         ep.initialize(&Default::default())?;
         Ok(ep)
+    }
+
+    fn workspace_pool(&self) -> Result<&onnx_runtime_memory_governor::HostWorkspacePool> {
+        if let Some(pool) = self.resources.workspace_pool() {
+            return Ok(pool);
+        }
+        if self.resources.is_governed() {
+            return Err(EpError::KernelFailed("CPU workspace has governed weights but no Host workspace resource domain; supply CpuMemoryResources::with_workspace_pool from the same model governor before constructing the provider".into()));
+        }
+        self.local_workspace
+            .get_or_init(|| {
+                onnx_runtime_memory_governor::HostWorkspacePool::ungoverned()
+                    .map_err(std::sync::Arc::new)
+            })
+            .as_ref()
+            .map_err(|source| EpError::Backend {
+                operation: "construct ungoverned CPU execution workspace",
+                source: Box::new(source.clone()),
+            })
     }
 
     /// Borrow the CPU op registry (shared with the session layer).
@@ -327,8 +355,7 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             let mut prepack = crate::kernels::matmul::MatMulPrepack::new(self.resources.clone());
             prepack.set_constant_inputs(constant_inputs);
-            prepack.prepare_constants(constants);
-            if prepack.has_prepared_transpose() {
+            if prepack.prepare_constants(constants)? {
                 return Ok(prepack.shareable_constant_state());
             }
         }
@@ -640,6 +667,43 @@ impl ExecutionProvider for CpuExecutionProvider {
         Ok(unsafe {
             DeviceBuffer::from_raw_parts(ptr.as_ptr().cast(), self.device, size, alignment)
         })
+    }
+
+    fn allocate_workspace(
+        &self,
+        size: usize,
+        alignment: usize,
+        role: onnx_runtime_memory_api::MemoryRole,
+    ) -> Result<onnx_runtime_ep_api::WorkspaceAllocation> {
+        let owner = self
+            .workspace_pool()?
+            .checkout(size, alignment, role)
+            .map_err(|source| EpError::Backend {
+                operation: "borrow CPU execution workspace",
+                source: Box::new(source),
+            })?;
+        Ok(onnx_runtime_ep_api::WorkspaceAllocation::new(
+            DeviceBuffer::from_managed_allocation(owner, self.device),
+            None,
+        ))
+    }
+    fn deallocate_workspace(
+        &self,
+        workspace: onnx_runtime_ep_api::WorkspaceAllocation,
+    ) -> Result<()> {
+        let pool = self.workspace_pool()?;
+        let (buffer, lease) = workspace.into_parts();
+        if lease.is_some() {
+            return Err(EpError::KernelFailed("CPU managed workspace must carry its charge in the backing owner, without an outer lease; return workspace from this provider's allocate_workspace".into()));
+        }
+        let onnx_runtime_ep_api::BoundBufferOwnership::Managed(owner)=buffer.into_bound_owner().map_err(|_|EpError::KernelFailed("CPU workspace is missing managed backing ownership; use this provider's allocate_workspace".into()))? else {
+            return Err(EpError::KernelFailed("CPU workspace must retain its managed backing owner; return workspace obtained from this provider's allocate_workspace".into()));
+        };
+        pool.recycle_completed(owner)
+            .map_err(|source| EpError::Backend {
+                operation: "return completed CPU execution workspace",
+                source: Box::new(source),
+            })
     }
 
     fn deallocate(&self, buffer: DeviceBuffer) -> Result<()> {
@@ -1018,6 +1082,121 @@ mod tests {
                 .insert("index_topk".into(), Attribute::Int(1));
         }
         node
+    }
+
+    #[test]
+    fn execution_workspace_keeps_one_managed_peak_and_yields_idle_backing_to_kv() {
+        use onnx_runtime_memory_api::{DeviceKey, MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{
+            HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+            ProcessMemoryManager,
+        };
+        let books = std::sync::Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::HOST,
+            0,
+            64,
+            0,
+        )));
+        let manager = ProcessMemoryManager::new().unwrap();
+        let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+        let resources = CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13)).unwrap(),
+            Default::default(),
+        )
+        .unwrap()
+        .with_workspace_pool(pool.clone())
+        .unwrap();
+        let first = CpuExecutionProvider::with_resources(resources.clone());
+        let second = CpuExecutionProvider::with_resources(resources);
+        let role = MemoryRole::Workspace { step_scoped: true };
+        let slot = first.allocate_workspace(64, 16, role).unwrap();
+        let identity = slot.managed_owner().unwrap().identity();
+        let (buffer, lease) = slot.into_parts();
+        assert!(
+            lease.is_none(),
+            "managed backing must be the sole charge owner"
+        );
+        first
+            .deallocate_workspace(onnx_runtime_ep_api::WorkspaceAllocation::new(buffer, None))
+            .unwrap();
+        for _ in 0..32 {
+            let next = second.allocate_workspace(16, 8, role).unwrap();
+            assert_eq!(next.managed_owner().unwrap().identity(), identity);
+            assert_eq!(next.len(), 64);
+            second.deallocate_workspace(next).unwrap();
+        }
+        assert_eq!(books.used(Tier::Host), 64);
+        assert_eq!(manager.process_used(Tier::Host), 64);
+        let snapshot = manager.snapshot().unwrap();
+        assert_eq!(snapshot.allocations.len(), 1);
+        assert_eq!(snapshot.allocations[0].role, role);
+        let kv = books
+            .reserve(Tier::Host, 64, MemoryRole::KvCache, HolderId::new(99))
+            .unwrap();
+        assert_eq!(books.used(Tier::Host), 64);
+        assert_eq!(manager.process_used(Tier::Host), 0);
+        assert!(manager.snapshot().unwrap().allocations.is_empty());
+        drop(kv);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn governed_workspace_requires_the_same_host_authority_as_weights() {
+        use onnx_runtime_memory_api::DeviceKey;
+        use onnx_runtime_memory_governor::{
+            HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, ProcessMemoryManager,
+        };
+        let books = std::sync::Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::HOST,
+            0,
+            64,
+            0,
+        )));
+        let resources = CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13)).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let ep = CpuExecutionProvider::with_resources(resources.clone());
+        assert!(
+            ep.allocate_workspace(
+                16,
+                16,
+                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: true }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no Host workspace resource domain")
+        );
+        let other = std::sync::Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::HOST,
+            0,
+            64,
+            0,
+        )));
+        let pool =
+            HostWorkspacePool::governed(&ProcessMemoryManager::new().unwrap(), other).unwrap();
+        assert!(
+            resources
+                .with_workspace_pool(pool)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("different Host authorities")
+        );
+    }
+
+    #[test]
+    fn ungoverned_cpu_workspace_reuses_real_backing_without_inventing_a_budget() {
+        let ep = CpuExecutionProvider::new();
+        let role = onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: true };
+        let first = ep.allocate_workspace(64, 16, role).unwrap();
+        let identity = first.managed_owner().unwrap().identity();
+        assert!(ep.workspace_pool().unwrap().authority_id().is_none());
+        ep.deallocate_workspace(first).unwrap();
+        let next = ep.allocate_workspace(32, 16, role).unwrap();
+        assert_eq!(next.managed_owner().unwrap().identity(), identity);
+        ep.deallocate_workspace(next).unwrap();
     }
 
     #[test]

@@ -243,6 +243,17 @@ impl<K: WeightCacheKey, P: WeightPayload> WeightCache<K, P> {
         self.max_bytes
     }
 
+    /// Cold-path query for the vector last-hit slot. A single member needs no
+    /// recency update; multi-entry consumers keep the canonical lookup path.
+    pub(super) fn has_single_entry(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .len()
+            == 1
+    }
+
     /// A single warm reader needs no group containers or accounting callbacks.
     pub(super) fn get(&self, key: &K) -> Option<Arc<GrantedWeight<P>>> {
         let mut inner = self
@@ -606,21 +617,6 @@ impl<K: WeightCacheKey, T: Copy + Default + Send + Sync + 'static> WeightCache<K
             build(index, &mut payload)?;
             Ok(payload)
         })
-    }
-
-    /// A dependent derived object that uses a payload's address as identity
-    /// must keep that payload alive for as long as its address-keyed entry lives.
-    pub(super) fn owner_of(&self, values: &[T]) -> Option<Arc<GrantedWeight<Vec<T>>>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entries
-            .values()
-            .find(|entry| {
-                entry.value.as_slice().as_ptr() == values.as_ptr()
-                    && entry.value.as_slice().len() == values.len()
-            })
-            .map(|entry| entry.value.clone())
     }
 }
 

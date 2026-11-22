@@ -1060,3 +1060,300 @@ packed numerical results. They also verify that source grants retire while
 old panel readers remain valid, identical owners reuse a panel, full half-view
 identity separates layouts, and call-owned conversion falls through correctly.
 Legacy process-global transpose payload funding/lifetime policy remains work.
+
+### Node-owned, funded half transposes
+
+Native-width f16/bf16 transpose payloads now use the same node-owned
+`WeightCache` as other prepared MatMul weights. Their actual `2*K*N` Host grant
+is acquired before writing into the admitted output allocation; the transpose
+algorithm allocates no second matrix. Identity includes the original contiguous
+source, interpretation and complete matrix geometry. Shape variants and fused
+operators share the node owner. Idle entries participate in Host pressure
+reclamation; executing Arc readers independently keep their payload and grant.
+A declined optional transpose runs no builder and can be retried later.
+
+Apple f16 decode can read the original row-major half storage directly after
+optional preparation is declined, without requesting a larger widened weight.
+MatMul and FusedMatMulBias use the same fallback arithmetic. x86 keeps its
+existing untransposed half GEMV. Cold preparation and pressure transitions may
+call accounting; 4,096 warm provider executions make no claim/refund calls,
+including zero-byte calls. This callback invariant does not assert zero cache
+lookup overhead or universal inference latency.
+
+The global half store and its diagnostic/clear APIs are removed. Multiturn
+benchmark diagnostics report model Host ledger usage, explicitly including all
+model holders. The remaining process-global **f32** transpose store is still
+legacy and needs actual funding/reclamation; its installed keys continue to be
+retired by the final node owner. Forecasts remain distinct from admission.
+
+On Apple M1 Max, native CPU 1,992 tests / 20 ignored and optional MLAS CPU
+2,032 / 35 ignored pass; session passes 277 / 279 tests respectively, with
+strict all-target Clippy in both configurations. The public provider regression
+fixture, injected with only a test observer into parent `95de9fef1`, compiles,
+selects one test, and fails at the first funding assertion: actual Host usage
+is 0 instead of 70 bytes. The current fixture also validates inference after
+reclamation and exact final refunds. No CUDA or other-ISA execution is claimed.
+
+### Fund the remaining f32 B transpose payloads
+
+The f32 B transpose now uses node-owned `WeightCache` storage too. Identity is
+the original logical view (effective address, dtype, shape, signed strides) plus
+requested matrix geometry. It never uses a recyclable widening allocation as
+identity and does not pin that allocation. Widened sources and transposes carry
+independent grants; an executing transpose remains valid after the source copy
+is reclaimed. Construction writes directly into the admitted transpose output.
+
+The global f32 store, installation/eviction memos, global clear/byte diagnostics,
+and the conversion-owner lookup are removed. `weight_transpose.rs` contains
+only the shared transpose algorithm. Node owners share preparation across
+shape kernels, while separate nodes/sessions cannot inherit entries at recycled
+original addresses. Empty matrices retain nothing.
+
+MatMul's optional f32 transpose can be refused and uses existing raw-layout
+arithmetic. Gemm with `transB` requires a row-major B copy for its backend;
+disabling retention now funds that copy transiently, and exhaustion returns an
+actionable admission error before building. Other call-owned layout/scratch
+allocations, including Gemm's A transpose, remain separate work. This step also
+does not fuse source widening into transpose construction: a converted B may
+still be materialized before looking up an existing transpose.
+
+Forecasts now include the fused MatMul+bias+Relu f32 route on Apple and promoted
+vector B operands. The registry forecast check describes declared routes;
+actual provider and Gemm tests independently reconcile their Host grants. Source
+validation, geometry/overflow, dtype isolation and pure transpose correctness
+checks remain. Old global-map storage/clear/installation tests are replaced at
+the actual node/cache seam: deterministic address reuse across node lifetimes,
+grow/shrink/equal extents, concurrent equal/distinct geometries, shared owners,
+pressure refusal/retry, independent readers and exact final refunds.
+
+On Apple M1 Max, native CPU 1,984 / 20 ignored and optional MLAS CPU 2,024 /
+35 ignored pass; sessions pass 277 / 279, with strict all-target Clippy in both
+configurations. Public MatMul, FusedMatMulBias, Gemm and FusedGemm tests cover
+matrix B; the MatMul family also covers vector B. Each admitted warm case makes
+zero further claims/releases over 4,096 executions. The old public provider
+fixture on parent `43055b185` compiles, selects one test and fails at its first
+funding assertion: actual 0 versus required 140 Host bytes. No CUDA or other-ISA
+execution or model-throughput result is implied.
+
+A subsequent warm-path optimization uses only a weak last-hit slot for a
+single-layout f32 cache. It cannot keep a payload or grant alive after idle
+reclamation; multi-layout nodes retain canonical lookup/recency. The initial
+full-key lookup added about 100 ns to a tiny case; the final coordinated run
+reduces the overall increment to about 13 ns for f64 and 20 ns for f32 on this
+Apple host. This remains measurable bookkeeping cost even though warm quota
+requests/refunds are zero. CPU_MLAS_MIGRATION.md records the control arms and
+ranges; no end-to-end model or other-tier performance is inferred.
+
+### Prepare f32 transposes from original views
+
+B preparation no longer accepts a separately materialized f32 slice. Its only
+source is the validated original matrix/vector view. Conversion and transposition
+share the tiled transpose traversal and write directly into the admitted final
+f32 payload. This avoids a second matrix-sized allocation and removes the API
+state in which supplied dense values could disagree with their identity view.
+Contiguous aligned f32 keeps the existing tiled copy fast path; strided, reversed
+and other float formats use original coordinates with unaligned numeric reads.
+
+The shared prepacked compute path tries the prepared B before asking for a dense
+B. Mandatory activation materialization still precedes optional B admission, so
+an optional transpose cannot consume memory needed by A. Direct-output execution
+keeps its original destination without a result-vector staging allocation. The
+low-level slice compute context again carries only the prepack; optional MLAS
+packing keeps its typed operand, unchanged.
+
+Decode-only widened B now needs one `4*K*N` derived representation. A session
+that also uses ordinary prefill may retain its independent dense B as well, but
+KV pressure can reclaim that idle copy without decode rebuilding it or making
+new quota calls. Gemm transB also builds its required retained/transient layout
+directly from the original view. Other scratch and conservative graph forecasts
+remain separate work.
+
+Public factory controls cover MatMul, both fused MatMul forms and Gemm: a one-
+representation budget succeeds from cold, 4,096 warm executions issue no further
+claims/refunds, and decode continues with no quota calls after KV pressure
+reclaims prefill's dense copy. The same test-only fixture compiles and selects
+one test on parent `404fd04c4`, then fails at cold requests 3 versus expected 2
+(including the setup anchor). All 65,536 bit patterns of f16 and bf16 are compared
+bit-for-bit against the old conversion followed by an independent transpose;
+f32/f64 special values and before-write extent checks are included too.
+
+## Current design decision: execution workspace domains
+
+Status: design reviewed; the CPU resource-domain foundation is implemented,
+with kernel migration still pending. The unpublished per-node mutable-layout
+pool prototype was withdrawn. The existing node-owned immutable weight preparation remains the
+baseline. The next implementation is a CPU vertical through the existing
+executor workspace contract, not another kernel-specific resource pool.
+
+### Resource and ownership boundaries
+
+| Resource | Owner / allocation unit | Authority interaction |
+|---|---|---|
+| Immutable prepared weights | Node preparation owner; independently reclaimable payloads or build groups | Cold build, growth and actual retirement |
+| Temporary scratch | Provider/session resource domain; one exclusive workspace per concurrent execution slot | Slot creation, capacity growth, idle trim and destruction |
+| KV and semantic persistent state | Their explicit state owners | Actual growth, shrink and release |
+| Kernel-local scratch regions | Aligned borrowed slices of the prepared workspace | No claims or refunds |
+
+Coarse allocation means pooling a real backing allocation with its existing
+charge. It does not mean reserving the sum of every forecast at model load, or
+introducing a second bank of unused budget credit. Stable-shape sequential
+nodes reuse the graph's scratch peak; independent concurrent runs need separate
+execution slots. A larger shape grows capacity at a preparation boundary.
+
+Retain object-level weight reclamation: placing all model weights into one
+session slab would let a small active reader pin an otherwise reclaimable slab.
+A weight build group can preflight its live construction peak once and split
+ownership afterward. `MemoryLease::split_off` avoids another claim, but each
+child lease still refunds through the issuer on drop; it is not a hot scratch
+suballocator.
+
+### Reuse the existing workspace seam
+
+`onnx-runtime-ep-api/src/kernel.rs` already supplies `workspace_requirement`,
+`workspace_requirement_for_execution` and `execute_with_workspace`.
+`onnx-runtime-session/src/executor/bindings.rs` collects workspace peaks and
+`executor/dispatch.rs` passes `WorkspaceView`. Keep this single execution seam.
+An EP describes checked size/alignment/layout and consumes borrowed regions;
+the common resource layer owns admission, pooling, concurrency and release.
+Direct kernel users should use the same public runner for workspace preparation.
+Provide one common checked layout/partition helper for overflow, alignment,
+capacity and non-overlap, so each EP supplies region requirements rather than
+reimplementing raw byte-offset validation and allocator fallback.
+
+Proposed lifecycle over the existing prepared-workspace allocation:
+
+```text
+run admission -> borrow exclusive execution slot -> dispatch with WorkspaceView
+              -> run completion -> return backing + charge to idle storage
+idle pressure / shutdown -> release backing -> settle its charge
+```
+
+Separate content lifetime from storage retention. Step-scoped contents expire
+at run completion, while their backing may remain idle and funded for reuse.
+Do not merely relabel temporary contents as `SessionPersistent`. State whose
+values must survive calls remains independently owned and cannot be overwritten
+by graph scratch reuse. An asynchronous slot enters pending until its completion
+event; capture pinning and quarantine also prevent idle reuse and refunds.
+
+The peak reflects overlap: mutually exclusive branches use a maximum; live
+parent regions add to the child's peak; concurrent branches need the sum of
+simultaneously active regions. Reuse is legal only at an established completion
+or ordering boundary. Do not add per-kernel synchronization to obtain reuse.
+
+Prepared-resource selection and scratch planning must agree. Either acquire and
+pin the selected prepared readers before computing scratch, or declare a peak
+that covers cache miss/refusal fallback. Workspace admission must not evict a
+weight whose presumed presence was used to omit required fallback storage.
+
+### CPU backing and accounting prerequisite
+
+The CPU provider currently inherits the default workspace reservation returning
+`None`. Merely advertising kernel workspace therefore does not prove a Host
+grant. Wire CPU workspace once at the provider/resource-domain boundary using
+`MemoryRole::Workspace` and the existing process memory manager's managed-owner
+and physical-release transactions. `DerivedWeightMemory` has a weight-role
+anchor; its sibling reservation must not misattribute scratch as weights.
+
+The default CPU allocator includes `LargeAllocCache`. Returning an allocation
+to that cache can retain its backing. An upper workspace pool must not refund
+capacity while a lower, unaccounted cache still holds the block. Use one reuse
+owner: trim either releases backing without reparking it, or transfers the same
+managed owner and charge into the lower cache. Logical availability inside a
+slot and physically releasable capacity are different facts, not two ledgers.
+
+### Implementation sequence and evidence
+
+1. Introduce borrow/return/idle-trim ownership for execution-slot workspace over
+   the existing prepared allocation; centralize its policy in the resource
+   domain, preserving active, pending, pinned and quarantined states.
+2. Connect CPU Host workspace backing and actual Workspace-role charges, with
+   one cache/release owner and an injectable authority for tests.
+3. Move dynamic Gemm A layout scratch into this workspace seam. Keep immutable
+   B preparation and checked original-view conversion; derive a single Gemm
+   layout plan for its selected route and fallback requirements. Gemm already
+   participates in workspace preparation; add no new op-name special case.
+4. Migrate accumulator/TLS/Einsum scratch through the shared mechanism and
+   remove their independent retention/accounting policies as each migrates.
+   Replace `is_planned_workspace_node` with compiled workspace-plan facts.
+
+The withdrawn prototype was useful evidence, not an implementation to publish:
+per-call transient grants made a tiny dynamic A case roughly 288 -> 403 ns on
+M1 Max. Retaining exclusive, refilled buffers eliminated warm issuer callbacks,
+but still measured approximately 300--309 ns versus 289 ns; local and governed
+arms were nearly equal. Zero issuer calls alone does not prove zero total cost.
+The experiment's exact source patch, baseline fixtures, full validation drivers
+and timing logs are preserved under `/tmp/nxrt-gemm-a-*`, with provenance in
+`nxrt-gemm-a-candidate-provenance.json`. It was not merged into runtime code.
+
+Required validation for the new implementation:
+
+- Sequential heterogeneous kernels share one graph peak rather than a sum of
+  node pools; simultaneous runs own independent slots.
+- Stable-shape warm multi-node sessions perform no issuer calls, including
+  zero-byte claims/refunds; growth admits only at the preparation boundary.
+- KV pressure reclaims idle backing while active, pending and pinned backing
+  remains funded. Cache refusal after route preparation remains executable
+  within the declared live peak or fails before output writes.
+- Allocation, execution and release failures preserve backing/charge ownership;
+  lower allocator retention never becomes an unaccounted second cache.
+- Shape growth, control-flow nesting, alignment and arithmetic overflow have
+  explicit success/refusal tests using the public runner/session.
+- Measure direct-kernel, common-runner and multi-node-session controls with the
+  same host lock, so kernel savings cannot hide dispatcher overhead.
+
+CPU tests and compilation may establish the Host contract. CUDA event ordering,
+Graph replay, quarantine and actual physical release still require real-device
+validation; no CUDA runtime or throughput claim follows from this design.
+
+### Implemented foundation: managed Host execution workspace
+
+`onnx-runtime-memory-governor::HostWorkspacePool` now borrows and returns whole
+managed Host workspace owners. Clones share idle execution lanes. A warm fit
+retains the original backing, authority and grant; capacity/alignment upgrades
+retain their joint high-water marks and release the replaced idle backing
+before admitting its replacement. Independent simultaneous executions receive
+independent owners. The pool contains no active owner and rejects returns with
+outstanding owned views. Physical release and issuer callbacks run outside pool
+locks; failed release preparation preserves its owner in the error, and an
+incomplete outcome remains charged/quarantined and is never reused.
+
+The domain retains its pressure responder strongly; the responder weakly
+references idle storage. Host authorities with a pressure registry can reclaim
+idle slots for KV requests. Other authorities require explicit idle trim.
+Private Host backing registrations retire after the scoped binding and verified
+idle releases; outstanding/quarantined ownership conservatively keeps its
+registration pinned. No empty budget-credit bank or per-kernel pool is added.
+
+CPU workspace allocation now forwards to this domain and returns a managed
+`DeviceBuffer` without an outer lease. Workspace backing uses uncached
+`HostAllocator`; ordinary tensors keep their existing configured allocator.
+Explicitly governed CPU resources require a matching workspace Host authority.
+An ungoverned provider lazily creates an ungoverned managed domain reporting
+unattributed physical bytes instead of inventing another budget.
+
+Engine construction selects the final shared memory/manager before creating
+CPU resources. Workers no longer construct CPU resources against temporary
+books and subsequently replace only their governor fields. The Host ledger
+identity now actually names the Host device, allowing canonical manager
+registration against those same books. The executor records the capacity and
+alignment returned by the provider, so a high-water backing is not needlessly
+replaced when a later requirement fits it.
+
+Native validation covers 77 governor unit tests (including six workspace
+regressions), 36 manager transaction tests, 25 CPU provider tests, 277 session
+tests, 15 engine governor tests and six authority tests, with strict all-target
+Clippy. The warm checkout/return control observes every issuer callback and
+performs 4,096 iterations without claims/refunds, including zero-byte calls.
+Other controls cover concurrent slots, KV idle reclamation versus active
+owners, alignment/capacity alternation, foreign or borrowed owners, delegated
+process capacity, incomplete release and registration retirement. The worker
+regression reconciles actual workspace and KV grants against the parent's Host
+books. Optional MLAS configuration additionally passes 25 provider tests, 279
+session tests and the exact worker regression; strict all-target Clippy passes
+across governor, CPU EP, session and engine in both configurations. Raw
+validation logs are `/tmp/nxrt-host-workspace-*`.
+
+This is the resource-domain foundation. Gemm and other CPU kernels still need
+the workspace-layout migration described above; these checks do not establish
+its end-to-end performance, control-flow scratch peak behavior, or CUDA runtime
+correctness. The remaining validation requirements remain open.

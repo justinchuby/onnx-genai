@@ -1597,3 +1597,131 @@ run. The wrapper's busy branch was exercised against the other session's live
 lock and refused execution with exit 75. Release completion was verified from
 the terminal handle and final rusage before notifying the other session to
 resume; neither participant relies on an announcement as proof of ownership.
+
+Half transpose preparation now uses node-owned granted storage rather than a
+process-global half table. Tests exercise f16/bf16 identity, active-reader grant
+lifetime, idle Host reclamation by KV allocation, refusal before building, retry,
+and public MatMul/FusedMatMulBias execution after reclamation. On Apple, an
+optional-transpose refusal takes a direct row-major f16 read instead of trying
+to allocate a larger f32 weight. The provider callback probe checks 4,096 warm
+executions with no additional quota claims or releases, counting zero-byte
+requests too. This is a structural accounting check; it does not replace a
+controlled timing comparison or extend prior f64/f32 results to half storage.
+The f32 global transpose cache remains a separate unfinished funding task.
+
+The half comparison held the same stable host flock across both release builds
+and six interleaved processes (150.97 seconds total). It uses the identical
+harness on parent `95de9fef1` and the funded implementation: Apple M1 Max,
+Accelerate, f32 activation/f16 weights, Rayon=1, three process medians with
+eleven interleaved rounds each. Actual retained half grants are checked outside
+the timer: baseline 0, current `2*K*N`; output checks run in both versions.
+
+For M=1,K=N=16, the governed median moves from 280.67 ns [279.36–293.51] to
+296.37 ns [295.64–317.27], +15.70 ns / +5.59%. Local accounting moves
+283.34→296.10 ns and its duplicate 278.87→296.09 ns; the governed f32 control
+moves 249.53→254.50 ns. The current governed/local pair differs by 0.27 ns.
+For M=1,K=128,N=256, governed moves 2071.49→2093.00 ns (+1.04%), local
+2072.92→2088.83 ns, duplicate 2077.18→2097.04 ns; the governed f32 control
+moves 2094.92→2103.13 ns. These small workloads show measurable overall cache
+bookkeeping cost and do not support a zero-overhead or model-throughput claim.
+Zero warm accountant callbacks are independently proven by the observer.
+
+Raw round samples, full ranges, footprint rows and coordination/build metadata
+are retained under `/tmp/nxrt-half-transpose-perf-{before,current}-{0,1,2}.tsv`
+and `/tmp/nxrt-half-transpose-performance-{metadata,summary}.json`. The harness
+selects f16 with `NXRT_ADMISSION_WEIGHT_FORMAT=f16`; default f64/f32 controls
+keep their exact footprint assertions. The wrapper's wall/CPU totals describe
+build-plus-sweep resource use and are not kernel latency.
+
+The remaining f32 B transposes now obtain real grants through the same node
+cache protocol. The key uses the original logical view and geometry; retiring
+a widened source does not invalidate or pin its transpose. Global f32 state and
+its APIs are removed, so normal native transpose payloads no longer depend on a
+process-wide store. The existing slice compute parameters remain intact;
+preparation additionally carries the borrowed original view through compute.
+Gemm's required B transpose is funded even when call-owned. Optional native
+MatMul refusal keeps raw-layout arithmetic. Widening-before-transpose scheduling
+and other temporary layouts remain further optimization/funding work.
+
+The benchmark adds a runtime-only f32 control whose constant flag is false.
+The retained constant-f32 arm now receives the changed cache treatment, so it
+must not be described as an unaffected control. The identical before/current
+harness checks each version's expected payload footprint outside the timer via
+`NXRT_ADMISSION_EXPECT_F32_TRANSPOSE_GRANT=0|1`; this input changes only the
+assertion, never runtime policy, allocation or computation. Output validation,
+A/A samples, all individual rounds and the transient policy rows remain.
+
+The first f32 candidate made the new complete-key map lookup on every warm
+call. In a coordinated three-pair sweep, tiny retained governed f64 moved
+305.50→405.45 ns (+32.7%) while the runtime-only f32 control moved only +2.0%;
+the local-accounting and A/A arms moved similarly to governed. This is a real
+shared cache-path regression, not evidence of quota callbacks. Those samples
+and metadata are retained separately under `/tmp/nxrt-f32-transpose-initial-*`.
+
+A single-entry weak last-hit slot removes repeated key construction/hashing.
+It owns no payload/grant, expires when a reclaimed payload dies, refreshes after
+rebuild, and is disabled for multi-layout nodes so their canonical LRU metadata
+still receives each hit. Pressure, concurrent distinct geometries and exact
+refund controls cover the slot. No raw-pointer publication or extra source
+payload pinning is introduced.
+
+The final coordinated sweep holds the stable flock for both release builds
+plus three interleaved before/current process pairs (140.39 seconds total).
+On Apple M1 Max / Accelerate / Rayon=1, M=1,K=N=16 retained governed f64 is
+305.94 ns [303.96–306.31] before and 319.28 ns [319.18–321.02] after
+(+13.34 ns / +4.36%). Current local accounting is 319.42 ns and its duplicate
+319.47 ns. The exposed f32 constant arm is 250.77→271.22 ns (+20.45 ns),
+with current local 271.20 ns. The unaffected runtime-only f32 control is
+270.31→269.47 ns (-0.31%). At K=128,N=256 the governed f64 median moves
+2113.82→2176.02 ns (+2.94%), local +1.03%, duplicate +0.90%, and runtime
+control +1.20%; these movements do not support a universal throughput claim.
+Warm quota callbacks remain zero independently of these timing comparisons.
+
+Final round samples and full ranges remain at
+`/tmp/nxrt-f32-transpose-perf-{before,current}-{0,1,2}.tsv`; metadata and summary
+are `/tmp/nxrt-f32-transpose-performance-{metadata,summary}.json`. Metadata is
+marked complete only after all 36 checked rows per process and every footprint
+and output assertion pass. Failed builds are not timing evidence. Wrapper
+resource totals include compilation and must not be reported as kernel latency.
+
+Original-view f32 transpose preparation now fuses conversion with the existing
+tiled traversal. The prepacked dispatcher consults/builds this representation
+before materializing B; mandatory A preparation still runs first. Warm decode
+can therefore use the final representation after prefill's idle dense copy is
+reclaimed. A fresh decode-only f64 B needs one `4*K*N` grant instead of two.
+The benchmark's assertion-only `NXRT_ADMISSION_EXPECT_DENSE_B_COPY=1|0` selects
+old/current expected footprints; runtime policy and computation are unchanged
+by that input. Both versions keep transpose-grant assertions enabled.
+
+A coordinated 144.81-second build/sweep uses parent `404fd04c4`, the identical
+harness, Accelerate, Rayon=1, and three interleaved process pairs (11 rounds and
+36 checked rows each). Tiny retained governed f64 moves 324.54 ns
+[324.43–331.84] to 264.42 ns [260.05–268.51], -18.52%; local and duplicate
+move -18.51% / -18.31%. The constant-f32 comparison moves 273.18→262.28 ns
+(-3.99%), while runtime-only f32 moves 273.53→278.96 ns (+1.99%). At
+K=128,N=256, governed f64 moves 2213.49→2091.41 ns (-5.52%), local -5.90%,
+duplicate -3.60%, and runtime control +0.24%. These are scoped CPU warm-kernel
+measurements, not cold-load or end-to-end model-throughput results.
+
+Public factory tests enforce a one-representation budget from cold and zero
+warm quota callbacks both before and after source-copy reclamation. They also
+pin admission order: optional B cannot take space required by constant A.
+All f16/bf16 bit patterns, f32/f64 special values, reversed strides with an
+interior byte offset, and validation before any mapped read/write are covered.
+Native CPU 1,986 / 20 ignored and optional MLAS CPU 2,026 / 35 ignored pass;
+sessions pass 277 / 279 with strict all-target Clippy. Additional exact factory
+checks and strict CPU Clippy pass in both modes after the admission-order test,
+plus engine load/memory-strategy filters of 29 tests each.
+
+Raw rounds and footprint rows are `/tmp/nxrt-direct-transpose-perf-{before,current}-{0,1,2}.tsv`;
+complete build/provenance metadata and summary are
+`/tmp/nxrt-direct-transpose-performance-{metadata,summary}.json`. The old public
+fixture compiles and selects one test on unchanged parent production code, then
+fails with cold claims 3 versus expected 2. Consumed generators/worktrees and
+executables can be removed; validation drivers, fixture patch and all logs stay.
+
+After measurement, two `dead_code` allowances document the existing x86/Apple
+half-transpose consumers on other architectures; removing just these attributes
+reproduces the measured MatMul source hash exactly. No Apple code changes after
+timing. Host-lock conformance passes all 124 tests after registering both new
+benchmark invocations. Linux/Windows ARM64 execution remains CI-only locally.

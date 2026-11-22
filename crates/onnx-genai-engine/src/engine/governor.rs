@@ -197,6 +197,17 @@ pub struct EngineResourceGovernor {
     cpu_resources: onnx_runtime_ep_cpu::CpuMemoryResources,
 }
 
+enum GovernorMemorySource<'a> {
+    Resolve {
+        provider: Option<&'a SharedMemoryAuthorityProvider>,
+        domain: Option<&'a DeviceCompatibilityDomain>,
+    },
+    Shared {
+        memory: EngineMemoryGovernor,
+        manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+    },
+}
+
 impl EngineResourceGovernor {
     #[cfg(test)]
     pub(crate) fn new(
@@ -229,8 +240,10 @@ impl EngineResourceGovernor {
             capacities,
             kv_config,
             (model_weights_bytes, model_weights_bytes),
-            None,
-            None,
+            GovernorMemorySource::Resolve {
+                provider: None,
+                domain: None,
+            },
         )
     }
 
@@ -250,8 +263,7 @@ impl EngineResourceGovernor {
             capacities,
             kv_config,
             (model_weights_bytes, model_weights_bytes),
-            provider,
-            domain,
+            GovernorMemorySource::Resolve { provider, domain },
         )
     }
 
@@ -269,20 +281,17 @@ impl EngineResourceGovernor {
         process_memory_manager: onnx_runtime_memory_governor::ProcessMemoryManager,
     ) -> Result<Self, ResourceError> {
         let capacities = capacity_providers_for_device(&limits, cuda_device_index);
-        let domain = memory.device_authority().domain().clone();
-        let mut governor = Self::new_with_capacities_and_authority(
+        Self::new_with_capacities_and_authority(
             limits,
             allow_runtime_override,
             capacities,
             kv_config,
             (0, 0),
-            None,
-            Some(&domain),
-        )?;
-        governor.memory = memory.clone();
-        governor.process_memory_manager = process_memory_manager;
-        governor.plan = Arc::new(std::sync::Mutex::new(ModelMemoryPlan::new(memory)));
-        Ok(governor)
+            GovernorMemorySource::Shared {
+                memory,
+                manager: process_memory_manager,
+            },
+        )
     }
 
     // Eight parameters (one over the lint's threshold) because this is
@@ -309,8 +318,7 @@ impl EngineResourceGovernor {
             capacities,
             kv_config,
             (model_weights_bytes, reservation_bytes),
-            provider,
-            domain,
+            GovernorMemorySource::Resolve { provider, domain },
         )
     }
 
@@ -320,8 +328,7 @@ impl EngineResourceGovernor {
         capacities: CapacityProviders,
         kv_config: ModelKvConfig,
         model_weight_bytes: (u64, u64),
-        provider: Option<&SharedMemoryAuthorityProvider>,
-        domain: Option<&DeviceCompatibilityDomain>,
+        source: GovernorMemorySource<'_>,
     ) -> Result<Self, ResourceError> {
         let (model_weights_bytes, reservation_bytes) = model_weight_bytes;
         // Captured before `capacities` is consumed by `ResourceGovernor::new`
@@ -421,37 +428,50 @@ impl EngineResourceGovernor {
                  weights, KV, and activations share this single cap (#1295)"
             );
         }
-        let device = match (provider, domain) {
-            (Some(provider), Some(domain)) => provider
-                .authority(domain, device_ceiling_bytes)
-                .map_err(|error| ResourceError::BudgetArithmeticOverflow {
-                    operation: "acquiring the shared device memory authority",
-                    reason: error.to_string(),
-                })?,
-            (None, Some(domain)) => {
-                DeviceMemoryAuthority::new(domain.clone(), device_ceiling_bytes)
-            }
-            _ => DeviceMemoryAuthority::new(
-                DeviceCompatibilityDomain::Accelerator {
-                    backend: "standalone".to_string(),
-                    index: 0,
-                },
-                device_ceiling_bytes,
-            ),
-        };
-        let memory = EngineMemoryGovernor::new(
-            device,
-            snapshot.resolved_limits.host_ram_bytes,
-            snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
+        let production_authority = matches!(
+            &source,
+            GovernorMemorySource::Resolve {
+                provider: Some(_),
+                ..
+            } | GovernorMemorySource::Shared { .. }
         );
-        let process_memory_manager = match provider {
-            Some(provider) => provider.process_memory_manager(),
-            None => onnx_runtime_memory_governor::ProcessMemoryManager::new().map_err(|error| {
-                ResourceError::BudgetArithmeticOverflow {
-                    operation: "constructing the local process memory manager",
-                    reason: error.to_string(),
-                }
-            })?,
+        let (memory, process_memory_manager) = match source {
+            GovernorMemorySource::Shared { memory, manager } => (memory, manager),
+            GovernorMemorySource::Resolve { provider, domain } => {
+                let device = match (provider, domain) {
+                    (Some(provider), Some(domain)) => provider
+                        .authority(domain, device_ceiling_bytes)
+                        .map_err(|error| ResourceError::BudgetArithmeticOverflow {
+                            operation: "acquiring the shared device memory authority",
+                            reason: error.to_string(),
+                        })?,
+                    (None, Some(domain)) => {
+                        DeviceMemoryAuthority::new(domain.clone(), device_ceiling_bytes)
+                    }
+                    _ => DeviceMemoryAuthority::new(
+                        DeviceCompatibilityDomain::Accelerator {
+                            backend: "standalone".to_string(),
+                            index: 0,
+                        },
+                        device_ceiling_bytes,
+                    ),
+                };
+                let memory = EngineMemoryGovernor::new(
+                    device,
+                    snapshot.resolved_limits.host_ram_bytes,
+                    snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
+                );
+                let process_memory_manager = match provider {
+                    Some(provider) => provider.process_memory_manager(),
+                    None => onnx_runtime_memory_governor::ProcessMemoryManager::new().map_err(
+                        |error| ResourceError::BudgetArithmeticOverflow {
+                            operation: "constructing the local process memory manager",
+                            reason: error.to_string(),
+                        },
+                    )?,
+                };
+                (memory, process_memory_manager)
+            }
         };
         // A reservation that "does not fit under the resolved ceiling" is only a
         // real failure when there *is* a resolved ceiling. When the device
@@ -459,7 +479,7 @@ impl EngineResourceGovernor {
         // under, so this must not refuse the load — it stays advisory, exactly as
         // it did before #947 stopped fabricating an 8 GiB ceiling here.
         if let Some(resolved_vram_bytes) = snapshot.resolved_limits.vram_bytes
-            && provider.is_some()
+            && production_authority
             && reservation_bytes > 0
             && !snapshot.derived_budget.reservation_applied
         {
@@ -529,6 +549,19 @@ impl EngineResourceGovernor {
         )
         .map_err(|source| {
             ResourceError::memory_grant("construct native CPU weight retention resources", source)
+        })?
+        .with_workspace_pool(
+            onnx_runtime_memory_governor::HostWorkspacePool::governed(
+                &process_memory_manager,
+                Arc::new(memory.clone()),
+            )
+            .map_err(|source| ResourceError::BudgetArithmeticOverflow {
+                operation: "construct shared Host execution workspace resources",
+                reason: source.to_string(),
+            })?,
+        )
+        .map_err(|source| {
+            ResourceError::memory_grant("attach shared Host execution workspace resources", source)
         })?;
         Ok(Self {
             inner,
@@ -1144,6 +1177,61 @@ pub(crate) fn component_governor(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn worker_cpu_resources_use_the_final_shared_host_books() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let limits = ResourceLimits {
+            vram_limit: ResourceLimit::Bytes(1024),
+            host_ram_limit: ResourceLimit::Bytes(128),
+            disk_spill_limit: None,
+        };
+        let kv = governor_no_paged_kv_config(&EngineConfig::default()).unwrap();
+        let root = EngineResourceGovernor::new(limits.clone(), false, kv, 0).unwrap();
+        assert_eq!(
+            root.memory.authority_id(Tier::Host).device(),
+            onnx_runtime_memory_api::DeviceKey::HOST
+        );
+        let worker = EngineResourceGovernor::new_worker_with_shared_memory(
+            limits,
+            false,
+            governor_no_paged_kv_config(&EngineConfig::default()).unwrap(),
+            None,
+            root.memory.clone(),
+            root.process_memory_manager.clone(),
+        )
+        .unwrap();
+        let resources =
+            worker.cpu_memory_resources(onnx_runtime_ep_cpu::CpuCacheRetention::new(true));
+        let ep = onnx_runtime_ep_cpu::CpuExecutionProvider::with_resources(resources);
+        let workspace = ep
+            .allocate_workspace(64, 16, MemoryRole::Workspace { step_scoped: true })
+            .unwrap();
+        assert_eq!(root.memory.used(Tier::Host), 64);
+        assert_eq!(worker.memory.used(Tier::Host), 64);
+        ep.deallocate_workspace(workspace).unwrap();
+        assert_eq!(
+            root.memory.used(Tier::Host),
+            64,
+            "idle workspace must stay funded"
+        );
+        let kv = root
+            .memory
+            .reserve(
+                Tier::Host,
+                128,
+                MemoryRole::KvCache,
+                onnx_runtime_memory_governor::HolderId::new(99),
+            )
+            .unwrap();
+        assert_eq!(root.memory.used(Tier::Host), 128);
+        assert_eq!(worker.memory.used(Tier::Host), 128);
+        drop(kv);
+        assert_eq!(root.memory.used(Tier::Host), 0);
+    }
+
     /// An explicit `--device` is authoritative in both directions. The CPU case
     /// is the one that matters: after #1551 made an undeclared device probe for
     /// an accelerator, asking for the CPU on a GPU machine must still get the
@@ -1317,8 +1405,10 @@ mod tests {
             capacities,
             kv_config,
             (0, 0),
-            None,
-            Some(&domain),
+            GovernorMemorySource::Resolve {
+                provider: None,
+                domain: Some(&domain),
+            },
         )
         .expect("governor construction with a measured device capacity");
 

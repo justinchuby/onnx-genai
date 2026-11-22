@@ -1123,7 +1123,7 @@ EP_RUST_DEFERRED = frozenset(
     }
 )
 
-EP_RUST_GOVERNED = frozenset({"einsum"})
+EP_RUST_GOVERNED = frozenset({"einsum", "bounded_expert_bench", "weight_admission_ab"})
 
 _BENCH_NAME = re.compile(r"""^\s*name\s*=\s*['"]([^'"]+)['"]""")
 _SHELL_FENCE = re.compile(r"```(?:bash|sh)\s*\n(.*?)```", re.DOTALL)

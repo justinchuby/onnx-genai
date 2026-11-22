@@ -98,6 +98,8 @@ pub mod large_alloc_cache;
 pub mod manager;
 pub mod shareability;
 pub mod shared_prefix;
+pub mod workspace;
+pub use workspace::{HostWorkspacePool, WorkspacePoolError};
 
 mod pressure;
 pub use pressure::{PressureRegistration, PressureRegistry};

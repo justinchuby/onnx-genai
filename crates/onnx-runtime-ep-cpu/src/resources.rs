@@ -65,6 +65,7 @@ pub struct CpuMemoryResources {
     host_cache: WeightOffloadHostCache,
     dense_bytes: usize,
     cache_retention: CpuCacheRetention,
+    workspace: Option<onnx_runtime_memory_governor::HostWorkspacePool>,
 }
 
 impl Default for CpuMemoryResources {
@@ -94,6 +95,7 @@ impl CpuMemoryResources {
             host_cache,
             dense_bytes: limits.dense_bytes,
             cache_retention: CpuCacheRetention::default(),
+            workspace: None,
         })
     }
 
@@ -101,6 +103,30 @@ impl CpuMemoryResources {
     pub fn with_cache_retention(mut self, retention: CpuCacheRetention) -> Self {
         self.cache_retention = retention;
         self
+    }
+
+    /// Supply one coarse Host workspace domain over the model's actual books.
+    /// Clones share its idle execution slots, without creating another budget.
+    pub fn with_workspace_pool(
+        mut self,
+        pool: onnx_runtime_memory_governor::HostWorkspacePool,
+    ) -> std::result::Result<Self, MemoryError> {
+        if let Some(owner) = &self.weight_memory().owner
+            && pool.authority_id() != Some(owner.domain.authority)
+        {
+            return Err(MemoryError::InvalidRequest {
+                tier: Tier::Host.name(),
+                requested: 0,
+                reason: "CPU weights and workspace use different Host authorities; construct both resources from the same model governor",
+            });
+        }
+        self.workspace = Some(pool);
+        Ok(self)
+    }
+    pub(crate) fn workspace_pool(
+        &self,
+    ) -> Option<&onnx_runtime_memory_governor::HostWorkspacePool> {
+        self.workspace.as_ref()
     }
 
     pub fn cache_retention(&self) -> &CpuCacheRetention {

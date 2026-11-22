@@ -3282,6 +3282,11 @@ impl ManagedAllocation {
             .expect("managed allocation owns its allocation until consumed")
     }
 
+    pub(crate) fn holder_and_role(&self) -> (HolderId, MemoryRole) {
+        let state = self.settlement.charge.lock();
+        (state.holder, state.role)
+    }
+
     pub fn identity(&self) -> AllocationIdentity {
         self.owner().identity()
     }

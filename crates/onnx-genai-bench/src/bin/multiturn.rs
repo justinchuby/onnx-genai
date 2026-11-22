@@ -26,8 +26,6 @@ use onnx_genai_engine::{
 };
 #[cfg(feature = "bench-native")]
 use onnx_genai_ort::{ChatMessage, ChatTemplate, available_execution_providers};
-#[cfg(feature = "bench-native")]
-use onnx_runtime_ep_cpu::kernels::matmul::weight_transpose_cache_sizes;
 
 const DEFAULT_TURNS: usize = 10;
 const DEFAULT_TOKENS_PER_TURN: usize = 30;
@@ -264,12 +262,8 @@ fn run_native_session(
         .with_context(|| format!("load native from {}", model_dir.display()))?;
     let model_load = load_start.elapsed();
 
-    // Cache verification: record weight transpose cache state after model load
-    let cache_after_load = weight_transpose_cache_sizes();
-    eprintln!(
-        "    cache after load: f16={}, f32={}",
-        cache_after_load.0, cache_after_load.1
-    );
+    let host_after_load = engine.resource_snapshot().host_ram.used;
+    eprintln!("    tracked Host bytes after load: {host_after_load}");
 
     if engine.decode_backend() != EngineDecodeBackend::Native {
         bail!(
@@ -355,14 +349,10 @@ fn run_native_session(
         engine.close_session(sid)?;
     }
 
-    // Cache verification: check cache state after all turns
-    let cache_after_turns = weight_transpose_cache_sizes();
+    let host_after_turns = engine.resource_snapshot().host_ram.used;
     eprintln!(
-        "    cache after {} turns: f16={}, f32={} (stable={})",
-        args.turns,
-        cache_after_turns.0,
-        cache_after_turns.1,
-        cache_after_load == cache_after_turns
+        "    tracked Host bytes after {} turns: {host_after_turns} (after load: {host_after_load}; includes all model holders)",
+        args.turns
     );
 
     Ok(SessionResult {

@@ -26,7 +26,6 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{
@@ -42,14 +41,15 @@ use super::half_gemv;
 #[cfg(feature = "mlas")]
 use super::weight_cache::WeightIdentity;
 use super::weight_cache::{GrantedWeight, WeightCache, WeightCacheKey, WeightLoad, WeightSpec};
-use super::weight_transpose::{self, WeightTransposeKey};
+use super::weight_transpose;
 use crate::CpuMemoryResources;
 use crate::backend::CpuBackend;
-use crate::dispatch_ledger;
 use crate::dtype::{
-    to_dense_f32_widen, to_dense_f32_widen_into, validate_f32_widen_input, write_dense_f32_narrow,
+    FloatElem, to_dense_f32_widen, to_dense_f32_widen_into, validate_f32_widen_input,
+    write_dense_f32_narrow,
 };
 use crate::strided::{next_index, numel};
+use crate::{dispatch_float, dispatch_ledger};
 
 // MLAS-style packed SIMD f32 GEMM (the `SimdX86` backend). Kept in a sibling
 // file but included here so `kernels/mod.rs` needs no edit; it is an internal
@@ -132,32 +132,14 @@ pub fn bnns_prefill_stats() -> (usize, u64) {
     )
 }
 
-/// Returns the number of entries in the process-global weight-transpose caches.
-/// (f16_entries, f32_entries). Used by benchmarks to verify cache reuse across turns.
-///
-/// For memory questions use [`weight_transpose_cache_bytes`] instead: an entry
-/// count cannot distinguish a cache holding kilobytes from one holding gigabytes.
-pub fn weight_transpose_cache_sizes() -> (usize, usize) {
-    weight_transpose::cache_sizes()
-}
-
-/// Bytes of transposed weight held by the process-global weight-transpose caches.
-///
-/// Each entry is a full `K x N` copy of a constant weight kept for the session,
-/// so this scales with model size and belongs in the memory plan (#1056).
-pub fn weight_transpose_cache_bytes() -> usize {
-    weight_transpose::cache_bytes()
-}
-
-/// Predicted bytes the process-global weight-transpose caches will hold for
-/// `graph` once it has run — the *prediction* the memory-strategy plan budgets
-/// for, whose accuracy [`weight_transpose_cache_bytes`] measures after the fact.
+/// Conservative transpose retention forecast for direct constant operands.
+/// All payloads are node-owned and obtain actual Host grants; this estimate
+/// is not admission.
 ///
 /// # What actually populates the cache
 ///
 /// The cache holds one f32/f16 `N x K` transpose per **constant** (initializer)
-/// weight that a kernel feeds through [`weight_transpose::cached_transpose_f32`]
-/// / [`weight_transpose::cached_transpose_f16`]. The precise callers, and hence
+/// weight that a kernel feeds through a node-owned transpose cache. The precise callers, and hence
 /// this predictor, are platform-split because the transpose is only consumed by
 /// the CPU EP's fast paths:
 ///
@@ -188,12 +170,9 @@ pub fn weight_transpose_cache_bytes() -> usize {
 ///   same arm — see the note there on why keying on the shared helper rather
 ///   than on an op-name list is what stops this going stale.
 ///
-/// The shape-keyed kernel cache instantiates a node once per activation shape
-/// (prefill `m > 1`, decode `m == 1`), but every instance keys the *global*
-/// cache on `(weight address, K, N)`, so the second instantiation hits the
-/// existing entry and allocates nothing extra. Unlike the MLAS packed buffer
-/// (#1051), the transpose is therefore held once per weight, not once per
-/// instantiation — no per-copy multiplier applies.
+/// Shape variants share the node's preparation owner, so one direct constant
+/// layout needs no shape multiplier. Runtime-created logical views are not
+/// represented by WeightRef and rely on actual grants when prepared.
 pub fn weight_transpose_cache_predicted_bytes(graph: &Graph) -> u64 {
     let mut total = 0_u64;
     for node in graph.nodes.values() {
@@ -209,11 +188,15 @@ fn constant_b_numel(node: &Node, graph: &Graph) -> Option<(u64, DataType)> {
     let b_value = (*node.inputs.get(1)?)?;
     let weight = graph.initializers.get(&b_value)?;
     let dims = weight.dims();
-    if dims.len() != 2 {
+    // MatMul promotes a vector B[K] to B[K,1]; Gemm requires a matrix.
+    // Higher-rank B never enters the single-matrix transpose consumers.
+    if dims.is_empty() || dims.len() > 2 || (dims.len() == 1 && node.op_type == "Gemm") {
         return None;
     }
-    let numel = (dims[0] as u64).checked_mul(dims[1] as u64)?;
-    Some((numel, weight.dtype()))
+    let elements = dims
+        .iter()
+        .fold(1u64, |n, &dim| n.saturating_mul(dim as u64));
+    Some((elements, weight.dtype()))
 }
 
 /// Per-node contribution to [`weight_transpose_cache_predicted_bytes`]. Mirrors
@@ -257,6 +240,16 @@ fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
         }
         return 0;
     }
+    // Fused MatMul+bias+Relu reaches the shared dense-f32 compute path.
+    // On Apple its optional f32 transpose is a 4-byte output even when the
+    // original source needs widening. Same-half execution can retain less.
+    if node.op_type == "FusedGemm" && contrib {
+        return if cfg!(any(target_os = "macos", target_os = "ios")) {
+            constant_b_numel(node, graph).map_or(0, |(elements, _)| elements.saturating_mul(4))
+        } else {
+            0
+        };
+    }
     // `MatMul` ships in the default domain, `FusedMatMulBias` in contrib.
     if (node.op_type == "MatMul" && node.is_default_domain())
         || (node.op_type == "FusedMatMulBias" && contrib)
@@ -285,14 +278,6 @@ fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
         return 0;
     }
     0
-}
-
-/// Explicit diagnostic reset of the shared transpose store.
-///
-/// Normal executor teardown drops its kernel and preparation owners before
-/// freeing weight buffers; it must not clear another session's warmed entries.
-pub fn clear_weight_transpose_caches() {
-    weight_transpose::clear_all();
 }
 
 /// Predicted retained f32 materialization bytes for registered MatMul-prepack
@@ -398,6 +383,20 @@ impl<const ELEMENT_BYTES: usize> WeightCacheKey for MatMulCopyKey<ELEMENT_BYTES>
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct HalfTransposeKey {
+    source: usize,
+    dtype: DataType,
+    k: usize,
+    n: usize,
+}
+impl WeightCacheKey for HalfTransposeKey {
+    fn weight_bytes(&self) -> Result<usize> {
+        self.k.checked_mul(self.n).and_then(|n| n.checked_mul(2)).ok_or_else(||
+            EpError::KernelFailed(format!("MatMul half transpose [{}, {}] byte count overflows usize; use addressable weight dimensions", self.k, self.n)))
+    }
+}
+
 #[cfg(feature = "mlas")]
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct SgemmPackKey {
@@ -457,13 +456,74 @@ impl AsRef<[f32]> for DenseOperand<'_> {
     }
 }
 
-struct F32TransposeMemo {
-    key: WeightTransposeKey,
-    installed: bool,
-    values: Arc<Vec<f32>>,
-    // Global transpose identity is the conversion buffer's address. Keep its
-    // payload/grant alive until that address-keyed dependency is retired.
-    _source: Option<Arc<GrantedWeight>>,
+/// Identity is the original logical operand, never a recyclable conversion
+/// allocation. A transpose can retire independently of its widened source.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct F32TransposeKey {
+    source: MatMulCopyKey<4>,
+    k: usize,
+    n: usize,
+}
+impl WeightCacheKey for F32TransposeKey {
+    fn weight_bytes(&self) -> Result<usize> {
+        self.source.weight_bytes()
+    }
+}
+
+struct F32TransposeHint {
+    key: F32TransposeKey,
+    // Flat-vector identity retains only a small Arc control block after the
+    // payload and grant retire; it cannot retain an inline matrix allocation.
+    reader: std::sync::Weak<GrantedWeight>,
+}
+
+fn transpose_source_geometry(source: &TensorView<'_>, k: usize, n: usize) -> bool {
+    k.checked_mul(n).is_some()
+        && (source.shape == [k, n].as_slice() || (n == 1 && source.shape == [k].as_slice()))
+}
+
+/// Widen directly into the transposed destination, never through a second
+/// matrix. Tiled source coordinates preserve the exact set of addressed elements.
+fn transpose_source_into(
+    source: &TensorView<'_>,
+    k: usize,
+    n: usize,
+    output: &mut [f32],
+) -> Result<()> {
+    validate_f32_widen_input("CPU B transpose source", source)?;
+    if !transpose_source_geometry(source, k, n) || k.checked_mul(n) != Some(output.len()) {
+        return Err(EpError::KernelFailed(format!(
+            "CPU B transpose [{k}, {n}] has source shape {:?} and {} output elements; supply a matching matrix or promoted B vector and complete output storage",
+            source.shape,
+            output.len()
+        )));
+    }
+    if output.is_empty() {
+        return Ok(());
+    }
+    if source.dtype == DataType::Float32
+        && source.is_contiguous()
+        && (source.data_ptr::<u8>() as usize).is_multiple_of(std::mem::align_of::<f32>())
+    {
+        // SAFETY: validated host-contiguous aligned f32 storage has exactly
+        // the checked matrix extent; source backing bounds are the EP contract.
+        let values = unsafe { std::slice::from_raw_parts(source.data_ptr::<f32>(), output.len()) };
+        return weight_transpose::transpose_row_major_into(values, k, n, output);
+    }
+    let (sr, sc) = if source.shape.len() == 1 {
+        (source.strides[0] as isize, 0)
+    } else {
+        (source.strides[0] as isize, source.strides[1] as isize)
+    };
+    dispatch_float!(source.dtype,"CPU B transpose conversion",T=>{
+        let origin=source.data_ptr::<T>() as usize;
+        weight_transpose::transpose_map_into(k,n,output,|i,j| {
+            // SAFETY: the validated original host view addresses this logical
+            // coordinate. Transposition changes traversal, never source bounds;
+            // the caller supplies backing bounds under the TensorView contract.
+            unsafe{(origin as *const T).offset(i as isize*sr+j as isize*sc).read_unaligned()}.to_f32()
+        })
+    })
 }
 
 /// Per-kernel policy over node-owned immutable MatMul preparation.
@@ -471,13 +531,9 @@ struct F32TransposeMemo {
 /// Contiguous f32 constants already have the ideal representation, so they stay
 /// zero-copy and need no owned cache entry.
 ///
-/// Weight transpose memos (`transposed_b`, `transposed_b_f16`) use `Arc` so the
-/// data is shared with the process-global caches in
-/// [`weight_transpose`](crate::kernels::weight_transpose). This ensures that a
-/// kernel-cache shape miss (e.g. prefill M=40 → decode M=1) finds the transpose
-/// in the global cache rather than recomputing it. Each memo stores the
-/// [`WeightTransposeKey`] it was filled for, so it is validated against the
-/// operand actually being multiplied on every call (#845).
+/// An Arc node owner keeps granted payloads shared across shape variants and
+/// fused operators. Source identities are checked against the actual operand;
+/// each prepared payload independently retains its grant through its readers.
 pub(crate) struct MatMulPrepack {
     retain_caches: bool,
     constant_inputs: [bool; 2],
@@ -509,12 +565,25 @@ struct MatMulWeights {
         not(any(target_os = "macos", target_os = "ios")),
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
-    transposed_b: OnceLock<F32TransposeMemo>,
-    /// Lazily-computed f16 transpose of the B weight matrix, with the key it
-    /// was computed for. Stores the raw u16 bit patterns of half::f16 in N×K
-    /// layout, read directly from the mmap'd model file without widening to
-    /// f32. Only populated when B is a constant Float16 input.
-    transposed_b_f16: OnceLock<(WeightTransposeKey, bool, Arc<Vec<u16>>)>,
+    transposed_b: WeightCache<F32TransposeKey>,
+    // A weak last-hit slot avoids constructing/hashing the full layout key on
+    // repeated decode. It owns no payload or quota and cannot block reclamation.
+    f32_transpose_hint: std::sync::Mutex<Option<F32TransposeHint>>,
+    /// Reclaimable native-width half transposes keyed by original source,
+    /// interpretation and matrix geometry. Executing readers keep their grant.
+    #[cfg_attr(
+        not(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_os = "macos",
+            target_os = "ios"
+        )),
+        allow(
+            dead_code,
+            reason = "native half GEMV consumes this on x86 or Apple; portable tests cover its ownership"
+        )
+    )]
+    half_transposes: WeightCache<HalfTransposeKey, Vec<u16>>,
     /// Lazily-computed contiguous f16 copy of B for non-contiguous weight
     /// matrices (e.g. lm_head vocab projection stored column-major in the ONNX
     /// model). Stores raw u16 bit patterns in row-major K×N layout. Only
@@ -525,24 +594,6 @@ struct MatMulWeights {
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
     contiguous_b_f16: WeightCache<MatMulCopyKey<2>, Vec<u16>>,
-}
-
-/// Installed global transpose keys retire when the final node-weight owner
-/// drops, rather than when its first shape-specialized kernel is evicted.
-/// Borrowed/prewarmed global entries remain owned by their original installer.
-/// Converted f32 sources stay pinned by F32TransposeMemo until key retirement;
-/// original model storage remains the executor's responsibility (#1726).
-impl Drop for MatMulWeights {
-    fn drop(&mut self) {
-        if let Some(memo) = self.transposed_b.get()
-            && memo.installed
-        {
-            weight_transpose::evict_f32(&memo.key);
-        }
-        if let Some((key, true, _)) = self.transposed_b_f16.get() {
-            weight_transpose::evict_half(key);
-        }
-    }
 }
 
 struct SharedMatMulWeights {
@@ -558,17 +609,12 @@ impl Default for MatMulPrepack {
 }
 
 impl MatMulPrepack {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    pub(crate) fn has_prepared_transpose(&self) -> bool {
-        self.weights.transposed_b.get().is_some() || self.weights.transposed_b_f16.get().is_some()
-    }
-
     /// Preserve load-time transpose warming inside the owning kernel’s policy.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(crate) fn prepare_constants(
         &mut self,
         constants: &[Option<onnx_runtime_ep_api::KernelConstantInput<'_>>],
-    ) {
+    ) -> Result<bool> {
         if self.retain_caches
             && self.constant_inputs[1]
             && let Some(Some(weight)) = constants.get(1)
@@ -576,7 +622,7 @@ impl MatMulPrepack {
         {
             let (k, n) = (weight.shape[0], weight.shape[1]);
             if k == 0 || n == 0 {
-                return;
+                return Ok(false);
             }
             let element_size = match weight.dtype {
                 DataType::Float16 => 2,
@@ -586,17 +632,17 @@ impl MatMulPrepack {
                 {
                     4
                 }
-                _ => return,
+                _ => return Ok(false),
             };
             if k.checked_mul(n)
                 .and_then(|numel| numel.checked_mul(element_size))
                 != Some(weight.bytes.len())
                 || !(weight.bytes.as_ptr() as usize).is_multiple_of(element_size)
             {
-                return;
+                return Ok(false);
             }
             let Ok(n_stride) = i64::try_from(n) else {
-                return;
+                return Ok(false);
             };
             let strides = [n_stride, 1];
             let view = TensorView::new(
@@ -607,19 +653,14 @@ impl MatMulPrepack {
                 onnx_runtime_ir::DeviceId::cpu(),
             );
             if weight.dtype == DataType::Float16 {
-                let _ = self.transposed_b_f16(&view, k, n);
+                return Ok(self
+                    .transposed_b_half(&view, k, n, HalfFormat::F16)?
+                    .is_some());
             } else {
-                // SAFETY: the dtype, byte count and f32 alignment were checked
-                // above; the descriptor borrows live immutable initializer bytes.
-                let values = unsafe {
-                    std::slice::from_raw_parts(
-                        weight.bytes.as_ptr().cast::<f32>(),
-                        weight.bytes.len() / 4,
-                    )
-                };
-                let _ = self.transposed_b(values, k, n);
+                return Ok(self.transposed_b(&view, k, n)?.is_some());
             }
         }
+        Ok(false)
     }
 
     pub(crate) fn new(resources: CpuMemoryResources) -> Self {
@@ -640,8 +681,9 @@ impl MatMulPrepack {
                 packed_b: WeightCache::new(resources.weight_memory().clone(), limit),
                 #[cfg(feature = "mlas")]
                 packed_b_from_half: WeightCache::new(resources.weight_memory().clone(), limit),
-                transposed_b: OnceLock::new(),
-                transposed_b_f16: OnceLock::new(),
+                transposed_b: WeightCache::new(resources.weight_memory().clone(), limit),
+                f32_transpose_hint: std::sync::Mutex::new(None),
+                half_transposes: WeightCache::new(resources.weight_memory().clone(), limit),
                 contiguous_b_f16: WeightCache::new(resources.weight_memory().clone(), limit),
             }),
         }
@@ -751,146 +793,206 @@ impl MatMulPrepack {
         }
     }
 
-    /// Returns a cached transpose of B[K,N] -> B_T[N,K] row-major.
-    ///
-    /// Only transposes constant (model weight) inputs. Uses a process-global
-    /// cache so the transpose survives kernel-cache shape evictions (e.g.
-    /// prefill M=40 → decode M=1).
-    ///
-    /// Returns `None` — never a buffer of the wrong length — when B is an
-    /// activation, when `b.len()` is not exactly `k * n`, or when this prepack's
-    /// memo was filled for a different operand or geometry. The callers index
-    /// the returned slice unchecked, so every `Some` is exactly `n * k` long
-    /// (#845); a `None` falls back to the untransposed kernel.
-    #[cfg_attr(
-        not(any(target_os = "macos", target_os = "ios")),
-        allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
-    )]
-    pub(crate) fn transposed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&[f32]> {
-        if !self.constant_inputs[1] {
-            return None;
-        }
-        // #1056: when the plan declines the transpose cache, hand back `None` so
-        // the caller recomputes a transient transpose per call (freed at the end
-        // of the call) rather than memoizing an Arc in the node owner; a
-        // shared memo would otherwise survive across its shape variants.
-        if !self.retain_caches {
-            return None;
-        }
-        let key = WeightTransposeKey::new(b.as_ptr(), k, n);
-        // Validate before touching the memo so a mismatched call can neither
-        // install a wrong-length entry nor poison a correct one.
-        if key.numel() != Some(b.len()) {
-            return None;
-        }
-        let memo = self.weights.transposed_b.get_or_init(|| {
-            // A live caller already holds the conversion reader. Capture a
-            // second reader before publishing a transpose keyed on its address.
-            let source = self.weights.dense[1].owner_of(b);
-            let (values, installed) = weight_transpose::cached_transpose_f32_reporting(b, k, n)
-                .expect("length was validated against [k, n] above");
-            F32TransposeMemo {
-                key,
-                installed,
-                values,
-                _source: source,
-            }
-        });
-        (memo.key == key).then(|| memo.values.as_slice())
-    }
-
-    /// Returns a cached f16 transpose of B[K,N] → B_T[N,K] row-major.
-    ///
-    /// Weight-scaled bytes this prepack is currently holding in its 16-bit
-    /// transpose memo — the *actual* side of the `predicted == actual`
-    /// reconciliation that `node_weight_transpose_cache_bytes` is the
-    /// predicted side of (#1056 ratio-1.00, #1702).
-    ///
-    /// Reads this instance rather than the process-global total, so a test can
-    /// attribute the bytes to the execution it just performed even under the
-    /// parallel harness.
-    #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
-    pub(crate) fn retained_transpose_bytes(&self) -> u64 {
-        self.weights
-            .transposed_b_f16
-            .get()
-            .map_or(0, |(_, _, bt)| bt.len() * std::mem::size_of::<u16>()) as u64
-    }
-
-    /// Like [`transposed_b`](Self::transposed_b) but preserves the original f16
-    /// storage format (as raw u16 bit patterns), reading directly from the
-    /// mmap'd model buffer. Uses a process-global cache so the transpose
-    /// survives kernel-cache shape evictions. The same total-identity rules as
-    /// [`transposed_b`](Self::transposed_b) apply: every `Some` is exactly
-    /// `n * k` elements long.
-    #[cfg_attr(
-        not(any(target_os = "macos", target_os = "ios", test)),
-        allow(
-            dead_code,
-            reason = "the f16-only spelling is consumed by the Apple Accelerate paths; \
-                      every other caller goes through `transposed_b_half`"
-        )
-    )]
-    pub(crate) fn transposed_b_f16(
+    /// Optional node-owned f32 transpose, keyed by the complete original view
+    /// and requested geometry. Conversion writes directly into admitted storage;
+    /// the result needs no intermediate dense copy or source-payload owner.
+    pub(super) fn transposed_b(
         &self,
-        b_view: &TensorView,
+        source: &TensorView<'_>,
         k: usize,
         n: usize,
-    ) -> Option<&[u16]> {
-        self.transposed_b_half(b_view, k, n, HalfFormat::F16)
+    ) -> Result<Option<Arc<GrantedWeight>>> {
+        if !self.constant_inputs[1] || !self.retain_caches {
+            return Ok(None);
+        }
+        validate_f32_widen_input("MatMul f32 transpose source", source)?;
+        {
+            let hint = self
+                .weights
+                .f32_transpose_hint
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(F32TransposeHint { key, reader }) = hint.as_ref()
+                && key.k == k
+                && key.n == n
+                && key.source.source == source.data_ptr::<u8>() as usize
+                && key.source.dtype == source.dtype
+                && key.source.shape.as_slice() == source.shape
+                && key.source.strides.as_slice() == source.strides
+                && let Some(reader) = reader.upgrade()
+            {
+                return Ok(Some(reader));
+            }
+        }
+        if !transpose_source_geometry(source, k, n) || k == 0 || n == 0 {
+            return Ok(None);
+        }
+        let key = F32TransposeKey {
+            source: MatMulCopyKey::from_view(source),
+            k,
+            n,
+        };
+        if let Some(hit) = self.weights.transposed_b.get(&key) {
+            self.remember_f32_transpose(key, &hit);
+            return Ok(Some(hit));
+        }
+        let loaded = self
+            .weights
+            .transposed_b
+            .load_group(&[WeightSpec::cached(&key)?], |_, output| {
+                transpose_source_into(source, k, n, output)
+            })
+            .map_err(|source| EpError::Backend {
+                operation: "MatMul f32 transpose preparation",
+                source: Box::new(source),
+            })?;
+        match loaded {
+            WeightLoad::Ready(mut loaded) => {
+                let reader = loaded.weights.remove(0);
+                self.remember_f32_transpose(key, &reader);
+                Ok(Some(reader))
+            }
+            WeightLoad::Declined(_) => Ok(None),
+        }
     }
 
-    /// [`transposed_b_f16`](Self::transposed_b_f16) for either 16-bit format.
-    ///
-    /// The transpose itself is a pure permutation of `u16` bit patterns, so it
-    /// is dtype-agnostic -- but serving it is not. `format` names the
-    /// interpretation the *caller* is about to apply, and the view's dtype must
-    /// match it exactly: handing `bf16` bits to an `f16` GEMV would silently
-    /// reinterpret every weight rather than fail, so the check is what keeps
-    /// one shared cache from becoming a type confusion.
-    pub(crate) fn transposed_b_half(
+    fn remember_f32_transpose(&self, key: F32TransposeKey, reader: &Arc<GrantedWeight>) {
+        let mut hint = self
+            .weights
+            .f32_transpose_hint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // With one entry, recency cannot affect victim choice. Multi-layout
+        // nodes use the canonical map so every hit keeps its LRU metadata.
+        *hint = (self.weights.transposed_b.has_single_entry()).then(|| F32TransposeHint {
+            key,
+            reader: Arc::downgrade(reader),
+        });
+    }
+
+    /// Gemm's row-major backend requires this layout even when retention is
+    /// disabled. Its call-owned copy must still be funded before building.
+    pub(super) fn required_transposed_b(
         &self,
-        b_view: &TensorView,
+        source: &TensorView<'_>,
+        k: usize,
+        n: usize,
+    ) -> Result<Arc<GrantedWeight>> {
+        if let Some(hit) = self.transposed_b(source, k, n)? {
+            return Ok(hit);
+        }
+        validate_f32_widen_input("Gemm required B transpose", source)?;
+        if !transpose_source_geometry(source, k, n) {
+            return Err(EpError::KernelFailed(format!(
+                "Gemm B transpose [{k}, {n}] disagrees with source shape {:?}; supply a matching matrix or promoted vector",
+                source.shape
+            )));
+        }
+        let bytes=k.checked_mul(n).and_then(|elements|elements.checked_mul(4)).ok_or_else(||EpError::KernelFailed(format!("Gemm B transpose [{k}, {n}] byte count overflows usize; use addressable matrix dimensions")))?;
+        let loaded = self
+            .weights
+            .transposed_b
+            .load_group(&[WeightSpec::transient(bytes)], |_, output| {
+                transpose_source_into(source, k, n, output)
+            })
+            .map_err(|source| EpError::Backend {
+                operation: "Gemm required B transpose preparation",
+                source: Box::new(source),
+            })?;
+        match loaded {
+            WeightLoad::Ready(mut loaded) => Ok(loaded.weights.remove(0)),
+            WeightLoad::Declined(source) => Err(EpError::Backend {
+                operation: "Gemm required B transpose admission",
+                source: Box::new(source),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn f32_transpose_stats(&self) -> (usize, usize) {
+        self.weights.transposed_b.stats()
+    }
+
+    /// Cached native-width half transposes, owned once per node and reclaimable
+    /// when idle. An executing Arc reader retains its own payload and grant.
+    #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+    pub(crate) fn retained_transpose_bytes(&self) -> u64 {
+        self.weights.half_transposes.stats().1 as u64
+    }
+
+    /// The requested interpretation must match the source dtype. Only complete
+    /// contiguous immutable matrices are eligible; refusal runs no builder and
+    /// leaves the existing untransposed computation available.
+    #[cfg_attr(
+        not(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_os = "macos",
+            target_os = "ios"
+        )),
+        allow(
+            dead_code,
+            reason = "native half GEMV consumes this on x86 or Apple; portable tests cover its ownership"
+        )
+    )]
+    pub(super) fn transposed_b_half(
+        &self,
+        view: &TensorView,
         k: usize,
         n: usize,
         format: HalfFormat,
-    ) -> Option<&[u16]> {
-        use onnx_runtime_ir::DataType;
+    ) -> Result<Option<Arc<GrantedWeight<Vec<u16>>>>> {
         let expected = match format {
             HalfFormat::F16 => DataType::Float16,
             HalfFormat::Bf16 => DataType::BFloat16,
         };
-        if !self.constant_inputs[1] || b_view.dtype != expected || !b_view.is_contiguous() {
-            return None;
+        if !self.constant_inputs[1]
+            || !self.retain_caches
+            || view.dtype != expected
+            || !view.is_contiguous()
+        {
+            return Ok(None);
         }
-        // #1056: declined cache -> recompute per call, retain nothing.
-        if !self.retain_caches {
-            return None;
+        view.validate()?;
+        if !view.device.is_host_accessible() {
+            return Err(EpError::KernelFailed(format!(
+                "MatMul constant half transpose cannot read {:?} storage on {:?}; explicitly transfer the matrix to host-accessible storage before preparing CPU weights",
+                view.dtype, view.device
+            )));
         }
-        // The caller derives `k` from A and `n` from B, so operands that
-        // disagree would otherwise build a slice longer than the weight and
-        // transpose out of bounds.
-        let numel = k.checked_mul(n)?;
-        if b_view.numel() != numel {
-            return None;
-        }
-        // SAFETY: `b_view` is a contiguous Float16 view whose element count was
-        // just checked to equal `k * n`, and it stays live for this call.
-        let src = unsafe { std::slice::from_raw_parts(b_view.data_ptr::<u16>(), numel) };
-        // The tag keeps `f16` and `bf16` apart in the shared `u16` cache; the
-        // dtype check above only proves what *this* view is, not what a hit on
-        // a recycled address was built from.
-        let tag = match format {
-            HalfFormat::F16 => 0,
-            HalfFormat::Bf16 => 1,
+        let Some(elements) = k.checked_mul(n) else {
+            return Ok(None);
         };
-        let key = WeightTransposeKey::tagged(src.as_ptr(), k, n, tag);
-        let (cached_key, _, bt) = self.weights.transposed_b_f16.get_or_init(|| {
-            let (bt, installed) = weight_transpose::cached_transpose_half_reporting(src, k, n, tag)
-                .expect("length was validated against [k, n] above");
-            (key, installed, bt)
-        });
-        (*cached_key == key).then(|| bt.as_slice())
+        if elements == 0 || view.numel() != elements {
+            return Ok(None);
+        }
+        let key = HalfTransposeKey {
+            source: view.data_ptr::<u16>() as usize,
+            dtype: view.dtype,
+            k,
+            n,
+        };
+        if let Some(hit) = self.weights.half_transposes.get(&key) {
+            return Ok(Some(hit));
+        }
+        let loaded = self
+            .weights
+            .half_transposes
+            .load_group(&[WeightSpec::cached(&key)?], |_, output| {
+                // SAFETY: validated host-accessible contiguous half storage, with
+                // exactly the checked matrix extent, stays live for this build.
+                let source =
+                    unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), elements) };
+                weight_transpose::transpose_row_major_into(source, k, n, output)
+            })
+            .map_err(|source| EpError::Backend {
+                operation: "MatMul constant half transpose preparation",
+                source: Box::new(source),
+            })?;
+        match loaded {
+            WeightLoad::Ready(mut loaded) => Ok(Some(loaded.weights.remove(0))),
+            WeightLoad::Declined(_) => Ok(None),
+        }
     }
 
     /// Returns a cached contiguous f16 copy of a non-contiguous B weight.
@@ -2534,6 +2636,52 @@ mod gemm_bt_avx2 {
     }
 }
 
+/// Decode directly from row-major half storage when optional preparation is
+/// unavailable. Only the activation and output are materialized; no weight
+/// widening or second weight grant is needed under Host memory pressure.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(super) fn untransposed_f16_decode(
+    prepack: &MatMulPrepack,
+    a: &TensorView,
+    b: &TensorView,
+    k: usize,
+    n: usize,
+) -> Result<Option<Vec<f32>>> {
+    if b.dtype != DataType::Float16 || !b.is_contiguous() {
+        return Ok(None);
+    }
+    b.validate()?;
+    if !b.device.is_host_accessible() {
+        return Err(EpError::KernelFailed(format!(
+            "CPU half decode cannot read weights on {:?}; explicitly transfer B to host-accessible storage",
+            b.device
+        )));
+    }
+    if k.checked_mul(n) != Some(b.numel()) {
+        return Ok(None);
+    }
+    let activation = prepack.dense(0, a)?;
+    if activation.len() != k {
+        return Ok(None);
+    }
+    // SAFETY: validated contiguous host half storage has exactly k*n elements.
+    let bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), b.numel()) };
+    let mut result = vec![0.0; n];
+    result
+        .par_chunks_mut(64)
+        .enumerate()
+        .for_each(|(tile, output)| {
+            let start = tile * 64;
+            for (p, &av) in activation.iter().enumerate() {
+                let row = &bits[p * n + start..p * n + start + output.len()];
+                for (slot, &weight) in output.iter_mut().zip(row) {
+                    *slot = half::f16::from_bits(weight).to_f32().mul_add(av, *slot);
+                }
+            }
+        });
+    Ok(Some(result))
+}
+
 impl Kernel for MatMulKernel {
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
         self.prepack.set_constant_inputs(constant_inputs);
@@ -2601,14 +2749,17 @@ impl MatMulKernel {
             && inputs[1].dtype == onnx_runtime_ir::DataType::Float16
         {
             // Try the transposed-B cache first (contiguous weights).
-            if let Some(bt_f16) = self.prepack.transposed_b_f16(&inputs[1], geom.k, geom.n) {
+            if let Some(bt_f16) =
+                self.prepack
+                    .transposed_b_half(&inputs[1], geom.k, geom.n, HalfFormat::F16)?
+            {
                 #[cfg(all(test, target_arch = "aarch64"))]
                 GEMV_F16_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let a_dense = self.prepack.dense(0, &inputs[0])?;
                 let mut result = vec![0.0f32; geom.n];
                 accelerate_gemm::neon_gemv_f16_col_parallel(
                     &a_dense,
-                    bt_f16,
+                    bt_f16.as_slice(),
                     &mut result,
                     geom.k,
                     geom.n,
@@ -2647,6 +2798,17 @@ impl MatMulKernel {
             }
         }
 
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if backend == CpuBackend::Accelerate
+            && geom.m == 1
+            && numel(&geom.batch_shape) <= 1
+            && geom.b_promoted_rank == 2
+            && let Some(result) =
+                untransposed_f16_decode(&self.prepack, &inputs[0], &inputs[1], geom.k, geom.n)?
+        {
+            return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+        }
+
         // x86 16-bit storage GEMV: the mirror of the Accelerate path above.
         // `try_matmul_half` packs both operands into cache-sized panels, which
         // pays for itself only when a panel of B is reused across several rows
@@ -2665,8 +2827,8 @@ impl MatMulKernel {
         // every `p` and runs 1.56-2.98x slower. A non-constant B, or a
         // declined cache, still reads in place through `gemv_half_kn` — so
         // this site remains available to a weight a prepacked transpose could
-        // not serve. The transpose costs a permanent 2*K*N bytes (272 MB for
-        // a 896x151936 lm_head), which is exactly why it must stay predicted.
+        // not serve. The transpose carries an actual 2*K*N Host grant and
+        // remains reclaimable while idle; its forecast is not an admission.
         //
         // No weight is large enough to divert this to the fused GEBP. That
         // handover existed (`half_decode_prefers_gebp`, `k * n >= 1M`) and was
@@ -2853,12 +3015,12 @@ impl MatMulKernel {
             // GEMM writes exactly within bounds. The slice is the sole mutable
             // borrow of this storage for the duration of the call.
             let out_slice = unsafe { std::slice::from_raw_parts_mut(ptr, numel) };
-            return matmul_dense_into_with_backend(
-                &self.prepack.dense(0, &inputs[0])?,
-                &self.prepack.dense(1, &inputs[1])?,
+            return matmul_prepacked_into(
+                &inputs[0],
+                &inputs[1],
                 &geom,
                 backend,
-                Some(&self.prepack),
+                &self.prepack,
                 out_slice,
             );
         }
@@ -3592,18 +3754,19 @@ pub(crate) fn half_decode_gemv_dispatch(
     k: usize,
     n: usize,
     trans_b: bool,
-) {
+) -> Result<()> {
     if trans_b {
         half_gemv::gemv_half_nk(format, a, b_bits, out, k, n);
-        return;
+        return Ok(());
     }
-    if let Some(bt) = prepack.transposed_b_half(b_view, k, n, format) {
+    if let Some(bt) = prepack.transposed_b_half(b_view, k, n, format)? {
         #[cfg(test)]
         HALF_DECODE_TRANSPOSED_CALLS.with(|c| c.set(c.get() + 1));
-        half_gemv::gemv_half_nk(format, a, bt, out, k, n);
-        return;
+        half_gemv::gemv_half_nk(format, a, bt.as_slice(), out, k, n);
+        return Ok(());
     }
     half_gemv::gemv_half_kn(format, a, b_bits, out, k, n);
+    Ok(())
 }
 
 /// The x86 16-bit decode GEMV arm, shared by every operator whose math is
@@ -3673,7 +3836,7 @@ pub(crate) fn try_half_decode_gemv(
         k,
         n,
         false,
-    );
+    )?;
     Ok(Some(result))
 }
 
@@ -3724,14 +3887,7 @@ pub(crate) fn matmul_dense_prepacked_into(
         )));
     }
     let out_slice = &mut out[..geom.result_len];
-    matmul_dense_into_with_backend(
-        &prepack.dense(0, a)?,
-        &prepack.dense(1, b)?,
-        &geom,
-        backend,
-        Some(prepack),
-        out_slice,
-    )?;
+    matmul_prepacked_into(a, b, &geom, backend, prepack, out_slice)?;
     Ok(geom.result_len)
 }
 
@@ -3745,12 +3901,72 @@ fn matmul_dense_prepacked_with_backend(
     if let Some(result) = try_matmul_half(a, b, &geom, backend)? {
         return Ok(result);
     }
-    matmul_dense_impl_with_geom(
-        prepack.dense(0, a)?,
-        prepack.dense(1, b)?,
-        &geom,
+    validate_f32_widen_input("MatMul prepared A", a)?;
+    validate_f32_widen_input("MatMul prepared B", b)?;
+    let mut out = vec![0.; geom.result_len];
+    matmul_prepacked_into(a, b, &geom, backend, prepack, &mut out)?;
+    Ok(out)
+}
+
+fn matmul_prepacked_into(
+    a: &TensorView,
+    b: &TensorView,
+    geom: &MatMulGeometry,
+    backend: CpuBackend,
+    prepack: &MatMulPrepack,
+    out: &mut [f32],
+) -> Result<()> {
+    if out.len() != geom.result_len {
+        return Err(EpError::KernelFailed(format!(
+            "MatMul prepared output has {} elements, expected {}; supply the complete result buffer",
+            out.len(),
+            geom.result_len
+        )));
+    }
+    if out.is_empty() {
+        validate_f32_widen_input("MatMul prepared A", a)?;
+        validate_f32_widen_input("MatMul prepared B", b)?;
+        return Ok(());
+    }
+    // Mandatory activation materialization precedes optional B admission, so
+    // an optional transpose cannot consume memory needed to execute at all.
+    let activation = prepack.dense(0, a)?;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if backend == CpuBackend::Accelerate
+        && numel(&geom.batch_shape) <= 1
+        && geom.b_promoted_rank == 2
+        && (geom.m == 1 || accelerate_gemm::thin_m_gemm_eligible(geom.m, geom.k, geom.n))
+        && let Some(bt) = prepack.transposed_b(b, geom.k, geom.n)?
+    {
+        if geom.m == 1 {
+            accelerate_gemm::neon_gemv_col_parallel(
+                &activation,
+                bt.as_slice(),
+                out,
+                geom.k,
+                geom.n,
+            );
+        } else {
+            #[cfg(all(test, target_arch = "aarch64"))]
+            THIN_M_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            accelerate_gemm::neon_thin_m_gemm_col_parallel(
+                &activation,
+                bt.as_slice(),
+                out,
+                geom.m,
+                geom.k,
+                geom.n,
+            );
+        }
+        return Ok(());
+    }
+    matmul_dense_into_with_backend(
+        &activation,
+        &prepack.dense(1, b)?,
+        geom,
         backend,
         Some(prepack),
+        out,
     )
 }
 
@@ -3894,10 +4110,9 @@ fn matmul_dense_into_with_backend(
     let (m, k, n) = (geom.m, geom.k, geom.n);
     let (a_mat, b_mat, c_mat) = (geom.a_mat, geom.b_mat, geom.c_mat);
 
-    // `prepack` is consumed on macOS/iOS (Accelerate transposed_b) and with the
-    // `mlas` feature (packed_b). On other platforms it is passed through for API
-    // consistency but not yet consumed.
-    #[cfg(not(any(feature = "mlas", target_os = "macos", target_os = "ios")))]
+    // Original-view preparation runs before this dense compute function.
+    // Only optional MLAS packing consumes the prepack here.
+    #[cfg(not(feature = "mlas"))]
     let _ = &prepack;
 
     #[cfg(feature = "mlas")]
@@ -3929,36 +4144,7 @@ fn matmul_dense_into_with_backend(
         && numel(&geom.batch_shape) <= 1
         && geom.b_promoted_rank == 2
     {
-        if let Some(bt) = prepack.and_then(|p| p.transposed_b(b_dense, k, n)) {
-            accelerate_gemm::neon_gemv_col_parallel(a_dense, bt, out, k, n);
-        } else {
-            accelerate_gemm::neon_gemv_parallel(a_dense, b_dense, out, k, n)?;
-        }
-        return Ok(());
-    }
-
-    // Thin-M GEMM: column-parallel NEON for M=2..16 with large B (f32 on macOS).
-    //
-    // When B is too large for the SLC and M is small, `cblas_sgemm`'s panel
-    // tiling reads B inefficiently. The column-parallel approach streams B_T
-    // once per thread (each column's data stays L1-hot across M rows),
-    // achieving 2–3× speedup for the lm_head projection [7,768]×[768,50257].
-    //
-    // Requires pre-transposed B (constant weight). Non-constant B falls through
-    // to cblas_sgemm. Does NOT affect the fp16 BNNS path (handled earlier).
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    if backend == CpuBackend::Accelerate
-        && accelerate_gemm::thin_m_gemm_eligible(m, k, n)
-        && numel(&geom.batch_shape) <= 1
-        && geom.b_promoted_rank == 2
-        && let Some(bt) = prepack.and_then(|p| p.transposed_b(b_dense, k, n))
-    {
-        #[cfg(all(test, target_arch = "aarch64"))]
-        THIN_M_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Column-parallel thin-M GEMM: process strips of 4 B_T columns at
-        // a time, computing all M rows per strip while data is L1-hot.
-        // This is ~2.6× faster than cblas_sgemm for these shapes.
-        accelerate_gemm::neon_thin_m_gemm_col_parallel(a_dense, bt, out, m, k, n);
+        accelerate_gemm::neon_gemv_parallel(a_dense, b_dense, out, k, n)?;
         return Ok(());
     }
 
@@ -4184,6 +4370,733 @@ mod tests {
     }
 
     #[test]
+    fn direct_transpose_conversion_preserves_float_bits_and_special_values() {
+        let bits: Vec<u16> = (0..=u16::MAX).collect();
+        let source = Owned::f16_bits(&[256, 256], &bits);
+        let prepack = constant_b_prepack();
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            let mut view = source.view();
+            view.dtype = dtype;
+            let dense = to_dense_f32_widen("reference conversion", &view).unwrap();
+            let expected = reference_transpose(&dense, 256, 256);
+            let got = prepack.transposed_b(&view, 256, 256).unwrap().unwrap();
+            for (index, (&got, &expected)) in got.as_slice().iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "{dtype:?} transposed element {index}"
+                );
+            }
+        }
+        assert!(
+            !prepack.dense_is_filled(1),
+            "source conversion writes only the final transpose"
+        );
+        for source in [
+            Owned::f64(
+                &[2, 3],
+                &[
+                    f64::from_bits(0x7ff0000000000001),
+                    f64::from_bits(0xfff0000000000001),
+                    f64::from_bits(1),
+                    f64::NAN,
+                    -0.,
+                    f64::MAX,
+                ],
+            ),
+            Owned::f32(
+                &[2, 3],
+                &[
+                    f32::from_bits(0x7f800001),
+                    f32::from_bits(0xff800001),
+                    f32::from_bits(1),
+                    f32::NAN,
+                    -0.,
+                    f32::MAX,
+                ],
+            ),
+        ] {
+            let view = source.view();
+            let dense = to_dense_f32_widen("reference conversion", &view).unwrap();
+            let expected = reference_transpose(&dense, 2, 3);
+            let got = prepack.transposed_b(&view, 2, 3).unwrap().unwrap();
+            assert_eq!(
+                got.as_slice()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn provider_decode_uses_only_final_transpose_before_and_after_source_reclamation() {
+        if retention_control_in_child(
+            "kernels::matmul::tests::provider_decode_uses_only_final_transpose_before_and_after_source_reclamation",
+            Some("accelerate"),
+        ) {
+            return;
+        }
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::{Attribute, NodeId};
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        for prefill in [false, true] {
+            for op in ["MatMul", "FusedMatMulBias", "FusedGemm", "Gemm"] {
+                let gemm = op == "Gemm";
+                let fused = op.starts_with("Fused");
+                let books = RecordingGovernor::new(if prefill { 48 } else { 24 });
+                let resources = CpuMemoryResources::new(
+                    books.weight_memory(HolderId::new(13)),
+                    Default::default(),
+                )
+                .unwrap();
+                let provider = crate::CpuExecutionProvider::with_resources(resources);
+                let mut node = Node::new(NodeId(0), op, vec![], vec![]);
+                if fused {
+                    node.domain = "com.microsoft".into();
+                }
+                if gemm {
+                    node.attributes.insert("transB".into(), Attribute::Int(1));
+                }
+                let shape = if gemm { vec![2, 3] } else { vec![3, 2] };
+                let b = Owned::f64(&shape, &[0.5; 6]);
+                let bias = Owned::f32(&[2], &[0.125; 2]);
+                let make = |rows| {
+                    let mut kernel = provider
+                        .get_kernel(&node, &[vec![rows, 3], shape.clone()], 17)
+                        .unwrap();
+                    kernel.set_constant_inputs(&[false, true]);
+                    kernel
+                };
+                let mut kernel = make(1);
+                if prefill {
+                    let first = make(3);
+                    let a = Owned::f32(&[3, 3], &[0.25; 9]);
+                    let mut out = Owned::zeros_f32(&[3, 2]);
+                    let inputs = if fused {
+                        vec![a.view(), b.view(), bias.view()]
+                    } else {
+                        vec![a.view(), b.view()]
+                    };
+                    first.execute(&inputs, &mut [out.view_mut()]).unwrap();
+                    assert_eq!(out.to_f32(), vec![if fused { 0.5 } else { 0.375 }; 6]);
+                    assert!(
+                        kernel
+                            .adopt_shareable_constant_state(
+                                first.shareable_constant_state().unwrap()
+                            )
+                            .unwrap()
+                    );
+                    drop(first);
+                }
+                let a = Owned::f32(&[1, 3], &[0.25; 3]);
+                let mut out = Owned::zeros_f32(&[1, 2]);
+                let inputs = if fused {
+                    vec![a.view(), b.view(), bias.view()]
+                } else {
+                    vec![a.view(), b.view()]
+                };
+                let mut run = || {
+                    kernel.execute(&inputs, &mut [out.view_mut()]).unwrap();
+                    assert_eq!(out.to_f32(), vec![if fused { 0.5 } else { 0.375 }; 2]);
+                };
+                let cold = books.claims();
+                run();
+                assert_eq!(
+                    books.claims(),
+                    cold + usize::from(!prefill || !gemm),
+                    "{op}: preparation must acquire only the final B representation"
+                );
+                assert_eq!(
+                    books.used(Tier::Host),
+                    if prefill && !gemm { 48 } else { 24 }
+                );
+                let warm = (books.claims(), books.releases());
+                for _ in 0..4096 {
+                    run();
+                }
+                assert_eq!(
+                    (books.claims(), books.releases()),
+                    warm,
+                    "{op}: warm decode must not prepare a source copy"
+                );
+                if prefill {
+                    let kv = books
+                        .reserve(Tier::Host, 24, MemoryRole::KvCache, HolderId::new(7))
+                        .unwrap();
+                    assert_eq!(books.used(Tier::Host), 48);
+                    let after_reclaim = (books.claims(), books.releases());
+                    for _ in 0..32 {
+                        run();
+                    }
+                    assert_eq!(
+                        (books.claims(), books.releases()),
+                        after_reclaim,
+                        "{op}: reclaiming the unused source must not force reconstruction"
+                    );
+                    drop(kv);
+                }
+                drop(kernel);
+                drop(provider);
+                assert_eq!(books.used(Tier::Host), 0);
+            }
+        }
+        // Optional preparation cannot take memory required by constant A.
+        for op in ["MatMul", "FusedMatMulBias", "FusedGemm"] {
+            let fused = op.starts_with("Fused");
+            let books = RecordingGovernor::new(24);
+            let resources =
+                CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                    .unwrap();
+            let provider = crate::CpuExecutionProvider::with_resources(resources);
+            let mut node = Node::new(NodeId(0), op, vec![], vec![]);
+            if fused {
+                node.domain = "com.microsoft".into();
+            }
+            let mut kernel = provider
+                .get_kernel(&node, &[vec![1, 3], vec![3, 2]], 17)
+                .unwrap();
+            kernel.set_constant_inputs(&[true, true]);
+            let a = Owned::f64(&[1, 3], &[0.25; 3]);
+            let b = Owned::f32(&[3, 2], &[0.5; 6]);
+            let bias = Owned::f32(&[2], &[0.125; 2]);
+            let mut out = Owned::zeros_f32(&[1, 2]);
+            let inputs = if fused {
+                vec![a.view(), b.view(), bias.view()]
+            } else {
+                vec![a.view(), b.view()]
+            };
+            kernel.execute(&inputs, &mut [out.view_mut()]).unwrap();
+            assert_eq!(out.to_f32(), vec![if fused { 0.5 } else { 0.375 }; 2]);
+            assert_eq!(
+                books.used(Tier::Host),
+                12,
+                "mandatory A fits while optional B must decline"
+            );
+            drop(kernel);
+            drop(provider);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
+    #[test]
+    fn f32_transpose_is_funded_reclaimable_and_warm_without_accounting() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let books = RecordingGovernor::new(24);
+        let resources =
+            CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                .unwrap();
+        let mut prepack = MatMulPrepack::new(resources);
+        prepack.set_constant_inputs(&[false, true]);
+        let source = Owned::f32(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
+        let view = source.view();
+        let reader = prepack.transposed_b(&view, 3, 2).unwrap().unwrap();
+        assert_eq!(reader.as_slice(), [1., 3., 5., 2., 4., 6.]);
+        assert_eq!(books.used(Tier::Host), 24);
+        let before = (books.claims(), books.releases());
+        for _ in 0..4096 {
+            let warm = prepack.transposed_b(&view, 3, 2).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&reader, &warm));
+        }
+        assert_eq!((books.claims(), books.releases()), before);
+        assert!(
+            books
+                .reserve(Tier::Host, 24, MemoryRole::KvCache, HolderId::new(7))
+                .is_err()
+        );
+        drop(reader);
+        let kv = books
+            .reserve(Tier::Host, 24, MemoryRole::KvCache, HolderId::new(7))
+            .unwrap();
+        assert_eq!(prepack.f32_transpose_stats(), (0, 0));
+        let builds = prepack.weights.transposed_b.activity().1;
+        assert!(prepack.transposed_b(&view, 3, 2).unwrap().is_none());
+        assert_eq!(prepack.weights.transposed_b.activity().1, builds);
+        drop(kv);
+        let reader = prepack.transposed_b(&view, 3, 2).unwrap().unwrap();
+        assert_eq!(prepack.weights.transposed_b.activity().1, builds + 1);
+        drop(prepack);
+        assert_eq!(books.used(Tier::Host), 24);
+        drop(reader);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn f32_transpose_keys_original_layout_without_materializing_a_copy() {
+        let source = Owned::f64(&[24], &(1..=24).map(|n| n as f64).collect::<Vec<_>>());
+        let shape = [3, 2];
+        let first_strides = [4, 1];
+        let next_strides = [1, 3];
+        let mut first = source.view();
+        first.shape = &shape;
+        first.strides = &first_strides;
+        let mut next = first;
+        next.strides = &next_strides;
+        let prepack = constant_b_prepack();
+
+        let first_t = prepack.transposed_b(&first, 3, 2).unwrap().unwrap();
+
+        let next_t = prepack.transposed_b(&next, 3, 2).unwrap().unwrap();
+        assert_eq!(first_t.as_slice(), [1., 5., 9., 2., 6., 10.]);
+        assert_eq!(next_t.as_slice(), [1., 2., 3., 4., 5., 6.]);
+        assert!(!Arc::ptr_eq(&first_t, &next_t));
+        let warm = prepack.transposed_b(&first, 3, 2).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first_t, &warm));
+        let reversed_strides = [-4, -1];
+        let mut reversed = first;
+        reversed.strides = &reversed_strides;
+        reversed.byte_offset = 9 * 8;
+        let reversed_t = prepack.transposed_b(&reversed, 3, 2).unwrap().unwrap();
+        assert_eq!(reversed_t.as_slice(), [10., 6., 2., 9., 5., 1.]);
+        assert!(!prepack.dense_is_filled(1));
+    }
+
+    #[test]
+    fn f32_transpose_does_not_cross_node_lifetimes_at_reused_original_addresses() {
+        let mut data = vec![1., 2., 3., 4., 5., 6.];
+        let address = data.as_ptr();
+        let first = constant_b_prepack();
+        let old = cached_f32(&first, &data, 3, 2).unwrap();
+        drop(first);
+        data.fill(9.);
+        assert_eq!(data.as_ptr(), address);
+        let next = constant_b_prepack();
+        let current = cached_f32(&next, &data, 3, 2).unwrap();
+        assert_eq!(old.as_slice(), [1., 3., 5., 2., 4., 6.]);
+        assert_eq!(current.as_slice(), [9.; 6]);
+        assert!(!Arc::ptr_eq(&old, &current));
+    }
+
+    #[test]
+    fn f32_transpose_concurrent_fills_share_one_granted_payload_per_geometry() {
+        for distinct in [false, true] {
+            let prepack = constant_b_prepack();
+            let source: Vec<f32> = (0..96).map(|v| v as f32).collect();
+            let barrier = std::sync::Barrier::new(8);
+            let readers = std::thread::scope(|scope| {
+                let jobs: Vec<_> = (0..8)
+                    .map(|i| {
+                        let prepack = &prepack;
+                        let source = &source;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            let (k, n) = if distinct { (i + 1, 3) } else { (3, 2) };
+                            barrier.wait();
+                            let reader = cached_f32(prepack, &source[..k * n], k, n).unwrap();
+                            assert_eq!(
+                                reader.as_slice(),
+                                reference_transpose(&source[..k * n], k, n)
+                            );
+                            reader
+                        })
+                    })
+                    .collect();
+                jobs.into_iter()
+                    .map(|job| job.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let expected = if distinct { 8 } else { 1 };
+            assert_eq!(prepack.weights.transposed_b.activity().1, expected);
+            assert_eq!(prepack.f32_transpose_stats().0, expected);
+            assert_eq!(
+                prepack.weights.f32_transpose_hint.lock().unwrap().is_some(),
+                !distinct
+            );
+            if distinct {
+                let hits = prepack.weights.transposed_b.activity().0;
+                for i in 0..8 {
+                    cached_f32(&prepack, &source[..(i + 1) * 3], i + 1, 3).unwrap();
+                }
+                assert_eq!(
+                    prepack.weights.transposed_b.activity().0,
+                    hits + 8,
+                    "multi-layout hits must update canonical recency"
+                );
+            }
+            if !distinct {
+                for other in &readers {
+                    assert!(Arc::ptr_eq(&readers[0], other));
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn provider_f32_transposes_are_funded_and_warm_without_accounting() {
+        if retention_control_in_child(
+            "kernels::matmul::tests::provider_f32_transposes_are_funded_and_warm_without_accounting",
+            Some("accelerate"),
+        ) {
+            return;
+        }
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::{Attribute, NodeId};
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        for (op, vector) in [
+            ("MatMul", false),
+            ("FusedMatMulBias", false),
+            ("Gemm", false),
+            ("FusedGemm", false),
+            ("MatMul", true),
+            ("FusedMatMulBias", true),
+            ("FusedGemm", true),
+        ] {
+            let n = if vector { 1 } else { 7 };
+            let bytes = (5 * n * 4) as u64;
+            let gemm = op == "Gemm";
+            let fused = op.starts_with("Fused");
+            let books = RecordingGovernor::new(bytes);
+            let resources =
+                CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                    .unwrap();
+            let provider = crate::CpuExecutionProvider::with_resources(resources);
+            let mut node = Node::new(NodeId(0), op, vec![], vec![]);
+            if fused {
+                node.domain = "com.microsoft".into();
+            }
+            if gemm {
+                node.attributes.insert("transB".into(), Attribute::Int(1));
+            }
+            let shape = if vector {
+                vec![5]
+            } else if gemm {
+                vec![n, 5]
+            } else {
+                vec![5, n]
+            };
+            let mut graph = Graph::new();
+            let a_id = graph.create_named_value(
+                "A",
+                DataType::Float32,
+                onnx_runtime_ir::static_shape([1, 5]),
+            );
+            let b_id = graph.create_named_value(
+                "B",
+                DataType::Float32,
+                onnx_runtime_ir::static_shape(shape.iter().copied()),
+            );
+            graph.initializers.insert(
+                b_id,
+                onnx_runtime_ir::WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                    DataType::Float32,
+                    shape.clone(),
+                    vec![0; bytes as usize],
+                )),
+            );
+            let mut forecast_node = node.clone();
+            forecast_node.inputs = vec![Some(a_id), Some(b_id)];
+            graph.insert_node(forecast_node);
+            assert_eq!(
+                weight_transpose_cache_predicted_bytes(&graph),
+                bytes,
+                "{op}: declared transpose footprint must cover the executed f32 route"
+            );
+            let mut kernel = provider
+                .get_kernel(&node, &[vec![1, 5], shape.clone()], 17)
+                .unwrap();
+            kernel.set_constant_inputs(&[false, true]);
+            let a = Owned::f32(&[1, 5], &[0.25; 5]);
+            let b = Owned::f32(&shape, &vec![0.5; 5 * n]);
+            let bias = Owned::f32(&[n], &vec![0.125; n]);
+            let inputs = if fused {
+                vec![a.view(), b.view(), bias.view()]
+            } else {
+                vec![a.view(), b.view()]
+            };
+            let mut out = Owned::zeros_f32(&if vector { vec![1] } else { vec![1, n] });
+            let mut run = || {
+                let result = kernel.execute(&inputs, &mut [out.view_mut()]);
+                if result.is_ok() {
+                    assert_eq!(
+                        out.to_f32(),
+                        vec![if fused { 0.75 } else { 0.625 }; n],
+                        "{op}"
+                    );
+                }
+                result
+            };
+            run().unwrap();
+            assert_eq!(
+                books.used(Tier::Host),
+                bytes,
+                "{op}: transpose must have an actual grant"
+            );
+            let before = (books.claims(), books.releases());
+            for _ in 0..4096 {
+                run().unwrap();
+            }
+            assert_eq!((books.claims(), books.releases()), before, "{op}");
+            let kv = books
+                .reserve(Tier::Host, bytes, MemoryRole::KvCache, HolderId::new(7))
+                .unwrap();
+            if gemm {
+                let error = run().unwrap_err().to_string();
+                assert!(error.contains("required B transpose admission"), "{error}");
+            } else {
+                run().unwrap();
+            }
+            assert_eq!(books.used(Tier::Host), bytes);
+            drop(kv);
+            run().unwrap();
+            assert_eq!(books.used(Tier::Host), bytes);
+            drop(kernel);
+            drop(provider);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
+    #[test]
+    fn half_transpose_grants_follow_shared_node_readers_and_host_pressure() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            let books = RecordingGovernor::new(12);
+            let resources =
+                CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                    .unwrap();
+            let mut first = MatMulPrepack::new(resources.clone());
+            first.set_constant_inputs(&[false, true]);
+            let source = Owned::f16_bits(&[2, 3], &[1, 2, 3, 4, 5, 6]);
+            let mut view = source.view();
+            if format == HalfFormat::Bf16 {
+                view.dtype = DataType::BFloat16;
+            }
+            let reader = first
+                .transposed_b_half(&view, 2, 3, format)
+                .unwrap()
+                .unwrap();
+            assert_eq!(reader.as_slice(), [1, 4, 2, 5, 3, 6]);
+            assert_eq!(books.used(Tier::Host), 12);
+            let calls = (books.claims(), books.releases());
+            let mut peer = MatMulPrepack::new(resources);
+            peer.set_constant_inputs(&[false, true]);
+            assert!(
+                peer.adopt_shareable_constant_state(first.shareable_constant_state().unwrap())
+                    .unwrap()
+            );
+            drop(first);
+            for _ in 0..4096 {
+                let warm = peer
+                    .transposed_b_half(&view, 2, 3, format)
+                    .unwrap()
+                    .unwrap();
+                assert!(Arc::ptr_eq(&reader, &warm));
+            }
+            assert_eq!(
+                (books.claims(), books.releases()),
+                calls,
+                "warm half readers must not request or return quota"
+            );
+            assert!(
+                books
+                    .reserve(Tier::Host, 12, MemoryRole::KvCache, HolderId::new(7))
+                    .is_err(),
+                "active readers protect their payload grant"
+            );
+            drop(reader);
+            let kv = books
+                .reserve(Tier::Host, 12, MemoryRole::KvCache, HolderId::new(7))
+                .unwrap();
+            assert_eq!(
+                peer.weights.half_transposes.stats(),
+                (0, 0),
+                "any Host claimant may reclaim an idle half transpose"
+            );
+            let builds = peer.weights.half_transposes.activity().1;
+            assert!(
+                peer.transposed_b_half(&view, 2, 3, format)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                peer.weights.half_transposes.activity().1,
+                builds,
+                "admission refusal runs no transpose builder"
+            );
+            drop(kv);
+            let reader = peer
+                .transposed_b_half(&view, 2, 3, format)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                peer.weights.half_transposes.activity().1,
+                builds + 1,
+                "a prior refusal must not poison later admission"
+            );
+            drop(peer);
+            drop(source);
+            assert_eq!(reader.as_slice(), [1, 4, 2, 5, 3, 6]);
+            assert_eq!(
+                books.used(Tier::Host),
+                12,
+                "the last executing reader independently owns its grant"
+            );
+            drop(reader);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
+    #[test]
+    fn half_transpose_eligibility_and_validation_precede_any_admission() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_governor::HolderId;
+        let books = RecordingGovernor::new(24);
+        let resources =
+            CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                .unwrap();
+        let source = Owned::f16(&[2, 3], &[0.5; 6]);
+        let mut prepack = MatMulPrepack::new(resources.clone());
+        let baseline = books.claims();
+        assert!(
+            prepack
+                .transposed_b_half(&source.view(), 2, 3, HalfFormat::F16)
+                .unwrap()
+                .is_none()
+        );
+        prepack.set_constant_inputs(&[false, true]);
+        assert!(
+            prepack
+                .transposed_b_half(&source.view(), 2, 3, HalfFormat::Bf16)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            prepack
+                .transposed_b_half(&source.view(), 3, 3, HalfFormat::F16)
+                .unwrap()
+                .is_none()
+        );
+        let mut foreign = source.view();
+        foreign.device = onnx_runtime_ir::DeviceId::cuda(0);
+        let error = prepack
+            .transposed_b_half(&foreign, 2, 3, HalfFormat::F16)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("half transpose") && error.contains("host-accessible"),
+            "{error}"
+        );
+        let empty = Owned::f16(&[0, 3], &[]);
+        assert!(
+            prepack
+                .transposed_b_half(&empty.view(), 0, 3, HalfFormat::F16)
+                .unwrap()
+                .is_none()
+        );
+        let mut disabled = MatMulPrepack::new(
+            resources.with_cache_retention(crate::CpuCacheRetention::new(false)),
+        );
+        disabled.set_constant_inputs(&[false, true]);
+        assert!(
+            disabled
+                .transposed_b_half(&source.view(), 2, 3, HalfFormat::F16)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(books.claims(), baseline);
+        assert_eq!(prepack.weights.half_transposes.stats(), (0, 0));
+        let first = prepack
+            .transposed_b_half(&source.view(), 2, 3, HalfFormat::F16)
+            .unwrap()
+            .unwrap();
+        let mut bf16 = source.view();
+        bf16.dtype = DataType::BFloat16;
+        let other = prepack
+            .transposed_b_half(&bf16, 2, 3, HalfFormat::Bf16)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "different storage interpretations need distinct identities"
+        );
+        assert_eq!(prepack.weights.half_transposes.stats(), (2, 24));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn provider_half_transpose_is_funded_and_falls_back_after_host_reclamation() {
+        if retention_control_in_child(
+            "kernels::matmul::tests::provider_half_transpose_is_funded_and_falls_back_after_host_reclamation",
+            Some("accelerate"),
+        ) {
+            return;
+        }
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::NodeId;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        for op in ["MatMul", "FusedMatMulBias"] {
+            let books = RecordingGovernor::new(70);
+            let resources =
+                CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                    .unwrap();
+            let provider = crate::CpuExecutionProvider::with_resources(resources);
+            let mut node = Node::new(NodeId(0), op, vec![], vec![]);
+            if op == "FusedMatMulBias" {
+                node.domain = "com.microsoft".into();
+            }
+            let mut kernel = provider
+                .get_kernel(&node, &[vec![1, 5], vec![5, 7]], 17)
+                .unwrap();
+            kernel.set_constant_inputs(&[false, true]);
+            let a = Owned::f16(&[1, 5], &[0.25; 5]);
+            let b = Owned::f16(&[5, 7], &[0.5; 35]);
+            let bias = Owned::f32(&[7], &[0.125; 7]);
+            let inputs = if op == "MatMul" {
+                vec![a.view(), b.view()]
+            } else {
+                vec![a.view(), b.view(), bias.view()]
+            };
+            let mut output = Owned::zeros_f32(&[1, 7]);
+            let mut run = || {
+                kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
+                assert_eq!(
+                    output.to_f32(),
+                    vec![if op == "MatMul" { 0.625 } else { 0.75 }; 7]
+                );
+            };
+            run();
+            assert_eq!(
+                books.used(Tier::Host),
+                70,
+                "{op}: half transpose bytes must carry an actual Host grant"
+            );
+            let baseline = (books.claims(), books.releases());
+            for _ in 0..4096 {
+                run();
+            }
+            assert_eq!((books.claims(), books.releases()), baseline);
+            let kv = books
+                .reserve(Tier::Host, 70, MemoryRole::KvCache, HolderId::new(7))
+                .unwrap();
+            run();
+            assert_eq!(
+                books.used(Tier::Host),
+                70,
+                "declined optional preparation must use existing untransposed arithmetic"
+            );
+            drop(kv);
+            run();
+            assert_eq!(books.used(Tier::Host), 70);
+            drop(kernel);
+            drop(provider);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
+    #[test]
     fn warm_provider_execution_never_calls_weight_accounting() {
         if retention_control_in_child(
             "kernels::matmul::tests::warm_provider_execution_never_calls_weight_accounting",
@@ -4191,66 +5104,13 @@ mod tests {
         ) {
             return;
         }
+        use crate::kernels::testutil::RecordingGovernor;
         use onnx_runtime_ep_api::ExecutionProvider;
         use onnx_runtime_ir::NodeId;
-        use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
-        use onnx_runtime_memory_governor::{
-            HolderId, LeaseAccounting, LeaseLedger, LedgerGovernor, MemoryAuthorityId,
-            MemoryGovernor, MemoryLease,
-        };
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        #[derive(Debug)]
-        struct Books {
-            governor: LedgerGovernor,
-            claims: AtomicUsize,
-            releases: AtomicUsize,
-        }
-        impl LeaseAccounting for Books {
-            fn authority_id(&self) -> Option<MemoryAuthorityId> {
-                Some(self.governor.authority_id(Tier::Host))
-            }
-            fn try_claim(
-                &self,
-                tier: Tier,
-                bytes: u64,
-                role: MemoryRole,
-            ) -> std::result::Result<(), MemoryError> {
-                self.claims.fetch_add(1, Ordering::Relaxed);
-                self.governor.ledger().try_claim(tier, bytes, role)
-            }
-            fn release(&self, tier: Tier, bytes: u64) {
-                self.releases.fetch_add(1, Ordering::Relaxed);
-                LeaseAccounting::release(self.governor.ledger().as_ref(), tier, bytes);
-            }
-        }
-        struct Governor(Arc<Books>);
-        impl MemoryGovernor for Governor {
-            fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
-                self.0.governor.authority_id(tier)
-            }
-            fn reserve(
-                &self,
-                tier: Tier,
-                bytes: u64,
-                role: MemoryRole,
-                holder: HolderId,
-            ) -> std::result::Result<MemoryLease, MemoryError> {
-                self.0.try_claim(tier, bytes, role)?;
-                Ok(MemoryLease::new(tier, bytes, role, holder, self.0.clone()))
-            }
-            fn available(&self, tier: Tier) -> u64 {
-                self.0.governor.available(tier)
-            }
-            fn used(&self, tier: Tier) -> u64 {
-                self.0.governor.used(tier)
-            }
-        }
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
         for retained in [true, false] {
-            let books = Arc::new(Books {
-                governor: LedgerGovernor::new(LeaseLedger::new(0, 1024 * 1024, 0)),
-                claims: AtomicUsize::new(0),
-                releases: AtomicUsize::new(0),
-            });
+            let books = RecordingGovernor::new(1024 * 1024);
             // Research MLAS can also retain a native panel. Admit its checked
             // size so repeated optional refusals cannot pollute a warm-hit test.
             #[cfg(feature = "mlas")]
@@ -4262,9 +5122,7 @@ mod tests {
             #[cfg(not(feature = "mlas"))]
             let panel_bytes = 0u64;
             let cold_claims = 1 + usize::from(panel_bytes != 0);
-            let source =
-                crate::DerivedWeightMemory::governed(&Governor(books.clone()), HolderId::new(13))
-                    .unwrap();
+            let source = books.weight_memory(HolderId::new(13));
             let resources = CpuMemoryResources::new(source, Default::default())
                 .unwrap()
                 .with_cache_retention(crate::CpuCacheRetention::new(retained));
@@ -4283,42 +5141,36 @@ mod tests {
                     .unwrap();
                 assert_eq!(output.to_f32(), [0.375; 4]);
             };
-            let setup_claims = books.claims.load(Ordering::Relaxed);
+            let setup_claims = books.claims();
             assert_eq!(
                 setup_claims, 1,
                 "only the zero-byte source anchor is created during setup"
             );
             execute();
-            assert_eq!(
-                books.claims.load(Ordering::Relaxed),
-                setup_claims + cold_claims
-            );
-            assert_eq!(
-                books.releases.load(Ordering::Relaxed),
-                usize::from(!retained)
-            );
+            assert_eq!(books.claims(), setup_claims + cold_claims);
+            assert_eq!(books.releases(), usize::from(!retained));
             let repeats = if retained { 4096 } else { 32 };
             for _ in 0..repeats {
                 execute();
             }
             assert_eq!(
-                books.claims.load(Ordering::Relaxed),
+                books.claims(),
                 setup_claims + if retained { cold_claims } else { repeats + 1 }
             );
             assert_eq!(
-                books.releases.load(Ordering::Relaxed),
+                books.releases(),
                 if retained { 0 } else { repeats + 1 },
                 "warm cached readers never return the owning payload's grant; transient controls must exercise the observer"
             );
             assert_eq!(
-                books.governor.used(Tier::Host),
+                books.used(Tier::Host),
                 if retained { 24 + panel_bytes } else { 0 }
             );
             drop(kernel);
             drop(provider);
-            assert_eq!(books.governor.used(Tier::Host), 0);
+            assert_eq!(books.used(Tier::Host), 0);
             assert_eq!(
-                books.releases.load(Ordering::Relaxed),
+                books.releases(),
                 if retained { cold_claims } else { repeats + 1 }
             );
         }
@@ -4734,16 +5586,10 @@ mod tests {
     }
 
     #[test]
-    fn matmul_global_transpose_retires_only_with_the_last_shared_weight_owner() {
-        if retention_control_in_child(
-            "kernels::matmul::tests::matmul_global_transpose_retires_only_with_the_last_shared_weight_owner",
-            None,
-        ) {
-            return;
-        }
+    fn matmul_funded_transpose_survives_shared_owners_and_executing_readers() {
         use onnx_runtime_memory_api::Tier;
         use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
-        let books = LedgerGovernor::new(LeaseLedger::new(0, 24, 0));
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 48, 0));
         let resources = CpuMemoryResources::new(
             crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
             Default::default(),
@@ -4754,37 +5600,26 @@ mod tests {
         let storage = Owned::f64(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
         let view = storage.view();
         let reader = first.dense(1, &view).unwrap();
-        let source = reader.as_ptr();
-        assert_eq!(
-            first.transposed_b(&reader, 3, 2).unwrap(),
-            [1., 3., 5., 2., 4., 6.]
-        );
-        drop(reader);
+        let transpose = first.transposed_b(&view, 3, 2).unwrap().unwrap();
+        assert_eq!(transpose.as_slice(), [1., 3., 5., 2., 4., 6.]);
+        assert_eq!(books.used(Tier::Host), 48);
         let mut peer = MatMulPrepack::new(resources);
         peer.set_constant_inputs(&[false, true]);
-        assert!(
-            peer.adopt_shareable_constant_state(first.shareable_constant_state().unwrap())
-                .unwrap()
-        );
+        peer.adopt_shareable_constant_state(first.shareable_constant_state().unwrap())
+            .unwrap();
         drop(first);
-        assert!(
-            weight_transpose::f32_cache_contains(source, 3, 2),
-            "first kernel eviction cannot retire a live node's key"
-        );
-        let reader = peer.dense(1, &view).unwrap();
-        assert_eq!(reader.as_ptr(), source);
-        assert_eq!(
-            peer.transposed_b(&reader, 3, 2).unwrap(),
-            [1., 3., 5., 2., 4., 6.]
-        );
+        let again = peer.transposed_b(&view, 3, 2).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&transpose, &again));
+        drop(again);
+        drop(reader);
         drop(peer);
-        assert!(!weight_transpose::f32_cache_contains(source, 3, 2));
         assert_eq!(
             books.used(Tier::Host),
             24,
-            "an executing reader keeps the funded source alive"
+            "only the executing transpose remains"
         );
-        drop(reader);
+        assert_eq!(transpose.as_slice(), [1., 3., 5., 2., 4., 6.]);
+        drop(transpose);
         assert_eq!(books.used(Tier::Host), 0);
     }
 
@@ -5184,10 +6019,10 @@ mod tests {
     }
 
     #[test]
-    fn address_keyed_transpose_keeps_its_funded_source_identity_alive() {
+    fn original_view_transpose_identity_does_not_pin_a_conversion() {
         use onnx_runtime_memory_api::{MemoryRole, Tier};
         use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
-        let books = LedgerGovernor::new(LeaseLedger::new(0, 24, 0));
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 48, 0));
         let resources = CpuMemoryResources::new(
             crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
             Default::default(),
@@ -5199,32 +6034,26 @@ mod tests {
         let view = weight.view();
         let reader = prepack.dense(1, &view).unwrap();
         let source = match &reader.0 {
-            DenseOperandStorage::Funded(source) => Arc::downgrade(source),
-            _ => panic!("expected funded copy"),
+            DenseOperandStorage::Funded(owner) => Arc::downgrade(owner),
+            _ => panic!("funded"),
         };
-        assert_eq!(
-            prepack.transposed_b(&reader, 3, 2).unwrap(),
-            [1., 3., 5., 2., 4., 6.]
-        );
+        let transpose = prepack.transposed_b(&view, 3, 2).unwrap().unwrap();
         drop(reader);
+        let kv = books
+            .reserve(Tier::Host, 24, MemoryRole::KvCache, HolderId::new(7))
+            .unwrap();
         assert!(
-            books
-                .reserve(Tier::Host, 1, MemoryRole::KvCache, HolderId::new(7))
-                .is_err(),
-            "an address-keyed derived cache must not outlive its identity buffer"
+            source.upgrade().is_none(),
+            "original-view identity must not pin the conversion"
         );
-        assert!(source.upgrade().is_some());
-        assert!(
-            prepack
-                .weights
-                .transposed_b
-                .get()
-                .unwrap()
-                ._source
-                .is_some()
-        );
+        assert_eq!(transpose.as_slice(), [1., 3., 5., 2., 4., 6.]);
+        let warm = prepack.transposed_b(&view, 3, 2).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&warm, &transpose));
+        drop(warm);
+        drop(kv);
         drop(prepack);
-        assert!(source.upgrade().is_none());
+        assert_eq!(books.used(Tier::Host), 24);
+        drop(transpose);
         assert_eq!(books.used(Tier::Host), 0);
     }
 
@@ -5633,7 +6462,7 @@ mod tests {
             assert_eq!(state.is_some(), admitted);
             if let Some(state) = state {
                 let prepack = state.downcast_ref::<SharedMatMulWeights>().unwrap();
-                assert!(prepack.weights.transposed_b_f16.get().is_some());
+                assert!(prepack.weights.half_transposes.test_first().is_some());
                 let weights = prepack.weights.clone();
                 let mut runtime = MatMulKernel {
                     prepack: MatMulPrepack::new(resources),
@@ -5781,6 +6610,27 @@ mod tests {
         out
     }
 
+    // Fixtures construct a real logical input; production callers carry the
+    // original view even when its dense conversion later retires.
+    fn cached_f32(
+        prepack: &MatMulPrepack,
+        b: &[f32],
+        k: usize,
+        n: usize,
+    ) -> Option<Arc<GrantedWeight>> {
+        let matches = k.checked_mul(n) == Some(b.len());
+        let shape = if matches { vec![k, n] } else { vec![b.len()] };
+        let strides = if matches { vec![n as i64, 1] } else { vec![1] };
+        let view = TensorView::new(
+            onnx_runtime_ep_api::DevicePtr(b.as_ptr().cast()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        prepack.transposed_b(&view, k, n).unwrap()
+    }
+
     fn constant_b_prepack() -> MatMulPrepack {
         let mut prepack = MatMulPrepack::default();
         prepack.set_constant_inputs(&[false, true]);
@@ -5809,37 +6659,37 @@ mod tests {
         for &((k1, n1), (k2, n2)) in &[
             ((4usize, 6usize), (96usize, 64usize)), // grow: stale entry too short
             ((96, 64), (4, 6)),                     // shrink: stale entry too long
+            ((4, 6), (6, 4)),                       // same extent, different geometry
         ] {
             let first = constant_b_prepack();
-            let bt1 = first
-                .transposed_b(&storage[..k1 * n1], k1, n1)
+            let bt1 = cached_f32(&first, &storage[..k1 * n1], k1, n1)
                 .expect("constant B of matching length must be transposed");
-            assert_eq!(bt1.len(), n1 * k1);
-            assert_eq!(bt1, reference_transpose(&storage[..k1 * n1], k1, n1));
+            assert_eq!(bt1.as_slice().len(), n1 * k1);
+            assert_eq!(
+                bt1.as_slice(),
+                reference_transpose(&storage[..k1 * n1], k1, n1)
+            );
 
             let second = constant_b_prepack();
-            let bt2 = second
-                .transposed_b(&storage[..k2 * n2], k2, n2)
+            let bt2 = cached_f32(&second, &storage[..k2 * n2], k2, n2)
                 .expect("a second kernel at the same address must still be served");
             assert_eq!(
-                bt2.len(),
+                bt2.as_slice().len(),
                 n2 * k2,
                 "[{k1},{n1}] then [{k2},{n2}] at one address: served a {}-element \
                  transpose where {} are indexed — release builds read past the end",
-                bt2.len(),
+                bt2.as_slice().len(),
                 n2 * k2
             );
             assert_eq!(
-                bt2,
+                bt2.as_slice(),
                 reference_transpose(&storage[..k2 * n2], k2, n2),
                 "[{k1},{n1}] then [{k2},{n2}] at one address: served another tensor's data"
             );
         }
     }
 
-    /// Two kernels that legitimately share one weight (same address, same
-    /// shape) still share one allocation — the global cache must not be
-    /// defeated by the wider key.
+    /// Shape kernels that explicitly adopt one node owner share one allocation.
     #[test]
     fn transposed_b_is_shared_across_kernels_for_the_same_weight() {
         let mut storage = vec![0.0f32; 8 * 12];
@@ -5847,12 +6697,15 @@ mod tests {
             *v = i as f32 * 0.25;
         }
         let first = constant_b_prepack();
-        let second = constant_b_prepack();
-        let a = first.transposed_b(&storage, 8, 12).expect("first");
-        let b = second.transposed_b(&storage, 8, 12).expect("second");
+        let mut second = constant_b_prepack();
+        second
+            .adopt_shareable_constant_state(first.shareable_constant_state().unwrap())
+            .unwrap();
+        let a = cached_f32(&first, &storage, 8, 12).expect("first");
+        let b = cached_f32(&second, &storage, 8, 12).expect("second");
         assert_eq!(
-            a.as_ptr(),
-            b.as_ptr(),
+            a.as_slice().as_ptr(),
+            b.as_slice().as_ptr(),
             "a second kernel on the same weight must reuse the cached transpose, \
              not recompute it"
         );
@@ -5864,20 +6717,20 @@ mod tests {
     fn transposed_b_rejects_geometry_that_does_not_match_the_operand() {
         let prepack = constant_b_prepack();
         let b = vec![1.0f32; 12];
-        assert!(prepack.transposed_b(&b, 3, 5).is_none(), "too long");
-        assert!(prepack.transposed_b(&b, 2, 5).is_none(), "too short");
+        assert!(cached_f32(&prepack, &b, 3, 5).is_none(), "too long");
+        assert!(cached_f32(&prepack, &b, 2, 5).is_none(), "too short");
         assert!(
-            prepack.transposed_b(&b, usize::MAX, 3).is_none(),
+            cached_f32(&prepack, &b, usize::MAX, 3).is_none(),
             "k * n overflow must fail closed"
         );
         assert!(
-            prepack.transposed_b(&b, 3, 4).is_some(),
+            cached_f32(&prepack, &b, 3, 4).is_some(),
             "matching geometry"
         );
 
         // Non-constant B is never transposed.
         let activation = MatMulPrepack::default();
-        assert!(activation.transposed_b(&b, 3, 4).is_none());
+        assert!(cached_f32(&activation, &b, 3, 4).is_none());
     }
 
     /// A prepack whose memo was filled for one geometry never serves it for
@@ -5889,46 +6742,37 @@ mod tests {
             *v = i as f32;
         }
         let prepack = constant_b_prepack();
-        let first = prepack.transposed_b(&storage[..12], 3, 4).expect("first");
-        assert_eq!(first.len(), 12);
+        let first = cached_f32(&prepack, &storage[..12], 3, 4).expect("first");
+        assert_eq!(first.as_slice().len(), 12);
 
         // Same prepack, same base address, different shape: the memo must not
         // be served. Falling back to `None` (the untransposed kernel) is
         // correct; serving a wrong-length slice is not.
-        match prepack.transposed_b(&storage, 4, 6) {
+        match cached_f32(&prepack, &storage, 4, 6) {
             None => {}
             Some(bt) => {
-                assert_eq!(bt.len(), 24, "memo served a wrong-length transpose");
-                assert_eq!(bt, reference_transpose(&storage, 4, 6));
+                assert_eq!(
+                    bt.as_slice().len(),
+                    24,
+                    "memo served a wrong-length transpose"
+                );
+                assert_eq!(bt.as_slice(), reference_transpose(&storage, 4, 6));
             }
         }
 
         // The original geometry keeps hitting the memo.
-        let again = prepack.transposed_b(&storage[..12], 3, 4).expect("again");
-        assert_eq!(again.as_ptr(), first.as_ptr());
+        let again = cached_f32(&prepack, &storage[..12], 3, 4).expect("again");
+        assert_eq!(again.as_slice().as_ptr(), first.as_slice().as_ptr());
     }
 
     /// Zero-element weights are handled without panicking and without growing
     /// the cache.
     #[test]
     fn transposed_b_handles_zero_sized_weights() {
-        let empty: Vec<f32> = Vec::new();
-        for (k, n) in [(0usize, 0usize), (0, 8), (8, 0)] {
-            let prepack = constant_b_prepack();
-            let bt = prepack
-                .transposed_b(&empty, k, n)
-                .unwrap_or_else(|| panic!("zero-size [{k}, {n}] must be served"));
-            assert!(bt.is_empty());
-        }
-        // One prepack reached with several zero geometries keeps its first memo
-        // and declines the rest — never a non-empty or wrong-shaped slice.
         let prepack = constant_b_prepack();
-        assert_eq!(prepack.transposed_b(&empty, 0, 0), Some(&[][..]));
-        for (k, n) in [(0usize, 8usize), (8, 0)] {
-            match prepack.transposed_b(&empty, k, n) {
-                None => {}
-                Some(bt) => assert!(bt.is_empty()),
-            }
+        for (k, n) in [(0, 0), (0, 8), (8, 0)] {
+            assert!(cached_f32(&prepack, &[], k, n).is_none());
+            assert_eq!(prepack.f32_transpose_stats(), (0, 0));
         }
     }
 
@@ -5936,23 +6780,31 @@ mod tests {
     /// does not match the view — which would otherwise build a slice longer
     /// than the weight and read out of bounds.
     #[test]
-    fn transposed_b_f16_validates_the_view_geometry() {
+    fn transposed_b_half_validates_the_view_geometry() {
         let bits: Vec<u16> = (0..24u16).map(|i| 0x3C00 + i).collect();
         let owned = Owned::f16_bits(&[4, 6], &bits);
         let prepack = constant_b_prepack();
 
         assert!(
-            prepack.transposed_b_f16(&owned.view(), 4, 7).is_none(),
+            prepack
+                .transposed_b_half(&owned.view(), 4, 7, HalfFormat::F16)
+                .unwrap()
+                .is_none(),
             "k * n larger than the view must fail closed"
         );
         assert!(
-            prepack.transposed_b_f16(&owned.view(), 2, 6).is_none(),
+            prepack
+                .transposed_b_half(&owned.view(), 2, 6, HalfFormat::F16)
+                .unwrap()
+                .is_none(),
             "k * n smaller than the view must fail closed"
         );
 
-        let bt = prepack
-            .transposed_b_f16(&owned.view(), 4, 6)
+        let bt_owner = prepack
+            .transposed_b_half(&owned.view(), 4, 6, HalfFormat::F16)
+            .unwrap()
             .expect("matching geometry");
+        let bt = bt_owner.as_slice();
         assert_eq!(bt.len(), 24);
         for j in 0..6 {
             for i in 0..4 {
@@ -5962,9 +6814,12 @@ mod tests {
 
         // Same buffer address, different shape: never a wrong-length slice.
         let reshaped = owned.with_view(&[3, 8], &[8, 1]);
-        match prepack.transposed_b_f16(&reshaped.view(), 3, 8) {
+        match prepack
+            .transposed_b_half(&reshaped.view(), 3, 8, HalfFormat::F16)
+            .unwrap()
+        {
             None => {}
-            Some(other) => assert_eq!(other.len(), 24),
+            Some(other) => assert_eq!(other.as_slice().len(), 24),
         }
     }
 
@@ -5977,15 +6832,16 @@ mod tests {
         let owned = Owned::f16_bits(&[2, 3], &bits);
         let prepack = constant_b_prepack();
 
-        let f32_bt = prepack.transposed_b(&f32_data, 2, 3).expect("f32");
-        assert_eq!(f32_bt, reference_transpose(&f32_data, 2, 3));
+        let f32_bt = cached_f32(&prepack, &f32_data, 2, 3).expect("f32");
+        assert_eq!(f32_bt.as_slice(), reference_transpose(&f32_data, 2, 3));
 
         let f16_prepack = constant_b_prepack();
         let f16_bt = f16_prepack
-            .transposed_b_f16(&owned.view(), 2, 3)
+            .transposed_b_half(&owned.view(), 2, 3, HalfFormat::F16)
+            .unwrap()
             .expect("f16");
         assert_eq!(
-            f16_bt,
+            f16_bt.as_slice(),
             [bits[0], bits[3], bits[1], bits[4], bits[2], bits[5]]
         );
     }
@@ -7646,10 +8502,17 @@ mod tests {
             .unwrap();
         assert_eq!(out1.to_f32(), vec![2., 6.]);
         // On macOS with M=1 and f16 weights, the f16 GEMV path reads weights
-        // directly as f16 (via transposed_b_f16) and never widens to f32 —
+        // directly as f16 (via transposed_b_half) and never widens to f32 —
         // so dense[1] is NOT populated. On other platforms, dense[1] IS populated.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        assert!(kernel.prepack.weights.transposed_b_f16.get().is_some());
+        assert!(
+            kernel
+                .prepack
+                .weights
+                .half_transposes
+                .test_first()
+                .is_some()
+        );
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         assert!(kernel.prepack.dense_is_filled(1));
         assert!(!kernel.prepack.dense_is_filled(0));
@@ -7661,10 +8524,10 @@ mod tests {
         let ptr_before = kernel
             .prepack
             .weights
-            .transposed_b_f16
-            .get()
+            .half_transposes
+            .test_first()
             .unwrap()
-            .2
+            .as_slice()
             .as_ptr();
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let ptr_before = kernel.prepack.dense_payload(1).unwrap().as_slice().as_ptr();
@@ -7682,13 +8545,13 @@ mod tests {
             kernel
                 .prepack
                 .weights
-                .transposed_b_f16
-                .get()
+                .half_transposes
+                .test_first()
                 .unwrap()
-                .2
+                .as_slice()
                 .as_ptr(),
             ptr_before,
-            "transposed_b_f16 cache was reallocated on the second execute"
+            "half transpose cache was reallocated on the second execute"
         );
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         assert_eq!(
@@ -8293,18 +9156,18 @@ mod tests {
             // replaces an older "must not transpose at all" -- the concern it
             // encoded (a silent, weight-scaled resident buffer) is preserved,
             // and now checked against the number the plan budgets.
-            if let Some((_, _, bt)) = kernel.prepack.weights.transposed_b_f16.get() {
+            if let Some(bt) = kernel.prepack.weights.half_transposes.test_first() {
                 assert_eq!(
-                    bt.len(),
+                    bt.as_slice().len(),
                     k * n,
                     "{format:?} a retained transpose must be exactly the weight"
                 );
                 let (node, graph) = half_matmul_node(format, k, n);
                 let predicted = node_weight_transpose_cache_bytes(&node, &graph);
                 assert!(
-                    predicted >= (bt.len() * 2) as u64,
+                    predicted >= (bt.as_slice().len() * 2) as u64,
                     "{format:?} retained {} bytes but the plan predicted {predicted}",
-                    bt.len() * 2
+                    bt.as_slice().len() * 2
                 );
             }
 
@@ -8375,17 +9238,8 @@ mod tests {
     /// A weight freed at one address must not lend its transpose to the next
     /// weight that lands there (#1726).
     ///
-    /// The global f16 transpose cache is keyed on `(address, k, n, tag)` and
-    /// nothing checks that the buffer still holds what was transposed, so a
-    /// recycled allocation of the same shape and dtype is served the *previous*
-    /// weight's rows. The route counter still reads 1, because the right route
-    /// did run -- it just read another weight's bytes. That is #1726's exact
-    /// signature: right route, values that are not a function of the inputs.
-    ///
-    /// Reusing one owning buffer makes the address collision deterministic on
-    /// every allocator and platform. The first kernel must evict the transpose
-    /// it installed when it drops; after the bytes are replaced in place, a
-    /// second kernel at the same address must transpose the new weight.
+    /// Original addresses can be reused after a node's lifetime. Fresh node
+    /// ownership must read the new values, including under the same geometry.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn a_recycled_weight_address_must_not_serve_the_previous_weights_transpose() {
@@ -8440,47 +9294,23 @@ mod tests {
         }
     }
 
-    /// A prewarmed transpose must survive the drop of a kernel that merely
-    /// *used* it (#1726 follow-up).
-    ///
-    /// The eviction that closes #1726 belongs to the call that installed the
-    /// entry, not to everyone who reaches it. This test manually installs
-    /// shared prewarm state under the key a consuming kernel later computes.
-    /// Kernel-owned constant preparation instead keeps its own memo and evicts
-    /// its installation when the owner drops. If a transient consumer evicted on drop, the first
-    /// kernel-cache shape eviction would throw away the prewarm -- the TTFT
-    /// spike it exists to prevent -- and would undercount
-    /// `weight_transpose_cache_bytes` while a sibling `Arc` still holds the
-    /// bytes resident.
+    /// A transient shape consumer cannot retire preparation retained by its
+    /// node owner or invalidate an independently executing reader.
     #[test]
     fn a_prewarmed_transpose_outlives_a_kernel_that_only_shared_it() {
-        let (k, n) = (48usize, 64usize);
-        let b_data: Vec<f32> = (0..k * n).map(|i| (i % 13) as f32 - 6.0).collect();
-        let ptr = b_data.as_ptr();
-        // Start from a known state: a since-freed weight of these dims may have
-        // left a stale entry at this recycled address.
-        weight_transpose::f32_cache_evict(ptr, k, n);
-
-        weight_transpose::cached_transpose_f32(&b_data, k, n).expect("prewarm installs");
-        assert!(
-            weight_transpose::f32_cache_contains(ptr, k, n),
-            "precondition: the prewarm must be resident before the consumer runs"
-        );
-
-        {
-            let mut prepack = MatMulPrepack::default();
-            prepack.set_constant_inputs(&[false, true]);
-            assert!(
-                prepack.transposed_b(&b_data, k, n).is_some(),
-                "the consumer must reach the prewarmed entry"
-            );
-        }
-
-        assert!(
-            weight_transpose::f32_cache_contains(ptr, k, n),
-            "a kernel that only shared the prewarmed transpose evicted it on drop"
-        );
-        weight_transpose::f32_cache_evict(ptr, k, n);
+        let owner = constant_b_prepack();
+        let mut peer = constant_b_prepack();
+        peer.adopt_shareable_constant_state(owner.shareable_constant_state().unwrap())
+            .unwrap();
+        let data: Vec<f32> = (0..48 * 64).map(|i| (i % 13) as f32 - 6.).collect();
+        let first = cached_f32(&owner, &data, 48, 64).unwrap();
+        let other = cached_f32(&peer, &data, 48, 64).unwrap();
+        assert!(Arc::ptr_eq(&first, &other));
+        drop(other);
+        drop(peer);
+        let warm = cached_f32(&owner, &data, 48, 64).unwrap();
+        assert!(Arc::ptr_eq(&first, &warm));
+        assert_eq!(owner.f32_transpose_stats(), (1, data.len() * 4));
     }
 
     #[test]
@@ -8537,7 +9367,12 @@ mod tests {
             .unwrap();
 
         assert!(
-            kernel.prepack.weights.transposed_b_f16.get().is_none(),
+            kernel
+                .prepack
+                .weights
+                .half_transposes
+                .test_first()
+                .is_none(),
             "an activation B must never be memoised as a weight transpose"
         );
         assert!(
@@ -8666,12 +9501,7 @@ mod tests {
                 !kernel.prepack.dense_is_filled(1),
                 "the GEMV must not widen B to f32"
             );
-            let retained = kernel
-                .prepack
-                .weights
-                .transposed_b_f16
-                .get()
-                .map_or(0, |(_, _, bt)| bt.len() * 2) as u64;
+            let retained = kernel.prepack.weights.half_transposes.stats().1 as u64;
             let (node, graph) = half_matmul_node(HalfFormat::F16, k, n);
             let predicted = node_weight_transpose_cache_bytes(&node, &graph);
             assert!(
@@ -10732,8 +11562,8 @@ mod weight_cache_accounting {
     use super::*;
     use onnx_runtime_ir::{NodeId, TensorData, WeightRef, static_shape};
 
-    /// Whether an operator can retain weight-scaled bytes in a process-global
-    /// cache, and hence whether it owes
+    /// Whether an operator can retain weight-scaled transpose bytes, and
+    /// hence whether it owes
     /// [`node_weight_transpose_cache_bytes`] a prediction.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum WeightCacheClass {
@@ -10741,7 +11571,7 @@ mod weight_cache_accounting {
         /// reconciliation test below builds a graph for it and asserts
         /// `predicted == actual`.
         CachesTransposedWeight,
-        /// Retains no weight-scaled process-global bytes. The `&'static str`
+        /// Retains no weight-scaled transpose bytes. The `&'static str`
         /// is the reason, and exists to make a wrong classification obvious in
         /// review rather than being a bare `false`.
         NoWeightCache(&'static str),
@@ -10760,13 +11590,7 @@ mod weight_cache_accounting {
             // --- the MatMul family: all three share `try_half_decode_gemv` ---
             "MatMul" | "FusedMatMulBias" | "Gemm" => CachesTransposedWeight,
 
-            // Fused MatMul+Bias+Relu. Routes through the shared MatMul GEMM,
-            // but its own kernel has no 16-bit decode GEMV arm, so it never
-            // reaches `cached_transpose_*`. If one is ever added, this arm must
-            // move up one line and the predictor must gain it -- the test
-            // below fails loudly in exactly that case, because the
-            // classification and the predictor are cross-checked.
-            "FusedGemm" => NoWeightCache("no 16-bit decode GEMV arm; f32 dense path only"),
+            "FusedGemm" => CachesTransposedWeight,
 
             // Registered only under the `mlas` feature. NCHWc convolution
             // reorders weights into its own blocked layout inside the MLAS
@@ -10825,7 +11649,7 @@ mod weight_cache_accounting {
             // the claim, and the test asserts the claim by executing the
             // predictor against them.
             other => NoWeightCache(match other {
-                _ if is_known_non_caching_op(other) => "no weight-scaled process-global cache",
+                _ if is_known_non_caching_op(other) => "no weight-scaled transpose cache",
                 _ => return None,
             }),
         })
@@ -11043,7 +11867,7 @@ mod weight_cache_accounting {
              \n\
              Add each to `weight_cache_accounting_classification` in \
              `crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs`. If the kernel can \
-             route a *constant* weight through `weight_transpose::cached_transpose_*` \
+             route a *constant* weight through `MatMulPrepack::transposed_b*` \
              (directly or via `try_half_decode_gemv`), classify it \
              `CachesTransposedWeight` AND give it an arm in \
              `node_weight_transpose_cache_bytes`, or the memory plan will \
@@ -11052,27 +11876,29 @@ mod weight_cache_accounting {
         );
     }
 
-    /// Minimal single-node graph with a constant 16-bit `[k, n]` `B`, for the
-    /// ops whose second input is a weight.
-    fn half_weight_graph(op_type: &str, domain: &str, k: usize, n: usize) -> Graph {
+    /// A single-node fixture for a supported transpose route: f32 for the
+    /// dense-only fusion, f16 for the shared half-decode family.
+    fn transpose_weight_graph(op_type: &str, domain: &str, k: usize, n: usize) -> Graph {
         let mut graph = Graph::new();
-        let a = graph.create_named_value("A", DataType::Float16, static_shape([1, k]));
-        let b = graph.create_named_value("B", DataType::Float16, static_shape([k, n]));
-        let y = graph.create_named_value("Y", DataType::Float16, static_shape([1, n]));
+        let dtype = if op_type == "FusedGemm" {
+            DataType::Float32
+        } else {
+            DataType::Float16
+        };
+        let width = if dtype == DataType::Float32 { 4 } else { 2 };
+        let a = graph.create_named_value("A", dtype, static_shape([1, k]));
+        let b = graph.create_named_value("B", dtype, static_shape([k, n]));
+        let y = graph.create_named_value("Y", dtype, static_shape([1, n]));
         graph.add_input(a);
         graph.add_input(b);
         let mut inputs = vec![Some(a), Some(b)];
-        if op_type == "FusedMatMulBias" {
-            let bias = graph.create_named_value("C", DataType::Float16, static_shape([n]));
+        if matches!(op_type, "FusedMatMulBias" | "FusedGemm") {
+            let bias = graph.create_named_value("C", dtype, static_shape([n]));
             graph.add_input(bias);
             inputs.push(Some(bias));
             graph.set_initializer(
                 bias,
-                WeightRef::Inline(TensorData::from_raw(
-                    DataType::Float16,
-                    vec![n],
-                    vec![0u8; n * 2],
-                )),
+                WeightRef::Inline(TensorData::from_raw(dtype, vec![n], vec![0u8; n * width])),
             );
         }
         let mut node = Node::new(NodeId(0), op_type, inputs, vec![y]);
@@ -11082,27 +11908,18 @@ mod weight_cache_accounting {
         graph.set_initializer(
             b,
             WeightRef::Inline(TensorData::from_raw(
-                DataType::Float16,
+                dtype,
                 vec![k, n],
-                vec![0u8; k * n * 2],
+                vec![0u8; k * n * width],
             )),
         );
         graph
     }
 
-    /// **The reconciliation property.** For every op classified as caching, a
-    /// real execution's retained bytes must equal the prediction — the #1056
-    /// ratio-1.00 criterion, now enforced per *route* rather than per
-    /// hand-written test.
-    ///
-    /// Runs on every target. The 16-bit decode GEMV is `cfg`-gated to x86, so
-    /// the *correct* prediction on aarch64 is 0 -- which is a property worth
-    /// asserting rather than a reason to compile the test out. Gating it to
-    /// x86 would also leave `half_weight_graph` dead on the aarch64 lane,
-    /// which builds tests with `-D warnings`; a guard that breaks the
-    /// cross-compile it is meant to protect is not a guard.
+    /// Every registered transpose route has its declared-width forecast.
+    /// Public provider and Gemm controls separately reconcile actual Host grants.
     #[test]
-    fn predicted_transpose_bytes_equal_actual_for_every_caching_op() {
+    fn transpose_forecast_covers_every_registered_preparation_route() {
         // Reads only the pure `node_weight_transpose_cache_bytes` predictor, so
         // unlike `gemm.rs`'s reconciliation it touches no process-global cache
         // and needs no global admission overrides (#1056).
@@ -11121,7 +11938,7 @@ mod weight_cache_accounting {
             // `Gemm` reaches the cache through its own `transB` arm, which
             // `gemm.rs` reconciles at f32 width; this graph builder feeds the
             // 16-bit `transB = 0` route the MatMul family shares.
-            let graph = half_weight_graph(&key.op_type, &key.domain, k, n);
+            let graph = transpose_weight_graph(&key.op_type, &key.domain, k, n);
             let node = graph.nodes.values().next().expect("single-node graph");
             let predicted = node_weight_transpose_cache_bytes(node, &graph);
             // A binary predicts exactly what its own kernels allocate. The
@@ -11131,8 +11948,14 @@ mod weight_cache_accounting {
             let x86 = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
             let apple_matmul =
                 cfg!(any(target_os = "macos", target_os = "ios")) && key.op_type != "Gemm";
-            let expected = if x86 || apple_matmul {
-                (k as u64) * (n as u64) * 2
+            let expected = if key.op_type == "FusedGemm" {
+                if cfg!(any(target_os = "macos", target_os = "ios")) {
+                    (k * n * 4) as u64
+                } else {
+                    0
+                }
+            } else if x86 || apple_matmul {
+                (k * n * 2) as u64
             } else {
                 0
             };
@@ -11147,8 +11970,8 @@ mod weight_cache_accounting {
             checked += 1;
         }
         assert!(
-            checked >= 3,
-            "expected at least MatMul, FusedMatMulBias and Gemm to be reconciled, \
+            checked >= 4,
+            "expected MatMul, FusedMatMulBias, FusedGemm and Gemm to be reconciled, \
              got {checked} -- did the classification silently narrow?"
         );
     }
@@ -11184,7 +12007,7 @@ mod weight_cache_accounting {
             // predictor gated on `is_default_domain()` returns 0 here for any
             // contrib-domain op while still looking correct in a test that
             // hardcodes `domain = ""`.
-            let graph = half_weight_graph(&key.op_type, &key.domain, k, n);
+            let graph = transpose_weight_graph(&key.op_type, &key.domain, k, n);
             let node = graph.nodes.values().next().expect("single-node graph");
 
             // `Gemm` is excluded from the dense predictor by design (it has its
@@ -11206,7 +12029,7 @@ mod weight_cache_accounting {
             let x86 = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
             let apple_matmul =
                 cfg!(any(target_os = "macos", target_os = "ios")) && key.op_type != "Gemm";
-            if x86 || apple_matmul {
+            if (x86 && key.op_type != "FusedGemm") || apple_matmul {
                 assert_ne!(
                     node_weight_transpose_cache_bytes(node, &graph),
                     0,
@@ -11220,8 +12043,8 @@ mod weight_cache_accounting {
             checked += 1;
         }
         assert!(
-            checked >= 3,
-            "expected MatMul, FusedMatMulBias and Gemm; got {checked}"
+            checked >= 4,
+            "expected MatMul, FusedMatMulBias, FusedGemm and Gemm; got {checked}"
         );
     }
 
@@ -11232,7 +12055,7 @@ mod weight_cache_accounting {
     fn fused_matmul_bias_is_budgeted_exactly_like_matmul() {
         let (k, n) = (83usize, 41usize);
         let bytes = |op: &str, domain: &str| {
-            let graph = half_weight_graph(op, domain, k, n);
+            let graph = transpose_weight_graph(op, domain, k, n);
             let node = graph.nodes.values().next().unwrap();
             node_weight_transpose_cache_bytes(node, &graph)
         };
