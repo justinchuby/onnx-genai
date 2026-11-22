@@ -1372,7 +1372,10 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("QLinearMatMul", "", 10),
-        Box::new(qlinear_matmul::QLinearMatMulFactory::new(retain_caches)),
+        Box::new(qlinear_matmul::QLinearMatMulFactory::new(
+            retain_caches,
+            derived_weights.clone(),
+        )),
     );
     // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
     // Elementwise unary math (f32). Additive, default-domain-only registrations.

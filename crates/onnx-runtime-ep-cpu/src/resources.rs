@@ -31,7 +31,8 @@ impl Default for CpuWeightCacheLimits {
 }
 
 /// Immutable CPU weight resources. Full f32 block-format/NBits expansions,
-/// owned native/optional-MLAS NBits preparations and retained or transient QMoE experts
+/// owned native/optional-MLAS NBits preparations, optional QLinearMatMul packs,
+/// and retained or transient QMoE experts
 /// use one Host grant source. Private fields
 /// prevent a shared expert cache from being paired with a different authority.
 /// Cache ceilings and the legacy planned-family verdict only admit retention;
