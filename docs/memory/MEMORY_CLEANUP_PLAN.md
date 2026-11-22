@@ -794,3 +794,20 @@ reuse inside the explicit node owner. MLAS scratch/workspace is not covered by
 this payload accounting, and serialized bytes still require capacity for a
 reference pack rather than taking a wire fallback. No CUDA execution or new
 performance claim is involved.
+
+
+### Ordinary MatMul derived copies honor retention decline
+
+The shared MatMul preparation layer previously retained MLAS f32 panels,
+once-widened f16 panels and native contiguous-half copies even with retention
+disabled. Both pack entries now require an admitted constant B. Strided f16
+copying returns an explicit borrowed-or-call-owned `Cow`, so a declined caller
+can compute through the existing rescue path and release its temporary copy
+without populating the kernel cache. Existing admitted reuse and borrowed
+column-major execution remain available.
+
+The three old-behavior regressions demonstrate the bypass independently. New
+bounded real-kernel controls check both verdicts and unchanged expected results,
+while avoiding shared test-counter interference. This is retention enforcement,
+not physical Host funding for ordinary SGEMM/transpose/dense/half caches; their
+authority integration and shared-node/idle-pressure lifecycles remain work.

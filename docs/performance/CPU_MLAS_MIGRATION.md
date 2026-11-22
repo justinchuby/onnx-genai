@@ -1126,3 +1126,48 @@ a one-pack budget, the parent selected one test and passed again, with explicit
 markers proving all four layouts ran on this host; final CPU MLAS all-target
 Clippy also passed again. Formatting and dispatch/reachability/platform/feature
 coverage checks pass. No other ISA's execution or CUDA behavior is established.
+
+
+### MatMul preparation obeys the captured retention verdict
+
+Ordinary SGEMM packing is retained derived-weight state. The shared
+`MatMulPrepack` f32 and once-widened-f16 MLAS packing entries now require both
+constant B and an admitting retention verdict. Previously these two entries
+looked only at constant-input status, so a provider configured to retain nothing
+could still keep a packed panel. Declined calls take the existing unpacked/half
+computation paths; admitted calls keep their existing packed reuse. MatMul,
+Gemm and FusedMatMulBias consume these same preparation entries.
+
+Native noncontiguous f16 preparation had the same retention gap. Its private
+API now returns `Cow<[u16]>`: an admitted cache lends its existing copy, while a
+declined call owns a temporary dense-half copy until computation finishes. It
+must not return `None` merely because retention is declined: the existing
+constant-weight rescue branch still needs actual operands to compute. The BNNS
+column-major zero-copy route remains unchanged. This makes the temporary
+lifetime explicit without changing the arithmetic primitives.
+
+Three regressions fail on their corresponding old behavior: retained f32 pack,
+retained widened-f16 pack, and retained strided-f16 copy despite decline. Final
+controls exercise both verdicts, repeated calls, changed activations and admitted
+reuse. The strided control also executes the Apple rescue path and checks that
+decline produces the expected result without filling either persistent half or
+dense-f32 storage. Their short dyadic corpus is exactly representable; its exact
+comparisons do not establish broad packed/unpacked bit identity or model token
+parity. Named bounded child processes keep these new real-kernel calls from
+perturbing existing libtest-wide platform dispatch observations.
+
+This closes a retention-policy bypass. It does not yet fund the ordinary
+SGEMM packed panels, half copies or existing MatMul transpose/dense caches with
+the physical Host authority, make them node-shared/pressure-reclaimable, or
+establish a performance improvement. Those ownership/admission steps remain
+separate from the already governed native/NBits/QLinearMatMul/expert caches.
+
+Validation on Apple M1 Max / ARM64 macOS with Rust 1.98 and cached ORT:
+native CPU 1,970 passed / 20 ignored and session 274 passed; optional-MLAS CPU
+2,001 passed / 35 ignored and session 276 passed. Both crates/configurations
+pass strict all-target Clippy. After isolating all new execution controls from
+shared platform probe counters, the final `honors_retention` filter selected
+three tests and all passed again; final MLAS CPU all-target Clippy also passed.
+Formatting and dispatch manifest/reachability/platform/feature checks pass.
+These results establish the tested retention behavior, not physical allocation
+limits, production speed, full-model numerics or another ISA's execution.
