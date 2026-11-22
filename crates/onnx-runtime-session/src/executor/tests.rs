@@ -13890,3 +13890,112 @@ fn execution_trims_absent_trailing_outputs_without_changing_the_source() {
     assert_eq!(graph.node(NodeId(0)).outputs, vec![Some(output)]);
     assert_eq!(source.node(NodeId(0)).outputs, vec![Some(output), None]);
 }
+
+#[cfg(feature = "mlas")]
+#[test]
+fn qlinear_shape_variants_share_one_host_pack_within_the_session_node() {
+    use onnx_runtime_memory_api::Tier;
+    use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 21);
+    let rows = graph.create_symbol(None);
+    let a = graph.create_named_value(
+        "a",
+        DataType::Uint8,
+        vec![Dim::Symbolic(rows), Dim::Static(64)],
+    );
+    let y = graph.create_named_value(
+        "y",
+        DataType::Uint8,
+        vec![Dim::Symbolic(rows), Dim::Static(96)],
+    );
+    let mut init = |name: &str, dtype, dims: Vec<usize>, bytes| {
+        let value = graph.create_named_value(name, dtype, static_shape(dims.iter().copied()));
+        graph.initializers.insert(
+            value,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(dtype, dims, bytes)),
+        );
+        value
+    };
+    let a_scale = init("as", DataType::Float32, vec![], 1f32.to_le_bytes().to_vec());
+    let a_zero = init("az", DataType::Uint8, vec![], vec![128]);
+    let b = init("b", DataType::Uint8, vec![64, 96], vec![129; 64 * 96]);
+    let b_scale = init("bs", DataType::Float32, vec![], 1f32.to_le_bytes().to_vec());
+    let b_zero = init("bz", DataType::Uint8, vec![], vec![128]);
+    let y_scale = init(
+        "ys",
+        DataType::Float32,
+        vec![],
+        64f32.to_le_bytes().to_vec(),
+    );
+    let y_zero = init("yz", DataType::Uint8, vec![], vec![128]);
+    graph.add_input(a);
+    graph.add_output(y);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "QLinearMatMul",
+        vec![a, a_scale, a_zero, b, b_scale, b_zero, y_scale, y_zero]
+            .into_iter()
+            .map(Some)
+            .collect(),
+        vec![y],
+    ));
+    let governor = LedgerGovernor::new(LeaseLedger::new(0, 1 << 20, 0));
+    let memory =
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+    let resources =
+        onnx_runtime_ep_cpu::CpuMemoryResources::new(memory, Default::default()).unwrap();
+    let cpu: Arc<dyn ExecutionProvider> =
+        Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+    let predicted = onnx_runtime_ep_cpu::qlinear_packed_b_predicted_bytes(&graph);
+    let mut executor = Executor::build(
+        graph.clone(),
+        Arc::new(WeightStore::new()),
+        cpu.clone(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(governor.used(Tier::Host), 0);
+    let mut packed_bytes = 0;
+    for rows in [3, 1, 5, 1] {
+        let input =
+            Tensor::from_raw(DataType::Uint8, vec![rows, 64], &vec![129; rows * 64]).unwrap();
+        let output = executor.run(&[("a", &input)]).unwrap();
+        assert_eq!(output[0].as_bytes(), &vec![129; rows * 96]);
+        if packed_bytes == 0 {
+            packed_bytes = governor.used(Tier::Host);
+        }
+        assert!(
+            packed_bytes > 0,
+            "the actual execution must have built a pack"
+        );
+        assert!(
+            predicted >= packed_bytes,
+            "the node prediction must cover its actual packed layout"
+        );
+        assert_eq!(
+            governor.used(Tier::Host),
+            packed_bytes,
+            "new activation shapes must share one constant B allocation"
+        );
+    }
+    assert!(
+        executor.cache.stats().entries >= 2,
+        "the test must create distinct shape-specialized kernels"
+    );
+    let mut peer = Executor::build(graph, Arc::new(WeightStore::new()), cpu, None).unwrap();
+    let input = Tensor::from_raw(DataType::Uint8, vec![1, 64], &[129; 64]).unwrap();
+    assert_eq!(
+        peer.run(&[("a", &input)]).unwrap()[0].as_bytes(),
+        &[129; 96]
+    );
+    assert_eq!(
+        governor.used(Tier::Host),
+        2 * packed_bytes,
+        "a separate session must own its own node state"
+    );
+    drop(executor);
+    assert_eq!(governor.used(Tier::Host), packed_bytes);
+    drop(peer);
+    assert_eq!(governor.used(Tier::Host), 0);
+}
