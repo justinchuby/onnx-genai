@@ -287,6 +287,28 @@ Ordered by *decode-path impact × distance from parity*, which is also
    #1104 absorbed int4 acc0 decode (1.36× / 1.56×); prefill is the remainder,
    and `MoE` follows it.
 
+Native byte-GEMM column-zero-point compensation consumes each A row sum where
+it is used, rather than allocating an m-element sum buffer for every batch.
+An all-zero B zero-point vector skips that compensation entirely. The raw dot
+kernel, ISA selection, threading and each K-reduction order remain unchanged;
+all arithmetic is still wrapping i32. Seeded-accumulator tests cover zero,
+sparse/extreme and mixed column offsets against the integer oracle.
+`qgemm_compensation_allocation` observes actual serial ARM64 QLinearMatMul
+execute calls with per-row A quantization, which cannot select MLAS even in a
+reference build. It checks that allocation count does not grow with batch
+count, using a positive allocator control and every output byte. Caller-owned
+inputs/output and factory setup are excluded, with one unobserved warm call.
+For the ARM64 fixture, the old zero-B-offset implementation requests 25, 26,
+and 41 allocations for 1, 2 and 17 batches in both debug and release. The new
+implementation requests 24 in every cell for B offsets 0 and 1, in debug and
+release with and without the optional reference. The reduction is one allocation
+per native GEMM batch, with no retained replacement buffer.
+These are calling-thread allocation-call counts for complete serial executes,
+including remaining parameter/geometry storage, rather than allocated-byte or
+RSS bounds. The regression removes batch-wise compensation churn. AVX2 retains
+its independent A-pair and B-panel scratch. No latency or end-to-end throughput
+claim follows from removing the sum buffer.
+
 Native SiLU shares the runtime chunk scheduler with host-pool preference and
 nested-pool avoidance. ARM64 retains its exp polynomial and stable scalar
 formula, but records exact exceptional-lane positions in four u32 masks.
