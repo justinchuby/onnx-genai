@@ -245,7 +245,6 @@ impl DerivedWeightMemory {
 
     /// Shared kernel preparation must retain the exact grant source, including
     /// its holder/pressure domain, rather than merely using the same Host books.
-    #[cfg(feature = "mlas")]
     pub(crate) fn shares_source_with(&self, other: &Self) -> bool {
         match (&self.owner, &other.owner) {
             (None, None) => true,

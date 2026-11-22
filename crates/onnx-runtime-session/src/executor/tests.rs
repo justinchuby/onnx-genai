@@ -13999,3 +13999,111 @@ fn qlinear_shape_variants_share_one_host_pack_within_the_session_node() {
     drop(peer);
     assert_eq!(governor.used(Tier::Host), 0);
 }
+
+#[test]
+fn nbits_shape_variants_share_one_native_pack_within_the_session_node() {
+    use onnx_runtime_memory_api::Tier;
+    use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 24);
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let rows = graph.create_symbol(None);
+    let a = graph.create_named_value(
+        "a",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(33)],
+    );
+    let y = graph.create_named_value(
+        "y",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(3)],
+    );
+    let mut init = |name: &str, dtype, dims: Vec<usize>, bytes| {
+        let value = graph.create_named_value(name, dtype, static_shape(dims.iter().copied()));
+        graph.initializers.insert(
+            value,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(dtype, dims, bytes)),
+        );
+        value
+    };
+    let b = init("b", DataType::Uint8, vec![3, 3, 4], vec![0x39; 36]);
+    // Half scales require native preparation; f32 contiguous wire scales borrow.
+    let scales = init(
+        "scales",
+        DataType::Float16,
+        vec![3, 3],
+        [0x3000u16.to_le_bytes(); 9].concat(),
+    );
+    let mut node = Node::new(
+        NodeId(0),
+        "MatMulNBits",
+        vec![Some(a), Some(b), Some(scales)],
+        vec![y],
+    );
+    node.domain = "com.microsoft".into();
+    for (name, value) in [("K", 33), ("N", 3), ("bits", 2), ("block_size", 16)] {
+        node.attributes
+            .insert(name.into(), onnx_runtime_ir::Attribute::Int(value));
+    }
+    graph.add_input(a);
+    graph.add_output(y);
+    graph.insert_node(node);
+    let governor = LedgerGovernor::new(LeaseLedger::new(0, 1 << 20, 0));
+    let memory =
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+    let resources =
+        onnx_runtime_ep_cpu::CpuMemoryResources::new(memory, Default::default()).unwrap();
+    let cpu: Arc<dyn ExecutionProvider> =
+        Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+    let mut executor = Executor::build(
+        graph.clone(),
+        Arc::new(WeightStore::new()),
+        cpu.clone(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(governor.used(Tier::Host), 0);
+    for rows in [3, 1, 5, 1] {
+        let input = Tensor::from_raw(
+            DataType::Float32,
+            vec![rows, 33],
+            &[0.25f32.to_le_bytes(); 165][..rows * 33].concat(),
+        )
+        .unwrap();
+        let output = executor.run(&[("a", &input)]).unwrap();
+        // Repeated 2-bit values 1,2,3,0 with implicit zero 2 sum to -17 over K.
+        assert_eq!(
+            output[0].as_bytes(),
+            &[(-0.53125f32).to_le_bytes(); 15][..rows * 3].concat()
+        );
+        assert_eq!(
+            governor.used(Tier::Host),
+            72,
+            "activation shape variants must share 36 wire bytes and 9 f32 scales"
+        );
+    }
+    assert!(
+        executor.cache.stats().entries >= 3,
+        "the test must construct distinct shape-specialized kernels"
+    );
+    let mut peer = Executor::build(graph, Arc::new(WeightStore::new()), cpu, None).unwrap();
+    let input = Tensor::from_raw(
+        DataType::Float32,
+        vec![1, 33],
+        &[0.25f32.to_le_bytes(); 33].concat(),
+    )
+    .unwrap();
+    assert_eq!(
+        peer.run(&[("a", &input)]).unwrap()[0].as_bytes(),
+        &[(-0.53125f32).to_le_bytes(); 3].concat()
+    );
+    assert_eq!(
+        governor.used(Tier::Host),
+        144,
+        "separate sessions own separate node state"
+    );
+    drop(executor);
+    assert_eq!(governor.used(Tier::Host), 72);
+    drop(peer);
+    assert_eq!(governor.used(Tier::Host), 0);
+}
