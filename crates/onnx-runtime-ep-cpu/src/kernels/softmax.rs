@@ -94,12 +94,8 @@ const MIN_PARALLEL_SOFTMAX_ELEMENTS: usize = 16 * 1024;
 /// use, which finds the row max, evaluates `exp` and normalizes in one pass
 /// over the row.
 ///
-/// The `exp` is only vectorised when the optional `mlas` feature is on, which
-/// it is **not** by default. The shipping build evaluates `f32::exp` one
-/// element at a time, and that is worth about 9x against ORT on a standalone
-/// `Softmax`. Fixing it is tracked separately; this comment previously claimed
-/// an 8-lane polynomial unconditionally, which was only ever true of the MLAS
-/// arm.
+/// Native AVX2+FMA and NEON row kernels evaluate a shared polynomial without
+/// linking MLAS. Other ISAs and short rows retain the scalar implementation.
 ///
 /// Rows are independent, so the outer loop fans out across the shared Rayon
 /// pool once the tensor is large enough to pay for it. ORT parallelizes the
@@ -254,6 +250,18 @@ fn scale_mask_softmax_serial(
 /// `the_parallel_fan_out_is_bit_identical_to_the_serial_path` test asserts that
 /// equality on both the MLAS and the pure-Rust builds.
 pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
+    softmax_rows_with_kernel(src, dst, n, d, softmax_rows_serial_out);
+}
+
+// Production and explicit test-only arithmetic controls share this scheduler.
+// A monomorphized function item keeps the selected row body direct/inlinable.
+fn softmax_rows_with_kernel(
+    src: &[f32],
+    dst: &mut [f32],
+    n: usize,
+    d: usize,
+    serial: impl Fn(&[f32], &mut [f32], usize, usize) + Sync,
+) {
     debug_assert_eq!(src.len(), n * d);
     debug_assert_eq!(dst.len(), n * d);
     if d == 0 || n == 0 {
@@ -266,10 +274,10 @@ pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
         // hands out several chunks per task for balance.
         crate::task_runtime::chunk_runs_mut(dst, block, 1, |first, out| {
             let start = first * block;
-            softmax_rows_serial_out(&src[start..start + out.len()], out, out.len() / d, d);
+            serial(&src[start..start + out.len()], out, out.len() / d, d);
         });
     } else {
-        softmax_rows_serial_out(src, dst, n, d);
+        serial(src, dst, n, d);
     }
 }
 
@@ -369,6 +377,29 @@ fn record_softmax_route(elements: usize) {
     });
 }
 
+// One coefficient set for the native AVX2 and NEON exponentials. These are
+// the existing degree-six fit, with exact constant/linear terms of one.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+#[allow(clippy::excessive_precision)]
+mod exp_coefficients {
+    pub(super) const LN2_HI: f32 = 0.693_359_375_f32;
+    pub(super) const LN2_LO: f32 = -2.121_944_40e-4_f32;
+    pub(super) const C2: f32 = 4.999_999_1e-1_f32;
+    pub(super) const C3: f32 = 1.666_642_0e-1_f32;
+    pub(super) const C4: f32 = 4.166_822_5e-2_f32;
+    pub(super) const C5: f32 = 8.374_816_0e-3_f32;
+    pub(super) const C6: f32 = 1.383_684_6e-3_f32;
+}
+
+// Two complete four-lane vectors amortize the polynomial/mask prologue.
+// Measured 4/7-element rows do not benefit; keep their original scalar body.
+#[cfg(target_arch = "aarch64")]
+const MIN_NEON_SOFTMAX_ROW: usize = 8;
+
+#[cfg(target_arch = "aarch64")]
+#[path = "softmax_neon.rs"]
+mod softmax_neon;
+
 /// Portable implementation with the same semantics: subtract the row max,
 /// `exp`, normalize. **This is the production route** — and the baseline the
 /// MLAS reference is differentially tested against, so it is compiled in every
@@ -378,7 +409,7 @@ fn record_softmax_route(elements: usize) {
 /// and was the entire gap against ORT's vectorised CPU softmax (9-11x on the
 /// attention shapes). Both the in-place and the out-of-place forms now route
 /// every row through the *one* [`softmax_row_core`] routine, which evaluates
-/// `exp` eight lanes at a time on AVX2+FMA (with a scalar fallback). Sharing a
+/// `exp` with AVX2+FMA or NEON (with a scalar fallback). Sharing a
 /// single core is also what keeps the two forms bit-identical - see
 /// `out_of_place_softmax_is_bit_identical_on_pathological_rows`.
 pub fn softmax_rows_serial_native(data: &mut [f32], n: usize, d: usize) {
@@ -418,8 +449,9 @@ pub fn softmax_rows_serial_out_native(src: &[f32], dst: &mut [f32], n: usize, d:
 /// non-finite rows the parity tests pin), because the max/`exp`/normalize
 /// arithmetic is literally the same instructions in both.
 ///
-/// On x86 with AVX2+FMA it evaluates `exp` eight lanes at a time; elsewhere,
-/// and on the sub-8 tail of every row, it uses the scalar libm `exp`.
+/// AVX2+FMA evaluates eight lanes at a time; NEON evaluates four. Other ISAs,
+/// short rows, and incomplete vector tails retain scalar libm `exp`. NEON also
+/// preserves gradual underflow for the ARM64 scalar path's tiny probabilities.
 ///
 /// # Safety
 /// `src` must be valid for `d` f32 reads and `dst` for `d` f32 writes. The two
@@ -440,14 +472,21 @@ unsafe fn softmax_row_core(src: *const f32, dst: *mut f32, d: usize) {
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    if d >= MIN_NEON_SOFTMAX_ROW && std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: runtime detection proves NEON; preserve the identical-or-
+        // disjoint source/destination contract and the complete row bounds.
+        unsafe { softmax_neon::softmax_row(src, dst, d) };
+        return;
+    }
     // SAFETY: same pointer/length contract; the scalar path performs the
     // identical reads and writes without any SIMD.
     unsafe { softmax_row_scalar(src, dst, d) };
 }
 
 /// Scalar reference reducer: one libm `exp` per element. This is the fallback
-/// for non-x86 targets, for x86 without AVX2+FMA, and (in the AVX2 kernel) for
-/// the tail of a row whose length is not a multiple of 8.
+/// for targets without a supported vector ISA and for short rows. Vector row
+/// kernels use the same libm formula for their incomplete final vector.
 ///
 /// # Safety
 /// Same contract as [`softmax_row_core`].
@@ -495,6 +534,7 @@ unsafe fn softmax_row_scalar(src: *const f32, dst: *mut f32, d: usize) {
 /// normalization.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod softmax_avx2 {
+    use super::exp_coefficients as coeff;
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
@@ -525,8 +565,8 @@ mod softmax_avx2 {
         let log2e = _mm256_set1_ps(core::f32::consts::LOG2_E);
         // ln2 split into a high part that is exact in f32 and a low
         // correction (Cody-Waite), so `x - k*ln2` keeps its low bits.
-        let ln2_hi = _mm256_set1_ps(0.693_359_375_f32);
-        let ln2_lo = _mm256_set1_ps(-2.121_944_40e-4_f32);
+        let ln2_hi = _mm256_set1_ps(coeff::LN2_HI);
+        let ln2_lo = _mm256_set1_ps(coeff::LN2_LO);
         let one = _mm256_set1_ps(1.0);
 
         // Degree-6 minimax (Remez) coefficients for `exp(r)` on `|r| <= ln2/2`,
@@ -535,11 +575,11 @@ mod softmax_avx2 {
         // form below: 6 FMAs, no separate `r^2` multiply and no trailing add,
         // which is one fewer FMA-unit op and one fewer FADD than the Cephes
         // `1 + r + r^2·P5(r)` form it replaces, while staying at 1 ULP.
-        let c2 = _mm256_set1_ps(4.999_999_1e-1_f32);
-        let c3 = _mm256_set1_ps(1.666_642_0e-1_f32);
-        let c4 = _mm256_set1_ps(4.166_822_5e-2_f32);
-        let c5 = _mm256_set1_ps(8.374_816_0e-3_f32);
-        let c6 = _mm256_set1_ps(1.383_684_6e-3_f32);
+        let c2 = _mm256_set1_ps(coeff::C2);
+        let c3 = _mm256_set1_ps(coeff::C3);
+        let c4 = _mm256_set1_ps(coeff::C4);
+        let c5 = _mm256_set1_ps(coeff::C5);
+        let c6 = _mm256_set1_ps(coeff::C6);
 
         // Below this, f32 `exp` has underflowed to (sub)normals we flush to
         // 0; `-inf` lands here too and must become exactly 0. Ordered `<=`, so

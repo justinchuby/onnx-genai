@@ -1,0 +1,29 @@
+{
+  "source_commit": "cd4dc683d95fca1a8a3f14123eca1a2550258bbb",
+  "logs": {
+    "native-full-tests": {
+      "artifact": "native-full-tests.log.gz",
+      "sha256": "1b1f2bc96dba2c71175671efa64d7cb0263ac035502b73d870a798ab61e8a9e9"
+    },
+    "mlas-release-full-tests": {
+      "artifact": "mlas-release-full-tests.log.gz",
+      "sha256": "3dfdf41576b98bb01505356e6e10c007799b07e2c4e47aa6b358cf2eb5797ce5"
+    },
+    "native-clippy": {
+      "artifact": "native-clippy.log.gz",
+      "sha256": "1e559fe81e48763b139ee0f06f6a8803d11c6af4303c42725c3418c6b9cdc1b6"
+    },
+    "mlas-clippy": {
+      "artifact": "mlas-clippy.log.gz",
+      "sha256": "4bbd0173aa5fb19b8aa2d7d6a1908ee7c2531bbc31507aa05234c141abf79186"
+    },
+    "mlas-differential-tests": {
+      "artifact": "mlas-differential-tests.log.gz",
+      "sha256": "f5e73c89dcd854da1cc226ddec0f7597659c63f2893f5e8865db8b7821b2342e"
+    },
+    "direct-exp-proof": {
+      "artifact": "direct-exp-proof.log.gz",
+      "sha256": "e3abdb47114dbfc94bdf66e3066082f9fa2fa4adde921c536cf9b897ec27cc24"
+    }
+  }
+}

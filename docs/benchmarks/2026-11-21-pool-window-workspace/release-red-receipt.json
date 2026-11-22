@@ -1,0 +1,29 @@
+{
+  "kind": "old production implementation plus new regression (expected failure)",
+  "baseline": "fb434c1edb6329eeaa9e0d1c87109af4fe5ba959",
+  "command": [
+    "cargo",
+    "test",
+    "-p",
+    "onnx-runtime-ep-cpu",
+    "--release",
+    "--test",
+    "pool_window_allocation",
+    "--",
+    "--exact",
+    "pool_window_allocations_do_not_scale_with_output_or_kernel_elements",
+    "--nocapture"
+  ],
+  "exit": 101,
+  "allocation_counts": [
+    261,
+    1733,
+    16389,
+    146885
+  ],
+  "pooling_source_sha256": "3e3de990285db2ce9c155b236f8b4b2438bdd280335483c05457d05ec4c73cb4",
+  "restored_source_sha256": "55913818d81bba780de33e49fd8dbc895b117ee7fa8daca067fc04d29eea4986",
+  "probe_source_sha256": "7416706635704cc03f78cd93b3bedf66829fa860e70814de954475fe15251f67",
+  "binary": "/tmp/nxrt-erf-nan-target/release/deps/pool_window_allocation-dcb7ae551f1c2663",
+  "binary_sha256": "45dcbfd19b4b766384ddb80ea243ba16bf17b95e7dd3cbe1678ff6444336ec19"
+}
