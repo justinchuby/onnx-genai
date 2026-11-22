@@ -24,7 +24,7 @@ pub struct CpuWeightCacheLimits {
 impl Default for CpuWeightCacheLimits {
     fn default() -> Self {
         Self {
-            dense_bytes: crate::kernels::dense_weight_cache::configured_dense_weight_cache_bytes(),
+            dense_bytes: crate::kernels::weight_cache::configured_dense_weight_cache_bytes(),
             expert_bytes: 0,
         }
     }

@@ -4499,15 +4499,13 @@ mod tests {
 
     #[test]
     fn shared_pressure_expert_and_dense_caches_reclaim_each_others_idle_payloads() {
-        use super::super::dense_weight_cache::{
-            DenseWeightCache, DenseWeightKey, DenseWeightLoad, DenseWeightSpec,
-        };
+        use super::super::weight_cache::{WeightCache, WeightCacheKey, WeightLoad, WeightSpec};
         use onnx_runtime_memory_api::Tier;
         use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         struct Key;
-        impl DenseWeightKey for Key {
-            fn dense_bytes(&self) -> Result<usize> {
+        impl WeightCacheKey for Key {
+            fn weight_bytes(&self) -> Result<usize> {
                 Ok(4)
             }
         }
@@ -4515,7 +4513,7 @@ mod tests {
         let governor = LedgerGovernor::new(LeaseLedger::new(0, 4, 0));
         let source = DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
         let experts = WeightOffloadHostCache::new(64, source.clone()).unwrap();
-        let dense = DenseWeightCache::<Key>::new(source, 4);
+        let dense = WeightCache::<Key>::new(source, 4);
         for _ in 0..4 {
             drop(
                 experts
@@ -4527,12 +4525,12 @@ mod tests {
         // when the shared Host books refuse another weight allocation.
         assert_eq!(experts.inner.cache.lock().unwrap().owned_bytes, 4);
         let loaded = dense
-            .load_group(&[DenseWeightSpec::cached(&Key).unwrap()], |_, row| {
+            .load_group(&[WeightSpec::cached(&Key).unwrap()], |_, row| {
                 row.fill(3.0);
                 Ok(())
             })
             .unwrap();
-        let DenseWeightLoad::Ready(loaded) = loaded else {
+        let WeightLoad::Ready(loaded) = loaded else {
             panic!("idle expert must fund dense payload");
         };
         assert_eq!(experts.inner.cache.lock().unwrap().owned_bytes, 0);
@@ -4560,11 +4558,11 @@ mod tests {
         let before = crate::weight_offload_stats();
         assert!(matches!(
             dense
-                .load_group(&[DenseWeightSpec::transient(4)], |_, _| panic!(
+                .load_group(&[WeightSpec::transient(4)], |_, _| panic!(
                     "active expert cannot be reclaimed"
                 ))
                 .unwrap(),
-            DenseWeightLoad::Declined(_)
+            WeightLoad::Declined(_)
         ));
         assert_eq!(
             crate::weight_offload_stats().host_cache_evictions,

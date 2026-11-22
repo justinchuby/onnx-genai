@@ -32,11 +32,9 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node};
 use rayon::prelude::*;
 
-use super::dense_weight_cache::{
-    DenseWeight, DenseWeightCache, DenseWeightKey, DenseWeightLoad, DenseWeightSpec,
-};
 use super::int4_nibble;
 use super::matmul::gemm;
+use super::weight_cache::{GrantedWeight, WeightCache, WeightCacheKey, WeightLoad, WeightSpec};
 use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_f32};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::resources::{DerivedWeightGrant, IdleWeightCache, WeightAdmission};
@@ -671,8 +669,8 @@ fn hand_int8_decode_has_native_dot() -> bool {
 struct NBitsDenseKey {
     bytes: usize,
 }
-impl DenseWeightKey for NBitsDenseKey {
-    fn dense_bytes(&self) -> Result<usize> {
+impl WeightCacheKey for NBitsDenseKey {
+    fn weight_bytes(&self) -> Result<usize> {
         Ok(self.bytes)
     }
 }
@@ -690,7 +688,7 @@ pub struct MatMulNBitsKernel {
     flops: Option<u64>,
     weight_prepacked: bool,
     constant_inputs: [bool; 5],
-    dense_weights: Arc<DenseWeightCache<NBitsDenseKey>>,
+    dense_weights: Arc<WeightCache<NBitsDenseKey>>,
     weight_memory: DerivedWeightMemory,
     native_packs: Arc<NativePackCaches>,
     /// Node-local reference layouts, shared only through constant-state adoption.
@@ -744,7 +742,7 @@ struct SharedNBitsWeightState {
     caches: Arc<NativePackCaches>,
     #[cfg(feature = "mlas")]
     mlas_caches: Arc<MlasPackedCaches>,
-    dense_weights: Arc<DenseWeightCache<NBitsDenseKey>>,
+    dense_weights: Arc<WeightCache<NBitsDenseKey>>,
     memory: DerivedWeightMemory,
     parameters: NBitsWeightParameters,
 }
@@ -1811,7 +1809,7 @@ impl KernelFactory for MatMulNBitsFactory {
             flops,
             weight_prepacked: weight_prepacked == 1,
             constant_inputs: [false; 5],
-            dense_weights: Arc::new(DenseWeightCache::new(
+            dense_weights: Arc::new(WeightCache::new(
                 self.resources.weight_memory().clone(),
                 if self.resources.cache_retention().is_admitted() {
                     self.resources.weight_cache_limits().dense_bytes
@@ -4130,7 +4128,7 @@ impl MatMulNBitsKernel {
         group_indices: Option<&TensorView>,
         can_prepack: bool,
         layout: WeightLayout,
-    ) -> Result<Option<Arc<DenseWeight>>> {
+    ) -> Result<Option<Arc<GrantedWeight>>> {
         let key = self.dense_key()?;
         let retain = matches!(layout, WeightLayout::Nk) && self.can_retain_dense(can_prepack, &key);
         let placement = if matches!(layout, WeightLayout::Nk) {
@@ -4141,9 +4139,9 @@ impl MatMulNBitsKernel {
         // The resolved placement owns both the peak rule and the actual copy.
         let peak = placement.build_peak(key.bytes)?;
         let spec = if retain {
-            DenseWeightSpec::cached(&key)?
+            WeightSpec::cached(&key)?
         } else {
-            DenseWeightSpec::transient(key.bytes)
+            WeightSpec::transient(key.bytes)
         }
         .with_build_peak(peak);
         match self.dense_weights.load_group_owned(&[spec], |_| {
@@ -4158,8 +4156,8 @@ impl MatMulNBitsKernel {
             )?;
             Ok(placement.place(built, self.n))
         })? {
-            DenseWeightLoad::Ready(mut loaded) => Ok(Some(loaded.weights.remove(0))),
-            DenseWeightLoad::Declined(_) => Ok(None),
+            WeightLoad::Ready(mut loaded) => Ok(Some(loaded.weights.remove(0))),
+            WeightLoad::Declined(_) => Ok(None),
         }
     }
 
@@ -13936,7 +13934,7 @@ mod tests {
                 8 => receiver.constant_inputs[2] = false,
                 9 => receiver.constant_inputs[4] = true,
                 _ => {
-                    receiver.dense_weights = Arc::new(DenseWeightCache::new(
+                    receiver.dense_weights = Arc::new(WeightCache::new(
                         memory.clone(),
                         if receiver.dense_weights.byte_limit() == 0 {
                             1
@@ -14877,7 +14875,7 @@ mod tests {
         }
     }
 
-    fn cached_dense_weight(kernel: &MatMulNBitsKernel) -> Option<Arc<DenseWeight>> {
+    fn cached_dense_weight(kernel: &MatMulNBitsKernel) -> Option<Arc<GrantedWeight>> {
         kernel.dense_weights.test_get(&kernel.dense_key().unwrap())
     }
     fn set_test_dense_retention(kernel: &mut MatMulNBitsKernel, enabled: bool) {
@@ -14885,10 +14883,10 @@ mod tests {
         {
             kernel.retain_mlas_packs = enabled;
         }
-        kernel.dense_weights = Arc::new(DenseWeightCache::new(
+        kernel.dense_weights = Arc::new(WeightCache::new(
             crate::DerivedWeightMemory::default(),
             if enabled {
-                super::super::dense_weight_cache::configured_dense_weight_cache_bytes()
+                super::super::weight_cache::configured_dense_weight_cache_bytes()
             } else {
                 0
             },
@@ -14907,7 +14905,7 @@ mod tests {
             flops: None,
             weight_prepacked: false,
             constant_inputs: [false; 5],
-            dense_weights: Arc::new(DenseWeightCache::default()),
+            dense_weights: Arc::new(WeightCache::default()),
             weight_memory: DerivedWeightMemory::default(),
             native_packs: Arc::new(NativePackCaches::new(&DerivedWeightMemory::default())),
             #[cfg(feature = "mlas")]

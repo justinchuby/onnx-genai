@@ -8,9 +8,7 @@
 //! larger weights use bounded row decoding shared with BlockQuantizedMoE.
 //! Neither path performs integer-domain matmul compute.
 
-use super::dense_weight_cache::{
-    DenseWeightCache, DenseWeightCacheStatus, DenseWeightLoad, DenseWeightSpec,
-};
+use super::weight_cache::{WeightCache, WeightCacheStatus, WeightLoad, WeightSpec};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -199,7 +197,7 @@ pub struct BlockQuantizedMatMulKernel {
     format: BlockFormat,
     packed_b_constant: bool,
     weight_identity: DenseWeightIdentity,
-    weight_cache: DenseWeightCache<DenseWeightCacheKey>,
+    weight_cache: WeightCache<DenseWeightCacheKey>,
 }
 
 pub struct BlockQuantizedMatMulFactory {
@@ -240,7 +238,7 @@ impl KernelFactory for BlockQuantizedMatMulFactory {
             format,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::new(self.memory.clone(), self.cache_bytes),
+            weight_cache: WeightCache::new(self.memory.clone(), self.cache_bytes),
         }))
     }
 }
@@ -326,8 +324,8 @@ impl Kernel for BlockQuantizedMatMulKernel {
             let mut resolved_payload = resolved.and_then(|resolved| resolved.payload);
             match self.weight_cache.load_group(
                 &[match key.as_deref() {
-                    Some(key) => DenseWeightSpec::cached(key)?,
-                    None => DenseWeightSpec::transient(dense_bytes),
+                    Some(key) => WeightSpec::cached(key)?,
+                    None => WeightSpec::transient(dense_bytes),
                 }],
                 |_, output| {
                     BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
@@ -345,13 +343,13 @@ impl Kernel for BlockQuantizedMatMulKernel {
                     )
                 },
             )? {
-                DenseWeightLoad::Ready(mut loaded) => {
-                    if loaded.statuses[0] == DenseWeightCacheStatus::Hit {
+                WeightLoad::Ready(mut loaded) => {
+                    if loaded.statuses[0] == WeightCacheStatus::Hit {
                         BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.fetch_add(1, Ordering::Relaxed);
                     }
                     Some(loaded.weights.remove(0))
                 }
-                DenseWeightLoad::Declined(reason) => {
+                WeightLoad::Declined(reason) => {
                     onnx_runtime_ep_api::record_kernel_variant!(
                         "block_matmul.streamed_rows",
                         "Host derived-weight grant declined: {reason}"
@@ -609,8 +607,8 @@ pub(super) struct DenseWeightCacheKey {
     source: DenseWeightSource,
 }
 
-impl super::dense_weight_cache::DenseWeightKey for DenseWeightCacheKey {
-    fn dense_bytes(&self) -> Result<usize> {
+impl super::weight_cache::WeightCacheKey for DenseWeightCacheKey {
+    fn weight_bytes(&self) -> Result<usize> {
         self.in_features
             .checked_mul(self.out_features)
             .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
@@ -1493,7 +1491,7 @@ pub(super) fn packed_for_format(
 
 #[cfg(test)]
 mod tests {
-    use super::super::dense_weight_cache::{
+    use super::super::weight_cache::{
         DEFAULT_DENSE_WEIGHT_CACHE_BYTES, parse_dense_weight_cache_bytes,
     };
     use super::*;
@@ -1579,7 +1577,7 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         let actual = kernel.dequantize_weight_kn(&view.view()).unwrap();
         let values = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
@@ -1733,7 +1731,7 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         let weight = kernel.dequantize_weight_kn(&packed_weight.view()).unwrap();
 
@@ -1790,7 +1788,7 @@ mod tests {
             format: BlockFormat::Iq4Nl,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let expected: Vec<f32> = IQ4_NL_CODEBOOK
@@ -1830,7 +1828,7 @@ mod tests {
             format: BlockFormat::Iq4Xs,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let mut expected = Vec::with_capacity(IQ_SUPER_QK);
@@ -1858,7 +1856,7 @@ mod tests {
             format: BlockFormat::Iq3S,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let mut expected = vec![0.0; IQ_SUPER_QK];
@@ -1891,7 +1889,7 @@ mod tests {
             format: BlockFormat::Iq3Xxs,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let group = [
@@ -1924,7 +1922,7 @@ mod tests {
             format: BlockFormat::Iq2S,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let group = [
@@ -1958,7 +1956,7 @@ mod tests {
             format: BlockFormat::Iq2Xs,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let group = [
@@ -1990,7 +1988,7 @@ mod tests {
             format: BlockFormat::Iq2Xxs,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let sign_masks = [0u8, 129, 130, 3];
@@ -2032,7 +2030,7 @@ mod tests {
             format: BlockFormat::Iq1S,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let mut expected = vec![-1.75; IQ_SUPER_QK];
@@ -2059,7 +2057,7 @@ mod tests {
             format: BlockFormat::Iq1M,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
         let mut expected = vec![-1.75; IQ_SUPER_QK];
@@ -2368,9 +2366,7 @@ mod tests {
                                 format,
                                 packed_b_constant: constant,
                                 weight_identity: DenseWeightIdentity::default(),
-                                weight_cache: DenseWeightCache::with_limit_and_memory(
-                                    bytes, memory,
-                                ),
+                                weight_cache: WeightCache::with_limit_and_memory(bytes, memory),
                             };
                             let streamed = BlockQuantizedMatMulKernel {
                                 k,
@@ -2378,7 +2374,7 @@ mod tests {
                                 format,
                                 packed_b_constant: constant,
                                 weight_identity: DenseWeightIdentity::default(),
-                                weight_cache: DenseWeightCache::with_limit(0),
+                                weight_cache: WeightCache::with_limit(0),
                             };
                             let mut packed = packed_for_format(format, 1, n, k);
                             let mut padded: Vec<_> =
@@ -2557,7 +2553,7 @@ mod tests {
                 format,
                 packed_b_constant: true,
                 weight_identity: DenseWeightIdentity::default(),
-                weight_cache: DenseWeightCache::with_limit(budget),
+                weight_cache: WeightCache::with_limit(budget),
             };
             let dense = make(bytes);
             for budget in [bytes - 1, 0] {
@@ -2617,7 +2613,7 @@ mod tests {
                 format: BlockFormat::Mxfp4,
                 packed_b_constant: true,
                 weight_identity: DenseWeightIdentity::default(),
-                weight_cache: DenseWeightCache::with_limit(0),
+                weight_cache: WeightCache::with_limit(0),
             };
             let a = floats(&[2, 32], &[1.; 64]);
             let bias = floats(&[2], &[0.5, -0.5]);
@@ -2678,7 +2674,7 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: true,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::with_limit(1024),
+            weight_cache: WeightCache::with_limit(1024),
         };
         let a = Owned::f32(&[0, 32], &[]);
         let b = Owned::u8(
@@ -2736,7 +2732,7 @@ mod tests {
                     format,
                     packed_b_constant: false,
                     weight_identity: DenseWeightIdentity::default(),
-                    weight_cache: DenseWeightCache::default(),
+                    weight_cache: WeightCache::default(),
                 };
                 let mut expected = Owned::zeros(dtype, &[1, n]);
                 uncached
@@ -2752,7 +2748,7 @@ mod tests {
                     format,
                     packed_b_constant: false,
                     weight_identity: DenseWeightIdentity::default(),
-                    weight_cache: DenseWeightCache::default(),
+                    weight_cache: WeightCache::default(),
                 };
                 cached.set_constant_inputs(&[false, true]);
                 let hits_before = BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed);
@@ -2816,7 +2812,7 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: true,
             weight_identity: DenseWeightIdentity::default(),
-            weight_cache: DenseWeightCache::default(),
+            weight_cache: WeightCache::default(),
         };
         kernel.set_constant_inputs(&[false, true]);
 
@@ -2857,8 +2853,8 @@ mod tests {
     }
 
     #[test]
-    fn dense_weight_cache_is_bounded_and_lru_evicts() {
-        let cache = DenseWeightCache::<DenseWeightCacheKey>::with_limit(16);
+    fn weight_cache_is_bounded_and_lru_evicts() {
+        let cache = WeightCache::<DenseWeightCacheKey>::with_limit(16);
         let packed1 = Owned::u8(&[4], &[1, 2, 3, 4]);
         let packed2 = Owned::u8(&[4], &[5, 6, 7, 8]);
         let identity1 = DenseWeightIdentity::default();
@@ -2884,7 +2880,7 @@ mod tests {
         let (_, status) = cache
             .test_get_or_insert_with(key1.as_ref(), || unreachable!("cache hit"))
             .unwrap();
-        assert_eq!(status, DenseWeightCacheStatus::Hit);
+        assert_eq!(status, WeightCacheStatus::Hit);
         let _ = cache
             .test_get_or_insert_with(key2.as_ref(), || Ok(vec![5.0, 6.0, 7.0, 8.0]))
             .unwrap();
@@ -2896,11 +2892,11 @@ mod tests {
         let (_, status) = cache
             .test_get_or_insert_with(key1.as_ref(), || Ok(vec![9.0, 10.0, 11.0, 12.0]))
             .unwrap();
-        assert_eq!(status, DenseWeightCacheStatus::MissStored);
+        assert_eq!(status, WeightCacheStatus::MissStored);
     }
 
     #[test]
-    fn dense_weight_cache_disabled_and_oversize_entries_are_not_retained() {
+    fn weight_cache_disabled_and_oversize_entries_are_not_retained() {
         let packed = Owned::u8(&[4], &[1, 2, 3, 4]);
         let identity = DenseWeightIdentity::default();
         let packed_view = packed.view();
@@ -2912,12 +2908,12 @@ mod tests {
             .key;
 
         for limit in [0, 15] {
-            let cache = DenseWeightCache::<DenseWeightCacheKey>::with_limit(limit);
+            let cache = WeightCache::<DenseWeightCacheKey>::with_limit(limit);
             for expected_builds in 1..=2 {
                 let (_, status) = cache
                     .test_get_or_insert_with(key.as_ref(), || Ok(vec![1.0, 2.0, 3.0, 4.0]))
                     .unwrap();
-                assert_eq!(status, DenseWeightCacheStatus::MissNotStored);
+                assert_eq!(status, WeightCacheStatus::MissNotStored);
                 assert_eq!(cache.stats(), (0, 0));
                 assert_eq!(cache.activity(), (0, expected_builds));
             }
@@ -2994,7 +2990,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_weight_cache_env_parser_handles_disable_whitespace_and_overflow() {
+    fn weight_cache_env_parser_handles_disable_whitespace_and_overflow() {
         assert_eq!(parse_dense_weight_cache_bytes(Some("0")), 0);
         assert_eq!(parse_dense_weight_cache_bytes(Some(" 4096 ")), 4096);
         assert_eq!(
@@ -3012,10 +3008,10 @@ mod tests {
     }
 
     #[test]
-    fn dense_weight_cache_concurrent_miss_builds_once() {
+    fn weight_cache_concurrent_miss_builds_once() {
         use std::sync::Barrier;
 
-        let cache = std::sync::Arc::new(DenseWeightCache::<DenseWeightCacheKey>::with_limit(1024));
+        let cache = std::sync::Arc::new(WeightCache::<DenseWeightCacheKey>::with_limit(1024));
         let packed = Owned::u8(&[4], &[9, 8, 7, 6]);
         let identity = DenseWeightIdentity::default();
         let packed_view = packed.view();
@@ -3087,7 +3083,7 @@ mod tests {
                 format,
                 packed_b_constant: false,
                 weight_identity: DenseWeightIdentity::default(),
-                weight_cache: DenseWeightCache::default(),
+                weight_cache: WeightCache::default(),
             };
 
             let decode_start = Instant::now();
