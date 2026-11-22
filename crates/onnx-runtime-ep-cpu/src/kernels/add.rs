@@ -100,12 +100,18 @@ pub static ADD_VDSP_TEST_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 pub static ADD_SCALAR_TEST_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Dispatch counter for the explicitly linked MLAS reference path.
+#[cfg(all(test, feature = "mlas"))]
+static ADD_MLAS_REF_TEST_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Kernel for AddKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Add", inputs, outputs, 2, 2, 1)?;
         crate::trace::record_kernel_metrics(inputs, outputs, || outputs[0].numel() as u64);
         #[cfg(feature = "mlas")]
         if add_contiguous_f32(inputs, &mut outputs[0])? {
+            #[cfg(test)]
+            ADD_MLAS_REF_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -389,21 +395,25 @@ mod tests {
 
     // ─── Dispatch reachability ───────────────────────────────────────────
 
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(any(feature = "mlas", target_os = "macos", target_os = "ios"))]
     #[test]
-    fn add_contiguous_f32_same_shape_uses_vdsp() {
+    fn add_contiguous_f32_same_shape_uses_selected_backend() {
         use std::sync::atomic::Ordering;
-        let before = super::ADD_VDSP_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(feature = "mlas")]
+        let read_hits = || super::ADD_MLAS_REF_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(not(feature = "mlas"))]
+        let read_hits = || super::ADD_VDSP_TEST_HITS.load(Ordering::Relaxed);
+        let before = read_hits();
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let b = Owned::f32(&[2, 3], &[10., 20., 30., 40., 50., 60.]);
         let mut out = Owned::zeros_f32(&[2, 3]);
         AddKernel
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
-        let after = super::ADD_VDSP_TEST_HITS.load(Ordering::Relaxed);
+        let after = read_hits();
         assert!(
             after > before,
-            "Contiguous f32 same-shape Add did not reach vDSP path"
+            "Contiguous f32 same-shape Add did not reach the selected MLAS/vDSP path"
         );
         assert_eq!(out.to_f32(), vec![11., 22., 33., 44., 55., 66.]);
     }

@@ -8,8 +8,8 @@
 //!   **`SimdX86`** MLAS-style packed SIMD f32 GEMM — the default fast path with
 //!   no extra dependency and no cargo feature required.
 //! * With the `mlas` Cargo feature, `NXRT_CPU_GEMM_BACKEND=mlas` explicitly
-//!   selects the vendored, **multi-threaded** MLAS f32 GEMM on x86-64. MLAS
-//!   does its own cache-aware tile partitioning and dispatches the tiles across
+//!   selects the vendored, **multi-threaded** MLAS f32 GEMM on supported targets.
+//!   MLAS does its own cache-aware tile partitioning and dispatches the tiles across
 //!   the process Rayon pool (see `mlas-sys`), so it honours the same thread
 //!   budget as `SimdX86`/`Generic` without oversubscribing.
 //! * Everything else falls back to the **Generic** pure-Rust blocked GEMM,
@@ -19,10 +19,9 @@
 //! path with `f32` accumulation. It is backend-independent today; bf16 can
 //! additionally select a runtime-gated AVX-512 BF16 microkernel.
 //!
-//! The `Xnnpack` (Android) and `Accelerate` (Apple) variants are present for
-//! design fidelity with §25.2 but are not wired to kernels yet; they degrade to
-//! the Generic path. Nothing above the [`onnx_runtime_ep_api::Kernel`] trait
-//! observes which backend ran — the choice is an internal perf detail.
+//! Apple `Accelerate` uses native NEON GEMV at M=1 and Accelerate SGEMM otherwise.
+//! `Xnnpack` (Android) remains a design placeholder using Generic arithmetic.
+//! Nothing above the [`onnx_runtime_ep_api::Kernel`] trait observes which backend ran — the choice is an internal perf detail.
 
 /// The CPU GEMM backend family, per `docs/architecture/ORT2.md` §25.2.
 ///
@@ -36,14 +35,14 @@ pub enum CpuBackend {
     /// on hosts without AVX2/FMA.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     SimdX86,
-    /// Vendored MLAS f32 SGEMM for x86-64. Available only with the `mlas`
+    /// Vendored MLAS f32 SGEMM. Available only with the `mlas`
     /// Cargo feature. Multi-threaded: MLAS partitions the GEMM and runs the
     /// tiles on the process Rayon pool.
     ///
-    /// This is the **default** on x86-64 whenever the feature is compiled in --
-    /// [`CpuBackend::auto_detect`] returns it without needing
-    /// `NXRT_CPU_GEMM_BACKEND=mlas`, which only forces it. Kernels that gate
-    /// behaviour on `== Mlas` (for example the `f16` prefill widening in
+    /// This is the research **default** on non-Apple/non-Android x86-64 when
+    /// the feature is compiled in. [`CpuBackend::auto_detect`] selects it without
+    /// `NXRT_CPU_GEMM_BACKEND=mlas`, which explicitly selects it on other
+    /// targets too. Kernels that gate behaviour on `== Mlas` (for example the `f16` prefill widening in
     /// `matmul`) are therefore live by default, not dead code.
     #[cfg(feature = "mlas")]
     Mlas,
@@ -51,8 +50,7 @@ pub enum CpuBackend {
     /// [`CpuBackend::Generic`] arithmetic.
     #[cfg(target_os = "android")]
     Xnnpack,
-    /// Apple Accelerate (macOS / iOS). Design placeholder — currently routes to
-    /// [`CpuBackend::Generic`] arithmetic.
+    /// Apple Accelerate (macOS / iOS), with native NEON GEMV at M=1.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     Accelerate,
     /// Pure-Rust blocked, register-tiled, rayon-parallelized GEMM. Always
@@ -65,7 +63,7 @@ impl CpuBackend {
     /// `docs/architecture/ORT2.md` §25.2.
     ///
     /// * Android → `Xnnpack` (placeholder; Generic arithmetic today).
-    /// * macOS / iOS → `Accelerate` (placeholder; Generic arithmetic today).
+    /// * macOS / iOS → `Accelerate` (NEON GEMV / Accelerate SGEMM).
     /// * Otherwise → vendored **`Mlas`** when the `mlas` Cargo feature is
     ///   compiled on x86-64 (multi-threaded, and the fastest measured f32 GEMM
     ///   path — see `docs/BENCH_CPU_F32_GEMM.md`); else the built-in `SimdX86`
@@ -134,7 +132,7 @@ impl CpuBackend {
             return Some(Self::Generic);
         }
         if value.eq_ignore_ascii_case("mlas") {
-            #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
+            #[cfg(feature = "mlas")]
             return Some(Self::Mlas);
         }
         None
@@ -325,7 +323,7 @@ mod tests {
             CpuBackend::from_env_override(Some("SIMD".into())),
             Some(CpuBackend::simd_x86_or_generic(has_simd_x86()))
         );
-        #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
+        #[cfg(feature = "mlas")]
         assert_eq!(
             CpuBackend::from_env_override(Some("mLaS".into())),
             Some(CpuBackend::Mlas)

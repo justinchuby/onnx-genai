@@ -138,8 +138,8 @@ fn default_build_can_reach_no_mlas_route() {
 }
 
 /// Every f32 GEMM backend this build offers must agree with the reference and
-/// with each other. On a default x86-64 build that is Generic, SimdX86 and
-/// MLAS — three independent implementations, one process.
+/// with each other. Native choices include Generic, runtime-supported SimdX86,
+/// and Apple Accelerate. MLAS joins them only with the research feature.
 #[test]
 fn f32_gemm_backends_agree_with_the_reference() {
     let backends = backend_ab::gemm_backends();

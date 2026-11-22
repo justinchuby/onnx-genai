@@ -31,8 +31,8 @@ use crate::dispatch_ledger::{Backend, KernelFamily};
 use crate::kernels::{matmul, sdpa, simd_activations, softmax};
 
 /// Whether this build linked the MLAS reference at all. False in every shipped
-/// build. When false, the `*_mlas` entry points return `None` and the
-/// differential tests degrade to native-vs-reference self-consistency rather
+/// build. When false, the `*_mlas` entry points return `false`, GEMM offers
+/// no reference backend, and differential tests use native self-consistency rather
 /// than silently passing on nothing.
 pub const fn mlas_available() -> bool {
     cfg!(feature = "mlas")
@@ -45,19 +45,17 @@ pub const fn mlas_available() -> bool {
 /// The first entry is always a native route, so a caller can use
 /// `gemm_backends()[0]` as the correctness baseline without a `cfg`.
 pub fn gemm_backends() -> Vec<CpuBackend> {
-    // aarch64 has neither route to add today -- the SIMD GEMM is x86-only and
-    // MLAS's GEMM is reached through the x86-64 backend enum -- so `mut` is
-    // genuinely unused there rather than mistakenly so.
-    #[cfg_attr(
-        not(any(target_arch = "x86", target_arch = "x86_64")),
-        allow(unused_mut)
-    )]
+    #[allow(unused_mut)]
     let mut backends = vec![CpuBackend::Generic];
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if crate::backend::has_simd_x86() {
         backends.push(CpuBackend::SimdX86);
     }
-    #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    backends.push(CpuBackend::Accelerate);
+    // The safe SGEMM entry point is compiled on every MLAS target; an x86
+    // microkernel ID is instrumentation, not the availability of the library.
+    #[cfg(feature = "mlas")]
     backends.push(CpuBackend::Mlas);
     backends
 }
@@ -312,6 +310,11 @@ mod tests {
     fn gemm_backends_lead_with_a_native_baseline() {
         let backends = gemm_backends();
         assert!(!backends.is_empty());
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert!(
+            backends.contains(&CpuBackend::Accelerate),
+            "A/B must include the actual shipped Apple GEMM route"
+        );
         assert_eq!(
             gemm_ledger_backend(backends[0]),
             Backend::Native,
@@ -324,9 +327,9 @@ mod tests {
         let has_mlas_backend = gemm_backends()
             .iter()
             .any(|b| gemm_ledger_backend(*b) == Backend::Mlas);
-        #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
+        #[cfg(feature = "mlas")]
         assert!(has_mlas_backend, "mlas is linked but not offered for A/B");
-        #[cfg(not(all(feature = "mlas", target_arch = "x86_64")))]
+        #[cfg(not(feature = "mlas"))]
         assert!(
             !has_mlas_backend,
             "offered an MLAS backend that is not linked"
