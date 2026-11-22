@@ -23,10 +23,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(feature = "mlas")]
 use std::sync::LazyLock;
-#[cfg(feature = "mlas")]
-use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "mlas")]
+use std::sync::{Mutex, Weak};
 
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, LazyWeightBoundary, Result, TensorMut, TensorView,
@@ -775,18 +775,131 @@ struct MlasShard {
 struct MlasPreparedPacked {
     packed: mlas_sys::SQNBitPackedB,
     workspace: Mutex<mlas_sys::SQNBitGemmWorkspace>,
+    // Packed allocation and metadata drop before their actual Host grant.
+    // Workspace/scratch is a separate ownership scope, not charged here.
+    _grant: DerivedWeightGrant,
 }
 
 #[cfg(feature = "mlas")]
 impl MlasPreparedPacked {
-    fn new(packed: mlas_sys::SQNBitPackedB) -> Self {
+    fn new(packed: mlas_sys::SQNBitPackedB, grant: DerivedWeightGrant) -> Self {
         let mut workspace = mlas_sys::SQNBitGemmWorkspace::new();
         workspace.reserve_for(&packed, 1);
         Self {
             packed,
             workspace: Mutex::new(workspace),
+            _grant: grant,
         }
     }
+}
+
+#[cfg(feature = "mlas")]
+struct MlasPackFootprint {
+    packed_bytes: usize,
+    owned_bytes: usize,
+}
+
+#[cfg(feature = "mlas")]
+enum MlasInput<'a, T> {
+    Borrowed(&'a [T]),
+    Prepare(TensorView<'a>),
+}
+#[cfg(feature = "mlas")]
+impl<'a, T: Clone> MlasInput<'a, T> {
+    fn new(view: &TensorView<'a>, borrowed: Option<&'a [T]>) -> Self {
+        borrowed.map_or_else(|| Self::Prepare(*view), Self::Borrowed)
+    }
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(values) => values.len(),
+            Self::Prepare(view) => view.numel(),
+        }
+    }
+    fn owned_bytes(&self) -> Result<usize> {
+        match self {
+            Self::Borrowed(_) => Ok(0),
+            Self::Prepare(view) => view
+                .numel()
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or_else(|| error("MLAS input preparation byte count overflows usize")),
+        }
+    }
+    fn prepare(self, convert: impl FnOnce(&TensorView) -> Result<Vec<T>>) -> Result<Cow<'a, [T]>> {
+        match self {
+            Self::Borrowed(values) => Ok(Cow::Borrowed(values)),
+            Self::Prepare(view) => convert(&view).map(Cow::Owned),
+        }
+    }
+}
+
+/// The resolved input plan carries borrowed slices or explicit conversion work;
+/// charging and construction cannot disagree about which buffers are owned.
+#[cfg(feature = "mlas")]
+struct MlasInputPlan<'a> {
+    packed: MlasInput<'a, u8>,
+    scales: MlasInput<'a, f32>,
+    zero_points: Option<MlasInput<'a, u8>>,
+    raw_bytes: usize,
+    widen_peak: usize,
+}
+#[cfg(feature = "mlas")]
+impl<'a> MlasInputPlan<'a> {
+    fn new(
+        packed: &TensorView<'a>,
+        scales: &TensorView<'a>,
+        points: Option<&TensorView<'a>>,
+    ) -> Result<Self> {
+        // Validate the full logical input sizes/dtypes before probing borrows.
+        nbits_preparation_bytes(packed, scales, points, false)?;
+        let packed = MlasInput::new(packed, contiguous_host_slice::<u8>(packed));
+        let scale_input = MlasInput::new(
+            scales,
+            if scales.dtype == DataType::Float32 {
+                contiguous_host_slice::<f32>(scales)
+            } else {
+                None
+            },
+        );
+        let zero_points =
+            points.map(|view| MlasInput::new(view, contiguous_host_slice::<u8>(view)));
+        let overflow =
+            || error("MLAS input preparation peak overflows usize; use addressable operands");
+        let point_bytes = zero_points.as_ref().map_or(Ok(0), MlasInput::owned_bytes)?;
+        let raw_bytes = packed
+            .owned_bytes()?
+            .checked_add(scale_input.owned_bytes()?)
+            .and_then(|v| v.checked_add(point_bytes))
+            .ok_or_else(overflow)?;
+        let widen_extra = if scales.dtype == DataType::Float32 {
+            0
+        } else {
+            scales.numel().checked_mul(2).ok_or_else(overflow)?
+        };
+        let widen_peak = raw_bytes.checked_add(widen_extra).ok_or_else(overflow)?;
+        Ok(Self {
+            packed,
+            scales: scale_input,
+            zero_points,
+            raw_bytes,
+            widen_peak,
+        })
+    }
+    fn prepare(self) -> Result<MlasPreparedInputs<'a>> {
+        Ok(MlasPreparedInputs {
+            packed: self.packed.prepare(to_dense_bytes)?,
+            scales: self.scales.prepare(to_dense_compute_f32)?,
+            zero_points: self
+                .zero_points
+                .map(|input| input.prepare(to_dense_bytes))
+                .transpose()?,
+        })
+    }
+}
+#[cfg(feature = "mlas")]
+struct MlasPreparedInputs<'a> {
+    packed: Cow<'a, [u8]>,
+    scales: Cow<'a, [f32]>,
+    zero_points: Option<Cow<'a, [u8]>>,
 }
 
 /// Identity of one MLAS SQNBit packed weight, shared across the shape-keyed
@@ -800,6 +913,11 @@ impl MlasPreparedPacked {
 /// on a 1-token run and 338 on a 48-token run). Because the packed buffer is a
 /// pure function of the source weight bytes and the pack parameters, both
 /// instances may share one allocation whenever they agree on every field here:
+//////
+/// The physical Host authority is also part of admission identity: a retained
+/// allocation cannot be paid by one set of books and reused for free by another.
+/// Source encoding (wire or serialized) and scale dtype determine interpretation
+/// even when the input addresses are identical.
 ///
 /// * **`addr`** -- the constant weight's mmap address, distinguishing weights;
 /// * **`n`, `k`, `bits`, `block_size`** -- the geometry, so a same-address
@@ -825,6 +943,9 @@ impl MlasPreparedPacked {
 #[cfg(feature = "mlas")]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct MlasPackedKey {
+    authority: Option<onnx_runtime_memory_governor::MemoryAuthorityId>,
+    prepacked: bool,
+    scales_dtype: DataType,
     addr: usize,
     /// Address of the scales tensor, and of the zero-points tensor when present
     /// (`0` when absent). The pack is a function of all three operands -- an
@@ -845,6 +966,9 @@ struct MlasPackedKey {
 impl MlasPackedKey {
     #[allow(clippy::too_many_arguments)]
     fn new(
+        authority: Option<onnx_runtime_memory_governor::MemoryAuthorityId>,
+        prepacked: bool,
+        scales_dtype: DataType,
         addr: usize,
         scales_addr: usize,
         zero_points_addr: usize,
@@ -856,6 +980,9 @@ impl MlasPackedKey {
         comp: mlas_sys::SQNBitComputeType,
     ) -> Self {
         Self {
+            authority,
+            prepacked,
+            scales_dtype,
             addr,
             scales_addr,
             zero_points_addr,
@@ -883,6 +1010,7 @@ impl MlasPackedKey {
 #[cfg(feature = "mlas")]
 #[derive(Default)]
 struct MlasPackedCaches {
+    fills: Mutex<HashMap<MlasPackedKey, Weak<Mutex<()>>>>,
     shards: Mutex<HashMap<MlasPackedKey, Arc<Vec<Option<MlasShard>>>>>,
     packed: Mutex<HashMap<MlasPackedKey, Arc<MlasPreparedPacked>>>,
 }
@@ -895,6 +1023,22 @@ type MlasStoreEntry<T> = Result<Option<(Arc<T>, bool)>>;
 
 #[cfg(feature = "mlas")]
 impl MlasPackedCaches {
+    /// A weak per-key gate serializes only identical cold preparations. Neither
+    /// the value-map nor gate-registry mutex is held across a builder/accountant.
+    fn fill_gate(&self, key: MlasPackedKey) -> Arc<Mutex<()>> {
+        let mut fills = self
+            .fills
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fills.retain(|_, gate| gate.strong_count() != 0);
+        if let Some(gate) = fills.get(&key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        fills.insert(key, Arc::downgrade(&gate));
+        gate
+    }
+
     /// Return the shared N-sharded pack for `key`, building it on a miss with
     /// `build`. `build` runs only on a miss, so a decode instance whose prefill
     /// sibling already packed the weight neither re-packs nor re-times it (the
@@ -914,25 +1058,37 @@ impl MlasPackedCaches {
         {
             return Ok(Some((hit, false)));
         }
+        let gate = self.fill_gate(key);
+        let _fill = gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hit) = self
+            .shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+        {
+            return Ok(Some((hit, false)));
+        }
         let Some(built) = build()? else {
             return Ok(None);
         };
         let arc = Arc::new(built);
-        // A concurrent racer may have inserted an identical entry meanwhile;
-        // keep whichever landed first so every reader shares one allocation.
-        match self
-            .shards
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-        {
-            std::collections::hash_map::Entry::Occupied(occupied) => {
-                Ok(Some((occupied.get().clone(), false)))
+        let selected = {
+            let mut entries = self
+                .shards
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match entries.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => (entry.get().clone(), false),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    (entry.insert(arc.clone()).clone(), true)
+                }
             }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                Ok(Some((vacant.insert(arc).clone(), true)))
-            }
-        }
+        };
+        drop(arc);
+        Ok(Some(selected))
     }
 
     /// Full-width analogue of [`Self::get_or_build_shards`].
@@ -950,23 +1106,37 @@ impl MlasPackedCaches {
         {
             return Ok(Some((hit, false)));
         }
+        let gate = self.fill_gate(key);
+        let _fill = gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hit) = self
+            .packed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+        {
+            return Ok(Some((hit, false)));
+        }
         let Some(built) = build()? else {
             return Ok(None);
         };
         let arc = Arc::new(built);
-        match self
-            .packed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-        {
-            std::collections::hash_map::Entry::Occupied(occupied) => {
-                Ok(Some((occupied.get().clone(), false)))
+        let selected = {
+            let mut entries = self
+                .packed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match entries.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => (entry.get().clone(), false),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    (entry.insert(arc.clone()).clone(), true)
+                }
             }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                Ok(Some((vacant.insert(arc).clone(), true)))
-            }
-        }
+        };
+        drop(arc);
+        Ok(Some(selected))
     }
 
     /// Drop the entry `key` names from the sharded store, if still present.
@@ -977,29 +1147,45 @@ impl MlasPackedCaches {
     /// served to whatever lands on that address next -- the #1726 defect, in a
     /// store whose values are packed weights rather than transposes.
     fn remove_shards(&self, key: &MlasPackedKey) {
-        self.shards
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
+        let retired = {
+            self.shards
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(key)
+        };
+        drop(retired);
     }
 
-    /// [`Self::remove_shards`] for the full-width store.
+    /// Full-width analogue of [`Self::remove_shards`].
     fn remove_packed(&self, key: &MlasPackedKey) {
-        self.packed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
+        let retired = {
+            self.packed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(key)
+        };
+        drop(retired);
     }
 
     fn clear(&self) {
-        self.shards
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.packed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let shards = {
+            std::mem::take(
+                &mut *self
+                    .shards
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
+        let packed = {
+            std::mem::take(
+                &mut *self
+                    .packed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
+        drop(shards);
+        drop(packed);
     }
 }
 
@@ -1958,7 +2144,7 @@ impl Kernel for MatMulNBitsKernel {
         }
         #[cfg(feature = "mlas")]
         {
-            if let Some(()) = self.try_mlas_sqnbit(
+            let routed = match self.try_mlas_sqnbit(
                 &inputs[1],
                 &inputs[2],
                 zero_points,
@@ -1968,7 +2154,18 @@ impl Kernel for MatMulNBitsKernel {
                 m,
                 bias.as_deref(),
                 result,
-            )? {
+            ) {
+                Ok(routed) => routed,
+                // Standard wire weights retain their native streaming fallback.
+                // Capacity does not become a cached "unsupported" verdict;
+                // serialized MLAS inputs cannot use the wire decoder.
+                Err(EpError::Memory(
+                    onnx_runtime_memory_api::MemoryError::TierExhausted { .. }
+                    | onnx_runtime_memory_api::MemoryError::CapacityUnavailable { .. },
+                )) if !self.weight_prepacked => None,
+                Err(failure) => return Err(failure),
+            };
+            if routed.is_some() {
                 let out = if direct_result {
                     Ok(())
                 } else {
@@ -3383,6 +3580,9 @@ impl MatMulNBitsKernel {
             None => 0,
         };
         Some(MlasPackedKey::new(
+            self.weight_memory.host_authority_id(),
+            self.weight_prepacked,
+            scales.dtype,
             addr,
             scales_addr,
             zero_points_addr,
@@ -3493,6 +3693,77 @@ impl MatMulNBitsKernel {
         Ok(Some(prepared))
     }
 
+    #[cfg(feature = "mlas")]
+    fn mlas_pack_footprint(
+        &self,
+        n: usize,
+        scale_elements: usize,
+        zero_point_elements: Option<usize>,
+        comp: mlas_sys::SQNBitComputeType,
+    ) -> Result<Option<MlasPackFootprint>> {
+        let overflow = || {
+            error(format!(
+                "MLAS packed-weight byte count overflows for K={}, N={n}, bits={}, block_size={}; use addressable weight dimensions",
+                self.k, self.bits, self.block_size
+            ))
+        };
+        if self.block_size == 0 {
+            return Err(error("MLAS packed-weight block_size must be nonzero"));
+        }
+        // Refuse unaddressable geometry before entering a vendor size query.
+        n.checked_mul(self.k).ok_or_else(overflow)?;
+        let metadata = scale_elements
+            .checked_mul(4)
+            .and_then(|v| v.checked_add(zero_point_elements.unwrap_or(0)))
+            .ok_or_else(overflow)?;
+        let Some(packed_bytes) = mlas_sys::sqnbit_packed_b_size(
+            n,
+            self.k,
+            self.bits,
+            self.block_size,
+            zero_point_elements.is_some(),
+            comp,
+        ) else {
+            return Ok(None);
+        };
+        std::alloc::Layout::from_size_align(packed_bytes, 64).map_err(|cause| error(format!("MLAS packed allocation of {packed_bytes} bytes for K={}, N={n} cannot use 64-byte alignment: {cause}; use addressable weight dimensions", self.k)))?;
+        let owned_bytes = packed_bytes.checked_add(metadata).ok_or_else(overflow)?;
+        Ok(Some(MlasPackFootprint {
+            packed_bytes,
+            owned_bytes,
+        }))
+    }
+
+    #[cfg(feature = "mlas")]
+    fn claim_mlas_build(
+        &self,
+        owned: usize,
+        raw: usize,
+        widen_peak: usize,
+    ) -> Result<DerivedWeightGrant> {
+        let peak = owned.checked_add(raw).ok_or_else(|| error("MLAS preparation peak byte count overflows usize; use addressable weight dimensions"))?.max(widen_peak);
+        match self.weight_memory.try_grant(peak)? {
+            WeightAdmission::Granted(grant) => Ok(grant),
+            WeightAdmission::Declined(reason) => Err(EpError::Memory(reason)),
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    fn funded_mlas_prepared(
+        &self,
+        packed: mlas_sys::SQNBitPackedB,
+        expected: usize,
+        grant: &mut DerivedWeightGrant,
+    ) -> Result<MlasPreparedPacked> {
+        let actual = packed.owned_heap_bytes();
+        if actual != expected {
+            return Err(error(format!(
+                "MLAS packed-weight allocation owns {actual} bytes but its admission query predicted {expected}; update the packed layout/metadata accounting before executing"
+            )));
+        }
+        Ok(MlasPreparedPacked::new(packed, grant.split_off(expected)?))
+    }
+
     /// Pack the constant int4 weight into one MLAS SQNBit shard per entry of
     /// [`Self::mlas_shard_segments`]. Returns `Ok(None)` when MLAS has no kernel
     /// for this `(bits, block_size, compute_type)` on the host (any shard failing
@@ -3506,20 +3777,75 @@ impl MatMulNBitsKernel {
         zero_points: Option<&TensorView>,
         comp: mlas_sys::SQNBitComputeType,
     ) -> Result<Option<Vec<Option<MlasShard>>>> {
-        let packed = to_dense_bytes(packed)?;
-        let scales = to_dense_compute_f32(scales)?;
-        let zero_points = zero_points.map(to_dense_bytes).transpose()?;
+        self.build_mlas_shards_for_segments(
+            packed,
+            scales,
+            zero_points,
+            comp,
+            self.mlas_shard_segments(),
+        )
+    }
 
+    #[cfg(feature = "mlas")]
+    fn build_mlas_shards_for_segments(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        comp: mlas_sys::SQNBitComputeType,
+        segments: Vec<(usize, usize)>,
+    ) -> Result<Option<Vec<Option<MlasShard>>>> {
+        let inputs = MlasInputPlan::new(packed, scales, zero_points)?;
+        if self.block_size == 0 {
+            return Err(error("MLAS shard block_size must be nonzero"));
+        }
         let k_blocks = self.k.div_ceil(self.block_size);
-        let blob_size = self.block_size * self.bits / 8;
-        let zp_blob_size = (k_blocks * self.bits).div_ceil(8);
-
-        let mut shards = Vec::new();
-        for (start, len) in self.mlas_shard_segments() {
+        let blob_size = self
+            .block_size
+            .checked_mul(self.bits)
+            .ok_or_else(|| error("MLAS packed block byte count overflows"))?
+            / 8;
+        let zp_blob_size = k_blocks
+            .checked_mul(self.bits)
+            .ok_or_else(|| error("MLAS zero-point row byte count overflows"))?
+            .div_ceil(8);
+        let mut footprints = Vec::with_capacity(segments.len());
+        let mut total = 0usize;
+        for &(_, len) in &segments {
             if len == 0 {
-                shards.push(None);
+                footprints.push(None);
                 continue;
             }
+            let scale_len = len
+                .checked_mul(k_blocks)
+                .ok_or_else(|| error("MLAS shard scales byte count overflows"))?;
+            let zp_len = zero_points
+                .map(|_| {
+                    len.checked_mul(zp_blob_size)
+                        .ok_or_else(|| error("MLAS shard zero-point byte count overflows"))
+                })
+                .transpose()?;
+            let Some(footprint) = self.mlas_pack_footprint(len, scale_len, zp_len, comp)? else {
+                return Ok(None);
+            };
+            total = total
+                .checked_add(footprint.owned_bytes)
+                .ok_or_else(|| error("MLAS shard preparation total byte count overflows"))?;
+            footprints.push(Some(footprint));
+        }
+        let mut grant = self.claim_mlas_build(total, inputs.raw_bytes, inputs.widen_peak)?;
+        let MlasPreparedInputs {
+            packed,
+            scales,
+            zero_points,
+        } = inputs.prepare()?;
+
+        let mut shards = Vec::with_capacity(segments.len());
+        for ((start, len), footprint) in segments.into_iter().zip(footprints) {
+            let Some(footprint) = footprint else {
+                shards.push(None);
+                continue;
+            };
             let packed_shard =
                 &packed[start * k_blocks * blob_size..(start + len) * k_blocks * blob_size];
             let scales_shard = &scales[start * k_blocks..(start + len) * k_blocks];
@@ -3539,7 +3865,11 @@ impl MatMulNBitsKernel {
                 Some(packed) => shards.push(Some(MlasShard {
                     start,
                     len,
-                    prepared: MlasPreparedPacked::new(packed),
+                    prepared: self.funded_mlas_prepared(
+                        packed,
+                        footprint.owned_bytes,
+                        &mut grant,
+                    )?,
                 })),
                 None => return Ok(None),
             }
@@ -3578,10 +3908,24 @@ impl MatMulNBitsKernel {
         zero_points: Option<&TensorView>,
         comp: mlas_sys::SQNBitComputeType,
     ) -> Result<Option<MlasPreparedPacked>> {
-        let packed = to_dense_bytes(packed)?;
-        let scales = to_dense_compute_f32(scales)?;
-        let zero_points = zero_points.map(to_dense_bytes).transpose()?;
-        Ok(mlas_sys::SQNBitPackedB::new(
+        let inputs = MlasInputPlan::new(packed, scales, zero_points)?;
+        let Some(footprint) = self.mlas_pack_footprint(
+            self.n,
+            inputs.scales.len(),
+            inputs.zero_points.as_ref().map(MlasInput::len),
+            comp,
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut grant =
+            self.claim_mlas_build(footprint.owned_bytes, inputs.raw_bytes, inputs.widen_peak)?;
+        let MlasPreparedInputs {
+            packed,
+            scales,
+            zero_points,
+        } = inputs.prepare()?;
+        let Some(packed) = mlas_sys::SQNBitPackedB::new(
             self.n,
             self.k,
             self.bits,
@@ -3590,8 +3934,14 @@ impl MatMulNBitsKernel {
             &packed,
             &scales,
             zero_points.as_deref(),
-        )
-        .map(MlasPreparedPacked::new))
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(self.funded_mlas_prepared(
+            packed,
+            footprint.owned_bytes,
+            &mut grant,
+        )?))
     }
 
     #[cfg(feature = "mlas")]
@@ -3614,10 +3964,35 @@ impl MatMulNBitsKernel {
         zero_points: Option<&TensorView>,
         comp: mlas_sys::SQNBitComputeType,
     ) -> Result<Option<MlasPreparedPacked>> {
-        let packed = to_dense_bytes(packed)?;
-        let scales = to_dense_compute_f32(scales)?;
-        let zero_points = zero_points.map(to_dense_bytes).transpose()?;
-        Ok(mlas_sys::SQNBitPackedB::from_prepacked(
+        let inputs = MlasInputPlan::new(packed, scales, zero_points)?;
+        let Some(footprint) = self.mlas_pack_footprint(
+            self.n,
+            inputs.scales.len(),
+            inputs.zero_points.as_ref().map(MlasInput::len),
+            comp,
+        )?
+        else {
+            return Ok(None);
+        };
+        if packed.numel() != footprint.packed_bytes {
+            return Err(error(format!(
+                "weight_prepacked=1 B has {} bytes, expected {} for K={}, N={}, bits={}, block_size={}; supply a buffer produced for this exact MLAS layout",
+                packed.numel(),
+                footprint.packed_bytes,
+                self.k,
+                self.n,
+                self.bits,
+                self.block_size
+            )));
+        }
+        let mut grant =
+            self.claim_mlas_build(footprint.owned_bytes, inputs.raw_bytes, inputs.widen_peak)?;
+        let MlasPreparedInputs {
+            packed,
+            scales,
+            zero_points,
+        } = inputs.prepare()?;
+        let Some(packed) = mlas_sys::SQNBitPackedB::from_prepacked(
             self.n,
             self.k,
             self.bits,
@@ -3626,8 +4001,14 @@ impl MatMulNBitsKernel {
             &packed,
             &scales,
             zero_points.as_deref(),
-        )
-        .map(MlasPreparedPacked::new))
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(self.funded_mlas_prepared(
+            packed,
+            footprint.owned_bytes,
+            &mut grant,
+        )?))
     }
 
     fn prepack_int8_weight(
@@ -11829,6 +12210,635 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mlas")]
+    fn mlas_grant_supported_case() -> Option<(usize, mlas_sys::SQNBitComputeType)> {
+        for comp in [
+            mlas_sys::SQNBitComputeType::Fp32,
+            mlas_sys::SQNBitComputeType::Int8,
+        ] {
+            for block in [32usize, 128] {
+                if mlas_sys::sqnbit_packed_b_size(16, 128, 4, block, false, comp).is_some() {
+                    return Some((block, comp));
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_grants_inputs_borrow_wire_and_fund_only_required_copies() {
+        let b = Owned::u8(&[8], &[0x39; 8]);
+        let f = Owned::f32(&[2], &[0.125, 0.25]);
+        let z = Owned::u8(&[1], &[0x12]);
+        let bv = b.view();
+        let fv = f.view();
+        let zv = z.view();
+        let plan = MlasInputPlan::new(&bv, &fv, Some(&zv)).unwrap();
+        assert_eq!((plan.raw_bytes, plan.widen_peak), (0, 0));
+        let inputs = plan.prepare().unwrap();
+        assert!(matches!(inputs.packed, Cow::Borrowed(_)));
+        assert!(matches!(inputs.scales, Cow::Borrowed(_)));
+        assert!(matches!(inputs.zero_points, Some(Cow::Borrowed(_))));
+        assert_eq!(inputs.packed.as_ptr(), bv.data_ptr::<u8>());
+        assert_eq!(inputs.scales.as_ptr(), fv.data_ptr::<f32>());
+        let half = Owned::f16(&[2], &[0.125, 0.25]);
+        let plan = MlasInputPlan::new(&bv, &half.view(), Some(&zv)).unwrap();
+        assert_eq!((plan.raw_bytes, plan.widen_peak), (8, 12));
+        let inputs = plan.prepare().unwrap();
+        assert!(matches!(inputs.packed, Cow::Borrowed(_)));
+        assert!(matches!(inputs.scales, Cow::Owned(_)));
+        assert_eq!(inputs.scales.as_ref(), &[0.125, 0.25]);
+        let padded = Owned::u8(
+            &[17],
+            &[
+                0, 0x39, 0, 0x39, 0, 0x39, 0, 0x39, 0, 0x39, 0, 0x39, 0, 0x39, 0, 0x39, 0,
+            ],
+        );
+        let mut strided = padded.view();
+        strided.shape = &[8];
+        strided.strides = &[2];
+        strided.byte_offset = 1;
+        let plan = MlasInputPlan::new(&strided, &half.view(), Some(&zv)).unwrap();
+        assert_eq!((plan.raw_bytes, plan.widen_peak), (16, 20));
+        let inputs = plan.prepare().unwrap();
+        assert!(matches!(inputs.packed, Cow::Owned(_)));
+        assert_eq!(inputs.packed.as_ref(), &[0x39; 8]);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_grants_actual_payloads_refuse_before_build_and_refund_all_paths() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let (k, n) = (128usize, 16usize);
+        let mut executed = 0;
+        for bits in [4usize, 8] {
+            for comp in [
+                mlas_sys::SQNBitComputeType::Fp32,
+                mlas_sys::SQNBitComputeType::Int8,
+            ] {
+                for block in [32usize, 128] {
+                    for affine in [false, true] {
+                        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+                            let blocks = k / block;
+                            let b = Owned::u8(
+                                &[n, blocks, block * bits / 8],
+                                &vec![0x39; n * k * bits / 8],
+                            );
+                            let scale_values = vec![0.125; n * blocks];
+                            let scales = match dtype {
+                                DataType::Float16 => Owned::f16(&[n, blocks], &scale_values),
+                                DataType::BFloat16 => Owned::bf16(&[n, blocks], &scale_values),
+                                _ => Owned::f32(&[n, blocks], &scale_values),
+                            };
+                            let z = affine.then(|| {
+                                Owned::u8(
+                                    &[n, (blocks * bits).div_ceil(8)],
+                                    &vec![0x12; n * (blocks * bits).div_ceil(8)],
+                                )
+                            });
+                            let bv = b.view();
+                            let sv = scales.view();
+                            let zv = z.as_ref().map(Owned::view);
+                            let plan = MlasInputPlan::new(&bv, &sv, zv.as_ref()).unwrap();
+                            let mut kernel = test_kernel(k, n, block);
+                            kernel.bits = bits;
+                            let Some(spec) = kernel
+                                .mlas_pack_footprint(
+                                    n,
+                                    plan.scales.len(),
+                                    plan.zero_points.as_ref().map(MlasInput::len),
+                                    comp,
+                                )
+                                .unwrap()
+                            else {
+                                let (gov, resources) = governed_dense_resources(0, 0);
+                                kernel.weight_memory = resources.weight_memory().clone();
+                                assert!(
+                                    kernel
+                                        .build_mlas_packed(&bv, &sv, zv.as_ref(), comp)
+                                        .unwrap()
+                                        .is_none()
+                                );
+                                assert_eq!(gov.used(Tier::Host), 0);
+                                continue;
+                            };
+                            executed += 1;
+                            let peak = (spec.owned_bytes + plan.raw_bytes).max(plan.widen_peak);
+                            for capacity in [peak - 1, peak] {
+                                let (gov, resources) = governed_dense_resources(capacity, 0);
+                                kernel.weight_memory = resources.weight_memory().clone();
+                                let result = kernel.build_mlas_packed(&bv, &sv, zv.as_ref(), comp);
+                                if capacity < peak {
+                                    assert!(matches!(
+                                        result,
+                                        Err(EpError::Memory(
+                                            onnx_runtime_memory_api::MemoryError::TierExhausted { .. }
+                                        ))
+                                    ));
+                                } else {
+                                    let packed = result
+                                        .unwrap()
+                                        .expect("the queried pack layout must construct");
+                                    assert_eq!(packed.packed.owned_heap_bytes(), spec.owned_bytes);
+                                    assert_eq!(gov.used(Tier::Host), spec.owned_bytes as u64);
+                                    drop(packed);
+                                }
+                                assert_eq!(gov.used(Tier::Host), 0);
+                            }
+                            // Two N shards and a zero-width worker keep independent exact grants.
+                            let segments = vec![(0usize, 8usize), (8, 8), (16, 0)];
+                            let shard_bytes: Option<usize> = segments
+                                .iter()
+                                .filter(|(_, len)| *len != 0)
+                                .map(|(_, len)| {
+                                    kernel
+                                        .mlas_pack_footprint(
+                                            *len,
+                                            len * blocks,
+                                            affine.then_some(len * (blocks * bits).div_ceil(8)),
+                                            comp,
+                                        )
+                                        .unwrap()
+                                        .map(|f| f.owned_bytes)
+                                })
+                                .try_fold(0usize, |sum, bytes| Some(sum + bytes?));
+                            if let Some(shard_bytes) = shard_bytes {
+                                let capacity = (shard_bytes + plan.raw_bytes).max(plan.widen_peak);
+                                let (gov, resources) = governed_dense_resources(capacity, 0);
+                                kernel.weight_memory = resources.weight_memory().clone();
+                                let shards = kernel
+                                    .build_mlas_shards_for_segments(
+                                        &bv,
+                                        &sv,
+                                        zv.as_ref(),
+                                        comp,
+                                        segments,
+                                    )
+                                    .unwrap()
+                                    .unwrap();
+                                assert_eq!(
+                                    shards
+                                        .iter()
+                                        .flatten()
+                                        .map(|s| s.prepared.packed.owned_heap_bytes())
+                                        .sum::<usize>(),
+                                    shard_bytes
+                                );
+                                assert_eq!(gov.used(Tier::Host), shard_bytes as u64);
+                                drop(shards);
+                                assert_eq!(gov.used(Tier::Host), 0);
+                            }
+                            // Reconstruct the real serialized representation under a fresh grant.
+                            let original = mlas_sys::SQNBitPackedB::new(
+                                n,
+                                k,
+                                bits,
+                                block,
+                                comp,
+                                &b.bytes,
+                                &scale_values,
+                                z.as_ref().map(|v| v.bytes.as_slice()),
+                            )
+                            .unwrap();
+                            if dtype == DataType::Float32 {
+                                let mut backing = vec![0u8; 1 + b.bytes.len() * 2];
+                                for (i, byte) in b.bytes.iter().enumerate() {
+                                    backing[1 + i * 2] = *byte;
+                                }
+                                let padded = Owned::u8(&[backing.len()], &backing);
+                                let shape = [b.bytes.len()];
+                                let strides = [2];
+                                let mut strided = padded.view();
+                                strided.shape = &shape;
+                                strided.strides = &strides;
+                                strided.byte_offset = 1;
+                                let plan = MlasInputPlan::new(&strided, &sv, zv.as_ref()).unwrap();
+                                assert_eq!(plan.raw_bytes, b.bytes.len());
+                                let (gov, resources) =
+                                    governed_dense_resources(spec.owned_bytes + plan.raw_bytes, 0);
+                                kernel.weight_memory = resources.weight_memory().clone();
+                                let prepared = kernel
+                                    .build_mlas_packed(&strided, &sv, zv.as_ref(), comp)
+                                    .unwrap()
+                                    .unwrap();
+                                assert_eq!(prepared.packed.as_bytes(), original.as_bytes());
+                                assert_eq!(gov.used(Tier::Host), spec.owned_bytes as u64);
+                                drop(prepared);
+                                assert_eq!(gov.used(Tier::Host), 0);
+                            }
+                            let serialized =
+                                Owned::u8(&[original.as_bytes().len()], original.as_bytes());
+                            let serialized_view = serialized.view();
+                            let input_plan =
+                                MlasInputPlan::new(&serialized_view, &sv, zv.as_ref()).unwrap();
+                            let capacity = (spec.owned_bytes + input_plan.raw_bytes)
+                                .max(input_plan.widen_peak);
+                            let (small, resources) = governed_dense_resources(capacity - 1, 0);
+                            kernel.weight_memory = resources.weight_memory().clone();
+                            assert!(matches!(
+                                kernel.build_mlas_prepacked(
+                                    &serialized_view,
+                                    &sv,
+                                    zv.as_ref(),
+                                    comp
+                                ),
+                                Err(EpError::Memory(
+                                    onnx_runtime_memory_api::MemoryError::TierExhausted { .. }
+                                ))
+                            ));
+                            assert_eq!(small.used(Tier::Host), 0);
+                            let invalid = Owned::u8(&[1], &[0]);
+                            let (empty, resources) = governed_dense_resources(0, 0);
+                            kernel.weight_memory = resources.weight_memory().clone();
+                            let failure = kernel
+                                .build_mlas_prepacked(&invalid.view(), &sv, zv.as_ref(), comp)
+                                .err()
+                                .unwrap();
+                            assert!(
+                                failure
+                                    .to_string()
+                                    .contains("weight_prepacked=1 B has 1 bytes"),
+                                "{failure}"
+                            );
+                            assert_eq!(empty.used(Tier::Host), 0);
+                            let (gov, resources) = governed_dense_resources(capacity, 0);
+                            kernel.weight_memory = resources.weight_memory().clone();
+                            let repacked = kernel
+                                .build_mlas_prepacked(&serialized_view, &sv, zv.as_ref(), comp)
+                                .unwrap()
+                                .unwrap();
+                            assert_eq!(repacked.packed.as_bytes(), original.as_bytes());
+                            assert_eq!(
+                                gov.used(Tier::Host),
+                                repacked.packed.owned_heap_bytes() as u64
+                            );
+                            drop(repacked);
+                            assert_eq!(gov.used(Tier::Host), 0);
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("MLAS grant validation executed {executed} supported pack/dtype/metadata cases");
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_grants_shared_entries_follow_authority_and_encoding() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let Some((block, comp)) = mlas_grant_supported_case() else {
+            return;
+        };
+        let (k, n) = (128usize, 16usize);
+        let blocks = k / block;
+        let b = Owned::u8(&[n, blocks, block / 2], &vec![0x39; n * k / 2]);
+        let scales = Owned::f32(&[n, blocks], &vec![0.125; n * blocks]);
+        let bv = b.view();
+        let sv = scales.view();
+        let mut first = test_kernel(k, n, block);
+        let bytes = first
+            .mlas_pack_footprint(n, n * blocks, None, comp)
+            .unwrap()
+            .unwrap()
+            .owned_bytes;
+        let (books, resources) = governed_dense_resources(bytes, 0);
+        first.weight_memory = resources.weight_memory().clone();
+        let source = DerivedWeightMemory::governed(&books, HolderId::new(14)).unwrap();
+        let mut second = test_kernel(k, n, block);
+        second.weight_memory = source;
+        let pack = first
+            .shared_mlas_packed(&bv, &sv, None, comp)
+            .unwrap()
+            .unwrap();
+        assert_eq!(books.used(Tier::Host), bytes as u64);
+        let shared = second
+            .shared_mlas_packed(&bv, &sv, None, comp)
+            .unwrap()
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&pack, &shared),
+            "same Host books should pay once, even with separate sources/holders"
+        );
+        let (foreign, resources) = governed_dense_resources(0, 0);
+        let mut other = test_kernel(k, n, block);
+        other.weight_memory = resources.weight_memory().clone();
+        assert!(matches!(
+            other.shared_mlas_packed(&bv, &sv, None, comp),
+            Err(EpError::Memory(
+                onnx_runtime_memory_api::MemoryError::TierExhausted { .. }
+            ))
+        ));
+        assert_eq!(foreign.used(Tier::Host), 0);
+        let local = test_kernel(k, n, block);
+        let key = first.mlas_packed_key(&bv, &sv, None, false, comp).unwrap();
+        assert_ne!(
+            key,
+            local.mlas_packed_key(&bv, &sv, None, false, comp).unwrap()
+        );
+        assert_ne!(
+            key,
+            other.mlas_packed_key(&bv, &sv, None, false, comp).unwrap()
+        );
+        let mut half_view = sv;
+        half_view.dtype = DataType::Float16;
+        assert_ne!(
+            key,
+            second
+                .mlas_packed_key(&bv, &half_view, None, false, comp)
+                .unwrap(),
+            "scale widening dtype is part of the packed value's identity"
+        );
+        second.weight_prepacked = true;
+        assert_ne!(
+            key,
+            second.mlas_packed_key(&bv, &sv, None, false, comp).unwrap(),
+            "wire and serialized source encodings are distinct identities"
+        );
+        drop(first); // installer eviction does not revoke a sharer's live grant
+        drop(second);
+        drop(shared);
+        assert_eq!(books.used(Tier::Host), bytes as u64);
+        drop(pack);
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(DerivedWeightMemory::default().host_authority_id(), None);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_grants_singleflight_and_out_of_lock_refunds() {
+        use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{
+            HolderId, LeaseAccounting, LeaseLedger, LedgerGovernor, MemoryAuthorityId,
+            MemoryGovernor, MemoryLease,
+        };
+        use std::sync::atomic::AtomicBool;
+        let Some((block, comp)) = mlas_grant_supported_case() else {
+            return;
+        };
+        struct Books {
+            governor: LedgerGovernor,
+            cache: Mutex<Weak<MlasPackedCaches>>,
+            blocked: AtomicBool,
+            check_locks: AtomicBool,
+            observations: AtomicUsize,
+        }
+        impl std::fmt::Debug for Books {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("MlasObservedBooks").finish_non_exhaustive()
+            }
+        }
+        impl Books {
+            fn observe(&self) {
+                // Check lock ownership only in quiescent phases: another
+                // thread's legitimate warm lookup is not a self-deadlock.
+                if !self.check_locks.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(cache) = self.cache.lock().unwrap().upgrade() {
+                    let unlocked = cache.packed.try_lock().is_ok()
+                        && cache.shards.try_lock().is_ok()
+                        && cache.fills.try_lock().is_ok();
+                    self.blocked.fetch_or(!unlocked, Ordering::Relaxed);
+                    self.observations.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        impl LeaseAccounting for Books {
+            // Deliberately no optional authority stamp: the source still knows
+            // the governor's physical identity and must not key this as Local.
+            fn try_claim(
+                &self,
+                tier: Tier,
+                bytes: u64,
+                role: MemoryRole,
+            ) -> std::result::Result<(), MemoryError> {
+                self.observe();
+                self.governor.ledger().try_claim(tier, bytes, role)
+            }
+            fn release(&self, tier: Tier, bytes: u64) {
+                self.observe();
+                self.governor.ledger().release(tier, bytes);
+            }
+        }
+        struct Governor(Arc<Books>);
+        impl MemoryGovernor for Governor {
+            fn authority_id(&self, tier: Tier) -> MemoryAuthorityId {
+                self.0.governor.authority_id(tier)
+            }
+            fn reserve(
+                &self,
+                tier: Tier,
+                bytes: u64,
+                role: MemoryRole,
+                holder: HolderId,
+            ) -> std::result::Result<MemoryLease, MemoryError> {
+                self.0.try_claim(tier, bytes, role)?;
+                Ok(MemoryLease::new(tier, bytes, role, holder, self.0.clone()))
+            }
+            fn available(&self, tier: Tier) -> u64 {
+                self.0.governor.available(tier)
+            }
+            fn used(&self, tier: Tier) -> u64 {
+                self.0.governor.used(tier)
+            }
+        }
+        let (k, n) = (128usize, 16usize);
+        let blocks = k / block;
+        let b = Owned::u8(&[n, blocks, block / 2], &vec![0x39; n * k / 2]);
+        let scales = Owned::f32(&[n, blocks], &vec![0.125; n * blocks]);
+        let mut kernel = test_kernel(k, n, block);
+        let bytes = kernel
+            .mlas_pack_footprint(n, n * blocks, None, comp)
+            .unwrap()
+            .unwrap()
+            .owned_bytes;
+        let books = Arc::new(Books {
+            governor: LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0)),
+            cache: Mutex::new(Weak::new()),
+            blocked: AtomicBool::new(false),
+            check_locks: AtomicBool::new(true),
+            observations: AtomicUsize::new(0),
+        });
+        kernel.weight_memory =
+            DerivedWeightMemory::governed(&Governor(books.clone()), HolderId::new(13)).unwrap();
+        assert_eq!(
+            kernel.weight_memory.host_authority_id(),
+            Some(books.governor.authority_id(Tier::Host))
+        );
+        let caches = Arc::new(MlasPackedCaches::default());
+        *books.cache.lock().unwrap() = Arc::downgrade(&caches);
+        let key = kernel
+            .mlas_packed_key(&b.view(), &scales.view(), None, false, comp)
+            .unwrap();
+        let blocker = books
+            .governor
+            .reserve(
+                Tier::Host,
+                bytes as u64,
+                MemoryRole::KvCache,
+                HolderId::new(2),
+            )
+            .unwrap();
+        assert!(matches!(
+            caches.get_or_build_packed(key, || kernel.build_mlas_packed(
+                &b.view(),
+                &scales.view(),
+                None,
+                comp
+            )),
+            Err(EpError::Memory(MemoryError::TierExhausted { .. }))
+        ));
+        assert!(caches.packed.lock().unwrap().is_empty());
+        drop(blocker);
+        books.check_locks.store(false, Ordering::Relaxed);
+        let start = std::sync::Barrier::new(8);
+        let builds = AtomicUsize::new(0);
+        let outputs = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let caches = &caches;
+                    let kernel = &kernel;
+                    let b = &b;
+                    let scales = &scales;
+                    let start = &start;
+                    let builds = &builds;
+                    scope.spawn(move || {
+                        start.wait();
+                        caches
+                            .get_or_build_packed(key, || {
+                                builds.fetch_add(1, Ordering::Relaxed);
+                                kernel.build_mlas_packed(&b.view(), &scales.view(), None, comp)
+                            })
+                            .unwrap()
+                            .unwrap()
+                            .0
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        books.check_locks.store(true, Ordering::Relaxed);
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            1,
+            "one-payload capacity must serve every simultaneous miss"
+        );
+        assert!(outputs.iter().all(|p| Arc::ptr_eq(p, &outputs[0])));
+        caches.clear();
+        assert_eq!(
+            books.governor.used(Tier::Host),
+            bytes as u64,
+            "clearing cache membership cannot revoke active owners"
+        );
+        drop(outputs);
+        assert_eq!(books.governor.used(Tier::Host), 0);
+        drop(
+            caches
+                .get_or_build_packed(key, || {
+                    kernel.build_mlas_packed(&b.view(), &scales.view(), None, comp)
+                })
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(books.governor.used(Tier::Host), bytes as u64);
+        caches.remove_packed(&key);
+        assert_eq!(books.governor.used(Tier::Host), 0);
+        assert!(
+            !books.blocked.load(Ordering::Relaxed),
+            "grant/refund callbacks observed a locked value map or registration table"
+        );
+        assert!(books.observations.load(Ordering::Relaxed) >= 4);
+        assert!(
+            caches
+                .fills
+                .lock()
+                .unwrap()
+                .values()
+                .all(|gate| gate.strong_count() == 0)
+        );
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_grants_factory_execution_keeps_the_pack_until_final_owner() {
+        let _probe = lock_dispatch_probe();
+        let _env = backend_env_lock().lock().unwrap();
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let (k, n, block) = (128usize, 16usize, 32usize);
+        let blocks = k / block;
+        let probe = test_kernel(k, n, block);
+        if !probe.mlas_sqnbit_owns_fp32_compute(true, false) {
+            return;
+        }
+        let comp = mlas_sys::SQNBitComputeType::Fp32;
+        let bytes = probe
+            .mlas_pack_footprint(n, n * blocks, None, comp)
+            .unwrap()
+            .unwrap()
+            .owned_bytes;
+        let b = Owned::u8(&[n, blocks, block / 2], &vec![0x39; n * k / 2]);
+        let scales = Owned::f32(&[n, blocks], &vec![0.125; n * blocks]);
+        let a = Owned::f32(&[1, k], &vec![0.25; k]);
+        let (books, resources) = governed_dense_resources(bytes, 0);
+        let mut kernel = MatMulNBitsFactory::new(resources)
+            .create(&governed_dense_node(k, n, 4, block), &[])
+            .unwrap();
+        kernel.set_constant_inputs(&[false, true, true]);
+        let before = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
+        let blocker = books
+            .reserve(Tier::Host, 1, MemoryRole::KvCache, HolderId::new(2))
+            .unwrap();
+        let mut fallback = Owned::zeros_f32(&[1, n]);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales.view()],
+                &mut [fallback.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(fallback.to_f32(), vec![-8.0; n]);
+        assert_eq!(books.used(Tier::Host), 1);
+        assert_eq!(MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed), before);
+        assert!(
+            kernel
+                .as_any()
+                .downcast_ref::<MatMulNBitsKernel>()
+                .unwrap()
+                .mlas_packed
+                .get()
+                .is_none(),
+            "capacity refusal cannot poison the static capability memo"
+        );
+        drop(blocker);
+        for _ in 0..3 {
+            let mut out = Owned::zeros_f32(&[1, n]);
+            kernel
+                .execute(&[a.view(), b.view(), scales.view()], &mut [out.view_mut()])
+                .unwrap();
+            assert_eq!(out.to_f32(), vec![-8.0; n]);
+            assert_eq!(books.used(Tier::Host), bytes as u64);
+        }
+        assert_eq!(MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) - before, 3);
+        let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+        let retained = concrete
+            .mlas_packed
+            .get()
+            .and_then(Option::as_ref)
+            .expect("unscoped M=1 must retain the full-width pack")
+            .clone();
+        assert_eq!(retained.packed.owned_heap_bytes(), bytes);
+        drop(kernel);
+        assert_eq!(books.used(Tier::Host), bytes as u64);
+        drop(retained);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
     #[test]
     fn native_pack_grants_match_real_payloads_and_bound_transformation_peaks() {
         use onnx_runtime_memory_api::{MemoryRole, Tier};
@@ -15580,6 +16590,9 @@ mod tests {
         let caches = MlasPackedCaches::default();
         let key_at = |addr: usize| {
             MlasPackedKey::new(
+                None,
+                false,
+                DataType::Float32,
                 addr,
                 addr + 1,
                 0,

@@ -1986,12 +1986,12 @@ pub struct SQNBitPackedB {
     blk_len: usize,
     comp: SQNBitComputeType,
     has_zp: bool,
-    scale: Vec<f32>,
-    zp: Option<Vec<u8>>,
+    scale: Box<[f32]>,
+    zp: Option<Box<[u8]>>,
 }
 
 // SAFETY: identical rationale to `PackedB`: construction fully initializes the
-// packed allocation and the owned scale/zp vectors, all of which are immutable
+// packed allocation and the owned scale/zp buffers, all of which are immutable
 // afterward. `sqnbit_gemm` only reads them, so sharing across threads (e.g.
 // MLAS's own tile parallelism) is race-free.
 unsafe impl Send for SQNBitPackedB {}
@@ -2015,11 +2015,11 @@ pub fn sqnbit_packed_live_bytes() -> usize {
 
 impl SQNBitPackedB {
     /// Heap bytes this instance owns: the packed allocation plus the scale and
-    /// optional zero-point copies MLAS's `Fp32` path consumes at GEMM time.
+    /// optional zero-point copies retained alongside the packed allocation.
     pub fn owned_heap_bytes(&self) -> usize {
         self.layout.size()
-            + self.scale.capacity() * std::mem::size_of::<f32>()
-            + self.zp.as_ref().map_or(0, Vec::capacity)
+            + self.scale.len() * std::mem::size_of::<f32>()
+            + self.zp.as_ref().map_or(0, |zp| zp.len())
     }
 
     fn account_alloc(&self) {
@@ -2072,8 +2072,8 @@ impl SQNBitPackedB {
             blk_len,
             comp,
             has_zp,
-            scale: scale.to_vec(),
-            zp: zp.map(<[u8]>::to_vec),
+            scale: scale.into(),
+            zp: zp.map(Box::<[u8]>::from),
         };
         packed.account_alloc();
         Some(packed)
@@ -2115,8 +2115,8 @@ impl SQNBitPackedB {
             blk_len,
             comp,
             has_zp,
-            scale: scale.to_vec(),
-            zp: zp.map(<[u8]>::to_vec),
+            scale: scale.into(),
+            zp: zp.map(Box::<[u8]>::from),
         };
         repacked.account_alloc();
         Some(repacked)
