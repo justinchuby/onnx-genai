@@ -61,6 +61,16 @@ impl Kernel for FusedMatMulBiasKernel {
         self.prepack.set_constant_inputs(constant_inputs);
     }
 
+    fn shareable_constant_state(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.prepack.shareable_constant_state()
+    }
+    fn adopt_shareable_constant_state(
+        &mut self,
+        state: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<bool> {
+        self.prepack.adopt_shareable_constant_state(state)
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("FusedMatMulBias", inputs, outputs, 3, 3, 1)?;
 

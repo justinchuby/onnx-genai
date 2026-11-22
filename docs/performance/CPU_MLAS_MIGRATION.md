@@ -1159,7 +1159,7 @@ perturbing existing libtest-wide platform dispatch observations.
 This closes a retention-policy bypass. Ordinary constant f32 materializations
 and native contiguous-half copies now obtain Host grants as described below.
 SGEMM packed panels and transpose payloads still need authority/lifecycle work;
-ordinary dense caches are not yet shared across a node's shape variants. No
+ordinary node-owned sharing is consolidated below. No
 performance improvement is established by these retention checks.
 
 Validation on Apple M1 Max / ARM64 macOS with Rust 1.98 and cached ORT:
@@ -1181,7 +1181,8 @@ Load-time preparation uses the same provider resources. The FusedGemm factory
 previously constructed an ungoverned default prepack regardless of its provider;
 it now captures the supplying source and retention policy too. The existing
 dense-preparation predictor covers all four consumers in their registered
-domains, for both constant operands, with its existing shape-instance multiplier.
+domains, for both constant operands. Node ownership below removes the historical
+shape-instance multiplier.
 
 The prepack's widened/densified constant slots use `WeightCache` and the
 provider's `DerivedWeightMemory`. Full f32 payload admission precedes allocation
@@ -1259,7 +1260,8 @@ reclamation, refusal/retry/refund, invalid sources, empty payloads, and actual
 Apple half rescue results. Baseline worktree is removed; logs remain available.
 This is ownership/correctness evidence on Apple M1 Max ARM64, not a performance
 claim or evidence about CUDA/other ISAs. Ordinary SGEMM panels, transpose
-payloads, shared shape-variant ownership and scratch remain separate work.
+payloads and scratch remain separate work; shape-variant ownership is
+consolidated below.
 
 Validation: native CPU 1,981 passed / 20 ignored and session 274 passed;
 optional-MLAS CPU 2,012 passed / 35 ignored and session 276 passed. Strict
@@ -1332,8 +1334,8 @@ provider execution runs both f32 and f16 inputs with retention on/off, sufficien
 and zero capacity, and competing KV ownership, checking packed and unpacked
 results. The prior distinct-source regression now checks both products and
 reuse rather than merely rejecting the second source. Legacy transpose grants,
-ordinary shape-variant sharing, other scratch and performance measurements remain
-separate work.
+other scratch and performance measurements remain separate work. Ordinary
+shape-variant ownership is consolidated below.
 
 Validation on Apple M1 Max ARM64 macOS / Rust 1.98 / cached ORT: native CPU
 1,981 passed / 20 ignored, session 274 passed; optional-MLAS CPU 2,017 passed
@@ -1346,3 +1348,60 @@ concurrency controls plus the exact provider control ran with checked nonzero
 counts and passed; both CPU Clippy configurations passed again. The temporary
 baseline worktree is removed and raw logs retained. No performance/CUDA or
 other-ISA inference follows from these ownership tests.
+
+
+### Share ordinary preparation across a node's shape variants
+
+The four MatMul-prepack consumers now implement the existing Kernel constant-
+state sharing seam. A node-owned Arc contains dense f32 materializations,
+contiguous half copies, native SGEMM panels and transpose memos. Each compiled
+kernel keeps its own policy/flags, geometry, attributes and FLOP estimate. The
+executor's existing same-node state exchange performs adoption without adding
+MatMul knowledge to generic session code.
+
+A state is accepted only with the same immutable operand flags and exact
+DerivedWeightMemory source. Unrecognized state and retention-off/runtime-only
+variants decline sharing; foreign grant sources and incompatible flags report
+actionable errors. Node/session boundaries remain the executor's sharing scope,
+with fresh owners constructed for new nodes or sessions. Installed process-global
+transpose keys retire with the last shared preparation owner rather than the
+first evicted kernel, and active readers still retain actual payload grants.
+This changes transpose-key ownership, not transpose payload funding.
+
+The dense estimator now counts one copy per constant operand per node and
+removes its fixed shape multiplier. Its regression executes three shape
+variants, verifies one actual Host charge and numerical results, then checks
+exported-owner lifetime/final refund. Factory controls cover all four ops and
+both constant slots with a no-pressure authority and exactly one-payload budget.
+Other controls cover foreign-source/flag rejection, last-owner transpose
+retirement and actual native panel reuse across activation shapes.
+
+An end-to-end executor control exercises several activation widths with one
+and two graph nodes, then a second session on the same provider. It verifies
+node-local sharing, node/session isolation, one-copy prediction and final
+release. Pressure reclamation is unavailable in that fixture, so a repeat
+allocation cannot be hidden by eviction and a denied optional SGEMM pack cannot
+evict a peer's payload on another CPU backend. No kernel arithmetic, production
+backend default or performance claim changes in this step.
+
+Validation on Apple M1 Max ARM64 macOS / Rust 1.98 / cached ORT: native CPU
+1,984 passed / 20 ignored, session 275 passed; optional-MLAS CPU 2,021 passed
+/ 35 ignored, session 277 passed. Strict all-target Clippy passes for both
+crates/configurations; formatting and dispatch manifest/reachability/platform/
+feature checks pass. Session suites/Clippy were rerun after making the resource
+fixture pressure-independent for portable footprint measurement.
+
+The unchanged exact public-factory fixture fails on parent d65b889d8: the second
+shape kernel requests another 24-byte constant copy while the first holds the
+complete budget. After explicitly cleaning/rebuilding the CPU crate, the exact
+provider control, a 15-test MatMul group containing the three new owner controls,
+and the exact one-copy prediction control execute nonzero checked counts and
+pass. Both CPU Clippy configurations pass again. The baseline worktree and
+consumed editing helpers are removed; raw transcripts remain. These are
+ownership/correctness results, not performance or CUDA/other-ISA evidence.
+
+Downstream validation: engine load tests 29 passed and memory-strategy tests
+29 passed with `--no-default-features --features native-backend` and the cached
+ORT library. The first load filter selected zero tests and was rejected by the
+validation driver; the corrected `engine::load::` filter actually ran 29 tests.
+No zero-test result is counted as coverage.

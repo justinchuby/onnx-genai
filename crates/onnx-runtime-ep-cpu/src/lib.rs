@@ -116,7 +116,7 @@ pub use kernels::matmul::weight_transpose_cache_bytes;
 // declines it through CpuCacheRetention (kernels then transpose
 // per call and retain nothing).
 pub use kernels::matmul::weight_transpose_cache_predicted_bytes;
-// #1056: the per-kernel `MatMulPrepack::dense` widened-f32 cache is the fourth
+// #1056: the node-owned `MatMulPrepack::dense` widened-f32 cache is the fourth
 // resident, weight-scaled buffer brought under the plan. The plan budgets
 // `matmul_dense_cache_predicted_bytes` and, when it does not fit, declines it via
 // CpuCacheRetention (kernels then widen per call and retain
