@@ -161,10 +161,14 @@ fn content_only_stream_deltas_remain_content_with_stop_finish_reason() {
 }
 
 fn tiny_png_data_uri() -> String {
+    png_data_uri(3, 4)
+}
+
+fn png_data_uri(width: u32, height: u32) -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 
-    let image = RgbImage::from_pixel(3, 4, Rgb([64, 128, 255]));
+    let image = RgbImage::from_pixel(width, height, Rgb([64, 128, 255]));
     let mut png = Cursor::new(Vec::new());
     DynamicImage::ImageRgb8(image)
         .write_to(&mut png, ImageFormat::Png)
@@ -4216,6 +4220,19 @@ async fn sessions_open_and_close_for_an_interpreted_package() {
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
 }
 
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create package directory");
+    for entry in std::fs::read_dir(from).expect("read fixture") {
+        let entry = entry.expect("fixture entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy fixture file");
+        }
+    }
+}
+
 /// An interpreted package's conversation survives the HTTP boundary.
 ///
 /// A session is what a client holds across requests, so the property has to be
@@ -4227,18 +4244,6 @@ fn workflow_session_package(scratch: &tempfile::TempDir) -> PathBuf {
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
     let source = fixtures.join("onnx_genai_workflows/decoder");
     let destination = scratch.path().join("package");
-    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
-        std::fs::create_dir_all(to).expect("create package directory");
-        for entry in std::fs::read_dir(from).expect("read fixture") {
-            let entry = entry.expect("fixture entry");
-            let target = to.join(entry.file_name());
-            if entry.file_type().expect("file type").is_dir() {
-                copy_tree(&entry.path(), &target);
-            } else {
-                std::fs::copy(entry.path(), target).expect("copy fixture file");
-            }
-        }
-    }
     copy_tree(&source, &destination);
     // The conformance fixture ships no tokenizer because its conformance is
     // about the workflow. An HTTP completion is text, so this borrows the tiny
@@ -6624,6 +6629,84 @@ mod native_compat {
                 .unwrap()
                 .contains("voice")
         );
+    }
+
+    #[tokio::test]
+    async fn media_input_token_counts_match_real_multimodal_inference() {
+        let scratch = tempfile::tempdir().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let package = scratch.path().join("vlm");
+        copy_tree(&fixtures.join("onnx_genai_workflows/vlm"), &package);
+        std::fs::copy(
+            fixtures.join("tiny-llm/tokenizer.json"),
+            package.join("tokenizer.json"),
+        )
+        .unwrap();
+        let tokenizer_path = package.join("tokenizer.json");
+        let mut tokenizer: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tokenizer_path).unwrap()).unwrap();
+        tokenizer["added_tokens"] = json!([{"id":31,"content":"tok31","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}]);
+        std::fs::write(&tokenizer_path, serde_json::to_string(&tokenizer).unwrap()).unwrap();
+        let metadata_path = package.join("inference_metadata.yaml");
+        let mut metadata: Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
+        metadata["package"]["tokenizer"]["special_tokens"]["image_token_id"] = json!(31);
+        std::fs::write(&metadata_path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        let state = AppState::load(&package, Some("vlm-counter".into())).unwrap();
+        let router = app(state);
+        let image = png_data_uri(1, 1);
+        let messages = json!([{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":image}}]}]);
+        let template = request(
+            router.clone(),
+            "/apply-template",
+            json!({"messages":messages}),
+        )
+        .await;
+        assert_eq!(template.status(), StatusCode::OK);
+        assert!(
+            json_body(template).await["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("tok31")
+        );
+        let response = request(
+            router.clone(),
+            "/v1/chat/completions",
+            json!({"messages":messages,"max_tokens":1,"temperature":0}),
+        )
+        .await;
+        let status = response.status();
+        let generation = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{generation}");
+        let expected = generation["usage"]["prompt_tokens"].as_u64().unwrap();
+        assert!(
+            expected >= 4,
+            "expanded image must contribute its declared patch count"
+        );
+        for (path, body) in [
+            (
+                "/v1/chat/completions/input_tokens",
+                json!({"messages":messages}),
+            ),
+            (
+                "/v1/responses/input_tokens",
+                json!({"input":[{"role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":image}]}]}),
+            ),
+            (
+                "/v1/messages/count_tokens",
+                json!({"messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image","source":{"type":"url","url":image}}]}]}),
+            ),
+        ] {
+            let response = request(router.clone(), path, body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["input_tokens"], expected);
+            if path.contains("messages") {
+                assert!(body.get("object").is_none());
+            } else {
+                assert_eq!(body["object"], "response.input_tokens");
+            }
+        }
     }
 
     #[tokio::test]

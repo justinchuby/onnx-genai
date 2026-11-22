@@ -15,7 +15,7 @@ name or a successful empty response is not an implemented capability.
 - [x] Create working branch and draft PR; incorporate current main before further work.
 - [ ] Resumable SSE: byte-exact replay, explicit cancellation, replacement, bounded history, expiry, frontend refresh/reconnect.
 - [ ] Native completion/embedding/infill protocols and native request parameters.
-- [ ] Token-counting protocols using the inference prompt renderer.
+- [x] Token-counting protocols using the inference preparation path, including declared media.
 - [ ] Responses and Anthropic Messages, including tools and streamed event contracts.
 - [ ] Generation controls/sampling and reporting needed by the upstream frontend.
 - [ ] Capability-backed ranking, adapter and slot/state operations; audit the engine boundary before introducing transport support.
@@ -46,7 +46,7 @@ alternate protocols and their streamed usage; synthetic stream tests pin reasoni
 tool indices and incomplete-stream rejection.
 
 This milestone does not check off the full rows above: browser refresh/reconnect,
-media token counting, native batching/prefill-only, timing/progress, additional
+native batching/prefill-only, timing/progress, additional
 sampling and runtime-backed state/adapter/ranking work still need completion.
 
 Sampling follow-up: `logit_bias` now lowers OpenAI objects and native token/text
@@ -54,7 +54,7 @@ pairs into one typed engine processor, including explicit bans. Token vocabulary
 validation is shared by the server and engine. Real tiny-model generation and
 engine processor tests pass, including the greedy/device-shortcut guard.
 
-Latest verified checkpoint: server library 367 passed / 2 inherited ignores,
+Latest verified checkpoint: server library 369 passed / 2 inherited ignores,
 4 protocol-history tests, real logit-bias HTTP and engine tests, 6 DRY engine
 tests, and the multi-token DRY request mapping test pass. Strict server all-target
 Clippy passes. The real Chrome smoke now verifies chat, persisted conversation
@@ -67,3 +67,12 @@ speech workflow and returns real PCM WAV. Explicit raw prompts bypass text
 assembly while retaining resource limits. Unsupported voice and synthesis fields
 are rejected, including on the OpenAI speech API. All 13 selected speech tests
 pass, including actual native synthesis; strict server all-target Clippy passes.
+
+Media-counting follow-up: buffered/streamed chat and all token counters now use
+one input-preparation path, including tool admission and declared media expansion.
+The fallback prompt formatter and `/apply-template` preserve image placeholders
+for packages without a chat template. An executable hermetic VLM HTTP test proves
+that Chat, Responses and Anthropic media counts equal real generation usage;
+the OpenAI count routes also return the required response.input_tokens object.
+Full server validation: 369 passed, 2 inherited ignores; strict all-target
+Clippy passes.

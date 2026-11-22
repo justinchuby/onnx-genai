@@ -320,13 +320,13 @@ pub(crate) async fn model_events(State(state): State<AppState>) -> Result<Respon
         .into_response())
 }
 
-/// Count the exact text prompt rendered for inference, without spending a generation.
+/// Count the exact prompt prepared for inference, including declared media, without spending a generation.
 pub(crate) async fn input_tokens(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<ChatCompletionRequest>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(
-        json!({"input_tokens": count_input_tokens(&state, &request).await?}),
+        json!({"object":"response.input_tokens", "input_tokens": count_input_tokens(&state, &request).await?}),
     ))
 }
 
@@ -335,24 +335,6 @@ pub(super) async fn count_input_tokens(
     request: &ChatCompletionRequest,
 ) -> Result<usize, ApiError> {
     validate_extensions(request)?;
-    if !request.image_urls().is_empty() || !request.input_audio().is_empty() {
-        return Err(ApiError::invalid_request(
-            "input token counting for media requires expanded model preprocessing; use text-only messages for this endpoint",
-        ));
-    }
     let handle = resolve_model(&state.registry, &request.model).await?;
-    let prompt = super::completions::render_model_prompt(
-        request,
-        &handle,
-        state.config.default_reasoning_effort,
-    )
-    .map_err(|err| {
-        ApiError::invalid_request(format!("input token prompt rendering failed: {err}"))
-    })?;
-    let count = handle
-        .tokenizer
-        .encode(&prompt)
-        .map_err(|err| ApiError::invalid_request(format!("input tokenization failed: {err}")))?
-        .len();
-    Ok(count)
+    super::completions::count_model_input_tokens(request, &handle, &state.config).await
 }

@@ -337,76 +337,68 @@ pub(crate) async fn chat_completions(
     super::llama::validate_extensions(&request)?;
     let handle = resolve_model(&state.registry, &request.model).await?;
     request.model = handle.id.clone();
-    tool_protocol::validate_request(
-        &request,
-        handle.tool_protocol.as_ref(),
-        handle.tool_protocol_metadata_path.as_deref(),
-    )
-    .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let requested_session_id = session_id_from_headers(&headers)?;
     // The session header names a conversation. Which runtime state continues it
     // — a decode core's paged KV sequence, or the interpreter's session-scoped
     // cells — is the engine's business, and it resolves that itself.
     let session_id = requested_session_id;
+    if request.stream {
+        Ok(stream_chat_completion(state, handle, request, session_id)
+            .await?
+            .into_response())
+    } else {
+        let response = run_chat_completion(state, handle, request, session_id).await?;
+        Ok(Json(response).into_response())
+    }
+}
+
+struct PreparedChatInput {
+    prepared: PreparedGenerateRequest,
+    pipeline_input: Option<MultimodalInput>,
+}
+
+// Inference and token counting must prepare the same tokenizer prompt and media
+// expansion. Only inference reserves output context or opens a session.
+async fn prepare_chat_input(
+    request: &ChatCompletionRequest,
+    handle: &ModelHandle,
+    config: &ServerConfig,
+    has_session: bool,
+    output_budget: usize,
+    media_reservation: usize,
+) -> Result<PreparedChatInput, ApiError> {
+    tool_protocol::validate_request(
+        request,
+        handle.tool_protocol.as_ref(),
+        handle.tool_protocol_metadata_path.as_deref(),
+    )
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let image_urls = request.image_urls();
     let input_audio = request.input_audio();
-    // One admission policy, shared with the CLI, so both front ends accept and
-    // reject the same inputs with the same explanation.
     crate::multimodal::admit_attachments(
         handle.multimodal.as_ref(),
         &format!("model '{}'", handle.id),
         image_urls.len(),
         input_audio.len(),
     )
-    .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
-
-    if request.stream {
-        Ok(
-            stream_chat_completion(state, handle, request, session_id, image_urls, input_audio)
-                .await?
-                .into_response(),
-        )
-    } else {
-        let response =
-            run_chat_completion(state, handle, request, session_id, image_urls, input_audio)
-                .await?;
-        Ok(Json(response).into_response())
-    }
-}
-
-async fn run_chat_completion(
-    state: AppState,
-    handle: Arc<ModelHandle>,
-    request: ChatCompletionRequest,
-    client_session_id: Option<String>,
-    image_urls: Vec<String>,
-    input_audio: Vec<InputAudio>,
-) -> Result<ChatCompletionResponse, ApiError> {
-    let id = completion_id();
-    let created = now_unix();
-    let model = request.model.clone();
-    let requested_top_logprobs = request
-        .logprobs
-        .then_some(request.top_logprobs.unwrap_or(0));
-    let tokenizer = handle.tokenizer.clone();
-    let placeholder = positional_image_placeholder(&request, &handle);
-    let output_budget = request.output_budget(state.config.max_output_tokens);
+    .map_err(|err| ApiError::invalid_request(format!("{err:#}")))?;
+    let placeholder = positional_image_placeholder(request, handle);
     let mut prepared = prepare_generate_request(
-        &request,
+        request,
         &handle.tokenizer,
-        client_session_id.is_some(),
+        has_session,
         &PromptContext {
             chat_template: handle.chat_template.as_deref(),
             tool_protocol: handle.tool_protocol.as_ref(),
             image_placeholder: placeholder.as_deref(),
             generation_defaults: handle.generation_defaults.as_ref(),
-            default_reasoning_effort: state.config.default_reasoning_effort,
+            default_reasoning_effort: config.default_reasoning_effort,
         },
         output_budget,
     )
-    .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+    .map_err(|err| ApiError::invalid_request(format!("prompt preparation failed: {err}")))?;
     if !input_audio.is_empty() {
-        prepared = prepare_audio_generate_request(&request, &handle.tokenizer, output_budget)?;
+        prepared = prepare_audio_generate_request(request, &handle.tokenizer, output_budget)?;
     }
     let pipeline_input = if !image_urls.is_empty() {
         Some(
@@ -423,15 +415,59 @@ async fn run_chat_completion(
                     })?,
                 &mut prepared,
                 handle.model_max_context,
-                reserved_output_tokens(&request, state.config.max_output_tokens),
+                media_reservation,
             )
             .await?,
         )
     } else if let Some(audio) = input_audio.first() {
-        Some(preprocess_chat_audio(audio, &handle)?)
+        Some(preprocess_chat_audio(audio, handle)?)
     } else {
         None
     };
+    Ok(PreparedChatInput {
+        prepared,
+        pipeline_input,
+    })
+}
+
+pub(super) async fn count_model_input_tokens(
+    request: &ChatCompletionRequest,
+    handle: &ModelHandle,
+    config: &ServerConfig,
+) -> Result<usize, ApiError> {
+    validate_request(request, config)?;
+    Ok(prepare_chat_input(request, handle, config, false, 1, 0)
+        .await?
+        .prepared
+        .prompt_tokens)
+}
+
+async fn run_chat_completion(
+    state: AppState,
+    handle: Arc<ModelHandle>,
+    request: ChatCompletionRequest,
+    client_session_id: Option<String>,
+) -> Result<ChatCompletionResponse, ApiError> {
+    let id = completion_id();
+    let created = now_unix();
+    let model = request.model.clone();
+    let requested_top_logprobs = request
+        .logprobs
+        .then_some(request.top_logprobs.unwrap_or(0));
+    let tokenizer = handle.tokenizer.clone();
+    let output_budget = request.output_budget(state.config.max_output_tokens);
+    let PreparedChatInput {
+        prepared,
+        pipeline_input,
+    } = prepare_chat_input(
+        &request,
+        &handle,
+        &state.config,
+        client_session_id.is_some(),
+        output_budget,
+        reserved_output_tokens(&request, state.config.max_output_tokens),
+    )
+    .await?;
     // The conversation is counted before admission, because the tokens this
     // turn is prefilled with are the conversation plus the request. The session
     // itself is opened after, so a rejected request neither strands one nor
@@ -570,8 +606,6 @@ async fn stream_chat_completion(
     handle: Arc<ModelHandle>,
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
-    image_urls: Vec<String>,
-    input_audio: Vec<InputAudio>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
     let id = completion_id();
     let created = now_unix();
@@ -585,49 +619,19 @@ async fn stream_chat_completion(
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
-    let placeholder = positional_image_placeholder(&request, &handle);
     let output_budget = request.output_budget(state.config.max_output_tokens);
-    let mut prepared = prepare_generate_request(
+    let PreparedChatInput {
+        prepared,
+        pipeline_input,
+    } = prepare_chat_input(
         &request,
-        &handle.tokenizer,
+        &handle,
+        &state.config,
         client_session_id.is_some(),
-        &PromptContext {
-            chat_template: handle.chat_template.as_deref(),
-            tool_protocol: handle.tool_protocol.as_ref(),
-            image_placeholder: placeholder.as_deref(),
-            generation_defaults: handle.generation_defaults.as_ref(),
-            default_reasoning_effort: state.config.default_reasoning_effort,
-        },
         output_budget,
+        reserved_output_tokens(&request, state.config.max_output_tokens),
     )
-    .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
-    if !input_audio.is_empty() {
-        prepared = prepare_audio_generate_request(&request, &handle.tokenizer, output_budget)?;
-    }
-    let pipeline_input = if !image_urls.is_empty() {
-        Some(
-            preprocess_chat_images(
-                &image_urls,
-                handle
-                    .multimodal
-                    .as_ref()
-                    .and_then(|multimodal| multimodal.vision.as_ref())
-                    .ok_or_else(|| {
-                        ApiError::bad_request(
-                            "image input requires a model with a declared vision input",
-                        )
-                    })?,
-                &mut prepared,
-                handle.model_max_context,
-                reserved_output_tokens(&request, state.config.max_output_tokens),
-            )
-            .await?,
-        )
-    } else if let Some(audio) = input_audio.first() {
-        Some(preprocess_chat_audio(audio, &handle)?)
-    } else {
-        None
-    };
+    .await?;
     // Taken before anything this request does can queue behind the turn it would
     // conflict with — including the carry read below, which is itself a command
     // to the worker running that turn.
@@ -1677,6 +1681,7 @@ pub fn build_generate_request_with_protocol(
         prompt: GeneratePrompt::Text(build_prompt_with_tool_prefix(
             request,
             &rendered.fallback_prefix,
+            None,
         )),
         options,
     })
@@ -2224,12 +2229,13 @@ pub(super) fn render_model_prompt(
     handle: &ModelHandle,
     default_reasoning_effort: Option<ReasoningEffort>,
 ) -> anyhow::Result<String> {
+    let placeholder = positional_image_placeholder(request, handle);
     render_prompt(
         request,
         &PromptContext {
             chat_template: handle.chat_template.as_deref(),
             tool_protocol: handle.tool_protocol.as_ref(),
-            image_placeholder: None,
+            image_placeholder: placeholder.as_deref(),
             generation_defaults: handle.generation_defaults.as_ref(),
             default_reasoning_effort,
         },
@@ -2273,17 +2279,25 @@ fn render_prompt(
         .transpose()
         .map_err(|error| anyhow::anyhow!("{error}"))?
         .map_or_else(String::new, |rendered| rendered.fallback_prefix);
-    Ok(build_prompt_with_tool_prefix(request, &prefix))
+    Ok(build_prompt_with_tool_prefix(
+        request,
+        &prefix,
+        context.image_placeholder,
+    ))
 }
 
 /// Build the Phase 2 chat prompt with a simple role-tagged template:
 /// `<|role|>\n{content}\n` for every message, followed by `<|assistant|>\n`.
 /// Model-specific templates will replace this once tokenizer chat templates are wired.
 pub fn build_prompt(request: &ChatCompletionRequest) -> String {
-    build_prompt_with_tool_prefix(request, "")
+    build_prompt_with_tool_prefix(request, "", None)
 }
 
-fn build_prompt_with_tool_prefix(request: &ChatCompletionRequest, tool_prefix: &str) -> String {
+fn build_prompt_with_tool_prefix(
+    request: &ChatCompletionRequest,
+    tool_prefix: &str,
+    image_placeholder: Option<&str>,
+) -> String {
     let mut prompt = String::new();
     prompt.push_str(tool_prefix);
     for message in &request.messages {
@@ -2296,7 +2310,7 @@ fn build_prompt_with_tool_prefix(request: &ChatCompletionRequest, tool_prefix: &
             prompt.push('\n');
         }
         if let Some(content) = &message.content {
-            prompt.push_str(&content.text());
+            prompt.push_str(&content.render(image_placeholder));
         }
         if let Some(tool_calls) = &message.tool_calls {
             if message.content.is_some() {

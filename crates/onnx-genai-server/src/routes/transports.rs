@@ -43,7 +43,10 @@ pub(crate) async fn messages_tokens(
     ApiJson(mut body): ApiJson<Map<String, Value>>,
 ) -> Result<Json<Value>, ApiError> {
     body.entry("max_tokens").or_insert(json!(1));
-    super::llama::input_tokens(State(state), ApiJson(anthropic_request(body)?)).await
+    let request = anthropic_request(body)?;
+    Ok(Json(
+        json!({"input_tokens": super::llama::count_input_tokens(&state, &request).await?}),
+    ))
 }
 
 fn required(body: &mut Map<String, Value>, key: &str) -> Result<Value, ApiError> {

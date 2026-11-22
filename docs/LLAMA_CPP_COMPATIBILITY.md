@@ -31,7 +31,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/embedding`, `/embeddings` | Native pooled embeddings with requested normalization |
 | POST | `/v1/responses`, `/responses` | Responses wire adapter over admitted chat generation |
 | POST | `/v1/messages` | Anthropic Messages wire adapter over admitted chat generation |
-| POST | `/v1/chat/completions/input_tokens`, `/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/responses/input_tokens`, `/v1/messages/count_tokens` | Text prompt token counts from the inference renderer |
+| POST | `/v1/chat/completions/input_tokens`, `/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/responses/input_tokens`, `/v1/messages/count_tokens` | Input token counts from the shared inference preparation path |
 | GET, DELETE | `/v1/stream` | Byte-offset replay or explicit producer cancellation by `conv_id` |
 | POST | `/v1/streams/lookup` | Lookup only requested conversation IDs, including model-qualified IDs |
 | POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Existing multipart transcription contract |
@@ -87,8 +87,9 @@ Requests without a conversation ID retain disconnect-cancels behavior.
 Native generation accepts one text prompt or one token-ID row. Prompt batches,
 `n_predict=0`, and infill extra files require further engine support. Native
 embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
-remain zero. Token-counting routes currently reject media because expanded media
-tokens must be counted after model preprocessing. Anthropic streaming receives
+remain zero. Token-counting routes use the same prompt renderer and declared media expansion
+as generation. They validate attachments and tool capability without executing a
+generation. Anthropic streaming receives
 the actual admitted prompt count (including media/session expansion) from the
 shared chat transaction, carried in its first chunk as `nxrt_prompt_tokens`.
 
