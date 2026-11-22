@@ -1,0 +1,34 @@
+{
+  "binary_sha256": "b18bbf7a40a01f10ec58c7af56a9b061fcd11a510e9a4c1268d56be342372955",
+  "tool": "Homebrew LLVM version 23.1.5\n  Optimized build.\n\n\n  Registered Targets:\n    aarch64     - AArch64 (little endian)\n    aarch64_32  - AArch64 (little endian ILP32)\n    aarch64_be  - AArch64 (big endian)\n    amdgcn      - legacy name for amdgpu\n    amdgpu      - AMDGPU gfx6+\n    arm         - ARM\n    arm64       - ARM64 (little endian)\n    arm64_32    - ARM64 (little endian ILP32)\n    armeb       - ARM (big endian)\n    avr         - Atmel AVR Microcontroller\n    bpf         - BPF (host endian)\n    bpfeb       - BPF (big endian)\n    bpfel       - BPF (little endian)\n    hexagon     - Hexagon\n    lanai       - Lanai\n    loongarch32 - 32-bit LoongArch\n    loongarch64 - 64-bit LoongArch\n    mips        - MIPS (32-bit big endian)\n    mips64      - MIPS (64-bit big endian)\n    mips64el    - MIPS (64-bit little endian)\n    mipsel      - MIPS (32-bit little endian)\n    msp430      - MSP430 [experimental]\n    nvptx       - NVIDIA PTX 32-bit\n    nvptx64     - NVIDIA PTX 64-bit\n    ppc32       - PowerPC 32\n    ppc32le     - PowerPC 32 LE\n    ppc64       - PowerPC 64\n    ppc64le     - PowerPC 64 LE\n    r600        - AMD GPUs HD2XXX-HD6XXX\n    riscv32     - 32-bit RISC-V\n    riscv32be   - 32-bit big endian RISC-V\n    riscv64     - 64-bit RISC-V\n    riscv64be   - 64-bit big endian RISC-V\n    sparc       - Sparc\n    sparcel     - Sparc LE\n    sparcv9     - Sparc V9\n    spirv       - SPIR-V Logical\n    spirv32     - SPIR-V 32-bit\n    spirv64     - SPIR-V 64-bit\n    systemz     - SystemZ\n    thumb       - Thumb\n    thumbeb     - Thumb (big endian)\n    ve          - VE\n    wasm32      - WebAssembly 32-bit\n    wasm64      - WebAssembly 64-bit\n    x86         - 32-bit X86: Pentium-Pro and above\n    x86-64      - 64-bit X86: EM64T and AMD64\n    xcore       - XCore\n",
+  "functions": [
+    {
+      "symbol": "__RNvNtNtNtCs4tTNrPFh6HF_19onnx_runtime_ep_cpu7kernels16simd_activations8neon_erf4gelu",
+      "start": "0x100306da4",
+      "stop": "0x1003076e0",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4298141092",
+        "--stop-address=4298143456",
+        "/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-4eb308943a07ad35"
+      ],
+      "artifact": "gelu.disasm.gz",
+      "uncompressed_sha256": "786325feb20b335b6258f27d6a3b17e1d4476f3b251ae41189d96b35c22cb611"
+    },
+    {
+      "symbol": "__RNvNtNtNtCs4tTNrPFh6HF_19onnx_runtime_ep_cpu7kernels16simd_activations8neon_erf18gelu_single_before",
+      "start": "0x100305f9c",
+      "stop": "0x1003064f4",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4298137500",
+        "--stop-address=4298138868",
+        "/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-4eb308943a07ad35"
+      ],
+      "artifact": "gelu_single_before.disasm.gz",
+      "uncompressed_sha256": "6c50563b0751970e03ed14c1769dae9ffc5856bf9e4cde7f1488eee2be0e257c"
+    }
+  ]
+}

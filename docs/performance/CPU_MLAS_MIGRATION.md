@@ -265,6 +265,21 @@ gap without graduating the family or removing its optional reference. BiasGelu
 bitwise consistency is tested; its latency and end-to-end models were not
 measured. The existing numerical bounds and NaN/signed-zero policies remain.
 
+The [NaN propagation follow-up](../benchmarks/2026-11-21-neon-erf-nan.md) removes
+redundant NEON masking/repair while preserving every f32 NaN payload/sign and
+before/after output bits. Qualified M1 Max cells with at least 257 elements
+show about 7–12% less wall time than the previous NEON body. All 18900 samples
+are retained; 179/180 cells pass A/A and one large runtime GELU cell is
+performance-unqualified. MLAS still wins some qualified cells, so the family
+and its optional reference remain.
+
+A [paired-vector loop experiment](../benchmarks/2026-11-21-neon-erf-paired.md)
+was rejected: all 180 A/A cells pass, but small M1 Max Erf/GELU calls regress
+and larger cases show no repeatable improvement. The candidate and 18900 raw
+samples remain reproducible; production retains the single-vector loop. Generated
+GELU code has a larger stack frame and more spills, so simple unrolling is not
+an evidence-backed next step for this implementation.
+
 Generic f32 GEMM's thin-M column-parallel path now borrows the original B
 stride and caller-owned output rows. It retains the same scalar register tiles
 and K-panel accumulation order, replacing full B/output element copies with

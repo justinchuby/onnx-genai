@@ -3320,10 +3320,28 @@ mod tests {
     /// culprit. We therefore recover the guard from a poisoned mutex: the
     /// offending test still reports its own failure, but the remaining tests
     /// continue to run and report honestly (one failure stays one failure).
-    fn hold_metrics_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        metrics_test_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    struct MetricsTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for MetricsTestGuard {
+        fn drop(&mut self) {
+            // TLS destructors run after the test function returns, when a bare
+            // mutex guard has already let the next test reset process gauges.
+            // Retire this thread's resources while the metrics lock is held.
+            // Drop payloads outside the RefCell borrow for accountant callbacks.
+            let old = TEST_RESOURCES
+                .with(|resources| resources.replace(crate::CpuMemoryResources::default()));
+            drop(old);
+        }
+    }
+
+    fn hold_metrics_test_lock() -> MetricsTestGuard {
+        MetricsTestGuard {
+            _lock: metrics_test_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
     }
 
     thread_local! {
@@ -4669,6 +4687,29 @@ mod tests {
         );
         drop(active);
         assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn metrics_guard_retires_thread_local_residency_before_unlock() {
+        {
+            let _guard = hold_metrics_test_lock();
+            reset_offload_test_state(4);
+            for _ in 0..2 {
+                drop(
+                    test_resources()
+                        .expert_cache()
+                        .lease(cache_key(0), 4, || Ok(expert_payload(1.0)))
+                        .unwrap(),
+                );
+            }
+            assert_eq!(crate::weight_offload_stats().owned_host_cache_bytes, 4);
+        }
+        // Do not reset metrics here: a later test must not inherit a cache
+        // whose eventual thread-local drop subtracts from that test's books.
+        let _next = hold_metrics_test_lock();
+        let stats = crate::weight_offload_stats();
+        assert_eq!(stats.owned_host_cache_bytes, 0);
+        assert_eq!(stats.host_cache_budget_bytes, 0);
     }
 
     #[test]
