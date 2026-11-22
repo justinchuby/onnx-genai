@@ -2,6 +2,10 @@
 //! `Sigmoid`, `Erf`, `Gelu` in both its exact and tanh forms, `FastGelu`,
 //! `QuickGelu`, `BiasGelu`).
 //!
+//! The MLAS-derived algorithms and coefficients retain Microsoft's MIT
+//! copyright and permission notice in this crate's `MLAS_LICENSE`, independently
+//! of the optional reference/vendor crate.
+//!
 //! # Why this exists
 //!
 //! The scalar kernels evaluate one `libm` transcendental per element. On this

@@ -1352,8 +1352,8 @@ mod silu_bench {
         }
         let width = crate::task_runtime::testing::pool_width();
         assert_eq!(width, crate::task_runtime::width());
-        let runs: [fn(&[f32], &mut [f32]); 3] =
-            [silu_f32_slice, silu_native_f32_slice, silu_native_f32_slice];
+        type SliceKernel = fn(&[f32], &mut [f32]);
+        let runs: [SliceKernel; 3] = [silu_f32_slice, silu_native_f32_slice, silu_native_f32_slice];
         println!("SILU_CSV,width,mode,pattern,n,rep,order,arm,iters,cpu_ns,wall_ns");
         for serial in [true, false] {
             for pattern in ["in_band", "sparse_repairs", "dense_negative_tail"] {
