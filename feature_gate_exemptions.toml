@@ -30,7 +30,7 @@
 [[exemption]]
 op = "GlobalPool"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/pooling.rs"
-line = 481
+line = 487
 feature = "mlas"
 reason = "GlobalPool: 1 node per model (MobileNetV2, ResNet), operates on small spatial tensors (typically 7×7 or 1×1) at network end. Scalar iteration over ≤49 elements is negligible share of runtime — LLVM auto-vectorizes the sum/max reduction. Not worth a dedicated SIMD path."
 reviewed_by = "resch"

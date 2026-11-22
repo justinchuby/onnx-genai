@@ -395,22 +395,22 @@ mod tests {
 
     // ─── Dispatch reachability ───────────────────────────────────────────
 
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(any(feature = "mlas", target_os = "macos", target_os = "ios"))]
     #[test]
     fn add_contiguous_f32_same_shape_uses_selected_backend() {
         use std::sync::atomic::Ordering;
         #[cfg(feature = "mlas")]
-        let counter = &super::ADD_MLAS_REF_TEST_HITS;
+        let read_hits = || super::ADD_MLAS_REF_TEST_HITS.load(Ordering::Relaxed);
         #[cfg(not(feature = "mlas"))]
-        let counter = &super::ADD_VDSP_TEST_HITS;
-        let before = counter.load(Ordering::Relaxed);
+        let read_hits = || super::ADD_VDSP_TEST_HITS.load(Ordering::Relaxed);
+        let before = read_hits();
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let b = Owned::f32(&[2, 3], &[10., 20., 30., 40., 50., 60.]);
         let mut out = Owned::zeros_f32(&[2, 3]);
         AddKernel
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
-        let after = counter.load(Ordering::Relaxed);
+        let after = read_hits();
         assert!(
             after > before,
             "Contiguous f32 same-shape Add did not reach the selected MLAS/vDSP path"

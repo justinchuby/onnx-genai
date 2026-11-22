@@ -1300,15 +1300,15 @@ mod tests {
 
     // ─── Dispatch reachability ───────────────────────────────────────────
 
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(any(feature = "mlas", target_os = "macos", target_os = "ios"))]
     #[test]
     fn max_pool_2d_no_padding_uses_selected_backend() {
         use std::sync::atomic::Ordering;
         #[cfg(feature = "mlas")]
-        let counter = &super::POOL_MLAS_REF_TEST_HITS;
+        let read_hits = || super::POOL_MLAS_REF_TEST_HITS.load(Ordering::Relaxed);
         #[cfg(not(feature = "mlas"))]
-        let counter = &super::POOL_BNNS_TEST_HITS;
-        let before = counter.load(Ordering::Relaxed);
+        let read_hits = || super::POOL_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        let before = read_hits();
         let x = Owned::f32(
             &[1, 1, 4, 4],
             &(1..=16).map(|v| v as f32).collect::<Vec<_>>(),
@@ -1323,7 +1323,7 @@ mod tests {
         };
         let mut out = Owned::zeros_f32(&[1, 1, 2, 2]);
         kernel.execute(&[x.view()], &mut [out.view_mut()]).unwrap();
-        let after = counter.load(Ordering::Relaxed);
+        let after = read_hits();
         assert!(
             after > before,
             "MaxPool 2D undilated did not reach the selected MLAS/BNNS path"
@@ -1331,15 +1331,15 @@ mod tests {
         assert_eq!(out.to_f32(), vec![6.0, 8.0, 14.0, 16.0]);
     }
 
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(any(feature = "mlas", target_os = "macos", target_os = "ios"))]
     #[test]
     fn max_pool_2d_with_padding_uses_selected_backend() {
         use std::sync::atomic::Ordering;
         #[cfg(feature = "mlas")]
-        let counter = &super::POOL_MLAS_REF_TEST_HITS;
+        let read_hits = || super::POOL_MLAS_REF_TEST_HITS.load(Ordering::Relaxed);
         #[cfg(not(feature = "mlas"))]
-        let counter = &super::POOL_BNNS_TEST_HITS;
-        let before = counter.load(Ordering::Relaxed);
+        let read_hits = || super::POOL_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        let before = read_hits();
         let x = Owned::f32(
             &[1, 1, 4, 4],
             &(1..=16).map(|v| v as f32).collect::<Vec<_>>(),
@@ -1354,7 +1354,7 @@ mod tests {
         };
         let mut out = Owned::zeros_f32(&[1, 1, 2, 2]);
         kernel.execute(&[x.view()], &mut [out.view_mut()]).unwrap();
-        let after = counter.load(Ordering::Relaxed);
+        let after = read_hits();
         assert!(
             after > before,
             "MaxPool 2D with padding did not reach the selected MLAS/BNNS path"
