@@ -204,10 +204,22 @@ covers KV competition and retry with byte-identical outputs;
 simultaneous builders obtain the same payload under a one-pack budget.
 
 The cache remains per kernel: prefill/decode instances can still hold separate
-packs, each charged independently. Cross-instance sharing and pressure-driven
-idle reclamation remain work; this does not graduate QLinearMatMul or retire
-its MLAS reference. The governed amount is the packed payload, not all transient
-operand/output or accumulator storage.
+packs, each charged independently. Each cache enrolls weakly in the same Host
+pressure domain. Ordinary KV reservation/growth and another weight admission
+can evict its entire idle packed payload; active Arc owners prevent eviction.
+Reclamation removes the entry under its state lock and releases the payload
+and grant after unlocking. Construction is serialized separately, so admission
+can synchronously visit the requesting cache without deadlocking. An evicted
+entry can be rebuilt on later use, or run unpacked while capacity is occupied.
+The bounded `qlinear_pack_pressure_reclaims_idle_without_deadlocking_builders`
+parent runs a named child that exercises self-callback admission, KV reserve
+and growth, active-owner exclusion, zero-pressure no-op, unrelated authorities,
+rebuild and weak registration lifetime. The old implementation fails the idle
+KV-reservation case; a deliberate admission-under-state-lock fault is rejected
+by the named parent after its child reaches self-cache admission and times out.
+Cross-instance sharing remains work; this does not graduate QLinearMatMul or
+retire its MLAS reference. The governed amount is the packed payload, not all
+transient operand/output or accumulator storage.
 
 ### Retired reference capabilities
 
