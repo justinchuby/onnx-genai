@@ -534,9 +534,11 @@ pub(crate) struct MatMulPrepack {
     dense: [DenseWeightCache<MatMulDenseKey>; 2],
     #[cfg(feature = "mlas")]
     packed_b: OnceLock<mlas_sys::PackedB>,
+    #[cfg(feature = "mlas")]
+    packed_build: std::sync::Mutex<()>,
     /// MLAS-packed f32 panel built once from a constant **f16** B weight.
     ///
-    /// The widened f32 copy is a temporary: it is consumed by `PackedB::new`
+    /// The widened f32 copy is a temporary: it is consumed by `PackedBPlan::pack`
     /// and dropped, so this costs one packed panel rather than the packed panel
     /// plus a permanent 4*K*N dense copy the way `dense[1]` + `packed_b` would.
     #[cfg(feature = "mlas")]
@@ -692,6 +694,8 @@ impl MatMulPrepack {
             ],
             #[cfg(feature = "mlas")]
             packed_b: OnceLock::new(),
+            #[cfg(feature = "mlas")]
+            packed_build: std::sync::Mutex::new(()),
             #[cfg(feature = "mlas")]
             packed_b_from_half: OnceLock::new(),
             transposed_b: OnceLock::new(),
@@ -1038,11 +1042,26 @@ impl MatMulPrepack {
                 .as_ref()
                 .and_then(|(cached_key, packed)| (*cached_key == key).then_some(packed)));
         }
+        let _fill = self.packed_build.lock().map_err(|_| EpError::KernelFailed(
+            "MatMul MLAS packed-weight construction lock was poisoned; recreate the CPU kernel before retrying".into()
+        ))?;
+        if let Some(cached) = self.packed_b_from_half.get() {
+            return Ok(cached
+                .as_ref()
+                .and_then(|(cached_key, packed)| (*cached_key == key).then_some(packed)));
+        }
+        let plan = mlas_sys::PackedBPlan::new(n, k).map_err(|source| EpError::Backend {
+            operation: "MatMul MLAS half-weight packing plan",
+            source: Box::new(source),
+        })?;
         let widened = to_dense_f32_widen("MatMul", view)?;
         if key.numel() != Some(widened.len()) {
             return Ok(None);
         }
-        let packed = mlas_sys::PackedB::new(n, k, &widened);
+        let packed = plan.pack(&widened).map_err(|source| EpError::Backend {
+            operation: "MatMul MLAS half-weight packing",
+            source: Box::new(source),
+        })?;
         drop(widened);
         Ok(self
             .packed_b_from_half
@@ -1066,11 +1085,54 @@ impl MatMulPrepack {
     }
 
     #[cfg(feature = "mlas")]
-    fn packed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&mlas_sys::PackedB> {
-        (self.retain_caches && self.constant_inputs[1]).then(|| {
-            self.packed_b
-                .get_or_init(|| mlas_sys::PackedB::new(n, k, b))
-        })
+    fn packed_b(&self, b: &[f32], k: usize, n: usize) -> Result<Option<&mlas_sys::PackedB>> {
+        if !self.retain_caches || !self.constant_inputs[1] {
+            return Ok(None);
+        }
+        let expected = n.checked_mul(k).ok_or_else(|| EpError::Backend {
+            operation: "MatMul MLAS constant B packing",
+            source: Box::new(mlas_sys::SgemmPackError::Geometry {
+                n,
+                k,
+                reason: "logical element count overflows usize",
+            }),
+        })?;
+        if b.len() != expected {
+            return Err(EpError::Backend {
+                operation: "MatMul MLAS constant B packing",
+                source: Box::new(mlas_sys::SgemmPackError::Length {
+                    expected,
+                    actual: b.len(),
+                }),
+            });
+        }
+        let cached = || -> Result<Option<&mlas_sys::PackedB>> {
+            let Some(packed) = self.packed_b.get() else {
+                return Ok(None);
+            };
+            if packed.dimensions() != (k, n) {
+                return Err(EpError::KernelFailed(format!(
+                    "MatMul MLAS packed B has dimensions {:?}, requested K={k}, N={n}; recreate the shape-specific kernel for a different constant layout",
+                    packed.dimensions()
+                )));
+            }
+            Ok(Some(packed))
+        };
+        if let Some(packed) = cached()? {
+            return Ok(Some(packed));
+        }
+        let _fill = self.packed_build.lock().map_err(|_| EpError::KernelFailed(
+            "MatMul MLAS packed-weight construction lock was poisoned; recreate the CPU kernel before retrying".into()
+        ))?;
+        if let Some(packed) = cached()? {
+            return Ok(Some(packed));
+        }
+        let packed = mlas_sys::PackedB::new(n, k, b).map_err(|source| EpError::Backend {
+            operation: "MatMul MLAS constant B packing",
+            source: Box::new(source),
+        })?;
+        let _ = self.packed_b.set(packed);
+        Ok(self.packed_b.get())
     }
 }
 
@@ -3824,7 +3886,10 @@ fn matmul_dense_into_with_backend(
 
     #[cfg(feature = "mlas")]
     let packed_b = if backend == CpuBackend::Mlas && geom.b_promoted_rank == 2 {
-        prepack.and_then(|prepack| prepack.packed_b(b_dense, k, n))
+        prepack
+            .map(|prepack| prepack.packed_b(b_dense, k, n))
+            .transpose()?
+            .flatten()
     } else {
         None
     };
@@ -6191,6 +6256,26 @@ mod tests {
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             let _ = m;
         }
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_pack_failure_preserves_context_and_can_retry_before_warm_validation() {
+        let mut prepack = MatMulPrepack::new(CpuMemoryResources::default());
+        prepack.set_constant_inputs(&[false, true]);
+        let error = prepack.packed_b(&[], 5, 3).err().unwrap();
+        assert!(error.to_string().contains("MatMul MLAS constant B packing"));
+        assert!(error.to_string().contains("expected 15"));
+        assert!(prepack.packed_b.get().is_none());
+        let first = prepack.packed_b(&[0.25; 15], 5, 3).unwrap().unwrap() as *const _;
+        let second = prepack.packed_b(&[0.25; 15], 5, 3).unwrap().unwrap() as *const _;
+        assert_eq!(first, second);
+        assert!(
+            prepack.packed_b(&[], 5, 3).is_err(),
+            "warm hits still validate source extent"
+        );
+        let error = prepack.packed_b(&[0.25; 15], 3, 5).err().unwrap();
+        assert!(error.to_string().contains("shape-specific kernel"));
     }
 
     #[cfg(feature = "mlas")]

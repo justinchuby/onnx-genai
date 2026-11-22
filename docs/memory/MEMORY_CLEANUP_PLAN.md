@@ -866,3 +866,29 @@ negative strides/offsets, concurrent construction, active-reader protection,
 KV eviction/refusal/retry, final refund, invalid host sources and empty layouts.
 This funds the native contiguous copy only: transpose payloads, ordinary MLAS
 SGEMM panels, shape-variant sharing and activation/output scratch remain work.
+
+
+### Check SGEMM panel allocation geometry before funding it
+
+The optional ordinary MLAS SGEMM packer now exposes an immutable `PackedBPlan`
+whose private fields bind logical dimensions, source extent, native padding and
+allocation layout. Planning allocates no payload. The native shim checks column
+rounding, products and buffer alignment against MLAS's own constants before its
+otherwise-unchecked size query. A disagreement with the standalone generic
+layout is an explicit refusal rather than a potentially undersized allocation.
+Rust additionally requires addressable source and destination layouts.
+
+`PackedB::new` and `PackedBPlan::pack` return typed errors for geometry, source
+length, layout and allocation failure; the old infallible interface is removed.
+The plan and resulting pack report actual owned allocation bytes, including
+padding and a one-byte empty sentinel. Empty operands do not call the packer.
+Ordinary MatMul propagates construction errors and leaves its memo retryable;
+a separate cold-fill gate prevents concurrent half conversions/packs while
+warm hits avoid that gate. Warm f32 memo hits validate source extent and the
+shape-specific packed dimensions before reuse.
+
+This is a prerequisite for panel admission, not panel funding itself. The
+ordinary SGEMM panels and half-to-f32 packing temporary still need actual Host
+grants and idle pressure integration. Existing f32/contiguous-half weight
+funding remains in place. No new GEMM primitive, backend default or performance
+claim is introduced by checking the reference packer's allocation geometry.

@@ -1267,3 +1267,40 @@ all-target Clippy passes for both crates/configurations. Formatting and dispatch
 manifest/reachability/platform/feature checks pass. These test totals include
 the four new half-copy controls and the existing real rescue control, whose
 Host grant assertions now run under both retention verdicts.
+
+
+### A checked allocation plan for ordinary SGEMM panels
+
+Before attaching Host admission to ordinary MLAS SGEMM panels, their allocation
+size must be a reliable preflight value. The old constructor used unchecked
+logical multiplication, an unchecked native padded-size query, allocation
+`unwrap`/assertions and no error return. `PackedBPlan` now binds dimensions and
+native layout without allocating payloads; packing consumes that checked layout
+and returns `SgemmPackError`. Both the plan and pack expose owned heap bytes.
+
+The shim derives padding/alignment from MLAS's own definitions and checks every
+rounding/product before querying the native size. It refuses disagreement with
+the standalone generic layout. Rust checks source extent and addressable
+allocation size; empty operands allocate a one-byte sentinel without calling
+native packing, and an empty packed reduction writes zeros without reading it.
+The shim now uses MLAS's canonical half definition instead of redeclaring it.
+
+MatMul's f32 and once-widened half callers propagate actionable typed errors.
+Cold fills serialize separately from immutable warm lookup; a failed build is
+not memoized. F32 warm reuse validates source extent and packed geometry. The
+once-widened half caller plans before materializing its source. These are
+allocation-contract changes, not panel grants: actual Host funding and idle
+reclamation for ordinary panels/half-packing scratch remain subsequent work.
+
+Validation on Apple M1 Max ARM64 macOS / Rust 1.98: native CPU 1,981 passed
+/ 20 ignored and session 274 passed; optional-MLAS CPU 2,013 passed / 35 ignored
+and session 276 passed. Binding suite: 54 passed / 3 ignored, followed by five
+explicitly selected SGEMM controls (four new controls plus the existing parallel
+SGEMM check). Strict all-target Clippy passes for bindings and both CPU/session
+configurations; formatting and dispatch manifest/reachability/platform/feature
+checks pass. The unchanged exact constructor regression fails on bc4bac366
+with the old length assertion unwinding. After the comparison, shared-target
+stale artifacts were rejected, the bindings rebuilt from the current source,
+and all five selected controls passed with their names/counts checked. The
+temporary baseline worktree is removed. Logs are correctness evidence, not
+performance or CUDA/other-ISA validation.
