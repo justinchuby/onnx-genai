@@ -810,8 +810,8 @@ The three old-behavior regressions demonstrate the bypass independently. New
 bounded real-kernel controls check both verdicts and unchanged expected results,
 while avoiding shared test-counter interference. This is retention enforcement,
 not physical Host funding by itself. Ordinary f32 constant materialization now
-joins Host admission below, followed by native half-copy payloads. SGEMM panels,
-transposes and shared-node ownership for ordinary MatMul remain work.
+joins Host admission below, followed by native half-copy payloads. SGEMM panels join Host admission below; transposes and shared-node ownership
+for ordinary MatMul remain work.
 
 
 ### Ordinary constant materialization joins the Host authority
@@ -833,8 +833,8 @@ forging an uncharged materialized constant through the preparation API.
 Address-keyed legacy transpose memos retain their converted source reader until
 their key retires, preventing source-address recycling after pressure. This pins
 those dependencies; funding/reclaiming transpose payloads themselves remains
-separate, as do MLAS panels, activation/output scratch and shared-node ownership
-of ordinary MatMul preparations. Native contiguous-half copies are funded below.
+separate, as do activation/output scratch and shared-node ownership of ordinary MatMul
+preparations. Native contiguous-half copies and SGEMM panels are funded below.
 
 The same provider-level test fails against the parent implementation with Host
 usage 0 versus 24 expected bytes. New factory, active-reader, capacity/refusal,
@@ -864,5 +864,65 @@ The unchanged public-provider regression fails on parent 3e2588329 with Host
 usage 0 versus 306 expected bytes. Controls cover both retention verdicts,
 negative strides/offsets, concurrent construction, active-reader protection,
 KV eviction/refusal/retry, final refund, invalid host sources and empty layouts.
-This funds the native contiguous copy only: transpose payloads, ordinary MLAS
-SGEMM panels, shape-variant sharing and activation/output scratch remain work.
+This step funds the native contiguous copy only. Ordinary SGEMM panel funding
+follows below; transpose payloads, shape-variant sharing and activation/output
+scratch remain work.
+
+
+### Check SGEMM panel allocation geometry before funding it
+
+The optional ordinary MLAS SGEMM packer now exposes an immutable `PackedBPlan`
+whose private fields bind logical dimensions, source extent, native padding and
+allocation layout. Planning allocates no payload. The native shim checks column
+rounding, products and buffer alignment against MLAS's own constants before its
+otherwise-unchecked size query. A disagreement with the standalone generic
+layout is an explicit refusal rather than a potentially undersized allocation.
+Rust additionally requires addressable source and destination layouts.
+
+`PackedB::new` and `PackedBPlan::pack` return typed errors for geometry, source
+length, layout and allocation failure; the old infallible interface is removed.
+The plan and resulting pack report actual owned allocation bytes, including
+padding and a one-byte empty sentinel. Empty operands do not call the packer.
+Ordinary MatMul propagates construction errors and leaves its memo retryable;
+a separate cold-fill gate prevents concurrent half conversions/packs while
+warm hits avoid that gate. Warm f32 memo hits validate source extent and the
+shape-specific packed dimensions before reuse.
+
+This is a prerequisite for panel admission, not panel funding itself. The
+next step below adds actual Host grants and idle pressure integration to
+ordinary SGEMM panels and the half-to-f32 packing temporary. Existing f32 and
+contiguous-half weight funding remains in place. No new GEMM primitive, backend default or performance
+claim is introduced by checking the reference packer's allocation geometry.
+
+
+### Ordinary SGEMM panels share the derived-weight authority
+
+The shared cache now accepts owned weight payloads rather than assuming every
+payload is a flat f32 vector. `WeightCache`, `GrantedWeight` and `WeightPayload`
+replace the old dense-only names; vector construction remains a specialized
+method and every caller uses the new types directly. Flat f32/u16 vectors and
+aligned MLAS SGEMM panels share admission-before-build, exact logical/allocation
+byte checks, serialized cold fills, active-reader ownership and weak idle
+pressure registration. The dense-expansion environment limit remains a separate
+policy and is not imposed on ordinary MatMul panels.
+
+Both ordinary f32 panels and once-widened half panels retain their actual native
+allocation grant in an executing Arc reader. Removing cache membership or
+dropping the kernel cannot revoke that reader. Independent idle panels can
+donate capacity to KV, and a subsequent call can rebuild. Keys bind the source,
+dtype and K/N geometry, so a different source/shape never receives stale packed
+values. Equal-source warm hits skip native layout planning and the fill gate.
+
+Half preparation preflights the packed allocation plus the entire simultaneously
+live f32 conversion before either buffer is created. Conversion writes directly
+into one fallibly allocated destination. The scratch portion is refunded after
+packing; only native panel bytes stay charged. Packing is optional: an admission
+refusal invokes no conversion/packing builder, records no failed cache entry and
+uses the existing unpacked execution route. Invalid layouts, bad source extents
+and actual construction failures remain contextual typed errors.
+
+This closes actual funding for ordinary SGEMM panel payloads and their half
+conversion peak. It does not fund unrelated activation/output/workspace scratch,
+legacy transpose payloads, or add shared ownership across MatMul shape variants.
+Forecast changes are not a substitute for these actual grants; future resident
+planning can use the checked native layout query.

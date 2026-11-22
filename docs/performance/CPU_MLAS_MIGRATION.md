@@ -975,7 +975,7 @@ Carried forward from [`ABSORBING_MLAS.md`](ABSORBING_MLAS.md), unchanged:
 
 - **Any resident buffer must be governed** (#1056): declared to the memory plan
   before allocation, in the bytes actually allocated, and declinable. Dense
-  expansions use `DenseWeightCache` with `DerivedWeightMemory`; each payload
+  expansions use `WeightCache` with `DerivedWeightMemory`; each payload
   owns its Host grant until the final reader drops it. Native compact packs
   also own grants; an estimate alone does not fund an allocation.
 - **Anything cached per kernel instance is retained at least twice** — the
@@ -1183,7 +1183,7 @@ it now captures the supplying source and retention policy too. The existing
 dense-preparation predictor covers all four consumers in their registered
 domains, for both constant operands, with its existing shape-instance multiplier.
 
-The prepack's widened/densified constant slots use `DenseWeightCache` and the
+The prepack's widened/densified constant slots use `WeightCache` and the
 provider's `DerivedWeightMemory`. Full f32 payload admission precedes allocation
 and conversion. A sealed operand reader carries the owned payload/grant through
 computation, whether cache retention is allowed or declined. Cache removal and
@@ -1240,7 +1240,7 @@ raw validation transcripts remain separate from performance evidence.
 
 ### Native noncontiguous f16 payload funding
 
-`DenseWeightCache` now stores flat copyable payload elements, sharing its
+`WeightCache` now stores flat copyable payload elements, sharing its
 existing admission, singleflight and idle-pressure implementation between f32
 expansions and native `u16` half-bit copies. A required noncontiguous constant
 f16 B copy obtains actual Host funding before allocating its payload, even when
@@ -1267,3 +1267,82 @@ all-target Clippy passes for both crates/configurations. Formatting and dispatch
 manifest/reachability/platform/feature checks pass. These test totals include
 the four new half-copy controls and the existing real rescue control, whose
 Host grant assertions now run under both retention verdicts.
+
+
+### A checked allocation plan for ordinary SGEMM panels
+
+Before attaching Host admission to ordinary MLAS SGEMM panels, their allocation
+size must be a reliable preflight value. The old constructor used unchecked
+logical multiplication, an unchecked native padded-size query, allocation
+`unwrap`/assertions and no error return. `PackedBPlan` now binds dimensions and
+native layout without allocating payloads; packing consumes that checked layout
+and returns `SgemmPackError`. Both the plan and pack expose owned heap bytes.
+
+The shim derives padding/alignment from MLAS's own definitions and checks every
+rounding/product before querying the native size. It refuses disagreement with
+the standalone generic layout. Rust checks source extent and addressable
+allocation size; empty operands allocate a one-byte sentinel without calling
+native packing, and an empty packed reduction writes zeros without reading it.
+The shim now uses MLAS's canonical half definition instead of redeclaring it.
+
+MatMul's f32 and once-widened half callers propagate actionable typed errors.
+Cold fills serialize separately from immutable warm lookup; a failed build is
+not memoized. F32 warm reuse validates source extent and packed geometry. The
+once-widened half caller plans before materializing its source. These are
+allocation-contract changes; the following step adds actual Host funding and
+idle reclamation for ordinary panels and half-packing scratch.
+
+Validation on Apple M1 Max ARM64 macOS / Rust 1.98: native CPU 1,981 passed
+/ 20 ignored and session 274 passed; optional-MLAS CPU 2,013 passed / 35 ignored
+and session 276 passed. Binding suite: 54 passed / 3 ignored, followed by five
+explicitly selected SGEMM controls (four new controls plus the existing parallel
+SGEMM check). Strict all-target Clippy passes for bindings and both CPU/session
+configurations; formatting and dispatch manifest/reachability/platform/feature
+checks pass. The unchanged exact constructor regression fails on bc4bac366
+with the old length assertion unwinding. After the comparison, shared-target
+stale artifacts were rejected, the bindings rebuilt from the current source,
+and all five selected controls passed with their names/counts checked. The
+temporary baseline worktree is removed. Logs are correctness evidence, not
+performance or CUDA/other-ISA validation.
+
+
+### Funded ordinary SGEMM panel ownership
+
+Ordinary f32 SGEMM panels and panels widened from constant half weights now use
+the same `WeightCache` authority as dense f32 expansions and native half copies.
+Its owned-payload contract verifies actual allocation bytes for flat vectors or
+MLAS-aligned panels. Remove the dedicated SGEMM OnceLock/build-lock mechanism;
+executing Arc readers retain the payload and grant together, while idle cache
+membership is reclaimable by ordinary Host/KV pressure. Source, dtype and K/N
+geometry distinguish payloads. Distinct sources obtain distinct funded packs,
+never each other's values; warm same-source hits skip planning/cold filling.
+
+Half packing reserves panel bytes plus the f32 conversion peak before building
+either payload. Only panel bytes remain after the conversion drops. A denied
+optional prepack performs no conversion or packing and falls through to existing
+unpacked computation without memoizing refusal. Retention-off behavior and
+numerical primitives stay unchanged. Default native builds remain MLAS-free.
+The existing dense expansion ceiling remains a policy for its original consumers,
+not a new limit on ordinary MatMul preparation.
+
+Controls exercise real native panel execution through live readers, exact Host
+charge, concurrent single construction, active-reader protection, KV idle
+reclamation, refusal/retry/refund, and half conversion peak boundaries. Public
+provider execution runs both f32 and f16 inputs with retention on/off, sufficient
+and zero capacity, and competing KV ownership, checking packed and unpacked
+results. The prior distinct-source regression now checks both products and
+reuse rather than merely rejecting the second source. Legacy transpose grants,
+ordinary shape-variant sharing, other scratch and performance measurements remain
+separate work.
+
+Validation on Apple M1 Max ARM64 macOS / Rust 1.98 / cached ORT: native CPU
+1,981 passed / 20 ignored, session 274 passed; optional-MLAS CPU 2,017 passed
+/ 35 ignored, session 276 passed. Strict all-target Clippy passes for both
+crates/configurations, as do formatting and dispatch manifest/reachability/
+platform/feature checks. The same public-provider fixture fails on 2fcd486f1
+with ledger 0 versus 320 native panel bytes. After that exact baseline test,
+the CPU crate was explicitly cleaned/rebuilt and the three panel lifecycle/peak/
+concurrency controls plus the exact provider control ran with checked nonzero
+counts and passed; both CPU Clippy configurations passed again. The temporary
+baseline worktree is removed and raw logs retained. No performance/CUDA or
+other-ISA inference follows from these ownership tests.

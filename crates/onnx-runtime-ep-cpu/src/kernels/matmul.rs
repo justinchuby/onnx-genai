@@ -35,12 +35,10 @@ use onnx_runtime_ir::{
 use rayon::prelude::*;
 
 use super::check_arity;
-use super::dense_weight_cache::{
-    DenseWeight, DenseWeightCache, DenseWeightKey, DenseWeightLoad, DenseWeightSpec,
-};
 use super::half_gemm::{self, HalfFormat, MatrixLayout};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use super::half_gemv;
+use super::weight_cache::{GrantedWeight, WeightCache, WeightCacheKey, WeightLoad, WeightSpec};
 use super::weight_transpose::{self, WeightTransposeKey};
 use crate::CpuMemoryResources;
 use crate::backend::CpuBackend;
@@ -466,18 +464,40 @@ struct MatMulHalfKey {
     elements: usize,
 }
 
-impl DenseWeightKey for MatMulHalfKey {
-    fn dense_bytes(&self) -> Result<usize> {
+impl WeightCacheKey for MatMulHalfKey {
+    fn weight_bytes(&self) -> Result<usize> {
         self.elements.checked_mul(std::mem::size_of::<u16>()).ok_or_else(||
             EpError::KernelFailed("MatMul constant f16 copy byte count overflow; use addressable weight dimensions".into()))
     }
 }
 
-impl DenseWeightKey for MatMulDenseKey {
-    fn dense_bytes(&self) -> Result<usize> {
+impl WeightCacheKey for MatMulDenseKey {
+    fn weight_bytes(&self) -> Result<usize> {
         self.elements.checked_mul(std::mem::size_of::<f32>()).ok_or_else(||
             EpError::KernelFailed("MatMul constant f32 payload size overflows usize; use addressable operand dimensions".into()))
     }
+}
+
+#[cfg(feature = "mlas")]
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SgemmPackKey {
+    source: usize,
+    dtype: DataType,
+    k: usize,
+    n: usize,
+}
+#[cfg(feature = "mlas")]
+impl WeightCacheKey for SgemmPackKey {
+    fn weight_bytes(&self) -> Result<usize> {
+        sgemm_pack_plan(self.k, self.n).map(|plan| plan.owned_heap_bytes())
+    }
+}
+#[cfg(feature = "mlas")]
+fn sgemm_pack_plan(k: usize, n: usize) -> Result<mlas_sys::PackedBPlan> {
+    mlas_sys::PackedBPlan::new(n, k).map_err(|source| EpError::Backend {
+        operation: "MatMul MLAS B packing plan",
+        source: Box::new(source),
+    })
 }
 
 /// A converted constant carries its Host grant through the executing reader;
@@ -486,7 +506,7 @@ pub(super) struct DenseOperand<'a>(DenseOperandStorage<'a>);
 
 enum DenseOperandStorage<'a> {
     Direct(Cow<'a, [f32]>),
-    Funded(Arc<DenseWeight>),
+    Funded(Arc<GrantedWeight>),
 }
 impl std::ops::Deref for DenseOperand<'_> {
     type Target = [f32];
@@ -509,7 +529,7 @@ struct F32TransposeMemo {
     values: Arc<Vec<f32>>,
     // Global transpose identity is the conversion buffer's address. Keep its
     // payload/grant alive until that address-keyed dependency is retired.
-    _source: Option<Arc<DenseWeight>>,
+    _source: Option<Arc<GrantedWeight>>,
 }
 
 /// Per-kernel cache for immutable MatMul operands that require materialization.
@@ -531,16 +551,16 @@ pub(crate) struct MatMulPrepack {
     /// memory plan (#1056): filled only under an admitting verdict, and reports
     /// its own held bytes via the caches' actual retained payload bytes. Only populated
     /// when the operand is not already contiguous f32 (see [`Self::dense`]).
-    dense: [DenseWeightCache<MatMulDenseKey>; 2],
+    dense: [WeightCache<MatMulDenseKey>; 2],
     #[cfg(feature = "mlas")]
-    packed_b: OnceLock<mlas_sys::PackedB>,
-    /// MLAS-packed f32 panel built once from a constant **f16** B weight.
+    packed_b: WeightCache<SgemmPackKey, mlas_sys::PackedB>,
+    /// Reclaimable MLAS-packed f32 panels derived from a constant **f16** B weight.
     ///
-    /// The widened f32 copy is a temporary: it is consumed by `PackedB::new`
+    /// The widened f32 copy is a temporary: it is consumed by `PackedBPlan::pack`
     /// and dropped, so this costs one packed panel rather than the packed panel
     /// plus a permanent 4*K*N dense copy the way `dense[1]` + `packed_b` would.
     #[cfg(feature = "mlas")]
-    packed_b_from_half: OnceLock<Option<(WeightTransposeKey, mlas_sys::PackedB)>>,
+    packed_b_from_half: WeightCache<SgemmPackKey, mlas_sys::PackedB>,
     /// Lazily-computed transpose of the B weight matrix for the Accelerate
     /// column-parallel GEMV path, with the key it was computed for. Only
     /// populated for constant (model weight) inputs.
@@ -563,7 +583,7 @@ pub(crate) struct MatMulPrepack {
         not(any(target_os = "macos", target_os = "ios")),
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
-    contiguous_b_f16: DenseWeightCache<MatMulHalfKey, u16>,
+    contiguous_b_f16: WeightCache<MatMulHalfKey, Vec<u16>>,
 }
 
 /// Entries this prepack *installed* in the process-global transpose caches must
@@ -687,16 +707,16 @@ impl MatMulPrepack {
             retain_caches,
             constant_inputs: [false; 2],
             dense: [
-                DenseWeightCache::new(resources.weight_memory().clone(), limit),
-                DenseWeightCache::new(resources.weight_memory().clone(), limit),
+                WeightCache::new(resources.weight_memory().clone(), limit),
+                WeightCache::new(resources.weight_memory().clone(), limit),
             ],
             #[cfg(feature = "mlas")]
-            packed_b: OnceLock::new(),
+            packed_b: WeightCache::new(resources.weight_memory().clone(), limit),
             #[cfg(feature = "mlas")]
-            packed_b_from_half: OnceLock::new(),
+            packed_b_from_half: WeightCache::new(resources.weight_memory().clone(), limit),
             transposed_b: OnceLock::new(),
             transposed_b_f16: OnceLock::new(),
-            contiguous_b_f16: DenseWeightCache::new(resources.weight_memory().clone(), limit),
+            contiguous_b_f16: WeightCache::new(resources.weight_memory().clone(), limit),
         }
     }
 }
@@ -710,7 +730,7 @@ impl MatMulPrepack {
     }
 
     #[cfg(test)]
-    fn dense_payload(&self, index: usize) -> Option<Arc<DenseWeight>> {
+    fn dense_payload(&self, index: usize) -> Option<Arc<GrantedWeight>> {
         self.dense[index].test_first()
     }
 
@@ -745,17 +765,17 @@ impl MatMulPrepack {
             elements: view.numel(),
         };
         let spec = if self.retain_caches {
-            DenseWeightSpec::cached(&key)?
+            WeightSpec::cached(&key)?
         } else {
-            DenseWeightSpec::transient(key.dense_bytes()?)
+            WeightSpec::transient(key.weight_bytes()?)
         };
         match self.dense[index].load_group(&[spec], |_, output| {
             to_dense_f32_widen_into("MatMul constant operand", view, output)
         })? {
-            DenseWeightLoad::Ready(mut loaded) => Ok(DenseOperand(DenseOperandStorage::Funded(
+            WeightLoad::Ready(mut loaded) => Ok(DenseOperand(DenseOperandStorage::Funded(
                 loaded.weights.remove(0),
             ))),
-            DenseWeightLoad::Declined(source) => Err(EpError::Backend {
+            WeightLoad::Declined(source) => Err(EpError::Backend {
                 operation: if index == 0 {
                     "MatMul constant A widening admission"
                 } else {
@@ -930,7 +950,7 @@ impl MatMulPrepack {
     pub(super) fn contiguous_b_f16(
         &self,
         b_view: &TensorView,
-    ) -> Result<Option<Arc<DenseWeight<u16>>>> {
+    ) -> Result<Option<Arc<GrantedWeight<Vec<u16>>>>> {
         use onnx_runtime_ir::DataType;
         if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || b_view.is_contiguous() {
             return Ok(None); // already contiguous or not cacheable
@@ -941,9 +961,9 @@ impl MatMulPrepack {
             elements: b_view.shape.iter().try_fold(1usize, |n, &dim| n.checked_mul(dim)).ok_or_else(|| EpError::KernelFailed("MatMul constant f16 contiguous preparation: element count overflow; use addressable weight dimensions".into()))?,
         };
         let spec = if self.retain_caches {
-            DenseWeightSpec::cached(&key)?
+            WeightSpec::cached(&key)?
         } else {
-            DenseWeightSpec::transient(key.dense_bytes()?)
+            WeightSpec::transient(key.weight_bytes()?)
         };
         let loaded = self.contiguous_b_f16.load_group(&[spec], |_, out| {
             let shape = b_view.shape;
@@ -1001,8 +1021,8 @@ impl MatMulPrepack {
             Ok(())
         })?;
         match loaded {
-            DenseWeightLoad::Ready(mut loaded) => Ok(Some(loaded.weights.remove(0))),
-            DenseWeightLoad::Declined(reason) => Err(EpError::Backend {
+            WeightLoad::Ready(mut loaded) => Ok(Some(loaded.weights.remove(0))),
+            WeightLoad::Declined(reason) => Err(EpError::Backend {
                 operation: "MatMul constant f16 contiguous preparation admission",
                 source: Box::new(reason),
             }),
@@ -1022,55 +1042,116 @@ impl MatMulPrepack {
         view: &TensorView<'_>,
         k: usize,
         n: usize,
-    ) -> Result<Option<&mlas_sys::PackedB>> {
+    ) -> Result<Option<Arc<GrantedWeight<mlas_sys::PackedB>>>> {
         if !self.retain_caches || !self.constant_inputs[1] {
             return Ok(None);
         }
-        // Defence in depth, mirroring `transposed_b`: a memo is only served
-        // back for the exact weight it was built from. Today the executor's
-        // kernel cache keys on node and input shapes and a constant input is a
-        // graph initializer whose address is stable, so the key can only ever
-        // match; the check exists so that broadening "constant" later fails
-        // loudly instead of silently returning another tensor's pack.
-        let key = WeightTransposeKey::new(view.data_ptr::<u16>(), k, n);
-        if let Some(cached) = self.packed_b_from_half.get() {
-            return Ok(cached
-                .as_ref()
-                .and_then(|(cached_key, packed)| (*cached_key == key).then_some(packed)));
+        validate_f32_widen_input("MatMul MLAS half-weight packing", view)?;
+        let elements = view.shape.iter().try_fold(1usize, |a, &b| a.checked_mul(b)).ok_or_else(|| EpError::KernelFailed("MatMul MLAS half-weight shape element count overflow; use addressable B dimensions".into()))?;
+        if Some(elements) != k.checked_mul(n) {
+            return Err(EpError::KernelFailed(format!(
+                "MatMul MLAS half-weight packing: shape {:?} does not describe K={k} N={n}; supply one complete B matrix",
+                view.shape
+            )));
         }
-        let widened = to_dense_f32_widen("MatMul", view)?;
-        if key.numel() != Some(widened.len()) {
-            return Ok(None);
+        let key = SgemmPackKey {
+            source: view.data_ptr::<u16>() as usize,
+            dtype: view.dtype,
+            k,
+            n,
+        };
+        if let Some(packed) = self.packed_b_from_half.get(&key) {
+            return Ok(Some(packed));
         }
-        let packed = mlas_sys::PackedB::new(n, k, &widened);
-        drop(widened);
-        Ok(self
-            .packed_b_from_half
-            .get_or_init(|| Some((key, packed)))
-            .as_ref()
-            .and_then(|(cached_key, packed)| (*cached_key == key).then_some(packed)))
+        let plan = sgemm_pack_plan(k, n)?;
+        let bytes = elements.checked_mul(4).ok_or_else(|| EpError::KernelFailed(
+            "MatMul MLAS half-weight conversion byte count overflow; use addressable B dimensions".into()
+        ))?;
+        let peak = plan.owned_heap_bytes().checked_add(bytes).ok_or_else(|| EpError::KernelFailed(
+            "MatMul MLAS half-weight packed-plus-conversion peak overflows usize; reduce B dimensions".into()
+        ))?;
+        let spec = WeightSpec::cached(&key)?.with_build_peak(peak);
+        match self.packed_b_from_half.load_group_owned(&[spec], |_| {
+            let mut widened = super::decoded_projection::zeroed_f32(
+                "MatMul MLAS half-weight packing",
+                "admitted conversion payload",
+                elements,
+            )?;
+            to_dense_f32_widen_into("MatMul MLAS half-weight packing", view, &mut widened)?;
+            let packed = plan.pack(&widened).map_err(|source| EpError::Backend {
+                operation: "MatMul MLAS half-weight packing",
+                source: Box::new(source),
+            })?;
+            drop(widened);
+            Ok(packed)
+        })? {
+            WeightLoad::Ready(mut loaded) => Ok(Some(loaded.weights.remove(0))),
+            // Packing is optional. The existing unpacked route remains valid;
+            // a declined build never allocates conversion or panel payloads.
+            WeightLoad::Declined(_) => Ok(None),
+        }
     }
 
-    /// Whether the once-widened MLAS pack for a constant f16 B has been built.
-    ///
-    /// Lets sibling modules' tests assert which route served a call; the field
-    /// itself stays private to this module.
     #[cfg(test)]
     pub(crate) fn half_pack_is_built(&self) -> bool {
         #[cfg(feature = "mlas")]
         {
-            self.packed_b_from_half.get().is_some_and(Option::is_some)
+            self.packed_b_from_half.stats().0 != 0
         }
         #[cfg(not(feature = "mlas"))]
-        false
+        {
+            false
+        }
     }
 
     #[cfg(feature = "mlas")]
-    fn packed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&mlas_sys::PackedB> {
-        (self.retain_caches && self.constant_inputs[1]).then(|| {
-            self.packed_b
-                .get_or_init(|| mlas_sys::PackedB::new(n, k, b))
-        })
+    fn packed_b(
+        &self,
+        b: &[f32],
+        k: usize,
+        n: usize,
+    ) -> Result<Option<Arc<GrantedWeight<mlas_sys::PackedB>>>> {
+        if !self.retain_caches || !self.constant_inputs[1] {
+            return Ok(None);
+        }
+        let expected = n.checked_mul(k).ok_or_else(|| EpError::Backend {
+            operation: "MatMul MLAS constant B packing",
+            source: Box::new(mlas_sys::SgemmPackError::Geometry {
+                n,
+                k,
+                reason: "logical element count overflows usize",
+            }),
+        })?;
+        if b.len() != expected {
+            return Err(EpError::Backend {
+                operation: "MatMul MLAS constant B packing",
+                source: Box::new(mlas_sys::SgemmPackError::Length {
+                    expected,
+                    actual: b.len(),
+                }),
+            });
+        }
+        let key = SgemmPackKey {
+            source: b.as_ptr() as usize,
+            dtype: DataType::Float32,
+            k,
+            n,
+        };
+        if let Some(packed) = self.packed_b.get(&key) {
+            return Ok(Some(packed));
+        }
+        let plan = sgemm_pack_plan(k, n)?;
+        match self
+            .packed_b
+            .load_group_owned(&[WeightSpec::cached(&key)?], |_| {
+                plan.pack(b).map_err(|source| EpError::Backend {
+                    operation: "MatMul MLAS constant B packing",
+                    source: Box::new(source),
+                })
+            })? {
+            WeightLoad::Ready(mut loaded) => Ok(Some(loaded.weights.remove(0))),
+            WeightLoad::Declined(_) => Ok(None),
+        }
     }
 }
 
@@ -1187,7 +1268,7 @@ pub(crate) fn try_packed_half_prefill(
         return Ok(None);
     }
     let mut result = vec![0.0f32; m * n];
-    gemm_packed(&a_dense, packed, &mut result, m, k, n)?;
+    gemm_packed(&a_dense, packed.payload(), &mut result, m, k, n)?;
     Ok(Some(result))
 }
 
@@ -3824,7 +3905,10 @@ fn matmul_dense_into_with_backend(
 
     #[cfg(feature = "mlas")]
     let packed_b = if backend == CpuBackend::Mlas && geom.b_promoted_rank == 2 {
-        prepack.and_then(|prepack| prepack.packed_b(b_dense, k, n))
+        prepack
+            .map(|prepack| prepack.packed_b(b_dense, k, n))
+            .transpose()?
+            .flatten()
     } else {
         None
     };
@@ -3888,8 +3972,8 @@ fn matmul_dense_into_with_backend(
     if numel(&geom.batch_shape) <= 1 {
         // No effective batch dims: a single matmul.
         #[cfg(feature = "mlas")]
-        if let Some(packed_b) = packed_b {
-            gemm_packed(a_dense, packed_b, out, m, k, n)?;
+        if let Some(packed_b) = &packed_b {
+            gemm_packed(a_dense, packed_b.payload(), out, m, k, n)?;
         } else {
             gemm_with_backend(backend, a_dense, b_dense, out, m, k, n)?;
         }
@@ -3904,8 +3988,8 @@ fn matmul_dense_into_with_backend(
             let a_tile = &a_dense[a_off..a_off + a_mat];
             let c_tile = &mut out[b_out * c_mat..b_out * c_mat + c_mat];
             #[cfg(feature = "mlas")]
-            if let Some(packed_b) = packed_b {
-                gemm_packed(a_tile, packed_b, c_tile, m, k, n)?;
+            if let Some(packed_b) = &packed_b {
+                gemm_packed(a_tile, packed_b.payload(), c_tile, m, k, n)?;
             } else {
                 gemm_with_backend(
                     backend,
@@ -3986,6 +4070,7 @@ mod tests {
     fn provider_strided_half_copy_uses_host_authority() {
         if retention_control_in_child(
             "kernels::matmul::tests::provider_strided_half_copy_uses_host_authority",
+            None,
         ) {
             return;
         }
@@ -4403,6 +4488,7 @@ mod tests {
     fn provider_matmul_family_widening_uses_its_host_authority() {
         if retention_control_in_child(
             "kernels::matmul::tests::provider_matmul_family_widening_uses_its_host_authority",
+            None,
         ) {
             return;
         }
@@ -6069,26 +6155,29 @@ mod tests {
                     "{m}x{k}x{n} packed/generic mismatch at {index}: {packed} vs {generic}"
                 );
             }
-            assert!(kernel.prepack.packed_b.get().is_some());
+            assert!(kernel.prepack.packed_b.test_first().is_some());
         }
     }
 
     /// Run real-kernel controls alone: platform dispatch counters are shared
     /// by the existing libtest process and negative guards observe their deltas.
-    fn retention_control_in_child(name: &str) -> bool {
+    fn retention_control_in_child(name: &str, backend: Option<&str>) -> bool {
         const CHILD: &str = "NXRT_TEST_MATMUL_RETENTION_CHILD";
         if std::env::var(CHILD).as_deref() == Ok(name) {
             return false;
         }
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", name, "--nocapture"])
             .env(CHILD, name)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        if let Some(backend) = backend {
+            command.env("NXRT_CPU_GEMM_BACKEND", backend);
+        }
+        let mut child = command.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         let timed_out = loop {
             if child.try_wait().unwrap().is_some() {
@@ -6116,6 +6205,7 @@ mod tests {
     fn strided_half_preparation_honors_retention() {
         if retention_control_in_child(
             "kernels::matmul::tests::strided_half_preparation_honors_retention",
+            None,
         ) {
             return;
         }
@@ -6194,6 +6284,282 @@ mod tests {
     }
 
     #[cfg(feature = "mlas")]
+    #[test]
+    fn sgemm_half_panel_requires_the_complete_conversion_peak_before_building() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let weight = Owned::f16(&[5, 3], &[0.5; 15]);
+        let payload = mlas_sys::PackedBPlan::new(3, 5).unwrap().owned_heap_bytes() as u64;
+        let peak = payload + 15 * 4;
+        for capacity in [payload, peak - 1, peak] {
+            let books = LedgerGovernor::new(LeaseLedger::new(0, capacity, 0));
+            let resources = CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+            let mut prepack = MatMulPrepack::new(resources);
+            prepack.set_constant_inputs(&[false, true]);
+            let reader = prepack.packed_b_from_half(&weight.view(), 5, 3).unwrap();
+            assert_eq!(
+                reader.is_some(),
+                capacity == peak,
+                "panel-only funding is insufficient while the f32 conversion is live"
+            );
+            assert_eq!(
+                prepack.packed_b_from_half.activity().1,
+                usize::from(capacity == peak)
+            );
+            assert_eq!(
+                books.used(Tier::Host),
+                if capacity == peak { payload } else { 0 }
+            );
+            assert_eq!(
+                prepack.dense_live_bytes(),
+                0,
+                "packing conversion must not become a permanent dense copy"
+            );
+            drop(prepack);
+            drop(reader);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn sgemm_panel_grants_follow_readers_idle_pressure_and_retry() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let (k, n) = (5, 3);
+        let bits = Owned::f16(&[k, n], &[0.5; 15]);
+        let floats = [0.5; 15];
+        let packed_bytes = mlas_sys::PackedBPlan::new(n, k).unwrap().owned_heap_bytes() as u64;
+        for half in [false, true] {
+            let capacity = packed_bytes + if half { 15 * 4 } else { 0 };
+            let books = LedgerGovernor::new(LeaseLedger::new(0, capacity, 0));
+            let resources = CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+            let mut prepack = MatMulPrepack::new(resources);
+            prepack.set_constant_inputs(&[false, true]);
+            let build = |prepack: &MatMulPrepack| {
+                if half {
+                    prepack.packed_b_from_half(&bits.view(), k, n)
+                } else {
+                    prepack.packed_b(&floats, k, n)
+                }
+            };
+            let reader = build(&prepack).unwrap().unwrap();
+            assert_eq!(reader.payload().owned_heap_bytes() as u64, packed_bytes);
+            assert_eq!(
+                books.used(Tier::Host),
+                packed_bytes,
+                "packing scratch must refund after construction"
+            );
+            let warm = build(&prepack).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&reader, &warm));
+            drop(warm);
+            assert!(
+                books
+                    .reserve(Tier::Host, capacity, MemoryRole::KvCache, HolderId::new(7))
+                    .is_err(),
+                "pressure cannot revoke an executing panel reader"
+            );
+            let mut output = [0.; 6];
+            gemm_packed(&[0.25; 10], reader.payload(), &mut output, 2, k, n).unwrap();
+            assert_eq!(output, [0.625; 6]);
+            drop(reader);
+            let kv = books
+                .reserve(Tier::Host, capacity, MemoryRole::KvCache, HolderId::new(7))
+                .unwrap();
+            let cache = if half {
+                &prepack.packed_b_from_half
+            } else {
+                &prepack.packed_b
+            };
+            assert_eq!(
+                cache.stats(),
+                (0, 0),
+                "KV pressure must reclaim an idle panel"
+            );
+            let before = cache.activity().1;
+            assert!(build(&prepack).unwrap().is_none());
+            assert_eq!(
+                cache.activity().1,
+                before,
+                "refusal must precede any native pack or half conversion"
+            );
+            drop(kv);
+            let reader = build(&prepack).unwrap().unwrap();
+            drop(prepack);
+            assert_eq!(books.used(Tier::Host), packed_bytes);
+            gemm_packed(&[0.25; 10], reader.payload(), &mut output, 2, k, n).unwrap();
+            assert_eq!(output, [0.625; 6]);
+            drop(reader);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn sgemm_panel_concurrent_builders_share_one_funded_payload() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let bits = Owned::f16(&[5, 3], &[0.5; 15]);
+        let floats = [0.5; 15];
+        let packed_bytes = mlas_sys::PackedBPlan::new(3, 5).unwrap().owned_heap_bytes() as u64;
+        for half in [false, true] {
+            let capacity = packed_bytes + if half { 60 } else { 0 };
+            let books = LedgerGovernor::new(LeaseLedger::new(0, capacity, 0));
+            let resources = CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+            let mut prepack = MatMulPrepack::new(resources);
+            prepack.set_constant_inputs(&[false, true]);
+            let barrier = std::sync::Barrier::new(8);
+            let readers = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            if half {
+                                prepack.packed_b_from_half(&bits.view(), 5, 3)
+                            } else {
+                                prepack.packed_b(&floats, 5, 3)
+                            }
+                            .unwrap()
+                            .unwrap()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|thread| thread.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert!(
+                readers
+                    .iter()
+                    .all(|reader| Arc::ptr_eq(reader, &readers[0]))
+            );
+            let cache = if half {
+                &prepack.packed_b_from_half
+            } else {
+                &prepack.packed_b
+            };
+            assert_eq!(cache.activity().1, 1);
+            assert_eq!(books.used(Tier::Host), packed_bytes);
+            drop(prepack);
+            assert_eq!(books.used(Tier::Host), packed_bytes);
+            drop(readers);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn provider_sgemm_panel_admission_preserves_packed_and_unpacked_execution() {
+        if retention_control_in_child(
+            "kernels::matmul::tests::provider_sgemm_panel_admission_preserves_packed_and_unpacked_execution",
+            Some("mlas"),
+        ) {
+            return;
+        }
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::NodeId;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        assert_eq!(CpuBackend::auto_detect(), CpuBackend::Mlas);
+        let (m, k, n) = (3, 5, 3);
+        let bytes = mlas_sys::PackedBPlan::new(n, k).unwrap().owned_heap_bytes() as u64;
+        for dtype in [DataType::Float32, DataType::Float16] {
+            let a = if dtype == DataType::Float32 {
+                Owned::f32(&[m, k], &[0.25; 15])
+            } else {
+                Owned::f16(&[m, k], &[0.25; 15])
+            };
+            let b = if dtype == DataType::Float32 {
+                Owned::f32(&[k, n], &[0.5; 15])
+            } else {
+                Owned::f16(&[k, n], &[0.5; 15])
+            };
+            let peak = bytes + if dtype == DataType::Float16 { 60 } else { 0 };
+            for retained in [true, false] {
+                for capacity in [peak, 0] {
+                    let books = LedgerGovernor::new(LeaseLedger::new(0, capacity, 0));
+                    let resources = CpuMemoryResources::new(
+                        crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                        Default::default(),
+                    )
+                    .unwrap()
+                    .with_cache_retention(crate::CpuCacheRetention::new(retained));
+                    let provider = crate::CpuExecutionProvider::with_resources(resources);
+                    let node = Node::new(NodeId(0), "MatMul", vec![], vec![]);
+                    let mut kernel = provider
+                        .get_kernel(&node, &[vec![m, k], vec![k, n]], 17)
+                        .unwrap();
+                    kernel.set_constant_inputs(&[false, true]);
+                    let run = || {
+                        let mut out = Owned::zeros_f32(&[m, n]);
+                        kernel
+                            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                            .unwrap();
+                        assert_eq!(out.to_f32(), vec![0.625; m * n]);
+                    };
+                    run();
+                    assert_eq!(
+                        books.used(Tier::Host),
+                        if retained && capacity != 0 { bytes } else { 0 },
+                        "{dtype:?}: panel ownership must use the provider's Host ledger"
+                    );
+                    if capacity != 0 {
+                        let kv = books
+                            .reserve(Tier::Host, capacity, MemoryRole::KvCache, HolderId::new(7))
+                            .unwrap();
+                        run();
+                        assert_eq!(
+                            books.used(Tier::Host),
+                            capacity,
+                            "declined optional packing must use the existing unpacked route"
+                        );
+                        drop(kv);
+                        run();
+                    }
+                    drop(kernel);
+                    drop(provider);
+                    assert_eq!(books.used(Tier::Host), 0);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_pack_failure_preserves_context_and_can_retry_before_warm_validation() {
+        let mut prepack = MatMulPrepack::new(CpuMemoryResources::default());
+        prepack.set_constant_inputs(&[false, true]);
+        let error = prepack.packed_b(&[], 5, 3).err().unwrap();
+        assert!(error.to_string().contains("MatMul MLAS constant B packing"));
+        assert!(error.to_string().contains("expected 15"));
+        assert!(prepack.packed_b.test_first().is_none());
+        let weight = [0.25; 15];
+        let first = prepack.packed_b(&weight, 5, 3).unwrap().unwrap().payload() as *const _;
+        let second = prepack.packed_b(&weight, 5, 3).unwrap().unwrap().payload() as *const _;
+        assert_eq!(first, second);
+        assert!(
+            prepack.packed_b(&[], 5, 3).is_err(),
+            "warm hits still validate source extent"
+        );
+        let changed = prepack.packed_b(&weight, 3, 5).unwrap().unwrap();
+        assert_eq!(changed.payload().dimensions(), (3, 5));
+        assert_ne!(first, changed.payload() as *const _);
+    }
+
+    #[cfg(feature = "mlas")]
     fn assert_mlas_pack_retention(dtype: DataType) {
         let (m, k, n) = (3usize, 17usize, 9usize);
         let weights: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 / 32.).collect();
@@ -6234,16 +6600,12 @@ mod tests {
                     "dtype={dtype:?}, admitted={admitted}, step={step}"
                 );
                 assert_eq!(
-                    kernel.prepack.packed_b.get().is_some(),
+                    kernel.prepack.packed_b.test_first().is_some(),
                     admitted && dtype == DataType::Float32,
                     "dtype={dtype:?}: f32 packed allocation must follow retention permission"
                 );
                 assert_eq!(
-                    kernel
-                        .prepack
-                        .packed_b_from_half
-                        .get()
-                        .is_some_and(Option::is_some),
+                    kernel.prepack.packed_b_from_half.test_first().is_some(),
                     admitted && dtype == DataType::Float16,
                     "dtype={dtype:?}: once-widened packed allocation must follow retention permission"
                 );
@@ -6257,7 +6619,10 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn mlas_f32_packing_honors_retention() {
-        if retention_control_in_child("kernels::matmul::tests::mlas_f32_packing_honors_retention") {
+        if retention_control_in_child(
+            "kernels::matmul::tests::mlas_f32_packing_honors_retention",
+            None,
+        ) {
             return;
         }
         assert_mlas_pack_retention(DataType::Float32);
@@ -6266,7 +6631,10 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn mlas_f16_packing_honors_retention() {
-        if retention_control_in_child("kernels::matmul::tests::mlas_f16_packing_honors_retention") {
+        if retention_control_in_child(
+            "kernels::matmul::tests::mlas_f16_packing_honors_retention",
+            None,
+        ) {
             return;
         }
         assert_mlas_pack_retention(DataType::Float16);
@@ -6292,7 +6660,8 @@ mod tests {
                 CpuBackend::Mlas,
             )
             .unwrap();
-        let packed_ptr = kernel.prepack.packed_b.get().unwrap() as *const mlas_sys::PackedB;
+        let packed_ptr =
+            kernel.prepack.packed_b.test_first().unwrap().payload() as *const mlas_sys::PackedB;
         let dense_ptr = kernel.prepack.dense_payload(1).unwrap().as_slice().as_ptr();
 
         let a2_data: Vec<f32> = (0..5 * 17)
@@ -6309,7 +6678,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            kernel.prepack.packed_b.get().unwrap() as *const mlas_sys::PackedB,
+            kernel.prepack.packed_b.test_first().unwrap().payload() as *const mlas_sys::PackedB,
             packed_ptr
         );
         assert_eq!(
@@ -6343,7 +6712,7 @@ mod tests {
 
         let mut expected = vec![0.0; m * n];
         gemm_generic(&a_data, &b_data, &mut expected, m, k, n);
-        assert!(kernel.prepack.packed_b.get().is_none());
+        assert!(kernel.prepack.packed_b.test_first().is_none());
         for (actual, expected) in out.to_f32().iter().zip(&expected) {
             assert!((actual - expected).abs() <= 1e-3);
         }
@@ -6358,7 +6727,7 @@ mod tests {
                 CpuBackend::Generic,
             )
             .unwrap();
-        assert!(generic_kernel.prepack.packed_b.get().is_none());
+        assert!(generic_kernel.prepack.packed_b.test_first().is_none());
         assert_eq!(generic_out.to_f32(), expected);
 
         let batched_b_data = [b_data.clone(), b_data].concat();
@@ -6375,7 +6744,7 @@ mod tests {
                 CpuBackend::Mlas,
             )
             .unwrap();
-        assert!(batched_kernel.prepack.packed_b.get().is_none());
+        assert!(batched_kernel.prepack.packed_b.test_first().is_none());
         for (actual, expected) in batched_out.to_f32().iter().zip(expected.iter().cycle()) {
             assert!((actual - expected).abs() <= 1e-3);
         }
@@ -6478,7 +6847,7 @@ mod tests {
         // `execute` resolves its backend by auto-detection, and only MLAS has a
         // pack to build; elsewhere the blocked path serves the call correctly.
         assert_eq!(
-            kernel.prepack.packed_b_from_half.get().is_some(),
+            kernel.prepack.packed_b_from_half.test_first().is_some(),
             crate::backend::CpuBackend::auto_detect() == crate::backend::CpuBackend::Mlas,
             "a constant f16 B at M>1 must be widened and packed once on MLAS, \
              not repacked per call"
@@ -6513,15 +6882,14 @@ mod tests {
             .expect("a constant f16 B at M>1 must take the packed route");
         let packed_before = prepack
             .packed_b_from_half
-            .get()
+            .test_first()
             .expect("the first call must populate the pack")
-            .as_ref()
-            .expect("a constant B must pack") as *const _;
+            .payload() as *const _;
 
         let second = try_packed_half_prefill(&prepack, backend, &a.view(), &b.view(), m, k, n)
             .unwrap()
             .expect("the second call must also take the packed route");
-        let packed_after = prepack.packed_b_from_half.get().unwrap().as_ref().unwrap() as *const _;
+        let packed_after = prepack.packed_b_from_half.test_first().unwrap().payload() as *const _;
 
         assert_eq!(
             packed_before, packed_after,
@@ -6559,7 +6927,7 @@ mod tests {
                 );
             }
             assert!(
-                kernel.prepack.packed_b_from_half.get().is_none(),
+                kernel.prepack.packed_b_from_half.test_first().is_none(),
                 "an activation B must never be packed as a weight"
             );
         }
@@ -6573,9 +6941,9 @@ mod tests {
     ///
     /// The executor keys its kernel cache on node and input shapes and a
     /// constant input is a graph initializer with a stable address, so this
-    /// cannot happen today. The guard is defence in depth: it makes any future
-    /// broadening of "constant" degrade to the slow-but-correct blocked path
-    /// rather than silently returning another tensor's product.
+    /// cannot happen today. Source, dtype and geometry still bind each panel:
+    /// a different source must fund its own preparation, never reuse another
+    /// tensor's packed values.
     #[cfg(feature = "mlas")]
     #[test]
     fn a_different_weight_is_never_served_the_cached_pack() {
@@ -6601,13 +6969,27 @@ mod tests {
             assert!((actual - want).abs() <= 1e-3, "first weight disagreed");
         }
 
-        let reused =
+        let changed =
             try_packed_half_prefill(&prepack, backend, &a.view(), &b_second.view(), m, k, n)
-                .unwrap();
-        assert!(
-            reused.is_none(),
-            "a weight the pack was not built for must be declined, not served \
-             the cached pack; got a result that would be the first weight's"
+                .unwrap()
+                .expect("a different weight must obtain its own preparation");
+        let want_second = naive_matmul(&a_data, &second, m, k, n);
+        for (actual, want) in changed.iter().zip(&want_second) {
+            assert!(
+                (actual - want).abs() <= 1e-3,
+                "second weight received stale packed values"
+            );
+        }
+        assert_ne!(changed, served);
+        assert_eq!(prepack.packed_b_from_half.activity().1, 2);
+        let again = try_packed_half_prefill(&prepack, backend, &a.view(), &b_first.view(), m, k, n)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, served);
+        assert_eq!(
+            prepack.packed_b_from_half.activity().1,
+            2,
+            "the original source must still reuse its own panel"
         );
     }
 
@@ -6686,7 +7068,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            kernel.prepack.packed_b_from_half.get().is_none(),
+            kernel.prepack.packed_b_from_half.test_first().is_none(),
             "M=1 must stay on the GEMV rather than building a prefill pack"
         );
         let expected = naive_matmul(&a_data, &b_data, 1, k, n);

@@ -2980,4 +2980,4 @@ mod tests {
 }
 
 mod decoded_projection;
-pub(crate) mod dense_weight_cache;
+pub(crate) mod weight_cache;
