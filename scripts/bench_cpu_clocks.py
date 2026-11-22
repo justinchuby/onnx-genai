@@ -248,7 +248,8 @@ def run(directory, reps, sweeps):
     writer = csv.writer(raw, lineterminator="\n")
     writer.writerow(["sweep", *FIELDS])
     # Stable shared inode, never unlink. Nonblocking admission; retain the lock
-    # over the whole sweep. Load receipts cannot prove isolation or CPU affinity.
+    # over the whole sweep; a surviving child retains it if the parent dies.
+    # Load receipts cannot prove isolation or CPU affinity.
     with LOCK.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for sweep in range(1, sweeps + 1):
@@ -269,6 +270,7 @@ def run(directory, reps, sweeps):
                         [str(binary), str(width), str(reps)],
                         stdout=stdout,
                         stderr=stderr,
+                        pass_fds=(lock.fileno(),),
                     ) as child,
                 ):
                     pid = child.pid
@@ -335,7 +337,15 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        EOFError,
+        csv.Error,
+        subprocess.SubprocessError,
+    ) as error:
         sys.exit(
             f"CPU-clock diagnostic failed: {error}. Inspect the output directory and retry in a fresh directory."
         )
