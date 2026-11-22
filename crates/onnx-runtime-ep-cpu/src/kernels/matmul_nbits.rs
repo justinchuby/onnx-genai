@@ -3398,6 +3398,10 @@ impl MatMulNBitsKernel {
         use crate::backend::CpuBackend;
 
         let backend = CpuBackend::auto_detect();
+        #[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+        if backend == CpuBackend::Accelerate && tests::legacy_apple_kn_forced() {
+            return Ok(false);
+        }
         if !super::matmul::nt_gemm_supported(backend) {
             return Ok(false);
         }
@@ -13024,6 +13028,240 @@ mod tests {
         assert_eq!(books.used(Tier::Host), bytes as u64);
         drop(retained);
         assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    thread_local! {
+        static LEGACY_APPLE_KN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(super) fn legacy_apple_kn_forced() -> bool {
+        LEGACY_APPLE_KN.with(std::cell::Cell::get)
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    struct AppleKnDiagnosticScope(bool);
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    impl AppleKnDiagnosticScope {
+        fn new(legacy: bool) -> Self {
+            Self(LEGACY_APPLE_KN.with(|flag| flag.replace(legacy)))
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    impl Drop for AppleKnDiagnosticScope {
+        fn drop(&mut self) {
+            LEGACY_APPLE_KN.with(|flag| flag.set(self.0));
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn apple_kn_diagnostic_scope_is_thread_local_and_restores_after_unwind() {
+        assert!(!legacy_apple_kn_forced());
+        let failed = std::panic::catch_unwind(|| {
+            let _scope = AppleKnDiagnosticScope::new(true);
+            assert!(legacy_apple_kn_forced());
+            assert!(!std::thread::spawn(legacy_apple_kn_forced).join().unwrap());
+            {
+                let _nested = AppleKnDiagnosticScope::new(false);
+                assert!(!legacy_apple_kn_forced());
+            }
+            assert!(legacy_apple_kn_forced());
+            panic!("diagnostic scope restore control");
+        });
+        assert!(failed.is_err());
+        assert!(!legacy_apple_kn_forced());
+    }
+
+    /// Synchronous real execute calls, with rotating KN / NT / repeated-NT
+    /// arms. Test-only cache bookkeeping and the route selector are included.
+    /// Inputs, outputs, warm validation/checksums and printing are not timed.
+    #[cfg(all(any(target_os = "macos", target_os = "ios"), unix))]
+    #[test]
+    #[ignore = "manual real-execute comparison; hold the shared host lock"]
+    fn bench_apple_dense_execute_kn_nt_ab() {
+        let _probe = lock_dispatch_probe();
+        #[cfg(feature = "mlas")]
+        let _env = backend_env_lock().lock().unwrap();
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        use std::hint::black_box;
+        use std::time::Instant;
+        assert_eq!(
+            crate::backend::CpuBackend::auto_detect(),
+            crate::backend::CpuBackend::Accelerate
+        );
+        assert!(numa_decode_active().is_none() && spmd_decode_active().is_none());
+        eprintln!(
+            "APPLE_EXECUTE_CONTEXT rayon_threads={} clocks=process-cpu,wall scope=synchronous-execute",
+            rayon::current_num_threads()
+        );
+        fn output_checksum(values: &[f32]) -> u64 {
+            values.iter().fold(0xcbf29ce484222325u64, |hash, &value| {
+                let bits = if value == 0. { 0 } else { value.to_bits() };
+                (hash ^ u64::from(bits)).wrapping_mul(0x100000001b3)
+            })
+        }
+        fn cpu_seconds() -> f64 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            // SAFETY: writable rusage is initialized on successful return.
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                0
+            );
+            let usage = unsafe { usage.assume_init() };
+            (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
+                + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 * 1e-6
+        }
+        for (m, k, n) in [
+            (2usize, 33usize, 3usize),
+            (8, 257, 65),
+            (32, 1024, 1024),
+            (128, 1024, 1024),
+            (16, 2048, 2048),
+        ] {
+            let block = 16;
+            let blocks = k.div_ceil(block);
+            let av: Vec<_> = (0..m * k).map(|i| ((i % 31) as f32 - 15.) / 32.).collect();
+            let bv: Vec<_> = (0..n * blocks * 8)
+                .map(|i| (i.wrapping_mul(73).wrapping_add(19) % 256) as u8)
+                .collect();
+            let sv: Vec<_> = (0..n * blocks).map(|i| (i % 7 + 1) as f32 / 128.).collect();
+            // Dyadic products have a common 1/4096 quantum and sums stay below
+            // 2^24 quanta, so this timing corpus has exact order-independent
+            // outputs. Broad non-dyadic numerical coverage is a separate test.
+            let expected: Vec<f32> = (0..m * n)
+                .map(|index| {
+                    let (row, col) = (index / n, index % n);
+                    (0..k)
+                        .map(|depth| {
+                            let offset = (col * blocks + depth / block) * 8 + (depth % block) / 2;
+                            let q = (bv[offset] >> ((depth % 2) * 4)) & 15;
+                            f64::from(av[row * k + depth])
+                                * f64::from(
+                                    (i32::from(q) - 8) as f32 * sv[col * blocks + depth / block],
+                                )
+                        })
+                        .sum::<f64>() as f32
+                })
+                .collect();
+            assert!(expected.windows(2).any(|p| p[0] != p[1]));
+            let expected_checksum = output_checksum(&expected);
+            let a = Owned::f32(&[m, k], &av);
+            let b = Owned::u8(&[n, blocks, 8], &bv);
+            let scales = Owned::f32(&[n, blocks], &sv);
+            let groups = Owned::i32(
+                &[k],
+                &(0..k).map(|i| (i / block) as i32).collect::<Vec<_>>(),
+            );
+            for retained in [false, true] {
+                let bytes = k * n * 4;
+                let limit = if retained { bytes } else { 0 };
+                let (old_books, old_resources) = governed_dense_resources(bytes * 2, limit);
+                let (new_books, new_resources) = governed_dense_resources(bytes * 2, limit);
+                let node = governed_dense_node(k, n, 4, block);
+                let mut old = MatMulNBitsFactory::new(old_resources)
+                    .create(&node, &[vec![m, k]])
+                    .unwrap();
+                let mut native = MatMulNBitsFactory::new(new_resources)
+                    .create(&node, &[vec![m, k]])
+                    .unwrap();
+                old.set_constant_inputs(&[false, true, true, false, true]);
+                native.set_constant_inputs(&[false, true, true, false, true]);
+                let mut outputs = [
+                    Owned::zeros_f32(&[m, n]),
+                    Owned::zeros_f32(&[m, n]),
+                    Owned::zeros_f32(&[m, n]),
+                ];
+                let iterations = (8_000_000 / (m * k * n)).clamp(4, 2048);
+                // Six orders balance positions and every predecessor pair,
+                // including round boundaries, for interleaved worker pools.
+                let orders = [
+                    [0, 1, 2],
+                    [1, 2, 0],
+                    [2, 0, 1],
+                    [0, 2, 1],
+                    [2, 1, 0],
+                    [1, 0, 2],
+                ];
+                for round in 0..24 {
+                    for arm in orders[round % orders.len()] {
+                        let _scope = AppleKnDiagnosticScope::new(arm == 0);
+                        let kernel = if arm == 0 {
+                            old.as_ref()
+                        } else {
+                            native.as_ref()
+                        };
+                        black_box(kernel)
+                            .execute(
+                                black_box(&[
+                                    a.view(),
+                                    b.view(),
+                                    scales.view(),
+                                    TensorView::absent(DataType::Uint8),
+                                    groups.view(),
+                                ]),
+                                &mut [black_box(&mut outputs[arm]).view_mut()],
+                            )
+                            .unwrap();
+                        assert_eq!(outputs[arm].to_f32(), expected);
+                        let cpu = cpu_seconds();
+                        let wall = Instant::now();
+                        for _ in 0..iterations {
+                            black_box(kernel)
+                                .execute(
+                                    black_box(&[
+                                        a.view(),
+                                        b.view(),
+                                        scales.view(),
+                                        TensorView::absent(DataType::Uint8),
+                                        groups.view(),
+                                    ]),
+                                    &mut [black_box(&mut outputs[arm]).view_mut()],
+                                )
+                                .unwrap();
+                        }
+                        let wall_ns = wall.elapsed().as_nanos();
+                        let cpu_ns = (cpu_seconds() - cpu) * 1e9;
+                        assert!(wall_ns > 0 && cpu_ns > 0.);
+                        let actual = outputs[arm].to_f32();
+                        assert_eq!(actual, expected);
+                        let checksum = output_checksum(&actual);
+                        assert_eq!(checksum, expected_checksum);
+                        println!(
+                            "ANT_SAMPLE,1,{m},{k},{n},{},{round},{arm},{iterations},{cpu_ns:.0},{wall_ns},{checksum}",
+                            usize::from(retained)
+                        );
+                    }
+                }
+                let old_kernel = old.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                let new_kernel = native.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                let old_builds = old_kernel.dense_weights.activity().1;
+                let new_builds = new_kernel.dense_weights.activity().1;
+                assert_eq!(old_builds, 24 * (iterations + 1));
+                assert_eq!(new_builds, if retained { 1 } else { 48 * (iterations + 1) });
+                assert_eq!(old_kernel.dense_weights.stats(), (0, 0));
+                assert_eq!(
+                    new_kernel.dense_weights.stats(),
+                    if retained { (1, bytes) } else { (0, 0) }
+                );
+                assert_eq!(old_books.used(Tier::Host), 0);
+                assert_eq!(
+                    new_books.used(Tier::Host),
+                    if retained { bytes as u64 } else { 0 }
+                );
+                println!(
+                    "ANT_WITNESS,1,{m},{k},{n},{},{old_builds},{new_builds},{},{}",
+                    usize::from(retained),
+                    old_books.used(Tier::Host),
+                    new_books.used(Tier::Host)
+                );
+                drop(old);
+                drop(native);
+                assert_eq!(old_books.used(Tier::Host), 0);
+                assert_eq!(new_books.used(Tier::Host), 0);
+            }
+        }
+        assert!(!legacy_apple_kn_forced());
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
