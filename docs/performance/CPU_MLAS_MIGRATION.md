@@ -280,6 +280,16 @@ samples remain reproducible; production retains the single-vector loop. Generate
 GELU code has a larger stack frame and more spills, so simple unrolling is not
 an evidence-backed next step for this implementation.
 
+Native Softmax row APIs take a buffer and column count, deriving row count from
+complete slices instead of accepting an ignored independent `n`. They return
+an explicit error for nonempty zero-width input, partial rows, or unequal source
+and destination extents before writing. Empty storage is a no-op. A checked
+`NonZeroUsize` width and exact-row iterators establish each raw kernel's extent
+from its borrowed row. Native and research A/B callers use the same geometry
+validation, including when MLAS is unavailable; no old signature or compatibility
+alias remains. These boundary changes do not remeasure the frozen latency tables
+below.
+
 ARM64 contiguous native Softmax now uses a four-lane NEON max/exp/sum/normalize
 core from eight elements onward, sharing the AVX2 polynomial coefficients while
 preserving gradual underflow and the original scalar short-row path. Both

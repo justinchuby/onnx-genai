@@ -123,16 +123,16 @@ pub(super) unsafe fn softmax_row(src: *const f32, dst: *mut f32, d: usize) {
 }
 
 #[cfg(all(test, feature = "mlas"))]
-fn initial_neon(src: &[f32], dst: &mut [f32], _n: usize, d: usize) {
-    for (input, output) in src.chunks(d).zip(dst.chunks_mut(d)) {
+fn initial_neon(src: &[f32], dst: &mut [f32], d: usize) {
+    for (input, output) in src.chunks_exact(d).zip(dst.chunks_exact_mut(d)) {
         // SAFETY: NEON test host; disjoint equal-length complete rows.
         unsafe { softmax_row_impl::<false>(input.as_ptr(), output.as_mut_ptr(), d) };
     }
 }
 
 #[cfg(all(test, feature = "mlas"))]
-fn scalar_before(src: &[f32], dst: &mut [f32], _n: usize, d: usize) {
-    for (input, output) in src.chunks(d).zip(dst.chunks_mut(d)) {
+fn scalar_before(src: &[f32], dst: &mut [f32], d: usize) {
+    for (input, output) in src.chunks_exact(d).zip(dst.chunks_exact_mut(d)) {
         // Match the native arm's test-only per-row bookkeeping.
         if d >= super::MIN_NEON_SOFTMAX_ROW {
             SOFTMAX_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -253,7 +253,8 @@ mod tests {
                 let mut backing = vec![-12345.5; d + 8];
                 let mut scalar = vec![0.0; d];
                 let mut direct = vec![0.0; d];
-                super::super::softmax_rows_serial_out_native(input, &mut backing[4..4 + d], 1, d);
+                super::super::softmax_rows_serial_out_native(input, &mut backing[4..4 + d], d)
+                    .unwrap();
                 // SAFETY: initialized equal-length slices, NEON host.
                 unsafe {
                     super::super::softmax_row_scalar(input.as_ptr(), scalar.as_mut_ptr(), d);
@@ -284,7 +285,7 @@ mod tests {
                     assert!((f64::from(y) - expected).abs() <= 1e-6);
                 }
                 let mut inplace = input.to_vec();
-                super::super::softmax_rows_serial_native(&mut inplace, 1, d);
+                super::super::softmax_rows_serial_native(&mut inplace, d).unwrap();
                 assert!(
                     inplace
                         .iter()
@@ -313,7 +314,7 @@ mod tests {
                 let mut input = vec![-3.0e38; d];
                 input[position] = 3.0e38;
                 let mut output = vec![f32::NAN; d];
-                super::super::softmax_rows_serial_out_native(&input, &mut output, 1, d);
+                super::super::softmax_rows_serial_out_native(&input, &mut output, d).unwrap();
                 for (i, value) in output.iter().enumerate() {
                     assert_eq!(
                         *value,
@@ -340,9 +341,9 @@ mod tests {
                     let mut input = vec![0.0; d];
                     input[position] = special;
                     let mut out = vec![f32::NAN; d];
-                    super::super::softmax_rows_serial_out_native(&input, &mut out, 1, d);
+                    super::super::softmax_rows_serial_out_native(&input, &mut out, d).unwrap();
                     let mut inplace = input.clone();
-                    super::super::softmax_rows_serial_native(&mut inplace, 1, d);
+                    super::super::softmax_rows_serial_native(&mut inplace, d).unwrap();
                     assert!(
                         out.iter()
                             .zip(&inplace)
@@ -362,7 +363,7 @@ mod tests {
             }
             let input = vec![f32::NEG_INFINITY; d];
             let mut out = vec![0.0; d];
-            super::super::softmax_rows_serial_out_native(&input, &mut out, 1, d);
+            super::super::softmax_rows_serial_out_native(&input, &mut out, d).unwrap();
             assert!(out.iter().all(|v| v.is_nan()));
         }
     }
@@ -413,15 +414,29 @@ mod tests {
                 let run = |arm, out: &mut [f32]| {
                     let input = black_box(source.as_slice());
                     let out = black_box(out);
-                    let kernel: fn(&[f32], &mut [f32], usize, usize) = match arm {
+                    let kernel: fn(&[f32], &mut [f32], usize) = match arm {
                         0 => scalar_before,
-                        1 | 2 => super::super::softmax_rows_serial_out_native,
-                        3 => mlas_sys::compute_softmax,
+                        1 | 2 => |src, dst, d| {
+                            super::super::softmax_rows_serial_out_native(src, dst, d)
+                                .expect("diagnostic native rows must be complete");
+                        },
+                        3 => |src, dst, d| {
+                            if let Some(width) = super::super::checked_row_width(src.len(), d)
+                                .expect("diagnostic reference rows must be complete")
+                            {
+                                mlas_sys::compute_softmax(
+                                    src,
+                                    dst,
+                                    src.len() / width.get(),
+                                    width.get(),
+                                );
+                            }
+                        },
                         4 => initial_neon,
                         _ => unreachable!(),
                     };
                     if serial {
-                        kernel(input, out, n, d);
+                        kernel(input, out, d);
                     } else {
                         super::super::softmax_rows_with_kernel(input, out, n, d, kernel);
                     }
