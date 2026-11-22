@@ -14107,3 +14107,111 @@ fn nbits_shape_variants_share_one_native_pack_within_the_session_node() {
     drop(peer);
     assert_eq!(governor.used(Tier::Host), 0);
 }
+
+#[test]
+fn nbits_shape_variants_share_one_dense_weight_within_the_session_node() {
+    use onnx_runtime_memory_api::Tier;
+    use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 24);
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let a = graph.create_named_value("a", DataType::Float32, vec![]);
+    let y = graph.create_named_value("y", DataType::Float32, vec![]);
+    // Unknown-rank ONNX inputs allow vector/matrix/batched-vector shapes. All
+    // have one row, so every backend exercises the resident NK dense route.
+    graph.mark_value_shape_unknown(a);
+    graph.mark_value_shape_unknown(y);
+    let mut init = |name: &str, dtype, dims: Vec<usize>, bytes| {
+        let value = graph.create_named_value(name, dtype, static_shape(dims.iter().copied()));
+        graph.initializers.insert(
+            value,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(dtype, dims, bytes)),
+        );
+        value
+    };
+    let b = init("b", DataType::Uint8, vec![3, 3, 8], vec![0x98; 72]);
+    let scales = init(
+        "scales",
+        DataType::Float32,
+        vec![3, 3],
+        [0.125f32.to_le_bytes(); 9].concat(),
+    );
+    let groups = init(
+        "groups",
+        DataType::Int32,
+        vec![33],
+        (0..33i32).flat_map(|i| (i / 16).to_le_bytes()).collect(),
+    );
+    let mut node = Node::new(
+        NodeId(0),
+        "MatMulNBits",
+        vec![Some(a), Some(b), Some(scales), None, Some(groups)],
+        vec![y],
+    );
+    node.domain = "com.microsoft".into();
+    for (name, value) in [("K", 33), ("N", 3), ("bits", 4), ("block_size", 16)] {
+        node.attributes
+            .insert(name.into(), onnx_runtime_ir::Attribute::Int(value));
+    }
+    graph.add_input(a);
+    graph.add_output(y);
+    graph.insert_node(node);
+    let books = LedgerGovernor::new(LeaseLedger::new(0, 1 << 20, 0));
+    let memory =
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap();
+    let resources =
+        onnx_runtime_ep_cpu::CpuMemoryResources::new(memory, Default::default()).unwrap();
+    let cpu: Arc<dyn ExecutionProvider> =
+        Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+    let mut executor = Executor::build(
+        graph.clone(),
+        Arc::new(WeightStore::new()),
+        cpu.clone(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+    for shape in [vec![33], vec![1, 33], vec![1, 1, 33], vec![1, 33]] {
+        let mut expected_shape = shape[..shape.len() - 1].to_vec();
+        expected_shape.push(3);
+        let input = Tensor::from_raw(
+            DataType::Float32,
+            shape,
+            &[0.25f32.to_le_bytes(); 33].concat(),
+        )
+        .unwrap();
+        let output = executor.run(&[("a", &input)]).unwrap();
+        assert_eq!(output[0].shape, expected_shape);
+        // Nibbles 8,9 with implicit zero 8 give sixteen ones over K=33.
+        assert_eq!(output[0].as_bytes(), &[0.5f32.to_le_bytes(); 3].concat());
+        assert_eq!(
+            books.used(Tier::Host),
+            396,
+            "all activation ranks must share one 33*3 f32 expansion"
+        );
+    }
+    assert!(
+        executor.cache.stats().entries >= 3,
+        "distinct resolved activation ranks must build separate kernels"
+    );
+    let mut peer = Executor::build(graph, Arc::new(WeightStore::new()), cpu, None).unwrap();
+    let input = Tensor::from_raw(
+        DataType::Float32,
+        vec![33],
+        &[0.25f32.to_le_bytes(); 33].concat(),
+    )
+    .unwrap();
+    assert_eq!(
+        peer.run(&[("a", &input)]).unwrap()[0].as_bytes(),
+        &[0.5f32.to_le_bytes(); 3].concat()
+    );
+    assert_eq!(
+        books.used(Tier::Host),
+        792,
+        "sessions must own distinct expansions"
+    );
+    drop(executor);
+    assert_eq!(books.used(Tier::Host), 396);
+    drop(peer);
+    assert_eq!(books.used(Tier::Host), 0);
+}

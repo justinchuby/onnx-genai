@@ -667,7 +667,7 @@ fn hand_int8_decode_has_native_dot() -> bool {
     }
 }
 
-// This key names the immutable f32 NK slot of one kernel, not a process-wide
+// This key names the immutable f32 NK slot of one node, not a process-wide
 // weight address. Only the existing all-constant operand proof enables retention.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct NBitsDenseKey {
@@ -692,7 +692,7 @@ pub struct MatMulNBitsKernel {
     flops: Option<u64>,
     weight_prepacked: bool,
     constant_inputs: [bool; 5],
-    dense_weights: DenseWeightCache<NBitsDenseKey>,
+    dense_weights: Arc<DenseWeightCache<NBitsDenseKey>>,
     weight_memory: DerivedWeightMemory,
     native_packs: Arc<NativePackCaches>,
     #[cfg(feature = "mlas")]
@@ -736,7 +736,7 @@ impl NativePackCaches {
 }
 
 #[derive(PartialEq, Eq)]
-struct NativePackParameters {
+struct NBitsWeightParameters {
     k: usize,
     n: usize,
     bits: usize,
@@ -744,11 +744,13 @@ struct NativePackParameters {
     accuracy_level: i64,
     weight_prepacked: bool,
     constant_inputs: [bool; 5],
+    dense_byte_limit: usize,
 }
-struct SharedNativePackState {
+struct SharedNBitsWeightState {
     caches: Arc<NativePackCaches>,
+    dense_weights: Arc<DenseWeightCache<NBitsDenseKey>>,
     memory: DerivedWeightMemory,
-    parameters: NativePackParameters,
+    parameters: NBitsWeightParameters,
 }
 
 /// Packed weights a kernel installed in the process-global store must not
@@ -1934,14 +1936,14 @@ impl KernelFactory for MatMulNBitsFactory {
             flops,
             weight_prepacked: weight_prepacked == 1,
             constant_inputs: [false; 5],
-            dense_weights: DenseWeightCache::new(
+            dense_weights: Arc::new(DenseWeightCache::new(
                 self.resources.weight_memory().clone(),
                 if self.resources.cache_retention().is_admitted() {
                     self.resources.weight_cache_limits().dense_bytes
                 } else {
                     0
                 },
-            ),
+            )),
             weight_memory: self.resources.weight_memory().clone(),
             native_packs: Arc::new(NativePackCaches::new(self.resources.weight_memory())),
             #[cfg(feature = "mlas")]
@@ -1962,9 +1964,10 @@ impl Kernel for MatMulNBitsKernel {
     }
 
     fn shareable_constant_state(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        let parameters = self.shareable_native_pack_parameters()?;
-        Some(Arc::new(SharedNativePackState {
+        let parameters = self.shareable_weight_parameters()?;
+        Some(Arc::new(SharedNBitsWeightState {
             caches: self.native_packs.clone(),
+            dense_weights: self.dense_weights.clone(),
             memory: self.weight_memory.clone(),
             parameters,
         }))
@@ -1974,18 +1977,19 @@ impl Kernel for MatMulNBitsKernel {
         &mut self,
         state: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Result<bool> {
-        let Ok(shared) = Arc::downcast::<SharedNativePackState>(state) else {
+        let Ok(shared) = Arc::downcast::<SharedNBitsWeightState>(state) else {
             return Ok(false);
         };
-        if self.shareable_native_pack_parameters().as_ref() != Some(&shared.parameters) {
+        if self.shareable_weight_parameters().as_ref() != Some(&shared.parameters) {
             return Ok(false);
         }
         if !self.weight_memory.shares_source_with(&shared.memory) {
             return Err(error(
-                "cannot adopt native packs from a different derived-weight grant source; construct this node's shape variants from clones of the same CpuMemoryResources",
+                "cannot adopt derived weights from a different derived-weight grant source; construct this node's shape variants from clones of the same CpuMemoryResources",
             ));
         }
         self.native_packs = shared.caches.clone();
+        self.dense_weights = shared.dense_weights.clone();
         Ok(true)
     }
 
@@ -2745,13 +2749,13 @@ impl Kernel for MatMulNBitsKernel {
 }
 
 impl MatMulNBitsKernel {
-    fn shareable_native_pack_parameters(&self) -> Option<NativePackParameters> {
+    fn shareable_weight_parameters(&self) -> Option<NBitsWeightParameters> {
         // Optional dynamic metadata still prevents retention at execute's
         // can_prepack gate. No mutable operand can fill these shared slots.
         if !self.constant_inputs[1] || !self.constant_inputs[2] || self.weight_prepacked {
             return None;
         }
-        Some(NativePackParameters {
+        Some(NBitsWeightParameters {
             k: self.k,
             n: self.n,
             bits: self.bits,
@@ -2759,6 +2763,7 @@ impl MatMulNBitsKernel {
             accuracy_level: self.accuracy_level,
             weight_prepacked: self.weight_prepacked,
             constant_inputs: self.constant_inputs,
+            dense_byte_limit: self.dense_weights.byte_limit(),
         })
     }
 
@@ -4940,9 +4945,9 @@ fn mlas_sqnbit_packed_b_cache_bytes(
 ///
 /// Compact native packs and decoder/activation scratch are outside this
 /// estimate; zero does not imply a zero-copy execution. MLAS packs share the
-/// `MLAS_PACKED_DECODE_INSTANTIATIONS` count. F32 expansions belong to each
-/// compiled kernel: dynamic prefill/decode instances may retain separate
-/// payloads, and policy/physical refusal may retain none. Owned Host grants,
+/// `MLAS_PACKED_DECODE_INSTANTIATIONS` count. F32 NK cache entries share the
+/// executor node's immutable state across shape variants; policy/physical
+/// refusal may retain none. Active evicted payloads keep their own Host grants,
 /// not this estimate, authorize their actual live bytes.
 #[allow(clippy::too_many_arguments)]
 pub fn planned_nbits_node_retained_bytes(
@@ -13022,6 +13027,211 @@ mod tests {
     }
 
     #[test]
+    fn dense_weight_shared_shapes_preserve_readers_reclaim_and_rebuild() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let (books, resources) = governed_dense_resources(396, 396);
+        let factory = MatMulNBitsFactory::new(resources);
+        let node = governed_dense_node(33, 3, 4, 16);
+        let mut producer = factory.create(&node, &[vec![1, 33]]).unwrap();
+        producer.set_constant_inputs(&[false, true, true]);
+        let b = Owned::u8(&[3, 3, 8], &[0x98; 72]);
+        let scales = Owned::f32(&[3, 3], &[0.125; 9]);
+        let first = producer
+            .as_any()
+            .downcast_ref::<MatMulNBitsKernel>()
+            .unwrap();
+        let active = first
+            .load_dense_weight(
+                &b.view(),
+                &scales.view(),
+                None,
+                None,
+                true,
+                WeightLayout::Nk,
+            )
+            .unwrap()
+            .unwrap();
+        for feature in 0..3 {
+            for depth in 0..33 {
+                assert_eq!(
+                    active.as_slice()[feature * 33 + depth],
+                    (depth % 2) as f32 * 0.125
+                );
+            }
+        }
+        let mut receiver = factory.create(&node, &[vec![3, 33]]).unwrap();
+        receiver.set_constant_inputs(&[false, true, true]);
+        assert!(
+            receiver
+                .adopt_shareable_constant_state(producer.shareable_constant_state().unwrap())
+                .unwrap()
+        );
+        let second = receiver
+            .as_any()
+            .downcast_ref::<MatMulNBitsKernel>()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.dense_weights, &second.dense_weights));
+        let warm = second
+            .load_dense_weight(
+                &b.view(),
+                &scales.view(),
+                None,
+                None,
+                true,
+                WeightLayout::Nk,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&active, &warm));
+        drop(warm);
+        drop(producer);
+        assert_eq!(books.used(Tier::Host), 396);
+        assert!(
+            books
+                .reserve(Tier::Host, 396, MemoryRole::KvCache, HolderId::new(2))
+                .is_err(),
+            "active dense readers must keep their funding after producer teardown"
+        );
+        drop(active);
+        let kv = books
+            .reserve(Tier::Host, 396, MemoryRole::KvCache, HolderId::new(2))
+            .unwrap();
+        assert!(
+            cached_dense_weight(second).is_none(),
+            "pressure enrollment must survive producer teardown"
+        );
+        drop(kv);
+        let rebuilt = second
+            .load_dense_weight(
+                &b.view(),
+                &scales.view(),
+                None,
+                None,
+                true,
+                WeightLayout::Nk,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(books.used(Tier::Host), 396);
+        drop(receiver);
+        assert_eq!(books.used(Tier::Host), 396);
+        drop(rebuilt);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn dense_weight_shared_shapes_serialize_distinct_cold_builders() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let (books, resources) = governed_dense_resources(64, 64);
+        let factory = MatMulNBitsFactory::new(resources);
+        let node = governed_dense_node(16, 1, 4, 16);
+        let mut owner = factory.create(&node, &[vec![1, 16]]).unwrap();
+        owner.set_constant_inputs(&[false, true, true]);
+        let state = owner.shareable_constant_state().unwrap();
+        let peers: Vec<_> = (1..=8)
+            .map(|rows| {
+                let mut peer = factory.create(&node, &[vec![rows, 16]]).unwrap();
+                peer.set_constant_inputs(&[false, true, true]);
+                assert!(peer.adopt_shareable_constant_state(state.clone()).unwrap());
+                peer
+            })
+            .collect();
+        drop(owner);
+        drop(state);
+        let b = Owned::u8(&[1, 1, 8], &[0x98; 8]);
+        let scales = Owned::f32(&[1, 1], &[0.125]);
+        let barrier = std::sync::Barrier::new(8);
+        let payloads = std::thread::scope(|scope| {
+            let handles: Vec<_> = peers
+                .iter()
+                .map(|peer| {
+                    let kernel = peer.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                    let (barrier, b, scales) = (&barrier, &b, &scales);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        kernel
+                            .load_dense_weight(
+                                &b.view(),
+                                &scales.view(),
+                                None,
+                                None,
+                                true,
+                                WeightLayout::Nk,
+                            )
+                            .unwrap()
+                            .unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(payloads.iter().all(|p| Arc::ptr_eq(p, &payloads[0])));
+        assert_eq!(
+            payloads[0].as_slice(),
+            &[
+                0., 0.125, 0., 0.125, 0., 0.125, 0., 0.125, 0., 0.125, 0., 0.125, 0., 0.125, 0.,
+                0.125
+            ]
+        );
+        assert_eq!(books.used(Tier::Host), 64);
+        drop(peers);
+        assert_eq!(books.used(Tier::Host), 64);
+        drop(payloads);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn dense_weight_shared_shapes_preserve_dynamic_metadata_and_denied_retention() {
+        let _probe = lock_dispatch_probe();
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        for constant_group in [false, true] {
+            let (books, resources) =
+                governed_dense_resources(132, if constant_group { 0 } else { 132 });
+            let factory = MatMulNBitsFactory::new(resources);
+            let node = governed_dense_node(33, 1, 4, 16);
+            let mut owner = factory.create(&node, &[]).unwrap();
+            owner.set_constant_inputs(&[false, true, true, false, constant_group]);
+            let mut peer = factory.create(&node, &[]).unwrap();
+            peer.set_constant_inputs(&[false, true, true, false, constant_group]);
+            assert!(
+                peer.adopt_shareable_constant_state(owner.shareable_constant_state().unwrap())
+                    .unwrap()
+            );
+            let a = Owned::f32(&[1, 33], &[0.25; 33]);
+            let b = Owned::u8(&[1, 3, 8], &[0x98; 24]);
+            let scales = Owned::f32(&[1, 3], &[0.125, 0.25, 0.5]);
+            for kernel in [&owner, &peer] {
+                for group in if constant_group { [0, 0] } else { [0, 1] } {
+                    let groups = Owned::i32(&[33], &[group; 33]);
+                    let mut output = Owned::zeros_f32(&[1, 1]);
+                    kernel
+                        .execute(
+                            &[
+                                a.view(),
+                                b.view(),
+                                scales.view(),
+                                TensorView::absent(DataType::Uint8),
+                                groups.view(),
+                            ],
+                            &mut [output.view_mut()],
+                        )
+                        .unwrap();
+                    assert_eq!(output.to_f32(), [if group == 0 { 0.5 } else { 1.0 }]);
+                    let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+                    assert!(cached_dense_weight(concrete).is_none());
+                    assert_eq!(books.used(Tier::Host), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_pack_shared_shapes_keep_all_layouts_alive_and_reclaimable() {
         use onnx_runtime_memory_api::{MemoryRole, Tier};
         use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
@@ -13204,7 +13414,7 @@ mod tests {
             );
             assert!(!Arc::ptr_eq(&receiver.native_packs, &producer.native_packs));
         }
-        for mode in 0..10 {
+        for mode in 0..11 {
             let mut receiver = test_kernel(16, 1, 16);
             receiver.weight_memory = memory.clone();
             receiver.set_constant_inputs(&[false, true, true]);
@@ -13218,7 +13428,17 @@ mod tests {
                 6 => receiver.constant_inputs[1] = false,
                 7 => receiver.constant_inputs[3] = true,
                 8 => receiver.constant_inputs[2] = false,
-                _ => receiver.constant_inputs[4] = true,
+                9 => receiver.constant_inputs[4] = true,
+                _ => {
+                    receiver.dense_weights = Arc::new(DenseWeightCache::new(
+                        memory.clone(),
+                        if receiver.dense_weights.byte_limit() == 0 {
+                            1
+                        } else {
+                            0
+                        },
+                    ))
+                }
             }
             assert!(
                 !receiver
@@ -13237,6 +13457,10 @@ mod tests {
         );
         assert!(receiver.adopt_shareable_constant_state(state).unwrap());
         assert!(Arc::ptr_eq(&receiver.native_packs, &producer.native_packs));
+        assert!(Arc::ptr_eq(
+            &receiver.dense_weights,
+            &producer.dense_weights
+        ));
         let mut local = test_kernel(16, 1, 16);
         let mut peer = test_kernel(16, 1, 16);
         local.set_constant_inputs(&[false, true, true]);
@@ -14142,14 +14366,14 @@ mod tests {
         {
             kernel.retain_mlas_packs = enabled;
         }
-        kernel.dense_weights = DenseWeightCache::new(
+        kernel.dense_weights = Arc::new(DenseWeightCache::new(
             crate::DerivedWeightMemory::default(),
             if enabled {
                 super::super::dense_weight_cache::configured_dense_weight_cache_bytes()
             } else {
                 0
             },
-        );
+        ));
     }
 
     fn test_kernel(k: usize, n: usize, block_size: usize) -> MatMulNBitsKernel {
@@ -14164,7 +14388,7 @@ mod tests {
             flops: None,
             weight_prepacked: false,
             constant_inputs: [false; 5],
-            dense_weights: DenseWeightCache::default(),
+            dense_weights: Arc::new(DenseWeightCache::default()),
             weight_memory: DerivedWeightMemory::default(),
             native_packs: Arc::new(NativePackCaches::new(&DerivedWeightMemory::default())),
             #[cfg(feature = "mlas")]
