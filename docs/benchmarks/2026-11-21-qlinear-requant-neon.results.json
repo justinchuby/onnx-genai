@@ -1,0 +1,1285 @@
+{
+  "cpu": "Apple M1 Max",
+  "logical_cpus": 10,
+  "memory_bytes": 34359738368,
+  "os": "macOS 27.0.1 build 26A434",
+  "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+  "base_commit": "216c894e1f9a171bc8bd7479dc89d4f70cfd4c50",
+  "source_sha256": "cacac1ccc4956792fbf7bf70934cc9c1364026991a29b81f542c912aa0cf3fa4",
+  "scope": "Hot-cache selected row kernel only; excludes GEMM, scale preparation, allocation, batch selection, threading, and session overhead. Whole-command maximum RSS includes build/harness activity.",
+  "samples_per_arm": 21,
+  "sweeps": [
+    {
+      "sweep": 1,
+      "provenance": [
+        {
+          "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+          "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported",
+          "pid": 37229,
+          "load_before": [
+            2.64892578125,
+            2.06640625,
+            2.228515625
+          ],
+          "command": [
+            "python3",
+            "/tmp/nxrt-env-exec.py",
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "--target-dir",
+            "/tmp/nxrt-qlinear-requant-target",
+            "-p",
+            "onnx-runtime-ep-cpu",
+            "--lib",
+            "--release",
+            "kernels::qlinear_matmul::tests::bench_requantization_neon_ab",
+            "--",
+            "--exact",
+            "--ignored",
+            "--nocapture"
+          ]
+        },
+        {
+          "wall_s": 140.20704041600402,
+          "cpu_s": 139.87573200000003,
+          "maxrss_bytes": 3877928960,
+          "load_after": [
+            1.541015625,
+            1.85302734375,
+            2.11669921875
+          ]
+        }
+      ],
+      "rows": [
+        {
+          "n": 7,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 1.074,
+          "wall_ns_per_element": 1.0737,
+          "cpu_sample_min": 0.915,
+          "cpu_sample_max": 2.21
+        },
+        {
+          "n": 7,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 1.071,
+          "wall_ns_per_element": 1.0706,
+          "cpu_sample_min": 0.902,
+          "cpu_sample_max": 1.91
+        },
+        {
+          "n": 7,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 1.069,
+          "wall_ns_per_element": 1.0678,
+          "cpu_sample_min": 0.913,
+          "cpu_sample_max": 1.878
+        },
+        {
+          "n": 7,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.831,
+          "wall_ns_per_element": 0.8309,
+          "cpu_sample_min": 0.83,
+          "cpu_sample_max": 0.846
+        },
+        {
+          "n": 7,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.831,
+          "wall_ns_per_element": 0.8303,
+          "cpu_sample_min": 0.83,
+          "cpu_sample_max": 0.849
+        },
+        {
+          "n": 7,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.833,
+          "wall_ns_per_element": 0.8328,
+          "cpu_sample_min": 0.83,
+          "cpu_sample_max": 0.846
+        },
+        {
+          "n": 8,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.733,
+          "wall_ns_per_element": 0.7319,
+          "cpu_sample_min": 0.731,
+          "cpu_sample_max": 0.767
+        },
+        {
+          "n": 8,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.581,
+          "wall_ns_per_element": 0.581,
+          "cpu_sample_min": 0.581,
+          "cpu_sample_max": 0.585
+        },
+        {
+          "n": 8,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.581,
+          "wall_ns_per_element": 0.581,
+          "cpu_sample_min": 0.581,
+          "cpu_sample_max": 0.59
+        },
+        {
+          "n": 8,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.719,
+          "wall_ns_per_element": 0.7185,
+          "cpu_sample_min": 0.718,
+          "cpu_sample_max": 0.726
+        },
+        {
+          "n": 8,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.581,
+          "wall_ns_per_element": 0.5809,
+          "cpu_sample_min": 0.581,
+          "cpu_sample_max": 0.584
+        },
+        {
+          "n": 8,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.582,
+          "wall_ns_per_element": 0.5809,
+          "cpu_sample_min": 0.58,
+          "cpu_sample_max": 0.622
+        },
+        {
+          "n": 17,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.52,
+          "wall_ns_per_element": 0.5198,
+          "cpu_sample_min": 0.519,
+          "cpu_sample_max": 0.527
+        },
+        {
+          "n": 17,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.456,
+          "wall_ns_per_element": 0.4556,
+          "cpu_sample_min": 0.455,
+          "cpu_sample_max": 0.469
+        },
+        {
+          "n": 17,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.456,
+          "wall_ns_per_element": 0.4556,
+          "cpu_sample_min": 0.455,
+          "cpu_sample_max": 0.466
+        },
+        {
+          "n": 17,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.499,
+          "wall_ns_per_element": 0.4981,
+          "cpu_sample_min": 0.498,
+          "cpu_sample_max": 0.505
+        },
+        {
+          "n": 17,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.438,
+          "wall_ns_per_element": 0.4375,
+          "cpu_sample_min": 0.437,
+          "cpu_sample_max": 0.444
+        },
+        {
+          "n": 17,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.438,
+          "wall_ns_per_element": 0.4374,
+          "cpu_sample_min": 0.437,
+          "cpu_sample_max": 0.445
+        },
+        {
+          "n": 128,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.382,
+          "wall_ns_per_element": 0.3821,
+          "cpu_sample_min": 0.382,
+          "cpu_sample_max": 0.386
+        },
+        {
+          "n": 128,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.208,
+          "wall_ns_per_element": 0.2081,
+          "cpu_sample_min": 0.208,
+          "cpu_sample_max": 0.235
+        },
+        {
+          "n": 128,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.209,
+          "wall_ns_per_element": 0.2082,
+          "cpu_sample_min": 0.208,
+          "cpu_sample_max": 0.213
+        },
+        {
+          "n": 128,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.381,
+          "wall_ns_per_element": 0.3804,
+          "cpu_sample_min": 0.38,
+          "cpu_sample_max": 0.443
+        },
+        {
+          "n": 128,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.209,
+          "wall_ns_per_element": 0.2082,
+          "cpu_sample_min": 0.208,
+          "cpu_sample_max": 0.214
+        },
+        {
+          "n": 128,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.208,
+          "wall_ns_per_element": 0.2083,
+          "cpu_sample_min": 0.208,
+          "cpu_sample_max": 0.215
+        },
+        {
+          "n": 257,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.381,
+          "wall_ns_per_element": 0.3805,
+          "cpu_sample_min": 0.38,
+          "cpu_sample_max": 0.388
+        },
+        {
+          "n": 257,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.202,
+          "wall_ns_per_element": 0.2013,
+          "cpu_sample_min": 0.201,
+          "cpu_sample_max": 0.204
+        },
+        {
+          "n": 257,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.201,
+          "wall_ns_per_element": 0.2013,
+          "cpu_sample_min": 0.201,
+          "cpu_sample_max": 0.206
+        },
+        {
+          "n": 257,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.379,
+          "wall_ns_per_element": 0.3791,
+          "cpu_sample_min": 0.379,
+          "cpu_sample_max": 0.386
+        },
+        {
+          "n": 257,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.2,
+          "wall_ns_per_element": 0.2001,
+          "cpu_sample_min": 0.2,
+          "cpu_sample_max": 0.209
+        },
+        {
+          "n": 257,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.201,
+          "wall_ns_per_element": 0.2002,
+          "cpu_sample_min": 0.2,
+          "cpu_sample_max": 0.209
+        },
+        {
+          "n": 2048,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.3792,
+          "wall_ns_per_element": 0.3789,
+          "cpu_sample_min": 0.3782,
+          "cpu_sample_max": 0.3972
+        },
+        {
+          "n": 2048,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.1921,
+          "wall_ns_per_element": 0.1915,
+          "cpu_sample_min": 0.1911,
+          "cpu_sample_max": 0.2031
+        },
+        {
+          "n": 2048,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.1921,
+          "wall_ns_per_element": 0.1914,
+          "cpu_sample_min": 0.1911,
+          "cpu_sample_max": 0.2091
+        },
+        {
+          "n": 2048,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.3782,
+          "wall_ns_per_element": 0.3781,
+          "cpu_sample_min": 0.3782,
+          "cpu_sample_max": 0.3812
+        },
+        {
+          "n": 2048,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.1911,
+          "wall_ns_per_element": 0.1913,
+          "cpu_sample_min": 0.1911,
+          "cpu_sample_max": 0.1941
+        },
+        {
+          "n": 2048,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.1921,
+          "wall_ns_per_element": 0.1912,
+          "cpu_sample_min": 0.1911,
+          "cpu_sample_max": 0.1981
+        },
+        {
+          "n": 5120,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.3786,
+          "wall_ns_per_element": 0.3778,
+          "cpu_sample_min": 0.3776,
+          "cpu_sample_max": 0.3826
+        },
+        {
+          "n": 5120,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.1903,
+          "wall_ns_per_element": 0.1902,
+          "cpu_sample_min": 0.1903,
+          "cpu_sample_max": 0.2023
+        },
+        {
+          "n": 5120,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.1903,
+          "wall_ns_per_element": 0.1902,
+          "cpu_sample_min": 0.1903,
+          "cpu_sample_max": 0.1933
+        },
+        {
+          "n": 5120,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.3776,
+          "wall_ns_per_element": 0.3769,
+          "cpu_sample_min": 0.3766,
+          "cpu_sample_max": 0.3806
+        },
+        {
+          "n": 5120,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.1903,
+          "wall_ns_per_element": 0.1897,
+          "cpu_sample_min": 0.1893,
+          "cpu_sample_max": 0.1943
+        },
+        {
+          "n": 5120,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.1903,
+          "wall_ns_per_element": 0.1897,
+          "cpu_sample_min": 0.1893,
+          "cpu_sample_max": 0.1973
+        }
+      ]
+    },
+    {
+      "sweep": 2,
+      "provenance": [
+        {
+          "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+          "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported",
+          "pid": 37508,
+          "load_before": [
+            1.611328125,
+            1.85693359375,
+            2.11474609375
+          ],
+          "command": [
+            "python3",
+            "/tmp/nxrt-env-exec.py",
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "--target-dir",
+            "/tmp/nxrt-qlinear-requant-target",
+            "-p",
+            "onnx-runtime-ep-cpu",
+            "--lib",
+            "--release",
+            "kernels::qlinear_matmul::tests::bench_requantization_neon_ab",
+            "--",
+            "--exact",
+            "--ignored",
+            "--nocapture"
+          ]
+        },
+        {
+          "wall_s": 0.7779266249999637,
+          "cpu_s": 0.59647,
+          "maxrss_bytes": 108871680,
+          "load_after": [
+            1.611328125,
+            1.85693359375,
+            2.11474609375
+          ]
+        }
+      ],
+      "rows": [
+        {
+          "n": 7,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.888,
+          "wall_ns_per_element": 0.8879,
+          "cpu_sample_min": 0.885,
+          "cpu_sample_max": 0.893
+        },
+        {
+          "n": 7,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.886,
+          "wall_ns_per_element": 0.8852,
+          "cpu_sample_min": 0.885,
+          "cpu_sample_max": 0.889
+        },
+        {
+          "n": 7,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.888,
+          "wall_ns_per_element": 0.8878,
+          "cpu_sample_min": 0.885,
+          "cpu_sample_max": 0.895
+        },
+        {
+          "n": 7,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.832,
+          "wall_ns_per_element": 0.8327,
+          "cpu_sample_min": 0.83,
+          "cpu_sample_max": 0.875
+        },
+        {
+          "n": 7,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.831,
+          "wall_ns_per_element": 0.83,
+          "cpu_sample_min": 0.83,
+          "cpu_sample_max": 0.836
+        },
+        {
+          "n": 7,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.831,
+          "wall_ns_per_element": 0.83,
+          "cpu_sample_min": 0.83,
+          "cpu_sample_max": 0.841
+        },
+        {
+          "n": 8,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.732,
+          "wall_ns_per_element": 0.7318,
+          "cpu_sample_min": 0.731,
+          "cpu_sample_max": 0.772
+        },
+        {
+          "n": 8,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.581,
+          "wall_ns_per_element": 0.5809,
+          "cpu_sample_min": 0.581,
+          "cpu_sample_max": 0.591
+        },
+        {
+          "n": 8,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.583,
+          "wall_ns_per_element": 0.5836,
+          "cpu_sample_min": 0.581,
+          "cpu_sample_max": 0.589
+        },
+        {
+          "n": 8,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.72,
+          "wall_ns_per_element": 0.7207,
+          "cpu_sample_min": 0.718,
+          "cpu_sample_max": 0.728
+        },
+        {
+          "n": 8,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.581,
+          "wall_ns_per_element": 0.5809,
+          "cpu_sample_min": 0.58,
+          "cpu_sample_max": 0.585
+        },
+        {
+          "n": 8,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.582,
+          "wall_ns_per_element": 0.5809,
+          "cpu_sample_min": 0.581,
+          "cpu_sample_max": 0.593
+        },
+        {
+          "n": 17,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.52,
+          "wall_ns_per_element": 0.5194,
+          "cpu_sample_min": 0.519,
+          "cpu_sample_max": 0.528
+        },
+        {
+          "n": 17,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.457,
+          "wall_ns_per_element": 0.4556,
+          "cpu_sample_min": 0.455,
+          "cpu_sample_max": 0.462
+        },
+        {
+          "n": 17,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.456,
+          "wall_ns_per_element": 0.4556,
+          "cpu_sample_min": 0.455,
+          "cpu_sample_max": 0.498
+        },
+        {
+          "n": 17,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.499,
+          "wall_ns_per_element": 0.4983,
+          "cpu_sample_min": 0.498,
+          "cpu_sample_max": 0.53
+        },
+        {
+          "n": 17,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.438,
+          "wall_ns_per_element": 0.4376,
+          "cpu_sample_min": 0.437,
+          "cpu_sample_max": 0.468
+        },
+        {
+          "n": 17,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.438,
+          "wall_ns_per_element": 0.4376,
+          "cpu_sample_min": 0.437,
+          "cpu_sample_max": 0.451
+        },
+        {
+          "n": 128,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.382,
+          "wall_ns_per_element": 0.3821,
+          "cpu_sample_min": 0.382,
+          "cpu_sample_max": 0.389
+        },
+        {
+          "n": 128,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.209,
+          "wall_ns_per_element": 0.2082,
+          "cpu_sample_min": 0.208,
+          "cpu_sample_max": 0.212
+        },
+        {
+          "n": 128,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.208,
+          "wall_ns_per_element": 0.2082,
+          "cpu_sample_min": 0.208,
+          "cpu_sample_max": 0.25
+        },
+        {
+          "n": 128,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.381,
+          "wall_ns_per_element": 0.3803,
+          "cpu_sample_min": 0.38,
+          "cpu_sample_max": 0.385
+        },
+        {
+          "n": 128,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.209,
+          "wall_ns_per_element": 0.2082,
+          "cpu_sample_min": 0.208,
+          "cpu_sample_max": 0.238
+        },
+        {
+          "n": 128,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.208,
+          "wall_ns_per_element": 0.2082,
+          "cpu_sample_min": 0.208,
+          "cpu_sample_max": 0.215
+        },
+        {
+          "n": 257,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.381,
+          "wall_ns_per_element": 0.3803,
+          "cpu_sample_min": 0.38,
+          "cpu_sample_max": 0.392
+        },
+        {
+          "n": 257,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.202,
+          "wall_ns_per_element": 0.2013,
+          "cpu_sample_min": 0.201,
+          "cpu_sample_max": 0.205
+        },
+        {
+          "n": 257,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.202,
+          "wall_ns_per_element": 0.2013,
+          "cpu_sample_min": 0.201,
+          "cpu_sample_max": 0.204
+        },
+        {
+          "n": 257,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.379,
+          "wall_ns_per_element": 0.3788,
+          "cpu_sample_min": 0.378,
+          "cpu_sample_max": 0.386
+        },
+        {
+          "n": 257,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.2,
+          "wall_ns_per_element": 0.2001,
+          "cpu_sample_min": 0.2,
+          "cpu_sample_max": 0.203
+        },
+        {
+          "n": 257,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.2,
+          "wall_ns_per_element": 0.2001,
+          "cpu_sample_min": 0.2,
+          "cpu_sample_max": 0.204
+        },
+        {
+          "n": 2048,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.3792,
+          "wall_ns_per_element": 0.3788,
+          "cpu_sample_min": 0.3782,
+          "cpu_sample_max": 0.4222
+        },
+        {
+          "n": 2048,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.1921,
+          "wall_ns_per_element": 0.1914,
+          "cpu_sample_min": 0.1911,
+          "cpu_sample_max": 0.1951
+        },
+        {
+          "n": 2048,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.1921,
+          "wall_ns_per_element": 0.1915,
+          "cpu_sample_min": 0.1911,
+          "cpu_sample_max": 0.1991
+        },
+        {
+          "n": 2048,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.3782,
+          "wall_ns_per_element": 0.3783,
+          "cpu_sample_min": 0.3782,
+          "cpu_sample_max": 0.3802
+        },
+        {
+          "n": 2048,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.1921,
+          "wall_ns_per_element": 0.1914,
+          "cpu_sample_min": 0.1911,
+          "cpu_sample_max": 0.1951
+        },
+        {
+          "n": 2048,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.1921,
+          "wall_ns_per_element": 0.1914,
+          "cpu_sample_min": 0.1911,
+          "cpu_sample_max": 0.1941
+        },
+        {
+          "n": 5120,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.3786,
+          "wall_ns_per_element": 0.3782,
+          "cpu_sample_min": 0.3776,
+          "cpu_sample_max": 0.4006
+        },
+        {
+          "n": 5120,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.1913,
+          "wall_ns_per_element": 0.1904,
+          "cpu_sample_min": 0.1903,
+          "cpu_sample_max": 0.2053
+        },
+        {
+          "n": 5120,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.1913,
+          "wall_ns_per_element": 0.1905,
+          "cpu_sample_min": 0.1903,
+          "cpu_sample_max": 0.2033
+        },
+        {
+          "n": 5120,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.3916,
+          "wall_ns_per_element": 0.3914,
+          "cpu_sample_min": 0.3766,
+          "cpu_sample_max": 0.4067
+        },
+        {
+          "n": 5120,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.1963,
+          "wall_ns_per_element": 0.1964,
+          "cpu_sample_min": 0.1923,
+          "cpu_sample_max": 0.2013
+        },
+        {
+          "n": 5120,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.2023,
+          "wall_ns_per_element": 0.2012,
+          "cpu_sample_min": 0.2003,
+          "cpu_sample_max": 0.2123
+        }
+      ]
+    },
+    {
+      "sweep": 3,
+      "provenance": [
+        {
+          "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+          "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported",
+          "pid": 37525,
+          "load_before": [
+            1.611328125,
+            1.85693359375,
+            2.11474609375
+          ],
+          "command": [
+            "python3",
+            "/tmp/nxrt-env-exec.py",
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "--target-dir",
+            "/tmp/nxrt-qlinear-requant-target",
+            "-p",
+            "onnx-runtime-ep-cpu",
+            "--lib",
+            "--release",
+            "kernels::qlinear_matmul::tests::bench_requantization_neon_ab",
+            "--",
+            "--exact",
+            "--ignored",
+            "--nocapture"
+          ]
+        },
+        {
+          "wall_s": 0.5862451249995502,
+          "cpu_s": 0.575701,
+          "maxrss_bytes": 108855296,
+          "load_after": [
+            1.611328125,
+            1.85693359375,
+            2.11474609375
+          ]
+        }
+      ],
+      "rows": [
+        {
+          "n": 7,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.887,
+          "wall_ns_per_element": 0.8856,
+          "cpu_sample_min": 0.885,
+          "cpu_sample_max": 0.896
+        },
+        {
+          "n": 7,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.886,
+          "wall_ns_per_element": 0.8852,
+          "cpu_sample_min": 0.885,
+          "cpu_sample_max": 0.897
+        },
+        {
+          "n": 7,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.888,
+          "wall_ns_per_element": 0.8879,
+          "cpu_sample_min": 0.885,
+          "cpu_sample_max": 0.929
+        },
+        {
+          "n": 7,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.831,
+          "wall_ns_per_element": 0.8302,
+          "cpu_sample_min": 0.83,
+          "cpu_sample_max": 0.848
+        },
+        {
+          "n": 7,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.833,
+          "wall_ns_per_element": 0.8326,
+          "cpu_sample_min": 0.83,
+          "cpu_sample_max": 0.868
+        },
+        {
+          "n": 7,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.833,
+          "wall_ns_per_element": 0.8328,
+          "cpu_sample_min": 0.83,
+          "cpu_sample_max": 0.853
+        },
+        {
+          "n": 8,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.733,
+          "wall_ns_per_element": 0.7328,
+          "cpu_sample_min": 0.732,
+          "cpu_sample_max": 0.761
+        },
+        {
+          "n": 8,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.582,
+          "wall_ns_per_element": 0.5824,
+          "cpu_sample_min": 0.581,
+          "cpu_sample_max": 0.604
+        },
+        {
+          "n": 8,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.582,
+          "wall_ns_per_element": 0.5813,
+          "cpu_sample_min": 0.58,
+          "cpu_sample_max": 0.603
+        },
+        {
+          "n": 8,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.719,
+          "wall_ns_per_element": 0.718,
+          "cpu_sample_min": 0.718,
+          "cpu_sample_max": 0.722
+        },
+        {
+          "n": 8,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.582,
+          "wall_ns_per_element": 0.5809,
+          "cpu_sample_min": 0.58,
+          "cpu_sample_max": 0.587
+        },
+        {
+          "n": 8,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.582,
+          "wall_ns_per_element": 0.5809,
+          "cpu_sample_min": 0.581,
+          "cpu_sample_max": 0.587
+        },
+        {
+          "n": 17,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.52,
+          "wall_ns_per_element": 0.5194,
+          "cpu_sample_min": 0.519,
+          "cpu_sample_max": 0.53
+        },
+        {
+          "n": 17,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.456,
+          "wall_ns_per_element": 0.4556,
+          "cpu_sample_min": 0.455,
+          "cpu_sample_max": 0.461
+        },
+        {
+          "n": 17,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.456,
+          "wall_ns_per_element": 0.4557,
+          "cpu_sample_min": 0.455,
+          "cpu_sample_max": 0.471
+        },
+        {
+          "n": 17,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.499,
+          "wall_ns_per_element": 0.4986,
+          "cpu_sample_min": 0.498,
+          "cpu_sample_max": 0.518
+        },
+        {
+          "n": 17,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.438,
+          "wall_ns_per_element": 0.4379,
+          "cpu_sample_min": 0.437,
+          "cpu_sample_max": 0.454
+        },
+        {
+          "n": 17,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.438,
+          "wall_ns_per_element": 0.4377,
+          "cpu_sample_min": 0.437,
+          "cpu_sample_max": 0.451
+        },
+        {
+          "n": 128,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.383,
+          "wall_ns_per_element": 0.3821,
+          "cpu_sample_min": 0.382,
+          "cpu_sample_max": 0.397
+        },
+        {
+          "n": 128,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.209,
+          "wall_ns_per_element": 0.2082,
+          "cpu_sample_min": 0.208,
+          "cpu_sample_max": 0.223
+        },
+        {
+          "n": 128,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.209,
+          "wall_ns_per_element": 0.2082,
+          "cpu_sample_min": 0.208,
+          "cpu_sample_max": 0.224
+        },
+        {
+          "n": 128,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.381,
+          "wall_ns_per_element": 0.3804,
+          "cpu_sample_min": 0.38,
+          "cpu_sample_max": 0.399
+        },
+        {
+          "n": 128,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.208,
+          "wall_ns_per_element": 0.2082,
+          "cpu_sample_min": 0.208,
+          "cpu_sample_max": 0.211
+        },
+        {
+          "n": 128,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.209,
+          "wall_ns_per_element": 0.2082,
+          "cpu_sample_min": 0.208,
+          "cpu_sample_max": 0.214
+        },
+        {
+          "n": 257,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.381,
+          "wall_ns_per_element": 0.3805,
+          "cpu_sample_min": 0.38,
+          "cpu_sample_max": 0.386
+        },
+        {
+          "n": 257,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.202,
+          "wall_ns_per_element": 0.2013,
+          "cpu_sample_min": 0.201,
+          "cpu_sample_max": 0.206
+        },
+        {
+          "n": 257,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.201,
+          "wall_ns_per_element": 0.2013,
+          "cpu_sample_min": 0.201,
+          "cpu_sample_max": 0.205
+        },
+        {
+          "n": 257,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.379,
+          "wall_ns_per_element": 0.3791,
+          "cpu_sample_min": 0.379,
+          "cpu_sample_max": 0.385
+        },
+        {
+          "n": 257,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.2,
+          "wall_ns_per_element": 0.2001,
+          "cpu_sample_min": 0.2,
+          "cpu_sample_max": 0.204
+        },
+        {
+          "n": 257,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.2,
+          "wall_ns_per_element": 0.2001,
+          "cpu_sample_min": 0.2,
+          "cpu_sample_max": 0.241
+        },
+        {
+          "n": 2048,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.3792,
+          "wall_ns_per_element": 0.3787,
+          "cpu_sample_min": 0.3782,
+          "cpu_sample_max": 0.3862
+        },
+        {
+          "n": 2048,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.1921,
+          "wall_ns_per_element": 0.1915,
+          "cpu_sample_min": 0.1911,
+          "cpu_sample_max": 0.1981
+        },
+        {
+          "n": 2048,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.1921,
+          "wall_ns_per_element": 0.1915,
+          "cpu_sample_min": 0.1911,
+          "cpu_sample_max": 0.1951
+        },
+        {
+          "n": 2048,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.3782,
+          "wall_ns_per_element": 0.3781,
+          "cpu_sample_min": 0.3782,
+          "cpu_sample_max": 0.3852
+        },
+        {
+          "n": 2048,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.1911,
+          "wall_ns_per_element": 0.1913,
+          "cpu_sample_min": 0.1911,
+          "cpu_sample_max": 0.1931
+        },
+        {
+          "n": 2048,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.1921,
+          "wall_ns_per_element": 0.1912,
+          "cpu_sample_min": 0.1911,
+          "cpu_sample_max": 0.1951
+        },
+        {
+          "n": 5120,
+          "dtype": "Int8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.3786,
+          "wall_ns_per_element": 0.3778,
+          "cpu_sample_min": 0.3776,
+          "cpu_sample_max": 0.3846
+        },
+        {
+          "n": 5120,
+          "dtype": "Int8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.1903,
+          "wall_ns_per_element": 0.1902,
+          "cpu_sample_min": 0.1903,
+          "cpu_sample_max": 0.1933
+        },
+        {
+          "n": 5120,
+          "dtype": "Int8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.1903,
+          "wall_ns_per_element": 0.1902,
+          "cpu_sample_min": 0.1903,
+          "cpu_sample_max": 0.2163
+        },
+        {
+          "n": 5120,
+          "dtype": "Uint8",
+          "arm": "portable",
+          "cpu_ns_per_element": 0.3776,
+          "wall_ns_per_element": 0.3769,
+          "cpu_sample_min": 0.3766,
+          "cpu_sample_max": 0.3816
+        },
+        {
+          "n": 5120,
+          "dtype": "Uint8",
+          "arm": "native",
+          "cpu_ns_per_element": 0.1903,
+          "wall_ns_per_element": 0.1897,
+          "cpu_sample_min": 0.1893,
+          "cpu_sample_max": 0.1933
+        },
+        {
+          "n": 5120,
+          "dtype": "Uint8",
+          "arm": "native_control",
+          "cpu_ns_per_element": 0.1903,
+          "wall_ns_per_element": 0.1897,
+          "cpu_sample_min": 0.1893,
+          "cpu_sample_max": 0.1933
+        }
+      ]
+    }
+  ]
+}

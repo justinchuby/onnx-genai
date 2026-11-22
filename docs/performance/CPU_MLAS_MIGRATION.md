@@ -232,6 +232,14 @@ not graduation of the MLAS packed/requantized route. See the scoped
 [M1 Max measurements](../benchmarks/2026-11-21-qgemm-neon.md). `Convolution` and `Pooling`
 still need their own capability and performance comparisons.
 
+The native ARM64 shared-A-scale requantization epilogue also uses eight-lane
+NEON rounding/clipping, with exact scalar tails and non-finite handling. Per-row
+A scales keep the scalar epilogue; other architectures retain their portable
+path. This introduces no packed copy or retained buffer. Its separate hot-cache
+row diagnostic and exact-byte contract are documented in
+[the requantization note](../benchmarks/2026-11-21-qlinear-requant-neon.md).
+This does not graduate the MLAS packed/fused GEMM or establish a session speedup.
+
 The `bench_qgemm_ab` kernel diagnostic runs native, portable and a repeated
 native A/A control in the same explicit Rayon pool, with rotating order. It
 checks exact output equality before timing and reports elapsed and process CPU

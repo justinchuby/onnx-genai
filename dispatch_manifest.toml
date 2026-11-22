@@ -374,3 +374,12 @@ minimum_tier = "tier2"
 counter = "DFT_FFT_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/dft.rs"
 description = "Power-of-two DFT uses Cooley-Tukey radix-2 FFT when vDSP unavailable"
+
+[[claim]]
+op = "QLinearMatMul"
+variant = "shared_scale_requantization"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "QLINEAR_REQUANT_NEON_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/qlinear_matmul.rs"
+description = "Native QLinearMatMul requantizes shared-A-scale rows with exact eight-lane NEON rounding/clipping and scalar tails; no MLAS call or packed copy"
