@@ -1461,9 +1461,12 @@ pub fn qgemm_i32(
     zero_point_b: QgemmZeroPoints<'_>,
     c: &mut [i32],
 ) {
-    assert_eq!(a.len(), m * k, "A must be m*k bytes");
-    assert_eq!(b.len(), k * n, "B must be k*n bytes");
-    assert_eq!(c.len(), m * n, "C must be m*n i32");
+    let a_len = qgemm_extent::<u8>(m, k, "A");
+    let b_len = qgemm_extent::<u8>(k, n, "B");
+    let c_len = qgemm_extent::<i32>(m, n, "C accumulator");
+    assert_eq!(a.len(), a_len, "A must be m*k bytes");
+    assert_eq!(b.len(), b_len, "B must be k*n bytes");
+    assert_eq!(c.len(), c_len, "C must be m*n i32");
     if m == 0 || n == 0 {
         return;
     }
@@ -1474,6 +1477,10 @@ pub fn qgemm_i32(
             (values.as_ptr(), 1)
         }
     };
+    if k == 0 {
+        c.fill(0);
+        return;
+    }
     ensure_threading();
     // SAFETY: the three slices are exactly the sizes asserted above, the zero
     // point pointer is either a per-column slice of length `n` or a borrow of a
@@ -1497,6 +1504,15 @@ pub fn qgemm_i32(
             c_int::from(mlas_threading_degree() > 1),
         );
     }
+}
+
+/// Checked slice extents shared by safe integer-GEMM entry points. Never let
+/// release-mode multiplication wrap before handing dimensions to native code.
+#[track_caller]
+fn qgemm_extent<T>(rows: usize, columns: usize, operand: &str) -> usize {
+    rows.checked_mul(columns)
+        .filter(|&elements| std::alloc::Layout::array::<T>(elements).is_ok())
+        .unwrap_or_else(|| panic!("quantized GEMM {operand} [{rows}, {columns}] exceeds addressable storage; reduce the matrix dimensions"))
 }
 
 /// A constant quantized `B` pre-packed into MLAS's kernel layout.
@@ -1545,6 +1561,7 @@ pub fn qgemm_pack_b_size(n: usize, k: usize, a_signed: bool, b_signed: bool) -> 
     if n == 0 || k == 0 {
         return None;
     }
+    std::alloc::Layout::array::<u8>(n.checked_mul(k)?).ok()?;
     // SAFETY: a pure size query with no pointer arguments.
     let size =
         unsafe { mlas_qgemm_pack_b_size(n, k, c_int::from(a_signed), c_int::from(b_signed)) };
@@ -1558,16 +1575,9 @@ impl QgemmPackedB {
     /// signedness combination, which is its documented way of saying "call the
     /// unpacked path"; callers must then keep using [`qgemm_i32`].
     pub fn new(n: usize, k: usize, b: &[u8], a_signed: bool, b_signed: bool) -> Option<Self> {
-        assert_eq!(b.len(), k * n, "B must be k*n bytes");
-        if n == 0 || k == 0 {
-            return None;
-        }
-        // SAFETY: a pure size query with no pointer arguments.
-        let size =
-            unsafe { mlas_qgemm_pack_b_size(n, k, c_int::from(a_signed), c_int::from(b_signed)) };
-        if size == 0 {
-            return None;
-        }
+        let b_len = qgemm_extent::<u8>(k, n, "packed B source");
+        assert_eq!(b.len(), b_len, "B must be k*n bytes");
+        let size = qgemm_pack_b_size(n, k, a_signed, b_signed)?;
         let layout = std::alloc::Layout::from_size_align(size, 64).ok()?;
         // SAFETY: `size` is non-zero, so the layout is non-zero-sized.
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -1637,8 +1647,11 @@ pub fn qgemm_i32_packed(
     zero_point_b: QgemmZeroPoints<'_>,
     c: &mut [i32],
 ) {
-    assert_eq!(a.len(), m * k, "A must be m*k bytes");
-    assert_eq!(c.len(), m * n, "C must be m*n i32");
+    let a_len = qgemm_extent::<u8>(m, k, "A");
+    let _b_len = qgemm_extent::<u8>(k, n, "B");
+    let c_len = qgemm_extent::<i32>(m, n, "C accumulator");
+    assert_eq!(a.len(), a_len, "A must be m*k bytes");
+    assert_eq!(c.len(), c_len, "C must be m*n i32");
     assert_eq!(
         packed.identity(),
         (k, n, a_signed, packed.b_signed),
@@ -1714,7 +1727,9 @@ pub enum QgemmScale<'a> {
 ///
 /// `c` is scratch: MLAS accumulates into it and requantizes it in place, so it
 /// must be `m * n` long, but its contents afterwards are unspecified and it
-/// does **not** need to be zeroed first.
+/// does **not** need to be zeroed first. Its `MaybeUninit` representation also
+/// permits fresh backing; this function never exposes it as initialized i32.
+/// With K=0, output is produced directly and scratch remains untouched.
 ///
 /// Numerically the processor computes, per element,
 /// `clamp(round_ties_even(c * scale), lo - zp, hi - zp) + zp`, where `lo`/`hi`
@@ -1745,17 +1760,20 @@ pub fn qgemm_requantize(
     output: &mut [u8],
     output_signed: bool,
     output_zero_point: i32,
-    c: &mut [i32],
+    c: &mut [std::mem::MaybeUninit<i32>],
 ) {
-    assert_eq!(a.len(), m * k, "A must be m*k bytes");
-    assert_eq!(c.len(), m * n, "C must be m*n i32");
-    assert_eq!(output.len(), m * n, "output must be m*n bytes");
+    let a_len = qgemm_extent::<u8>(m, k, "A");
+    let b_len = qgemm_extent::<u8>(k, n, "B");
+    let c_len = qgemm_extent::<i32>(m, n, "C accumulator");
+    assert_eq!(a.len(), a_len, "A must be m*k bytes");
+    assert_eq!(c.len(), c_len, "C must be m*n i32");
+    assert_eq!(output.len(), c_len, "output must be m*n bytes");
     if m == 0 || n == 0 {
         return;
     }
     let (b_ptr, b_signed, ldb, b_is_packed) = match b {
         QgemmWeights::Dense { bytes, signed } => {
-            assert_eq!(bytes.len(), k * n, "B must be k*n bytes");
+            assert_eq!(bytes.len(), b_len, "B must be k*n bytes");
             (bytes.as_ptr().cast::<c_void>(), signed, n, 0)
         }
         QgemmWeights::Packed(packed) => {
@@ -1786,6 +1804,24 @@ pub fn qgemm_requantize(
             (values.as_ptr(), 1)
         }
     };
+    if k == 0 {
+        let (minimum, maximum) = if output_signed { (-128, 127) } else { (0, 255) };
+        let zero = output_zero_point.clamp(minimum, maximum) as u8;
+        for row in output.chunks_mut(n) {
+            for (column, byte) in row.iter_mut().enumerate() {
+                let factor = match scale {
+                    QgemmScale::PerTensor(value) => value,
+                    QgemmScale::PerColumn(values) => values[column],
+                };
+                *byte = if factor.is_finite() {
+                    zero
+                } else {
+                    minimum as u8
+                };
+            }
+        }
+        return;
+    }
     ensure_threading();
     // SAFETY: every slice is exactly the size asserted above; the zero-point and
     // scale pointers are either `n`-long slices or borrows of locals that
@@ -1807,7 +1843,7 @@ pub fn qgemm_requantize(
             b_is_packed,
             zero_point_b_ptr,
             per_column_zero_points,
-            c.as_mut_ptr(),
+            c.as_mut_ptr().cast::<i32>(),
             n,
             output.as_mut_ptr().cast::<c_void>(),
             n,
@@ -5034,7 +5070,7 @@ mod tests {
                         .into_iter()
                         .flatten()
                         {
-                            let mut scratch = vec![0i32; m * n];
+                            let mut scratch = vec![std::mem::MaybeUninit::<i32>::uninit(); m * n];
                             let mut got = vec![0u8; m * n];
                             qgemm_requantize(
                                 m,
@@ -5069,6 +5105,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn qgemm_rejects_wrapped_or_unaddressable_extents_before_ffi() {
+        let huge = 1usize << (usize::BITS - 1);
+        let error = std::panic::catch_unwind(|| {
+            qgemm_requantize(
+                huge,
+                2,
+                2,
+                &[],
+                false,
+                0,
+                QgemmWeights::Dense {
+                    bytes: &[0; 4],
+                    signed: false,
+                },
+                QgemmZeroPoints::PerTensor(0),
+                QgemmScale::PerTensor(1.),
+                &mut [],
+                false,
+                0,
+                &mut [],
+            );
+        })
+        .expect_err("wrapped dimensions must never reach MLAS with empty slices");
+        let text = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(text.contains("GEMM A") && text.contains("reduce"), "{text}");
+        assert!(std::panic::catch_unwind(|| qgemm_i32(
+            huge,
+            2,
+            2,
+            &[],
+            false,
+            0,
+            &[0; 4],
+            false,
+            QgemmZeroPoints::PerTensor(0),
+            &mut []
+        ))
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            QgemmPackedB::new(huge, 2, &[], false, false);
+        })
+        .is_err());
+        assert!(qgemm_pack_b_size(huge, 2, false, false).is_none());
+        assert!(std::panic::catch_unwind(|| {
+            qgemm_extent::<i32>(isize::MAX as usize / 4 + 1, 1, "C accumulator");
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn qgemm_zero_k_requantizes_without_reading_uninitialized_scratch() {
+        let mut accumulators = [73i32; 6];
+        qgemm_i32(
+            2,
+            3,
+            0,
+            &[],
+            false,
+            0,
+            &[],
+            false,
+            QgemmZeroPoints::PerTensor(0),
+            &mut accumulators,
+        );
+        assert_eq!(
+            accumulators, [0; 6],
+            "an empty dot product overwrites stale accumulator values"
+        );
+        for signed in [false, true] {
+            let zero = if signed { 17 } else { 100 };
+            let scales = [0.5, f32::INFINITY, f32::NAN];
+            let mut scratch = [std::mem::MaybeUninit::<i32>::uninit(); 6];
+            let mut output = [73u8; 6];
+            qgemm_requantize(
+                2,
+                3,
+                0,
+                &[],
+                false,
+                0,
+                QgemmWeights::Dense {
+                    bytes: &[],
+                    signed: false,
+                },
+                QgemmZeroPoints::PerTensor(0),
+                QgemmScale::PerColumn(&scales),
+                &mut output,
+                signed,
+                zero,
+                &mut scratch,
+            );
+            let minimum = if signed { (-128i8) as u8 } else { 0 };
+            assert_eq!(
+                output,
+                [zero as u8, minimum, minimum, zero as u8, minimum, minimum]
+            );
+        }
+    }
+
     /// Saturation is part of the contract: an accumulator that scales past the
     /// output dtype's range must clamp, not wrap.
     #[test]
@@ -5078,7 +5217,7 @@ mod tests {
         // a scale large enough that every column overflows the byte range.
         let a = vec![255u8; m * k];
         let b = vec![255u8; k * n];
-        let mut scratch = vec![0i32; m * n];
+        let mut scratch = vec![std::mem::MaybeUninit::<i32>::uninit(); m * n];
         let mut got = vec![0u8; m * n];
         qgemm_requantize(
             m,

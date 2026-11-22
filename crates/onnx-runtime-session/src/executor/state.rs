@@ -774,6 +774,21 @@ pub(crate) struct Executor {
     /// peak allocation without reserving or allocating a second buffer.
     pub(super) inherited_workspace: InheritedWorkspaces,
     pub(super) workspace_preparation_required: bool,
+    pub(super) workspace_preparation_memo: Option<WorkspacePreparationMemo>,
+}
+
+/// One successful metadata-only plan, scoped to this immutable executor graph.
+/// Shapes are derived solely from graph/weight metadata and these symbols;
+/// growing-symbol classification supplies the remaining capacity-bound input.
+/// Store peaks, never borrowed addresses or admission/ownership proofs.
+pub(super) struct WorkspacePreparationMemo {
+    pub(super) symbols: HashMap<SymbolId, usize>,
+    pub(super) growing_symbols: HashSet<SymbolId>,
+    pub(super) artifacts: ExecutorArtifactConfig,
+    pub(super) kernel_misses: u64,
+    pub(super) kernel_evictions: u64,
+    pub(super) persistent: WorkspaceRequirement,
+    pub(super) step: WorkspaceRequirement,
 }
 
 /// Parent scratch remains separated by lifetime; a step must never borrow and

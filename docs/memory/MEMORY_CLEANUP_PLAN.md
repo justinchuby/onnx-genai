@@ -1448,3 +1448,104 @@ linear-session paths; nested lifetime selection is covered by the separate
 functional regressions. Raw timing rounds, source/binary provenance and drivers
 remain under `/tmp/nxrt-gemm-workspace-*`. Further slot/dispatcher improvements
 must preserve these no-transpose and end-to-end controls.
+
+### QLinearMatMul accumulator: one funded execution peak
+
+The integer accumulator now belongs to the same execution workspace domain.
+Its checked requirement is one logical `M * N * sizeof(i32)` tile, reused
+synchronously across broadcast batches; it is not the full batched result size.
+Empty batches or zero M/N need no accumulator. A nonempty zero-K output still
+initializes its tile before requantizing the zero product. Geometry parsing
+checks source spans, broadcast count, tile/output extents and byte capacity
+before admission or execution. Common 2-D geometry uses inline shape storage
+instead of allocating promotion copies and stride vectors for each query.
+
+The TLS accumulator, independent process counter and public
+`qlinear_accumulator_*` / `set_qlinear_accumulator_process_cap_bytes` interfaces
+are removed without aliases. Engine resident-weight planning no longer adds a
+fixed 128 MiB scratch forecast. Workspace backing and its existing charge are
+reused independently of immutable-weight retention policy, and idle pressure
+reclamation uses the common domain. The existing preparation inventory now
+includes QLinearMatMul and its coverage guard; replacing that inventory with
+compiled workspace facts remains separate work.
+
+Native/nonfused accumulation initializes each tile before creating a readable
+i32 slice. The MLAS fused reference accepts `MaybeUninit<i32>` scratch directly,
+so it adds no memset and promises no initialized scratch afterward. Its zero-K
+entry explicitly produces the requantized zero result; ordinary zero-K integer
+GEMM overwrites stale accumulators with zero. Safe dense/packed/requantized
+reference entry points check matrix element and byte spans before FFI, including
+release-mode overflow. The packing constructor and size query also reject
+unaddressable inputs.
+
+Validation covers 2,001 native CPU tests and 282 native session tests, 2,042 CPU
+tests and 284 session tests with optional MLAS, strict all-target Clippy across
+CPU/session/engine in both configurations, ten integer-GEMM reference tests,
+and a release-mode overflow refusal regression requiring no large allocation.
+A two-node quantized graph uses a single 24-byte workspace peak instead of
+summing 16 and 24 bytes. Concurrent calls hold separate funded lanes; a fourth
+16-byte call refuses while three fill an actual 48-byte Host quota. Batch refill,
+empty dimensions, vector promotion, zero contraction, nonfinite combined
+scales and fused-to-native scratch reuse preserve the existing byte results.
+The shape-variant pack test reconciles node-owned weight bytes separately from
+the shared workspace charge and verifies both disappear through their owners.
+
+The RSS example now uses an actual Host governor and shared workspace pool.
+`QLINEAR_HOST_BUDGET_MIB` controls real admission; it reports admitted/refused
+lanes and charged workspace bytes, not a fake per-thread retention total.
+Scales, zero-point vectors, sign-domain copies, output staging and native/backend
+packing scratch remain on their existing paths; accumulator migration is not a
+claim that all quantized-kernel allocations or RSS are governed. Einsum still
+uses the separate legacy accumulator-budget helper and remains to migrate.
+
+Preparation now reuses dispatch's existing compiled-kernel bindings, then keeps
+one successful metadata-only plan per executor. This memo holds the two
+lifetime peaks, not physical storage or quota credit. Its signature uses exact
+resolved symbols (including physical-capacity bindings), growing-axis
+classification, artifact provider/executor/generation and kernel publication /
+eviction counters. The graph, declared input dtypes/presence and immutable
+weights are fixed for that executor. Input and external-binding validation
+always precedes the memo lookup; unknown shapes that cannot be planned never
+publish a memo. A hit still reserves both workspace slots, so a step return or
+pressure eviction cannot turn a cached plan into uncharged execution. Metadata
+requirements explicitly remain stable cold/warm upper bounds; runtime
+refinement still runs at dispatch. Bound diagnostics deliberately bypass the
+memo. Peak bytes and alignment are merged independently, including when a
+smaller node needs stricter alignment.
+
+Regression coverage includes changed row symbols, capacity refusal without
+memo publication, dtype validation on a would-be hit, actual idle backing
+reclamation followed by readmission, and 4,096 warm checkout/execute/return
+cycles with retained constant B and **zero issuer callbacks**. This is a warm
+admission property, not a claim of zero mutex, planning or dispatch cost. The
+RSS smoke control admits four 16-byte lanes with a 1 MiB Host budget and
+refuses all four with a zero budget; reclaimed charged bytes return to zero.
+
+CPU-only performance controls on the same M1 Max / ARM64 macOS host compare
+commit `9679414eb` (old TLS accumulator) with this change. Each mode runs in a
+separate process; both arms warm 1,000 calls, collect 15 batches and use the
+median of three process medians in alternating order. Both use the same
+one-thread environment settings (`RAYON_NUM_THREADS`, `MLAS_NUM_THREADS`,
+`OMP_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS`); these settings are not a measured
+MLAS worker-count claim. The stable host lock covers the entire paired sweep.
+Every case verifies output bytes. Direct-kernel timing reuses output and holds
+its workspace outside the timed region; the real two-node session timings
+include workspace checkout/return and optional constant-weight retention.
+
+| Mode | Native before → after | Optional MLAS before → after |
+| --- | --- | --- |
+| Tiny kernel, M=1 K=32 N=16 | 0.920 → 0.894 us | 0.788 → 0.747 us |
+| Prefill kernel, M=64 K=256 N=256 | 343.237 → 343.343 us | 22.601 → 22.368 us |
+| Two-node session run | 5.645 → 5.880 us | 6.192 → 6.571 us |
+| Two-node session prepare + run | 5.816 → 6.113 us | 6.294 → 6.662 us |
+
+The first version regressed repeated prepare + run by roughly 3 us: it walked
+the graph and rebuilt metadata/cache keys every call. Reusing compiled bindings
+and the pure planning memo removes that regression. The residual roughly
+0.24–0.38 us/run on this very small graph is real slot/dispatch cost, despite
+zero warm issuer callbacks. The larger kernel controls are approximately flat;
+none of these CPU microbenchmarks establishes whole-model or CUDA throughput.
+Raw initial, prebinding-only and final rounds, drivers, binary/source hashes
+and summaries remain under `/tmp/nxrt-qlinear-*`. Consumed baseline worktree,
+one-shot mutation scripts and probe binaries are removed after provenance is
+recorded; retained drivers can rebuild the documented base for reproduction.
