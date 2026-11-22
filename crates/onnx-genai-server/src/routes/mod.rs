@@ -596,6 +596,9 @@ pub(crate) fn session_fork_failure(error: anyhow::Error) -> ApiError {
 /// the type rather than the wording is what keeps those answers identical.
 pub(crate) fn package_execution_failure(capability: PackageExecutionError) -> ApiError {
     match capability {
+        PackageExecutionError::NativePromptReplacementUnavailable => {
+            ApiError::conflict(capability.to_string())
+        }
         PackageExecutionError::NoSessionState => ApiError::conflict(capability.to_string()),
         PackageExecutionError::DFlashExecutionUnavailable { .. } => {
             ApiError::conflict(capability.to_string())

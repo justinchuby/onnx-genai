@@ -274,15 +274,59 @@ struct NativeDecoderTurnParticipant {
     turn: crate::pipeline::TurnTransaction,
     session_id: SessionId,
     identity: crate::native_decode::NativeLogicalStateIdentity,
-    materialized_len: Option<usize>,
-    recurrent: Option<crate::native_decode::RecurrentStateSnapshot>,
+    baseline: NativeTurnBaseline,
     speculative_stats: SpeculativeStats,
     connector_stats: ConnectorStats,
 }
 
 #[cfg(feature = "native-backend")]
+enum NativeSessionTarget {
+    /// An implementation cache for a stateless request, not a named conversation.
+    CachedRequest(SessionId),
+    Conversation(SessionId),
+}
+
+#[cfg(feature = "native-backend")]
+impl NativeSessionTarget {
+    fn id(&self) -> SessionId {
+        match self {
+            Self::CachedRequest(id) | Self::Conversation(id) => *id,
+        }
+    }
+}
+
+#[cfg(feature = "native-backend")]
+enum NativeTurnBaseline {
+    Empty,
+    PreservedPrefix {
+        length: usize,
+        recurrent: Option<crate::native_decode::RecurrentStateSnapshot>,
+    },
+    Complete {
+        snapshot: crate::native_decode::NativePastSnapshot,
+        _lease: onnx_runtime_memory_governor::MemoryLease,
+    },
+}
+
+#[cfg(feature = "native-backend")]
+impl NativeTurnBaseline {
+    fn len(&self) -> Option<usize> {
+        match self {
+            Self::Empty => None,
+            Self::PreservedPrefix { length, .. } => Some(*length),
+            Self::Complete { snapshot, .. } => Some(snapshot.len()),
+        }
+    }
+}
+
+#[cfg(feature = "native-backend")]
 impl NativeDecoderTurnParticipant {
-    fn admit(engine: &mut Engine, session_id: SessionId) -> anyhow::Result<Self> {
+    fn admit(
+        engine: &mut Engine,
+        target: NativeSessionTarget,
+        prompt: &[TokenId],
+    ) -> anyhow::Result<Self> {
+        let session_id = target.id();
         let identity = engine.native_turn_identity(session_id)?;
         let active_before = engine.native_active_session;
         let native = engine.native_session.as_mut().context(
@@ -291,24 +335,54 @@ impl NativeDecoderTurnParticipant {
         if active_before == Some(session_id) {
             native.ensure_logical_state(identity)?;
         }
-        let materialized_len = (active_before == Some(session_id)).then(|| native.current_len());
-        let recurrent = materialized_len
-            .filter(|length| *length > 0 && native.has_recurrent_state())
-            .map(|_| {
-                native.snapshot_recurrent_state().with_context(|| {
-                    "cannot admit atomic native decoder turn: non-prefix-sliceable state could \
-                     not be snapshotted before mutation"
-                })
-            })
-            .transpose()?;
+        let baseline = if active_before != Some(session_id)
+            || matches!(target, NativeSessionTarget::CachedRequest(_))
+        {
+            NativeTurnBaseline::Empty
+        } else {
+            let length = native.current_len();
+            // Prefix slicing can restore an append, but cannot undo a reset or
+            // an overwrite. Generation re-evaluates a fully cached final token.
+            let preserves_prefix = engine
+                .native_sessions
+                .get(&session_id)
+                .is_some_and(|state| {
+                    prompt.len() > length && common_prefix_len(&state.tokens, prompt) >= length
+                });
+            if length > 0 && !preserves_prefix {
+                if !native.supports_past_snapshots() {
+                    return Err(PackageExecutionError::NativePromptReplacementUnavailable.into());
+                }
+                let bytes = native.past_snapshot_bytes()?;
+                let lease = onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                    engine.governor.memory(),
+                    onnx_runtime_memory_api::Tier::Host,
+                    bytes,
+                    Holder::DecoderTurnSnapshot.role(),
+                    Holder::DecoderTurnSnapshot.id(),
+                )
+                .context("reserve host memory for atomic decoder prompt replacement")?;
+                NativeTurnBaseline::Complete {
+                    snapshot: native
+                        .snapshot_past()
+                        .context("capture complete native state before prompt replacement")?,
+                    _lease: lease,
+                }
+            } else {
+                let recurrent = (length > 0 && native.has_recurrent_state())
+                    .then(|| native.snapshot_recurrent_state())
+                    .transpose()
+                    .context("capture non-prefix-sliceable state before native append")?;
+                NativeTurnBaseline::PreservedPrefix { length, recurrent }
+            }
+        };
         Ok(Self {
             turn: crate::pipeline::TurnTransaction::admit_runtime_participant(
                 engine.workflow.next_turn_transaction_id(),
             ),
             session_id,
             identity,
-            materialized_len,
-            recurrent,
+            baseline,
             speculative_stats: engine.last_speculative_stats,
             connector_stats: engine.connector.stats().clone(),
         })
@@ -330,25 +404,30 @@ impl NativeDecoderTurnParticipant {
     ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
         engine.last_speculative_stats = self.speculative_stats;
         engine.connector.restore_stats(self.connector_stats);
+        let materialized_len = self.baseline.len();
         let restored = {
             let native = engine.native_session.as_mut().context(
                 "cannot abort atomic native decoder turn: native decoder session is unavailable",
             )?;
-            match self.materialized_len {
-                Some(length) => {
+            match self.baseline {
+                NativeTurnBaseline::PreservedPrefix { length, recurrent } => {
                     native.ensure_logical_state(self.identity)?;
-                    if let Some(snapshot) = &self.recurrent {
+                    if let Some(snapshot) = &recurrent {
                         native.restore_state_snapshot_at(snapshot, length)
                     } else {
                         native.rewind(length)
                     }
                 }
-                None => native.reset(),
+                NativeTurnBaseline::Complete { snapshot, _lease } => {
+                    native.ensure_logical_state(self.identity)?;
+                    native.restore_owned_past_snapshot(snapshot)
+                }
+                NativeTurnBaseline::Empty => native.reset(),
             }
         };
         if let Err(rollback) = restored {
             engine.native_active_session = None;
-            let logical_baseline_lost = self.materialized_len.is_some();
+            let logical_baseline_lost = materialized_len.is_some();
             if logical_baseline_lost {
                 poison_native_generation(
                     &mut engine.native_sessions,
@@ -384,7 +463,7 @@ impl NativeDecoderTurnParticipant {
                 ))),
             };
         }
-        engine.native_active_session = self.materialized_len.map(|_| self.session_id);
+        engine.native_active_session = materialized_len.map(|_| self.session_id);
         Ok(self.turn.abort(reason)?)
     }
 }
@@ -958,7 +1037,11 @@ impl Engine {
         options.max_new_tokens = scheduled.max_tokens;
         let mut staged_output =
             CommitOnlyTokenStager::new(native_output_stage_limit(options.max_new_tokens));
-        let turn = match NativeDecoderTurnParticipant::admit(self, scheduler_session_id) {
+        let turn = match NativeDecoderTurnParticipant::admit(
+            self,
+            NativeSessionTarget::CachedRequest(scheduler_session_id),
+            &prompt_tokens,
+        ) {
             Ok(turn) => turn,
             Err(error) => {
                 self.scheduler.complete(scheduler_session_id);
@@ -1789,7 +1872,7 @@ impl Engine {
             }
             let session_id = self.default_native_session()?;
             return self.generate_native_in_session_with_callbacks(
-                session_id,
+                NativeSessionTarget::CachedRequest(session_id),
                 request,
                 tool_call_policy,
                 control.as_ref(),
@@ -2023,7 +2106,7 @@ impl Engine {
                 anyhow::bail!("custom samplers are not supported on the native backend");
             }
             return self.generate_native_in_session_with_callbacks(
-                session_id,
+                NativeSessionTarget::Conversation(session_id),
                 request,
                 tool_call_policy,
                 control.as_ref(),
@@ -3656,13 +3739,14 @@ impl Engine {
 
     fn generate_native_in_session_with_callbacks(
         &mut self,
-        session_id: SessionId,
+        target: NativeSessionTarget,
         request: GenerateRequest,
         tool_call_policy: ToolCallPolicy,
         control: Option<&crate::pipeline::GenerationControl>,
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        let session_id = target.id();
         request.options.validate()?;
         let mut options = request.options;
         reject_native_request_speculation(&options)?;
@@ -3693,7 +3777,7 @@ impl Engine {
         options.max_new_tokens = scheduled.max_tokens;
         let mut staged_output =
             CommitOnlyTokenStager::new(native_output_stage_limit(options.max_new_tokens));
-        let turn = match NativeDecoderTurnParticipant::admit(self, session_id) {
+        let turn = match NativeDecoderTurnParticipant::admit(self, target, &prompt_tokens) {
             Ok(turn) => turn,
             Err(error) => {
                 self.scheduler.complete(session_id);
@@ -3748,10 +3832,12 @@ impl Engine {
                 common_prefix_len(&state.tokens, &prompt_tokens)
             };
 
-            let supports_past_snapshots = self
-                .native_session
-                .as_ref()
-                .is_some_and(|native| native.supports_past_snapshots());
+            // Semantic-prefix caching targets recurrent history. Complete
+            // turn snapshots also admit dense host KV, without changing this
+            // cache's scope or its recurrent-prefix telemetry.
+            let supports_past_snapshots = self.native_session.as_ref().is_some_and(|native| {
+                native.has_recurrent_state() && native.supports_past_snapshots()
+            });
             let mut restored_prefix_len = None;
             let mut should_store_semantic_snapshot = false;
             if !active_matches
@@ -4172,6 +4258,183 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_cancelled_prompt_replacement_restores_exact_kv_contents() -> anyhow::Result<()> {
+        use crate::pipeline::{GenerationBoundary, GenerationCancelled, GenerationControl};
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        let directory = tempfile::tempdir()?;
+        for name in ["inference_metadata.yaml", "tokenizer.json"] {
+            std::fs::copy(source.join(name), directory.path().join(name))?;
+        }
+        // This fixture's KV must depend on token content; its constant logits
+        // alone cannot distinguish an overwritten prefix from the old state.
+        let mut graph = std::fs::read_to_string(source.join("model.onnx.textproto"))?.replace(
+            "input: \"attention_mask\"\n    output: \"cast_input_ids\"",
+            "input: \"input_ids\"\n    output: \"cast_input_ids\"",
+        );
+        for kind in ["key", "value"] {
+            let before = format!(
+                "input: \"current_kv\"\n    output: \"present.0.{kind}\"\n    op_type: \"Identity\""
+            );
+            let after = format!(
+                "input: \"past_key_values.0.{kind}\"\n    input: \"current_kv\"\n    output: \"present.0.{kind}\"\n    op_type: \"Concat\"\n    attribute {{ name: \"axis\" i: 2 type: INT }}"
+            );
+            assert!(graph.contains(&before));
+            graph = graph.replace(&before, &after);
+        }
+        std::fs::write(directory.path().join("model.onnx.textproto"), graph)?;
+        let mut engine = Engine::from_dir(
+            directory.path(),
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..EngineConfig::default()
+            },
+        )?;
+        let session = engine.create_session()?;
+        let mut request = tiny_native_cold_request(false);
+        request.options.max_new_tokens = 1;
+        engine.generate_in_session(session, request.clone())?;
+        let cache = || "past_key_values.0.key";
+        let baseline = engine
+            .native_session
+            .as_ref()
+            .unwrap()
+            .host_present_kv(cache())
+            .context("warm KV")?;
+        assert_eq!(baseline.0, [0.0]);
+        let memory = engine.governor.memory().clone();
+        let used = || {
+            onnx_runtime_memory_governor::MemoryGovernor::used(
+                &memory,
+                onnx_runtime_memory_api::Tier::Host,
+            )
+        };
+        let before = used();
+        let mut append = engine.native_sessions[&session].tokens.clone();
+        append.push(0);
+        let append_turn = NativeDecoderTurnParticipant::admit(
+            &mut engine,
+            NativeSessionTarget::Conversation(session),
+            &append,
+        )?;
+        assert!(matches!(
+            &append_turn.baseline,
+            NativeTurnBaseline::PreservedPrefix { .. }
+        ));
+        assert_eq!(used(), before, "an append must not copy the full KV cache");
+        append_turn.abort(&mut engine, crate::pipeline::TurnAbortReason::Cancellation)?;
+        let snapshot_bytes = engine
+            .native_session
+            .as_ref()
+            .unwrap()
+            .past_snapshot_bytes()?;
+        let replacement_turn = NativeDecoderTurnParticipant::admit(
+            &mut engine,
+            NativeSessionTarget::Conversation(session),
+            &[1],
+        )?;
+        assert!(matches!(
+            &replacement_turn.baseline,
+            NativeTurnBaseline::Complete { .. }
+        ));
+        assert_eq!(
+            used(),
+            before + snapshot_bytes,
+            "complete snapshots must be charged before mutation"
+        );
+        replacement_turn.abort(&mut engine, crate::pipeline::TurnAbortReason::Cancellation)?;
+        assert_eq!(
+            used(),
+            before,
+            "resolved turn must release its snapshot reservation"
+        );
+        let authority = GenerationControl::new();
+        let cancellation = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == GenerationBoundary::BeforeSemanticCommit {
+                assert!(cancellation.cancel());
+            }
+            Ok(())
+        });
+        request.prompt = GeneratePrompt::TokenIds(vec![1]);
+        request.options.max_new_tokens = 4;
+        let error = engine
+            .generate_in_session_with_control_callbacks(session, request, control, None, None)
+            .expect_err("replacement must cancel before commit");
+        assert!(
+            error.downcast_ref::<GenerationCancelled>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(
+            engine
+                .native_session
+                .as_ref()
+                .unwrap()
+                .host_present_kv(cache())
+                .context("restored KV")?,
+            baseline,
+            "rewinding length alone cannot restore bytes overwritten by prompt replacement"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_prompt_replacement_without_complete_snapshot_refuses_before_mutation()
+    -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-native-scalar-gqa");
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..EngineConfig::default()
+            },
+        )?;
+        let session = engine.create_session()?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+        request.options.max_new_tokens = 1;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        engine.generate_in_session(session, request.clone())?;
+        let native = engine.native_session.as_ref().unwrap();
+        assert!(
+            !native.supports_past_snapshots(),
+            "fixture must exercise an in-place backend"
+        );
+        let materialized = native.current_len();
+        assert!(materialized > 0);
+        let tokens = engine.native_sessions[&session].tokens.clone();
+        let stamp = engine.native_sessions[&session].last_access;
+        let error = engine
+            .generate_in_session(session, request.clone())
+            .expect_err("unsafe replacement must be refused");
+        assert!(
+            matches!(
+                error.downcast_ref::<PackageExecutionError>(),
+                Some(PackageExecutionError::NativePromptReplacementUnavailable)
+            ),
+            "{error:#}"
+        );
+        assert_eq!(
+            engine.native_session.as_ref().unwrap().current_len(),
+            materialized
+        );
+        assert_eq!(engine.native_sessions[&session].tokens, tokens);
+        assert_eq!(engine.native_sessions[&session].last_access, stamp);
+        assert_eq!(engine.scheduler.running_count(), 0);
+        // Stateless requests own only a discardable implementation cache, so
+        // replacing it must keep working even without conversation snapshots.
+        assert_eq!(engine.generate(request.clone())?.token_ids.len(), 1);
+        request.prompt = GeneratePrompt::TokenIds(vec![1]);
+        assert_eq!(engine.generate(request)?.token_ids.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
     fn tiny_native_cold_request(speculative: bool) -> GenerateRequest {
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
         request.options.max_new_tokens = 3;
@@ -4423,13 +4686,17 @@ mod tests {
         engine.generate_in_session(failed, tiny_native_cold_request(false))?;
         assert_eq!(engine.native_active_session, Some(failed));
 
+        let mut append = tiny_native_cold_request(false);
+        let mut prompt = engine.native_sessions[&failed].tokens.clone();
+        prompt.push(0);
+        append.prompt = GeneratePrompt::TokenIds(prompt);
         engine
             .native_session
             .as_mut()
             .context("native decoder")?
-            .fail_rewind_after_for_test(1);
+            .fail_rewind_after_for_test(0);
         let failure = with_native_output_stage_limit_for_test(1, || {
-            engine.generate_in_session(failed, tiny_native_cold_request(false))
+            engine.generate_in_session(failed, append)
         })
         .expect_err("the active turn's rollback must hit the injected rewind failure");
         let failure = format!("{failure:#}");

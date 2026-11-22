@@ -258,3 +258,27 @@ Commit-boundary validation: the new native case failed before the fix (5 retaine
 tokens versus the committed 2), then all three selected cancellation tests passed
 with both boundary cases. Full native-enabled engine library: 788 passed / 1
 inherited ignore. Strict native-enabled engine all-target Clippy passes.
+
+Physical-KV audit: a content-dependent ONNX cache fixture reproduced silent
+corruption after cancelled prompt replacement: the restored length was correct,
+but KV value 0.0 had become 1.0. Rollback now distinguishes an unchanged prefix
+from a destructive overwrite/reset. Host-owned state takes a complete tensor and
+hidden-conditioning snapshot, with an explicit governor lease reserved before
+copying. Abort consumes the snapshot without allocating another copy. Tests
+compare exact KV values/shapes and verify append requests avoid full copies,
+snapshot bytes are charged, and transaction resolution releases the reservation.
+
+Named native conversations on in-place/device/compressed backends without a
+complete checkpoint now refuse destructive replacement before mutation with a
+typed 409. Stateless requests hold only a discardable implementation cache and
+continue to accept replacement. The old rollback-poison regression is retained
+on the prefix-preserving append path, where rewind is still the correct rollback
+primitive. Complete state snapshots for the remaining backends and prefill-only
+execution, remain required work; this does not close the cancellation row.
+
+Physical-KV checkpoint validation: the content-dependent test failed before the
+fix (1.0 instead of the committed 0.0), then passed with complete snapshots.
+Full native-enabled engine library: 790 passed / 1 inherited ignore. Final
+focused runs selected and passed exact KV/resource restoration, in-place refusal
+plus stateless replacement, and rollback-failure poisoning. The typed server
+409 mapping test passes; strict native engine and server all-target Clippy pass.

@@ -295,19 +295,23 @@ pub struct CompressedStatePathStats {
     pub environment_reads: u64,
 }
 
-/// Deep-copy of the native loop-carried tensors at a semantic prefix boundary.
+/// Deep-copy of host-owned native state at a prefix or transaction boundary.
 ///
 /// Host-native decoding keeps dense KV and recurrent state in the same `past`
 /// map, so the production snapshot stores the whole map to make restoring a
-/// boundary actually executable. The recurrent entries are still identified
-/// from the declared present→past pairs for sizing and gating.
+/// boundary actually executable. Hidden-state conditioning belongs to the same
+/// boundary and is restored alongside the tensors.
 pub(crate) struct NativePastSnapshot {
     past: HashMap<String, Tensor>,
     len: usize,
     bytes: u64,
+    last_hidden: Option<Vec<f32>>,
 }
 
 impl NativePastSnapshot {
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -735,10 +739,7 @@ impl NativeDecodeSession {
     }
 
     pub(crate) fn supports_past_snapshots(&self) -> bool {
-        self.cuda.is_none()
-            && self.cpu_kv.is_none()
-            && self.has_recurrent_state()
-            && self.compressed_state.is_empty()
+        self.cuda.is_none() && self.cpu_kv.is_none() && self.compressed_state.is_empty()
     }
 
     fn recurrent_past_names(&self) -> HashSet<String> {
@@ -798,22 +799,36 @@ impl NativeDecodeSession {
         !self.recurrent_past_names().is_empty() || !self.compressed_state.is_empty()
     }
 
+    pub(crate) fn past_snapshot_bytes(&self) -> anyhow::Result<u64> {
+        let past = self.past.values().try_fold(0u64, |sum, tensor| {
+            sum.checked_add(u64::try_from(tensor.as_bytes().len())?)
+                .context("native state snapshot byte count overflow")
+        })?;
+        let hidden = self.last_hidden.as_ref().map_or(0, |hidden| hidden.len());
+        past.checked_add(
+            u64::try_from(hidden)?
+                .checked_mul(4)
+                .context("native hidden-state snapshot byte count overflow")?,
+        )
+        .context("native complete state snapshot byte count overflow")
+    }
+
     pub(crate) fn snapshot_past(&self) -> anyhow::Result<NativePastSnapshot> {
         if let Some(error) = self.compressed_state_refusal(NativeStateOperation::Snapshot, None) {
             return Err(error);
         }
         if !self.supports_past_snapshots() {
-            bail!("native past snapshots require host past tensors and recurrent state");
+            bail!(
+                "native past snapshots require host-owned past tensors without compressed record cursors"
+            );
         }
         let recurrent = self.recurrent_past_names();
         if !recurrent.iter().all(|name| self.past.contains_key(name)) {
             bail!("cannot snapshot recurrent prefix before all recurrent tensors are materialized");
         }
-        let mut bytes = 0u64;
+        let bytes = self.past_snapshot_bytes()?;
         let mut past = HashMap::with_capacity(self.past.len());
         for (name, tensor) in &self.past {
-            bytes =
-                bytes.saturating_add(u64::try_from(tensor.as_bytes().len()).unwrap_or(u64::MAX));
             past.insert(
                 name.clone(),
                 tensor.try_clone().map_err(anyhow::Error::from)?,
@@ -823,6 +838,7 @@ impl NativeDecodeSession {
             past,
             len: self.current_len,
             bytes,
+            last_hidden: self.last_hidden.clone(),
         })
     }
 
@@ -836,7 +852,9 @@ impl NativeDecodeSession {
             return Err(error);
         }
         if !self.supports_past_snapshots() {
-            bail!("native past snapshots require host past tensors and recurrent state");
+            bail!(
+                "native past snapshots require host-owned past tensors without compressed record cursors"
+            );
         }
         let mut restored = HashMap::with_capacity(snapshot.past.len());
         for (name, tensor) in &snapshot.past {
@@ -847,7 +865,22 @@ impl NativeDecodeSession {
         }
         self.past = restored;
         self.current_len = snapshot.len;
-        self.last_hidden = None;
+        self.last_hidden = snapshot.last_hidden.clone();
+        Ok(())
+    }
+
+    /// Restore a transaction-owned capture without allocating a second copy.
+    pub(crate) fn restore_owned_past_snapshot(
+        &mut self,
+        snapshot: NativePastSnapshot,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.supports_past_snapshots(),
+            "complete native state restore requires host-owned past tensors without compressed record cursors"
+        );
+        self.past = snapshot.past;
+        self.current_len = snapshot.len;
+        self.last_hidden = snapshot.last_hidden;
         Ok(())
     }
 

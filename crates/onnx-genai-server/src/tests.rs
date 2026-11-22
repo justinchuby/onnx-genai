@@ -5814,6 +5814,13 @@ async fn a_cancelled_client_does_not_leak_its_session_lease() {
 fn capability_refusals_map_to_the_status_their_variant_means() {
     use onnx_genai_engine::PackageExecutionError;
 
+    let replacement = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageExecutionError::NativePromptReplacementUnavailable,
+    ));
+    let response = crate::routes::generation_failure(replacement);
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert!(response.message.contains("refused before mutation"));
+
     let no_state = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
         PackageExecutionError::NoSessionState,
     ));

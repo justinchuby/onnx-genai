@@ -150,6 +150,8 @@ holder_registry! {
     DraftModelPool = 11,
     /// Live f32 weight copies owned by native CPU kernels.
     CpuDerivedWeights = 12,
+    /// Complete host-owned state retained until a destructive decoder turn resolves.
+    DecoderTurnSnapshot = 13,
 }
 
 impl Holder {
@@ -164,7 +166,7 @@ impl Holder {
             // demotion candidate and not step-scoped `Workspace` either. It
             // lives and dies with its sequence, like KV.
             Holder::RecurrentState | Holder::RecurrentPrefixSnapshot => MemoryRole::KvCache,
-            Holder::NativeKvCache => MemoryRole::KvCache,
+            Holder::NativeKvCache | Holder::DecoderTurnSnapshot => MemoryRole::KvCache,
             Holder::Activations => MemoryRole::Activation,
             Holder::FixedDeviceReservation => MemoryRole::Weights,
             // A standing pool the component keeps for as long as the session
@@ -186,6 +188,7 @@ impl Holder {
             Holder::RecurrentState => "recurrent state",
             Holder::RecurrentPrefixSnapshot => "recurrent prefix snapshots",
             Holder::NativeKvCache => "native decode KV tensors",
+            Holder::DecoderTurnSnapshot => "decoder transaction snapshots",
             Holder::Activations => "activations",
             Holder::FixedDeviceReservation => "fixed device reservation",
             Holder::PipelineComponentPool => "pipeline component device pool",
@@ -205,7 +208,7 @@ impl Holder {
             // Charging it to `Device` would let it exhaust host RAM while the
             // device ledger still reported headroom.
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => Tier::Host,
-            Holder::CpuDerivedWeights => Tier::Host,
+            Holder::CpuDerivedWeights | Holder::DecoderTurnSnapshot => Tier::Host,
             Holder::WeightResidency
             | Holder::RecurrentState
             | Holder::RecurrentPrefixSnapshot

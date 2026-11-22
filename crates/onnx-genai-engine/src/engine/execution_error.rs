@@ -13,6 +13,10 @@
 /// variant rather than from the wording.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PackageExecutionError {
+    #[error(
+        "native prompt replacement would overwrite committed decoder state, but this backend cannot capture a complete atomic-turn checkpoint. Append beyond the cached prefix, reset this session explicitly, or select a backend with complete state snapshots; the request was refused before mutation"
+    )]
+    NativePromptReplacementUnavailable,
     /// The package publishes a token stream but declares no session-scoped
     /// state anything can carry, so a session over it would restart every turn.
     #[error(
