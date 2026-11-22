@@ -4,6 +4,19 @@ use super::*;
 
 use super::session_state::{CheckedPosition, SessionLen, SessionStore};
 
+struct OrtPrefixTensor {
+    name: String,
+    shape: Vec<i64>,
+    dtype: DataType,
+    bytes: Vec<u8>,
+}
+
+struct OrtPrefixSnapshot {
+    length: usize,
+    tensors: Vec<OrtPrefixTensor>,
+    _lease: onnx_runtime_memory_governor::MemoryLease,
+}
+
 fn generate_uses_scheduler(_backend: EngineDecodeBackend) -> bool {
     true
 }
@@ -1385,6 +1398,281 @@ impl Engine {
             );
         }
         Ok(())
+    }
+
+    /// Evaluate the complete prompt without sampling or publishing an output token.
+    pub fn prefill(&mut self, request: PrefillRequest) -> anyhow::Result<PrefillResult> {
+        self.prefill_with_callbacks(request, None, None)
+    }
+
+    /// Prompt-only evaluation with ordinary admission and atomic cancellation.
+    pub fn prefill_with_callbacks(
+        &mut self,
+        request: PrefillRequest,
+        control: Option<crate::pipeline::GenerationControl>,
+        mut admitted: Option<&mut dyn FnMut()>,
+    ) -> anyhow::Result<PrefillResult> {
+        self.require_workflow_execution_admitted()?;
+        let unavailable = |reason: String| PackageExecutionError::PrefillUnavailable { reason };
+        if !self.holds_decode_core() {
+            return Err(
+                unavailable("the package has no runtime-owned decode executor".into()).into(),
+            );
+        }
+        let workflow = self.workflow.workflow_spec();
+        crate::pipeline::generation::validate_generation_workflow(workflow).map_err(|error| {
+            unavailable(format!(
+                "the generation contract cannot be isolated: {error:#}"
+            ))
+        })?;
+        // Only a decoder/policy/emit loop with no authored setup can have its
+        // decoder evaluated alone. Component identities and model names carry
+        // no authority; the declared contracts and effects decide this.
+        let [onnx_genai_metadata::WorkflowStep::Loop { setup, steps, .. }] =
+            workflow.steps.as_slice()
+        else {
+            return Err(unavailable(
+                "the workflow includes steps outside its generation loop".into(),
+            )
+            .into());
+        };
+        let [
+            onnx_genai_metadata::WorkflowStep::Invoke {
+                component: decoder, ..
+            },
+            onnx_genai_metadata::WorkflowStep::Invoke {
+                component: policy, ..
+            },
+            onnx_genai_metadata::WorkflowStep::Emit { .. },
+        ] = steps.as_slice()
+        else {
+            return Err(unavailable(
+                "the loop includes authored work beyond decoder, token policy and emission".into(),
+            )
+            .into());
+        };
+        let implements = |name: &str, expected: &str| {
+            workflow.components.get(name).is_some_and(|component| {
+                component.effects.is_empty()
+                    && component
+                        .contract
+                        .as_ref()
+                        .is_some_and(|contract| contract.id == expected)
+            })
+        };
+        if !setup.is_empty()
+            || !implements(
+                decoder,
+                onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT,
+            )
+            || !implements(
+                policy,
+                onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT,
+            )
+        {
+            return Err(unavailable(
+                "the loop has setup, external effects, or non-runtime decoder/policy contracts"
+                    .into(),
+            )
+            .into());
+        }
+        let tokens = self.tokenize_prompt(&request.prompt)?;
+        anyhow::ensure!(
+            !tokens.is_empty(),
+            "prefill prompt must contain at least one token"
+        );
+        let tokenizer = self.require_tokenizer()?;
+        for (index, &id) in tokens.iter().enumerate() {
+            anyhow::ensure!(
+                tokenizer.inner().id_to_token(id).is_some(),
+                "prefill prompt[{index}] token id {id} is absent from the package vocabulary; tokenize with this package"
+            );
+        }
+        anyhow::ensure!(
+            request.max_context != Some(0),
+            "prefill max_context must be greater than zero"
+        );
+        let max_context = self.max_context_for_request(&GenerateOptions::default());
+        let max_context = match (max_context, request.max_context) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        anyhow::ensure!(
+            max_context.is_none_or(|limit| tokens.len() <= limit),
+            "prefill prompt contains {} tokens, exceeding max_context {:?}; shorten the prompt",
+            tokens.len(),
+            max_context
+        );
+        if let Some(control) = &control {
+            control.check(crate::pipeline::GenerationBoundary::BeforeWorkflowNode)?;
+        }
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            return self.prefill_native(&tokens, control.as_ref(), admitted);
+        }
+        let session = self.create_session()?;
+        let result = (|| -> anyhow::Result<PrefillResult> {
+            self.admit_generate_request_with_scheduler(session, tokens.len(), 0, Priority::Normal)?;
+            let result = (|| -> anyhow::Result<PrefillResult> {
+                let mut state = self
+                    .sessions
+                    .remove(&session)
+                    .context("prefill session disappeared before admission")?;
+                let outcome = (|| -> anyhow::Result<PrefillResult> {
+                    let turn = DecoderTurnParticipant::admit(
+                        self.workflow.next_turn_transaction_id(),
+                        &mut state,
+                        self.last_speculative_stats,
+                        self.connector.stats().clone(),
+                    )?;
+                    let result = (|| -> anyhow::Result<PrefillResult> {
+                        if let Some(callback) = admitted.as_mut() {
+                            callback();
+                        }
+                        let prefix_cache_hit_len = if request.cold_start {
+                            if self.connector.is_active() {
+                                self.connector.reset_stats();
+                            }
+                            state.tokens.extend_from_slice(&tokens);
+                            0
+                        } else {
+                            self.prepare_session_prefix(session, &mut state, &tokens)?
+                        };
+                        // This also runs a no-KV decoder: ensure_session_kv_current
+                        // alone would skip its entire forward pass.
+                        let _ = next_session_token_logits(
+                            self.session.as_deref().context(MISSING_ORT_SESSION)?,
+                            self.kv_model.as_ref(),
+                            &mut self.kv_cache,
+                            session,
+                            &mut state,
+                        )?;
+                        self.ensure_session_kv_current(session, &mut state)?;
+                        if let Some(control) = &control {
+                            control
+                                .check(crate::pipeline::GenerationBoundary::AfterDecoderForward)?;
+                            control.require_commit()?;
+                        }
+                        Ok(PrefillResult {
+                            prompt_tokens: tokens.len(),
+                            prefix_cache_hit_len,
+                        })
+                    })();
+                    match result {
+                        Ok(result) => {
+                            turn.commit()?;
+                            if let Some(control) = &control {
+                                control.finish_commit();
+                            }
+                            if let Err(error) =
+                                self.insert_cached_prefixes(session, &state, tokens.len())
+                            {
+                                tracing::debug!(%error, "prefill committed but optional prefix publication failed");
+                            }
+                            Ok(result)
+                        }
+                        Err(error) => {
+                            if let Some(control) = &control {
+                                control.abort_commit();
+                            }
+                            let reason =
+                                if error.downcast_ref::<crate::GenerationCancelled>().is_some() {
+                                    crate::pipeline::TurnAbortReason::Cancellation
+                                } else {
+                                    crate::pipeline::TurnAbortReason::ExecutionFailure
+                                };
+                            if let Err(rollback) = turn.abort(self, session, &mut state, reason) {
+                                return Err(error.context(format!("prompt-only decoder transaction failed and baseline restoration also failed: {rollback:#}")));
+                            }
+                            Err(error)
+                        }
+                    }
+                })();
+                self.sessions.insert(session, state);
+                outcome
+            })();
+            self.scheduler.complete(session);
+            result
+        })();
+        let closed = self.close_session(session);
+        match (result, closed) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn prefill_native(
+        &mut self,
+        tokens: &[TokenId],
+        control: Option<&crate::pipeline::GenerationControl>,
+        mut admitted: Option<&mut dyn FnMut()>,
+    ) -> anyhow::Result<PrefillResult> {
+        let session = self.default_native_session()?;
+        let identity = self.ensure_native_session_dispatchable(session)?;
+        self.admit_generate_request_with_scheduler(session, tokens.len(), 0, Priority::Normal)?;
+        let result = (|| -> anyhow::Result<PrefillResult> {
+            let turn = NativeDecoderTurnParticipant::admit(
+                self,
+                NativeSessionTarget::CachedRequest(session),
+                tokens,
+            )?;
+            let result = (|| -> anyhow::Result<PrefillResult> {
+                if let Some(callback) = admitted.as_mut() {
+                    callback();
+                }
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native prefill executor is unavailable")?;
+                native.prepare_generation_workspace_preserving_state(tokens)?;
+                native.reset()?;
+                native.bind_logical_state(identity)?;
+                self.native_active_session = Some(session);
+                native.prefill_prefix(tokens)?;
+                if let Some(control) = control {
+                    control.check(crate::pipeline::GenerationBoundary::AfterDecoderForward)?;
+                    control.require_commit()?;
+                }
+                Ok(PrefillResult {
+                    prompt_tokens: tokens.len(),
+                    prefix_cache_hit_len: 0,
+                })
+            })();
+            match result {
+                Ok(result) => {
+                    let last_access = self.touch_native_session();
+                    let state = self
+                        .native_sessions
+                        .get_mut(&session)
+                        .context("admitted native prefill session disappeared")?;
+                    state.tokens = tokens.to_vec();
+                    state.last_access = last_access;
+                    turn.commit()?;
+                    if let Some(control) = control {
+                        control.finish_commit();
+                    }
+                    self.evict_native_sessions(session);
+                    Ok(result)
+                }
+                Err(error) => {
+                    if let Some(control) = control {
+                        control.abort_commit();
+                    }
+                    let reason = if error.downcast_ref::<crate::GenerationCancelled>().is_some() {
+                        crate::pipeline::TurnAbortReason::Cancellation
+                    } else {
+                        crate::pipeline::TurnAbortReason::ExecutionFailure
+                    };
+                    if let Err(rollback) = turn.abort(self, reason) {
+                        return Err(error.context(format!("native prompt-only transaction failed and baseline restoration also failed: {rollback:#}")));
+                    }
+                    Err(error)
+                }
+            }
+        })();
+        self.scheduler.complete(session);
+        result
     }
 
     /// Generate text for a request.
@@ -2962,6 +3250,14 @@ impl Engine {
         }
     }
 
+    fn prefix_reuse_permitted(&self) -> bool {
+        self.metadata.decoder_io().is_none_or(|io| {
+            io.state_groups
+                .iter()
+                .all(|group| group.reuse.prefix_reusable)
+        })
+    }
+
     fn prepare_session_prefix(
         &mut self,
         session_id: SessionId,
@@ -2982,15 +3278,53 @@ impl Engine {
         let mut loaded_prompt_prefix = 0;
         let mut cross_session_hit_len = 0;
 
-        if started_empty && state.decode_state.uses_token_prefix_cache() {
-            cross_session_hit_len = self
-                .token_prefix_cache
-                .iter()
-                .map(|cached| common_prefix_len(cached, prompt_tokens).min(cached.len()))
-                .filter(|&len| len > 0)
-                .max()
-                .unwrap_or(0);
+        if started_empty
+            && self.prefix_reuse_permitted()
+            && state.decode_state.runner_supports_kv_handoff()
+        {
+            if let Some((matched, snapshot)) = self
+                .prefix_cache
+                .lookup_snapshot::<OrtPrefixSnapshot>(prompt_tokens)
+            {
+                let materialized = matched.min(prompt_tokens.len().saturating_sub(1));
+                if materialized > 0
+                    && let Ok(_staging) = onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                        self.governor.memory(),
+                        onnx_runtime_memory_api::Tier::Host,
+                        snapshot._lease.bytes().checked_mul(2).context("ORT prefix restore staging size overflows")?,
+                        Holder::OrtPrefixSnapshot.role(),
+                        Holder::OrtPrefixSnapshot.id(),
+                    ).inspect_err(|error| tracing::debug!(%error, materialized, "portable KV prefix restore lacks host staging budget; recomputing the complete prompt"))
+                {
+                    let kv = snapshot
+                        .tensors
+                        .iter()
+                        .map(|tensor| {
+                            Ok((
+                                tensor.name.clone(),
+                                onnx_genai_ort::Value::from_raw_bytes(
+                                    tensor.bytes.clone(),
+                                    &tensor.shape,
+                                    tensor.dtype,
+                                )?,
+                            ))
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    state.decode_state.import_runner_kv(snapshot.length, kv)?;
+                    state.decode_state.rewind_runner(materialized)?;
+                    self.kv_cache.append(session_id, materialized)?;
+                    state.kv_token_count = materialized;
+                    state
+                        .tokens
+                        .extend_from_slice(&prompt_tokens[..materialized]);
+                    loaded_prompt_prefix = materialized;
+                    cross_session_hit_len = materialized;
+                }
+            }
         } else if started_empty
+            && self.prefix_reuse_permitted()
+            && !state.decode_state.has_runner()
+            && !state.decode_state.is_windowed()
             && state.decode_state.use_kv
             && self.kv_model.is_some()
             && self.kv_cache.page_table.tensor_config.is_some()
@@ -3065,7 +3399,7 @@ impl Engine {
         // absolute positions is byte-exact — proven token-identical by the gold
         // integration test. If injection is not possible we fall back to the
         // reporting-only `lookup_extension`, never claiming a hit we can't serve.
-        if self.connector.is_active() {
+        if self.connector.is_active() && self.prefix_reuse_permitted() {
             let injected =
                 self.try_connector_kv_injection(session_id, state, prompt_tokens, in_process_hit)?;
             if let Some(total) = injected {
@@ -3573,6 +3907,9 @@ impl Engine {
         state: &EngineSession,
         prompt_len: usize,
     ) -> anyhow::Result<()> {
+        if !self.prefix_reuse_permitted() {
+            return Ok(());
+        }
         // K4: extract the freshly computed KV for each complete resident chunk
         // and push the real bytes to the external connector for future
         // cross-session / cross-node reuse. Only ZeroCopyRebind `PastPresent`
@@ -3581,12 +3918,15 @@ impl Engine {
         if self.connector.is_active() {
             self.store_connector_prefix(session_id, state);
         }
-        if state.decode_state.uses_token_prefix_cache() {
-            if prompt_len > 0 && prompt_len <= state.kv_token_count {
-                self.insert_token_prefix(&state.tokens[..prompt_len]);
-            }
-            if state.kv_token_count == state.tokens.len() {
-                self.insert_token_prefix(&state.tokens);
+        if state.decode_state.has_runner() || state.decode_state.is_windowed() {
+            if state.decode_state.runner_supports_kv_handoff() {
+                if prompt_len > 0 && prompt_len <= state.kv_token_count {
+                    self.insert_runner_prefix(state, prompt_len)?;
+                }
+                if state.kv_token_count == state.tokens.len() && state.kv_token_count != prompt_len
+                {
+                    self.insert_runner_prefix(state, state.kv_token_count)?;
+                }
             }
             return Ok(());
         }
@@ -3616,16 +3956,54 @@ impl Engine {
         Ok(())
     }
 
-    fn insert_token_prefix(&mut self, tokens: &[TokenId]) {
-        if tokens.is_empty()
-            || self
-                .token_prefix_cache
-                .iter()
-                .any(|cached| cached.as_slice() == tokens)
+    fn insert_runner_prefix(&mut self, state: &EngineSession, length: usize) -> anyhow::Result<()> {
+        let tokens = &state.tokens[..length];
+        if self
+            .prefix_cache
+            .lookup_snapshot::<OrtPrefixSnapshot>(tokens)
+            .is_some_and(|(matched, _)| matched == length)
         {
-            return;
+            return Ok(());
         }
-        self.token_prefix_cache.push(tokens.to_vec());
+        let bytes = state.decode_state.runner_prefix_bytes(length)?;
+        let memory = self.governor.memory();
+        let reserve = || {
+            onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                memory,
+                onnx_runtime_memory_api::Tier::Host,
+                bytes,
+                Holder::OrtPrefixSnapshot.role(),
+                Holder::OrtPrefixSnapshot.id(),
+            )
+        };
+        let lease = match reserve() {
+            Ok(lease) => lease,
+            Err(_) if self.prefix_cache.evict_lru_snapshot() => reserve()?,
+            Err(error) => return Err(error.into()),
+        };
+        // Export and compacting/raw-byte copies coexist only during capture.
+        let _staging = reserve()?;
+        let exported = state.decode_state.export_runner_prefix(length)?;
+        let tensors = exported
+            .into_iter()
+            .map(|(name, value)| {
+                Ok(OrtPrefixTensor {
+                    name,
+                    shape: value.shape().to_vec(),
+                    dtype: value.dtype(),
+                    bytes: value.to_raw_bytes()?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.prefix_cache.insert_snapshot(
+            tokens,
+            Arc::new(OrtPrefixSnapshot {
+                length,
+                tensors,
+                _lease: lease,
+            }),
+        );
+        Ok(())
     }
 
     pub(crate) fn finish_result(
@@ -3836,11 +4214,7 @@ impl Engine {
             // Semantic-prefix caching targets recurrent history. Complete
             // turn snapshots also admit dense host KV, without changing this
             // cache's scope or its recurrent-prefix telemetry.
-            let prefix_reuse_permitted = self.metadata.decoder_io().is_none_or(|io| {
-                io.state_groups
-                    .iter()
-                    .all(|group| group.reuse.prefix_reusable)
-            });
+            let prefix_reuse_permitted = self.prefix_reuse_permitted();
             let supports_past_snapshots = prefix_reuse_permitted
                 && self.native_session.as_ref().is_some_and(|native| {
                     native.has_recurrent_state() && native.supports_past_snapshots()
@@ -4976,6 +5350,300 @@ mod tests {
         Ok(())
     }
 
+    fn prefill_request(tokens: &[TokenId]) -> PrefillRequest {
+        PrefillRequest {
+            prompt: GeneratePrompt::TokenIds(tokens.to_vec()),
+            max_context: None,
+            cold_start: false,
+        }
+    }
+
+    #[test]
+    fn prompt_only_prefill_publishes_real_ort_cache_without_output() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let prompt = [2, 4, 3];
+        let result = engine.prefill(prefill_request(&prompt))?;
+        assert_eq!(
+            result,
+            PrefillResult {
+                prompt_tokens: 3,
+                prefix_cache_hit_len: 0
+            }
+        );
+        assert!(
+            engine.sessions.is_empty(),
+            "ephemeral prefill session must be closed"
+        );
+        assert_eq!(engine.scheduler.running_count(), 0);
+        assert_eq!(
+            engine
+                .prefix_cache
+                .lookup_snapshot::<OrtPrefixSnapshot>(&prompt)
+                .unwrap()
+                .0,
+            3,
+            "the real evaluated KV must outlive its ephemeral session"
+        );
+        let snapshot = engine
+            .prefix_cache
+            .lookup_snapshot::<OrtPrefixSnapshot>(&prompt)
+            .unwrap()
+            .1;
+        assert!(
+            snapshot
+                .tensors
+                .iter()
+                .any(|tensor| tensor.bytes.iter().any(|&byte| byte != 0)),
+            "this fixture must expose nonzero computed KV bytes"
+        );
+        // A cache hit must install actual physical state, not just publish a
+        // token-match count. No forward is executed by this preparation call.
+        let inspection = engine.create_session()?;
+        let mut state = engine.sessions.remove(&inspection).unwrap();
+        assert_eq!(
+            engine.prepare_session_prefix(inspection, &mut state, &prompt)?,
+            2
+        );
+        assert_eq!(state.decode_state.runner_len(), 2);
+        let restored = state.decode_state.export_runner_kv()?;
+        assert!(!restored.is_empty());
+        for (name, tensor) in restored {
+            let source = snapshot
+                .tensors
+                .iter()
+                .find(|tensor| tensor.name == name)
+                .unwrap();
+            assert_eq!(tensor.dtype(), source.dtype);
+            let mut strides = vec![1usize; source.shape.len()];
+            for axis in (0..strides.len() - 1).rev() {
+                strides[axis] = strides[axis + 1] * source.shape[axis + 1] as usize;
+            }
+            let size = source.dtype.size_of();
+            let mut expected = Vec::new();
+            for mut linear in 0..tensor.numel() {
+                let mut offset = 0;
+                for (axis, &extent) in tensor.shape().iter().enumerate().rev() {
+                    offset += (linear % extent as usize) * strides[axis];
+                    linear /= extent as usize;
+                }
+                expected.extend_from_slice(&source.bytes[offset * size..(offset + 1) * size]);
+            }
+            assert_eq!(
+                tensor.to_raw_bytes()?,
+                expected,
+                "restored physical KV for {name}"
+            );
+        }
+        engine.sessions.insert(inspection, state);
+        engine.close_session(inspection)?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.to_vec()));
+        request.options.max_new_tokens = 2;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        let generated = engine.generate(request.clone())?;
+        assert!(generated.prefix_cache_hit_len > 0);
+        let oracle = Engine::from_dir(&fixture, EngineConfig::default())?.generate(request)?;
+        assert_eq!(generated.token_ids, oracle.token_ids);
+        assert_eq!(generated.text, oracle.text);
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_only_prefill_honors_declared_no_prefix_reuse() -> anyhow::Result<()> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let directory = tempfile::tempdir()?;
+        for name in ["model.onnx.textproto", "tokenizer.json"] {
+            std::fs::copy(source.join(name), directory.path().join(name))?;
+        }
+        let metadata = std::fs::read_to_string(source.join("inference_metadata.yaml"))?
+            .replace("prefix_reusable: true", "prefix_reusable: false");
+        std::fs::write(directory.path().join("inference_metadata.yaml"), metadata)?;
+        let mut engine = Engine::from_dir(directory.path(), EngineConfig::default())?;
+        let prompt = [2, 4, 3];
+        engine.prefill(prefill_request(&prompt))?;
+        assert!(
+            engine
+                .prefix_cache
+                .lookup_snapshot::<OrtPrefixSnapshot>(&prompt)
+                .is_none()
+        );
+        assert_eq!(
+            engine
+                .prefill(prefill_request(&prompt))?
+                .prefix_cache_hit_len,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_only_prefill_cache_restore_budget_shortfall_recomputes_honestly() -> anyhow::Result<()>
+    {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(&source, EngineConfig::default())?;
+        let prompt = [2, 4, 3];
+        engine.prefill(prefill_request(&prompt))?;
+        let memory = engine.governor.memory();
+        let available = onnx_runtime_memory_governor::MemoryGovernor::available(
+            memory,
+            onnx_runtime_memory_api::Tier::Host,
+        );
+        let _pressure = onnx_runtime_memory_governor::MemoryGovernor::reserve(
+            memory,
+            onnx_runtime_memory_api::Tier::Host,
+            available,
+            Holder::OrtPrefixSnapshot.role(),
+            Holder::OrtPrefixSnapshot.id(),
+        )?;
+        let result = engine.prefill(prefill_request(&prompt))?;
+        assert_eq!(result.prefix_cache_hit_len, 0);
+        assert_eq!(result.prompt_tokens, prompt.len());
+        assert_eq!(engine.scheduler.running_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_only_prefill_cold_start_resets_connector_request_counters() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                kv_connector: KvConnectorConfig {
+                    backend: KvConnectorBackend::LocalTiered(onnx_genai_kv::LocalTieredConfig {
+                        chunk_size: 2,
+                        page_size: 2,
+                        ..Default::default()
+                    }),
+                    chunk_size: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )?;
+        let mut request = prefill_request(&[2, 4, 3, 5]);
+        engine.prefill(request.clone())?;
+        assert!(engine.last_connector_stats().stores > 0);
+        request.cold_start = true;
+        engine.prefill(request.clone())?;
+        let first_cold = engine.last_connector_stats();
+        assert_eq!(first_cold.lookups, 0);
+        engine.prefill(request)?;
+        assert_eq!(engine.last_connector_stats(), first_cold);
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_prompt_only_prefill_restores_ort_and_does_not_publish_prefix() -> anyhow::Result<()>
+    {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let prompt = [2, 4, 3];
+        let authority = crate::GenerationControl::new();
+        let cancel = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == crate::GenerationBoundary::BeforeSemanticCommit {
+                cancel.cancel();
+            }
+            Ok(())
+        });
+        let error = engine
+            .prefill_with_callbacks(prefill_request(&prompt), Some(control), None)
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+            "{error:#}"
+        );
+        assert!(
+            engine
+                .prefix_cache
+                .lookup_snapshot::<OrtPrefixSnapshot>(&prompt)
+                .is_none()
+        );
+        assert!(engine.sessions.is_empty());
+        assert_eq!(engine.scheduler.running_count(), 0);
+        assert_eq!(
+            engine
+                .prefill(prefill_request(&prompt))?
+                .prefix_cache_hit_len,
+            0
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_only_prefill_retains_exact_native_prompt_and_cancellation_is_atomic()
+    -> anyhow::Result<()> {
+        let mut engine = tiny_native_cold_engine()?;
+        let prompt = [0, 0, 0];
+        let result = engine.prefill(prefill_request(&prompt))?;
+        assert_eq!(result.prompt_tokens, prompt.len());
+        let session = engine.native_default_session.unwrap();
+        assert_eq!(engine.native_sessions[&session].tokens, prompt);
+        assert_eq!(
+            engine.native_session.as_ref().unwrap().current_len(),
+            prompt.len()
+        );
+        let access = engine.native_sessions[&session].last_access;
+        let authority = crate::GenerationControl::new();
+        let cancel = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == crate::GenerationBoundary::BeforeSemanticCommit {
+                cancel.cancel();
+            }
+            Ok(())
+        });
+        let error = engine
+            .prefill_with_callbacks(prefill_request(&[0, 0]), Some(control), None)
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(engine.native_sessions[&session].tokens, prompt);
+        assert_eq!(engine.native_sessions[&session].last_access, access);
+        assert_eq!(engine.native_active_session, None);
+        assert_eq!(engine.scheduler.running_count(), 0);
+        engine.prefill(prefill_request(&prompt))?;
+        assert_eq!(
+            engine.native_session.as_ref().unwrap().current_len(),
+            prompt.len()
+        );
+        let mut request = tiny_native_cold_request(false);
+        request.prompt = GeneratePrompt::TokenIds(prompt.to_vec());
+        let actual = engine.generate(request.clone())?;
+        assert_eq!(
+            actual.token_ids,
+            tiny_native_cold_engine()?.generate(request)?.token_ids
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_only_prefill_refuses_empty_invalid_and_over_context_before_admission()
+    -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        for (tokens, limit, field) in [
+            (vec![], None, "at least one"),
+            (vec![999999], None, "token id"),
+            (vec![2, 4, 3], Some(2), "max_context"),
+            (vec![2], Some(0), "max_context"),
+        ] {
+            let mut request = prefill_request(&tokens);
+            request.max_context = limit;
+            let mut admitted = false;
+            let error = engine
+                .prefill_with_callbacks(request, None, Some(&mut || admitted = true))
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(field), "{error:#}");
+            assert!(!admitted);
+            assert_eq!(engine.scheduler.running_count(), 0);
+        }
+        Ok(())
+    }
+
     #[test]
     fn aborted_turn_restores_tier_journal_and_preserves_sibling_session() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5016,7 +5684,6 @@ mod tests {
         assert!(sibling_len > 0);
         let committed_connector_stats = engine.last_connector_stats();
 
-        engine.token_prefix_cache.clear();
         engine.prefix_cache = PrefixCache::new();
         let target = engine.create_session()?;
         let mut state = engine
@@ -5201,7 +5868,6 @@ mod tests {
             metadata_hints: MetadataHints::default(),
             kv_cache: PagedKvCache::new(1, 1),
             prefix_cache: PrefixCache::new(),
-            token_prefix_cache: Vec::new(),
             kv_model: None,
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::with_byte_budget(
@@ -5805,7 +6471,6 @@ mod tests {
             metadata_hints: MetadataHints::default(),
             kv_cache: PagedKvCache::new(1, 1),
             prefix_cache: PrefixCache::new(),
-            token_prefix_cache: Vec::new(),
             kv_model: None,
             decode_path: ModelDecodePath::StaticCache { max_len: 16 },
             scheduler: Scheduler::with_byte_budget(

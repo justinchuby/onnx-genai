@@ -85,15 +85,7 @@ pub(super) fn device_logits_to_host_value(
 /// new, session-independent CPU [`Value`]. Used to hand a KV cache between two
 /// [`DecodeSession`]s (e.g. Metal-EP prefill → CPU-EP decode).
 pub(super) fn clone_value_to_owned(value: &Value) -> Result<Value> {
-    let shape = value.shape().to_vec();
-    match value.dtype() {
-        DataType::Float32 => Value::from_vec_f32(value.to_vec_f32()?, &shape),
-        DataType::Float16 => Value::from_vec_f16_bits(value.to_vec_f16_bits()?, &shape),
-        DataType::BFloat16 => Value::from_vec_bf16_bits(value.to_vec_bf16_bits()?, &shape),
-        dtype => Err(OrtError::InvalidArgument(format!(
-            "cannot export/clone KV tensor with dtype {dtype:?}"
-        ))),
-    }
+    Value::from_raw_bytes(value.to_raw_bytes()?, value.shape(), value.dtype())
 }
 
 pub(super) fn allocate_static_cache_buffers(

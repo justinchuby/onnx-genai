@@ -193,6 +193,12 @@ pub(crate) enum DriverCommand {
         events: mpsc::Sender<DriverEvent>,
         permit: WorkerPermit,
     },
+    Prefill {
+        request: onnx_genai_engine::PrefillRequest,
+        control: GenerationControl,
+        reply: oneshot::Sender<Result<onnx_genai_engine::PrefillResult, DriverFailure>>,
+        permit: WorkerPermit,
+    },
     ScorePair {
         pair: Box<onnx_genai_engine::ranking::PreparedTokenPair>,
         reply: oneshot::Sender<anyhow::Result<onnx_genai_engine::ranking::RerankingScore>>,
@@ -1206,6 +1212,38 @@ impl EngineDriver {
         Ok(())
     }
 
+    pub(crate) async fn prefill(
+        &self,
+        request: onnx_genai_engine::PrefillRequest,
+    ) -> Result<onnx_genai_engine::PrefillResult, GenerateSubmitError> {
+        struct CancelOnDrop(GenerationControl);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let (commands, permit) = self.reserve_stateless_command()?;
+        let control = GenerationControl::default();
+        let _cancel = CancelOnDrop(control.clone());
+        let (reply, response) = oneshot::channel();
+        if commands
+            .send(DriverCommand::Prefill {
+                request,
+                control,
+                reply,
+                permit,
+            })
+            .await
+            .is_err()
+        {
+            return Err(GenerateSubmitError::DriverStopped);
+        }
+        response
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?
+            .map_err(GenerateSubmitError::Failed)
+    }
+
     pub(crate) async fn generate_fim(
         &self,
         prefix: String,
@@ -1842,6 +1880,7 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
                     | DriverCommand::SynthesizeSpeech { .. }
                     | DriverCommand::Embed { .. }
                     | DriverCommand::ScorePair { .. }
+                    | DriverCommand::Prefill { .. }
             )
         })
         .count()
@@ -2221,6 +2260,20 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
                     shape: image.shape().to_vec(),
                 })
             })();
+            let _ = reply.send(result);
+        }
+        DriverCommand::Prefill {
+            request,
+            control,
+            reply,
+            permit: _permit,
+        } => {
+            let result = engine
+                .prefill_with_callbacks(request, Some(control), None)
+                .map_err(|error| DriverFailure::from_engine_error(&error));
+            if let Ok(result) = &result {
+                crate::metrics::add_prompt_tokens(result.prompt_tokens);
+            }
             let _ = reply.send(result);
         }
         DriverCommand::ScorePair {

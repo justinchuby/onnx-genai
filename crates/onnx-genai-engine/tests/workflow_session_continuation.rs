@@ -67,6 +67,36 @@ fn authored_sampler_refuses_dynamic_temperature_before_admission() -> anyhow::Re
     Ok(())
 }
 
+#[test]
+fn authored_workflow_refuses_prompt_only_prefill_without_skipping_steps() -> anyhow::Result<()> {
+    let mut engine = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let mut admitted = false;
+    let error = engine
+        .prefill_with_callbacks(
+            onnx_genai_engine::PrefillRequest {
+                prompt: GeneratePrompt::TokenIds(vec![2, 4, 3]),
+                max_context: None,
+                cold_start: false,
+            },
+            None,
+            Some(&mut || admitted = true),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        onnx_genai_engine::package_execution_error(&error),
+        Some(onnx_genai_engine::PackageExecutionError::PrefillUnavailable { .. })
+    ));
+    assert!(format!("{error:#}").contains("explicit prefill operation"));
+    assert!(!admitted);
+    assert!(
+        engine
+            .component_invocations()
+            .values()
+            .all(|&count| count == 0)
+    );
+    Ok(())
+}
+
 fn decoder_package() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/onnx_genai_workflows/decoder")
 }

@@ -51,11 +51,11 @@ pub use crate::config::{
     GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
     KvConnectorConfig, LayerWeightBytes, LimitParseError, MemoryPolicyApplication, MemoryStrategy,
     MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
-    MtpConfig, MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest,
-    PrioritizedGenerateResult, RecurrentPrefixCacheStats, RewindTokenCount, SamplingOverrides,
-    ScheduledGenerateArrival, SessionCheckpoint, SessionId, SessionPosition, SpeculativeMode,
-    TokenLogprob, ToolCallPolicy, WeightAccessPattern, WeightPlacementReport, XtcConfig,
-    parse_device_policy, parse_resource_limit,
+    MtpConfig, MtpHiddenLayout, MtpWeightSource, PrefillRequest, PrefillResult,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
+    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint, SessionId,
+    SessionPosition, SpeculativeMode, TokenLogprob, ToolCallPolicy, WeightAccessPattern,
+    WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -210,7 +210,6 @@ mod tests {
             metadata_hints: MetadataHints::default(),
             kv_cache,
             prefix_cache: PrefixCache::new(),
-            token_prefix_cache: Vec::new(),
             kv_model: None,
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
@@ -2558,7 +2557,6 @@ mod tests {
         // Drop the in-process caches so the connector is the ONLY source of
         // cross-session reuse — simulating a fresh process / different node that
         // shares nothing but the connector.
-        engine.token_prefix_cache.clear();
         engine.prefix_cache = PrefixCache::new();
 
         // Request 2 shares the whole prefix (≥ 1 chunk) with request 1.
@@ -2612,7 +2610,6 @@ mod tests {
         engine.generate(warm)?;
         assert!(engine.last_connector_stats().stores > 0);
 
-        engine.token_prefix_cache.clear();
         engine.prefix_cache = PrefixCache::new();
 
         let mut isolated = GenerateRequest::new(GeneratePrompt::TokenIds(prompt));

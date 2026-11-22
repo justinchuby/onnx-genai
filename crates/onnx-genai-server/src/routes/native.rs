@@ -9,6 +9,7 @@ struct NativeRequest {
     prompt: MixedPrompt,
     suffix: Option<String>,
     return_tokens: bool,
+    prefill_only: bool,
 }
 
 fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, ApiError> {
@@ -64,6 +65,17 @@ fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, Ap
             "send n_predict or max_tokens, not both",
         ));
     }
+    let prefill_only = body.get("max_tokens").and_then(Value::as_u64) == Some(0);
+    if prefill_only {
+        // Sampling validation still runs through the shared positive-output
+        // schema; the operation below never submits that placeholder budget.
+        body.insert("max_tokens".into(), json!(1));
+        if body.contains_key("max_completion_tokens") {
+            return Err(ApiError::invalid_request(
+                "send n_predict=0 or max_tokens=0 without max_completion_tokens",
+            ));
+        }
+    }
     let return_tokens = match body.remove("return_tokens") {
         None => false,
         Some(Value::Bool(value)) => value,
@@ -94,6 +106,7 @@ fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, Ap
         prompt,
         suffix,
         return_tokens,
+        prefill_only,
     })
 }
 
@@ -117,8 +130,15 @@ impl IntoResponse for NativeOutput {
 struct PreparedNative {
     request: NativeRequest,
     handle: Arc<ModelHandle>,
-    tokens: Vec<u32>,
-    options: GenerateOptions,
+    operation: NativeOperation,
+}
+
+enum NativeOperation {
+    Generate {
+        tokens: Vec<u32>,
+        options: Box<GenerateOptions>,
+    },
+    Prefill(onnx_genai_engine::PrefillRequest),
 }
 
 pub(crate) async fn completions(
@@ -143,6 +163,7 @@ pub(crate) async fn completions(
                 .map_err(|error| ApiError::invalid_request(format!("invalid prompt: {error}")))?,
             suffix: None,
             return_tokens: first.return_tokens,
+            prefill_only: first.prefill_only,
         });
     }
     validate_native_request(&first, &state.config)?;
@@ -299,6 +320,38 @@ fn prepare(
             "prompt must encode to at least one token; send nonempty text or token ids",
         ));
     }
+    if request.prefill_only {
+        super::completions::build_generate_options_with_tokenizer(
+            &request.sampling,
+            &handle.tokenizer,
+            1,
+        )
+        .map_err(|error| ApiError::invalid_request(error.to_string()))?;
+        if handle
+            .model_max_context
+            .is_some_and(|limit| prompt_tokens > limit)
+        {
+            return Err(ApiError::invalid_request(format!(
+                "prefill prompt contains {prompt_tokens} tokens, exceeding model context {:?}; shorten the prompt",
+                handle.model_max_context
+            )));
+        }
+        let cold_start = request
+            .sampling
+            .extensions
+            .get("cache_prompt")
+            .and_then(Value::as_bool)
+            == Some(false);
+        return Ok(PreparedNative {
+            request,
+            operation: NativeOperation::Prefill(onnx_genai_engine::PrefillRequest {
+                prompt: GeneratePrompt::TokenIds(tokens),
+                max_context: handle.model_max_context,
+                cold_start,
+            }),
+            handle,
+        });
+    }
     let output_budget = super::completions::admit_output_budget(
         &request.sampling,
         prompt_tokens,
@@ -321,17 +374,42 @@ fn prepare(
     Ok(PreparedNative {
         request,
         handle,
-        tokens,
-        options,
+        operation: NativeOperation::Generate {
+            tokens,
+            options: Box::new(options),
+        },
     })
 }
 async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, ApiError> {
     let PreparedNative {
         request,
         handle,
-        tokens,
-        options,
+        operation,
     } = prepared;
+    let (tokens, options) = match operation {
+        NativeOperation::Generate { tokens, options } => (tokens, *options),
+        NativeOperation::Prefill(input) => {
+            let result = handle
+                .engine
+                .prefill(input)
+                .await
+                .map_err(map_generate_submit_error)?;
+            let value = json!({"content":"","tokens":[],"stop":true,"index":index,"model":handle.id,
+                "tokens_predicted":0,"tokens_evaluated":result.prompt_tokens,
+                "tokens_cached":result.prefix_cache_hit_len,"stop_type":"limit","truncated":false});
+            if !request.sampling.stream {
+                return Ok(NativeOutput::Buffered(value));
+            }
+            let (tx, receiver) = mpsc::channel(1);
+            let (completed, outcome) = oneshot::channel();
+            let _ = tx.send(Ok(Event::default().data(value.to_string()))).await;
+            let _ = completed.send(());
+            return Ok(NativeOutput::Stream {
+                receiver,
+                completed: outcome,
+            });
+        }
+    };
     let prompt_tokens = tokens.len();
     let generation = if let Some(suffix) = &request.suffix {
         let MixedPrompt::Text(prefix) = &request.prompt else {

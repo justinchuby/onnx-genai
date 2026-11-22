@@ -1834,6 +1834,22 @@ mod mtp_config_tests {
     }
 }
 
+/// Evaluate a prompt without committing any generated token.
+#[derive(Debug, Clone)]
+pub struct PrefillRequest {
+    pub prompt: GeneratePrompt,
+    pub max_context: Option<usize>,
+    /// Re-evaluate the complete prompt instead of loading an existing prefix.
+    pub cold_start: bool,
+}
+
+/// Actual prompt evaluation and the prefix reused from an earlier request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillResult {
+    pub prompt_tokens: usize,
+    pub prefix_cache_hit_len: usize,
+}
+
 /// A single generation request.
 #[derive(Debug, Clone)]
 pub struct GenerateRequest {

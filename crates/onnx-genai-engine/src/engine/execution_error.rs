@@ -14,6 +14,10 @@
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PackageExecutionError {
     #[error(
+        "prompt-only prefill is unavailable: {reason}. Select a standalone runtime-owned autoregressive decoder or export an explicit prefill operation; this runtime will not skip authored workflow steps or generate a token as a substitute"
+    )]
+    PrefillUnavailable { reason: String },
+    #[error(
         "dynatemp_range requires a runtime-owned token-policy executor; this authored workflow sampler declares no dynamic-temperature input contract. Select a package with runtime-owned sampling or set dynatemp_range=0"
     )]
     DynamicTemperatureUnavailable,

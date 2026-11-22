@@ -343,3 +343,46 @@ benchmark library/profiling-bin Clippy pass. The seeded HTTP test also proves
 that disabling adaptation changes the fixture's output, so an ignored control
 cannot satisfy endpoint equivalence. PR remains draft while the other ledger
 items are implemented.
+
+Prompt-only milestone: native `n_predict=0` / `max_tokens=0` now lowers to an
+independent engine PrefillRequest rather than a zero-iteration generation loop
+or a sampled throwaway token. Both native and ORT perform a real decoder forward,
+share ordinary driver/worker admission and atomic cancellation, and publish no
+output token. A prompt-only scheduler reservation does not demand space for an
+extra output token. The structural admission requires an isolated runtime-owned
+decoder/policy/emit loop without authored setup or effects; other packages must
+export a prefill operation rather than have their workflow silently skipped.
+
+The real cache test exposed reporting-only ORT cross-request reuse: the old
+token-prefix vector remembered token matches after its runner was destroyed. It
+is removed. Portable runners now export compact, byte-exact KV snapshots into
+the shared prefix trie, with explicit host-memory leases for retained and staging
+bytes. A new request imports that state and reports only the materialized prefix;
+unsupported or memory-constrained restores perform full evaluation and report
+zero reuse. Snapshot byte slicing follows tensor strides and element sizes, not
+model identities or fixed attention geometry.
+
+Prefill reuse also honors every declared decoder state group's prefix policy;
+`prefix_reusable=false` never publishes or loads a cross-request snapshot.
+Restoring a cached prefix requires its actual physical runner state to be
+installed before the hit count is returned; the regression inspects those
+restored bytes against the saved state. Raw KV clone/prefix extraction preserves
+element bytes (including non-contiguous heads and multiple element types).
+
+The zero-output operation is currently exposed by the native completion/infill
+adapter. OpenAI-compatible zero-budget request behavior still needs a separate
+contract audit; positive-output GenerateOptions retain their existing invariant.
+Composite workflow prefill, native media/infill extras, timing/progress, custom
+sampler order, device checkpoint/state/adapter operations and the other unchecked
+rows remain open. This milestone does not complete the overall goal or authorize
+marking the draft PR merged before those delivery requirements are satisfied.
+
+Prompt-only validation: full native engine library 805 passed / 1 inherited ignore
+and full server library 395 passed / 2 inherited ignores. Final focused checks
+selected and passed all 7 prefill engine tests after physical-byte and cold-start
+counter refinements, plus the real native HTTP batch/SSE/context-limit regression.
+The authored-workflow refusal integration test selected and passed one test.
+Scheduler validation passed all 72 unit and 15 pressure-conformance tests. Both
+portable KV byte/invalid-shape tests pass. Strict engine/server/ORT/scheduler
+all-target Clippy passes; git diff whitespace checks pass. These are functional
+checks, with no performance claims.

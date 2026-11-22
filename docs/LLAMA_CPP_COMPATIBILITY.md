@@ -154,9 +154,19 @@ before the output budget. Committed callback batches verify their full decoded
 text before publishing; a decoder that revises a prior prefix defers that batch's
 text to its last token. Live callbacks cannot retract published bytes and report
 an explicit error if a decoder changes them.
-`n_predict=0`, native multimodal prompt objects and infill extra files still
-require further engine support. Native
-embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
+`n_predict=0` (or native `max_tokens=0`) evaluates the prompt without producing
+an output token. It uses ordinary driver capacity, prompt-only scheduler budget
+and atomic cancellation. Buffered and SSE results contain empty content, zero
+predicted tokens and the actual evaluated prompt count, including for batches
+and prompts filling the complete context. Declared standalone runtime-owned
+decoders support this operation; composite/authored workflows without an explicit
+prefill contract return an actionable 400 before execution. Portable ORT runner
+KV snapshots retain actual bytes under a host-memory lease and can warm later
+requests; `tokens_cached` counts materialized reuse, never a token-only match.
+`cache_prompt=false` forces complete prompt evaluation. Other ORT runner modes can still evaluate but report zero cross-request
+reuse. Native evaluation retains its ordinary implementation cache.
+Native multimodal prompt objects and infill extra files still require further
+engine support. Native embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
 remain zero. Token-counting routes use the same prompt renderer and declared media expansion
 as generation. They validate attachments and tool capability without executing a
 generation. Anthropic streaming receives

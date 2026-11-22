@@ -41,7 +41,6 @@ pub struct Engine {
     /// Shared-prefix cache for reusing paged KV across sessions.
     pub(crate) prefix_cache: PrefixCache,
     /// Token-only prefix index used by ORT-owned decode sessions until page import/export lands.
-    pub(crate) token_prefix_cache: Vec<Vec<TokenId>>,
     /// KV tensor layout inferred from model present/past TensorInfo.
     pub(crate) kv_model: Option<KvModelInfo>,
     /// ORT decode path selected by model I/O introspection.
@@ -182,7 +181,6 @@ impl Engine {
             metadata_hints: MetadataHints::default(),
             kv_cache: PagedKvCache::new(1, 1),
             prefix_cache: PrefixCache::new(),
-            token_prefix_cache: Vec::new(),
             kv_model: None,
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
