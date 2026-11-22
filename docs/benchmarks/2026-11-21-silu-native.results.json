@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "base": "d4d0b01a92a401136123c4362afdf7cb652401e3",
   "source_sha256": "5a874ab3ba15c3c3cce17886d1dbfaf6a0bb0e55e3c78923ae701e3a7e4097ff",
   "platform": {
@@ -192,6 +192,101 @@
       "log": "/tmp/nxrt-silu-ab-runs/sweep3-threads1.log"
     }
   ],
+  "measured_source_commit": "edd930a63b1bf96c1e86df9734073f27d22eca57",
+  "simd_source_sha256": "dec5ff1bdcf9bbd2d155935d2c2a8ddabbc3fe9b7d97ecba54526c4122e3a77b",
+  "samples_file": "2026-11-21-silu-native.samples.csv.gz",
+  "samples_sha256": "802d46c95ab8e9a26c40b1047c01bf77eda455bd02ae462a62ea77368801bcf7",
+  "samples_count": 17010,
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "lock_mechanism": "Darwin fcntl.flock held across all nine children; hostlock.sh unsupported on Darwin",
+  "flags": {
+    "profile": "release",
+    "features": [
+      "mlas"
+    ],
+    "CARGO_PROFILE_RELEASE_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0",
+    "RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null
+  },
+  "decision": "retain MLAS research; no cross-shape graduation",
+  "rejected_candidate": {
+    "commit": "1ee82c3e24ac6668a9815aed77bf83626942a276",
+    "reason": "Native independent f64 error budget exceeded despite bitwise vector agreement with MLAS",
+    "input_f32": -16.434999465942383,
+    "got_f32": -3.4286081e-06,
+    "reference_f64": -1.1971266100662218e-06,
+    "absolute_error": 2.2314814899337782e-06,
+    "allowed_absolute_error": 2e-06,
+    "contract_test": "kernels::activations::native_silu_contract::native_silu_dense_band_agrees_with_independent_f64_formula",
+    "result": {
+      "passed": 3,
+      "failed": 1
+    },
+    "reverted": true
+  },
+  "arms": [
+    "mlas",
+    "native",
+    "native_aa"
+  ],
+  "repetitions": 21,
+  "matrix": {
+    "sweep": [
+      1,
+      2,
+      3
+    ],
+    "width": [
+      1,
+      4,
+      8
+    ],
+    "mode": [
+      "serial",
+      "runtime"
+    ],
+    "pattern": [
+      "in_band",
+      "sparse_repairs",
+      "dense_negative_tail"
+    ],
+    "n": [
+      3,
+      17,
+      4096,
+      65537,
+      1048581
+    ]
+  },
+  "batch": {
+    "target_elements": 1048576,
+    "min_iters": 1,
+    "max_iters": 16384
+  },
+  "cell_count": 270,
+  "ratios": {
+    "wall_ratio": {
+      "numerator": "mlas",
+      "denominator": "native",
+      "metric": "wall_ns"
+    },
+    "cpu_ratio": {
+      "numerator": "mlas",
+      "denominator": "native",
+      "metric": "cpu_ns"
+    },
+    "aa_wall_ratio": {
+      "numerator": "native",
+      "denominator": "native_aa",
+      "metric": "wall_ns"
+    },
+    "aa_cpu_ratio": {
+      "numerator": "native",
+      "denominator": "native_aa",
+      "metric": "cpu_ns"
+    }
+  },
   "summary": [
     {
       "sweep": 1,
@@ -6943,39 +7038,5 @@
       "aa_wall_ratio": 1.0008182867326627,
       "aa_cpu_ratio": 1.0009242144177448
     }
-  ],
-  "measured_source_commit": "edd930a63b1bf96c1e86df9734073f27d22eca57",
-  "simd_source_sha256": "dec5ff1bdcf9bbd2d155935d2c2a8ddabbc3fe9b7d97ecba54526c4122e3a77b",
-  "samples_file": "2026-11-21-silu-native.samples.csv.gz",
-  "samples_sha256": "802d46c95ab8e9a26c40b1047c01bf77eda455bd02ae462a62ea77368801bcf7",
-  "samples_count": 17010,
-  "arm_summary_count": 270,
-  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
-  "lock_mechanism": "Darwin fcntl.flock held across all nine children; hostlock.sh unsupported on Darwin",
-  "flags": {
-    "profile": "release",
-    "features": [
-      "mlas"
-    ],
-    "CARGO_PROFILE_RELEASE_DEBUG": "0",
-    "CARGO_INCREMENTAL": "0",
-    "RUSTFLAGS": null,
-    "CARGO_ENCODED_RUSTFLAGS": null
-  },
-  "decision": "retain MLAS research; no cross-shape graduation",
-  "rejected_candidate": {
-    "commit": "1ee82c3e24ac6668a9815aed77bf83626942a276",
-    "reason": "Native independent f64 error budget exceeded despite bitwise vector agreement with MLAS",
-    "input_f32": -16.434999465942383,
-    "got_f32": -3.4286081e-06,
-    "reference_f64": -1.1971266100662218e-06,
-    "absolute_error": 2.2314814899337782e-06,
-    "allowed_absolute_error": 2e-06,
-    "contract_test": "kernels::activations::native_silu_contract::native_silu_dense_band_agrees_with_independent_f64_formula",
-    "result": {
-      "passed": 3,
-      "failed": 1
-    },
-    "reverted": true
-  }
+  ]
 }
