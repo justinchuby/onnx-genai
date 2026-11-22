@@ -740,3 +740,37 @@ reduction differences and f64-oracle error bounds. No token-equivalence, GPU
 behavior or throughput claim follows. The shared BLAS boundary validates buffer
 extents and ABI dimensions before unsafe entry; pure native GEMV keeps usize
 shape extents. Memory placement and grant/reclaim algorithms are unchanged.
+
+
+### Reuse-gated Apple dense prefill
+
+The resolved NT capability declares its dense-prefill reuse policy. Apple uses
+NT only when immutable weights and the existing dense-byte ceiling admit NK
+retention. With disabled/insufficient retention or mutable metadata, it preserves
+KN preparation; physical grant refusal still follows the existing fallbacks.
+This does not add a budget, model identity gate or geometry tuning table.
+
+[Actual execute evidence](../benchmarks/APPLE_NT_EXECUTE_AB.md) keeps the initial
+transient-NT observations separate from a newly recorded reuse-gated corpus.
+Build-count, Host-charge and successful-NT-call witnesses accompany every cell.
+The source's thread-local diagnostic selector is absent from shipped builds;
+its scope/unwind behavior is tested. Process CPU includes framework/worker spin,
+and no model throughput, RSS or other-device behavior follows from the numbers.
+
+
+### Node-scoped optional reference ownership
+
+MLAS SQNBit reference layout maps join the existing per-node constant-state
+owner. Shape variants share only after the same source and preparation/retention
+policy checks; independent nodes and sessions retain separate maps, even if they
+use identical operand addresses and Host books. The global and test-local stores,
+installer eviction responsibility and executor-wide clear API are removed.
+Dropping an executor releases its kernel and static-state owners before source
+buffers, without touching another executor's caches. Active payloads continue to
+own Host grants through their final reader. No primitive arithmetic or production
+backend choice changes. See the
+[reference ownership contract](../performance/CPU_MLAS_MIGRATION.md#node-scoped-ownership-for-optional-sqnbit-reference-packs).
+
+This does not yet make reference memos or layout maps reclaimable under idle
+Host pressure; that is a separate remaining lifecycle step. Serialized prepacked
+sources retain their existing exclusion from node-state adoption.

@@ -1,0 +1,21 @@
+test_aa_failure_is_retained_and_clock_specific (test_bench_apple_dense_execute.ReaderControls.test_aa_failure_is_retained_and_clock_specific) ... ok
+test_bad_round_arm_or_iterations (test_bench_apple_dense_execute.ReaderControls.test_bad_round_arm_or_iterations) ... ok
+test_blank_record (test_bench_apple_dense_execute.ReaderControls.test_blank_record) ... ok
+test_checksum_disagreement (test_bench_apple_dense_execute.ReaderControls.test_checksum_disagreement) ... ok
+test_duplicate_sample (test_bench_apple_dense_execute.ReaderControls.test_duplicate_sample) ... ok
+test_duplicate_witness (test_bench_apple_dense_execute.ReaderControls.test_duplicate_witness) ... ok
+test_empty_corpus (test_bench_apple_dense_execute.ReaderControls.test_empty_corpus) ... ok
+test_invalid_durations (test_bench_apple_dense_execute.ReaderControls.test_invalid_durations) ... ok
+test_missing_sample (test_bench_apple_dense_execute.ReaderControls.test_missing_sample) ... ok
+test_missing_witness (test_bench_apple_dense_execute.ReaderControls.test_missing_witness) ... ok
+test_positive_complete_corpus (test_bench_apple_dense_execute.ReaderControls.test_positive_complete_corpus) ... ok
+test_unknown_shape_or_retention (test_bench_apple_dense_execute.ReaderControls.test_unknown_shape_or_retention) ... ok
+test_wrong_record_kind_or_field_count (test_bench_apple_dense_execute.ReaderControls.test_wrong_record_kind_or_field_count) ... ok
+test_wrong_six_order_sequence (test_bench_apple_dense_execute.ReaderControls.test_wrong_six_order_sequence) ... ok
+test_wrong_version (test_bench_apple_dense_execute.ReaderControls.test_wrong_version) ... ok
+test_wrong_witness (test_bench_apple_dense_execute.ReaderControls.test_wrong_witness) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 0.049s
+
+OK

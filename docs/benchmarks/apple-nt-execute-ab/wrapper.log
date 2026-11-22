@@ -1,0 +1,17 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 45223, "load_before": [1.869140625, 2.2890625, 2.291015625], "command": ["python3", "/tmp/nxrt-apple-execute-ab-final-pipeline.py"]}
+PASS /tmp/nxrt-apple-execute-ab-final-list.log
+PASS /tmp/nxrt-apple-execute-ab-final-run-1.log
+RECORDED sweep 1: {"cpu": 9, "wall": 9}
+PASS /tmp/nxrt-apple-execute-ab-final-run-2.log
+RECORDED sweep 2: {"cpu": 9, "wall": 10}
+PASS /tmp/nxrt-apple-execute-ab-final-run-3.log
+RECORDED sweep 3: {"cpu": 9, "wall": 10}
+PASS /tmp/nxrt-apple-execute-ab-final-native.tests.log
+PASS /tmp/nxrt-apple-execute-ab-final-native.clippy.log
+PASS /tmp/nxrt-apple-execute-ab-final-native-session.tests.log
+PASS /tmp/nxrt-apple-execute-ab-final-native-session.clippy.log
+PASS /tmp/nxrt-apple-execute-ab-final-mlas.tests.log
+PASS /tmp/nxrt-apple-execute-ab-final-mlas.clippy.log
+PASS /tmp/nxrt-apple-execute-ab-final-mlas-session.tests.log
+PASS /tmp/nxrt-apple-execute-ab-final-mlas-session.clippy.log
+{"wall_s": 347.68590666598175, "cpu_s": 894.584604, "maxrss_bytes": 4058251264, "load_after": [7.8759765625, 4.96875, 3.38427734375]}

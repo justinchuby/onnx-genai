@@ -1,0 +1,45 @@
+{
+  "sample_count": 2160,
+  "cell_count": 30,
+  "metrics": {
+    "cpu": {
+      "qualified": 28,
+      "unqualified": [
+        {
+          "sweep": 2,
+          "m": 8,
+          "k": 257,
+          "n": 65,
+          "retained": 1,
+          "median_ns_per_call": [
+            576847.4576271186,
+            4118.64406779661,
+            3847.4576271186443
+          ],
+          "native_aa_ratio": 1.0704845814977972,
+          "qualified": false,
+          "legacy_over_native": 144.8255319148936
+        },
+        {
+          "sweep": 3,
+          "m": 8,
+          "k": 257,
+          "n": 65,
+          "retained": 1,
+          "median_ns_per_call": [
+            584355.9322033898,
+            4474.576271186441,
+            5262.71186440678
+          ],
+          "native_aa_ratio": 1.1761363636363635,
+          "qualified": false,
+          "legacy_over_native": 120.02436901653611
+        }
+      ]
+    },
+    "wall": {
+      "qualified": 30,
+      "unqualified": []
+    }
+  }
+}

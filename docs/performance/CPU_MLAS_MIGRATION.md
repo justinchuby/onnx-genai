@@ -908,7 +908,7 @@ cache and its cold-fill gate. Adoption additionally requires the same immutable
 dense-byte limit, so a disabled or smaller retention policy cannot inherit a
 larger cache. The [dense ownership regression](../benchmarks/NBITS_DENSE_NODE_SHARING.md)
 checks three actual executor shape variants, session isolation, pressure and
-concurrent builders. The MLAS research memo/store owners remain separate work.
+concurrent builders. The MLAS research layouts now share explicit node-scoped state as described below; their per-kernel warm memos remain separate and retain active payloads.
 
 ## Reference reachability and numerical comparisons
 
@@ -976,13 +976,13 @@ Carried forward from [`ABSORBING_MLAS.md`](ABSORBING_MLAS.md), unchanged:
 - **Any resident buffer must be governed** (#1056): declared to the memory plan
   before allocation, in the bytes actually allocated, and declinable. Dense
   expansions use `DenseWeightCache` with `DerivedWeightMemory`; each payload
-  owns its Host grant until the final reader drops it. Compact retained packs
-  remain outstanding work; an estimate alone does not fund an allocation.
+  owns its Host grant until the final reader drops it. Native compact packs
+  also own grants; an estimate alone does not fund an allocation.
 - **Anything cached per kernel instance is retained at least twice** — the
   executor's `KernelCache` is shape-keyed, so prefill and decode are separate
-  instances. Share eligible weights through the owning `CpuMemoryResources`
-  cache using explicit immutable source identity, rather than a process-global
-  raw-address cache. Borrow unchanged source layouts when placement permits.
+  instances. Share eligible weights through the executor node's constant state
+  using the exact immutable `CpuMemoryResources` grant source, rather than a
+  process-global raw-address cache. Borrow unchanged source layouts when placement permits.
 - **The memory-cheapest technique wins ties.** The MLAS int4 route holds a packed
   copy at ~2× the int4 bytes; on a 14B model that is 16.7 GB and the memory plan
   declines it (#1051), so the model that most needs the speed is the one that
@@ -1014,3 +1014,65 @@ returns actionable errors. Its validated operand type also serves GEMV; ABI
 limits are enforced only for BLAS, preserving the native large-GEMV usize
 extent domain. The optional MLAS reference is unchanged and no family is
 thereby graduated.
+
+
+### Resolve NT implementation and reuse policy together
+
+The transposed-GEMM predicate and unchecked backend dispatcher are replaced by
+one resolved `NtGemm` value with private fields. Resolution includes backend
+availability (and runtime AVX2/FMA eligibility for the native x86 implementation)
+and its prefill weight-reuse requirement. Execution consumes that value. Generic
+NN remains available when NT cannot resolve; no compatibility functions remain.
+
+The [real-execute comparison](../benchmarks/APPLE_NT_EXECUTE_AB.md) preserves an
+initial transient-NT candidate with qualified wall regressions in its zero-cache
+128x1024x1024 fixture. The Apple descriptor now requires admitted NK retention,
+using the existing constant-input and dense-byte-limit rule rather than a model
+or geometry threshold. Disabled/insufficient retention and mutable metadata keep
+the established KN route. Other NT backend policies are unchanged. Protocol 2
+records successful NT calls so the zero-retention null cannot silently measure
+NT. Original results and failed A/A cells are retained separately.
+
+These are instrumented real-kernel execute observations on one Apple tier, not
+model throughput, production-latency guarantees or MLAS graduation. The separate
+non-dyadic numerical contract and all grant/pressure/fallback guards remain.
+
+
+### Node-scoped ownership for optional SQNBit reference packs
+
+The optional MLAS SQNBit store is now owned by a node's shared constant state,
+matching native layouts and dense expansions. The executor's existing adoption
+hook shares it across eligible shape variants only after fixed preparation
+parameters, constant-input policy, dense-byte limit, MLAS retention verdict and
+exact immutable grant source agree. Operand addresses distinguish layouts inside
+that owner; matching addresses or physical Host books never discover another
+node or session's cache.
+
+There is no process-global store, test-only thread-local replacement, installer
+key list, or executor blanket-clear API. Retiring the original builder leaves
+adopted variants warm; the final owner releases membership. Active packed-payload
+readers keep their own grants until they drop. Cold-fill gates still serialize
+identical builds without holding a value-map lock during admission or refunds.
+Dynamic and serialized-input paths retain their existing eligibility rules;
+serialized prepacked inputs are not newly eligible for constant-state adoption.
+
+The regressions check explicit sharing after builder retirement, deterministic
+weak-owner teardown in the recycled-address test, independent-node charges on the
+same source operands/Host books, concurrent preparation and lock-safe refunds,
+and a real executor running three activation shapes plus an independent session.
+The executor test reruns the survivor after peer teardown and checks warm charges
+and complete final refund. This changes ownership only; it does not change packed
+arithmetic, claim performance parity, graduate a family or remove the remaining
+optional reference dependency. Idle pressure eviction of these reference memos
+and layout maps remains outstanding; native caches already support it.
+
+Validation on Apple M1 Max / ARM64 macOS, Rust 1.98, using cached ORT headers
+and libraries: native CPU 1,969 passed / 20 ignored, native session 274 passed;
+optional-MLAS CPU 1,997 passed / 34 ignored, optional-MLAS session 276 passed.
+Strict all-target Clippy passes for both crates in both configurations. After
+strengthening scale-key coverage and adding the session test's unsupported-tier
+qualification, both named controls selected one test and passed again, and both
+MLAS all-target Clippy checks passed again. The qualification did not skip the
+session control on this host. Rust formatting, dispatch manifest/reachability,
+platform naming and feature-gate coverage checks pass. These are correctness and
+ownership results, with no CUDA execution or new performance measurement.

@@ -1,0 +1,95 @@
+{
+  "protocol": 2,
+  "sample_count": 2160,
+  "cell_count": 30,
+  "validation_counts": {
+    "native-cpu": {
+      "passed": 1969,
+      "ignored": 20
+    },
+    "native-session": {
+      "passed": 274,
+      "ignored": 0
+    },
+    "mlas-cpu": {
+      "passed": 1997,
+      "ignored": 34
+    },
+    "mlas-session": {
+      "passed": 275,
+      "ignored": 0
+    }
+  },
+  "metrics": {
+    "cpu": {
+      "qualified": 27,
+      "unqualified": [
+        {
+          "sweep": 1,
+          "m": 8,
+          "k": 257,
+          "n": 65,
+          "retained": 1,
+          "median_ns_per_call": [
+            601584.7457627119,
+            3322.0338983050847,
+            3567.796610169492
+          ],
+          "native_aa_ratio": 1.0739795918367347,
+          "qualified": false,
+          "legacy_over_native": 174.62976629766297
+        },
+        {
+          "sweep": 2,
+          "m": 8,
+          "k": 257,
+          "n": 65,
+          "retained": 1,
+          "median_ns_per_call": [
+            585915.2542372881,
+            4135.593220338983,
+            6076.271186440678
+          ],
+          "native_aa_ratio": 1.4692622950819674,
+          "qualified": false,
+          "legacy_over_native": 114.75186721991702
+        },
+        {
+          "sweep": 3,
+          "m": 8,
+          "k": 257,
+          "n": 65,
+          "retained": 1,
+          "median_ns_per_call": [
+            577389.8305084745,
+            6338.983050847458,
+            3245.762711864407
+          ],
+          "native_aa_ratio": 1.9530026109660574,
+          "qualified": false,
+          "legacy_over_native": 120.48099027409371
+        }
+      ]
+    },
+    "wall": {
+      "qualified": 29,
+      "unqualified": [
+        {
+          "sweep": 1,
+          "m": 8,
+          "k": 257,
+          "n": 65,
+          "retained": 0,
+          "median_ns_per_call": [
+            69086.86440677967,
+            69065.68644067796,
+            72639.4745762712
+          ],
+          "native_aa_ratio": 1.0517447710979146,
+          "qualified": false,
+          "legacy_over_native": 0.9750790149205121
+        }
+      ]
+    }
+  }
+}

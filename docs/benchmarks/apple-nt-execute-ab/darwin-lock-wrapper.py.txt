@@ -1,0 +1,12 @@
+import fcntl, json, os, pathlib, platform, resource, subprocess, sys, time
+assert platform.system() == 'Darwin'
+# Stable inode; never unlink or reap. Kernel owns release on every exit path.
+lock_path = '/tmp/onnx-genai-hostlock-darwin.flock'
+with open(lock_path, 'a+') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print(json.dumps({'lock': lock_path, 'mechanism':'Darwin fcntl.flock; hostlock.sh unsupported', 'pid':os.getpid(), 'load_before':os.getloadavg(), 'command':sys.argv[1:]}), flush=True)
+    started=time.monotonic()
+    result=subprocess.run(sys.argv[1:], pass_fds=(lock.fileno(),))
+    usage=resource.getrusage(resource.RUSAGE_CHILDREN)
+    print(json.dumps({'wall_s':time.monotonic()-started,'cpu_s':usage.ru_utime+usage.ru_stime,'maxrss_bytes':usage.ru_maxrss,'load_after':os.getloadavg()}), flush=True)
+    raise SystemExit(result.returncode)

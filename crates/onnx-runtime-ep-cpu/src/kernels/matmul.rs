@@ -1146,85 +1146,79 @@ pub(crate) fn gemm_with_backend(
     }
 }
 
-/// Whether a transposed-B ("NT") dense GEMM — `c[m,n] = a[m,k] @ b_nk[n,k]^T`,
-/// reading the weight in its natural `[n, k]` layout with no `[k, n]` copy — is
-/// available for `backend`. This is the single legality predicate shared by the
-/// MLAS and native `MatMulNBits` prefill routes (see [`gemm_nt_with_backend`]);
-/// keeping it in one place stops the two build configurations from drifting.
-pub(crate) fn nt_gemm_supported(backend: CpuBackend) -> bool {
-    match backend {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        CpuBackend::Accelerate => true,
-        #[cfg(feature = "mlas")]
-        CpuBackend::Mlas => true,
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        CpuBackend::SimdX86 => true,
-        _ => {
-            let _ = backend;
-            false
-        }
-    }
-}
-
-/// Transposed-B dense GEMM: `c[m,n] = a[m,k] @ b_nk[n,k]^T`, where `b_nk` is
-/// `[n, k]` row-major. It computes the same matrix as NN on a KN transpose,
-/// while floating-point reduction order can differ by backend and operand layout.
-/// Numerical tests use an f64 oracle; layout equality alone is not a proof of
-/// bit-identical f32 outputs.
-///
-/// * `Accelerate`: checked row-major CBLAS with transposed B and `ldb = k`.
-/// * `Mlas`: MLAS's cache-tiled SGEMM with `trans_b` (`ldb = k`) reads `b_nk`
-///   as the transposed operand directly.
-/// * `SimdX86`: the native NT SGEMM ([`x86_sgemm::sgemm_simd_nt`]), which packs
-///   the same B panels the NN path would and drives the same microkernel.
-///
-/// `backend` must satisfy [`nt_gemm_supported`]; callers gate on it, and an
-/// unsupported backend here is a caller bug rather than a runtime condition.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gemm_nt_with_backend(
+/// A resolved NT implementation for an available CPU backend. Private fields
+/// keep unsupported backends out of callers' executable capability values.
+#[derive(Clone, Copy)]
+pub(crate) struct NtGemm {
     backend: CpuBackend,
-    a: &[f32],
-    b_nk: &[f32],
-    c: &mut [f32],
-    m: usize,
-    k: usize,
-    n: usize,
-) -> Result<()> {
-    dispatch_ledger::record_with(|| {
-        dispatch_ledger::Observation::gemm(
-            dispatch_ledger::KernelFamily::MatMulF32,
-            ledger_backend(backend),
-            "f32",
-            m,
-            n,
-            k,
-        )
-    });
-    match backend {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        CpuBackend::Accelerate => accelerate_gemm::sgemm_nt(a, b_nk, c, m, k, n),
-        #[cfg(feature = "mlas")]
-        CpuBackend::Mlas => {
-            // C[m, n] = A[m, k] * B_nk[n, k]^T. `trans_b` with `ldb = k` reads
-            // the Nk weight as the transposed operand without materializing a
-            // Kn copy.
-            mlas_sys::sgemm(false, true, m, n, k, 1.0, a, k, b_nk, k, 0.0, c, n, true);
-            Ok(())
-        }
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        CpuBackend::SimdX86 => {
-            x86_sgemm::sgemm_simd_nt(a, b_nk, c, m, k, n);
-            Ok(())
-        }
-        _ => {
-            // On a target without an NT arm (e.g. non-Apple aarch64 without
-            // `mlas`) none of the operands are read; bind them so the arch
-            // gating does not turn every parameter into an unused variable.
-            let _ = (a, b_nk, c, m, k, n);
-            Err(EpError::KernelFailed(format!(
-                "gemm_nt_with_backend called for backend {backend:?} without a transposed-B GEMM; \
-                 callers must gate on nt_gemm_supported"
-            )))
+    requires_retained_weights: bool,
+}
+impl NtGemm {
+    pub(crate) fn resolve(backend: CpuBackend) -> Option<Self> {
+        let reuse = match backend {
+            // Apple NT's demonstrated advantage is amortized NK preparation.
+            // Preserve NN for transient weights: initial real-execute probes
+            // show no uniform transient benefit, including slower wall cells.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            CpuBackend::Accelerate => Some(true),
+            #[cfg(feature = "mlas")]
+            CpuBackend::Mlas => Some(false),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            CpuBackend::SimdX86 if crate::backend::has_simd_x86() => Some(false),
+            _ => None,
+        };
+        reuse.map(|requires_retained_weights| Self {
+            backend,
+            requires_retained_weights,
+        })
+    }
+
+    pub(crate) fn requires_retained_weights(self) -> bool {
+        self.requires_retained_weights
+    }
+
+    /// C[M,N] = A[M,K] @ B[N,K]^T. Backend/layout reduction orders can differ;
+    /// finite f64-oracle coverage does not imply bit-identical f32 outputs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run(
+        self,
+        a: &[f32],
+        b_nk: &[f32],
+        c: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        dispatch_ledger::record_with(|| {
+            dispatch_ledger::Observation::gemm(
+                dispatch_ledger::KernelFamily::MatMulF32,
+                ledger_backend(self.backend),
+                "f32",
+                m,
+                n,
+                k,
+            )
+        });
+        match self.backend {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            CpuBackend::Accelerate => accelerate_gemm::sgemm_nt(a, b_nk, c, m, k, n),
+            #[cfg(feature = "mlas")]
+            CpuBackend::Mlas => {
+                mlas_sys::sgemm(false, true, m, n, k, 1.0, a, k, b_nk, k, 0.0, c, n, true);
+                Ok(())
+            }
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            CpuBackend::SimdX86 => {
+                x86_sgemm::sgemm_simd_nt(a, b_nk, c, m, k, n);
+                Ok(())
+            }
+            _ => {
+                let _ = (a, b_nk, c, m, k, n);
+                Err(EpError::KernelFailed(format!(
+                    "resolved NT GEMM contains unsupported backend {:?}; construct capabilities through NtGemm::resolve",
+                    self.backend
+                )))
+            }
         }
     }
 }
@@ -5260,6 +5254,23 @@ mod tests {
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap_err();
         assert!(format!("{err}").contains("WHAT"));
+    }
+
+    #[test]
+    fn unresolved_nt_keeps_the_portable_nn_backend_available() {
+        assert!(NtGemm::resolve(CpuBackend::Generic).is_none());
+        let mut result = [0.; 4];
+        gemm_with_backend(
+            CpuBackend::Generic,
+            &[1., 2., 3., 4.],
+            &[5., 6., 7., 8.],
+            &mut result,
+            2,
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(result, [19., 22., 43., 50.]);
     }
 
     #[test]

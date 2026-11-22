@@ -1,0 +1,13 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 43042, "load_before": [1.31982421875, 1.71484375, 1.943359375], "command": ["python3", "/tmp/nxrt-apple-execute-ab-pipeline.py"]}
+PASS /tmp/nxrt-apple-execute-ab-list.log
+PASS /tmp/nxrt-apple-execute-ab-run-1.log
+RECORDED sweep 1: {"cpu": 10, "wall": 10}
+PASS /tmp/nxrt-apple-execute-ab-run-2.log
+RECORDED sweep 2: {"cpu": 9, "wall": 10}
+PASS /tmp/nxrt-apple-execute-ab-run-3.log
+RECORDED sweep 3: {"cpu": 9, "wall": 10}
+PASS /tmp/nxrt-apple-execute-ab-native.tests.log
+PASS /tmp/nxrt-apple-execute-ab-native.clippy.log
+PASS /tmp/nxrt-apple-execute-ab-mlas.tests.log
+PASS /tmp/nxrt-apple-execute-ab-mlas.clippy.log
+{"wall_s": 300.82750574999955, "cpu_s": 799.3242329999999, "maxrss_bytes": 4046454784, "load_after": [5.3984375, 3.26611328125, 2.49365234375]}
