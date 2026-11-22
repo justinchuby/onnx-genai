@@ -896,9 +896,14 @@ eight factory-wired slots using real Host/KV reservations, including pressure
 from another thread. Existing native-pack tests continue to verify payload and
 conversion-peak byte accounting, refusal before construction, failed-builder
 refund, warm reuse, dynamic call ownership, and the actual selected operator
-cache. Compact borrowing and numerical kernels are unchanged. Native packs are
-still kernel-local; cross-kernel sharing and pressure eviction of the remaining
-MLAS research memo/store owners are separate work.
+cache. Compact borrowing and numerical kernels are unchanged. Native layout slots and their cold-fill gate now share one owner among the
+shape variants of an executor node, using the existing constant-state hook.
+Adoption verifies fixed preparation parameters, constant-input policy and the
+exact immutable grant source; separate nodes/sessions keep separate state.
+The active-reader and idle-pressure lifetimes remain unchanged. The
+[host regression](../benchmarks/NBITS_NODE_PACK_SHARING.md) checks a real
+executor, all eight native layout slots and independent concurrent builders.
+Dense f32 caches and the MLAS research memo/store owners remain separate work.
 
 ## Reference reachability and numerical comparisons
 

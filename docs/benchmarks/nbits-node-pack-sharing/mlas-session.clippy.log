@@ -1,0 +1,3 @@
+    Checking onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-ep-cpu)
+    Checking onnx-runtime-session v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-session)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.75s

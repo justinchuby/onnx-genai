@@ -675,3 +675,29 @@ See the [scoped diagnostic and allocation proof](../benchmarks/2026-11-21-generi
 This removes one family of ungoverned matrix copies; mutable MLAS workspace,
 other transient scratch, idle OnceLock reclamation, process quota and physical
 Host/Device reconciliation remain unfinished.
+
+
+### Native NBits node pack ownership
+
+MatMulNBits native layout slots and their single cold-fill gate now form one
+shared node owner. The existing executor constant-state hook passes that owner
+between activation-shape variants; no process-wide address store, second cache
+registry or compatibility interface is added. Both publication and adoption
+consume one eligibility rule, and adoption verifies preparation attributes,
+constant-input flags and exact `DerivedWeightMemory` source identity. Only a
+clone of the same governed source is interchangeable, even behind identical
+Host books and holder numbers. Ungoverned standalone peers can still share.
+
+Every layout retains its existing pressure enrollment and owned payload grant.
+Dropping the producer kernel does not remove enrollment while a peer lives;
+pressure cannot evict active readers, idle slots can be reclaimed, and the next
+reader rebuilds under fresh admission. Optional dynamic metadata still forces
+call-owned preparation through the existing execution gate. Dense f32 caches
+and optional MLAS memo/store owners are unchanged.
+
+[Host evidence](../benchmarks/NBITS_NODE_PACK_SHARING.md) reproduces duplicate
+ledger charging in a real executor before the change, then verifies three
+shape variants, output bytes, session isolation, all eight slot lifetimes and
+concurrent cold builders. This is a node ownership change, not a throughput or
+GPU execution result. Other scratch/activation accounting, physical capacity
+relationships and CUDA asynchronous validation remain open.
