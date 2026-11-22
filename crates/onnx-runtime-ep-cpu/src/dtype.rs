@@ -826,17 +826,58 @@ pub fn narrow_bf16_slice_into(src: &[f32], dst: &mut [u16]) {
 /// supported float view (`f16`/`bf16`/`f64` or strided f32) into dense f32.
 /// Rejects non-float dtypes with a RULE #1 error.
 pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<'a, [f32]>> {
+    validate_f32_widen_input(op, view)?;
+    let len = view.numel();
     if view.dtype == DataType::Float32 && view.is_contiguous() {
-        view.validate()?;
-        let len = view.numel();
         if len == 0 {
             return Ok(Cow::Borrowed(&[]));
         }
-        // SAFETY: a validated contiguous Float32 view describes exactly `len`
-        // initialized f32 elements starting at `data_ptr`; the TensorView
-        // contract keeps that storage alive for the duration of this borrow.
+        // SAFETY: validated contiguous host Float32 storage lives for this borrow.
         let data = unsafe { std::slice::from_raw_parts(view.data_ptr::<f32>(), len) };
         return Ok(Cow::Borrowed(data));
+    }
+    let mut values = vec![0.; len];
+    to_dense_f32_widen_into(op, view, &mut values)?;
+    Ok(Cow::Owned(values))
+}
+
+pub(crate) fn validate_f32_widen_input(op: &str, view: &TensorView<'_>) -> Result<()> {
+    view.validate()?;
+    if !view.device.is_host_accessible() {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: cannot widen {:?} on {:?} through a CPU pointer; explicitly transfer the tensor to host-accessible storage",
+            view.dtype, view.device
+        )));
+    }
+    if !matches!(
+        view.dtype,
+        DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
+    ) {
+        return Err(unsupported_dtype(op, view.dtype));
+    }
+    Ok(())
+}
+
+/// Convert directly into an already admitted f32 payload. Matrix-sized source
+/// copies are unnecessary: scalar strided conversion reads each original value,
+/// while contiguous half paths keep their existing runtime-selected SIMD helpers.
+pub(crate) fn to_dense_f32_widen_into(
+    op: &str,
+    view: &TensorView<'_>,
+    out: &mut [f32],
+) -> Result<()> {
+    validate_f32_widen_input(op, view)?;
+    if out.len() != view.numel() {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: f32 widening destination has {} elements, expected {} for {:?} shape {:?}; allocate the complete logical output before conversion",
+            out.len(),
+            view.numel(),
+            view.dtype,
+            view.shape
+        )));
+    }
+    if out.is_empty() {
+        return Ok(());
     }
     // F16C bulk widen for a contiguous f16 tensor (the KV-cache decode hot path).
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -844,16 +885,15 @@ pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<
         view.validate()?;
         let len = view.numel();
         if len == 0 {
-            return Ok(Cow::Borrowed(&[]));
+            return Ok(());
         }
         // SAFETY: a validated contiguous Float16 view addresses exactly `len`
         // 2-byte elements; `half::f16` is `repr(transparent)` over `u16`, so the
         // same storage reads soundly as `u16` bit patterns.
         let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), len) };
-        let mut dst = vec![0.0f32; len];
         // SAFETY: `f16c::available()` confirmed `f16c` + `avx2`; lengths match.
-        unsafe { f16c::widen(src, &mut dst) };
-        return Ok(Cow::Owned(dst));
+        unsafe { f16c::widen(src, out) };
+        return Ok(());
     }
     // Bulk widen for a contiguous bf16 tensor. Unlike f16 this needs no
     // conversion instruction at all — bf16 is the top half of an f32 — so the
@@ -864,18 +904,17 @@ pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<
         view.validate()?;
         let len = view.numel();
         if len == 0 {
-            return Ok(Cow::Borrowed(&[]));
+            return Ok(());
         }
         // SAFETY: a validated contiguous BFloat16 view addresses exactly `len`
         // 2-byte elements; `half::bf16` is `repr(transparent)` over `u16`, so
         // the same storage reads soundly as `u16` bit patterns.
         let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), len) };
-        let mut dst = vec![0.0f32; len];
         // SAFETY: `bf16x::available()` confirmed `avx2`; lengths match.
         // `widen_quieting`, not `widen`: this replaces a `half::bf16::to_f32`
         // call, which quiets signalling NaN.
-        unsafe { bf16x::widen_quieting(src, &mut dst) };
-        return Ok(Cow::Owned(dst));
+        unsafe { bf16x::widen_quieting(src, out) };
+        return Ok(());
     }
     // NEON bulk widen for contiguous f16 tensors on aarch64.
     // Uses `fcvtl` (ARMv8 base FP, no FEAT_FP16 required) to widen 4 f16→f32
@@ -887,18 +926,23 @@ pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<
         view.validate()?;
         let len = view.numel();
         if len == 0 {
-            return Ok(Cow::Borrowed(&[]));
+            return Ok(());
         }
         let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), len) };
-        let mut dst = vec![0.0f32; len];
-        neon_f16_to_f32_bulk(src, &mut dst);
-        return Ok(Cow::Owned(dst));
+        neon_f16_to_f32_bulk(src, out);
+        return Ok(());
     }
     dispatch_float!(view.dtype, op, T => {
-        let raw = to_dense_float::<T>(view)?;
-        Ok(Cow::Owned(
-            raw.into_iter().map(|v| v.to_f32()).collect(),
-        ))
+        let origin = view.data_ptr::<T>();
+        let mut index = vec![0; view.shape.len()];
+        for value in out {
+            let offset = elem_offset(view.strides, &index);
+            // SAFETY: validated host view, in-shape indices, unaligned numeric
+            // read. The owning EP supplies backing bounds (TensorView contract).
+            *value = unsafe { origin.offset(offset).read_unaligned() }.to_f32();
+            next_index(view.shape, &mut index);
+        }
+        Ok(())
     })
 }
 
@@ -1130,6 +1174,104 @@ fn neon_f32_to_f16_bulk(src: &[f32], dst: &mut [u16]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_widening_preserves_strides_offsets_and_float_values() {
+        use crate::kernels::testutil::Owned;
+        let values = [
+            0.,
+            -0.,
+            1.,
+            -2.,
+            0.5,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            3.5,
+            -0.25,
+            16.,
+            -8.,
+        ];
+        for dtype in [
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            let make = |data: &[f32]| match dtype {
+                DataType::Float16 => Owned::f16(&[data.len()], data),
+                DataType::BFloat16 => Owned::bf16(&[data.len()], data),
+                DataType::Float32 => Owned::f32(&[data.len()], data),
+                _ => Owned::f64(
+                    &[data.len()],
+                    &data.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+                ),
+            };
+            let expected: Vec<f32> = values
+                .iter()
+                .map(|&value| match dtype {
+                    DataType::Float16 => half::f16::from_f32(value).to_f32(),
+                    DataType::BFloat16 => half::bf16::from_f32(value).to_f32(),
+                    _ => value,
+                })
+                .collect();
+            let padded: Vec<f32> = std::iter::once(99.)
+                .chain(values.iter().flat_map(|&v| [v, 77.]))
+                .collect();
+            let backing = make(&padded);
+            let shape = [values.len()];
+            let strides = [2];
+            let mut view = backing.view();
+            view.shape = &shape;
+            view.strides = &strides;
+            view.byte_offset = dtype.byte_size();
+            let mut actual = vec![0.; values.len()];
+            to_dense_f32_widen_into("direct fixture", &view, &mut actual).unwrap();
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{dtype:?}"
+            );
+            let reverse = [-2];
+            view.strides = &reverse;
+            view.byte_offset = (1 + 2 * (values.len() - 1)) * dtype.byte_size();
+            to_dense_f32_widen_into("reverse fixture", &view, &mut actual).unwrap();
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .rev()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                "reverse {dtype:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_widening_refuses_bad_destination_and_nonhost_storage_before_write() {
+        use crate::kernels::testutil::Owned;
+        let source = Owned::f64(&[3], &[1., 2., 3.]);
+        let mut short = [99.; 2];
+        let error = to_dense_f32_widen_into("test operand", &source.view(), &mut short)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("test operand")
+                && error.contains("2 elements")
+                && error.contains("expected 3"),
+            "{error}"
+        );
+        assert_eq!(short, [99.; 2]);
+        let mut gpu = source.view();
+        gpu.device = onnx_runtime_ir::DeviceId::cuda(0);
+        let mut out = [99.; 3];
+        assert!(to_dense_f32_widen_into("test operand", &gpu, &mut out).is_err());
+        assert_eq!(out, [99.; 3]);
+        let empty = Owned::f64(&[0], &[]);
+        to_dense_f32_widen_into("empty", &empty.view(), &mut []).unwrap();
+    }
 
     #[test]
     fn f16_roundtrips_through_f32_without_bit_reinterpret() {

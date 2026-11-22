@@ -30,7 +30,8 @@ impl Default for CpuWeightCacheLimits {
     }
 }
 
-/// Immutable CPU weight resources. Full f32 block-format/NBits expansions,
+/// Immutable CPU weight resources. Ordinary MatMul-family constant f32
+/// materializations, full f32 block-format/NBits expansions,
 /// owned native/optional-MLAS NBits preparations, optional QLinearMatMul packs,
 /// and retained or transient QMoE experts
 /// use one Host grant source. Private fields
@@ -124,7 +125,7 @@ impl CpuMemoryResources {
     }
 }
 
-/// Grant source for owned f32 copies derived from packed weights.
+/// Grant source for owned weight preparations and constant conversions.
 ///
 /// A governed source retains a zero-byte anchor, rather than a standing cache
 /// allowance. Each owned expansion claims its payload bytes against the same

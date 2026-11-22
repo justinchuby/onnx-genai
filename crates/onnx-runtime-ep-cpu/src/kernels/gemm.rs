@@ -33,16 +33,16 @@ pub struct GemmKernel {
 /// Factory reading `alpha`/`beta` (default 1.0) and `transA`/`transB`
 /// (default 0).
 pub struct GemmFactory {
-    retain_caches: bool,
+    resources: crate::CpuMemoryResources,
 }
 impl GemmFactory {
-    pub fn new(retain_caches: bool) -> Self {
-        Self { retain_caches }
+    pub fn new(resources: crate::CpuMemoryResources) -> Self {
+        Self { resources }
     }
 }
 impl Default for GemmFactory {
     fn default() -> Self {
-        Self::new(true)
+        Self::new(crate::CpuMemoryResources::default())
     }
 }
 
@@ -57,7 +57,7 @@ impl KernelFactory for GemmFactory {
             beta,
             trans_a,
             trans_b,
-            prepack: MatMulPrepack::new(self.retain_caches),
+            prepack: MatMulPrepack::new(self.resources.clone()),
         }))
     }
 }
@@ -277,7 +277,7 @@ impl Kernel for GemmKernel {
             let a_rm: Cow<'_, [f32]> = if self.trans_a {
                 Cow::Owned(transpose_row_major(&a, k, m))
             } else {
-                a
+                Cow::Borrowed(&a)
             };
             let b_rm: Cow<'_, [f32]> = if self.trans_b {
                 match self.prepack.transposed_b(&b, n, k) {
@@ -285,7 +285,7 @@ impl Kernel for GemmKernel {
                     None => Cow::Owned(transpose_row_major(&b, n, k)),
                 }
             } else {
-                b
+                Cow::Borrowed(&b)
             };
 
             let mut output = vec![0.0f32; m * n];
@@ -1261,7 +1261,10 @@ mod tests {
                 beta: 1.0,
                 trans_a: false,
                 trans_b: true,
-                prepack: MatMulPrepack::new(retain_caches),
+                prepack: MatMulPrepack::new(
+                    crate::CpuMemoryResources::default()
+                        .with_cache_retention(crate::CpuCacheRetention::new(retain_caches)),
+                ),
             };
             kernel.set_constant_inputs(&[false, true]);
             kernel
@@ -1332,7 +1335,10 @@ mod half_decode_route_tests {
             beta: 1.0,
             trans_a: false,
             trans_b,
-            prepack: MatMulPrepack::new(retain_caches),
+            prepack: MatMulPrepack::new(
+                crate::CpuMemoryResources::default()
+                    .with_cache_retention(crate::CpuCacheRetention::new(retain_caches)),
+            ),
         };
         kernel.set_constant_inputs(&[false, true]);
         super::reset_half_decode_gemv_calls();

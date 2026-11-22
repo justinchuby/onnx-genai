@@ -1156,11 +1156,11 @@ comparisons do not establish broad packed/unpacked bit identity or model token
 parity. Named bounded child processes keep these new real-kernel calls from
 perturbing existing libtest-wide platform dispatch observations.
 
-This closes a retention-policy bypass. It does not yet fund the ordinary
-SGEMM packed panels, half copies or existing MatMul transpose/dense caches with
-the physical Host authority, make them node-shared/pressure-reclaimable, or
-establish a performance improvement. Those ownership/admission steps remain
-separate from the already governed native/NBits/QLinearMatMul/expert caches.
+This closes a retention-policy bypass. Ordinary constant f32 materializations
+now obtain Host grants as described below. SGEMM packed panels, native half
+copies and transpose payloads still need their own authority/lifecycle work;
+ordinary dense caches are not yet shared across a node's shape variants. No
+performance improvement is established by these retention checks.
 
 Validation on Apple M1 Max / ARM64 macOS with Rust 1.98 and cached ORT:
 native CPU 1,970 passed / 20 ignored and session 274 passed; optional-MLAS CPU
@@ -1171,3 +1171,67 @@ three tests and all passed again; final MLAS CPU all-target Clippy also passed.
 Formatting and dispatch manifest/reachability/platform/feature checks pass.
 These results establish the tested retention behavior, not physical allocation
 limits, production speed, full-model numerics or another ISA's execution.
+
+
+### Ordinary MatMul constant f32 copies own actual Host grants
+
+MatMul, Gemm, FusedMatMulBias and FusedGemm factories now consume immutable
+`CpuMemoryResources`, replacing their bool-only/default preparation wiring.
+Load-time preparation uses the same provider resources. The FusedGemm factory
+previously constructed an ungoverned default prepack regardless of its provider;
+it now captures the supplying source and retention policy too. The existing
+dense-preparation predictor covers all four consumers in their registered
+domains, for both constant operands, with its existing shape-instance multiplier.
+
+The prepack's widened/densified constant slots use `DenseWeightCache` and the
+provider's `DerivedWeightMemory`. Full f32 payload admission precedes allocation
+and conversion. A sealed operand reader carries the owned payload/grant through
+computation, whether cache retention is allowed or declined. Cache removal and
+kernel destruction do not refund an executing reader. Independent idle copies
+can be reclaimed by ordinary KV reserve/growth through the existing weak
+pressure domain. Warm fills use the cache's existing singleflight mechanism.
+The legacy family retention verdict remains separate from the block/NBits dense
+expansion ceiling; no implicit new 256-MiB limit is introduced for ordinary
+MatMul. An explicitly ungoverned default source remains local ownership.
+
+Contiguous f32 constants still borrow original storage and claim zero bytes.
+Dynamic activation conversion remains scratch, outside this weight-grant scope.
+A materialized constant must fit its actual Host grant even when retention is
+disabled; capacity refusal reports the MatMul constant-input admission operation
+and preserves the typed memory cause. It does not silently allocate an uncharged
+full matrix. Later calls may retry after capacity returns.
+
+Conversion can fill an already admitted destination directly. The shared dtype
+wrapper uses the same converter, preserving its existing F16C/NEON f16 and x86
+bf16 helpers. Scalar strided conversion reads original elements into f32 output
+without a second full matrix in the source dtype, including f64. Rank-sized
+index bookkeeping is outside payload accounting. This changes materialization
+ownership, not GEMM arithmetic, and is not a latency/throughput claim.
+
+A dependent legacy transpose still uses the conversion buffer's address as its
+key. Its memo now holds a source reader until that address-keyed entry retires.
+Pressure therefore cannot free/recycle the source address underneath a retained
+transpose. Such dependent sources remain pinned until the transpose owner drops;
+transpose payload grants and reclaiming that dependency as a unit remain work.
+Ordinary MLAS SGEMM packed panels, native half-copy buffers, graph activations,
+outputs and other scratch are not covered by this f32-copy grant claim.
+
+The unchanged public-provider regression fails on parent 2aa11cfc7: a real
+MatMul retains a 24-byte f32 copy while Host books report zero. The corrected
+regression drives all four factories with retention on/off, KV competition,
+refusal, retry and final release. Additional controls check call-owned/retained
+reader lifetime, borrowed f32 at zero capacity, eight simultaneous builders under
+one-payload capacity, the transpose/source dependency, and conversion with
+positive/negative strides, offsets, dtype variation and rejected destinations.
+No CUDA device or other-ISA execution is inferred from these host checks.
+
+Validation: native CPU 1,977 passed / 20 ignored and session 274 passed;
+optional-MLAS CPU 2,008 passed / 35 ignored and session 276 passed. Strict
+all-target Clippy passes for both crates in both configurations. Seven selected
+ownership/factory/conversion/dependency/prediction controls pass, with explicit
+nonzero selected counts. Formatting and dispatch manifest/reachability/platform/
+feature checks pass. Host: Apple M1 Max ARM64 macOS, Rust 1.98, cached ORT root.
+The parent comparison selected the exact named provider test and failed on the
+0-versus-24-byte assertion, rather than treating a compilation error or zero-test
+filter as evidence. The temporary parent worktree was restored and removed;
+raw validation transcripts remain separate from performance evidence.

@@ -809,5 +809,35 @@ column-major execution remain available.
 The three old-behavior regressions demonstrate the bypass independently. New
 bounded real-kernel controls check both verdicts and unchanged expected results,
 while avoiding shared test-counter interference. This is retention enforcement,
-not physical Host funding for ordinary SGEMM/transpose/dense/half caches; their
-authority integration and shared-node/idle-pressure lifecycles remain work.
+not physical Host funding by itself. Ordinary f32 constant materialization now
+joins Host admission below; SGEMM panels, transposes and half-copy payloads, plus
+shared-node ownership for ordinary MatMul, remain work.
+
+
+### Ordinary constant materialization joins the Host authority
+
+All four MatMul-prepack consumers (MatMul, Gemm, FusedMatMulBias and FusedGemm)
+now receive the provider's immutable resources rather than a bool/default-only
+prepack. Both constant operand slots obtain actual Host payload grants before
+conversion, retaining them in an executing reader or idle cache. The common
+dense-cache authority handles singleflight construction and idle pressure.
+Contiguous f32 borrowing remains zero-copy; dynamic activations are a separate
+scratch scope. A declined retention policy changes lifetime, not the need to
+fund a required constant materialization. Admission refusal stays typed and
+retryable rather than allocating an uncharged fallback matrix.
+
+The dtype converter writes directly into an admitted f32 destination and keeps
+the existing SIMD conversion helpers. Strided/scalar conversion does not first
+allocate a full source-dtype copy. A sealed reader prevents sibling kernels from
+forging an uncharged materialized constant through the preparation API.
+Address-keyed legacy transpose memos retain their converted source reader until
+their key retires, preventing source-address recycling after pressure. This pins
+those dependencies; funding/reclaiming transpose payloads themselves remains
+separate, as do MLAS panels, native half buffers, activation/output scratch and
+shared-node ownership of ordinary MatMul preparations.
+
+The same provider-level test fails against the parent implementation with Host
+usage 0 versus 24 expected bytes. New factory, active-reader, capacity/refusal,
+retry, concurrent-fill and transpose-source controls exercise actual ownership.
+The planner also includes Gemm and FusedGemm dense preparation, previously
+omitted despite using the same prepack, and preserves domain gates.

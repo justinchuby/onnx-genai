@@ -409,6 +409,21 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
         }))
     }
 
+    /// A dependent derived object that uses a payload's address as identity
+    /// must keep that payload alive for as long as its address-keyed entry lives.
+    pub(super) fn owner_of(&self, values: &[f32]) -> Option<Arc<DenseWeight>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .values()
+            .find(|entry| {
+                entry.value.as_slice().as_ptr() == values.as_ptr()
+                    && entry.value.as_slice().len() == values.len()
+            })
+            .map(|entry| entry.value.clone())
+    }
+
     #[cfg(test)]
     pub(super) fn test_get(&self, key: &K) -> Option<Arc<DenseWeight>> {
         self.inner
@@ -417,6 +432,17 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
             .entries
             .get(key)
             .map(|entry| Arc::clone(&entry.value))
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_first(&self) -> Option<Arc<DenseWeight>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .values()
+            .next()
+            .map(|entry| entry.value.clone())
     }
 
     #[cfg(test)]
