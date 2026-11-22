@@ -16,6 +16,8 @@ use onnx_runtime_ir::Node;
 use super::add::broadcast_apply;
 use super::check_arity;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+use super::half_gemm::HalfFormat;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use super::matmul::neon_gemv_f16_col_parallel;
 use super::matmul::{
     MatMulPrepack, matmul_dense_prepacked, matmul_dense_prepacked_into,
@@ -92,14 +94,29 @@ impl Kernel for FusedMatMulBiasKernel {
                 } else {
                     1
                 };
-                if m == 1
-                    && batch_numel <= 1
-                    && let Some(bt_f16) = self.prepack.transposed_b_f16(&inputs[1], k, n)
-                {
-                    let a_dense = self.prepack.dense(0, &inputs[0])?;
+                let result = if m == 1 && batch_numel <= 1 {
+                    if let Some(bt) =
+                        self.prepack
+                            .transposed_b_half(&inputs[1], k, n, HalfFormat::F16)?
+                    {
+                        let a_dense = self.prepack.dense(0, &inputs[0])?;
+                        let mut result = vec![0.0f32; n];
+                        neon_gemv_f16_col_parallel(&a_dense, bt.as_slice(), &mut result, k, n);
+                        Some(result)
+                    } else {
+                        super::matmul::untransposed_f16_decode(
+                            &self.prepack,
+                            &inputs[0],
+                            &inputs[1],
+                            k,
+                            n,
+                        )?
+                    }
+                } else {
+                    None
+                };
+                if let Some(mut result) = result {
                     let bias = to_dense_f32_widen("FusedMatMulBias", &inputs[2])?;
-                    let mut result = vec![0.0f32; n];
-                    neon_gemv_f16_col_parallel(&a_dense, bt_f16, &mut result, k, n);
                     // Add 1-D bias in-place.
                     let bias_shape = inputs[2].shape;
                     if bias_shape.len() == 1 && bias_shape[0] == n {

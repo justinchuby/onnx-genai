@@ -14082,7 +14082,7 @@ fn weight_derived_cache_owners_are_released_before_their_buffers_are_freed() {
         .expect("Executor has a Drop impl")
         .1;
     assert!(
-        !drop_body.contains("clear_weight_transpose_caches()"),
+        !drop_body.contains("clear_legacy_f32_weight_transpose_cache()"),
         "dropping one executor must not clear another session's warmed transposes"
     );
     assert!(

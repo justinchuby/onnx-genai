@@ -1597,3 +1597,38 @@ run. The wrapper's busy branch was exercised against the other session's live
 lock and refused execution with exit 75. Release completion was verified from
 the terminal handle and final rusage before notifying the other session to
 resume; neither participant relies on an announcement as proof of ownership.
+
+Half transpose preparation now uses node-owned granted storage rather than a
+process-global half table. Tests exercise f16/bf16 identity, active-reader grant
+lifetime, idle Host reclamation by KV allocation, refusal before building, retry,
+and public MatMul/FusedMatMulBias execution after reclamation. On Apple, an
+optional-transpose refusal takes a direct row-major f16 read instead of trying
+to allocate a larger f32 weight. The provider callback probe checks 4,096 warm
+executions with no additional quota claims or releases, counting zero-byte
+requests too. This is a structural accounting check; it does not replace a
+controlled timing comparison or extend prior f64/f32 results to half storage.
+The f32 global transpose cache remains a separate unfinished funding task.
+
+The half comparison held the same stable host flock across both release builds
+and six interleaved processes (150.97 seconds total). It uses the identical
+harness on parent `95de9fef1` and the funded implementation: Apple M1 Max,
+Accelerate, f32 activation/f16 weights, Rayon=1, three process medians with
+eleven interleaved rounds each. Actual retained half grants are checked outside
+the timer: baseline 0, current `2*K*N`; output checks run in both versions.
+
+For M=1,K=N=16, the governed median moves from 280.67 ns [279.36–293.51] to
+296.37 ns [295.64–317.27], +15.70 ns / +5.59%. Local accounting moves
+283.34→296.10 ns and its duplicate 278.87→296.09 ns; the governed f32 control
+moves 249.53→254.50 ns. The current governed/local pair differs by 0.27 ns.
+For M=1,K=128,N=256, governed moves 2071.49→2093.00 ns (+1.04%), local
+2072.92→2088.83 ns, duplicate 2077.18→2097.04 ns; the governed f32 control
+moves 2094.92→2103.13 ns. These small workloads show measurable overall cache
+bookkeeping cost and do not support a zero-overhead or model-throughput claim.
+Zero warm accountant callbacks are independently proven by the observer.
+
+Raw round samples, full ranges, footprint rows and coordination/build metadata
+are retained under `/tmp/nxrt-half-transpose-perf-{before,current}-{0,1,2}.tsv`
+and `/tmp/nxrt-half-transpose-performance-{metadata,summary}.json`. The harness
+selects f16 with `NXRT_ADMISSION_WEIGHT_FORMAT=f16`; default f64/f32 controls
+keep their exact footprint assertions. The wrapper's wall/CPU totals describe
+build-plus-sweep resource use and are not kernel latency.

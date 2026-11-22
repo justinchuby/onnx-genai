@@ -1060,3 +1060,36 @@ packed numerical results. They also verify that source grants retire while
 old panel readers remain valid, identical owners reuse a panel, full half-view
 identity separates layouts, and call-owned conversion falls through correctly.
 Legacy process-global transpose payload funding/lifetime policy remains work.
+
+### Node-owned, funded half transposes
+
+Native-width f16/bf16 transpose payloads now use the same node-owned
+`WeightCache` as other prepared MatMul weights. Their actual `2*K*N` Host grant
+is acquired before writing into the admitted output allocation; the transpose
+algorithm allocates no second matrix. Identity includes the original contiguous
+source, interpretation and complete matrix geometry. Shape variants and fused
+operators share the node owner. Idle entries participate in Host pressure
+reclamation; executing Arc readers independently keep their payload and grant.
+A declined optional transpose runs no builder and can be retried later.
+
+Apple f16 decode can read the original row-major half storage directly after
+optional preparation is declined, without requesting a larger widened weight.
+MatMul and FusedMatMulBias use the same fallback arithmetic. x86 keeps its
+existing untransposed half GEMV. Cold preparation and pressure transitions may
+call accounting; 4,096 warm provider executions make no claim/refund calls,
+including zero-byte calls. This callback invariant does not assert zero cache
+lookup overhead or universal inference latency.
+
+The global half store and its diagnostic/clear APIs are removed. Multiturn
+benchmark diagnostics report model Host ledger usage, explicitly including all
+model holders. The remaining process-global **f32** transpose store is still
+legacy and needs actual funding/reclamation; its installed keys continue to be
+retired by the final node owner. Forecasts remain distinct from admission.
+
+On Apple M1 Max, native CPU 1,992 tests / 20 ignored and optional MLAS CPU
+2,032 / 35 ignored pass; session passes 277 / 279 tests respectively, with
+strict all-target Clippy in both configurations. The public provider regression
+fixture, injected with only a test observer into parent `95de9fef1`, compiles,
+selects one test, and fails at the first funding assertion: actual Host usage
+is 0 instead of 70 bytes. The current fixture also validates inference after
+reclamation and exact final refunds. No CUDA or other-ISA execution is claimed.

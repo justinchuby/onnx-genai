@@ -2023,6 +2023,111 @@ pub(crate) mod testutil {
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
     use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
 
+    /// Observe real issuer callbacks, including zero-byte requests, while
+    /// keeping the ledger's pressure/retry protocol intact.
+    #[derive(Clone)]
+    pub struct RecordingGovernor(std::sync::Arc<RecordingBooks>);
+    #[derive(Debug)]
+    struct RecordingBooks {
+        governor: onnx_runtime_memory_governor::LedgerGovernor,
+        claims: std::sync::atomic::AtomicUsize,
+        releases: std::sync::atomic::AtomicUsize,
+    }
+    impl RecordingGovernor {
+        pub fn new(host_bytes: u64) -> Self {
+            Self(std::sync::Arc::new(RecordingBooks {
+                governor: onnx_runtime_memory_governor::LedgerGovernor::new(
+                    onnx_runtime_memory_governor::LeaseLedger::new(0, host_bytes, 0),
+                ),
+                claims: std::sync::atomic::AtomicUsize::new(0),
+                releases: std::sync::atomic::AtomicUsize::new(0),
+            }))
+        }
+        pub fn claims(&self) -> usize {
+            self.0.claims.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        pub fn releases(&self) -> usize {
+            self.0.releases.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        pub fn weight_memory(
+            &self,
+            holder: onnx_runtime_memory_governor::HolderId,
+        ) -> crate::DerivedWeightMemory {
+            crate::DerivedWeightMemory::governed(self, holder).unwrap()
+        }
+    }
+    impl onnx_runtime_memory_governor::LeaseAccounting for RecordingBooks {
+        fn authority_id(&self) -> Option<onnx_runtime_memory_governor::MemoryAuthorityId> {
+            Some(onnx_runtime_memory_governor::MemoryGovernor::authority_id(
+                &self.governor,
+                onnx_runtime_memory_api::Tier::Host,
+            ))
+        }
+        fn try_claim(
+            &self,
+            tier: onnx_runtime_memory_api::Tier,
+            bytes: u64,
+            role: onnx_runtime_memory_api::MemoryRole,
+        ) -> std::result::Result<(), onnx_runtime_memory_api::MemoryError> {
+            self.claims
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.governor.ledger().try_claim(tier, bytes, role)
+        }
+        fn release(&self, tier: onnx_runtime_memory_api::Tier, bytes: u64) {
+            self.releases
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            onnx_runtime_memory_governor::LeaseAccounting::release(
+                self.governor.ledger().as_ref(),
+                tier,
+                bytes,
+            );
+        }
+    }
+    impl onnx_runtime_memory_governor::MemoryGovernor for RecordingGovernor {
+        fn authority_id(
+            &self,
+            tier: onnx_runtime_memory_api::Tier,
+        ) -> onnx_runtime_memory_governor::MemoryAuthorityId {
+            self.0.governor.authority_id(tier)
+        }
+        fn reserve(
+            &self,
+            tier: onnx_runtime_memory_api::Tier,
+            bytes: u64,
+            role: onnx_runtime_memory_api::MemoryRole,
+            holder: onnx_runtime_memory_governor::HolderId,
+        ) -> std::result::Result<
+            onnx_runtime_memory_governor::MemoryLease,
+            onnx_runtime_memory_api::MemoryError,
+        > {
+            onnx_runtime_memory_governor::LeaseAccounting::try_claim(
+                self.0.as_ref(),
+                tier,
+                bytes,
+                role,
+            )?;
+            Ok(onnx_runtime_memory_governor::MemoryLease::new(
+                tier,
+                bytes,
+                role,
+                holder,
+                self.0.clone(),
+            ))
+        }
+        fn available(&self, tier: onnx_runtime_memory_api::Tier) -> u64 {
+            self.0.governor.available(tier)
+        }
+        fn used(&self, tier: onnx_runtime_memory_api::Tier) -> u64 {
+            self.0.governor.used(tier)
+        }
+        fn pressure_registry(
+            &self,
+            tier: onnx_runtime_memory_api::Tier,
+        ) -> Option<onnx_runtime_memory_governor::PressureRegistry> {
+            self.0.governor.pressure_registry(tier)
+        }
+    }
+
     /// A dense f32 buffer plus the shape/stride metadata a view needs.
     #[derive(Debug)]
     pub struct Owned {

@@ -100,6 +100,7 @@ pub use kernels::einsum::{
     CpuCacheRetention, einsum_scratch_budget_predicted_bytes, einsum_scratch_live_bytes,
     einsum_scratch_process_cap_bytes,
 };
+pub use kernels::group_query_attention::{present_inplace_count, present_inplace_half_count};
 pub use kernels::matmul_nbits::bound_process_to_decode_budget;
 pub use kernels::matmul_nbits::set_decode_thread_budget;
 pub use kernels::matmul_nbits::with_decode_pool_scope;
@@ -107,14 +108,10 @@ pub use kernels::matmul_nbits::{
     mlas_sqnbit_packed_live_bytes, nbits_decode_f32_retention_candidate,
     planned_nbits_node_retained_bytes, planned_nbits_retained_bytes,
 };
-// #1056: a resident, session-lifetime, weight-scaled buffer must be reportable
-// in bytes. The entry-count accessor stays for the benchmarks that assert reuse.
-pub use kernels::group_query_attention::{present_inplace_count, present_inplace_half_count};
-pub use kernels::matmul::weight_transpose_cache_bytes;
-// #1056: the transpose cache is now *governed*, not just reported: the plan
-// budgets `weight_transpose_cache_predicted_bytes` and, when it does not fit,
-// declines it through CpuCacheRetention (kernels then transpose
-// per call and retain nothing).
+// Half transposes obtain actual Host grants and belong to node-owned caches.
+// This diagnostic describes only the remaining legacy f32 global store.
+pub use kernels::matmul::legacy_f32_weight_transpose_cache_bytes;
+// Retention forecasting does not replace actual derived-weight admission.
 pub use kernels::matmul::weight_transpose_cache_predicted_bytes;
 // #1056: the node-owned `MatMulPrepack::dense` widened-f32 cache is the fourth
 // resident, weight-scaled buffer brought under the plan. The plan budgets

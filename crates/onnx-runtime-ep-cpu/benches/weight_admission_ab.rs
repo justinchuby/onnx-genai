@@ -17,19 +17,34 @@ use onnx_runtime_ir::{DataType, DeviceId, Node, NodeId};
 use onnx_runtime_memory_api::Tier;
 use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WeightFormat {
+    F32,
+    F64,
+    F16,
+}
+
 struct Case {
     kernel: Box<dyn Kernel>,
     a: Vec<f32>,
     b32: Vec<f32>,
     b64: Vec<f64>,
+    b16: Vec<u16>,
     output: Vec<f32>,
     shapes: [[usize; 2]; 3],
     strides: [[i64; 2]; 3],
-    wide: bool,
+    format: WeightFormat,
     governor: LedgerGovernor,
 }
 impl Case {
-    fn new(m: usize, k: usize, n: usize, wide: bool, governed: bool, retained: bool) -> Self {
+    fn new(
+        m: usize,
+        k: usize,
+        n: usize,
+        format: WeightFormat,
+        governed: bool,
+        retained: bool,
+    ) -> Self {
         let governor = LedgerGovernor::new(LeaseLedger::new(0, (k * n * 16) as u64, 0));
         let memory = if governed {
             DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap()
@@ -50,10 +65,11 @@ impl Case {
             a: vec![0.25; m * k],
             b32: vec![0.5; k * n],
             b64: vec![0.5; k * n],
+            b16: vec![half::f16::from_f32(0.5).to_bits(); k * n],
             output: vec![0.; m * n],
             shapes: [[m, k], [k, n], [m, n]],
             strides: [[k as i64, 1], [n as i64, 1], [n as i64, 1]],
-            wide,
+            format,
             governor,
         };
         for _ in 0..16 {
@@ -71,14 +87,28 @@ impl Case {
         };
         #[cfg(not(feature = "mlas"))]
         let panel_bytes = 0u64;
-        assert_eq!(
-            case.governor.used(Tier::Host),
-            if governed && retained {
-                (if wide { k * n * 4 } else { 0 }) as u64 + panel_bytes
-            } else {
-                0
-            }
+        // The F16 switch is also copied unchanged to an older baseline whose
+        // transpose is uncharged. Record its actual bytes outside the timer;
+        // public provider tests separately require the new half grant.
+        println!(
+            "footprint\t{m}\t{k}\t{n}\t{format:?}\t{governed}\t{retained}\t{}",
+            case.governor.used(Tier::Host)
         );
+        if format != WeightFormat::F16 {
+            assert_eq!(
+                case.governor.used(Tier::Host),
+                if governed && retained {
+                    (if format == WeightFormat::F64 {
+                        k * n * 4
+                    } else {
+                        0
+                    }) as u64
+                        + panel_bytes
+                } else {
+                    0
+                }
+            );
+        }
         case
     }
     fn execute(&mut self) {
@@ -89,10 +119,10 @@ impl Case {
             &self.strides[0],
             DeviceId::cpu(),
         );
-        let (pointer, dtype) = if self.wide {
-            (self.b64.as_ptr().cast(), DataType::Float64)
-        } else {
-            (self.b32.as_ptr().cast(), DataType::Float32)
+        let (pointer, dtype) = match self.format {
+            WeightFormat::F64 => (self.b64.as_ptr().cast(), DataType::Float64),
+            WeightFormat::F16 => (self.b16.as_ptr().cast(), DataType::Float16),
+            WeightFormat::F32 => (self.b32.as_ptr().cast(), DataType::Float32),
         };
         let b = TensorView::new(
             DevicePtr(pointer),
@@ -141,17 +171,28 @@ fn median(values: &[f64]) -> f64 {
     sorted[sorted.len() / 2]
 }
 fn main() {
+    let format = match std::env::var("NXRT_ADMISSION_WEIGHT_FORMAT").as_deref() {
+        Ok("f16") => WeightFormat::F16,
+        Ok("f64") | Err(_) => WeightFormat::F64,
+        Ok(value) => {
+            panic!("NXRT_ADMISSION_WEIGHT_FORMAT={value:?} is unsupported; choose f16 or f64")
+        }
+    };
+    println!(
+        "context\tweight_format={format:?}\tbackend={:?}",
+        onnx_runtime_ep_cpu::backend::CpuBackend::auto_detect()
+    );
     println!(
         "m\tk\tn\tretained\tarm\titerations\twall_ns_median\twall_ns_min\twall_ns_max\tcpu_ns_median"
     );
     for (m, k, n) in [(1, 16, 16), (1, 128, 256), (8, 128, 256)] {
         for retained in [true, false] {
             let mut cases = [
-                Case::new(m, k, n, true, false, retained),
-                Case::new(m, k, n, true, true, retained),
-                Case::new(m, k, n, true, false, retained),
-                Case::new(m, k, n, false, false, retained),
-                Case::new(m, k, n, false, true, retained),
+                Case::new(m, k, n, format, false, retained),
+                Case::new(m, k, n, format, true, retained),
+                Case::new(m, k, n, format, false, retained),
+                Case::new(m, k, n, WeightFormat::F32, false, retained),
+                Case::new(m, k, n, WeightFormat::F32, true, retained),
             ];
             let ns = cases[0].batch(256).0;
             let iterations = ((10_000_000. / ns) as usize).clamp(16, 100_000);

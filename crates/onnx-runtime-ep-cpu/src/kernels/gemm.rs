@@ -153,7 +153,7 @@ impl GemmKernel {
                     k,
                     n,
                     trans_b,
-                );
+                )?;
                 return Ok(Some(result));
             }
         }
@@ -1220,7 +1220,7 @@ mod tests {
         );
         // And that copy is genuinely part of the global total the plan budgets.
         assert!(
-            matmul::weight_transpose_cache_bytes() >= predicted as usize,
+            matmul::legacy_f32_weight_transpose_cache_bytes() >= predicted as usize,
             "the global byte total must account for at least this weight's \
              resident transpose"
         );

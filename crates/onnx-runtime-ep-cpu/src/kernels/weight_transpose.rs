@@ -1,11 +1,8 @@
-//! Process-global weight-transpose caches for the MatMul hot path.
+//! Shared transpose algorithm and the remaining legacy f32 transpose store.
 //!
-//! The Accelerate/NEON GEMV and thin-M GEMM kernels consume `B_T[N,K]`
-//! row-major, so a constant (initializer) weight `B[K,N]` is transposed once and
-//! reused for the lifetime of the model. The transpose is O(N×K) — ~1 s for a
-//! large `lm_head` — so it must survive kernel-cache shape evictions (prefill
-//! M=40 → decode M=1), which is why the cache is process-global rather than
-//! per-kernel.
+//! Shape variants share preparation through their node owner. Half payloads
+//! live in the node's granted, pressure-reclaimable WeightCache. The legacy f32
+//! store remains process-global, with installed keys retired by the node owner.
 //!
 //! ## Cache identity must be total (#845)
 //!
@@ -26,18 +23,20 @@
 //!
 //! Address recycling *within* one key (a second model whose mmap lands the same
 //! weight shape at the same address) is a lifetime problem, not a keying one,
-//! and is still handled by [`clear_all`] on `Executor` drop.
+//! and is handled by node owners retiring installed f32 keys before their source
+//! buffers. Half transposes use node-owned, granted WeightCache storage.
 //!
 //! ## Portability
 //!
-//! Only Apple targets consume these transposes today, but the module itself is
-//! target-independent so the identity rules above are exercised by unit tests on
+//! The legacy f32 consumers are Apple kernels; half consumers also include x86.
+//! The algorithm and identity rules are target-independent and tested on
 //! every CI platform. The bug in #845 reached CI precisely because the affected
 //! code could not be tested off macOS.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use onnx_runtime_ep_api::{EpError, Result};
 use rayon::prelude::*;
 
 /// Total identity of one cached weight transpose.
@@ -262,8 +261,27 @@ pub fn transpose_row_major<T: Copy + Default + Send + Sync>(
         src.len()
     );
     let mut out = vec![T::default(); src.len()];
+    transpose_row_major_into(src, k, n, &mut out)
+        .expect("source geometry checked and matching output allocated");
+    out
+}
+
+/// Fill already admitted storage; no second matrix-sized allocation is made.
+pub(crate) fn transpose_row_major_into<T: Copy + Default + Send + Sync>(
+    src: &[T],
+    k: usize,
+    n: usize,
+    out: &mut [T],
+) -> Result<()> {
+    if k.checked_mul(n) != Some(src.len()) || out.len() != src.len() {
+        return Err(EpError::KernelFailed(format!(
+            "weight transpose [{k}, {n}] has {} source and {} output elements; provide matching complete matrix storage",
+            src.len(),
+            out.len()
+        )));
+    }
     if out.is_empty() {
-        return out;
+        return Ok(());
     }
     let threads = rayon::current_num_threads();
     let rows_per_thread = n.div_ceil(threads).max(1);
@@ -284,12 +302,8 @@ pub fn transpose_row_major<T: Copy + Default + Send + Sync>(
                 }
             }
         });
-    out
+    Ok(())
 }
-
-/// Process-global cache of transposed f16 weights, stored as the raw `u16` bit
-/// patterns read straight from the model's mmap (no widening to f32).
-static WEIGHT_TRANSPOSE_F16: LazyLock<TransposeCache<u16>> = LazyLock::new(TransposeCache::default);
 
 /// Process-global cache of transposed f32 weights (Accelerate GEMV / thin-M).
 static WEIGHT_TRANSPOSE_F32: LazyLock<TransposeCache<f32>> = LazyLock::new(TransposeCache::default);
@@ -327,36 +341,7 @@ pub(crate) fn f32_cache_evict(ptr: *const f32, k: usize, n: usize) {
     WEIGHT_TRANSPOSE_F32.remove(&WeightTransposeKey::new(ptr, k, n));
 }
 
-/// Cached `B_T[N,K]` for an f16 weight `B[K,N]` held as raw `u16` bit patterns,
-/// or `None` when `src.len()` is not exactly `k * n`.
-///
-/// When the owning prepack declines retention, the transpose is
-/// computed per call and not retained (#1056).
-pub fn cached_transpose_f16(src: &[u16], k: usize, n: usize) -> Option<Arc<Vec<u16>>> {
-    cached_transpose_half(src, k, n, 0)
-}
-
-/// [`cached_transpose_f16`] for either 16-bit format; `tag` separates the two
-/// interpretations sharing this `u16` map (0 = `f16`, 1 = `bf16`).
-pub fn cached_transpose_half(src: &[u16], k: usize, n: usize, tag: u16) -> Option<Arc<Vec<u16>>> {
-    cached_transpose_half_reporting(src, k, n, tag).map(|(transposed, _)| transposed)
-}
-
-/// [`cached_transpose_half`] reporting whether this call installed the entry,
-/// i.e. whether the caller owns its eviction (#1726).
-///
-/// A declined cache retains nothing, so its `false` is truthful: there is no
-/// global entry to evict.
-pub(crate) fn cached_transpose_half_reporting(
-    src: &[u16],
-    k: usize,
-    n: usize,
-    tag: u16,
-) -> Option<(Arc<Vec<u16>>, bool)> {
-    WEIGHT_TRANSPOSE_F16.get_or_insert_transpose_reporting(src, k, n, tag)
-}
-
-/// [`cached_transpose_half_reporting`] for the f32 map.
+/// Cached f32 transpose, reporting installation ownership.
 pub(crate) fn cached_transpose_f32_reporting(
     src: &[f32],
     k: usize,
@@ -365,66 +350,52 @@ pub(crate) fn cached_transpose_f32_reporting(
     WEIGHT_TRANSPOSE_F32.get_or_insert_transpose_reporting(src, k, n, 0)
 }
 
-/// Drop the f16 entry `key` names, if it is still present.
-///
-/// The caller is the owner that installed it: entries are keyed on the source
-/// buffer's *address*, and nothing in the key proves that the bytes there are
-/// still the ones that were transposed. An entry that outlives its source is a
-/// loaded gun -- the next allocation of the same shape and dtype to land on
-/// that address is served the previous weight's rows, with the right route and
-/// silently foreign numbers (#1726). Evicting at the owner's drop keeps every
-/// entry's lifetime inside its source's.
-pub(crate) fn evict_half(key: &WeightTransposeKey) {
-    WEIGHT_TRANSPOSE_F16.remove(key);
-}
-
-/// [`evict_half`] for the f32 map.
+/// Retire an installed legacy f32 key before its source buffer is freed.
 pub(crate) fn evict_f32(key: &WeightTransposeKey) {
     WEIGHT_TRANSPOSE_F32.remove(key);
 }
 
-/// Test-only: drop any f16 entry keyed on `(ptr, k, n)`.
-///
-/// The f16 counterpart of [`f32_cache_evict`], and safe for the same reason: a
-/// *live* concurrent allocation can never share `ptr`, so the only entry this
-/// can remove is a stale one left by a freed buffer that nobody is using.
+/// Number of entries in the remaining legacy f32 store.
 #[cfg(test)]
-pub(crate) fn f16_cache_evict(ptr: *const u16, k: usize, n: usize) {
-    half_cache_evict(ptr, k, n, 0);
+fn f32_cache_size() -> usize {
+    WEIGHT_TRANSPOSE_F32.len()
 }
 
-/// Test-only: drop a 16-bit entry keyed on `(ptr, k, n, tag)`.
-#[cfg(test)]
-pub(crate) fn half_cache_evict(ptr: *const u16, k: usize, n: usize, tag: u16) {
-    WEIGHT_TRANSPOSE_F16.remove(&WeightTransposeKey::tagged(ptr, k, n, tag));
+/// Bytes of the remaining legacy f32 global store; half storage is node-owned.
+pub fn f32_cache_bytes() -> usize {
+    WEIGHT_TRANSPOSE_F32.bytes()
 }
 
-/// Entry counts of the global caches as `(f16, f32)`.
-pub fn cache_sizes() -> (usize, usize) {
-    (WEIGHT_TRANSPOSE_F16.len(), WEIGHT_TRANSPOSE_F32.len())
-}
-
-/// Bytes of transposed weight held by the global caches, summed across both.
-///
-/// This is a resident, session-lifetime, weight-scaled allocation: one full
-/// `K x N` copy per transposed constant weight. #1056 requires such buffers to
-/// be reportable in bytes rather than in entry counts, because only bytes can
-/// answer whether they fit.
-pub fn cache_bytes() -> usize {
-    WEIGHT_TRANSPOSE_F16
-        .bytes()
-        .saturating_add(WEIGHT_TRANSPOSE_F32.bytes())
-}
-
-/// Evict every entry from both global caches.
-pub fn clear_all() {
-    WEIGHT_TRANSPOSE_F16.clear();
+/// Explicit diagnostic reset of only the legacy f32 global store.
+pub fn clear_f32() {
     WEIGHT_TRANSPOSE_F32.clear();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admitted_transpose_output_is_checked_before_any_write() {
+        let source = [1u16, 2, 3, 4, 5, 6];
+        let mut wrong = [99; 5];
+        let error = transpose_row_major_into(&source, 2, 3, &mut wrong)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("[2, 3]") && error.contains("6 source") && error.contains("5 output"),
+            "{error}"
+        );
+        assert_eq!(wrong, [99; 5]);
+        let mut output = [99; 6];
+        assert!(transpose_row_major_into(&source[..5], 2, 3, &mut output).is_err());
+        assert_eq!(output, [99; 6]);
+        assert!(transpose_row_major_into(&source, usize::MAX, 2, &mut output).is_err());
+        assert_eq!(output, [99; 6]);
+        transpose_row_major_into(&source, 2, 3, &mut output).unwrap();
+        assert_eq!(output, [1, 4, 2, 5, 3, 6]);
+        transpose_row_major_into::<u16>(&[], 0, 7, &mut []).unwrap();
+    }
 
     /// Reference transpose: independent of the production tiled/parallel code.
     fn reference_transpose(src: &[f32], k: usize, n: usize) -> Vec<f32> {
@@ -925,16 +896,19 @@ mod tests {
 
         f32_cache_evict(f32_buf.as_ptr(), 3, 4);
         f32_cache_evict(f32_buf.as_ptr(), 4, 3);
-        f16_cache_evict(f16_buf.as_ptr(), 3, 4);
+        let half_cache = TransposeCache::<u16>::default();
 
-        let (f16_before, f32_before) = cache_sizes();
+        let f16_before = half_cache.len();
+        let f32_before = f32_cache_size();
 
         let a = cached_transpose_f32(&f32_buf, 3, 4).expect("f32 [3,4]");
         let b = cached_transpose_f32(&f32_buf, 4, 3).expect("f32 [4,3]");
         assert_eq!(a.as_slice(), reference_transpose(&f32_buf, 3, 4));
         assert_ne!(a.as_slice(), b.as_slice());
 
-        let c = cached_transpose_f16(&f16_buf, 3, 4).expect("f16 [3,4]");
+        let c = half_cache
+            .get_or_insert_transpose(&f16_buf, 3, 4)
+            .expect("f16 [3,4]");
         assert_eq!(c.len(), 12);
         for j in 0..4 {
             for i in 0..3 {
@@ -942,7 +916,8 @@ mod tests {
             }
         }
 
-        let (f16_after, f32_after) = cache_sizes();
+        let f16_after = half_cache.len();
+        let f32_after = f32_cache_size();
         assert!(
             f32_after >= f32_before + 2,
             "both f32 shapes must be cached"
@@ -966,8 +941,13 @@ mod tests {
         // are ~2.0, so a crossed hit is unmistakable in the values too.
         let src: Vec<u16> = (0..k * n).map(|i| 0x3C00 + i as u16).collect();
 
-        let as_f16 = cached_transpose_half(&src, k, n, 0).expect("f16 transpose");
-        let as_bf16 = cached_transpose_half(&src, k, n, 1).expect("bf16 transpose");
+        let cache = TransposeCache::<u16>::default();
+        let as_f16 = cache
+            .get_or_insert_transpose_tagged(&src, k, n, 0)
+            .expect("f16 transpose");
+        let as_bf16 = cache
+            .get_or_insert_transpose_tagged(&src, k, n, 1)
+            .expect("bf16 transpose");
 
         assert_eq!(
             WeightTransposeKey::tagged(src.as_ptr(), k, n, 0).tag,
