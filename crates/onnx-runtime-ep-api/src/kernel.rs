@@ -647,7 +647,7 @@ pub enum WorkspaceLifetime {
     SessionPersistent,
 }
 
-/// A kernel's exact owned-scratch request for one concrete input geometry.
+/// A kernel's owned-scratch bound for one concrete input geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkspaceRequirement {
     pub bytes: u64,
@@ -922,7 +922,8 @@ pub trait Kernel: Send + KernelType {
         ))
     }
 
-    /// Report exact owned scratch needed for these concrete inputs.
+    /// Report a safe owned-scratch bound for these concrete metadata inputs.
+    /// Runtime layout facts may refine this bound before dispatch.
     fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
         let _ = inputs;
         Ok(WorkspaceRequirement::NONE)

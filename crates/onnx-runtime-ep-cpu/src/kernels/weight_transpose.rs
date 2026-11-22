@@ -46,6 +46,20 @@ pub(crate) fn transpose_map_into<T: Copy + Send + Sync>(
     out: &mut [T],
     read: impl Fn(usize, usize) -> T + Send + Sync,
 ) -> Result<()> {
+    // SAFETY: MaybeUninit<T> has T's layout. This exclusive initialized slice
+    // may be written as MaybeUninit because Copy elements require no drop;
+    // the complete fill below reestablishes initialized storage before return.
+    let uninit = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast(), out.len()) };
+    transpose_map_uninit(k, n, uninit, read).map(|_| ())
+}
+
+/// Initialize every destination element exactly once, including fresh workspace.
+pub(crate) fn transpose_map_uninit<T: Copy + Send + Sync>(
+    k: usize,
+    n: usize,
+    out: &mut [std::mem::MaybeUninit<T>],
+    read: impl Fn(usize, usize) -> T + Send + Sync,
+) -> Result<&mut [T]> {
     if k.checked_mul(n) != Some(out.len()) {
         return Err(EpError::KernelFailed(format!(
             "weight transpose [{k}, {n}] cannot fill {} output elements; provide the complete matrix destination",
@@ -53,7 +67,7 @@ pub(crate) fn transpose_map_into<T: Copy + Send + Sync>(
         )));
     }
     if out.is_empty() {
-        return Ok(());
+        return Ok(&mut []);
     }
     let threads = rayon::current_num_threads();
     let rows_per_thread = n.div_ceil(threads).max(1);
@@ -69,17 +83,33 @@ pub(crate) fn transpose_map_into<T: Copy + Send + Sync>(
                 for jj in 0..chunk_n {
                     let j = j0 + jj;
                     for i in i0..ie {
-                        chunk[jj * k + i] = read(i, j);
+                        chunk[jj * k + i].write(read(i, j));
                     }
                 }
             }
         });
-    Ok(())
+    // SAFETY: checked geometry and the disjoint parallel output rows ensure
+    // every element was initialized above; no source reader can skip a write.
+    Ok(unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast(), out.len()) })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn initializes_fresh_workspace_without_a_zero_fill() {
+        for (k, n) in [(1, 1), (3, 5), (65, 63), (129, 7)] {
+            let mut output = vec![std::mem::MaybeUninit::<f32>::uninit(); k * n];
+            let values =
+                transpose_map_uninit(k, n, &mut output, |i, j| (i * n + j) as f32).unwrap();
+            for j in 0..n {
+                for i in 0..k {
+                    assert_eq!(values[j * k + i], (i * n + j) as f32);
+                }
+            }
+        }
+    }
+
     #[test]
     fn admitted_transpose_output_is_checked_before_any_write() {
         let source = [1u16, 2, 3, 4, 5, 6];

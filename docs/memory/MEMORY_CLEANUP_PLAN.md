@@ -1179,8 +1179,9 @@ f32/f64 special values and before-write extent checks are included too.
 
 ## Current design decision: execution workspace domains
 
-Status: design reviewed; the CPU resource-domain foundation is implemented,
-with kernel migration still pending. The unpublished per-node mutable-layout
+Status: design reviewed; the CPU resource-domain foundation and first Gemm
+transpose-workspace migration are implemented. Other scratch migration remains
+pending. The unpublished per-node mutable-layout
 pool prototype was withdrawn. The existing node-owned immutable weight preparation remains the
 baseline. The next implementation is a CPU vertical through the existing
 executor workspace contract, not another kernel-specific resource pool.
@@ -1353,7 +1354,97 @@ session tests and the exact worker regression; strict all-target Clippy passes
 across governor, CPU EP, session and engine in both configurations. Raw
 validation logs are `/tmp/nxrt-host-workspace-*`.
 
-This is the resource-domain foundation. Gemm and other CPU kernels still need
-the workspace-layout migration described above; these checks do not establish
-its end-to-end performance, control-flow scratch peak behavior, or CUDA runtime
-correctness. The remaining validation requirements remain open.
+These foundation checks establish the resource domain; the first Gemm
+migration below adds a real kernel consumer. Full control-flow scratch peak
+validation, remaining kernel migration and CUDA runtime correctness still
+require their own evidence.
+
+
+### First kernel migration: Gemm transpose layouts
+
+The requested subagent review confirmed the coarse allocation boundary: one
+resource domain owns whole execution lanes, each kernel declares checked regions
+and fills borrowed storage, and node-owned immutable weights remain separately
+reclaimable. EPs keep the existing three workspace methods; no issuer, pressure
+responder, mutable node pool or second execution API is added to Gemm.
+
+`WorkspaceLayout<N>` performs fixed-size, stack-only layout arithmetic and binds
+one workspace into disjoint raw subviews. Capacity, alignment, layout overflow
+and address wrap are checked once. It deliberately does not return safe typed
+references: the EP must establish Host/device accessibility, exclusive ownership
+and lifetime before dereferencing. Fresh scratch is represented as
+`MaybeUninit<f32>`; shared tiled traversal initializes every element once before
+returning a readable slice. There is no preliminary zero fill or dense staging
+matrix for a converted transpose.
+
+Gemm's A transpose and dynamic/nonretained B transpose now use two simultaneous
+regions within the execution slot. The required retained B transpose keeps its
+existing node-owned grant and does not depend on an assumed cache hit. A
+contiguous f32 unit-axis transpose can borrow the original linear storage;
+strided unit-axis inputs still materialize, including negative strides and byte
+offsets. Metadata-only planning covers unknown strides; actual views can shrink
+the request, including to zero on the contiguous same-half computation route.
+Missing or insufficient workspace fails before output writes. Direct kernel
+callers must provide the same declared workspace, without a private allocator
+fallback.
+
+Immutable A's existing widening memo is preserved before filling its borrowed
+transpose region, so a warm constant need not reconvert its source every call.
+Dynamic/nonretained transposes fuse conversion directly from the original view.
+
+This first migration intentionally leaves ordinary nontransposed widening,
+output/bias buffers and half-kernel internal packing/scratch on their existing
+paths. It also does not add an immutable A-transpose cache. Subsequent migration
+must account for its own live peak rather than claim that all Gemm allocations
+are now governed.
+
+Native validation covers 99 EP API unit tests and 1,997 CPU unit tests (20
+existing ignored tests), followed by the final 24 Gemm and three shared-transpose
+controls. Final session validation covers 280 native tests; optional MLAS covers
+2,038 CPU tests (35 existing ignored tests) and 282 session tests. Strict
+all-target Clippy passes across all three crates in both configurations. The real governed Gemm control performs 4,096 workspace
+checkout/execute/return cycles with zero issuer callbacks, including zero-byte
+calls. A strict prepared two-Gemm graph uses one 32-byte peak allocation rather
+than the sum of its 24- and 32-byte regions, and reuses the same managed identity
+across calls. Other controls cover fresh uninitialized storage, simultaneous
+regions, refill after source changes, half fallback, signed strides, offsets,
+unit-axis borrowing, overflow and failure before output writes. These establish
+Host ownership and execution behavior, not CUDA correctness or whole-model
+throughput. Isolated timing evidence is recorded separately when available.
+
+
+Nested executors now carry persistent and step workspace separately and select
+by the requested lifetime. Forwarding prefers the inherited owner, matching
+ordinary kernel dispatch, before considering an older local prepared slot.
+Real If/Gemm regressions exercise both branches, smaller/larger persistent
+backing, preserved persistent contents, and an older local step slot below or
+above the inherited peak. The child creates no additional lane. This is Host
+execution evidence; it does not establish asynchronous CUDA completion safety.
+
+Isolated M1 Max native timing used the same stable host flock as the parallel
+llama.cpp work, optimized builds, `RAYON_NUM_THREADS=1`, and alternating baseline
+and candidate processes (three each). Each process reports the median of 15
+batches; the table takes the median across processes. Baseline is `9a691aff5`,
+whose tree equals merged foundation `8ff087186`. Kernel rows exclude preparation
+and hold their workspace outside the timer; session rows include ordinary
+public API dispatch, output collection and identical result checks. The shared
+checked-out/returned-owner counter control above measures the issuer separately.
+
+| Workload | Baseline | Workspace implementation |
+|---|---:|---:|
+| f32 A transpose, M=1 K=16 N=16 (linear-order equivalent) | 0.242 us | 0.218 us |
+| f32 A transpose, M=4 K=16 N=16 | 0.335 us | 0.328 us |
+| f32 A transpose, M=8 K=128 N=64 | 1.776 us | 1.614 us |
+| f32 dynamic A+B transpose, M=2 K=32 N=16 | 1.097 us | 0.917 us |
+| f32 no-transpose control, M=4 K=16 N=16 | 0.248 us | 0.253 us |
+| Two-Gemm session run | 3.707 us | 3.909 us |
+| Two-Gemm session prepare + run | 5.228 us | 5.285 us |
+
+Zero issuer calls does not mean zero total runtime overhead. The tiny two-node
+session still costs about 0.2 us more per run; this design amortizes slot handling
+across the graph rather than paying it per kernel. Individual transpose wins
+are not a whole-model throughput result. These timings cover the CPU/layout and
+linear-session paths; nested lifetime selection is covered by the separate
+functional regressions. Raw timing rounds, source/binary provenance and drivers
+remain under `/tmp/nxrt-gemm-workspace-*`. Further slot/dispatcher improvements
+must preserve these no-transpose and end-to-end controls.

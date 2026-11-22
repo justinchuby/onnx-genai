@@ -5,10 +5,13 @@
 //! 2-D `[M,K]` (or `[K,M]` when transposed), `B` is `[K,N]` (or `[N,K]`). The
 //! optional bias `C` is unidirectionally broadcast to `[M,N]`.
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView, WorkspaceLayout,
+    WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
-use std::borrow::Cow;
+use std::alloc::Layout;
 
 use super::add::broadcast_apply;
 use super::check_arity;
@@ -16,7 +19,6 @@ use super::half_gemm::{self, HalfFormat, MatrixLayout};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use super::half_gemv;
 use super::matmul::{self, MatMulPrepack};
-use super::weight_transpose::transpose_row_major;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 /// f32 Gemm kernel carrying its scalar/transpose attributes.
@@ -63,6 +65,57 @@ impl KernelFactory for GemmFactory {
 }
 
 impl GemmKernel {
+    /// Existing nontransposed preparation is unchanged. Retained B transposes
+    /// use node-owned weights; other transposes borrow execution scratch.
+    /// A-transpose preparation
+    /// is currently scratch even for constants (there is no retained A cache).
+    fn retains_transpose(&self, index: usize) -> bool {
+        index == 1 && self.prepack.retains_constant(index)
+    }
+
+    fn layout_plan(
+        &self,
+        metadata: &[TensorMetadata<'_>],
+        views: Option<&[TensorView<'_>]>,
+    ) -> Result<WorkspaceLayout<2>> {
+        if metadata.len() < 2
+            || metadata[..2]
+                .iter()
+                .any(|input| !input.present || input.shape.len() != 2)
+        {
+            return Err(EpError::KernelFailed("Gemm workspace needs two present rank-2 operands A and B; provide concrete matrix metadata before preparation".into()));
+        }
+        let half_direct = views.is_some_and(|views| {
+            views.len() >= 2
+                && matmul::half_storage_format(views[0].dtype, views[1].dtype).is_some()
+                && views[0].is_contiguous()
+                && views[1].is_contiguous()
+        });
+        let mut regions = [Layout::new::<[f32; 0]>(); 2];
+        for (index, transpose) in [self.trans_a, self.trans_b].into_iter().enumerate() {
+            if !transpose || half_direct || self.retains_transpose(index) {
+                continue;
+            }
+            let shape = metadata[index].shape;
+            let elements = shape[0].checked_mul(shape[1]).ok_or_else(|| EpError::KernelFailed(format!("Gemm operand {index} shape {shape:?} overflows element capacity; use addressable matrix dimensions")))?;
+            let borrowed = views.is_some_and(|views| {
+                views
+                    .get(index)
+                    .is_some_and(|view| Self::borrowable(view, transpose))
+            });
+            if !borrowed {
+                regions[index] = Layout::array::<f32>(elements).map_err(|_| EpError::KernelFailed(format!("Gemm operand {index} shape {shape:?} exceeds f32 workspace capacity; reduce the matrix dimensions")))?;
+            }
+        }
+        WorkspaceLayout::new(regions)
+    }
+
+    fn borrowable(view: &TensorView<'_>, transpose: bool) -> bool {
+        view.dtype == DataType::Float32
+            && view.is_contiguous()
+            && (!transpose || view.shape.contains(&1) || view.shape.contains(&0))
+    }
+
     /// The f16 decode GEMV and prefill packed-SGEMM routes, in that order.
     ///
     /// Returns `None` whenever neither applies, leaving the portable blocked
@@ -203,7 +256,53 @@ impl Kernel for GemmKernel {
         self.prepack.adopt_shareable_constant_state(state)
     }
 
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        let plan = self.layout_plan(inputs, None)?;
+        Ok(WorkspaceRequirement {
+            bytes: plan.bytes() as u64,
+            alignment: plan.alignment(),
+            ..WorkspaceRequirement::NONE
+        })
+    }
+
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        metadata: &[TensorMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
+        let plan = self.layout_plan(metadata, Some(inputs))?;
+        Ok(WorkspaceRequirement {
+            bytes: plan.bytes() as u64,
+            alignment: plan.alignment(),
+            ..WorkspaceRequirement::NONE
+        })
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
+    }
+}
+
+impl GemmKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         check_arity("Gemm", inputs, outputs, 2, 3, 1)?;
         let a_shape = inputs[0].shape;
         let b_shape = inputs[1].shape;
@@ -230,6 +329,7 @@ impl Kernel for GemmKernel {
             )));
         }
         let k = ka;
+        let output_elements = m.checked_mul(n).filter(|&elements| Layout::array::<f32>(elements).is_ok()).ok_or_else(|| EpError::KernelFailed(format!("Gemm output [{m}, {n}] exceeds addressable f32 storage; reduce the output dimensions")))?;
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             // Conventional roofline estimate: one multiply and one add per GEMM
             // contraction, plus scale-and-add for each optional bias output.
@@ -277,33 +377,72 @@ impl Kernel for GemmKernel {
             }
             half_output
         } else {
-            let a = self.prepack.dense(0, &inputs[0])?;
+            // Only transposes consume this workspace. Keep ordinary GEMM off
+            // the layout-planning path, including its metadata construction.
+            let regions = if self.trans_a || self.trans_b {
+                let metadata = std::array::from_fn::<_, 2, _>(|index| {
+                    TensorMetadata::new(inputs[index].dtype, inputs[index].shape, true)
+                });
+                self.layout_plan(&metadata, Some(inputs))?.bind(workspace)?
+            } else {
+                [WorkspaceView::new(onnx_runtime_ep_api::DevicePtrMut(std::ptr::null_mut()), 0); 2]
+            };
+            // Each operand owns a distinct region until GEMM completes. Binding
+            // checks arithmetic/alignment, not pointer validity: the executor
+            // guarantees exclusive, live Host workspace for this synchronous EP.
+            let prepare = |index: usize, transpose: bool| -> Result<matmul::DenseOperand<'_>> {
+                let source = &inputs[index];
+                if !transpose || Self::borrowable(source, transpose) {
+                    return self.prepack.dense(index, source);
+                }
+                if self.retains_transpose(index) {
+                    return self
+                        .prepack
+                        .required_transposed_b(source, source.shape[0], source.shape[1])
+                        .map(matmul::DenseOperand::funded);
+                }
+                let region = regions[index];
+                let values = if region.bytes() == 0 {
+                    &mut []
+                } else {
+                    // SAFETY: the bound regions are aligned and disjoint. The
+                    // executor owns their complete Host backing through this
+                    // call; inputs/output do not alias the scratch allocation.
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            region.ptr().as_ptr::<std::mem::MaybeUninit<f32>>(),
+                            region.bytes() / 4,
+                        )
+                    }
+                };
+                let initialized = if index == 0 && self.prepack.retains_constant(index) {
+                    // Preserve the existing immutable A widening memo; a warm
+                    // transpose need not reconvert a constant source each call.
+                    let dense = self.prepack.dense(index, source)?;
+                    let source_values = dense.as_ref();
+                    let columns = source.shape[1];
+                    super::weight_transpose::transpose_map_uninit(
+                        source.shape[0],
+                        columns,
+                        values,
+                        |i, j| source_values[i * columns + j],
+                    )?
+                } else {
+                    matmul::transpose_source_uninit(
+                        source,
+                        source.shape[0],
+                        source.shape[1],
+                        values,
+                    )?
+                };
+                Ok(matmul::DenseOperand::borrowed(initialized))
+            };
+            let a_rm = prepare(0, self.trans_a)?;
+            let b_rm = prepare(1, self.trans_b)?;
 
-            // The shared GEMM consumes row-major `A[M,K]` and `B[K,N]`, so an
-            // operand stored transposed is materialized in that layout first.
-            // The transposes are O(M*K) and O(K*N) against an O(M*N*K) product,
-            // and a constant `B` is transposed once per session and memoized.
-            let a_rm: Cow<'_, [f32]> = if self.trans_a {
-                Cow::Owned(transpose_row_major(&a, k, m))
-            } else {
-                Cow::Borrowed(&a)
-            };
-            let cached_b = if self.trans_b {
-                Some(self.prepack.required_transposed_b(&inputs[1], n, k)?)
-            } else {
-                None
-            };
-            let dense_b;
-            let b_rm = if let Some(cached) = &cached_b {
-                cached.as_slice()
-            } else {
-                dense_b = self.prepack.dense(1, &inputs[1])?;
-                dense_b.as_ref()
-            };
-
-            let mut output = vec![0.0f32; m * n];
+            let mut output = vec![0.0f32; output_elements];
             if m != 0 && n != 0 && k != 0 {
-                matmul::gemm(&a_rm, b_rm, &mut output, m, k, n)?;
+                matmul::gemm(&a_rm, &b_rm, &mut output, m, k, n)?;
             }
             if self.alpha != 1.0 {
                 for value in &mut output {
@@ -321,10 +460,6 @@ impl Kernel for GemmKernel {
         }
 
         write_dense_f32_narrow("Gemm", &mut outputs[0], &out)
-    }
-
-    fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        true
     }
 }
 
@@ -408,6 +543,28 @@ fn reset_half_decode_gemv_calls() {
 }
 
 #[cfg(test)]
+trait PreparedTestKernel: Kernel {
+    fn execute_prepared(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let metadata = inputs
+            .iter()
+            .map(|input| TensorMetadata::new(input.dtype, input.shape, true))
+            .collect::<Vec<_>>();
+        let requirement = self.workspace_requirement_for_execution(inputs, &metadata)?;
+        assert!(requirement.alignment <= std::mem::align_of::<u128>());
+        let mut backing = vec![0u128; (requirement.bytes as usize).div_ceil(16)];
+        let workspace = (!backing.is_empty()).then(|| {
+            WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+                backing.len() * 16,
+            )
+        });
+        self.execute_with_workspace(inputs, outputs, workspace)
+    }
+}
+#[cfg(test)]
+impl<T: Kernel + ?Sized> PreparedTestKernel for T {}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
@@ -435,7 +592,348 @@ mod tests {
         if let Some(c) = c {
             ins.push(c.view());
         }
-        k.execute(&ins, &mut [out.view_mut()]).unwrap();
+        k.execute_prepared(&ins, &mut [out.view_mut()]).unwrap();
+    }
+
+    #[test]
+    fn governed_layout_workspace_reuses_backing_with_zero_warm_issuer_calls() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{
+            HolderId, HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
+        };
+        use std::sync::Arc;
+        let books = Arc::new(RecordingGovernor::new_host(72));
+        let manager = ProcessMemoryManager::new().unwrap();
+        let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+        let resources = crate::CpuMemoryResources::new(
+            books.weight_memory(HolderId::new(13)),
+            Default::default(),
+        )
+        .unwrap()
+        .with_workspace_pool(pool.clone())
+        .unwrap();
+        let provider =
+            crate::CpuExecutionProvider::initialized_with_resources(resources.clone()).unwrap();
+        let kernel = GemmKernel {
+            alpha: 1.,
+            beta: 1.,
+            trans_a: true,
+            trans_b: true,
+            prepack: MatMulPrepack::new(resources),
+        };
+        let a = Owned::f32(&[3, 2], &[1.; 6]);
+        let b = Owned::f32(&[4, 3], &[1.; 12]);
+        let mut out = Owned::zeros_f32(&[2, 4]);
+        let metadata = [
+            TensorMetadata::new(a.dtype, &a.shape, true),
+            TensorMetadata::new(b.dtype, &b.shape, true),
+        ];
+        let request = kernel
+            .workspace_requirement_for_execution(&[a.view(), b.view()], &metadata)
+            .unwrap();
+        let first = provider
+            .allocate_workspace(request.bytes as usize, request.alignment, request.role)
+            .unwrap();
+        let identity = first.managed_owner().unwrap().identity();
+        provider.deallocate_workspace(first).unwrap();
+        let before_control = (books.claims(), books.releases());
+        let zero = books
+            .reserve(Tier::Host, 0, request.role, HolderId::new(99))
+            .unwrap();
+        assert_eq!(
+            books.claims(),
+            before_control.0 + 1,
+            "zero-byte claim positive control"
+        );
+        drop(zero);
+        books.probe_zero_release();
+        assert_eq!(
+            books.releases(),
+            before_control.1 + 1,
+            "zero-byte refund positive control"
+        );
+        let calls = (books.claims(), books.releases());
+        for _ in 0..4096 {
+            let mut allocation = provider
+                .allocate_workspace(request.bytes as usize, request.alignment, request.role)
+                .unwrap();
+            assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
+            let workspace = WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(allocation.as_mut_ptr()),
+                allocation.len(),
+            );
+            kernel
+                .execute_with_workspace(
+                    &[a.view(), b.view()],
+                    &mut [out.view_mut()],
+                    Some(workspace),
+                )
+                .unwrap();
+            provider.deallocate_workspace(allocation).unwrap();
+        }
+        assert_eq!(out.to_f32(), [3.; 8]);
+        assert_eq!(
+            (books.claims(), books.releases()),
+            calls,
+            "observe even zero-byte issuer callbacks"
+        );
+        assert_eq!(books.used(Tier::Host), 72);
+        assert_eq!(manager.process_used(Tier::Host), 72);
+        pool.trim_idle(72).unwrap();
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn constant_transposed_a_preserves_its_widening_memo() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let books = RecordingGovernor::new(24);
+        let resources = crate::CpuMemoryResources::new(
+            books.weight_memory(HolderId::new(13)),
+            Default::default(),
+        )
+        .unwrap();
+        let mut kernel = GemmKernel {
+            alpha: 1.,
+            beta: 1.,
+            trans_a: true,
+            trans_b: false,
+            prepack: MatMulPrepack::new(resources),
+        };
+        kernel.set_constant_inputs(&[true, false]);
+        let a = Owned::f64(&[3, 2], &[0.25; 6]);
+        let b = Owned::f32(&[3, 2], &[0.5; 6]);
+        let mut out = Owned::zeros_f32(&[2, 2]);
+        kernel
+            .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(
+            books.used(Tier::Host),
+            24,
+            "retain the existing immutable A conversion"
+        );
+        let calls = (books.claims(), books.releases());
+        for _ in 0..64 {
+            kernel
+                .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            assert_eq!(out.to_f32(), [0.375; 4]);
+        }
+        assert_eq!((books.claims(), books.releases()), calls);
+        drop(kernel);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn dynamic_layouts_use_disjoint_workspace_and_refill_each_call() {
+        // Stored A[3,2] and B[4,3]; both must transpose into disjoint regions.
+        let kernel = GemmKernel {
+            alpha: 1.,
+            beta: 1.,
+            trans_a: true,
+            trans_b: true,
+            prepack: MatMulPrepack::default(),
+        };
+        let mut a = Owned::f64(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[4, 3], &[1., 0., 0., 0., 1., 0., 0., 0., 1., 1., 1., 1.]);
+        let mut out = Owned::zeros_f32(&[2, 4]);
+        let metadata = [
+            TensorMetadata::new(a.dtype, &a.shape, true),
+            TensorMetadata::new(b.dtype, &b.shape, true),
+        ];
+        let bound = kernel.workspace_requirement(&metadata).unwrap();
+        assert_eq!(bound.bytes, (6 + 12) * 4);
+        let mut backing = vec![0f32; 18];
+        let workspace = WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+            72,
+        );
+        for scale in [1., 2.] {
+            a = Owned::f64(
+                &[3, 2],
+                &(1..=6).map(|v| v as f64 * scale).collect::<Vec<_>>(),
+            );
+            kernel
+                .execute_with_workspace(
+                    &[a.view(), b.view()],
+                    &mut [out.view_mut()],
+                    Some(workspace),
+                )
+                .unwrap();
+            assert_eq!(
+                out.to_f32(),
+                [1., 3., 5., 9., 2., 4., 6., 12.].map(|v| v * scale as f32)
+            );
+        }
+        assert_eq!(
+            kernel.prepack.f32_transpose_stats(),
+            (0, 0),
+            "dynamic layouts create no weight cache"
+        );
+    }
+
+    #[test]
+    fn metadata_covers_strided_half_fallback_and_runtime_can_shrink() {
+        let kernel = GemmKernel {
+            alpha: 1.,
+            beta: 1.,
+            trans_a: true,
+            trans_b: false,
+            prepack: MatMulPrepack::default(),
+        };
+        for bf16 in [false, true] {
+            let make = |shape: &[usize], values: &[f32]| {
+                if bf16 {
+                    Owned::bf16(shape, values)
+                } else {
+                    Owned::f16(shape, values)
+                }
+            };
+            let mut a = make(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
+            let b = make(&[3, 2], &[1., 0., 0., 1., 1., 1.]);
+            let metadata = [
+                TensorMetadata::new(a.dtype, &a.shape, true),
+                TensorMetadata::new(b.dtype, &b.shape, true),
+            ];
+            let bound = kernel.workspace_requirement(&metadata).unwrap();
+            assert_eq!(bound.bytes, 24);
+            assert_eq!(
+                kernel
+                    .workspace_requirement_for_execution(&[a.view(), b.view()], &metadata)
+                    .unwrap()
+                    .bytes,
+                0
+            );
+            a.strides = vec![1, 3];
+            let metadata = [
+                TensorMetadata::new(a.dtype, &a.shape, true),
+                TensorMetadata::new(b.dtype, &b.shape, true),
+            ];
+            assert_eq!(
+                kernel
+                    .workspace_requirement_for_execution(&[a.view(), b.view()], &metadata)
+                    .unwrap(),
+                bound
+            );
+            let mut out = Owned::zeros_f32(&[2, 2]);
+            kernel
+                .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            assert_eq!(out.to_f32(), [4., 5., 10., 11.]);
+        }
+    }
+
+    #[test]
+    fn missing_or_short_workspace_fails_before_output_writes() {
+        let kernel = GemmKernel {
+            alpha: 1.,
+            beta: 1.,
+            trans_a: true,
+            trans_b: true,
+            prepack: MatMulPrepack::default(),
+        };
+        let a = Owned::f32(&[3, 2], &[1.; 6]);
+        let b = Owned::f32(&[4, 3], &[1.; 12]);
+        let mut out = Owned::f32(&[2, 4], &[73.; 8]);
+        let error = kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("72 bytes") && error.contains("prepare and pass"),
+            "{error}"
+        );
+        let mut short = [0f32; 17];
+        let view = WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(short.as_mut_ptr().cast()),
+            68,
+        );
+        assert!(
+            kernel
+                .execute_with_workspace(&[a.view(), b.view()], &mut [out.view_mut()], Some(view))
+                .is_err()
+        );
+        assert_eq!(out.to_f32(), [73.; 8]);
+    }
+
+    #[test]
+    fn strided_unit_axis_transpose_still_materializes_original_view() {
+        let kernel = GemmKernel {
+            alpha: 1.,
+            beta: 1.,
+            trans_a: true,
+            trans_b: false,
+            prepack: MatMulPrepack::default(),
+        };
+        let mut a = Owned::f32(&[3, 1], &[1., 99., 2., 99., 3.]);
+        let b = Owned::f32(&[3, 2], &[1., 0., 0., 1., 1., 1.]);
+        let metadata = [
+            TensorMetadata::new(a.dtype, &a.shape, true),
+            TensorMetadata::new(b.dtype, &b.shape, true),
+        ];
+        let bound = kernel.workspace_requirement(&metadata).unwrap();
+        assert!(bound.bytes >= 12);
+        let mut out = Owned::zeros_f32(&[1, 2]);
+        for (stride, offset, expected) in [(2, 0, [4., 5.]), (-2, 16, [4., 3.])] {
+            a.strides = vec![stride, 1];
+            let view = a.view().with_byte_offset(offset);
+            let requirement = kernel
+                .workspace_requirement_for_execution(&[view, b.view()], &metadata)
+                .unwrap();
+            assert_eq!(requirement.bytes, 12);
+            assert!(requirement.bytes <= bound.bytes);
+            kernel
+                .execute_prepared(
+                    &[a.view().with_byte_offset(offset), b.view()],
+                    &mut [out.view_mut()],
+                )
+                .unwrap();
+            assert_eq!(out.to_f32(), expected);
+        }
+    }
+
+    #[test]
+    fn zero_contraction_does_not_bypass_output_extent_check() {
+        let kernel = GemmKernel {
+            alpha: 1.,
+            beta: 1.,
+            trans_a: false,
+            trans_b: false,
+            prepack: MatMulPrepack::default(),
+        };
+        let a = Owned::f32(&[usize::MAX, 0], &[]);
+        let b = Owned::f32(&[0, 2], &[]);
+        let mut out = Owned::f32(&[1], &[73.]);
+        let error = kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("output") && error.contains("reduce the output dimensions"),
+            "{error}"
+        );
+        assert_eq!(out.to_f32(), [73.]);
+    }
+
+    #[test]
+    fn contiguous_unit_axis_transpose_borrows_without_workspace() {
+        let kernel = GemmKernel {
+            alpha: 1.,
+            beta: 1.,
+            trans_a: true,
+            trans_b: false,
+            prepack: MatMulPrepack::default(),
+        };
+        let a = Owned::f32(&[3, 1], &[1., 2., 3.]);
+        let b = Owned::f32(&[3, 2], &[1., 0., 0., 1., 1., 1.]);
+        let mut out = Owned::zeros_f32(&[1, 2]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), [4., 5.]);
     }
 
     #[test]
@@ -517,7 +1015,7 @@ mod tests {
             trans_b: false,
             prepack: MatMulPrepack::default(),
         }
-        .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
+        .execute_prepared(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
         .unwrap();
         // [[58,64],[139,154]] + [[10,20],[10,20]]
         assert_eq!(out.to_f16_as_f32(), vec![68., 84., 149., 174.]);
@@ -549,7 +1047,7 @@ mod tests {
         };
         kernel.set_constant_inputs(&[false, true]);
         kernel
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         let packed = kernel.prepack.half_pack_is_built();
         (out.to_f32(), packed)
@@ -741,7 +1239,7 @@ mod tests {
             trans_b: false,
             prepack: MatMulPrepack::default(),
         }
-        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
         .unwrap();
         assert_eq!(out.to_bf16_as_f32(), vec![58., 64., 139., 154.]);
     }
@@ -822,10 +1320,10 @@ mod tests {
             let mut first = Owned::zeros(dtype, &[m, n]);
             let mut second = Owned::zeros(dtype, &[m, n]);
             kernel
-                .execute(&[a.view(), b.view(), bias.view()], &mut [first.view_mut()])
+                .execute_prepared(&[a.view(), b.view(), bias.view()], &mut [first.view_mut()])
                 .unwrap();
             kernel
-                .execute(&[a.view(), b.view(), bias.view()], &mut [second.view_mut()])
+                .execute_prepared(&[a.view(), b.view(), bias.view()], &mut [second.view_mut()])
                 .unwrap();
             let first = match dtype {
                 DataType::Float16 => first.to_f16_as_f32(),
@@ -980,7 +1478,7 @@ mod tests {
         for round in 0..3 {
             let mut out = Owned::zeros_f32(&[m, n]);
             kernel
-                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
                 .unwrap();
             let got = out.to_f32();
             let max_error = got
@@ -1140,7 +1638,7 @@ mod tests {
                 assert!(kernel.adopt_shareable_constant_state(state).unwrap());
             }
             kernel
-                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
                 .unwrap();
             for (j, &value) in out.to_f32().iter().take(n).enumerate() {
                 let expected = data[j * k..(j + 1) * k].iter().sum::<f32>() * 0.25;
@@ -1160,8 +1658,8 @@ mod tests {
         assert_eq!(books.used(Tier::Host), 0);
     }
 
-    /// Disabling retention keeps no payload between calls. The required
-    /// layout copy is funded transiently and preserves identical arithmetic.
+    /// Disabling retention keeps no weight payload between calls. The caller
+    /// supplies execution workspace for the required layout instead.
     #[test]
     fn declined_transpose_cache_retains_nothing_and_is_byte_identical() {
         use onnx_runtime_memory_api::Tier;
@@ -1188,7 +1686,7 @@ mod tests {
             kernel.set_constant_inputs(&[false, true]);
             let mut out = Owned::zeros_f32(&[m, n]);
             kernel
-                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
                 .unwrap();
             assert_eq!(
                 kernel.prepack.f32_transpose_stats(),
@@ -1242,7 +1740,7 @@ mod half_decode_route_tests {
         kernel.set_constant_inputs(&[false, true]);
         super::reset_half_decode_gemv_calls();
         kernel
-            .execute(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
+            .execute_prepared(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
             .unwrap();
         (out.to_f32(), super::half_decode_gemv_calls())
     }
@@ -1256,7 +1754,7 @@ mod half_decode_route_tests {
         kernel.set_constant_inputs(&[false, true]);
         matmul::reset_half_decode_gemv_calls();
         kernel
-            .execute(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
+            .execute_prepared(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
             .unwrap();
         (out.to_f32(), matmul::half_decode_gemv_calls())
     }
@@ -1580,7 +2078,7 @@ mod half_decode_route_tests {
         kernel.set_constant_inputs(&[false, true]);
         super::reset_half_decode_gemv_calls();
         kernel
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(
             super::half_decode_gemv_calls(),
@@ -1614,7 +2112,7 @@ mod half_decode_route_tests {
         kernel.set_constant_inputs(&[false, true]);
         super::reset_half_decode_gemv_calls();
         kernel
-            .execute(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
+            .execute_prepared(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
             .unwrap();
         (out.to_f32(), super::half_decode_gemv_calls())
     }
@@ -1628,7 +2126,7 @@ mod half_decode_route_tests {
         kernel.set_constant_inputs(&[false, true]);
         matmul::reset_half_decode_gemv_calls();
         kernel
-            .execute(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
+            .execute_prepared(&[a_t.view(), b_t.view()], &mut [out.view_mut()])
             .unwrap();
         (out.to_f32(), matmul::half_decode_gemv_calls())
     }
@@ -1706,7 +2204,7 @@ mod half_decode_route_bench {
         super::reset_half_decode_gemv_calls();
         let start = Instant::now();
         kernel
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         let cold = start.elapsed().as_secs_f64() * 1e3;
         let gemv = super::half_decode_gemv_calls();
@@ -1715,7 +2213,7 @@ mod half_decode_route_bench {
         for _ in 0..reps {
             let start = Instant::now();
             kernel
-                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
                 .unwrap();
             samples.push(start.elapsed().as_secs_f64() * 1e3);
         }
