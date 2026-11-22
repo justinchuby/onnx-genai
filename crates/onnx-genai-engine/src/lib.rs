@@ -56,9 +56,9 @@ pub use engine::{
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
     OrtEngineWorkerFactory, OrtSessionWorkerLoadError, PackageExecutionError, PrefillRequest,
     PrefillResult, PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount,
-    SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint, SessionForkError,
-    SessionForkParticipant, SessionForkParticipantKind, SessionForkPlan, SessionId,
-    SessionPosition, SessionPrefillCarry, SpeculativeMode, TokenLogprob, ToolCallPolicy,
+    SamplerSequence, SamplerStage, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
+    SessionForkError, SessionForkParticipant, SessionForkParticipantKind, SessionForkPlan,
+    SessionId, SessionPosition, SessionPrefillCarry, SpeculativeMode, TokenLogprob, ToolCallPolicy,
     WeightAccessPattern, WeightPlacementReport, XtcConfig, package_execution_error,
     parse_device_policy, parse_resource_limit, resolve_device_vram_limit_bytes,
 };

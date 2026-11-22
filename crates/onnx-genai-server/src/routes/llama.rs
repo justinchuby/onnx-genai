@@ -64,7 +64,7 @@ pub(crate) async fn props(
         &SamplingOverrides::default(),
     );
     let modalities = handle.multimodal.as_ref();
-    Ok(Json(json!({
+    let mut properties = json!({
         "role": "model",
         "model_alias": handle.id,
         "default_generation_settings": {
@@ -82,6 +82,8 @@ pub(crate) async fn props(
                 "mirostat": 0, "mirostat_tau": 5.0, "mirostat_eta": 0.1,
                 "xtc_probability": 0.0, "xtc_threshold": 0.1,
                 "dynatemp_range": 0.0, "dynatemp_exponent": 1.0,
+                "top_n_sigma": -1.0,
+                "samplers": onnx_genai_engine::SamplerSequence::DEFAULT.iter().filter(|&&stage| stage != onnx_genai_engine::SamplerStage::TopA).collect::<Vec<_>>(),
                 "backend_sampling": false, "timings_per_token": false,
                 "stop": []
             }
@@ -99,10 +101,16 @@ pub(crate) async fn props(
         "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION")),
         "nxrt_capabilities": {
             "resumable_streams": true, "reasoning_control": false,
-            "tools": handle.tool_protocol.is_some(), "custom_sampler_order": false,
+            "tools": handle.tool_protocol.is_some(), "custom_sampler_order": handle.engine.runtime_sampling,
             "reranking": handle.engine.reranking.is_some()
         }
-    })))
+    });
+    if !handle.engine.runtime_sampling
+        && let Some(params) = properties["default_generation_settings"]["params"].as_object_mut()
+    {
+        params.remove("samplers");
+    }
+    Ok(Json(properties))
 }
 
 #[derive(Deserialize)]

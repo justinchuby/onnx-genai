@@ -267,14 +267,25 @@ impl Engine {
                 ),
             };
         }
-        if !request.request.options.selects_greedily()
-            && request
-                .request
-                .options
+        let options = &request.request.options;
+        let unsupported = if options.sampler_order.is_some() {
+            Some("samplers")
+        } else if !options.greedy && options.top_n_sigma > 0.0 {
+            Some("top_n_sigma")
+        } else if !options.greedy
+            && options
                 .dynamic_temperature
                 .is_some_and(|config| config.range > 0.0)
         {
-            return Err(super::PackageExecutionError::DynamicTemperatureUnavailable.into());
+            Some("dynatemp_range")
+        } else {
+            None
+        };
+        if let Some(field) = unsupported {
+            return Err(super::PackageExecutionError::RuntimeSamplingUnavailable {
+                field: field.into(),
+            }
+            .into());
         }
         // Everything that reaches here runs the declared workflow: a
         // no-decode-core prompt, and any request carrying tensors or component

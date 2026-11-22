@@ -1759,6 +1759,11 @@ impl Engine {
         session.generate(prompt_tokens, options, chain, tokenizer, runtime)
     }
 
+    /// Whether this runtime can execute ordered sampling stages itself.
+    pub fn supports_runtime_sampling(&self) -> bool {
+        self.holds_decode_core()
+    }
+
     /// Whether this runtime holds the fused decode session that implements the
     /// declared `onnx-genai.autoregressive-decode` step.
     ///

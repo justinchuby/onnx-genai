@@ -607,7 +607,7 @@ pub(crate) fn package_execution_failure(capability: PackageExecutionError) -> Ap
             ApiError::conflict(capability.to_string())
         }
         PackageExecutionError::PrefillUnavailable { .. }
-        | PackageExecutionError::DynamicTemperatureUnavailable
+        | PackageExecutionError::RuntimeSamplingUnavailable { .. }
         | PackageExecutionError::CandidateTreeRawWorkflowApi { .. }
         | PackageExecutionError::DFlashRawWorkflowApi { .. } => {
             ApiError::invalid_request(capability.to_string())

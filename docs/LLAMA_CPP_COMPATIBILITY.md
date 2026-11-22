@@ -102,16 +102,34 @@ are prepared before generation. `X-Session-Id` requires a single prompt, and
 `--max-completion-prompts` limit apply to both endpoints. Probability streams
 use the common incremental text decoder for their content as well.
 
-The sampler pipeline is nxrt's existing fixed pipeline. Arbitrary `samplers`
-orders, thinking budgets, continuation of a final assistant message and other
-unsupported active controls are rejected with an `invalid_request_error`.
-`dynatemp_range` and `dynatemp_exponent` drive entropy-based temperature scaling
-at the temperature stage of that fixed pipeline, using the pinned upstream
-interval and exponent formula. Zero range disables it; temperature zero remains
-greedy. Controls must be finite and non-negative. This processor uses the host
-distribution when the device sampler cannot express it. Authored sampler graphs
-without a dynamic-temperature input contract reject active dynamic temperature
-before execution rather than ignoring it.
+Runtime-owned token policies accept an ordered `samplers` array of at most 64
+stages: `penalties`, `dry`, `top_n_sigma`, `top_k`, `typ_p`, `top_p`, `min_p`,
+`top_a`, `xtc` and `temperature`. Case, kebab/compact spellings and upstream
+`nucleus`/`temp`/`typ` aliases are accepted. An empty list applies no optional
+stages; omitted stages stay omitted and repeated stages run again. Bias, grammar
+and stop contracts always remain active. The default ordering follows the pinned
+[upstream sampler pipeline](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/common.h),
+with the optional nxrt `top_a` extension after min-p. Mirostat mode replaces the
+ordered warper list with temperature and Mirostat. `top_n_sigma` uses population
+standard deviation of finite logits; non-positive values disable it.
+
+A zero-temperature stage creates a point mass where it occurs; preceding stages
+still run. Omitting it does not force greedy selection merely because the
+request's temperature value is zero. `dynatemp_range` and `dynatemp_exponent`
+control entropy-based temperature at that same position. Candidate truncation
+updates its entropy denominator; mask-only stages retain their candidate count.
+The device sampler runs only when cached typed transforms prove the actual
+parameters and stage order equivalent to its fixed pipeline. Positive-temperature
+scaling may commute through top-k, preserving that fast path. Otherwise the
+runtime evaluates the requested stages on host logits.
+
+`/props.nxrt_capabilities.custom_sampler_order` reports the actual executor
+capability. Authored sampler graphs without runtime-owned sampling reject custom
+orders, active top-n-sigma and dynamic temperature before execution, with typed
+400 errors; their properties do not advertise an unusable default stage list.
+Adaptive/infill selector stages, thinking budgets, continuation of a final
+assistant message and other unsupported active controls still return actionable
+request errors.
 Optional progress/control subscription fields from Llama Chat are accepted, but
 `/props.nxrt_capabilities` advertises resumable streams and reports realtime
 reasoning control as unavailable. Per-token timing/progress events are not promised.

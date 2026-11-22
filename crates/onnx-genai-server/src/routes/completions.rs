@@ -1459,6 +1459,11 @@ pub(super) fn validate_request(
             "temperature + dynatemp_range must be finite; reduce the requested range",
         ));
     }
+    if !request.top_n_sigma.is_finite() {
+        return Err(ApiError::invalid_request(
+            "top_n_sigma must be finite; use a non-positive value to disable it",
+        ));
+    }
     validate_sampling_range(request.top_p, "top_p")?;
     if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
         return Err(ApiError::invalid_request(
@@ -2101,7 +2106,9 @@ fn prepare_generate_request(
 }
 
 fn requests_stochastic_sampling(request: &ChatCompletionRequest) -> bool {
-    request.temperature.is_some_and(|t| t > 0.0)
+    request.temperature.is_some()
+        || request.samplers.is_some()
+        || request.top_n_sigma > 0.0
         || request.dynatemp_range > 0.0
         || request.seed.is_some()
         || request.top_k > 0
@@ -2123,6 +2130,8 @@ fn build_generate_options(
     let mut options = GenerateOptions {
         max_new_tokens: output_budget,
         temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
+        sampler_order: request.samplers.clone(),
+        top_n_sigma: request.top_n_sigma,
         dynamic_temperature: (request.dynatemp_range > 0.0).then_some(
             onnx_genai_engine::DynamicTemperatureConfig {
                 range: request.dynatemp_range,
@@ -2142,7 +2151,7 @@ fn build_generate_options(
             .and_then(|v| usize::try_from(v).ok()),
         frequency_penalty: request.frequency_penalty,
         presence_penalty: request.presence_penalty,
-        greedy: request.temperature == Some(0.0) || !stochastic_sampling_requested,
+        greedy: !stochastic_sampling_requested,
         seed: request.seed,
         cold_start: request
             .extensions
@@ -2224,13 +2233,7 @@ fn apply_tool_output_constraint(
 /// the model.
 pub(super) fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides {
     let requests_sampling = requests_stochastic_sampling(request);
-    let greedy = if request.temperature == Some(0.0) {
-        Some(true)
-    } else if requests_sampling {
-        Some(false)
-    } else {
-        None
-    };
+    let greedy = if requests_sampling { Some(false) } else { None };
     SamplingOverrides {
         greedy,
         // An absent field is a caller with no opinion, not a caller choosing
@@ -3239,7 +3242,7 @@ mod sampling_resolution_tests {
     }
 
     #[test]
-    fn dynamic_temperature_controls_request_sampling_and_preserves_greedy() {
+    fn dynamic_temperature_controls_request_sampling_at_zero_base_temperature() {
         let request = chat_request(json!({"dynatemp_range":0.4,"dynatemp_exponent":2.0}));
         let mut options = build_generate_options(&request, 4);
         options.resolve_sampling_defaults(
@@ -3257,7 +3260,10 @@ mod sampling_resolution_tests {
         );
         let request = chat_request(json!({"temperature":0.0,"dynatemp_range":0.4}));
         let options = build_generate_options(&request, 4);
-        assert!(options.selects_greedily());
+        assert!(
+            !options.selects_greedily(),
+            "a positive dynamic interval can sample even when its base temperature is zero"
+        );
     }
 
     // A silent chat request against a model that declares do_sample=true now
@@ -3296,7 +3302,10 @@ mod sampling_resolution_tests {
             Some(&declared(Some(true), Some(0.6))),
             &chat_sampling_overrides(&cold),
         );
-        assert!(options.greedy, "temperature 0 forces greedy over the model");
+        assert!(
+            options.selects_greedily(),
+            "temperature zero selects a point mass after preceding stages"
+        );
     }
 
     // `top_k` is absent from the OpenAI schema, so a client that never mentions
@@ -3362,7 +3371,7 @@ mod sampling_resolution_tests {
     // Zero temperature is still how OpenAI clients ask for determinism, and it
     // has to keep winning over a package that declares sampling.
     #[test]
-    fn an_explicit_zero_temperature_still_forces_greedy() {
+    fn an_explicit_zero_temperature_still_selects_a_point_mass() {
         let request = chat_request(json!({ "temperature": 0.0 }));
         let mut options = build_generate_options(&request, DEFAULT_MAX_OUTPUT_TOKENS);
         options.resolve_sampling_defaults(
@@ -3370,7 +3379,10 @@ mod sampling_resolution_tests {
             &chat_sampling_overrides(&request),
         );
 
-        assert!(options.greedy, "an explicit zero temperature is greedy");
+        assert!(
+            options.selects_greedily(),
+            "an explicit zero-temperature stage selects a point mass"
+        );
         assert_eq!(options.temperature, 0.0);
     }
 

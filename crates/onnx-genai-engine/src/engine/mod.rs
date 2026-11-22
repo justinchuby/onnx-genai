@@ -8,12 +8,14 @@ pub(crate) use crate::decode::{
     next_session_token_logits, next_session_token_sampled,
 };
 pub(crate) use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, exceeded_context_limit};
+#[cfg(any(feature = "native-backend", test))]
+pub(crate) use crate::kv_bridge::common_prefix_len;
 pub(crate) use crate::kv_bridge::{
     KvModelInfo, PlacedPayload, RewindRequest, RewindRunnerPolicy, attach_pages_to_sequence,
-    chunk_payload_from_exported, common_prefix_len, exported_layers_from_runner,
-    infer_kv_model_info, kv_model_past_is_f32, load_materialized_past,
-    ort_session_has_recurrent_state, past_kv_from_payloads, rewind_draft_state_to_len,
-    rewind_target_state_to_len, sequence_pages_for_len, validate_draft_state_rewind_to_len,
+    chunk_payload_from_exported, exported_layers_from_runner, infer_kv_model_info,
+    kv_model_past_is_f32, load_materialized_past, ort_session_has_recurrent_state,
+    past_kv_from_payloads, rewind_draft_state_to_len, rewind_target_state_to_len,
+    sequence_pages_for_len, validate_draft_state_rewind_to_len,
     validate_target_state_rewind_to_len,
 };
 pub(crate) use crate::logits::{StopSequence, TokenId};
@@ -53,9 +55,10 @@ pub use crate::config::{
     MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
     MtpConfig, MtpHiddenLayout, MtpWeightSource, PrefillRequest, PrefillResult,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
-    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint, SessionId,
-    SessionPosition, SpeculativeMode, TokenLogprob, ToolCallPolicy, WeightAccessPattern,
-    WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
+    RewindTokenCount, SamplerSequence, SamplerStage, SamplingOverrides, ScheduledGenerateArrival,
+    SessionCheckpoint, SessionId, SessionPosition, SpeculativeMode, TokenLogprob, ToolCallPolicy,
+    WeightAccessPattern, WeightPlacementReport, XtcConfig, parse_device_policy,
+    parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -1582,11 +1585,6 @@ mod tests {
                 sequence_breakers: vec![vec![13]],
                 window: None,
             }),
-            mirostat: Some(crate::config::MirostatConfig {
-                tau: 5.0,
-                eta: 0.1,
-                version: crate::config::MirostatVersion::V2,
-            }),
             xtc: Some(crate::config::XtcConfig {
                 probability: 0.5,
                 threshold: 0.1,
@@ -1598,22 +1596,18 @@ mod tests {
         assert_eq!(
             chain.names(),
             vec![
+                "stop_sequence",
                 "repetition_penalty",
                 "frequency_penalty",
                 "presence_penalty",
                 "dry",
-                "stop_sequence",
-                "temperature",
-                // top_k and top_p are fused when both are configured: running
-                // them separately makes top_p rescan the whole vocabulary that
-                // top_k just reduced. The fused processor occupies the same
-                // position in the order and produces the same surviving set.
-                "top_k_top_p",
+                "top_k",
+                "typical_p",
+                "top_p",
                 "min_p",
                 "top_a",
-                "typical_p",
-                "mirostat_v2",
-                "xtc"
+                "xtc",
+                "temperature"
             ]
         );
     }
@@ -1645,15 +1639,16 @@ mod tests {
         assert_eq!(
             chain.names(),
             vec![
+                "json_constraint",
                 "repetition_penalty",
                 "frequency_penalty",
                 "presence_penalty",
-                "json_constraint",
-                "temperature",
-                "top_k_top_p",
+                "top_k",
+                "typical_p",
+                "top_p",
                 "min_p",
                 "top_a",
-                "typical_p"
+                "temperature"
             ]
         );
         Ok(())

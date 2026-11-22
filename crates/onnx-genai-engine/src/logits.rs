@@ -1,9 +1,9 @@
 //! Logit processor chain.
 //!
-//! Processor order:
-//! repetition/frequency/presence/DRY penalties -> constraints/stop checks ->
-//! temperature -> top-k -> top-p -> min-p -> top-a -> typical-p ->
-//! Mirostat -> XTC.
+//! Mandatory bias, constraints and stop checks surround a declared ordered
+//! sampler pipeline. Default stages follow llama.cpp ordering; Mirostat owns
+//! its own temperature/selector mode. Device shortcuts require a cached typed
+//! transform proof, including actual parameters and equivalent stage order.
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Mutex;
@@ -86,10 +86,42 @@ pub enum GrammarConstraintKind {
     Lark,
 }
 
+/// Exact transforms the fixed device sampler can perform in its declared order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DeviceSamplingTransform {
+    Temperature(f32),
+    TopK(usize),
+    TopP(f32),
+    MinP(f32),
+    TopKTopP { top_k: usize, top_p: f32 },
+}
+
 /// A logit processor modifies the logit distribution before sampling.
 pub trait LogitProcessor: Send + Sync {
     fn process(&self, logits: &mut [f32], context: &ProcessorContext);
     fn name(&self) -> &str;
+
+    /// Whether this processor needs logical candidate cardinality after truncation.
+    fn needs_candidate_count(&self) -> bool {
+        false
+    }
+
+    /// Process logits and carry the logical candidate-array size. Masking alone
+    /// preserves the size; truncating samplers override this to describe removal.
+    fn process_with_candidate_count(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        count: usize,
+    ) -> usize {
+        self.process(logits, context);
+        count
+    }
+
+    /// Declare exact fixed-device semantics; unknown/custom transforms stay on host.
+    fn device_sampling_transform(&self) -> Option<DeviceSamplingTransform> {
+        None
+    }
 
     /// Return a termination signal for the current context, if this processor owns one.
     fn signal(&self, _context: &ProcessorContext) -> Option<ProcessorSignal> {
@@ -102,28 +134,49 @@ pub trait LogitProcessor: Send + Sync {
     /// This is what lets greedy decoding skip the chain and take the device
     /// argmax, which never materializes logits on the host at all.
     ///
-    /// The bar is deliberately "does not touch the logits", not "probably keeps
-    /// the maximum". The sampling warpers are not built for a greedy request in
-    /// the first place (see `build_processor_chain`), so they never need this
-    /// exemption, and claiming one for them would be reasoning nobody exercises.
-    /// What can still appear in a greedy chain is the penalties, DRY,
-    /// constraints, and stop sequences -- and of those only the stop-sequence
-    /// processor leaves logits alone.
+    /// Rank-preserving truncations and a static zero-temperature point mass
+    /// may qualify. History penalties, constraints, typical sampling and XTC
+    /// can change the winning token and must execute on host before selection.
     fn preserves_argmax(&self) -> bool {
         false
     }
 }
 
 /// Ordered chain of logit processors.
-#[derive(Default)]
 pub struct ProcessorChain {
     processors: Vec<Box<dyn LogitProcessor>>,
+    device_transforms: Option<Vec<DeviceSamplingTransform>>,
+    track_candidates: bool,
+}
+impl Default for ProcessorChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn push_device_transform(
+    transforms: &mut Vec<DeviceSamplingTransform>,
+    transform: DeviceSamplingTransform,
+) {
+    // Positive temperature and top-k commute: rank truncation is invariant to
+    // positive scaling. Probability filters never commute through temperature.
+    if let DeviceSamplingTransform::Temperature(temperature) = transform
+        && temperature > 0.0
+        && let Some(DeviceSamplingTransform::TopK(top_k)) = transforms.last().copied()
+    {
+        *transforms.last_mut().expect("top-k was observed above") = transform;
+        transforms.push(DeviceSamplingTransform::TopK(top_k));
+    } else {
+        transforms.push(transform);
+    }
 }
 
 impl ProcessorChain {
     pub fn new() -> Self {
         Self {
             processors: Vec::new(),
+            device_transforms: Some(Vec::new()),
+            track_candidates: false,
         }
     }
 
@@ -132,7 +185,40 @@ impl ProcessorChain {
     }
 
     pub fn add(&mut self, processor: Box<dyn LogitProcessor>) {
+        self.track_candidates |= processor.needs_candidate_count();
+        if let Some(transforms) = &mut self.device_transforms {
+            if let Some(transform) = processor.device_sampling_transform() {
+                push_device_transform(transforms, transform);
+            } else {
+                self.device_transforms = None;
+            }
+        }
         self.processors.push(processor);
+    }
+
+    pub(crate) fn device_transforms(&self) -> Option<&[DeviceSamplingTransform]> {
+        self.device_transforms.as_deref()
+    }
+
+    pub(crate) fn fuse_last_top_k_with_top_p(&mut self, top_p: f32) -> bool {
+        let Some(DeviceSamplingTransform::TopK(top_k)) = self
+            .processors
+            .last()
+            .and_then(|processor| processor.device_sampling_transform())
+        else {
+            return false;
+        };
+        self.processors.pop();
+        self.processors
+            .push(Box::new(TopKTopPProcessor { top_k, top_p }));
+        self.device_transforms =
+            self.processors
+                .iter()
+                .try_fold(Vec::new(), |mut transforms, processor| {
+                    push_device_transform(&mut transforms, processor.device_sampling_transform()?);
+                    Some(transforms)
+                });
+        true
     }
 
     /// Whether the chain has no processors. When empty, greedy decoding reduces
@@ -172,8 +258,15 @@ impl ProcessorChain {
 
     /// Apply processors in insertion order.
     pub fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
-        for proc in &self.processors {
-            proc.process(logits, context);
+        if self.track_candidates {
+            let mut candidates = logits.len();
+            for processor in &self.processors {
+                candidates = processor.process_with_candidate_count(logits, context, candidates);
+            }
+        } else {
+            for processor in &self.processors {
+                processor.process(logits, context);
+            }
         }
     }
 
@@ -856,11 +949,11 @@ pub struct TemperatureProcessor {
 }
 
 impl TemperatureProcessor {
-    fn resolved_temperature(&self, logits: &[f32]) -> f32 {
+    fn resolved_temperature(&self, logits: &[f32], candidates: usize) -> f32 {
         let Some(dynamic) = self.dynamic.filter(|config| config.range > 0.0) else {
             return self.temperature;
         };
-        if logits.len() <= 1 {
+        if candidates <= 1 {
             return 1.0;
         }
         let Some(probabilities) = softmax_probabilities(logits) else {
@@ -871,7 +964,7 @@ impl TemperatureProcessor {
             .filter(|&&p| p > 0.0)
             .map(|&p| -p * p.ln())
             .sum();
-        let normalized = (entropy / (logits.len() as f32).ln()).clamp(0.0, 1.0);
+        let normalized = (entropy / (candidates as f32).ln()).clamp(0.0, 1.0);
         let minimum = (self.temperature - dynamic.range).max(0.0);
         let maximum = self.temperature + dynamic.range;
         minimum + (maximum - minimum) * normalized.powf(dynamic.exponent)
@@ -879,8 +972,34 @@ impl TemperatureProcessor {
 }
 
 impl LogitProcessor for TemperatureProcessor {
-    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
-        let temperature = self.resolved_temperature(logits);
+    fn preserves_argmax(&self) -> bool {
+        self.temperature == 0.0 && self.dynamic.is_none_or(|config| config.range == 0.0)
+    }
+
+    fn device_sampling_transform(&self) -> Option<DeviceSamplingTransform> {
+        if self.temperature.is_finite()
+            && self.temperature > 0.0
+            && self.dynamic.is_none_or(|config| config.range == 0.0)
+        {
+            Some(DeviceSamplingTransform::Temperature(self.temperature))
+        } else {
+            None
+        }
+    }
+
+    fn needs_candidate_count(&self) -> bool {
+        self.dynamic.is_some_and(|config| config.range > 0.0)
+    }
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
+        self.process_with_candidate_count(logits, context, logits.len());
+    }
+    fn process_with_candidate_count(
+        &self,
+        logits: &mut [f32],
+        _context: &ProcessorContext,
+        count: usize,
+    ) -> usize {
+        let temperature = self.resolved_temperature(logits, count);
         if temperature == 0.0 {
             // A collapsed interval is a point mass on the first maximum, as
             // in llama.cpp's temperature sampler. Preserve exclusions and never
@@ -888,8 +1007,12 @@ impl LogitProcessor for TemperatureProcessor {
             if let Some((best, _)) = logits
                 .iter()
                 .enumerate()
-                .filter(|(_, value)| value.is_finite())
-                .max_by(|(a, x), (b, y)| x.total_cmp(y).then_with(|| b.cmp(a)))
+                .filter(|(_, value)| !value.is_nan() && **value != f32::NEG_INFINITY)
+                .max_by(|(a, x), (b, y)| {
+                    x.partial_cmp(y)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.cmp(a))
+                })
             {
                 for (index, logit) in logits.iter_mut().enumerate() {
                     if index != best {
@@ -902,6 +1025,7 @@ impl LogitProcessor for TemperatureProcessor {
                 *logit /= temperature;
             }
         }
+        count
     }
 
     fn name(&self) -> &str {
@@ -1177,6 +1301,45 @@ impl LogitProcessor for StopSequenceProcessor {
     }
 }
 
+/// Top-n-sigma masks logits below maximum minus n population standard deviations.
+pub struct TopNSigmaProcessor {
+    pub n: f32,
+}
+impl LogitProcessor for TopNSigmaProcessor {
+    fn preserves_argmax(&self) -> bool {
+        true
+    }
+
+    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+        if self.n <= 0.0 {
+            return;
+        }
+        let mut count = 0usize;
+        let mut mean = 0.0f64;
+        let mut m2 = 0.0f64;
+        let mut maximum = f32::NEG_INFINITY;
+        for &logit in logits.iter().filter(|logit| logit.is_finite()) {
+            count += 1;
+            let delta = f64::from(logit) - mean;
+            mean += delta / count as f64;
+            m2 += delta * (f64::from(logit) - mean);
+            maximum = maximum.max(logit);
+        }
+        if count <= 1 {
+            return;
+        }
+        let cutoff = f64::from(maximum) - f64::from(self.n) * (m2 / count as f64).sqrt();
+        for logit in logits {
+            if f64::from(*logit) < cutoff {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+    }
+    fn name(&self) -> &str {
+        "top_n_sigma"
+    }
+}
+
 pub struct TopKProcessor {
     pub top_k: usize,
 }
@@ -1201,6 +1364,29 @@ impl PartialOrd for TopKLogit {
 }
 
 impl LogitProcessor for TopKProcessor {
+    fn preserves_argmax(&self) -> bool {
+        true
+    }
+
+    fn process_with_candidate_count(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        count: usize,
+    ) -> usize {
+        self.process(logits, context);
+
+        if self.top_k > 0 {
+            count.min(self.top_k)
+        } else {
+            count
+        }
+    }
+
+    fn device_sampling_transform(&self) -> Option<DeviceSamplingTransform> {
+        Some(DeviceSamplingTransform::TopK(self.top_k))
+    }
+
     fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
         let Some(threshold) = top_k_threshold(logits, self.top_k) else {
             return;
@@ -1239,6 +1425,37 @@ pub struct TopKTopPProcessor {
 }
 
 impl LogitProcessor for TopKTopPProcessor {
+    fn preserves_argmax(&self) -> bool {
+        true
+    }
+
+    fn process_with_candidate_count(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        count: usize,
+    ) -> usize {
+        self.process(logits, context);
+        let live = logits.iter().filter(|value| value.is_finite()).count();
+        let limited = if self.top_k > 0 {
+            count.min(self.top_k)
+        } else {
+            count
+        };
+        if self.top_p < 1.0 && live > 0 {
+            live.min(limited)
+        } else {
+            limited
+        }
+    }
+
+    fn device_sampling_transform(&self) -> Option<DeviceSamplingTransform> {
+        Some(DeviceSamplingTransform::TopKTopP {
+            top_k: self.top_k,
+            top_p: self.top_p,
+        })
+    }
+
     fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
         let Some(threshold) = top_k_threshold(logits, self.top_k) else {
             // No top-k pruning applies, so this degenerates to plain top-p.
@@ -1319,6 +1536,29 @@ pub struct TopPProcessor {
 }
 
 impl LogitProcessor for TopPProcessor {
+    fn preserves_argmax(&self) -> bool {
+        true
+    }
+
+    fn process_with_candidate_count(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        count: usize,
+    ) -> usize {
+        self.process(logits, context);
+        let live = logits.iter().filter(|value| value.is_finite()).count();
+        if self.top_p < 1.0 {
+            if live > 0 { live.min(count) } else { count }
+        } else {
+            count
+        }
+    }
+
+    fn device_sampling_transform(&self) -> Option<DeviceSamplingTransform> {
+        Some(DeviceSamplingTransform::TopP(self.top_p))
+    }
+
     fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
         if !self.top_p.is_finite() || self.top_p >= 1.0 || logits.is_empty() {
             return;
@@ -1354,6 +1594,29 @@ pub struct MinPProcessor {
 }
 
 impl LogitProcessor for MinPProcessor {
+    fn preserves_argmax(&self) -> bool {
+        true
+    }
+
+    fn process_with_candidate_count(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        count: usize,
+    ) -> usize {
+        self.process(logits, context);
+        let live = logits.iter().filter(|value| value.is_finite()).count();
+        if self.min_p > 0.0 {
+            if live > 0 { live.min(count) } else { count }
+        } else {
+            count
+        }
+    }
+
+    fn device_sampling_transform(&self) -> Option<DeviceSamplingTransform> {
+        Some(DeviceSamplingTransform::MinP(self.min_p))
+    }
+
     fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
         if !self.min_p.is_finite() || self.min_p <= 0.0 || logits.is_empty() {
             return;
@@ -1383,6 +1646,25 @@ pub struct TopAProcessor {
 }
 
 impl LogitProcessor for TopAProcessor {
+    fn preserves_argmax(&self) -> bool {
+        true
+    }
+
+    fn process_with_candidate_count(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        count: usize,
+    ) -> usize {
+        self.process(logits, context);
+        let live = logits.iter().filter(|value| value.is_finite()).count();
+        if self.top_a > 0.0 {
+            if live > 0 { live.min(count) } else { count }
+        } else {
+            count
+        }
+    }
+
     fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
         if !self.top_a.is_finite() || self.top_a <= 0.0 || logits.is_empty() {
             return;
@@ -1410,6 +1692,21 @@ pub struct TypicalPProcessor {
 }
 
 impl LogitProcessor for TypicalPProcessor {
+    fn process_with_candidate_count(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        count: usize,
+    ) -> usize {
+        self.process(logits, context);
+        let live = logits.iter().filter(|value| value.is_finite()).count();
+        if self.typical_p < 1.0 {
+            if live > 0 { live.min(count) } else { count }
+        } else {
+            count
+        }
+    }
+
     fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
         if !self.typical_p.is_finite() || self.typical_p >= 1.0 || logits.is_empty() {
             return;
@@ -1614,6 +1911,18 @@ impl XtcProcessor {
 }
 
 impl LogitProcessor for XtcProcessor {
+    fn process_with_candidate_count(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        count: usize,
+    ) -> usize {
+        let before = logits.iter().filter(|value| value.is_finite()).count();
+        self.process(logits, context);
+        let after = logits.iter().filter(|value| value.is_finite()).count();
+        count.saturating_sub(before.saturating_sub(after))
+    }
+
     fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
         if !self.probability.is_finite()
             || self.probability <= 0.0
@@ -2735,14 +3044,14 @@ mod tests {
         let logits = [0.75_f32.ln(), 0.25_f32.ln()];
         let entropy = -0.75_f32 * 0.75_f32.ln() - 0.25_f32 * 0.25_f32.ln();
         let expected = 0.5 + (entropy / 2_f32.ln()).powi(2);
-        assert!((processor.resolved_temperature(&logits) - expected).abs() < 1e-6);
+        assert!((processor.resolved_temperature(&logits, logits.len()) - expected).abs() < 1e-6);
         let mut scaled = logits;
         processor.process(&mut scaled, &ProcessorContext::default());
         for (actual, original) in scaled.into_iter().zip(logits) {
             assert!((actual - original / expected).abs() < 1e-6);
         }
-        assert!((processor.resolved_temperature(&[3.0, 3.0]) - 1.5).abs() < 1e-6);
-        assert_eq!(processor.resolved_temperature(&[0.0, -1000.0]), 0.5);
+        assert!((processor.resolved_temperature(&[3.0, 3.0], 2) - 1.5).abs() < 1e-6);
+        assert_eq!(processor.resolved_temperature(&[0.0, -1000.0], 2), 0.5);
     }
 
     #[test]
@@ -2761,9 +3070,26 @@ mod tests {
         processor.process(&mut single, &ProcessorContext::default());
         assert_eq!(single, [7.0]);
         processor.dynamic.as_mut().unwrap().exponent = 0.0;
-        assert_eq!(processor.resolved_temperature(&[0.0, -1000.0]), 1.5);
+        assert_eq!(processor.resolved_temperature(&[0.0, -1000.0], 2), 1.5);
         processor.dynamic.as_mut().unwrap().range = 0.0;
-        assert_eq!(processor.resolved_temperature(&[0.0, -1000.0]), 0.5);
+        assert_eq!(processor.resolved_temperature(&[0.0, -1000.0], 2), 0.5);
+    }
+
+    #[test]
+    fn temperature_zero_keeps_lowest_id_for_signed_zero_and_infinite_ties() {
+        let processor = TemperatureProcessor {
+            temperature: 0.0,
+            dynamic: None,
+        };
+        for mut logits in [
+            vec![-0.0, 0.0],
+            vec![f32::INFINITY, 1.0],
+            vec![f32::INFINITY, f32::INFINITY],
+        ] {
+            let expected = crate::sampling::sample_greedy(&logits);
+            processor.process(&mut logits, &ProcessorContext::default());
+            assert_eq!(crate::sampling::sample_greedy(&logits), expected);
+        }
     }
 
     #[test]

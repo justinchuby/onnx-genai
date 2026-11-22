@@ -386,3 +386,38 @@ Scheduler validation passed all 72 unit and 15 pressure-conformance tests. Both
 portable KV byte/invalid-shape tests pass. Strict engine/server/ORT/scheduler
 all-target Clippy passes; git diff whitespace checks pass. These are functional
 checks, with no performance claims.
+
+Ordered-sampling milestone: `samplers` now has a bounded typed sequence shared
+by native, legacy OpenAI completion and chat requests. Defaults use upstream
+penalties/DRY/sigma/K/typical/P/min-p/XTC/temperature ordering, with the nxrt top-A
+extension between min-p and XTC. Omissions, empty lists, repetition and upstream
+name aliases are executable behavior. Mandatory bias/grammar/stops remain outside
+the optional list. Mirostat selects its separate temperature/selector mode.
+Top-n-sigma now performs a real finite-logit population-deviation mask.
+
+Device dispatch no longer trusts processor names: a cached typed transform proof
+checks both parameter values and equivalent operation order. Adjacent active
+top-k/top-p still fuse; positive temperature/top-k commutation and rank-preserving
+zero-temperature argmax paths remain eligible. A renamed or foreign processor
+cannot obtain a shortcut through its diagnostic name. Dynamic temperature tracks
+logical candidate counts across truncations, mask-only sigma and XTC removal.
+Package capability errors for custom order, sigma and dynamic temperature share
+one typed runtime-sampling refusal. Properties advertise only actual executors.
+
+The real HTTP regression swaps penalties and temperature and proves different
+expected tokens through all three generation protocols. It also demonstrates
+that a temperature omitted from an empty stage list does not force greedy output.
+Further sampler conformance work remains, including top-k tie cardinality and
+adaptive/infill selectors; the broad generation-control ledger row stays open.
+
+Ordered-sampling validation: the full native engine library passed 814 cases
+with 1 inherited ignore; final refinements passed all 16 selected sampler cases.
+The full server library passed 396 cases with 2 inherited ignores. Both selected
+authored-sampler integration cases and the actual HTTP ordering/sigma/empty-list
+regression passed. Strict native engine and server all-target Clippy passed.
+The official frontend passed real Chrome chat and persistence, automatic
+nonzero-offset replay and active refresh during a 16,384-token ONNX generation
+(one generation POST, two replay requests), and explicit Stop with worker release
+and cancelled replay returning 404. No browser errors were reported.
+Strict non-native engine all-target Clippy also passes after gating the
+native/test-only prefix helper import.

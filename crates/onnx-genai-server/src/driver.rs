@@ -64,6 +64,7 @@ pub(crate) struct EngineDriver {
     /// What the loaded package's serialized workflow says, read once at
     /// startup. Facts about the document, not about which executor runs it.
     pub(crate) workflow_facts: WorkflowFacts,
+    pub(crate) runtime_sampling: bool,
     pub(crate) reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
     /// One lock-free KV mirror per worker. The legacy aggregate fields continue
     /// to report worker 0; debug/status expose this full list.
@@ -419,6 +420,7 @@ struct EngineWorkerReady {
     memory_strategy_plan: Arc<MemoryStrategyPlan>,
     memory_accounting: Option<EngineMemoryAccounting>,
     workflow_facts: WorkflowFacts,
+    runtime_sampling: bool,
     reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
 }
 
@@ -453,6 +455,7 @@ fn prepare_engine_worker<DropProbe>(
         declares_generation_loop: engine.workflow_declares_generation_loop(),
     };
     let resource_snapshot = Arc::new(Mutex::new(Some(engine.resource_snapshot())));
+    let runtime_sampling = engine.supports_runtime_sampling();
     let ready = EngineWorkerReady {
         batching,
         kv_telemetry,
@@ -460,6 +463,7 @@ fn prepare_engine_worker<DropProbe>(
         memory_strategy_plan,
         memory_accounting,
         workflow_facts,
+        runtime_sampling,
         reranking,
     };
     Ok((
@@ -697,6 +701,7 @@ impl EngineDriver {
                 memory_accounting: first_ready.memory_accounting,
                 batching: first_ready.batching,
                 workflow_facts: first_ready.workflow_facts,
+                runtime_sampling: first_ready.runtime_sampling,
                 reranking: first_ready.reranking,
                 worker_kv_telemetry,
             },
@@ -3218,6 +3223,7 @@ mod admission_tests {
             .expect("fill command queue");
         let driver = EngineDriver {
             reranking: None,
+            runtime_sampling: false,
             workflow_facts: crate::driver::WorkflowFacts {
                 components: 0,
                 graph_components: 0,
@@ -3575,6 +3581,7 @@ mod admission_tests {
         let (commands, _rx) = mpsc::channel(1);
         let driver = EngineDriver {
             reranking: None,
+            runtime_sampling: false,
             workflow_facts: WorkflowFacts {
                 components: 0,
                 graph_components: 0,
@@ -3628,6 +3635,7 @@ mod admission_tests {
         let (commands, rx) = mpsc::channel(1);
         let driver = EngineDriver {
             reranking: None,
+            runtime_sampling: false,
             workflow_facts: WorkflowFacts {
                 components: 0,
                 graph_components: 0,

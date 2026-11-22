@@ -1,13 +1,15 @@
 //! Request logit processor construction and token selection helpers.
 
 use crate::FimConfig;
-use crate::config::{FinishReason, GenerateConstraint, GenerateOptions};
+use crate::config::{
+    FinishReason, GenerateConstraint, GenerateOptions, SamplerSequence, SamplerStage,
+};
 use crate::logits::{
     ConstraintProcessor, DryProcessor, FrequencyPenaltyProcessor, GrammarConstraintKind,
     JsonConstraint, LlguidanceConstraint, MinPProcessor, MirostatProcessor,
     PresencePenaltyProcessor, ProcessorChain, ProcessorContext, ProcessorSignal,
     RepetitionPenaltyProcessor, StopSequence, StopSequenceProcessor, TemperatureProcessor, TokenId,
-    TopAProcessor, TopKProcessor, TopKTopPProcessor, TopPProcessor, TypicalPProcessor,
+    TopAProcessor, TopKProcessor, TopNSigmaProcessor, TopPProcessor, TypicalPProcessor,
     XtcProcessor,
 };
 use crate::sampling::{Sampler, default_sampler_for_options};
@@ -15,38 +17,20 @@ use anyhow::Context;
 use onnx_genai_ort::Tokenizer;
 use std::path::Path;
 
-/// Build the request's logit processor chain.
-///
-/// The chain has two halves, and the split is the same one HuggingFace
-/// `transformers` draws between a *processor* and a *warper*:
-///
-/// - **Processors** express what the caller wants generated: the penalties, DRY,
-///   stop sequences, grammar/JSON constraints. They apply to every decoding
-///   strategy, and they may legitimately change which token is the maximum.
-/// - **Warpers** reshape a probability distribution so it can be *sampled*:
-///   temperature, top-k, top-p, min-p, top-a, typical-p, mirostat, XTC. They are
-///   meaningless under greedy selection, which reads only the maximum.
-///
-/// So when selection is greedy the warpers are not built at all. This is not an
-/// optimization, it is the definition of greedy: `do_sample=False` in
-/// `transformers` likewise never calls `_get_logits_warper`. Models ship
-/// `top_k` / `top_p` in their `generation` defaults and those defaults ride
-/// along on every request, so building them anyway meant a caller asking for
-/// greedy got a truncated distribution, an argmax over it, and no way to tell
-/// from the outside. It also blocked the device argmax, which is only sound
-/// when nothing rewrites the logits first.
-///
-/// `has_custom_sampler` suppresses the greedy shortcut: a custom sampler
-/// replaces the default selection entirely, so it is not necessarily greedy and
-/// must receive the distribution the caller configured.
+/// Build mandatory safety processors and the effective ordered sampler list.
+/// An explicit greedy policy bypasses stochastic warpers; a temperature-zero
+/// stage instead creates its point mass at the requested position. Hard bias,
+/// grammar and stop contracts cannot be omitted through a custom stage list.
+/// A caller-supplied terminal sampler still receives the configured distribution.
 pub(crate) fn build_processor_chain(
     options: &GenerateOptions,
     tokenizer: Option<&Tokenizer>,
     has_custom_sampler: bool,
 ) -> anyhow::Result<ProcessorChain> {
     let mut chain = ProcessorChain::new();
-    let samples = !options.selects_greedily() || has_custom_sampler;
-
+    // A temperature-zero stage still runs at its requested position. Only an
+    // explicit greedy policy bypasses stochastic warpers before terminal selection.
+    let samples = !options.greedy || has_custom_sampler;
     if !options.logit_bias.is_empty() {
         if let Some(tokenizer) = tokenizer {
             options.validate_logit_bias(tokenizer)?;
@@ -55,38 +39,6 @@ pub(crate) fn build_processor_chain(
             biases: options.logit_bias.clone(),
         }));
     }
-    if options.repetition_penalty != 1.0 {
-        chain.add(Box::new(RepetitionPenaltyProcessor {
-            penalty: options.repetition_penalty,
-            window: options.repetition_window,
-        }));
-    }
-
-    if options.frequency_penalty != 0.0 {
-        chain.add(Box::new(FrequencyPenaltyProcessor {
-            frequency_penalty: options.frequency_penalty,
-        }));
-    }
-
-    if options.presence_penalty != 0.0 {
-        chain.add(Box::new(PresencePenaltyProcessor {
-            presence_penalty: options.presence_penalty,
-        }));
-    }
-
-    if let Some(dry) = &options.dry
-        && dry.multiplier > 0.0
-        && dry.window != Some(0)
-    {
-        chain.add(Box::new(DryProcessor {
-            multiplier: dry.multiplier,
-            base: dry.base,
-            allowed_length: dry.allowed_length,
-            sequence_breakers: dry.sequence_breakers.clone(),
-            window: dry.window,
-        }));
-    }
-
     if !options.stop_sequences.is_empty() {
         chain.add(Box::new(StopSequenceProcessor::new(
             options.stop_sequences.clone(),
@@ -146,99 +98,194 @@ pub(crate) fn build_processor_chain(
         }
     }
 
-    if !samples {
-        return Ok(chain);
-    }
-
-    if (options.temperature > 0.0 && options.temperature != 1.0)
-        || options
-            .dynamic_temperature
-            .is_some_and(|config| config.range > 0.0)
-    {
-        chain.add(Box::new(TemperatureProcessor {
-            temperature: options.temperature,
-            dynamic: options.dynamic_temperature,
-        }));
-    }
-
-    // Fused when both are configured, which is the common case. Running them
-    // separately makes top-p rescan the whole vocabulary that top-k has
-    // already reduced to `top_k` entries; the fused processor keeps the
-    // survivors and runs the nucleus search on those alone.
-    match (options.top_k > 0, options.top_p < 1.0) {
-        (true, true) => {
-            chain.add(Box::new(TopKTopPProcessor {
-                top_k: options.top_k,
-                top_p: options.top_p,
+    if let Some(mirostat) = options.mirostat.filter(|_| samples) {
+        // Mirostat owns selection policy and, like upstream, replaces the
+        // ordered warper list with fixed temperature followed by Mirostat.
+        if options.temperature != 1.0 {
+            chain.add(Box::new(TemperatureProcessor {
+                temperature: options.temperature,
+                dynamic: None,
             }));
         }
-        (true, false) => {
-            chain.add(Box::new(TopKProcessor {
-                top_k: options.top_k,
-            }));
-        }
-        (false, true) => {
-            chain.add(Box::new(TopPProcessor {
-                top_p: options.top_p,
-            }));
-        }
-        (false, false) => {}
-    }
-
-    if options.min_p > 0.0 {
-        chain.add(Box::new(MinPProcessor {
-            min_p: options.min_p,
-        }));
-    }
-
-    if options.top_a > 0.0 {
-        chain.add(Box::new(TopAProcessor {
-            top_a: options.top_a,
-        }));
-    }
-
-    if options.typical_p < 1.0 {
-        chain.add(Box::new(TypicalPProcessor {
-            typical_p: options.typical_p,
-        }));
-    }
-
-    if let Some(mirostat) = options.mirostat {
         chain.add(Box::new(MirostatProcessor::new(
             mirostat.tau,
             mirostat.eta,
             mirostat.version,
         )));
+        return Ok(chain);
     }
-
-    if let Some(xtc) = options.xtc
-        && xtc.probability > 0.0
-    {
-        chain.add(Box::new(XtcProcessor::new(
-            xtc.probability,
-            xtc.threshold,
-            options.seed,
-        )));
+    let stages = options
+        .sampler_order
+        .as_ref()
+        .map_or(SamplerSequence::DEFAULT, |sequence| sequence.stages());
+    for &stage in stages {
+        append_sampler_stage(&mut chain, options, stage, samples);
     }
-
     Ok(chain)
 }
 
-/// Whether every processor in `chain` is implemented by the device sampler.
-///
-/// `top_k_top_p` is the fused form of `top_k` followed by `top_p`. It performs
-/// exactly the same filtering, so a chain containing it is portable wherever
-/// one containing the two separately would have been. Omitting it here would
-/// silently disable the device sampling fast path for the most common
-/// configuration -- the chain would still produce correct tokens, just on the
-/// host, with no error to indicate why.
+fn append_sampler_stage(
+    chain: &mut ProcessorChain,
+    options: &GenerateOptions,
+    stage: SamplerStage,
+    samples: bool,
+) {
+    if !samples && !matches!(stage, SamplerStage::Penalties | SamplerStage::Dry) {
+        return;
+    }
+    match stage {
+        SamplerStage::Penalties => {
+            if options.repetition_penalty != 1.0 {
+                chain.add(Box::new(RepetitionPenaltyProcessor {
+                    penalty: options.repetition_penalty,
+                    window: options.repetition_window,
+                }));
+            }
+            if options.frequency_penalty != 0.0 {
+                chain.add(Box::new(FrequencyPenaltyProcessor {
+                    frequency_penalty: options.frequency_penalty,
+                }));
+            }
+            if options.presence_penalty != 0.0 {
+                chain.add(Box::new(PresencePenaltyProcessor {
+                    presence_penalty: options.presence_penalty,
+                }));
+            }
+        }
+        SamplerStage::Dry => {
+            if let Some(dry) = &options.dry
+                && dry.multiplier > 0.0
+                && dry.window != Some(0)
+            {
+                chain.add(Box::new(DryProcessor {
+                    multiplier: dry.multiplier,
+                    base: dry.base,
+                    allowed_length: dry.allowed_length,
+                    sequence_breakers: dry.sequence_breakers.clone(),
+                    window: dry.window,
+                }));
+            }
+        }
+        SamplerStage::Temperature => {
+            if options.temperature != 1.0
+                || options
+                    .dynamic_temperature
+                    .is_some_and(|config| config.range > 0.0)
+            {
+                chain.add(Box::new(TemperatureProcessor {
+                    temperature: options.temperature,
+                    dynamic: options.dynamic_temperature,
+                }));
+            }
+        }
+        SamplerStage::TopNSigma => {
+            if options.top_n_sigma > 0.0 {
+                chain.add(Box::new(TopNSigmaProcessor {
+                    n: options.top_n_sigma,
+                }));
+            }
+        }
+        SamplerStage::TopK => {
+            if options.top_k > 0 {
+                chain.add(Box::new(TopKProcessor {
+                    top_k: options.top_k,
+                }));
+            }
+        }
+        SamplerStage::TopP => {
+            if options.top_p < 1.0 && !chain.fuse_last_top_k_with_top_p(options.top_p) {
+                chain.add(Box::new(TopPProcessor {
+                    top_p: options.top_p,
+                }));
+            }
+        }
+        SamplerStage::MinP => {
+            if options.min_p > 0.0 {
+                chain.add(Box::new(MinPProcessor {
+                    min_p: options.min_p,
+                }));
+            }
+        }
+        SamplerStage::TopA => {
+            if options.top_a > 0.0 {
+                chain.add(Box::new(TopAProcessor {
+                    top_a: options.top_a,
+                }));
+            }
+        }
+        SamplerStage::TypicalP => {
+            if options.typical_p < 1.0 {
+                chain.add(Box::new(TypicalPProcessor {
+                    typical_p: options.typical_p,
+                }));
+            }
+        }
+        SamplerStage::Xtc => {
+            if let Some(xtc) = options.xtc.filter(|config| config.probability > 0.0) {
+                chain.add(Box::new(XtcProcessor::new(
+                    xtc.probability,
+                    xtc.threshold,
+                    options.seed,
+                )));
+            }
+        }
+    }
+}
+
+/// Expand cached typed transforms into the fixed device sampler's operations.
+/// Processor names are diagnostics and carry no dispatch authority.
+fn flattened_device_transforms(
+    chain: &ProcessorChain,
+) -> Option<impl Iterator<Item = crate::logits::DeviceSamplingTransform> + '_> {
+    use crate::logits::DeviceSamplingTransform as Transform;
+    Some(
+        chain
+            .device_transforms()?
+            .iter()
+            .flat_map(|&transform| match transform {
+                Transform::TopKTopP { top_k, top_p } => {
+                    [Some(Transform::TopK(top_k)), Some(Transform::TopP(top_p))]
+                }
+                transform => [Some(transform), None],
+            })
+            .flatten(),
+    )
+}
+
 pub(crate) fn is_device_portable_chain(chain: &ProcessorChain) -> bool {
-    chain.names().into_iter().all(|name| {
-        matches!(
-            name,
-            "temperature" | "top_k" | "top_p" | "top_k_top_p" | "min_p"
-        )
-    })
+    use crate::logits::DeviceSamplingTransform as Transform;
+    let Some(transforms) = flattened_device_transforms(chain) else {
+        return false;
+    };
+    let mut previous = None;
+    for transform in transforms {
+        let rank = match transform {
+            Transform::Temperature(_) => 0,
+            Transform::TopK(_) => 1,
+            Transform::TopP(_) => 2,
+            Transform::MinP(_) => 3,
+            Transform::TopKTopP { .. } => unreachable!("fused transforms expanded above"),
+        };
+        if previous.is_some_and(|previous| previous >= rank) {
+            return false;
+        }
+        previous = Some(rank);
+    }
+    true
+}
+
+fn device_pipeline_matches_options(chain: &ProcessorChain, options: &GenerateOptions) -> bool {
+    use crate::logits::DeviceSamplingTransform as Transform;
+    let Some(actual) = flattened_device_transforms(chain) else {
+        return false;
+    };
+    let expected = [
+        (options.temperature != 1.0).then_some(Transform::Temperature(options.temperature)),
+        (options.top_k > 0).then_some(Transform::TopK(options.top_k)),
+        (options.top_p < 1.0).then_some(Transform::TopP(options.top_p)),
+        (options.min_p > 0.0).then_some(Transform::MinP(options.min_p)),
+    ];
+    actual.into_iter().eq(expected.into_iter().flatten())
 }
 
 /// How a single request's next token can be selected: entirely on the device
@@ -297,7 +344,9 @@ pub(crate) fn device_sampling_plan(
     let sampled = !options.selects_greedily()
         && options.top_logprobs.is_none()
         && !has_custom_sampler
+        && options.temperature > 0.0
         && is_device_portable_chain(chain)
+        && device_pipeline_matches_options(chain, options)
         && sampled_fastpath_supported;
     if sampled {
         DeviceSamplingPlan::Sampled
@@ -497,11 +546,8 @@ mod device_portability_tests {
     /// The standard sampling configuration must stay eligible for the device
     /// sampling fast path.
     ///
-    /// `is_device_portable_chain` matches on processor *names*, so renaming or
-    /// fusing a processor silently drops the chain off the device path: tokens
-    /// stay correct, they are just sampled on the host instead, with no error
-    /// to say why. Fusing top_k and top_p broke exactly this, and only two
-    /// decode-loop tests noticed. This pins it directly.
+    /// Fused top-k/top-p carries the same typed transform proof as its separate
+    /// stages, preserving the standard device sampling configuration.
     #[test]
     fn a_top_k_top_p_chain_is_device_portable() {
         let chain = build_processor_chain(&options_with(40, 0.95), None, false)
@@ -541,11 +587,6 @@ mod device_portability_tests {
             min_p: 0.05,
             top_a: 0.2,
             typical_p: 0.5,
-            mirostat: Some(crate::config::MirostatConfig {
-                tau: 5.0,
-                eta: 0.1,
-                version: crate::config::MirostatVersion::V2,
-            }),
             xtc: Some(crate::config::XtcConfig {
                 probability: 0.5,
                 threshold: 0.1,
@@ -610,9 +651,9 @@ mod device_portability_tests {
             for warper in WARPER_NAMES {
                 if matches!(
                     *warper,
-                    "top_k" | "top_p" | "temperature" | "dynamic_temperature"
+                    "top_k_top_p" | "mirostat_v2" | "temperature" | "dynamic_temperature"
                 ) {
-                    // Top-k/p are fused; the temperature stage was checked above.
+                    // Typical-p intervenes here, so K and P remain separate; Mirostat owns a distinct selection mode.
                     continue;
                 }
                 assert!(
@@ -638,7 +679,7 @@ mod device_portability_tests {
         let chain = build_processor_chain(&options, None, false).expect("options build a chain");
         assert_eq!(
             chain.names(),
-            vec!["repetition_penalty", "presence_penalty", "stop_sequence"],
+            vec!["stop_sequence", "repetition_penalty", "presence_penalty"],
             "only the sampling warpers are dropped under greedy selection"
         );
     }
@@ -652,32 +693,33 @@ mod device_portability_tests {
         let chain =
             build_processor_chain(&options, None, true).expect("custom-sampler chain builds");
         assert!(
-            chain.names().contains(&"top_k_top_p"),
+            chain.names().contains(&"top_k") && chain.names().contains(&"top_p"),
             "a custom sampler samples; it needs the distribution, got {:?}",
             chain.names()
         );
     }
 
-    /// `temperature == 0.0` is the other spelling of greedy and must behave
-    /// identically to `greedy: true`.
+    /// Temperature zero is a point-mass stage at its requested position;
+    /// an explicit global greedy policy bypasses those warpers entirely.
     #[test]
-    fn zero_temperature_drops_the_warpers_exactly_like_the_greedy_flag() {
-        let by_flag = build_processor_chain(&greedy_options(every_warper()), None, false)
-            .expect("chain builds")
-            .names()
-            .len();
-        let by_temperature = build_processor_chain(
-            &GenerateOptions {
-                temperature: 0.0,
-                ..every_warper()
-            },
-            None,
-            false,
-        )
-        .expect("chain builds")
-        .names()
-        .len();
-        assert_eq!(by_flag, by_temperature, "both spellings mean greedy");
+    fn zero_temperature_runs_at_its_requested_stage() {
+        let options = GenerateOptions {
+            greedy: false,
+            temperature: 0.0,
+            sampler_order: Some(
+                SamplerSequence::new(vec![SamplerStage::Temperature, SamplerStage::TopK]).unwrap(),
+            ),
+            top_k: 2,
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None, false).unwrap();
+        assert!(chain.names().contains(&"temperature"));
+        assert!(options.selects_greedily());
+        let mut logits = vec![3.0, 1.0, 2.0];
+        chain.process(&mut logits, &ProcessorContext::default());
+        assert_eq!(logits, vec![3.0, f32::NEG_INFINITY, f32::NEG_INFINITY]);
+        let raw = build_processor_chain(&greedy_options(options), None, false).unwrap();
+        assert!(raw.is_empty());
     }
 
     /// The chat-model shape -- greedy plus the model's sampler defaults plus a
@@ -942,6 +984,299 @@ mod logit_bias_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("logit_bias[0]")
+        );
+    }
+}
+
+#[cfg(test)]
+mod ordered_sampler_tests {
+    use super::*;
+    use crate::logits::{LogitProcessor, TemperatureProcessor};
+    fn options(stages: Vec<SamplerStage>) -> GenerateOptions {
+        GenerateOptions {
+            greedy: false,
+            temperature: 2.0,
+            top_p: 0.6,
+            sampler_order: Some(SamplerSequence::new(stages).unwrap()),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn sampler_order_changes_the_actual_processed_distribution() {
+        let mut before = vec![2.0, 1.0, 0.0];
+        let mut after = before.clone();
+        build_processor_chain(
+            &options(vec![SamplerStage::Temperature, SamplerStage::TopP]),
+            None,
+            false,
+        )
+        .unwrap()
+        .process(&mut before, &ProcessorContext::default());
+        build_processor_chain(
+            &options(vec![SamplerStage::TopP, SamplerStage::Temperature]),
+            None,
+            false,
+        )
+        .unwrap()
+        .process(&mut after, &ProcessorContext::default());
+        assert_eq!(before.iter().filter(|value| value.is_finite()).count(), 2);
+        assert_eq!(after.iter().filter(|value| value.is_finite()).count(), 1);
+    }
+    #[test]
+    fn sampler_order_omissions_and_repetitions_are_load_bearing() {
+        let mut options = options(vec![]);
+        options.temperature = 0.0;
+        let chain = build_processor_chain(&options, None, false).unwrap();
+        assert!(chain.is_empty());
+        assert!(
+            !options.selects_greedily(),
+            "omitting temperature cannot turn a raw categorical distribution into greedy"
+        );
+        assert_eq!(
+            device_sampling_plan(&chain, &options, false, true, true),
+            DeviceSamplingPlan::Host
+        );
+        options.temperature = 2.0;
+        options.sampler_order =
+            Some(SamplerSequence::new(vec![SamplerStage::Temperature; 2]).unwrap());
+        let chain = build_processor_chain(&options, None, false).unwrap();
+        let mut logits = vec![4.0, 0.0];
+        chain.process(&mut logits, &ProcessorContext::default());
+        assert_eq!(logits, vec![1.0, 0.0]);
+        assert_eq!(
+            device_sampling_plan(&chain, &options, false, true, true),
+            DeviceSamplingPlan::Host
+        );
+    }
+    #[test]
+    fn sampler_device_capability_checks_order_parameters_and_real_implementation() {
+        let ordered = options(vec![SamplerStage::Temperature, SamplerStage::TopP]);
+        let fixed = build_processor_chain(&ordered, None, false).unwrap();
+        assert_eq!(
+            device_sampling_plan(&fixed, &ordered, false, true, true),
+            DeviceSamplingPlan::Sampled
+        );
+        let reverse = options(vec![SamplerStage::TopP, SamplerStage::Temperature]);
+        let chain = build_processor_chain(&reverse, None, false).unwrap();
+        assert_eq!(
+            device_sampling_plan(&chain, &reverse, false, true, true),
+            DeviceSamplingPlan::Host
+        );
+        let mut wrong_params = ProcessorChain::new();
+        wrong_params.add(Box::new(TemperatureProcessor {
+            temperature: 3.0,
+            dynamic: None,
+        }));
+        assert_eq!(
+            device_sampling_plan(&wrong_params, &ordered, false, true, true),
+            DeviceSamplingPlan::Host
+        );
+        struct Impostor;
+        impl LogitProcessor for Impostor {
+            fn process(&self, logits: &mut [f32], _: &ProcessorContext) {
+                logits.reverse();
+            }
+            fn name(&self) -> &str {
+                "temperature"
+            }
+        }
+        let mut impostor = ProcessorChain::new();
+        impostor.add(Box::new(Impostor));
+        assert!(!is_device_portable_chain(&impostor));
+    }
+    #[test]
+    fn sampler_fusion_respects_only_adjacent_active_stages_and_keeps_commuting_fastpath() {
+        let options = GenerateOptions {
+            greedy: false,
+            temperature: 2.0,
+            top_k: 2,
+            sampler_order: Some(
+                SamplerSequence::new(vec![SamplerStage::TopK, SamplerStage::Temperature]).unwrap(),
+            ),
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None, false).unwrap();
+        assert_eq!(chain.names(), vec!["top_k", "temperature"]);
+        assert_eq!(
+            device_sampling_plan(&chain, &options, false, true, true),
+            DeviceSamplingPlan::Sampled
+        );
+        let mut options = options;
+        options.top_p = 0.6;
+        options.sampler_order = Some(
+            SamplerSequence::new(vec![
+                SamplerStage::TopK,
+                SamplerStage::TypicalP,
+                SamplerStage::TopP,
+                SamplerStage::Temperature,
+            ])
+            .unwrap(),
+        );
+        let chain = build_processor_chain(&options, None, false).unwrap();
+        assert_eq!(chain.names(), vec!["top_k_top_p", "temperature"]);
+        assert_eq!(
+            device_sampling_plan(&chain, &options, false, true, true),
+            DeviceSamplingPlan::Host
+        );
+    }
+    #[test]
+    fn sampler_dynamic_entropy_uses_compacted_candidates_but_preserves_mask_only_cardinality() {
+        let mut options = GenerateOptions {
+            greedy: false,
+            temperature: 1.0,
+            top_k: 2,
+            dynamic_temperature: Some(crate::DynamicTemperatureConfig {
+                range: 0.5,
+                exponent: 1.0,
+            }),
+            sampler_order: Some(
+                SamplerSequence::new(vec![SamplerStage::TopK, SamplerStage::Temperature]).unwrap(),
+            ),
+            ..Default::default()
+        };
+        let mut logits = vec![3.0, 3.0, -100.0, -100.0];
+        build_processor_chain(&options, None, false)
+            .unwrap()
+            .process(&mut logits, &ProcessorContext::default());
+        assert_eq!(logits, vec![2.0, 2.0, f32::NEG_INFINITY, f32::NEG_INFINITY]);
+        options.top_n_sigma = 1.0;
+        options.sampler_order = Some(
+            SamplerSequence::new(vec![SamplerStage::TopNSigma, SamplerStage::Temperature]).unwrap(),
+        );
+        let mut logits = vec![3.0, 3.0, -100.0, -100.0];
+        build_processor_chain(&options, None, false)
+            .unwrap()
+            .process(&mut logits, &ProcessorContext::default());
+        assert_eq!(logits, vec![3.0, 3.0, f32::NEG_INFINITY, f32::NEG_INFINITY]);
+    }
+
+    #[test]
+    fn sampler_mirostat_replaces_the_ordered_warper_list() {
+        let options = GenerateOptions {
+            greedy: false,
+            temperature: 0.7,
+            top_k: 40,
+            mirostat: Some(crate::MirostatConfig {
+                tau: 5.0,
+                eta: 0.1,
+                version: crate::MirostatVersion::V2,
+            }),
+            sampler_order: Some(SamplerSequence::new(vec![SamplerStage::TopK]).unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_processor_chain(&options, None, false)
+                .unwrap()
+                .names(),
+            vec!["temperature", "mirostat_v2"]
+        );
+    }
+
+    #[test]
+    fn sampler_candidate_cardinality_handles_disabled_k_and_xtc_removal() {
+        use crate::logits::TopKTopPProcessor;
+        let context = ProcessorContext::default();
+        let initial = vec![0.6_f32.ln(), 0.3_f32.ln(), 0.1_f32.ln(), f32::NEG_INFINITY];
+        let mut logits = initial.clone();
+        assert_eq!(
+            TopKTopPProcessor {
+                top_k: 0,
+                top_p: 0.7
+            }
+            .process_with_candidate_count(&mut logits, &context, 4),
+            2
+        );
+        let mut logits = initial;
+        assert_eq!(
+            XtcProcessor::new(1.0, 0.2, Some(17)).process_with_candidate_count(
+                &mut logits,
+                &context,
+                4
+            ),
+            3
+        );
+        assert_eq!(logits.iter().filter(|value| value.is_finite()).count(), 2);
+        assert!(
+            TemperatureProcessor {
+                temperature: f32::INFINITY,
+                dynamic: None
+            }
+            .device_sampling_transform()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn sampler_zero_temperature_keeps_argmax_shortcut_with_rank_preserving_filters() {
+        let options = GenerateOptions {
+            greedy: false,
+            temperature: 0.0,
+            top_k: 3,
+            top_p: 0.9,
+            min_p: 0.1,
+            top_a: 0.2,
+            top_n_sigma: 1.0,
+            sampler_order: Some(
+                SamplerSequence::new(vec![
+                    SamplerStage::TopNSigma,
+                    SamplerStage::TopK,
+                    SamplerStage::TopP,
+                    SamplerStage::MinP,
+                    SamplerStage::TopA,
+                    SamplerStage::Temperature,
+                ])
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None, false).unwrap();
+        assert_eq!(
+            device_sampling_plan(&chain, &options, false, true, true),
+            DeviceSamplingPlan::Greedy
+        );
+        for mut logits in [
+            vec![3.0, 2.0, 1.0, 0.0],
+            vec![2.0, 2.0, 2.0, 2.0],
+            vec![f32::NAN, -0.0, 0.0, f32::INFINITY, 3.0, 2.0],
+            vec![3e38, 2e38, 0.0],
+        ] {
+            let expected = crate::sampling::sample_greedy(&logits);
+            chain.process(&mut logits, &ProcessorContext::default());
+            assert_eq!(crate::sampling::sample_greedy(&logits), expected);
+        }
+    }
+
+    #[test]
+    fn sampler_stage_aliases_bounds_and_top_n_sigma_are_real() {
+        let order: SamplerSequence = serde_json::from_value(serde_json::json!([
+            "TOP-K",
+            "nucleus",
+            "temp",
+            "typ",
+            "topnsigma"
+        ]))
+        .unwrap();
+        assert_eq!(
+            order.stages(),
+            [
+                SamplerStage::TopK,
+                SamplerStage::TopP,
+                SamplerStage::Temperature,
+                SamplerStage::TypicalP,
+                SamplerStage::TopNSigma
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(SamplerStage::TopNSigma).unwrap(),
+            "top_n_sigma"
+        );
+        assert!(SamplerSequence::new(vec![SamplerStage::TopK; 65]).is_err());
+        assert!(serde_json::from_value::<SamplerSequence>(serde_json::json!(["unknown"])).is_err());
+        let mut logits = vec![3.0, 2.0, 1.0, f32::NEG_INFINITY];
+        TopNSigmaProcessor { n: 1.0 }.process(&mut logits, &ProcessorContext::default());
+        assert_eq!(
+            logits,
+            vec![3.0, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY]
         );
     }
 }

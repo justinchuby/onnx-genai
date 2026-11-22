@@ -42,7 +42,11 @@ fn authored_sampler_refuses_dynamic_temperature_before_admission() -> anyhow::Re
         .unwrap_err();
     assert_eq!(
         onnx_genai_engine::package_execution_error(&error),
-        Some(onnx_genai_engine::PackageExecutionError::DynamicTemperatureUnavailable)
+        Some(
+            onnx_genai_engine::PackageExecutionError::RuntimeSamplingUnavailable {
+                field: "dynatemp_range".into()
+            }
+        )
     );
     let message = format!("{error:#}");
     assert!(message.contains("dynatemp_range"), "{message}");
@@ -94,6 +98,42 @@ fn authored_workflow_refuses_prompt_only_prefill_without_skipping_steps() -> any
             .values()
             .all(|&count| count == 0)
     );
+    Ok(())
+}
+
+#[test]
+fn authored_sampler_refuses_order_and_sigma_before_admission() -> anyhow::Result<()> {
+    for field in ["samplers", "top_n_sigma"] {
+        let mut engine = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+        let mut request = tokens(&[2, 4, 3], 2);
+        request.options.greedy = false;
+        request.options.temperature = 1.0;
+        if field == "samplers" {
+            request.options.sampler_order =
+                Some(onnx_genai_engine::SamplerSequence::new(vec![]).unwrap());
+        } else {
+            request.options.top_n_sigma = 1.0;
+        }
+        let mut admitted = false;
+        let error = engine
+            .generate_with_callbacks(request, Some(&mut || admitted = true), None)
+            .unwrap_err();
+        assert_eq!(
+            onnx_genai_engine::package_execution_error(&error),
+            Some(
+                onnx_genai_engine::PackageExecutionError::RuntimeSamplingUnavailable {
+                    field: field.into()
+                }
+            )
+        );
+        assert!(!admitted);
+        assert!(
+            engine
+                .component_invocations()
+                .values()
+                .all(|&count| count == 0)
+        );
+    }
     Ok(())
 }
 

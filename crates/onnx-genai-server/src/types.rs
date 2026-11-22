@@ -120,6 +120,10 @@ pub struct ChatCompletionRequest {
     pub dynatemp_range: f32,
     #[serde(default = "default_typical_p")]
     pub dynatemp_exponent: f32,
+    #[serde(default)]
+    pub samplers: Option<onnx_genai_engine::SamplerSequence>,
+    #[serde(default = "default_top_n_sigma")]
+    pub top_n_sigma: f32,
     /// Absent when the caller left sampling to the model. See
     /// [`Self::sampling_overrides`].
     #[serde(default)]
@@ -773,6 +777,9 @@ pub struct CompletionLogprobs {
     pub text_offset: Vec<usize>,
 }
 
+fn default_top_n_sigma() -> f32 {
+    -1.0
+}
 fn default_typical_p() -> f32 {
     1.0
 }

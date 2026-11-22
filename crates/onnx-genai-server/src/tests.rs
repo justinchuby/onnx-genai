@@ -5815,7 +5815,9 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     use onnx_genai_engine::PackageExecutionError;
 
     let dynamic = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageExecutionError::DynamicTemperatureUnavailable,
+        PackageExecutionError::RuntimeSamplingUnavailable {
+            field: "dynatemp_range".into(),
+        },
     ));
     let response = crate::routes::generation_failure(dynamic);
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
@@ -6263,7 +6265,7 @@ mod llama_compat {
         );
         for (key, value) in [
             ("dynatemp_range", json!(-0.2)),
-            ("samplers", json!(["temperature"])),
+            ("samplers", json!(["unknown"])),
             ("thinking_budget_tokens", json!(32)),
         ] {
             let mut body = json!({"messages": [{"role": "user", "content": "hello"}]});
@@ -6543,6 +6545,115 @@ mod native_compat {
                     .unwrap()
                     .contains(field)
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_sampler_order_changes_actual_generation_across_protocols() {
+        let router = app(tiny_state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/props")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let properties = json_body(response).await;
+        assert_eq!(
+            properties["nxrt_capabilities"]["custom_sampler_order"],
+            true
+        );
+        assert_eq!(
+            properties["default_generation_settings"]["params"]["samplers"],
+            json!([
+                "penalties",
+                "dry",
+                "top_n_sigma",
+                "top_k",
+                "typ_p",
+                "top_p",
+                "min_p",
+                "xtc",
+                "temperature"
+            ])
+        );
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    match id {
+                        5 => json!(100),
+                        6 => json!(99),
+                        _ => json!(false),
+                    },
+                )
+            })
+            .collect();
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
+            let mut outputs = Vec::new();
+            for samplers in [
+                json!(["penalties", "temperature"]),
+                json!(["temperature", "penalties"]),
+            ] {
+                let mut body = json!({"max_tokens":1,"temperature":0,"repeat_penalty":2.0,"repeat_last_n":-1,"samplers":samplers,"logit_bias":bias,"ignore_eos":true});
+                if path == "/v1/chat/completions" {
+                    body["messages"] = json!([{"role":"user","content":"world"}]);
+                } else {
+                    body["prompt"] = json!([5]);
+                }
+                let response = request(router.clone(), path, body).await;
+                let status = response.status();
+                let value = json_body(response).await;
+                assert_eq!(status, StatusCode::OK, "{path}: {value}");
+                let text = if path == "/completion" {
+                    value["content"].clone()
+                } else if path == "/v1/completions" {
+                    value["choices"][0]["text"].clone()
+                } else {
+                    value["choices"][0]["message"]["content"].clone()
+                };
+                outputs.push(text);
+            }
+            assert_eq!(
+                outputs,
+                json!(["the", "world"]).as_array().unwrap().clone(),
+                "{path}"
+            );
+        }
+        let mut categorical_selected_second = false;
+        for seed in 0..16 {
+            let response=request(router.clone(),"/completion",json!({"prompt":[5],"max_tokens":1,"temperature":0,"samplers":[],"logit_bias":bias,"seed":seed,"ignore_eos":true,"return_tokens":true})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json_body(response).await;
+            assert!(
+                value["tokens"] == json!([5]) || value["tokens"] == json!([6]),
+                "mandatory bias must survive an empty stage list: {value}"
+            );
+            categorical_selected_second |= value["tokens"] == json!([6]);
+            let response=request(router.clone(),"/completion",json!({"prompt":[5],"max_tokens":1,"temperature":0,"samplers":["top_n_sigma"],"top_n_sigma":0.1,"logit_bias":bias,"seed":seed,"ignore_eos":true,"return_tokens":true})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                json_body(response).await["tokens"],
+                json!([5]),
+                "sigma stage must mask the lower logit even without a temperature stage"
+            );
+        }
+        assert!(
+            categorical_selected_second,
+            "an omitted temperature stage must leave the original categorical distribution"
+        );
+        for samplers in [json!(["unknown"]), json!(vec!["top_k"; 65]), json!(false)] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":"hello","max_tokens":1,"samplers":samplers}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
     }
 
@@ -7060,7 +7171,7 @@ mod native_compat {
     async fn legacy_completion_rejects_dropped_controls_and_invalid_common_sampling() {
         let router = app(tiny_state());
         for (control, field) in [
-            (json!({"samplers":["temperature"]}), "samplers"),
+            (json!({"samplers":["unknown"]}), "samplers"),
             (json!({"misspelled_control":true}), "misspelled_control"),
             (json!({"logit_bias":{"999999":100}}), "token"),
             (json!({"seed":-2}), "seed"),

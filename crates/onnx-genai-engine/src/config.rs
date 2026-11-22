@@ -1200,15 +1200,100 @@ pub struct DynamicTemperatureConfig {
     pub exponent: f32,
 }
 
+/// A stage in an explicitly ordered token-sampling pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplerStage {
+    Penalties,
+    Dry,
+    TopNSigma,
+    TopK,
+    #[serde(rename = "typ_p")]
+    TypicalP,
+    TopP,
+    MinP,
+    TopA,
+    Xtc,
+    Temperature,
+}
+
+impl<'de> Deserialize<'de> for SamplerStage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let normalized = value.to_ascii_lowercase().replace(['_', '-'], "");
+        match normalized.as_str() {
+            "penalties" => Ok(Self::Penalties),
+            "dry" => Ok(Self::Dry),
+            "topnsigma" => Ok(Self::TopNSigma),
+            "topk" => Ok(Self::TopK),
+            "typp" | "typ" => Ok(Self::TypicalP),
+            "topp" | "nucleus" => Ok(Self::TopP),
+            "minp" => Ok(Self::MinP),
+            "topa" => Ok(Self::TopA),
+            "xtc" => Ok(Self::Xtc),
+            "temperature" | "temp" => Ok(Self::Temperature),
+            _ => Err(serde::de::Error::custom(format!(
+                "samplers contains unsupported stage '{value}'; use penalties, dry, top_n_sigma, top_k, typ_p, top_p, min_p, top_a, xtc or temperature"
+            ))),
+        }
+    }
+}
+
+/// Bounded ordered sampling stages. Empty lists intentionally apply no stages.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(try_from = "Vec<SamplerStage>", into = "Vec<SamplerStage>")]
+pub struct SamplerSequence(Vec<SamplerStage>);
+
+impl SamplerSequence {
+    pub const MAX_STAGES: usize = 64;
+    pub const DEFAULT: &'static [SamplerStage] = &[
+        SamplerStage::Penalties,
+        SamplerStage::Dry,
+        SamplerStage::TopNSigma,
+        SamplerStage::TopK,
+        SamplerStage::TypicalP,
+        SamplerStage::TopP,
+        SamplerStage::MinP,
+        SamplerStage::TopA,
+        SamplerStage::Xtc,
+        SamplerStage::Temperature,
+    ];
+    pub fn new(stages: Vec<SamplerStage>) -> Result<Self, &'static str> {
+        if stages.len() > Self::MAX_STAGES {
+            return Err("samplers must contain at most 64 stages; shorten the requested pipeline");
+        }
+        Ok(Self(stages))
+    }
+    pub fn stages(&self) -> &[SamplerStage] {
+        &self.0
+    }
+}
+impl TryFrom<Vec<SamplerStage>> for SamplerSequence {
+    type Error = &'static str;
+    fn try_from(value: Vec<SamplerStage>) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl From<SamplerSequence> for Vec<SamplerStage> {
+    fn from(value: SamplerSequence) -> Self {
+        value.0
+    }
+}
+
 /// User-controllable decoding options for Phase 1 generation.
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
     /// Maximum tokens to produce after the prompt.
     pub max_new_tokens: usize,
-    /// Temperature applied before sampling. Zero forces greedy selection.
+    /// Temperature at its sampling stage. Zero creates a point mass there.
     pub temperature: f32,
     /// Optional entropy-driven temperature scaling; zero range disables it.
     pub dynamic_temperature: Option<DynamicTemperatureConfig>,
+    /// An explicit sequence replaces the default stage list, including omissions.
+    pub sampler_order: Option<SamplerSequence>,
+    /// Mask logits more than this many population standard deviations below the maximum.
+    /// Non-positive values disable the mask.
+    pub top_n_sigma: f32,
     /// Nucleus sampling probability. Values >= 1 disable top-p filtering.
     pub top_p: f32,
     /// Keep only the top-k logits before sampling. Zero disables top-k filtering.
@@ -1287,6 +1372,8 @@ impl Default for GenerateOptions {
             max_new_tokens: 128,
             temperature: 1.0,
             dynamic_temperature: None,
+            sampler_order: None,
+            top_n_sigma: -1.0,
             top_p: 1.0,
             top_k: 0,
             min_p: 0.0,
@@ -1379,21 +1466,23 @@ impl GenerateOptions {
             && (self.eos_token_ids.contains(&token) || self.eos_token_id == Some(token))
     }
 
-    /// Whether token selection is greedy: the maximum logit wins, deterministically.
-    ///
-    /// `temperature == 0.0` means the same thing as `greedy` -- a zero-temperature
-    /// softmax is a point mass on the maximum -- and callers use both spellings,
-    /// so every decision that turns on "is this greedy" must ask here rather than
-    /// re-spell the disjunction. Three places had spelled it out inline and one
-    /// of them was already drifting.
-    ///
-    /// This is the predicate that decides whether the sampling warpers
-    /// (temperature, top-k, top-p, min-p, top-a, typical-p, mirostat, XTC) are
-    /// built at all: under greedy selection they cannot affect the outcome that
-    /// the caller asked for, so applying them would be a silent contradiction of
-    /// the request.
+    /// Whether final selection is deterministic after the processor chain.
+    /// An explicit greedy policy bypasses warpers. Otherwise a temperature-zero
+    /// stage creates a point mass only when that stage is present and its
+    /// dynamic interval is disabled. Stage execution is a separate question:
+    /// earlier penalties/filters still run before a zero-temperature stage.
     pub fn selects_greedily(&self) -> bool {
-        self.greedy || self.temperature == 0.0
+        self.greedy
+            || (self.temperature == 0.0
+                && (self.mirostat.is_some()
+                    || self
+                        .dynamic_temperature
+                        .is_none_or(|dynamic| dynamic.range == 0.0))
+                && (self.mirostat.is_some()
+                    || self
+                        .sampler_order
+                        .as_ref()
+                        .is_none_or(|order| order.stages().contains(&SamplerStage::Temperature))))
     }
 
     /// Resolve sampling controls against a model author's declared generation
@@ -1414,15 +1503,11 @@ impl GenerateOptions {
     /// runtime from baking in a decoding assumption the model contradicts
     /// (RULES.md rule 2).
     ///
-    /// After the four controls are resolved, a *resolved* temperature of `0.0`
-    /// forces `greedy = true`, regardless of where that zero came from (an
-    /// explicit caller override, or a model that declares `do_sample: true`
-    /// alongside `temperature: 0.0`). Temperature zero has no stochastic meaning
-    /// — the sampler already collapses it to argmax — so the resolved
-    /// `GenerateOptions` is made self-consistent here rather than leaving a
-    /// `greedy: false, temperature: 0.0` state that reads as "sample at zero".
-    /// Every consumer (not just the CLI) therefore inherits the
-    /// `temperature 0 -> greedy` mapping by construction.
+    /// A zero temperature normally resolves to the global greedy policy when
+    /// there is no explicit sampling override or custom stage list. An explicit
+    /// sampling policy keeps the stages enabled instead: temperature zero then
+    /// creates a point mass at its position. This preserves both authored model
+    /// defaults and the ordered-sampling contract without discarding stages.
     pub fn resolve_sampling_defaults(
         &mut self,
         declared: Option<&GenerationDefaults>,
@@ -1453,10 +1538,13 @@ impl GenerateOptions {
         {
             self.top_k = top_k;
         }
-        // A resolved temperature of zero is greedy by definition; keep the flag
-        // and the value consistent so the decision is inspectable rather than
-        // implicit in the sampler (RULES.md rule 5).
-        if self.temperature == 0.0 {
+        // An explicit sampling override keeps ordered stage execution enabled;
+        // temperature zero still determines terminal selection through the
+        // shared selects_greedily() predicate.
+        if self.temperature == 0.0
+            && self.sampler_order.is_none()
+            && overrides.greedy != Some(false)
+        {
             self.greedy = true;
         }
     }
@@ -1587,6 +1675,9 @@ impl GenerateOptions {
                 (self.temperature + dynamic.range).is_finite(),
                 "temperature + dynatemp_range must be finite; reduce the requested range"
             );
+        }
+        if !self.top_n_sigma.is_finite() {
+            anyhow::bail!("top_n_sigma must be finite; use a non-positive value to disable it");
         }
         if !self.top_p.is_finite() || self.top_p < 0.0 {
             anyhow::bail!("top_p must be finite and non-negative");

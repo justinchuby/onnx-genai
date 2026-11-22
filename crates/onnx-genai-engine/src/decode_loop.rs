@@ -579,6 +579,15 @@ mod tests {
             top_k: 2,
             top_p: 0.95,
             min_p: 0.1,
+            sampler_order: Some(
+                crate::SamplerSequence::new(vec![
+                    crate::SamplerStage::Temperature,
+                    crate::SamplerStage::TopK,
+                    crate::SamplerStage::TopP,
+                    crate::SamplerStage::MinP,
+                ])
+                .unwrap(),
+            ),
             seed: Some(17),
             ..Default::default()
         };
@@ -680,6 +689,15 @@ mod tests {
             top_k: 2,
             top_p: 0.95,
             min_p: 0.1,
+            sampler_order: Some(
+                crate::SamplerSequence::new(vec![
+                    crate::SamplerStage::Temperature,
+                    crate::SamplerStage::TopK,
+                    crate::SamplerStage::TopP,
+                    crate::SamplerStage::MinP,
+                ])
+                .unwrap(),
+            ),
             seed: Some(17),
             ..Default::default()
         };
