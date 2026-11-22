@@ -3,10 +3,10 @@ use std::path::Path;
 
 use onnx_genai::ort::ChatMessage;
 
-use super::interactive::{
-    Backend, EXIT_INTERRUPTED, ReplInputMode, TurnInput, apply_context_sized_max_new_tokens,
-    context_exhaustion_error, context_window_is_full, initial_repl_show_stats,
-    install_ctrlc_handler, is_interrupt_error, repl_input_mode, warn_missing_context_limit,
+use super::execution::{
+    Backend, EXIT_INTERRUPTED, InputMode, TurnInput, apply_context_sized_max_new_tokens,
+    context_exhaustion_error, context_window_is_full, initial_show_stats, input_mode,
+    install_ctrlc_handler, is_interrupt_error, warn_missing_context_limit,
 };
 use super::output::{
     bind_response_tokens, build_turn_prompt, detect_reasoning, emit_stats_line, load_chat_template,
@@ -25,7 +25,7 @@ pub(super) fn generate(
     let model_dir = resolve_model_dir(&args.model);
     let profile = RunProfile::new(model_dir.display().to_string());
     let output_kind = GenerateOutputKind::Text;
-    let input_mode = repl_input_mode(io::stdin().is_terminal(), io::stdout().is_terminal());
+    let input_mode = input_mode(io::stdin().is_terminal(), io::stdout().is_terminal());
     let show_stats = initial_generate_show_stats(input_mode, args.no_stats, output_kind);
     generate_text(&model_dir, args, prompt, profiling, profile, show_stats)
 }
@@ -36,11 +36,11 @@ enum GenerateOutputKind {
 }
 
 fn initial_generate_show_stats(
-    mode: ReplInputMode,
+    mode: InputMode,
     no_stats: bool,
     output_kind: GenerateOutputKind,
 ) -> bool {
-    matches!(output_kind, GenerateOutputKind::Text) && initial_repl_show_stats(mode, no_stats)
+    matches!(output_kind, GenerateOutputKind::Text) && initial_show_stats(mode, no_stats)
 }
 
 fn generate_text(
@@ -114,7 +114,6 @@ fn generate_text(
         Some(&mut profile),
         reasoning.as_ref(),
         response.as_ref(),
-        None,
     ) {
         Ok(output) => {
             if !args.stream {
@@ -352,17 +351,17 @@ mod tests {
     #[test]
     fn text_generate_defaults_to_stats_only_on_the_repl_tty_path() {
         assert!(initial_generate_show_stats(
-            ReplInputMode::Tty,
+            InputMode::Tty,
             false,
             GenerateOutputKind::Text
         ));
         assert!(!initial_generate_show_stats(
-            ReplInputMode::Plain,
+            InputMode::Plain,
             false,
             GenerateOutputKind::Text
         ));
         assert!(!initial_generate_show_stats(
-            ReplInputMode::Tty,
+            InputMode::Tty,
             true,
             GenerateOutputKind::Text
         ));

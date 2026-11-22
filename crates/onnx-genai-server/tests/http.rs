@@ -1104,21 +1104,31 @@ fn response_format_maps_to_the_requested_generate_constraint() {
     }));
 
     assert_eq!(
-        build_generate_request(&json_request).options.constraint,
+        build_generate_request(&json_request, &fixture_tokenizer())
+            .unwrap()
+            .options
+            .constraint,
         Some(GenerateConstraint::Json)
     );
     assert_eq!(
-        build_generate_request(&json_schema_request)
+        build_generate_request(&json_schema_request, &fixture_tokenizer())
+            .unwrap()
             .options
             .constraint,
         Some(GenerateConstraint::JsonSchema(schema.to_string()))
     );
     assert_eq!(
-        build_generate_request(&text_request).options.constraint,
+        build_generate_request(&text_request, &fixture_tokenizer())
+            .unwrap()
+            .options
+            .constraint,
         None
     );
     assert_eq!(
-        build_generate_request(&absent_request).options.constraint,
+        build_generate_request(&absent_request, &fixture_tokenizer())
+            .unwrap()
+            .options
+            .constraint,
         None
     );
 }
@@ -1189,11 +1199,14 @@ fn forced_specific_tool_choice_builds_lark_tool_call_constraint() {
         }
     }));
 
-    let Some(GenerateConstraint::Lark(grammar)) =
-        build_generate_request_with_protocol(&request, &declared_protocol("tagged-json"))
-            .unwrap()
-            .options
-            .constraint
+    let Some(GenerateConstraint::Lark(grammar)) = build_generate_request_with_protocol(
+        &request,
+        &declared_protocol("tagged-json"),
+        &fixture_tokenizer(),
+    )
+    .unwrap()
+    .options
+    .constraint
     else {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
@@ -1236,11 +1249,14 @@ fn required_tool_choice_with_multiple_tools_allows_any_tool_schema() {
         "tool_choice": "required"
     }));
 
-    let Some(GenerateConstraint::Lark(grammar)) =
-        build_generate_request_with_protocol(&request, &declared_protocol("tagged-json"))
-            .unwrap()
-            .options
-            .constraint
+    let Some(GenerateConstraint::Lark(grammar)) = build_generate_request_with_protocol(
+        &request,
+        &declared_protocol("tagged-json"),
+        &fixture_tokenizer(),
+    )
+    .unwrap()
+    .options
+    .constraint
     else {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
@@ -1275,20 +1291,31 @@ fn auto_and_none_tool_choice_do_not_constrain_generation() {
     }));
 
     assert_eq!(
-        build_generate_request_with_protocol(&auto_request, &declared_protocol("tagged-json"))
-            .unwrap()
-            .options
-            .constraint,
+        build_generate_request_with_protocol(
+            &auto_request,
+            &declared_protocol("tagged-json"),
+            &fixture_tokenizer()
+        )
+        .unwrap()
+        .options
+        .constraint,
         None
     );
     assert_eq!(
-        build_generate_request_with_protocol(&none_request, &declared_protocol("atem-xml"))
-            .unwrap()
-            .options
-            .constraint,
+        build_generate_request_with_protocol(
+            &none_request,
+            &declared_protocol("atem-xml"),
+            &fixture_tokenizer()
+        )
+        .unwrap()
+        .options
+        .constraint,
         None
     );
-    let GeneratePrompt::Text(prompt) = build_generate_request(&none_request).prompt else {
+    let GeneratePrompt::Text(prompt) = build_generate_request(&none_request, &fixture_tokenizer())
+        .unwrap()
+        .prompt
+    else {
         panic!("expected text prompt");
     };
     assert!(!prompt.contains("<|tools|>"), "{prompt}");
@@ -1326,7 +1353,7 @@ fn generic_request_builder_does_not_guess_a_tool_protocol() {
         "tool_choice": "auto"
     }));
 
-    let generate_request = build_generate_request(&request);
+    let generate_request = build_generate_request(&request, &fixture_tokenizer()).unwrap();
     let GeneratePrompt::Text(prompt) = generate_request.prompt else {
         panic!("expected text prompt");
     };
@@ -1991,4 +2018,12 @@ async fn chat_completions_reuses_persistent_session() {
         .await
         .unwrap();
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+}
+
+fn fixture_tokenizer() -> onnx_genai_ort::Tokenizer {
+    onnx_genai_ort::Tokenizer::from_file(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+    )
+    .unwrap()
 }

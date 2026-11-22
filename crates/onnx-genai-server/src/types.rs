@@ -96,11 +96,12 @@ pub struct EmbeddingUsage {
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
+    #[serde(default)]
     pub model: String,
     pub messages: Vec<ChatMessage>,
     /// Deprecated by OpenAI in favour of `max_completion_tokens`, and absent
     /// from requests aimed at reasoning models. See [`Self::output_budget`].
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_token_budget")]
     pub max_tokens: Option<usize>,
     /// The budget covering reasoning *and* answer tokens, which is the only
     /// output limit OpenAI accepts for a reasoning model.
@@ -120,15 +121,15 @@ pub struct ChatCompletionRequest {
     pub min_p: f32,
     #[serde(default)]
     pub top_a: f32,
-    #[serde(default = "default_typical_p")]
+    #[serde(default = "default_typical_p", rename = "typ_p")]
     pub typical_p: f32,
-    #[serde(default = "default_repetition_penalty")]
+    #[serde(default = "default_repetition_penalty", rename = "repeat_penalty")]
     pub repetition_penalty: f32,
     #[serde(default)]
     pub frequency_penalty: f32,
     #[serde(default)]
     pub presence_penalty: f32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_seed")]
     pub seed: Option<u64>,
     #[serde(default)]
     pub dry_multiplier: f32,
@@ -137,7 +138,7 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_dry_allowed_length")]
     pub dry_allowed_length: usize,
     #[serde(default)]
-    pub dry_sequence_breakers: Vec<u32>,
+    pub dry_sequence_breakers: Vec<String>,
     /// `0` disables Mirostat; `1` and `2` select the corresponding algorithm.
     #[serde(default)]
     pub mirostat: u8,
@@ -167,6 +168,49 @@ pub struct ChatCompletionRequest {
     /// the model's chat template on its own default.
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub chat_template_kwargs: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub stream_options: StreamOptions,
+    #[serde(default = "default_true")]
+    pub add_generation_prompt: bool,
+    #[serde(default)]
+    pub continue_final_message: bool,
+    /// Retain extensions so unsupported active controls cannot silently disappear.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn deserialize_token_budget<'de, D: Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+    let value = Option::<i64>::deserialize(d)?;
+    match value {
+        None | Some(-1) => Ok(None),
+        Some(value) => usize::try_from(value).map(Some).map_err(|_| {
+            D::Error::custom("max_tokens must be -1 (server limit) or a non-negative integer")
+        }),
+    }
+}
+
+fn deserialize_seed<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let value = Option::<serde_json::Number>::deserialize(d)?;
+    match value {
+        None => Ok(None),
+        Some(value) if value.as_i64() == Some(-1) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            D::Error::custom("seed must be -1 (random) or an unsigned 64-bit integer")
+        }),
+    }
 }
 
 #[derive(Debug, Deserialize)]

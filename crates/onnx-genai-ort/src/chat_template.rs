@@ -90,6 +90,8 @@ impl<'de> Deserialize<'de> for ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Value>,
     /// OpenAI's optional message `name`, which tool templates read to label a
@@ -107,6 +109,7 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: content.into(),
+            reasoning_content: None,
             tool_calls: None,
             name: None,
             tool_call_id: None,
@@ -253,6 +256,44 @@ impl ChatTemplate {
         add_generation_prompt: bool,
         reasoning_effort: Option<&str>,
     ) -> Result<String> {
+        self.render_with_kwargs(
+            messages,
+            tools,
+            add_generation_prompt,
+            reasoning_effort,
+            &Default::default(),
+        )
+    }
+
+    /// Reject structural variable overrides before rendering or request admission.
+    pub fn validate_kwargs(kwargs: &std::collections::BTreeMap<String, Value>) -> Result<()> {
+        for key in [
+            "messages",
+            "tools",
+            "add_generation_prompt",
+            "bos_token",
+            "eos_token",
+        ] {
+            if kwargs.contains_key(key) {
+                return Err(OrtError::InvalidArgument(format!(
+                    "chat_template_kwargs.{key} is reserved; set the corresponding request field instead"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Render additional template variables supplied by a protocol client.
+    /// Structural variables remain owned by the renderer.
+    pub fn render_with_kwargs(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&str>,
+        add_generation_prompt: bool,
+        reasoning_effort: Option<&str>,
+        kwargs: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<String> {
+        Self::validate_kwargs(kwargs)?;
         let tools = match tools {
             Some(tools) => serde_json::from_str::<Value>(tools).map_err(|err| {
                 OrtError::InvalidArgument(format!("invalid tools JSON for chat template: {err}"))
@@ -286,6 +327,7 @@ impl ChatTemplate {
                 reasoning_strength => reasoning_effort,
                 bos_token => self.bos_token.as_deref().unwrap_or_default(),
                 eos_token => self.eos_token.as_deref().unwrap_or_default(),
+                ..minijinja::Value::from_serialize(kwargs),
             })
             .map_err(|err| OrtError::InvalidArgument(format!("chat template render failed: {err}")))
     }
@@ -679,6 +721,33 @@ mod tests {
             template.render(&[], None, false).unwrap(),
             "before\n    value\nafter"
         );
+    }
+
+    #[test]
+    fn template_kwargs_and_assistant_reasoning_reach_the_same_renderer() {
+        let template = ChatTemplate::from_source(
+            "{{ enable_thinking }}|{{ messages[0].reasoning_content }}|{{ add_generation_prompt }}",
+        );
+        let mut message = ChatMessage::assistant("answer");
+        message.reasoning_content = Some("reason".into());
+        let kwargs = std::collections::BTreeMap::from([(
+            "enable_thinking".to_string(),
+            serde_json::json!(false),
+        )]);
+        assert_eq!(
+            template
+                .render_with_kwargs(&[message], None, true, None, &kwargs)
+                .unwrap(),
+            "false|reason|true"
+        );
+        let kwargs =
+            std::collections::BTreeMap::from([("messages".to_string(), serde_json::json!([]))]);
+        let error = template
+            .render_with_kwargs(&[], None, false, None, &kwargs)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("chat_template_kwargs.messages"));
+        assert!(error.contains("reserved"));
     }
 
     fn test_dir(name: &str) -> PathBuf {

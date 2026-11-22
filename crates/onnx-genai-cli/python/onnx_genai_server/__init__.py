@@ -1,7 +1,7 @@
 """onnx_genai_server — the ``onnx-genai`` command-line tool and OpenAI-compatible server.
 
 Installing the ``onnx-genai-server`` wheel provides a single ``onnx-genai``
-console command (``serve``, ``generate``, ``run``, ``show``, ``list``,
+console command (``serve``, ``generate``, ``show``, ``list``,
 ``version``). The command runs in-process through a compiled extension module;
 this launcher first loads the ONNX Runtime shared library from the installed
 ``onnxruntime`` / ``onnxruntime-gpu`` wheel so ONNX Runtime is **not** bundled —

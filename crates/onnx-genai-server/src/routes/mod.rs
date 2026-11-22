@@ -50,6 +50,7 @@ use crate::{
 mod admin;
 mod completions;
 mod images;
+pub(crate) mod llama;
 mod multimodal;
 mod sessions;
 mod speech;
@@ -100,6 +101,13 @@ struct ModelObject {
     object: &'static str,
     created: u64,
     owned_by: &'static str,
+    status: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    architecture: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_length: Option<usize>,
+    in_cache: bool,
+    can_remove: bool,
 }
 
 #[derive(Debug, Serialize)]

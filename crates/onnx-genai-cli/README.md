@@ -18,37 +18,29 @@ uses whichever execution providers you installed.
 onnx-genai serve ./model                # OpenAI-compatible HTTP server
 onnx-genai serve --models-dir ./models   # ... or serve every model under a directory
 onnx-genai generate ./model "Hello"      # one-shot generation
-onnx-genai run ./model                   # interactive REPL
 onnx-genai show ./model                  # resolved files + metadata
 onnx-genai list ./models                 # list models
 onnx-genai version                       # version + execution providers
 ```
 
-`generate`, `run`, and `show` accept either a model directory or a config file
+`generate` and `show` accept either a model directory or a config file
 inside it (a file resolves to its parent directory).
 
 For `generate`, `MODEL PROMPT` is the canonical invocation. `--prompt PROMPT`
 is also supported; supply exactly one prompt, not both forms.
 
-### Interactive REPL controls
+### Interactive chat
 
-In `onnx-genai run`, press **Ctrl-C** while a response is generating to cancel
-that turn and return to the prompt. At an idle prompt, press **Ctrl-D** or
-**Ctrl-C** (or enter an empty line) to exit. A one-shot `onnx-genai generate`
-run is also cancelled by **Ctrl-C** mid-generation.
-
-When both stdin and stdout are terminals, the REPL uses a rich line editor:
-arrow-key cursor movement, persistent history, bracketed paste, slash-command
-completion, and multiline input with **Alt+Enter** (plain **Enter** submits).
-Interactive terminal text generation shows compact per-turn stats by default;
-pass `--no-stats` to hide them. Stats are enabled only when stdin and stdout are
-terminals, and they are printed to stderr; piped stdout remains byte-stable
-generated text. When stdin or stdout is piped, the REPL also keeps the original
-plain `>>> ` line-loop behavior for scripts and tests.
+Run `onnx-genai serve ./model` and open **http://127.0.0.1:8080/**.
+The server embeds the official Llama Chat frontend; the terminal `run` command
+and its REPL have been removed. No frontend build or Node.js is needed at runtime.
+See [protocol compatibility](../../docs/LLAMA_CPP_COMPATIBILITY.md).
+One-shot `generate` still supports Ctrl-C cancellation, `--stream`, compact
+terminal stats, and profiling.
 
 ### Generation budget and sampling
 
-When `--max-new-tokens` is omitted, `generate` and `run` follow the model's
+When `--max-new-tokens` is omitted, `generate` follows the model's
 effective context window: the CLI uses the remaining context after the prompt, so
 generation stops on EOS, a stop sequence, or the full context. Pass
 `--max-new-tokens` to override exactly. If neither metadata nor the decode path
@@ -56,16 +48,13 @@ reveals a context limit, the CLI warns and uses a finite fallback instead of
 risking an ORT out-of-bounds decode; fix that with `--max-context TOKENS` or by
 declaring `model.max_sequence_length` in inference metadata.
 
-The REPL recomputes that remaining-context ceiling every turn as conversation
-history grows. `/stats` includes a terse context meter (`ctx used / max`).
-
 Sampling flags (`--temperature` above 0, `--top-p`, or `--top-k`) switch from
 greedy argmax to stochastic sampling. `--temperature 0` remains greedy. Use
 `--greedy` or `--no-greedy` to make the mode explicit.
 
 ### Polite CPU decode
 
-Use `--cpu-cores N` with `generate` or `run` to cap native CPU decode to N
+Use `--cpu-cores N` with `generate` to cap native CPU decode to N
 persistent workers:
 
 ```bash
@@ -173,13 +162,9 @@ CUDA has two independent switches:
    EP (`onnx-runtime-ep-cuda`).
 2. Runtime settings select which path to use. `ONNX_GENAI_EP=cuda` asks the ORT
    session to use CUDA, while `--backend auto|ort|native` selects the decoder
-   for `generate`, `transcribe`, and the starting decoder for `run`. Speech
-   transcription uses the same autoregressive pipeline decoder as multimodal
-   generation, so backend selection is meaningful there too. In the REPL,
-   `/backend` can still reload the model and switch the decoder without
-   restarting. Profile output, `/session`, bare `/backend`, and `/stats` report
-   the resolved backend (`auto` is shown separately as the request when it
-   resolved to `ort` or `native`).
+   for `generate` and `transcribe`. Speech transcription uses the same
+   autoregressive pipeline decoder as multimodal generation. Profile output
+   reports the resolved backend.
 
 CUDA failure modes are intentionally distinct:
 
@@ -248,10 +233,10 @@ they are the fastest way to check that a change works. Run these from the
 repository root:
 
 ```bash
-# Text generation, and the interactive REPL
+# Text generation and browser chat
 cargo run -p onnx-genai-cli --bin onnx-genai -- \
   generate tests/fixtures/tiny-llm --prompt "hello" --max-new-tokens 5 --raw
-cargo run -p onnx-genai-cli --bin onnx-genai -- run tests/fixtures/tiny-llm
+cargo run -p onnx-genai-cli --bin onnx-genai -- serve tests/fixtures/tiny-llm
 
 # Image input (the prompt needs one <image> placeholder per image)
 cargo run -p onnx-genai-cli --bin onnx-genai -- \
@@ -280,88 +265,6 @@ Model loading logs and default text-generation stats go to stderr; append
 `generate --output-audio`, and `transcribe` do not print the compact token stats
 line by default; use `--profile` for their timing and throughput diagnostics.
 
-### Checking the REPL's live view
-
-Interactive terminal sessions render the reply and live numbers together by
-default. That path is only taken when stdin and stdout are real terminals, so it
-cannot be seen through a pipe. Run the REPL directly in a terminal and type a
-prompt:
-
-```bash
-cargo run -p onnx-genai-cli --bin onnx-genai -- run tests/fixtures/tiny-llm --max-new-tokens 5
-```
-
-```text
->>> hello
-dogtok29over,dog
-[ 7 in · 5 out · backend ort · 2.0 tok/s · ttft 1 ms · rss 50.6 MiB ]
-```
-
-Use `/stats` to toggle the compact line at runtime, or start `run` or text
-`generate` with `--no-stats`. Piping a script into the REPL exercises the
-byte-stable plain-text fallback instead, which is what the tests do:
-
-```bash
-printf '/stats\nhello\n\n' | cargo run -p onnx-genai-cli --bin onnx-genai -- \
-  run tests/fixtures/tiny-llm --max-new-tokens 5
-```
-
-### Changing the session without restarting
-
-The REPL can reload the model under a different execution provider or decode
-backend, and switch models outright:
-
-```text
->>> /ep                     # current provider, and what this build can select
->>> /ep cpu
->>> /backend ort            # auto | ort | native
->>> /model ./another-model
->>> /profile on             # report timings, memory, and cache reuse per turn
->>> /session                # model, sampling, message counts, and token totals
-```
-
-On Apple Silicon the MLX/Metal execution provider is offered — and
-auto-selected — when its plugin library is configured, which the Python packages
-do for you. From a source build, point at it yourself:
-
-```bash
-ONNX_GENAI_METAL_EP_LIB=$(python -c 'import onnxruntime_mlx, os;
-print(os.path.join(os.path.dirname(onnxruntime_mlx.__file__), "libonnxruntime_mlx_ep.dylib"))') cargo run -p onnx-genai-cli --bin onnx-genai -- run ./model
-```
-
-`/ep` then lists `metal` and `--profile` reports it. Selection is non-strict: if
-the plugin fails to load, the session falls back to CPU rather than failing.
-
-All but `/profile` reload the model and clear the conversation. A selection that
-fails to load is reported and the previous session keeps running, so an
-unavailable provider does not end the session.
-
-### Seeing what the KV cache holds
-
-`/pages` shows the page pool as it stands, which is the view you want when a
-pool is filling up and the question is whether that is one long conversation or
-many that should be sharing:
-
-```text
-kv pages   ▓▓▓▓████················  38%
-           38 of 100 pages held · 16 tokens/page
-           512 of 608 token slots used (84% of held pages)
-           9 shared (23%) — pages more than one sequence or cached prefix holds
-
-references per page
-    1x      29 pages
-    2x       7 pages
-    3x       2 pages
-
-live sequences
-  sequence     pages   tokens   shared
-  7               12      190        5
-```
-
-Shared pages are drawn first (`▓`) because they are the ones that would
-otherwise have been duplicated. A model whose KV is not paged says so, rather
-than reporting an empty pool.
-
 ### Tests
 
 Always name packages explicitly. A bare `--workspace` pulls in `mlas-sys`, whose
@@ -370,5 +273,5 @@ git submodule checked out:
 
 ```bash
 cargo test -p onnx-genai-cli
-cargo test -p onnx-genai-cli --test repl_e2e
+cargo test -p onnx-genai-cli --test prompt_e2e
 ```

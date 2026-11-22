@@ -97,17 +97,15 @@ supported when it reads more clearly with other options:
 `onnx-genai generate MODEL --prompt "your prompt"`. Supply exactly one prompt,
 not both forms.
 
-When `--max-new-tokens` is omitted, `generate` and `run` use whatever budget
+When `--max-new-tokens` is omitted, `generate` uses whatever budget
 remains in the model's effective context window, stopping on EOS, a stop
 sequence, or context length. Sampling flags such as `--temperature 0.7`,
 `--top-p`, or `--top-k` enable stochastic sampling, while `--temperature 0` and
 `--greedy` force argmax. If a package has no discoverable context limit, the CLI
 warns and uses a finite fallback; pass `--max-context TOKENS` or declare
 `model.max_sequence_length` in inference metadata to make context-fill automatic.
-In the REPL this budget is recomputed for each turn as history grows; `/stats`
-shows `ctx used / max`.
 
-On a shared machine, add `--cpu-cores N` to `generate`, `run`, or `transcribe` to
+On a shared machine, add `--cpu-cores N` to `generate` or `transcribe` to
 cap native CPU decode to N workers (for example, `--cpu-cores 8`); where
 supported, those workers are pinned to at most N allowed CPUs. The equivalent
 environment variable is `ONNX_GENAI_CPU_DECODE_THREADS=N`; precedence is CLI flag >
@@ -116,57 +114,22 @@ peak-throughput default. This is a decode-worker budget, not a hard cpuset for
 prefill or ONNX Runtime threads; combine it with an OS cpuset/taskset when the
 entire process must be confined.
 
-`onnx-genai run <model>` starts an interactive REPL. In a terminal it uses a
-rich line editor with cursor movement, persistent history, bracketed paste,
-slash-command completion, and multiline input via Alt+Enter (Enter submits).
-Interactive terminal text generation shows compact per-turn stats by default;
-pass `--no-stats` to hide them. Stats are enabled only when stdin and stdout are
-terminals, and they are printed to stderr; piped stdout remains byte-stable
-generated text. If stdin or stdout is piped, the REPL keeps the original plain
-`>>> ` line loop for script compatibility. One Ctrl-C stops the current
-generation; two in a row exit. Slash commands control the session:
+Start the server and open **http://127.0.0.1:8080/** for interactive chat:
 
-```text
->>> /help
->>> /system Be concise.
->>> /image ./cat.png What is in this image?
->>> /audio ./speech.wav
->>> /raw
->>> /stats                  # runtime toggle for compact per-turn stats
->>> /profile on
->>> /model ./other-model
->>> /ep cpu
->>> /backend ort
->>> /reset
+```bash
+./target/release/onnx-genai serve ./model
 ```
 
-`/model`, `/ep`, and `/backend` reload the model, because an ONNX session is
-created against its execution provider and decode backend and cannot be moved
-between them; the conversation is cleared with it, since a reply belongs to the
-model that produced it. If the new selection fails to load, the message says so
-and the previous session keeps running. With no argument each reports the
-current setting, and `/ep` also lists what this build can select — provider
-support is compiled in, so a provider left out of the build cannot be chosen at
-runtime.
+The server embeds a pinned build of llama.cpp's **Llama Chat** with a small capability adapter.
+It needs no Node.js installation or network access at runtime. Chat history,
+branching, Markdown rendering and frontend preferences belong to Llama Chat;
+inference runs through our server. The terminal REPL has been removed.
+See [llama.cpp compatibility](docs/LLAMA_CPP_COMPATIBILITY.md) for supported
+protocols, capability limits and the upstream refresh procedure.
 
-`/profile on` turns the report on mid-session, and starts a Perfetto timeline
-with it at full detail — deciding you want a timeline usually happens after
-something looks wrong, which is the one moment a startup-only switch cannot
-serve. `/profile trace <path>` chooses where it goes (`trace off` stops it), and
-`/profile verbosity <decisions|ops|full>` changes how much it records between
-turns. Full adds a span per worker thread per operator and costs about 4%.
-
-The per-stage ORT breakdown is the exception: it is switched on from the
-environment before any thread starts, so it needs `--profile` at startup, and
-the command says so rather than printing a report that is quietly missing its
-most detailed section.
-
-`/stats` toggles per-turn numbers, for watching throughput and cache behavior
-without the full `--profile` report. `generate` uses the same compact line for
-terminal text generation unless `--no-stats` is passed. While a REPL reply
-streams, the numbers update live beneath it; when the turn ends they settle into
-a deliberate two-line block: performance and termination first, cache/scheduler/
-memory behavior second.
+`generate` keeps one-shot streaming, Ctrl-C cancellation and `--profile` /
+`--profile-trace` diagnostics. Terminal stats go to stderr unless `--no-stats`
+is set; piped stdout contains generated text.
 
 ```text
 [ 613 in · 64 out · backend native · 41.7 tok/s · e2e 39.3 tok/s · ttft 116 ms · finish stop-seq · cap 3.6k->128 ]
@@ -176,18 +139,11 @@ memory behavior second.
 If the scheduler had to admit a smaller decode budget, or the KV page pool
 allocated/freed/evicted pages during the turn, those appear in this block.
 
-The live view is drawn with [ratatui](https://ratatui.rs) into an *inline*
-viewport rather than an alternate screen, so finished lines spill into the
-terminal's own scrollback and the conversation stays selectable, copyable, and
-present after the session ends. Compact stats are used only on a terminal and go
-to stderr for `generate`: a piped session, or one started with `--no-stats`, gets
-exactly the plain streaming output it got before.
-
 ### Image and audio input
 
 Vision-language and speech packages declare their preprocessing contract in
 inference metadata (`preprocessing.image` + `pipeline.vision` for images, an
-`input_features` component input for audio). `run` and `generate` accept those
+`input_features` component input for audio). `generate` accepts those
 modalities on any package that declares one:
 
 ```bash
@@ -448,28 +404,15 @@ The delimiters are read from the package's own chat template — a template that
 writes `<think>` is declaring the convention — so nothing is keyed off a model
 name and a package that declares none is untouched.
 
-In `run`, reasoning is dimmed as it streams (on a terminal only, so a piped
-transcript stays clean), and **only the answer becomes conversation history**.
-These models are trained with earlier turns' thinking removed: replaying it
-degrades quality and inflates the context, since the reasoning of a long session
-can dwarf the conversation itself.
+`generate --stream` dims declared reasoning on a terminal; piped output remains
+free of ANSI escapes. The server sends reasoning separately as
+`reasoning_content` so Llama Chat can display it independently of the answer.
+Conversation replay and whether earlier reasoning is included follow the
+frontend's settings and the model's declared chat template.
 
-When `--max-new-tokens` is omitted, the CLI gives reasoning models the same
-model-following budget as any other model: the remaining context window. If an
-explicit or fallback decode budget still runs out inside the reasoning, the turn
-genuinely has no answer. The exchange is dropped rather than stored as an empty
-reply, which would otherwise teach the model that questions go unanswered:
-
-```text
-note: generation stopped inside the model's reasoning after hitting
---max-new-tokens 2. No answer was produced, so this turn is not kept.
-Try --max-new-tokens 4.
-```
-
-Because the thinking is stripped before history is replayed, a follow-up prompt
-diverges from what the model last held in its KV cache, at the point the
-thinking began. Reuse covers everything before that, so the conversation and any
-attached image are still reused; only the discarded reasoning is recomputed.
+When `--max-new-tokens` is omitted, the CLI uses the remaining context window.
+A reply truncated during reasoning may contain no final answer; increase the
+explicit output budget or shorten the prompt when that happens.
 
 ### Transcribe speech
 

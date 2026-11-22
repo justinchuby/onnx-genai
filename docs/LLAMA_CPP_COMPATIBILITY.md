@@ -1,0 +1,113 @@
+# llama.cpp protocol compatibility
+
+The server embeds the official Llama Chat frontend with a small capability adapter from
+[llama.cpp commit 8d60873dfb8619f2b5ed31adfbab07cccb40db5c](https://github.com/ggml-org/llama.cpp/tree/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/ui/apps/chat).
+The integration patch gates automatically attached browser tools using the
+model's declared `nxrt_capabilities.tools`; a package with no tool protocol can
+chat without receiving an unsupported tool request. Ordinary llama-server
+connections, which do not send this extension, keep upstream behavior. The
+patch and its hash are checked in alongside asset provenance.
+
+Start `onnx-genai serve MODEL` and open `http://127.0.0.1:8080/`.
+Node/npm and network access are not needed to build the Rust server or use its UI.
+The removed `run` REPL has no alias or migration shim. `generate`, `transcribe`,
+model inspection, profiling and command-line streaming remain available.
+
+## Implemented surface
+
+| Method | Paths | Contract |
+| --- | --- | --- |
+| GET | `/`, embedded asset paths | Official UI, MIME types, revalidation, immutable hashed assets, cross-origin isolation headers |
+| GET | `/health`, `/v1/health` | Existing nxrt health response |
+| GET | `/models`, `/v1/models` | Configured models, committed load status, input modalities and context length when known |
+| GET | `/props` | Model generation defaults, chat template, declared input modalities; router role for multiple configured models |
+| POST | `/tokenize` | `content`, `add_special`, `with_pieces`, optional `model`; package vocabulary/tokenizer |
+| POST | `/detokenize` | `tokens`, optional `model`; preserves special tokens, rejects absent vocabulary IDs |
+| POST | `/apply-template` | Chat request fields; same prompt renderer as chat inference |
+| POST | `/v1/chat/completions`, `/chat/completions` | Buffered/streaming text, tools, reasoning, declared image/audio inputs |
+| POST | `/v1/completions` | Existing OpenAI text/FIM completion contract |
+| POST | `/v1/embeddings` | Existing OpenAI embedding contract |
+| POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Existing multipart transcription contract |
+| POST | `/v1/audio/speech`, `/audio/speech` | Existing speech contract |
+| GET | `/models/sse` | Initial state and changes to committed model load status; one-second polling, no invented progress |
+| POST | `/models/load`, `/models/unload` | Configured model IDs; requires `--enable-admin-endpoints` |
+| GET | `/metrics` | Existing nxrt Prometheus metrics when compiled with `metrics`; names are not llama metric aliases |
+
+`/props?model=ID&autoload=false` never loads a model. The default is
+`autoload=true`. The UI uses `autoload=false` for discovery. Unknown/unloaded
+models are reported explicitly. Model load/unload requests complete when the
+operation completes; clients can inspect the committed status afterward.
+Models are configured with `--models-dir` or `--models-config`; this does not
+implement llama.cpp's Hugging Face/GGUF download manager. Load `extra_args` are
+rejected because these models execute in-process with explicit nxrt settings.
+
+## Request compatibility
+
+- `model` can be omitted for the default chat model.
+- `max_tokens: -1` uses the configured server output cap; context limits still apply.
+- `seed: -1` selects an unseeded request; unsigned 64-bit seeds remain accepted.
+- `repeat_penalty` and `typ_p` map to the existing repetition/typical controls.
+- `repeat_last_n: -1` uses full history; non-negative values select the repetition window.
+- `chat_template_kwargs` supplies template variables such as `enable_thinking`.
+  Structural variables (`messages`, `tools`, generation prompt and BOS/EOS) cannot
+  be overridden through kwargs. Unreferenced variables have the template's normal behavior.
+- `add_generation_prompt` reaches the prompt renderer.
+- Assistant `reasoning_content` is preserved when rendering subsequent turns.
+- `stream_options.include_usage` adds an empty-choices usage event after the final
+  finish chunk, before `[DONE]`, including the tool-calling stream path.
+- DRY breaker strings are tokenized with the requested model. The current backend
+  supports single-token breakers; multi-token breakers fail with a field-specific
+  error instead of being flattened into a different rule.
+
+The sampler pipeline is nxrt's existing fixed pipeline. Arbitrary `samplers`
+orders, dynamic temperature, thinking budgets, continuation of a final assistant
+message, logit bias and other unsupported active controls are rejected with an
+`invalid_request_error`. Neutral dynamic-temperature settings are accepted.
+Optional progress/control subscription fields from Llama Chat are accepted, but
+`/props.nxrt_capabilities` states that realtime reasoning control and resumable
+streams are unavailable. Per-token timing/progress events are not promised.
+A dropped streaming connection cancels the driver receiver; Stop works by
+aborting that connection. A refresh cannot reconnect to an abandoned generation.
+
+## Remaining differences
+
+This is a functional Llama Chat integration, not a claim of complete llama-server
+parity. These upstream protocols are still unimplemented:
+
+- Native `/completion`, `/completions`, `/embedding`, `/embeddings`, `/infill`.
+- Responses and Anthropic Messages, their token-counting routes, and chat token counting.
+- Reranking, `/tts`, realtime audio/WebSocket inference and `/v1/systemone`.
+- Slot save/restore, LoRA hot swapping, resumable streams and reasoning control.
+- GGUF/Hugging Face model downloads and deletion.
+
+`/tools`, `/cors-proxy`, model download/delete and mutable `/props` return
+`403 feature_disabled`; they never execute shell commands or proxy requests.
+Other unknown paths return JSON 404 errors rather than the HTML app.
+Existing nxrt sessions/admin/debug/image APIs remain available with their own
+contracts. Capability flags are derived from admitted package metadata; ONNX
+models are never advertised as GGUF models and unknown dimensions are not invented.
+
+Serve the UI and API on the same origin (the embedded default, or a reverse
+proxy). Cross-origin standalone hosting needs a proxy that explicitly configures
+CORS. No permissive CORS policy is enabled implicitly by embedding the UI.
+
+## Refreshing the upstream UI
+
+Run `python3 scripts/update_llama_chat.py` with git, Node >=20 and npm installed.
+The script fetches the exact commit, applies
+`scripts/llama_chat/capabilities.patch`, builds with the upstream lockfile, copies
+the static output and license notices, and records asset SHA-256 hashes. To update upstream, change the explicit commit pin and review
+protocol changes before regenerating. Cargo embeds exact asset paths with
+`build.rs`; it never runs npm or downloads UI code. Keep assets and notices in
+the same change. The dependency notices conservatively include build-time packages.
+
+Use the server's compatibility tests plus CLI generation/transcription tests and
+an actual-browser chat smoke test after an update. Tiny fixtures verify protocol
+behavior; they are not representative language models or performance benchmarks.
+
+For a browser smoke test, build the server, install Playwright in a temporary
+Node environment, then run `node scripts/test_llama_chat.mjs /absolute/path/to/playwright/index.mjs`.
+The script starts a tiny-fixture server on port 18080, sends a message through
+the actual UI, verifies the answer and persisted conversation, then shuts down
+Chrome and the server. Set `NXRT_UI_SCREENSHOT` to save a screenshot. Coordinate
+this inference workload with other sessions using the shared host lock.

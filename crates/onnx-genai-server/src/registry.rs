@@ -475,22 +475,28 @@ impl ModelRegistry {
         &self,
         requested: &str,
     ) -> Result<Option<Arc<ModelHandle>>, RegistryError> {
+        let handle = self.lookup_loaded(requested)?;
+        if let Some(handle) = &handle {
+            handle
+                .last_request_at
+                .store(now_millis(), Ordering::Relaxed);
+        }
+        Ok(handle)
+    }
+
+    /// Inspect committed state without counting UI polling as an inference use
+    /// for the eviction policy. Resolution and introspection share this lookup.
+    pub(crate) fn lookup_loaded(
+        &self,
+        requested: &str,
+    ) -> Result<Option<Arc<ModelHandle>>, RegistryError> {
         let inner = self.read()?;
-        let handle = if !requested.trim().is_empty() {
-            inner.models.get(requested)
+        let id = if requested.trim().is_empty() {
+            inner.default_id.as_deref()
         } else {
-            inner
-                .default_id
-                .as_deref()
-                .and_then(|default| inner.models.get(default))
+            Some(requested)
         };
-        let Some(handle) = handle else {
-            return Ok(None);
-        };
-        handle
-            .last_request_at
-            .store(now_millis(), Ordering::Relaxed);
-        Ok(Some(Arc::clone(handle)))
+        Ok(id.and_then(|id| inner.models.get(id)).cloned())
     }
 
     /// Returns `true` if `id` is a configured model (loaded or not).
@@ -499,6 +505,7 @@ impl ModelRegistry {
     }
 
     /// Returns the ids of all currently loaded models in insertion order.
+    #[cfg(test)]
     pub(crate) fn ids(&self) -> Result<Vec<String>, RegistryError> {
         Ok(self.read()?.order.clone())
     }

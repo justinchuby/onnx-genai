@@ -12,7 +12,7 @@ use onnx_genai::preprocess::audio::{
 use onnx_genai::{GenerateOptions, GeneratePrompt, GenerateRequest, GenerateToken};
 use onnx_genai_server::multimodal;
 
-use super::interactive::{GENERATING, INTERRUPT_REQUESTED, Interrupted, install_ctrlc_handler};
+use super::execution::{GENERATING, INTERRUPT_REQUESTED, Interrupted, install_ctrlc_handler};
 use super::profile::RunProfile;
 use super::{
     ProfileArgs, TranscribeArgs, TranscriptFormat, decode_backend_name, resolve_model_dir,

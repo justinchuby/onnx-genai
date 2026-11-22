@@ -278,6 +278,8 @@ jobs:
         run: python scripts/benchmark_muse_native_local.py --self-test --require-numpy
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check pinned Llama Chat assets
+        run: python scripts/update_llama_chat.py --check
       # This lane builds a subset of the workspace, so only that subset's
       # packages land in the registry cache. The MLAS-free merge gate in
       # onnx-runtime-ep-cpu-plugin asks `cargo metadata --offline` for the
@@ -1173,7 +1175,7 @@ jobs:
           fi
 
       # The portable lane must stay offline, but the CLI is the user-facing ORT
-      # entry point and its REPL contract tests catch token-budget regressions.
+      # entry point and its generation contract tests catch token-budget regressions.
       # Keep this isolated so the native ORT download is intentional, pinned by
       # ort-sys checksums, and paid only by the crate that needs it.
       - name: Build onnx-genai-cli

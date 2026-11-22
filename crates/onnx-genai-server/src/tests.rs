@@ -289,15 +289,15 @@ fn chat_sampling_controls_round_trip_into_generate_options() {
         "top_k": 40,
         "min_p": 0.1,
         "top_a": 0.2,
-        "typical_p": 0.7,
-        "repetition_penalty": 1.15,
+        "typ_p": 0.7,
+        "repeat_penalty": 1.15,
         "frequency_penalty": 0.3,
         "presence_penalty": 0.4,
         "seed": 1234,
         "dry_multiplier": 0.5,
         "dry_base": 1.75,
         "dry_allowed_length": 3,
-        "dry_sequence_breakers": [13, 42],
+        "dry_sequence_breakers": ["hello"],
         "mirostat": 2,
         "mirostat_tau": 4.5,
         "mirostat_eta": 0.2,
@@ -306,7 +306,9 @@ fn chat_sampling_controls_round_trip_into_generate_options() {
     }))
     .unwrap();
 
-    let options = build_generate_request(&request).options;
+    let options = build_generate_request(&request, &fixture_tokenizer())
+        .unwrap()
+        .options;
     assert_eq!(options.temperature, 0.8);
     assert_eq!(options.top_p, 0.9);
     assert_eq!(options.top_k, 40);
@@ -323,7 +325,14 @@ fn chat_sampling_controls_round_trip_into_generate_options() {
     assert_eq!(dry.multiplier, 0.5);
     assert_eq!(dry.base, 1.75);
     assert_eq!(dry.allowed_length, 3);
-    assert_eq!(dry.sequence_breakers, vec![13, 42]);
+    assert_eq!(
+        dry.sequence_breakers,
+        fixture_tokenizer()
+            .inner()
+            .encode("hello", false)
+            .unwrap()
+            .get_ids()
+    );
 
     let mirostat = options.mirostat.expect("Mirostat enabled");
     assert_eq!(mirostat.tau, 4.5);
@@ -346,8 +355,15 @@ fn chat_sampling_defaults_stay_greedy_while_seed_enables_sampling() {
         .unwrap()
     };
 
-    assert!(build_generate_request(&request(Value::Null)).options.greedy);
-    let seeded = build_generate_request(&request(json!(17))).options;
+    assert!(
+        build_generate_request(&request(Value::Null), &fixture_tokenizer())
+            .unwrap()
+            .options
+            .greedy
+    );
+    let seeded = build_generate_request(&request(json!(17)), &fixture_tokenizer())
+        .unwrap()
+        .options;
     assert!(!seeded.greedy);
     assert_eq!(seeded.seed, Some(17));
 }
@@ -793,8 +809,8 @@ async fn chat_sampling_controls_reject_invalid_ranges() {
     for (field, value) in [
         ("min_p", json!(1.1)),
         ("top_a", json!(-0.1)),
-        ("typical_p", json!(1.1)),
-        ("repetition_penalty", json!(0.0)),
+        ("typ_p", json!(1.1)),
+        ("repeat_penalty", json!(0.0)),
         ("dry_base", json!(0.5)),
         ("mirostat", json!(3)),
         ("xtc_probability", json!(1.1)),
@@ -2827,7 +2843,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
             input: None,
             session_id: None,
             lease: None,
-            request: Box::new(build_generate_request(&slow_request)),
+            request: Box::new(build_generate_request(&slow_request, &fixture_tokenizer()).unwrap()),
             tool_call_policy: onnx_genai_engine::ToolCallPolicy::Disabled,
             admission: slow_admission,
             events: slow_tx,
@@ -2838,7 +2854,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
     let fast_rx = driver
         .generate(
             None,
-            build_generate_request(&fast_request),
+            build_generate_request(&fast_request, &fixture_tokenizer()).unwrap(),
             onnx_genai_engine::ToolCallPolicy::Disabled,
             None,
         )
@@ -6025,4 +6041,403 @@ async fn every_session_refusal_reports_a_status_and_a_type_a_client_can_branch_o
         "{conflict}"
     );
     drop(busy);
+}
+
+fn fixture_tokenizer() -> onnx_genai_ort::Tokenizer {
+    onnx_genai_ort::Tokenizer::from_file(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+    )
+    .unwrap()
+}
+
+mod llama_compat {
+    use super::*;
+
+    async fn call(
+        router: axum::Router,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn discovery_and_properties_describe_the_admitted_model() {
+        let state = tiny_state();
+        let handle = state.registry.lookup_loaded("").unwrap().unwrap();
+        handle
+            .last_request_at
+            .store(42, std::sync::atomic::Ordering::Relaxed);
+        let router = app(state);
+        for path in ["/health", "/v1/health"] {
+            let (status, body) = call(router.clone(), "GET", path, Value::Null).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "ok");
+        }
+        let (_, models) = call(router.clone(), "GET", "/models", Value::Null).await;
+        assert_eq!(models["data"][0]["id"], "tiny-llm");
+        let (status, props) =
+            call(router.clone(), "GET", "/props?autoload=false", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(props["role"], "model");
+        assert_eq!(props["model_alias"], "tiny-llm");
+        assert_eq!(props["modalities"]["vision"], false);
+        assert!(props["chat_template"].is_string());
+        assert_eq!(props["endpoint_slots"], false);
+        assert_eq!(
+            handle
+                .last_request_at
+                .load(std::sync::atomic::Ordering::Relaxed),
+            42,
+            "metadata polling must not refresh the model's LRU inference timestamp"
+        );
+        let (status, error) = call(
+            router,
+            "GET",
+            "/props?model=missing&autoload=false",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn tokenizer_round_trip_and_invalid_ids_are_explicit() {
+        let router = app(tiny_state());
+        let (status, encoded) = call(
+            router.clone(),
+            "POST",
+            "/tokenize",
+            json!({"content": "hello", "add_special": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, decoded) = call(
+            router.clone(),
+            "POST",
+            "/detokenize",
+            json!({"tokens": encoded["tokens"]}),
+        )
+        .await;
+        assert_eq!(decoded["content"], "hello");
+        let (_, pieces) = call(
+            router.clone(),
+            "POST",
+            "/tokenize",
+            json!({"content": "hello", "with_pieces": true}),
+        )
+        .await;
+        assert!(pieces["tokens"][0]["id"].is_number());
+        assert!(pieces["tokens"][0]["piece"].is_string());
+        let (status, error) = call(
+            router,
+            "POST",
+            "/detokenize",
+            json!({"tokens": [4294967295_u32]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("4294967295")
+        );
+    }
+
+    #[tokio::test]
+    async fn template_endpoint_renders_model_template_and_protects_structural_variables() {
+        let router = app(tiny_state());
+        let (status, result) = call(
+            router.clone(),
+            "POST",
+            "/apply-template",
+            json!({
+                "messages": [{"role": "user", "content": "hello"}], "add_generation_prompt": true
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let request: ChatCompletionRequest =
+            serde_json::from_value(json!({"messages": [{"role": "user", "content": "hello"}]}))
+                .unwrap();
+        let expected = crate::build_prompt(&request);
+        assert_eq!(result["prompt"], expected);
+        let (status, error) = call(router, "POST", "/apply-template", json!({
+            "messages": [{"role": "user", "content": "hello"}], "chat_template_kwargs": {"messages": []}
+        })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reserved")
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_chat_payload_streams_usage_and_rejects_unsupported_controls() {
+        let router = app(tiny_state());
+        let body = json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 2, "seed": -1, "repeat_penalty": 1.0,
+            "repeat_last_n": -1, "typ_p": 1.0,
+            "reasoning_format": "auto", "reasoning_control": true,
+            "return_progress": true, "sse_ping_interval": 1,
+            "dynatemp_range": 0.0, "dynatemp_exponent": 1.0,
+            "stream": true, "stream_options": {"include_usage": true},
+            "chat_template_kwargs": {"enable_thinking": false}
+        });
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let events = sse_json_events(&bytes);
+        let usage = events.last().unwrap();
+        assert_eq!(usage["choices"], json!([]));
+        assert!(usage["usage"]["completion_tokens"].as_u64().unwrap() <= 2);
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .ends_with("data: [DONE]\n\n")
+        );
+        for (key, value) in [
+            ("dynatemp_range", json!(0.2)),
+            ("samplers", json!(["temperature"])),
+            ("thinking_budget_tokens", json!(32)),
+        ] {
+            let mut body = json!({"messages": [{"role": "user", "content": "hello"}]});
+            body[key] = value;
+            let (status, error) = call(router.clone(), "POST", "/v1/chat/completions", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert!(error["error"]["message"].as_str().unwrap().contains(key));
+        }
+    }
+
+    #[test]
+    fn llama_sentinels_and_parameter_spellings_are_preserved() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "messages": [], "max_tokens": -1, "seed": -1,
+            "repeat_penalty": 1.2, "typ_p": 0.8
+        }))
+        .unwrap();
+        assert_eq!(request.output_budget(123), 123);
+        assert_eq!(request.seed, None);
+        assert_eq!(request.repetition_penalty, 1.2);
+        assert_eq!(request.typical_p, 0.8);
+        for body in [
+            json!({"messages": [], "max_tokens": -2}),
+            json!({"messages": [], "seed": -2}),
+        ] {
+            assert!(serde_json::from_value::<ChatCompletionRequest>(body).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_ui_and_disabled_features_have_correct_http_contracts() {
+        let router = app(tiny_state());
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers()["cross-origin-opener-policy"],
+            "same-origin"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("_app/immutable/")
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_app/does-not-exist.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        for path in ["/tools", "/cors-proxy"] {
+            let (status, error) = call(router.clone(), "GET", path, Value::Null).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(error["error"]["type"], "feature_disabled");
+        }
+    }
+}
+
+mod llama_router_compat {
+    use super::*;
+    use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn router_discovery_lifecycle_and_events_follow_registry_state() {
+        let state = lazy_state(ServerConfig {
+            enable_admin_endpoints: true,
+            ..ServerConfig::default()
+        });
+        let router = app(state.clone());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/props?autoload=false")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_body(response).await["role"], "router");
+        assert!(
+            state.registry.resolve("model-b").unwrap().is_none(),
+            "discovery must not lazy-load"
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        assert_eq!(body["data"].as_array().unwrap().len(), 2);
+        assert_eq!(body["data"][1]["status"]["value"], "unloaded");
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/models/sse")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let first = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&first)
+                .unwrap()
+                .contains("status_update")
+        );
+        drop(stream);
+        for (path, loaded) in [("/models/load", true), ("/models/unload", false)] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({"model": "model-b"}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["success"], true);
+            assert_eq!(state.registry.resolve("model-b").unwrap().is_some(), loaded);
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/models/load")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"model": "model-b", "extra_args": ["--ctx-size", "1024"]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("extra_args")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_props_query_and_template_overrides_are_actionable_before_inference() {
+        let router = app(tiny_state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/props?autoload=perhaps")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("autoload")
+        );
+        let response = router.oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"messages": [{"role": "user", "content": "hello"}], "chat_template_kwargs": {"messages": []}}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reserved")
+        );
+    }
 }

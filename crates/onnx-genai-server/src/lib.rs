@@ -42,6 +42,7 @@ mod sse;
 mod state;
 mod tool_protocol;
 mod types;
+mod webui;
 mod worker;
 
 pub use cli::{ServeArgs, run_serve};
@@ -71,6 +72,36 @@ pub use types::{
 pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/health", get(routes::health))
+        .route("/v1/health", get(routes::health))
+        .route(
+            "/models",
+            get(routes::models)
+                .post(routes::llama::disabled_feature)
+                .delete(routes::llama::disabled_feature),
+        )
+        .route("/models/sse", get(routes::llama::model_events))
+        .route(
+            "/audio/transcriptions",
+            post(routes::audio_transcriptions)
+                .layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
+        .route("/audio/speech", post(routes::audio_speech))
+        .route(
+            "/props",
+            get(routes::llama::props).post(routes::llama::disabled_feature),
+        )
+        .route("/tokenize", post(routes::llama::tokenize))
+        .route("/detokenize", post(routes::llama::detokenize))
+        .route("/apply-template", post(routes::llama::apply_template))
+        .route(
+            "/tools",
+            get(routes::llama::disabled_feature).post(routes::llama::disabled_feature),
+        )
+        .route(
+            "/cors-proxy",
+            get(routes::llama::disabled_feature).post(routes::llama::disabled_feature),
+        )
+        .route("/chat/completions", post(routes::chat_completions))
         .route("/v1/models", get(routes::models))
         .route("/v1/status", get(routes::status))
         .route("/v1/resources", get(routes::resources))
@@ -115,6 +146,8 @@ pub fn app(state: AppState) -> Router {
     }
     if state.config.enable_admin_endpoints {
         router = router
+            .route("/models/load", post(routes::llama::load_model))
+            .route("/models/unload", post(routes::llama::unload_model))
             .route("/v1/admin/models", get(routes::admin_list_models))
             .route("/v1/admin/models/{id}/load", post(routes::admin_load_model))
             .route(
@@ -130,6 +163,7 @@ pub fn app(state: AppState) -> Router {
     #[cfg(feature = "metrics")]
     let router = router.route("/metrics", get(routes::prometheus_metrics));
     router
+        .fallback(webui::serve)
         .with_state(state)
         .layer(middleware::from_fn(trace_request))
 }

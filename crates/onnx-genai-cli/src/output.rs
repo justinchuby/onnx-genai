@@ -1,14 +1,15 @@
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use onnx_genai::ort::{ChatMessage, ChatTemplate};
 use onnx_genai::reasoning::{ReasoningChunk, ReasoningMarkers, ReasoningStream};
 use onnx_genai::{GenerateToken, GenerationBudgetCap};
 
-use super::interactive::{Backend, GENERATING, INTERRUPT_REQUESTED, Interrupted, TurnInput};
-use super::{live_turn, profile};
+use super::execution::{Backend, GENERATING, INTERRUPT_REQUESTED, Interrupted, TurnInput};
+use super::profile;
 use profile::RunProfile;
 
 #[derive(Debug, Clone)]
@@ -302,10 +303,6 @@ pub(super) fn load_chat_template(model_dir: &Path, raw: bool) -> Option<ChatTemp
     }
 }
 
-/// How often the live status is refreshed while a reply streams. Fast enough to
-/// look continuous, slow enough that redrawing is not part of the measurement.
-const STATUS_REFRESH: std::time::Duration = std::time::Duration::from_millis(100);
-
 /// Write one timeline holding both the engine's spans and the runtime's.
 ///
 /// The engine records through the ORT profiler while the native runtime and its
@@ -397,28 +394,23 @@ fn emit_reasoning_segment(
     segment: &ReasoningChunk,
     dim_reasoning: bool,
     dimmed: &mut bool,
-    live: Option<&mut live_turn::LiveTurn>,
 ) -> anyhow::Result<()> {
     if segment.text.is_empty() {
         return Ok(());
     }
-    if let Some(live) = live {
-        live.push(&segment.text, segment.is_reasoning)?;
-    } else {
-        if dim_reasoning && segment.is_reasoning != *dimmed {
-            print!(
-                "{}",
-                if segment.is_reasoning {
-                    "\x1b[2m"
-                } else {
-                    "\x1b[0m"
-                }
-            );
-            *dimmed = segment.is_reasoning;
-        }
-        print!("{}", segment.text);
-        io::stdout().flush()?;
+    if dim_reasoning && segment.is_reasoning != *dimmed {
+        print!(
+            "{}",
+            if segment.is_reasoning {
+                "\x1b[2m"
+            } else {
+                "\x1b[0m"
+            }
+        );
+        *dimmed = segment.is_reasoning;
     }
+    print!("{}", segment.text);
+    io::stdout().flush()?;
     Ok(())
 }
 
@@ -430,10 +422,6 @@ fn visible_token_text(token: &GenerateToken, reasoning: Option<&ReasoningConfig>
         .and_then(|config| config.marker_text_for_token(token.token_id))
         .unwrap_or_default()
         .to_string()
-}
-
-fn live_frame_due(draws: usize, last_draw: Instant, now: Instant) -> bool {
-    draws == 0 || now.duration_since(last_draw) >= STATUS_REFRESH
 }
 
 fn should_emit_stats_line(show_stats: bool, show_profile: bool) -> bool {
@@ -475,7 +463,6 @@ pub(super) fn run_generation_turn(
     profile: Option<&mut RunProfile>,
     reasoning: Option<&ReasoningConfig>,
     response: Option<&ResponseConfig>,
-    live: Option<&mut live_turn::LiveTurn>,
 ) -> anyhow::Result<String> {
     INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
     GENERATING.store(true, Ordering::SeqCst);
@@ -516,11 +503,6 @@ pub(super) fn run_generation_turn(
         .map(|config| ReasoningStream::new(config.markers.clone(), config.opened_by_template));
     let mut response_stream = response.map(ResponseStream::new);
     let mut dimmed = false;
-    let mut live = live.filter(|live| stream && live.is_active());
-    // Numbers move faster than a reader can follow, and every update costs a
-    // frame, so the status is refreshed on a timer rather than per token.
-    let mut last_live_draw = Instant::now();
-    let mut live_draws = 0usize;
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         if INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
             return Err(anyhow::Error::new(Interrupted));
@@ -555,36 +537,7 @@ pub(super) fn run_generation_turn(
                 }]
             };
             for segment in segments {
-                let using_live = live.is_some() && !segment.text.is_empty();
-                emit_reasoning_segment(&segment, dim_reasoning, &mut dimmed, live.as_deref_mut())?;
-                let now = Instant::now();
-                let draw_live_frame = using_live && live_frame_due(live_draws, last_live_draw, now);
-                if draw_live_frame {
-                    live_draws += 1;
-                    last_live_draw = now;
-                    // The first token draws immediately so the line is never empty
-                    // while a reply is on screen; after that the numbers are
-                    // throttled, since they move faster than they can be read and
-                    // every update costs a frame.
-                    let mut status = timings.live_summary();
-                    if let (Some(prompt_tokens), Some(context_limit)) =
-                        (prompt_tokens, context_limit)
-                    {
-                        let context = profile::ContextUsage {
-                            used_tokens: prompt_tokens + timings.tokens(),
-                            max_tokens: context_limit,
-                        };
-                        if status.is_empty() {
-                            status = format!("ctx {context}");
-                        } else {
-                            status.push_str(&format!(" · ctx {context}"));
-                        }
-                    }
-                    if let Some(live) = live.as_deref_mut() {
-                        live.set_status(status)?;
-                        live.draw()?;
-                    }
-                }
+                emit_reasoning_segment(&segment, dim_reasoning, &mut dimmed)?;
             }
         }
         Ok(())
@@ -593,20 +546,15 @@ pub(super) fn run_generation_turn(
     let result = backend.generate(turn, &mut callback);
     if stream && let Some(tracker) = reasoning_stream.as_mut() {
         for segment in tracker.finish() {
-            emit_reasoning_segment(&segment, dim_reasoning, &mut dimmed, live.as_deref_mut())?;
+            emit_reasoning_segment(&segment, dim_reasoning, &mut dimmed)?;
         }
-    }
-    if let Some(live) = live.as_deref_mut() {
-        live.draw()?;
     }
     if dimmed {
         print!("\x1b[0m");
         let _ = io::stdout().flush();
     }
     let output_needs_trailing_newline = needs_trailing_newline(&output);
-    if let Some(live) = live {
-        live.finish(output_needs_trailing_newline)?;
-    } else if stream {
+    if stream {
         if io::stdout().is_terminal() {
             // TTY: conditional — skip when the reply already ended with a
             // newline. A model that terminates with `\n` would otherwise
@@ -657,14 +605,6 @@ pub(super) fn run_generation_turn(
     }
     result?;
     Ok(output)
-}
-
-pub(super) fn display_paths(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 #[cfg(test)]
@@ -902,26 +842,6 @@ mod tests {
         };
 
         assert_eq!(visible_token_text(&eos, Some(&config)), "");
-    }
-
-    #[test]
-    fn live_frames_are_coalesced_over_a_token_burst() {
-        let start = Instant::now();
-        let mut last_draw = start;
-        let mut draws = 0usize;
-
-        for millisecond in 0..250 {
-            let now = start + std::time::Duration::from_millis(millisecond);
-            if live_frame_due(draws, last_draw, now) {
-                draws += 1;
-                last_draw = now;
-            }
-        }
-
-        assert_eq!(
-            draws, 3,
-            "250 token callbacks at 1 ms spacing should draw at t=0, 100, and 200 ms, not once per token"
-        );
     }
 
     /// The stats format is determined by stderr's terminal state, not stdout's.

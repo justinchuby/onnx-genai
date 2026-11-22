@@ -16,20 +16,35 @@ pub(crate) async fn health(
 pub(crate) async fn models(
     State(state): State<AppState>,
 ) -> Result<Json<ModelsResponse>, ApiError> {
+    let statuses = state.registry.statuses().map_err(map_registry_error)?;
+    let mut data = Vec::with_capacity(statuses.len());
+    for status in statuses {
+        let handle = state
+            .registry
+            .lookup_loaded(&status.id)
+            .map_err(map_registry_error)?;
+        let architecture = handle.as_ref().map(|h| {
+            let mut inputs = vec!["text"];
+            if h.multimodal.as_ref().is_some_and(|m| m.vision.is_some()) {
+                inputs.push("image");
+            }
+            if h.multimodal.as_ref().is_some_and(|m| m.audio.is_some()) {
+                inputs.push("audio");
+            }
+            serde_json::json!({"input_modalities": inputs})
+        });
+        data.push(ModelObject {
+            id: status.id,
+            object: "model", created: now_unix(), owned_by: "onnx-genai",
+            status: serde_json::json!({"value": if handle.is_some() { "loaded" } else { "unloaded" }}),
+            architecture,
+            context_length: handle.as_ref().and_then(|h| h.model_max_context),
+            in_cache: false, can_remove: false,
+        });
+    }
     Ok(Json(ModelsResponse {
         object: "list",
-        data: state
-            .registry
-            .ids()
-            .map_err(map_registry_error)?
-            .into_iter()
-            .map(|id| ModelObject {
-                id,
-                object: "model",
-                created: now_unix(),
-                owned_by: "onnx-genai",
-            })
-            .collect(),
+        data,
     }))
 }
 

@@ -228,7 +228,10 @@ async fn stream_completion(
         let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
         let mut emitted_text = false;
         let result = loop {
-            match driver_rx.recv().await {
+            match tokio::select! {
+                _ = tx.closed() => return Ok(()),
+                event = driver_rx.recv() => event,
+            } {
                 Some(DriverEvent::Token(token)) => {
                     if requested_logprobs.is_some() {
                         continue;
@@ -326,10 +329,12 @@ async fn stream_completion(
 pub(crate) async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    ApiJson(request): ApiJson<ChatCompletionRequest>,
+    ApiJson(mut request): ApiJson<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let handle = resolve_model(&state.registry, &request.model).await?;
     validate_request(&request, &state.config)?;
+    super::llama::validate_extensions(&request)?;
+    let handle = resolve_model(&state.registry, &request.model).await?;
+    request.model = handle.id.clone();
     tool_protocol::validate_request(
         &request,
         handle.tool_protocol.as_ref(),
@@ -662,6 +667,8 @@ async fn stream_chat_completion(
                 &user_stop_sequences,
                 wants_constrained_json,
                 &mut driver_rx,
+                prompt_tokens,
+                request.stream_options.include_usage,
             )
             .await;
         }
@@ -669,7 +676,10 @@ async fn stream_chat_completion(
         let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
         let mut channel_gate = PrivateChannelGate::new(handle.private_channels);
         let result = loop {
-            match driver_rx.recv().await {
+            match tokio::select! {
+                _ = tx.closed() => return Ok(()),
+                event = driver_rx.recv() => event,
+            } {
                 Some(DriverEvent::Token(token)) => {
                     let finish_reason = token.finish_reason.clone();
                     // The special-token spelling is only read by an armed gate; a
@@ -784,6 +794,15 @@ async fn stream_chat_completion(
                     )
                     .await?;
                 }
+                if request.stream_options.include_usage {
+                    send_usage(
+                        &tx,
+                        (&id, created, &model),
+                        prompt_tokens,
+                        result.token_ids.len(),
+                    )
+                    .await?;
+                }
             }
             Err(StreamOutputFailure::Driver(err))
                 if wants_constrained_json
@@ -831,13 +850,18 @@ async fn stream_declared_tool_chat_completion(
     user_stop_sequences: &[String],
     wants_constrained_json: bool,
     driver_rx: &mut mpsc::Receiver<DriverEvent>,
+    prompt_tokens: usize,
+    include_usage: bool,
 ) -> anyhow::Result<()> {
     let (id, created, model) = response;
     let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.to_vec());
     let mut channel_gate = PrivateChannelGate::new(private_channels);
     let mut buffered_text = String::new();
     let result = loop {
-        match driver_rx.recv().await {
+        match tokio::select! {
+            _ = tx.closed() => return Ok(()),
+            event = driver_rx.recv() => event,
+        } {
             Some(DriverEvent::Token(token)) => {
                 let finish_reason = token.finish_reason.clone();
                 let spelled = channel_gate
@@ -919,6 +943,9 @@ async fn stream_declared_tool_chat_completion(
                     ),
                 )
                 .await?;
+            }
+            if include_usage {
+                send_usage(tx, response, prompt_tokens, result.token_ids.len()).await?;
             }
         }
         Err(StreamOutputFailure::Driver(err))
@@ -1148,7 +1175,8 @@ fn prepare_audio_generate_request(
     Ok(PreparedGenerateRequest {
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
-            options: build_generate_options_with_tokenizer(request, tokenizer, output_budget),
+            options: build_generate_options_with_tokenizer(request, tokenizer, output_budget)
+                .map_err(|err| ApiError::invalid_request(err.to_string()))?,
         },
         prompt_tokens,
     })
@@ -1188,12 +1216,12 @@ fn validate_request(
     }
     if !request.typical_p.is_finite() || !(0.0..=1.0).contains(&request.typical_p) {
         return Err(ApiError::bad_request(
-            "typical_p must be finite and between 0 and 1",
+            "typ_p must be finite and between 0 and 1",
         ));
     }
     if !request.repetition_penalty.is_finite() || request.repetition_penalty <= 0.0 {
         return Err(ApiError::bad_request(
-            "repetition_penalty must be finite and greater than zero",
+            "repeat_penalty must be finite and greater than zero",
         ));
     }
     if !request.frequency_penalty.is_finite() {
@@ -1600,11 +1628,18 @@ async fn get_or_create_session(
 
 /// Builds a generation request without a server in hand, so an unspecified
 /// output budget falls back to the default cap a server would have applied.
-pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateRequest {
-    GenerateRequest {
+pub fn build_generate_request(
+    request: &ChatCompletionRequest,
+    tokenizer: &Tokenizer,
+) -> anyhow::Result<GenerateRequest> {
+    Ok(GenerateRequest {
         prompt: GeneratePrompt::Text(build_prompt(request)),
-        options: build_generate_options(request, request.output_budget(DEFAULT_MAX_OUTPUT_TOKENS)),
-    }
+        options: build_generate_options_with_tokenizer(
+            request,
+            tokenizer,
+            request.output_budget(DEFAULT_MAX_OUTPUT_TOKENS),
+        )?,
+    })
 }
 
 /// Build options for one already-resolved package protocol.
@@ -1614,9 +1649,13 @@ pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateReques
 pub fn build_generate_request_with_protocol(
     request: &ChatCompletionRequest,
     protocol: &ToolProtocol,
-) -> Result<GenerateRequest, tool_protocol::ToolProtocolError> {
-    let mut options =
-        build_generate_options(request, request.output_budget(DEFAULT_MAX_OUTPUT_TOKENS));
+    tokenizer: &Tokenizer,
+) -> anyhow::Result<GenerateRequest> {
+    let mut options = build_generate_options_with_tokenizer(
+        request,
+        tokenizer,
+        request.output_budget(DEFAULT_MAX_OUTPUT_TOKENS),
+    )?;
     apply_tool_output_constraint(&mut options, protocol, request)?;
     let rendered = protocol.render(request)?;
     Ok(GenerateRequest {
@@ -1823,7 +1862,7 @@ fn prepare_generate_request(
         .encode(&prompt)
         .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
     let prompt_tokens = token_ids.len();
-    let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget);
+    let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget)?;
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
     options.resolve_sampling_defaults(
@@ -1850,7 +1889,8 @@ fn build_generate_options(
     // Chat historically used greedy decoding even with its default temperature
     // and top-p fields. Preserve that default while treating the newly exposed
     // stochastic controls as an explicit request to sample.
-    let stochastic_sampling_requested = request.seed.is_some()
+    let stochastic_sampling_requested = request.temperature.is_some_and(|t| t > 0.0)
+        || request.seed.is_some()
         || request.top_k > 0
         || request.min_p > 0.0
         || request.top_a > 0.0
@@ -1866,6 +1906,11 @@ fn build_generate_options(
         top_a: request.top_a,
         typical_p: request.typical_p,
         repetition_penalty: request.repetition_penalty,
+        repetition_window: request
+            .extensions
+            .get("repeat_last_n")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok()),
         frequency_penalty: request.frequency_penalty,
         presence_penalty: request.presence_penalty,
         greedy: request.temperature == Some(0.0) || !stochastic_sampling_requested,
@@ -1874,7 +1919,7 @@ fn build_generate_options(
             multiplier: request.dry_multiplier,
             base: request.dry_base,
             allowed_length: request.dry_allowed_length,
-            sequence_breakers: request.dry_sequence_breakers.clone(),
+            sequence_breakers: Vec::new(),
         }),
         mirostat: match request.mirostat {
             1 => Some(MirostatConfig {
@@ -1934,7 +1979,8 @@ fn apply_tool_output_constraint(
 /// temperature/top_p/top_k, and only the greedy (do_sample) decision defers to
 /// the model.
 fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides {
-    let requests_sampling = request.seed.is_some()
+    let requests_sampling = request.temperature.is_some_and(|t| t > 0.0)
+        || request.seed.is_some()
         || request.top_k > 0
         || request.min_p > 0.0
         || request.top_a > 0.0
@@ -1993,10 +2039,26 @@ fn response_format_constraint(request: &ChatCompletionRequest) -> Option<Generat
 
 fn build_generate_options_with_tokenizer(
     request: &ChatCompletionRequest,
-    _tokenizer: &Tokenizer,
+    tokenizer: &Tokenizer,
     output_budget: usize,
-) -> GenerateOptions {
-    build_generate_options(request, output_budget)
+) -> anyhow::Result<GenerateOptions> {
+    let mut options = build_generate_options(request, output_budget);
+    if let Some(dry) = &mut options.dry {
+        for (index, breaker) in request.dry_sequence_breakers.iter().enumerate() {
+            let ids = tokenizer
+                .inner()
+                .encode(breaker.as_str(), false)
+                .map_err(|err| {
+                    anyhow::anyhow!("dry_sequence_breakers[{index}] could not be tokenized: {err}")
+                })?;
+            anyhow::ensure!(
+                ids.len() == 1,
+                "dry_sequence_breakers[{index}] must encode to one token on this backend; remove the breaker or disable DRY"
+            );
+            dry.sequence_breakers.push(ids.get_ids()[0]);
+        }
+    }
+    Ok(options)
 }
 
 fn json_constraint_stopped_incomplete_message(message: &str) -> bool {
@@ -2029,6 +2091,7 @@ fn template_message(
             .unwrap_or_default(),
     )
     .with_tool_result(message.name.clone(), message.tool_call_id.clone());
+    template_message.reasoning_content = message.reasoning_content.clone();
     if let Some(tool_calls) = &message.tool_calls {
         template_message = template_message.with_tool_calls(template_tool_calls(tool_calls)?);
     }
@@ -2063,10 +2126,28 @@ fn template_tool_calls(tool_calls: &[ChatMessageToolCall]) -> anyhow::Result<ser
     Ok(value)
 }
 
+pub(super) fn render_model_prompt(
+    request: &ChatCompletionRequest,
+    handle: &ModelHandle,
+    default_reasoning_effort: Option<ReasoningEffort>,
+) -> anyhow::Result<String> {
+    render_prompt(
+        request,
+        &PromptContext {
+            chat_template: handle.chat_template.as_deref(),
+            tool_protocol: handle.tool_protocol.as_ref(),
+            image_placeholder: None,
+            generation_defaults: handle.generation_defaults.as_ref(),
+            default_reasoning_effort,
+        },
+    )
+}
+
 fn render_prompt(
     request: &ChatCompletionRequest,
     context: &PromptContext<'_>,
 ) -> anyhow::Result<String> {
+    ChatTemplate::validate_kwargs(&request.chat_template_kwargs)?;
     if let Some(chat_template) = context.chat_template {
         let messages = request
             .messages
@@ -2079,16 +2160,17 @@ fn render_prompt(
             .transpose()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         return chat_template
-            .render_with_reasoning_effort(
+            .render_with_kwargs(
                 &messages,
                 rendered_tools
                     .as_ref()
                     .and_then(|rendered| rendered.tools_json.as_deref()),
-                true,
+                request.add_generation_prompt,
                 request
                     .reasoning_effort
                     .or(context.default_reasoning_effort)
                     .map(ReasoningEffort::as_str),
+                &request.chat_template_kwargs,
             )
             .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"));
     }
@@ -2132,7 +2214,9 @@ fn build_prompt_with_tool_prefix(request: &ChatCompletionRequest, tool_prefix: &
         }
         prompt.push('\n');
     }
-    prompt.push_str("<|assistant|>\n");
+    if request.add_generation_prompt {
+        prompt.push_str("<|assistant|>\n");
+    }
     prompt
 }
 
@@ -3349,4 +3433,22 @@ mod buffered_reasoning_tests {
         );
         assert_eq!(atem_visible_content(&output).as_deref(), Some(""));
     }
+}
+
+async fn send_usage(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    (id, created, model): (&str, u64, &str),
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> anyhow::Result<()> {
+    let data = serde_json::json!({
+        "id": id, "object": "chat.completion.chunk", "created": created,
+        "model": model, "choices": [], "usage": {
+            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens
+        }
+    });
+    tx.send(Ok(Event::default().data(data.to_string())))
+        .await
+        .context("stream receiver closed before usage delivery")
 }
