@@ -740,3 +740,19 @@ reduction differences and f64-oracle error bounds. No token-equivalence, GPU
 behavior or throughput claim follows. The shared BLAS boundary validates buffer
 extents and ABI dimensions before unsafe entry; pure native GEMV keeps usize
 shape extents. Memory placement and grant/reclaim algorithms are unchanged.
+
+
+### Reuse-gated Apple dense prefill
+
+The resolved NT capability declares its dense-prefill reuse policy. Apple uses
+NT only when immutable weights and the existing dense-byte ceiling admit NK
+retention. With disabled/insufficient retention or mutable metadata, it preserves
+KN preparation; physical grant refusal still follows the existing fallbacks.
+This does not add a budget, model identity gate or geometry tuning table.
+
+[Actual execute evidence](../benchmarks/APPLE_NT_EXECUTE_AB.md) keeps the initial
+transient-NT observations separate from a newly recorded reuse-gated corpus.
+Build-count, Host-charge and successful-NT-call witnesses accompany every cell.
+The source's thread-local diagnostic selector is absent from shipped builds;
+its scope/unwind behavior is tested. Process CPU includes framework/worker spin,
+and no model throughput, RSS or other-device behavior follows from the numbers.

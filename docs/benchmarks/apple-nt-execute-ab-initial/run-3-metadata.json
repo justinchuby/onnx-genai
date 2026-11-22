@@ -1,0 +1,41 @@
+{
+  "source_commit": "afe9cc8ede968b8fbf10948bfda6a868e72d3b4b",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_nbits.rs": "5afa95419802ccf9eb6f3dd410e773dfe53e69713b2947c2c5ec3f8a5f7681cf",
+    "scripts/bench_apple_dense_execute.py": "6aa7a18dd418db65ad2e29de64c0c363213bfb8fd489b6a2b95393f544b54f0e",
+    "scripts/test_bench_apple_dense_execute.py": "bf1639bda858c016f08643375d4bd8e394cfbb25d0dfeb5604b24f033826e491"
+  },
+  "binary": "/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-a26db3a5d89b84f9",
+  "binary_sha256": "4e72436e76e22bb9782828923250c3557e24d1e844747081e823e9a88cc6b4eb",
+  "cargo_lock_sha256": "d84aae080dc08d740c9a44e02780a72c943716de13048d06110c9039bf6da54d",
+  "cargo_manifest_sha256": "9e87e15986f1c87b243ad43c787fc1f8bc42423c65cbf0d20e4eadcf299bd52e",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "cpu": "Apple M1 Max",
+  "features": "default; no MLAS",
+  "selected_environment": {
+    "NXRT_CPU_DISPATCH_LEDGER": null,
+    "ONNX_GENAI_PROFILE_MM": null,
+    "NXRT_CPU_GEMM_BACKEND": null,
+    "RAYON_NUM_THREADS": null,
+    "VECLIB_MAXIMUM_THREADS": null,
+    "VECLIB_NUM_THREADS": null,
+    "OMP_NUM_THREADS": null
+  },
+  "shared_host_lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "scope": "synchronous real factory kernel execute; process CPU includes worker activity/spin; libtest cache bookkeeping and test-only route selector included; no affinity or isolation claim",
+  "sweep": 3,
+  "load_before": [
+    2.44677734375,
+    1.8193359375,
+    1.92724609375
+  ],
+  "start_utc": "2026-11-22T11:35:27Z",
+  "rayon_threads": 10,
+  "load_after": [
+    3.05126953125,
+    1.955078125,
+    1.97412109375
+  ],
+  "end_utc": "2026-11-22T11:35:36Z"
+}

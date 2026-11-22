@@ -1014,3 +1014,25 @@ returns actionable errors. Its validated operand type also serves GEMV; ABI
 limits are enforced only for BLAS, preserving the native large-GEMV usize
 extent domain. The optional MLAS reference is unchanged and no family is
 thereby graduated.
+
+
+### Resolve NT implementation and reuse policy together
+
+The transposed-GEMM predicate and unchecked backend dispatcher are replaced by
+one resolved `NtGemm` value with private fields. Resolution includes backend
+availability (and runtime AVX2/FMA eligibility for the native x86 implementation)
+and its prefill weight-reuse requirement. Execution consumes that value. Generic
+NN remains available when NT cannot resolve; no compatibility functions remain.
+
+The [real-execute comparison](../benchmarks/APPLE_NT_EXECUTE_AB.md) preserves an
+initial transient-NT candidate with qualified wall regressions in its zero-cache
+128x1024x1024 fixture. The Apple descriptor now requires admitted NK retention,
+using the existing constant-input and dense-byte-limit rule rather than a model
+or geometry threshold. Disabled/insufficient retention and mutable metadata keep
+the established KN route. Other NT backend policies are unchanged. Protocol 2
+records successful NT calls so the zero-retention null cannot silently measure
+NT. Original results and failed A/A cells are retained separately.
+
+These are instrumented real-kernel execute observations on one Apple tier, not
+model throughput, production-latency guarantees or MLAS graduation. The separate
+non-dyadic numerical contract and all grant/pressure/fallback guards remain.

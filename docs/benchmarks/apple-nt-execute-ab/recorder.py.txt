@@ -1,0 +1,46 @@
+import hashlib,json,os,pathlib,platform,re,subprocess,time
+root=pathlib.Path('/tmp/nxrt-compact-wire-grants');prefix='/tmp/nxrt-apple-execute-ab-final'
+paths=['crates/onnx-runtime-ep-cpu/src/kernels/matmul_nbits.rs','crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs','scripts/bench_apple_dense_execute.py','scripts/test_bench_apple_dense_execute.py']
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+fingerprints={p:sha(root/p) for p in paths}
+head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+selected_env={name:os.environ.get(name) for name in ['NXRT_CPU_DISPATCH_LEDGER','ONNX_GENAI_PROFILE_MM','NXRT_CPU_GEMM_BACKEND','RAYON_NUM_THREADS','VECLIB_MAXIMUM_THREADS','VECLIB_NUM_THREADS','OMP_NUM_THREADS']}
+for name in ['NXRT_CPU_DISPATCH_LEDGER','ONNX_GENAI_PROFILE_MM']:
+ if selected_env[name] not in [None,'','0']:raise RuntimeError('record with optional instrumentation disabled: '+name)
+if selected_env['NXRT_CPU_GEMM_BACKEND']:raise RuntimeError('record the default backend with NXRT_CPU_GEMM_BACKEND unset')
+def run(command,label,names=()):
+ p=pathlib.Path(prefix+'-'+label+'.log')
+ with p.open('w') as out:r=subprocess.run(command,cwd=root,stdout=out,stderr=subprocess.STDOUT)
+ data=p.read_text()
+ if r.returncode:print(data[-10000:],flush=True);raise RuntimeError('command failed: '+str(p))
+ for name in names:
+  if not any(line.startswith('test ') and line.endswith(name+' ... ok') for line in data.splitlines()):raise RuntimeError('named test did not pass: '+name)
+ print('PASS '+str(p),flush=True);return data
+name='kernels::matmul_nbits::tests::bench_apple_dense_execute_kn_nt_ab'
+base=['cargo','test','--locked','-p','onnx-runtime-ep-cpu','--release','--lib',name,'--','--exact','--ignored']
+listing=run(base+['--list'],'list')
+if [line.split(': test')[0] for line in listing.splitlines() if line.endswith(': test')]!=[name]:raise RuntimeError('wrong diagnostic selector')
+match=re.search(r'Running unittests src/lib.rs \(([^\n]+)\)',listing)
+if not match:raise RuntimeError('missing diagnostic binary')
+binary=pathlib.Path(match[1]);binary_sha=sha(binary)
+common={'protocol':2,'source_commit':head,'source_sha256':fingerprints,'binary':str(binary),'binary_sha256':binary_sha,'cargo_lock_sha256':sha(root/'Cargo.lock'),'cargo_manifest_sha256':sha(root/'crates/onnx-runtime-ep-cpu/Cargo.toml'),'rustc':subprocess.check_output(['rustc','-vV'],text=True),'platform':platform.platform(),'cpu':'Apple M1 Max','features':'default; no MLAS','selected_environment':selected_env,'shared_host_lock':'/tmp/onnx-genai-hostlock-darwin.flock','scope':'synchronous real factory kernel execute; process CPU includes worker activity/spin; libtest cache bookkeeping and test-only route selector included; no affinity or isolation claim'}
+for sweep in [1,2,3]:
+ if any(sha(root/p)!=value for p,value in fingerprints.items()) or sha(binary)!=binary_sha:raise RuntimeError('source/binary drift')
+ meta=dict(common,sweep=sweep,load_before=os.getloadavg(),start_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()))
+ data=run(base+['--nocapture'],f'run-{sweep}',[name])
+ if any(sha(root/p)!=value for p,value in fingerprints.items()) or sha(binary)!=binary_sha:raise RuntimeError('source/binary changed during diagnostic')
+ records=re.findall(r'ANT_(?:SAMPLE|WITNESS),[^\r\n]*',data)
+ pathlib.Path(prefix+f'-run-{sweep}.csv').write_text('\n'.join(records)+'\n')
+ context=re.findall(r'APPLE_EXECUTE_CONTEXT rayon_threads=(\d+)',data)
+ if len(context)!=1 or int(context[0])<1:raise RuntimeError('missing runtime thread context')
+ meta.update(rayon_threads=int(context[0]),load_after=os.getloadavg(),end_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()))
+ pathlib.Path(prefix+f'-run-{sweep}-metadata.json').write_text(json.dumps(meta,indent=2)+'\n')
+ summary=json.loads(subprocess.check_output(['python3','-O','scripts/bench_apple_dense_execute.py',prefix+f'-run-{sweep}.csv'],cwd=root,text=True))
+ pathlib.Path(prefix+f'-run-{sweep}-summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+ print(f'RECORDED sweep {sweep}: '+json.dumps({clock:sum(c[clock]['qualified'] for c in summary['cells']) for clock in ['cpu','wall']}),flush=True)
+for features,label in [([], 'native'),(['--features','mlas'],'mlas')]:
+ run(['cargo','test','--locked','-p','onnx-runtime-ep-cpu',*features,'--lib'],label+'.tests',['::apple_kn_diagnostic_scope_is_thread_local_and_restores_after_unwind','::apple_dense_prefill_reuses_one_nk_expansion','::apple_dense_prefill_without_reuse_keeps_kn_and_no_nt_calls','::unresolved_nt_keeps_the_portable_nn_backend_available'])
+ run(['cargo','clippy','--locked','-p','onnx-runtime-ep-cpu',*features,'--all-targets','--','-D','warnings'],label+'.clippy')
+
+ run(['cargo','test','--locked','-p','onnx-runtime-session',*features,'--lib'],label+'-session.tests',['::apple_nbits_prefill_and_decode_share_one_dense_expansion'])
+ run(['cargo','clippy','--locked','-p','onnx-runtime-session',*features,'--all-targets','--','-D','warnings'],label+'-session.clippy')

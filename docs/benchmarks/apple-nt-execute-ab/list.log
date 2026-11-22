@@ -1,0 +1,6 @@
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-ep-cpu)
+    Finished `release` profile [optimized] target(s) in 2m 25s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-a26db3a5d89b84f9)
+kernels::matmul_nbits::tests::bench_apple_dense_execute_kn_nt_ab: test
+
+1 test, 0 benchmarks

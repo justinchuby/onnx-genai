@@ -1,0 +1,12 @@
+{"lock": "/tmp/onnx-genai-hostlock-darwin.flock", "mechanism": "Darwin fcntl.flock; hostlock.sh unsupported", "pid": 44662, "load_before": [2.86474609375, 2.4365234375, 2.26513671875], "command": ["cargo", "test", "--locked", "-p", "onnx-runtime-ep-cpu", "--lib", "kernels::matmul_nbits::tests::apple_dense_prefill", "--", "--nocapture"]}
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-ep-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.53s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-30635267f98d516a)
+
+running 2 tests
+test kernels::matmul_nbits::tests::apple_dense_prefill_reuses_one_nk_expansion ... ok
+test kernels::matmul_nbits::tests::apple_dense_prefill_without_reuse_keeps_kn_and_no_nt_calls ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1987 filtered out; finished in 0.01s
+
+{"wall_s": 19.37940437500947, "cpu_s": 36.592873000000004, "maxrss_bytes": 2501591040, "load_after": [3.3193359375, 2.56884765625, 2.31591796875]}
