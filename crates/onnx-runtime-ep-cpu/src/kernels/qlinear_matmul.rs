@@ -7,8 +7,27 @@ use onnx_runtime_ir::{
 use rayon::prelude::*;
 
 use super::{check_arity, qgemm_native, to_dense_bytes, write_dense_bytes};
+use crate::DerivedWeightMemory;
+#[cfg(feature = "mlas")]
+use crate::resources::{DerivedWeightGrant, WeightAdmission};
 use crate::strided::numel;
 use std::borrow::Cow;
+#[cfg(feature = "mlas")]
+use std::sync::{Arc, Mutex};
+
+/// The payload is dropped before its Host grant, including after cache eviction.
+#[cfg(feature = "mlas")]
+struct GrantedQgemmPack {
+    packed: mlas_sys::QgemmPackedB,
+    _grant: DerivedWeightGrant,
+}
+
+#[cfg(feature = "mlas")]
+struct CachedQgemmPack {
+    key: QgemmPackKey,
+    // None records a reference layout refusal, never a temporary capacity refusal.
+    packed: Option<Arc<GrantedQgemmPack>>,
+}
 
 /// Borrow a tensor's bytes when they are already dense, copy them when they are
 /// not.
@@ -319,46 +338,58 @@ pub struct QLinearMatMulKernel {
     /// index 3 (`B`) is consulted; the rest are carried so the array lines up
     /// with the operand list.
     constant_inputs: [bool; 8],
-    /// `B` pre-packed into MLAS's quantized kernel layout, built at most once.
-    ///
-    /// `None` inside the `OnceLock` records that MLAS declined to pack this
-    /// shape, so the unpacked path is used and no further attempt is made.
+    /// One constant weight pack; construction is serialized before allocation.
+    /// Active calls own an Arc, so its grant follows the payload's last owner.
     #[cfg(feature = "mlas")]
-    packed_b: std::sync::OnceLock<Option<(QgemmPackKey, mlas_sys::QgemmPackedB)>>,
+    packed_b: Mutex<Option<CachedQgemmPack>>,
+    #[cfg(feature = "mlas")]
+    weight_memory: DerivedWeightMemory,
 }
 
 pub struct QLinearMatMulFactory {
     retain_caches: bool,
+    weight_memory: DerivedWeightMemory,
 }
 impl QLinearMatMulFactory {
-    pub fn new(retain_caches: bool) -> Self {
-        Self { retain_caches }
+    /// Bind retained reference packs to the provider's immutable Host grant source.
+    pub fn new(retain_caches: bool, weight_memory: DerivedWeightMemory) -> Self {
+        Self {
+            retain_caches,
+            weight_memory,
+        }
     }
 }
 impl Default for QLinearMatMulFactory {
     fn default() -> Self {
-        Self::new(true)
+        Self::new(true, DerivedWeightMemory::default())
     }
 }
 impl Default for QLinearMatMulKernel {
     fn default() -> Self {
-        Self::new(true)
+        Self::new(true, DerivedWeightMemory::default())
     }
 }
 
 impl KernelFactory for QLinearMatMulFactory {
     fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(QLinearMatMulKernel::new(self.retain_caches)))
+        Ok(Box::new(QLinearMatMulKernel::new(
+            self.retain_caches,
+            self.weight_memory.clone(),
+        )))
     }
 }
 
 impl QLinearMatMulKernel {
-    fn new(retain_caches: bool) -> Self {
+    fn new(retain_caches: bool, weight_memory: DerivedWeightMemory) -> Self {
+        #[cfg(not(feature = "mlas"))]
+        let _ = weight_memory;
         Self {
             retain_caches,
             constant_inputs: [false; 8],
             #[cfg(feature = "mlas")]
-            packed_b: std::sync::OnceLock::new(),
+            packed_b: Mutex::new(None),
+            #[cfg(feature = "mlas")]
+            weight_memory,
         }
     }
     /// The identity a pack for this call would have, or `None` when `B` must
@@ -400,27 +431,64 @@ impl QLinearMatMulKernel {
     /// has a pack can skip densifying `B` entirely -- the dense bytes exist
     /// only to feed the packer.
     #[cfg(feature = "mlas")]
-    fn pack_lookup(&self, key: QgemmPackKey) -> Option<&mlas_sys::QgemmPackedB> {
-        self.packed_b
-            .get()?
+    fn pack_lookup(&self, key: QgemmPackKey) -> Result<Option<Arc<GrantedQgemmPack>>> {
+        let cache = self.packed_b.lock().map_err(|_| EpError::KernelFailed(
+            "QLinearMatMul packed-weight cache lock was poisoned; recreate the CPU kernel before retrying".into()
+        ))?;
+        Ok(cache
             .as_ref()
-            .and_then(|(cached, packed)| (*cached == key).then_some(packed))
+            .filter(|cached| cached.key == key)
+            .and_then(|cached| cached.packed.clone()))
     }
 
-    /// Build the pack for `key` from `b_bytes`, at most once per kernel.
-    ///
-    /// A stored `None` records that MLAS declined this shape, so the unpacked
-    /// path serves every later call without another attempt.
+    /// Serialize the first construction, then keep its grant with the payload.
+    /// A capacity refusal leaves the slot empty so a later call can retry.
+    /// A different weight never builds a throwaway pack or uses the cached one.
     #[cfg(feature = "mlas")]
-    fn pack_build(&self, key: QgemmPackKey, b_bytes: &[u8]) -> Option<&mlas_sys::QgemmPackedB> {
-        if b_bytes.len() != key.k.checked_mul(key.n)? {
-            return None;
+    fn pack_build(
+        &self,
+        key: QgemmPackKey,
+        b_bytes: &[u8],
+    ) -> Result<Option<Arc<GrantedQgemmPack>>> {
+        if key.k.checked_mul(key.n) != Some(b_bytes.len()) {
+            return Ok(None);
         }
-        let packed = mlas_sys::QgemmPackedB::new(key.n, key.k, b_bytes, key.a_signed, key.b_signed);
-        self.packed_b
-            .get_or_init(|| packed.map(|packed| (key, packed)))
+        let mut cache = self.packed_b.lock().map_err(|_| EpError::KernelFailed(
+            "QLinearMatMul packed-weight cache lock was poisoned; recreate the CPU kernel before retrying".into()
+        ))?;
+        if let Some(cached) = cache.as_ref() {
+            return Ok((cached.key == key).then(|| cached.packed.clone()).flatten());
+        }
+        let Some(bytes) = mlas_sys::qgemm_pack_b_size(key.n, key.k, key.a_signed, key.b_signed)
+        else {
+            *cache = Some(CachedQgemmPack { key, packed: None });
+            return Ok(None);
+        };
+        let grant = match self.weight_memory.try_grant(bytes)? {
+            WeightAdmission::Granted(grant) => grant,
+            WeightAdmission::Declined(_) => return Ok(None),
+        };
+        let packed = mlas_sys::QgemmPackedB::new(key.n, key.k, b_bytes, key.a_signed, key.b_signed)
+            .map(|packed| {
+                Arc::new(GrantedQgemmPack {
+                    packed,
+                    _grant: grant,
+                })
+            });
+        if packed
             .as_ref()
-            .and_then(|(cached, packed)| (*cached == key).then_some(packed))
+            .is_some_and(|payload| payload.packed.owned_heap_bytes() != bytes)
+        {
+            return Err(EpError::KernelFailed(format!(
+                "QLinearMatMul packed B allocation disagrees with its {bytes}-byte Host grant for K={} N={}; fix the reference size query before retaining the pack",
+                key.k, key.n
+            )));
+        }
+        *cache = Some(CachedQgemmPack {
+            key,
+            packed: packed.clone(),
+        });
+        Ok(packed)
     }
 }
 
@@ -655,7 +723,12 @@ impl Kernel for QLinearMatMulKernel {
             .as_ref()
             .and_then(|plan| self.pack_key(&inputs[3], &geometry, plan));
         #[cfg(feature = "mlas")]
-        let pack_ready = pack_key.is_some_and(|key| self.pack_lookup(key).is_some());
+        let existing_pack = pack_key
+            .map(|key| self.pack_lookup(key))
+            .transpose()?
+            .flatten();
+        #[cfg(feature = "mlas")]
+        let pack_ready = existing_pack.is_some();
         #[cfg(not(feature = "mlas"))]
         let pack_ready = false;
         #[cfg_attr(not(feature = "mlas"), allow(unused_mut))]
@@ -685,10 +758,15 @@ impl Kernel for QLinearMatMulKernel {
         }
         // Loop-invariant: the pack depends only on the weight, not the batch.
         #[cfg(feature = "mlas")]
-        let packed = pack_key.and_then(|key| match self.pack_lookup(key) {
+        let packed_owner = match existing_pack {
             Some(packed) => Some(packed),
-            None => self.pack_build(key, &b_bytes),
-        });
+            None => pack_key
+                .map(|key| self.pack_build(key, &b_bytes))
+                .transpose()?
+                .flatten(),
+        };
+        #[cfg(feature = "mlas")]
+        let packed = packed_owner.as_deref().map(|owner| &owner.packed);
         #[cfg(not(feature = "mlas"))]
         let packed: Option<&()> = None;
         let (m, k, n) = (geometry.m, geometry.k, geometry.n);
@@ -3198,7 +3276,12 @@ mod tests {
     /// Returns whether this kernel is holding a built pack.
     #[cfg(all(test, feature = "mlas"))]
     fn qlinear_pack_state(kernel: &QLinearMatMulKernel) -> Option<bool> {
-        kernel.packed_b.get().map(|slot| slot.is_some())
+        kernel
+            .packed_b
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|slot| slot.packed.is_some())
     }
 
     #[cfg(feature = "mlas")]
@@ -3252,7 +3335,7 @@ mod tests {
     }
 
     #[cfg(feature = "mlas")]
-    fn run_with(kernel: &QLinearMatMulKernel, fixture: &PackFixture) -> Owned {
+    fn run_with(kernel: &dyn Kernel, fixture: &PackFixture) -> Owned {
         let mut output = Owned::zeros(DataType::Uint8, &[fixture.m, fixture.n]);
         let (a_scale, a_zero) = (Owned::f32(&[], &[0.02]), Owned::u8(&[], &[128]));
         let (b_scale, b_zero) = (Owned::f32(&[], &[0.01]), Owned::u8(&[], &[127]));
@@ -3269,6 +3352,163 @@ mod tests {
         ];
         kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
         output
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn provider_qlinear_pack_owns_its_host_grant() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let fixture = pack_fixture(3, 64, 96, 1);
+        let bytes = mlas_sys::qgemm_pack_b_size(96, 64, false, false)
+            .expect("the fixture must support an actual packed allocation");
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+        let resources = crate::CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap(),
+            crate::CpuWeightCacheLimits::default(),
+        )
+        .unwrap();
+        let provider = crate::CpuExecutionProvider::with_resources(resources);
+        let mut kernel = provider
+            .get_kernel(
+                &Node::new(onnx_runtime_ir::NodeId(0), "QLinearMatMul", vec![], vec![]),
+                &[],
+                10,
+            )
+            .unwrap();
+        kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        assert_eq!(governor.used(Tier::Host), 0);
+        let actual = run_with(kernel.as_ref(), &fixture);
+        assert_eq!(
+            governor.used(Tier::Host),
+            bytes as u64,
+            "the provider's Host books must fund the actual pack"
+        );
+        assert_eq!(
+            actual.bytes,
+            run_with(&QLinearMatMulKernel::default(), &fixture).bytes
+        );
+        assert_eq!(run_with(kernel.as_ref(), &fixture).bytes, actual.bytes);
+        assert_eq!(
+            governor.used(Tier::Host),
+            bytes as u64,
+            "a warm hit must not claim a second pack"
+        );
+        drop(kernel);
+        assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn qlinear_pack_capacity_refusal_retries_and_active_owner_keeps_grant() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let fixture = pack_fixture(3, 64, 96, 9);
+        let bytes = mlas_sys::qgemm_pack_b_size(96, 64, false, false).unwrap();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+        let memory = crate::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        let mut kernel = QLinearMatMulKernel::new(true, memory);
+        kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        let kv = governor
+            .reserve(
+                Tier::Host,
+                bytes as u64,
+                MemoryRole::KvCache,
+                HolderId::new(7),
+            )
+            .unwrap();
+        let unpacked = run_with(&kernel, &fixture);
+        assert!(
+            qlinear_pack_state(&kernel).is_none(),
+            "capacity refusal must leave a retryable empty slot"
+        );
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(kv);
+        assert_eq!(governor.used(Tier::Host), 0);
+        let packed = run_with(&kernel, &fixture);
+        assert_eq!(
+            packed.bytes, unpacked.bytes,
+            "refused and admitted routes must agree bitwise"
+        );
+        assert_eq!(qlinear_pack_state(&kernel), Some(true));
+        let key = kernel.packed_b.lock().unwrap().as_ref().unwrap().key;
+        let live = kernel.pack_lookup(key).unwrap().unwrap();
+        assert_eq!(live.packed.owned_heap_bytes(), bytes);
+        drop(kernel);
+        assert_eq!(
+            governor.used(Tier::Host),
+            bytes as u64,
+            "an active call must keep its payload charged after kernel drop"
+        );
+        assert!(
+            governor
+                .reserve(Tier::Host, 1, MemoryRole::KvCache, HolderId::new(7))
+                .is_err()
+        );
+        drop(live);
+        assert_eq!(governor.used(Tier::Host), 0);
+        let _kv = governor
+            .reserve(
+                Tier::Host,
+                bytes as u64,
+                MemoryRole::KvCache,
+                HolderId::new(7),
+            )
+            .unwrap();
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn qlinear_pack_concurrent_builders_share_one_granted_payload() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let fixture = pack_fixture(3, 64, 96, 9);
+        let bytes = mlas_sys::qgemm_pack_b_size(96, 64, false, false).unwrap();
+        let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+        let memory = crate::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
+        let kernel = QLinearMatMulKernel::new(true, memory);
+        let key = QgemmPackKey {
+            addr: fixture.b.bytes.as_ptr() as usize,
+            k: 64,
+            n: 96,
+            a_signed: false,
+            b_signed: false,
+            flip_b: false,
+        };
+        let barrier = std::sync::Barrier::new(8);
+        let owners = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        kernel.pack_build(key, &fixture.b.bytes).unwrap().unwrap()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(owners.len(), 8);
+        assert!(owners.iter().all(|owner| Arc::ptr_eq(owner, &owners[0])));
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        let other = QgemmPackKey {
+            addr: key.addr + 1,
+            ..key
+        };
+        assert!(
+            kernel
+                .pack_build(other, &fixture.b.bytes)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(kernel);
+        assert_eq!(governor.used(Tier::Host), bytes as u64);
+        drop(owners);
+        assert_eq!(governor.used(Tier::Host), 0);
     }
 
     /// A constant weight must be packed exactly once and then reused, and the
@@ -3375,7 +3615,9 @@ mod tests {
                         )
                         .unwrap(),
                 )
+                .unwrap()
                 .unwrap();
+            let packed = &packed.packed;
             let zeros = vec![127u8; n];
             let mut products = vec![0i32; m * n];
             for _ in 0..3 {
@@ -3654,11 +3896,14 @@ mod tests {
             .pack_key(&flat.view(), &plan_geometry, &plan)
             .expect("a constant 2-D weight is packable, or the rest is vacuous");
         assert!(
-            kernel.pack_build(key, &[7u8; 8]).is_none(),
+            kernel.pack_build(key, &[7u8; 8]).unwrap().is_none(),
             "a byte count that is not k * n must be declined, not packed"
         );
         assert!(
-            kernel.pack_build(key, &vec![7u8; 64 * 96]).is_some(),
+            kernel
+                .pack_build(key, &vec![7u8; 64 * 96])
+                .unwrap()
+                .is_some(),
             "MLAS must accept this shape, or the decline above proves nothing"
         );
     }
