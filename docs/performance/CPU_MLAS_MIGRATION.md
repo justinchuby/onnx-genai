@@ -1139,8 +1139,8 @@ computation paths; admitted calls keep their existing packed reuse. MatMul,
 Gemm and FusedMatMulBias consume these same preparation entries.
 
 Native noncontiguous f16 preparation had the same retention gap. Its private
-API now returns `Cow<[u16]>`: an admitted cache lends its existing copy, while a
-declined call owns a temporary dense-half copy until computation finishes. It
+API now returns a grant-carrying reader: an admitted cache shares its existing
+copy, while a declined call owns a transient until computation finishes. It
 must not return `None` merely because retention is declined: the existing
 constant-weight rescue branch still needs actual operands to compute. The BNNS
 column-major zero-copy route remains unchanged. This makes the temporary
@@ -1157,8 +1157,8 @@ parity. Named bounded child processes keep these new real-kernel calls from
 perturbing existing libtest-wide platform dispatch observations.
 
 This closes a retention-policy bypass. Ordinary constant f32 materializations
-now obtain Host grants as described below. SGEMM packed panels, native half
-copies and transpose payloads still need their own authority/lifecycle work;
+and native contiguous-half copies now obtain Host grants as described below.
+SGEMM packed panels and transpose payloads still need authority/lifecycle work;
 ordinary dense caches are not yet shared across a node's shape variants. No
 performance improvement is established by these retention checks.
 
@@ -1213,8 +1213,9 @@ key. Its memo now holds a source reader until that address-keyed entry retires.
 Pressure therefore cannot free/recycle the source address underneath a retained
 transpose. Such dependent sources remain pinned until the transpose owner drops;
 transpose payload grants and reclaiming that dependency as a unit remain work.
-Ordinary MLAS SGEMM packed panels, native half-copy buffers, graph activations,
-outputs and other scratch are not covered by this f32-copy grant claim.
+Ordinary MLAS SGEMM packed panels, graph activations, outputs and other scratch
+are not covered by this f32-copy grant claim. Native half copies are funded in
+the next step below.
 
 The unchanged public-provider regression fails on parent 2aa11cfc7: a real
 MatMul retains a 24-byte f32 copy while Host books report zero. The corrected
@@ -1235,3 +1236,34 @@ The parent comparison selected the exact named provider test and failed on the
 0-versus-24-byte assertion, rather than treating a compilation error or zero-test
 filter as evidence. The temporary parent worktree was restored and removed;
 raw validation transcripts remain separate from performance evidence.
+
+
+### Native noncontiguous f16 payload funding
+
+`DenseWeightCache` now stores flat copyable payload elements, sharing its
+existing admission, singleflight and idle-pressure implementation between f32
+expansions and native `u16` half-bit copies. A required noncontiguous constant
+f16 B copy obtains actual Host funding before allocating its payload, even when
+retention is declined. Its reader keeps the grant until the last owner drops.
+The existing parallel 2-D and scalar N-D copy routes write directly into the
+admitted destination; empty layouts avoid zero-sized parallel chunks. Both
+Apple rescue callers propagate admission errors instead of returning zero
+results or allocating an uncharged fallback. BNNS zero-copy transposed input
+and GEMM arithmetic remain unchanged.
+
+On parent 3e2588329, the exact unchanged public-provider regression executes one
+selected test and fails with ledger usage 0 versus 306 expected bytes. The new
+controls check retained/transient lifetimes, negative strides and offsets, eight
+concurrent fills under one-payload capacity, active-reader exclusion, KV idle
+reclamation, refusal/retry/refund, invalid sources, empty payloads, and actual
+Apple half rescue results. Baseline worktree is removed; logs remain available.
+This is ownership/correctness evidence on Apple M1 Max ARM64, not a performance
+claim or evidence about CUDA/other ISAs. Ordinary SGEMM panels, transpose
+payloads, shared shape-variant ownership and scratch remain separate work.
+
+Validation: native CPU 1,981 passed / 20 ignored and session 274 passed;
+optional-MLAS CPU 2,012 passed / 35 ignored and session 276 passed. Strict
+all-target Clippy passes for both crates/configurations. Formatting and dispatch
+manifest/reachability/platform/feature checks pass. These test totals include
+the four new half-copy controls and the existing real rescue control, whose
+Host grant assertions now run under both retention verdicts.

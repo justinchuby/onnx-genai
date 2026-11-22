@@ -459,6 +459,20 @@ struct MatMulDenseKey {
     dtype: DataType,
     elements: usize,
 }
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MatMulHalfKey {
+    source: usize,
+    elements: usize,
+}
+
+impl DenseWeightKey for MatMulHalfKey {
+    fn dense_bytes(&self) -> Result<usize> {
+        self.elements.checked_mul(std::mem::size_of::<u16>()).ok_or_else(||
+            EpError::KernelFailed("MatMul constant f16 copy byte count overflow; use addressable weight dimensions".into()))
+    }
+}
+
 impl DenseWeightKey for MatMulDenseKey {
     fn dense_bytes(&self) -> Result<usize> {
         self.elements.checked_mul(std::mem::size_of::<f32>()).ok_or_else(||
@@ -549,7 +563,7 @@ pub(crate) struct MatMulPrepack {
         not(any(target_os = "macos", target_os = "ios")),
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
-    contiguous_b_f16: OnceLock<Arc<Vec<u16>>>,
+    contiguous_b_f16: DenseWeightCache<MatMulHalfKey, u16>,
 }
 
 /// Entries this prepack *installed* in the process-global transpose caches must
@@ -682,7 +696,7 @@ impl MatMulPrepack {
             packed_b_from_half: OnceLock::new(),
             transposed_b: OnceLock::new(),
             transposed_b_f16: OnceLock::new(),
-            contiguous_b_f16: OnceLock::new(),
+            contiguous_b_f16: DenseWeightCache::new(resources.weight_memory().clone(), limit),
         }
     }
 }
@@ -906,24 +920,38 @@ impl MatMulPrepack {
     ///   - the element-by-element `to_dense_f32_widen` (~1 s at 136 M elements)
     ///   - the 2× memory of f16→f32 widening
     ///
-    /// The memo is validated against the current view's element count before it
-    /// is served: the consumers read it as a dense `K×N` buffer, so a memo
-    /// filled for a differently-sized operand must not be handed out (#845).
+    /// The node's initializer layout is immutable. Source address and element
+    /// count distinguish different operands at this slot (#845). Both retained
+    /// and transient copies hold a Host grant until their last reader drops.
     #[cfg_attr(
         not(any(target_os = "macos", target_os = "ios")),
         allow(dead_code, reason = "consumed only by the Apple Accelerate paths")
     )]
-    pub(crate) fn contiguous_b_f16(&self, b_view: &TensorView) -> Option<Cow<'_, [u16]>> {
+    pub(super) fn contiguous_b_f16(
+        &self,
+        b_view: &TensorView,
+    ) -> Result<Option<Arc<DenseWeight<u16>>>> {
         use onnx_runtime_ir::DataType;
         if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || b_view.is_contiguous() {
-            return None; // already contiguous or not cacheable
+            return Ok(None); // already contiguous or not cacheable
         }
-        let build = || {
-            let numel = b_view.numel();
+        validate_f32_widen_input("MatMul constant f16 contiguous preparation", b_view)?;
+        let key = MatMulHalfKey {
+            source: b_view.data_ptr::<u16>() as usize,
+            elements: b_view.shape.iter().try_fold(1usize, |n, &dim| n.checked_mul(dim)).ok_or_else(|| EpError::KernelFailed("MatMul constant f16 contiguous preparation: element count overflow; use addressable weight dimensions".into()))?,
+        };
+        let spec = if self.retain_caches {
+            DenseWeightSpec::cached(&key)?
+        } else {
+            DenseWeightSpec::transient(key.dense_bytes()?)
+        };
+        let loaded = self.contiguous_b_f16.load_group(&[spec], |_, out| {
             let shape = b_view.shape;
             let strides = b_view.strides;
             let base = b_view.data_ptr::<u16>();
-            let mut out = vec![0u16; numel];
+            if out.is_empty() {
+                return Ok(());
+            }
 
             // Optimised 2-D path (covers all weight matrices).
             if shape.len() == 2 {
@@ -934,8 +962,8 @@ impl MatMulPrepack {
                 let rows_per_thread = rows.div_ceil(threads).max(1);
                 // SAFETY: `base` points into the model's mmap'd weight
                 // buffer which is immutable for the session lifetime.
-                // Each Rayon task reads a disjoint set of source rows
-                // and writes a disjoint output chunk.
+                // Concurrent source reads are immutable (strides may alias);
+                // each Rayon task writes a disjoint output chunk.
                 let base_usize = base as usize;
                 out.par_chunks_mut(rows_per_thread * cols)
                     .enumerate()
@@ -947,7 +975,7 @@ impl MatMulPrepack {
                             let row_base = unsafe { base.offset(i as isize * sr) };
                             let dst = &mut chunk[(i - i0) * cols..(i - i0 + 1) * cols];
                             for (j, d) in dst.iter_mut().enumerate() {
-                                *d = unsafe { *row_base.offset(j as isize * sc) };
+                                *d = unsafe { row_base.offset(j as isize * sc).read_unaligned() };
                             }
                         }
                     });
@@ -960,7 +988,7 @@ impl MatMulPrepack {
                         .zip(strides.iter())
                         .map(|(&i, &s)| i as isize * s as isize)
                         .sum();
-                    *o = unsafe { *base.offset(off) };
+                    *o = unsafe { base.offset(off).read_unaligned() };
                     for d in (0..shape.len()).rev() {
                         idx[d] += 1;
                         if idx[d] < shape[d] {
@@ -970,13 +998,15 @@ impl MatMulPrepack {
                     }
                 }
             }
-            out
-        };
-        if !self.retain_caches {
-            return Some(Cow::Owned(build()));
+            Ok(())
+        })?;
+        match loaded {
+            DenseWeightLoad::Ready(mut loaded) => Ok(Some(loaded.weights.remove(0))),
+            DenseWeightLoad::Declined(reason) => Err(EpError::Backend {
+                operation: "MatMul constant f16 contiguous preparation admission",
+                source: Box::new(reason),
+            }),
         }
-        let cached = self.contiguous_b_f16.get_or_init(|| Arc::new(build()));
-        (cached.len() == b_view.numel()).then(|| Cow::Borrowed(cached.as_slice()))
     }
 
     /// MLAS-packed B built by widening a constant f16 weight to f32 once.
@@ -2666,11 +2696,11 @@ impl MatMulKernel {
                         a_bits, bt_bits, &mut out, geom.m, geom.k, geom.n,
                     ) {
                         // Fallback: materialise contiguous copy
-                        if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view) {
+                        if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view)? {
                             half_gemm_tile(
                                 HalfFormat::F16,
                                 a_bits,
-                                &b_contig,
+                                b_contig.as_slice(),
                                 &mut out,
                                 geom.m,
                                 geom.k,
@@ -2678,17 +2708,22 @@ impl MatMulKernel {
                             );
                         }
                     }
-                } else if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view) {
+                } else if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view)? {
                     // Non-column-major or batched: use the prepared copy,
                     // borrowing the cache or owning a temporary until compute ends.
                     if trivial_batch {
                         if !accelerate_gemm::bnns_matmul_f16(
-                            a_bits, &b_contig, &mut out, geom.m, geom.k, geom.n,
+                            a_bits,
+                            b_contig.as_slice(),
+                            &mut out,
+                            geom.m,
+                            geom.k,
+                            geom.n,
                         ) {
                             half_gemm_tile(
                                 HalfFormat::F16,
                                 a_bits,
-                                &b_contig,
+                                b_contig.as_slice(),
                                 &mut out,
                                 geom.m,
                                 geom.k,
@@ -2696,7 +2731,7 @@ impl MatMulKernel {
                             );
                         }
                     } else {
-                        bnns_half_dense_into(a_bits, &b_contig, &geom, &mut out);
+                        bnns_half_dense_into(a_bits, b_contig.as_slice(), &geom, &mut out);
                     }
                 }
             }
@@ -3946,6 +3981,196 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn provider_strided_half_copy_uses_host_authority() {
+        if retention_control_in_child(
+            "kernels::matmul::tests::provider_strided_half_copy_uses_host_authority",
+        ) {
+            return;
+        }
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::NodeId;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let (m, k, n) = (3, 17, 9);
+        let a = Owned::f16(&[m, k], &vec![0.25; m * k]);
+        let b = Owned::f16(&[k, 2 * n], &vec![0.5; k * 2 * n]);
+        let shape = [k, n];
+        let strides = [(2 * n) as i64, 2];
+        let bytes = (k * n * 2) as u64;
+        for retained in [true, false] {
+            let books = LedgerGovernor::new(LeaseLedger::new(0, bytes, 0));
+            let resources = CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                Default::default(),
+            )
+            .unwrap()
+            .with_cache_retention(crate::CpuCacheRetention::new(retained));
+            let provider = crate::CpuExecutionProvider::with_resources(resources);
+            let node = Node::new(NodeId(0), "MatMul", vec![], vec![]);
+            let mut kernel = provider
+                .get_kernel(&node, &[vec![m, k], vec![k, n]], 17)
+                .unwrap();
+            kernel.set_constant_inputs(&[false, true]);
+            let run = || {
+                let mut view = b.view();
+                view.shape = &shape;
+                view.strides = &strides;
+                let mut output = Owned::zeros_f32(&[m, n]);
+                kernel.execute(&[a.view(), view], &mut [output.view_mut()])?;
+                assert_eq!(output.to_f32(), vec![k as f32 * 0.125; m * n]);
+                Ok::<_, EpError>(())
+            };
+            run().unwrap();
+            assert_eq!(books.used(Tier::Host), if retained { bytes } else { 0 });
+            let kv = books
+                .reserve(Tier::Host, bytes, MemoryRole::KvCache, HolderId::new(7))
+                .unwrap();
+            let error = run()
+                .expect_err("occupied Host capacity must refuse the copy")
+                .to_string();
+            assert!(
+                error.contains("MatMul constant f16 contiguous preparation admission"),
+                "{error}"
+            );
+            drop(kv);
+            run().unwrap();
+            drop(kernel);
+            drop(provider);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
+    #[test]
+    fn half_copy_rejects_invalid_sources_before_admission_and_handles_empty_layouts() {
+        use onnx_runtime_ir::DeviceId;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 0, 0));
+        let resources = CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut prepack = MatMulPrepack::new(resources);
+        prepack.set_constant_inputs(&[false, true]);
+        let storage = Owned::f16(&[2, 4], &[0.; 8]);
+        let mut view = storage.view();
+        let shape = [2, 2];
+        let strides = [4, 2];
+        view.shape = &shape;
+        view.strides = &strides;
+        view.byte_offset = 1;
+        let error = prepack.contiguous_b_f16(&view).err().unwrap().to_string();
+        assert!(error.contains("byte_offset"), "{error}");
+        view.byte_offset = 0;
+        view.device = DeviceId::cuda(0);
+        let error = prepack.contiguous_b_f16(&view).err().unwrap().to_string();
+        assert!(error.contains("host-accessible storage"), "{error}");
+        assert_eq!(prepack.contiguous_b_f16.activity(), (0, 0));
+        assert_eq!(books.used(Tier::Host), 0);
+        view.device = DeviceId::cpu();
+        let shape = [2, 0];
+        view.shape = &shape;
+        let empty = prepack.contiguous_b_f16(&view).unwrap().unwrap();
+        assert!(empty.as_slice().is_empty());
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn half_copy_grants_cover_readers_refusal_and_idle_reclamation() {
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let values = [0.25f32, -0.5, 1.0, 2.0, -4.0, 0.0];
+        let storage: Vec<f32> = values.iter().rev().flat_map(|&v| [v, -99.]).collect();
+        let weight = Owned::f16(&[3, 4], &storage);
+        let mut view = weight.view();
+        let shape = [3, 2];
+        let strides = [-4, -2];
+        view.shape = &shape;
+        view.strides = &strides;
+        view.byte_offset = 20;
+        let expected = values.map(|v| half::f16::from_f32(v).to_bits());
+        let bytes = values.len() * 2;
+        for retained in [false, true] {
+            let books = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));
+            let resources = CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                Default::default(),
+            )
+            .unwrap()
+            .with_cache_retention(crate::CpuCacheRetention::new(retained));
+            let mut prepack = MatMulPrepack::new(resources);
+            prepack.set_constant_inputs(&[false, true]);
+            assert_eq!(books.used(Tier::Host), 0);
+            let reader = prepack.contiguous_b_f16(&view).unwrap().unwrap();
+            assert_eq!(reader.as_slice(), &expected);
+            assert_eq!(books.used(Tier::Host), bytes as u64);
+            assert_eq!(
+                prepack.contiguous_b_f16.stats().1 as u64,
+                if retained { bytes as u64 } else { 0 }
+            );
+            assert!(
+                books
+                    .reserve(Tier::Host, 1, MemoryRole::KvCache, HolderId::new(7))
+                    .is_err(),
+                "a live call must retain the complete grant"
+            );
+            if retained {
+                let warm = prepack.contiguous_b_f16(&view).unwrap().unwrap();
+                assert_eq!(reader.as_slice().as_ptr(), warm.as_slice().as_ptr());
+            } else {
+                let error = prepack
+                    .contiguous_b_f16(&view)
+                    .err()
+                    .expect("a second transient needs its own grant");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("MatMul constant f16 contiguous preparation admission")
+                );
+            }
+            drop(reader);
+            if retained {
+                let kv = books
+                    .reserve(
+                        Tier::Host,
+                        bytes as u64,
+                        MemoryRole::KvCache,
+                        HolderId::new(7),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    prepack.contiguous_b_f16.stats().1 as u64,
+                    0,
+                    "ordinary KV pressure must reclaim idle derived constants"
+                );
+                let before = prepack.contiguous_b_f16.activity();
+                assert!(prepack.contiguous_b_f16(&view).is_err());
+                assert_eq!(
+                    prepack.contiguous_b_f16.activity(),
+                    before,
+                    "refusal must precede conversion"
+                );
+                drop(kv);
+            }
+            let reader = prepack.contiguous_b_f16(&view).unwrap().unwrap();
+            let witness = prepack.contiguous_b_f16.test_first();
+            assert_eq!(witness.is_some(), retained);
+            drop(witness);
+            drop(prepack);
+            assert_eq!(
+                books.used(Tier::Host),
+                bytes as u64,
+                "kernel drop cannot revoke an executing reader"
+            );
+            assert_eq!(reader.as_slice(), &expected);
+            drop(reader);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
     #[test]
     fn dense_operand_grants_cover_retained_and_call_owned_readers() {
         use onnx_runtime_memory_api::{MemoryRole, Tier};
@@ -4005,7 +4230,7 @@ mod tests {
                 assert_eq!(
                     prepack.dense_live_bytes(),
                     0,
-                    "ordinary KV pressure must reclaim idle widened constants"
+                    "ordinary KV pressure must reclaim idle derived constants"
                 );
                 let before = prepack.dense[1].activity();
                 assert!(prepack.dense(1, &view).is_err());
@@ -4081,6 +4306,52 @@ mod tests {
         assert!(prepack.transposed_b.get().unwrap()._source.is_some());
         drop(prepack);
         assert!(source.upgrade().is_none());
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn half_copy_concurrent_builders_share_one_granted_payload() {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 12, 0));
+        let resources = CpuMemoryResources::new(
+            crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut prepack = MatMulPrepack::new(resources);
+        prepack.set_constant_inputs(&[false, true]);
+        let weight = Owned::f16(&[3, 4], &[0.25; 12]);
+        let barrier = std::sync::Barrier::new(8);
+        let readers = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let mut view = weight.view();
+                        let shape = [3, 2];
+                        let strides = [4, 2];
+                        view.shape = &shape;
+                        view.strides = &strides;
+                        prepack.contiguous_b_f16(&view).unwrap().unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            readers
+                .iter()
+                .all(|reader| Arc::ptr_eq(reader, &readers[0]))
+        );
+        assert_eq!(prepack.contiguous_b_f16.activity().1, 1);
+        assert_eq!(books.used(Tier::Host), 12);
+        drop(prepack);
+        assert_eq!(books.used(Tier::Host), 12);
+        drop(readers);
         assert_eq!(books.used(Tier::Host), 0);
     }
 
@@ -5862,13 +6133,29 @@ mod tests {
             .map(|&v| half::f16::from_f32(v).to_bits())
             .collect();
         for admitted in [false, true] {
-            let mut kernel = MatMulKernel::with_cache_retention(admitted);
+            use onnx_runtime_memory_api::Tier;
+            use onnx_runtime_memory_governor::{
+                HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor,
+            };
+            let bytes = (k * n * 2) as u64;
+            let books = LedgerGovernor::new(LeaseLedger::new(0, bytes, 0));
+            let resources = CpuMemoryResources::new(
+                crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
+                Default::default(),
+            )
+            .unwrap()
+            .with_cache_retention(crate::CpuCacheRetention::new(admitted));
+            let mut kernel = MatMulKernel {
+                prepack: MatMulPrepack::new(resources),
+                flops: None,
+            };
             kernel.set_constant_inputs(&[false, true]);
             for _ in 0..3 {
-                let prepared = kernel.prepack.contiguous_b_f16(&b).unwrap();
-                assert_eq!(&*prepared, &expected_bits);
+                let prepared = kernel.prepack.contiguous_b_f16(&b).unwrap().unwrap();
+                assert_eq!(prepared.as_slice(), &expected_bits);
+                assert_eq!(books.used(Tier::Host), bytes);
                 assert_eq!(
-                    kernel.prepack.contiguous_b_f16.get().is_some(),
+                    kernel.prepack.contiguous_b_f16.stats().0 != 0,
                     admitted,
                     "noncontiguous f16 copying must follow retention permission"
                 );
@@ -5897,8 +6184,9 @@ mod tests {
                     expected,
                     "declining reuse must not turn the rescue output into zeros"
                 );
-                assert_eq!(kernel.prepack.contiguous_b_f16.get().is_some(), admitted);
+                assert_eq!(kernel.prepack.contiguous_b_f16.stats().0 != 0, admitted);
                 assert_eq!(kernel.prepack.dense_live_bytes(), 0);
+                assert_eq!(books.used(Tier::Host), if admitted { bytes } else { 0 });
             }
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             let _ = m;

@@ -1,4 +1,7 @@
 //! Dense derived weights: cache membership is a policy, ownership holds the grant.
+//!
+//! Flat copyable elements let f32 expansions and native half-bit copies share
+//! the same admission, reader lifetime, cold-fill and idle-pressure rules.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -30,14 +33,14 @@ pub(super) fn parse_dense_weight_cache_bytes(value: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_DENSE_WEIGHT_CACHE_BYTES)
 }
 
-pub(super) struct DenseWeight {
-    values: Vec<f32>,
+pub(super) struct DenseWeight<T = f32> {
+    values: Vec<T>,
     // Declaration order frees the payload before returning its grant.
     _grant: DerivedWeightGrant,
 }
 
-impl DenseWeight {
-    pub(super) fn as_slice(&self) -> &[f32] {
+impl<T> DenseWeight<T> {
+    pub(super) fn as_slice(&self) -> &[T] {
         &self.values
     }
 }
@@ -72,7 +75,7 @@ impl<'a, K: DenseWeightKey> DenseWeightSpec<'a, K> {
             build_peak_bytes: bytes,
         }
     }
-    /// Upper bound on simultaneously live f32 weight buffers during building.
+    /// Upper bound on simultaneously live weight buffers during building.
     /// Only payload bytes remain charged after the operation completes.
     pub(super) fn with_build_peak(mut self, bytes: usize) -> Self {
         self.build_peak_bytes = bytes;
@@ -80,42 +83,42 @@ impl<'a, K: DenseWeightKey> DenseWeightSpec<'a, K> {
     }
 }
 
-pub(super) struct LoadedDenseWeights {
-    pub(super) weights: Vec<Arc<DenseWeight>>,
+pub(super) struct LoadedDenseWeights<T = f32> {
+    pub(super) weights: Vec<Arc<DenseWeight<T>>>,
     pub(super) statuses: Vec<DenseWeightCacheStatus>,
 }
 
-pub(super) enum DenseWeightLoad {
-    Ready(LoadedDenseWeights),
+pub(super) enum DenseWeightLoad<T = f32> {
+    Ready(LoadedDenseWeights<T>),
     Declined(MemoryError),
 }
 
-pub(super) struct DenseWeightCache<K> {
+pub(super) struct DenseWeightCache<K, T = f32> {
     max_bytes: usize,
     memory: DerivedWeightMemory,
-    inner: Arc<Mutex<CacheState<K>>>,
+    inner: Arc<Mutex<CacheState<K, T>>>,
     // Cold fills serialize separately: accountant callbacks and decoding never
     // run under the payload lock. Warm hits do not acquire this gate.
     fill: Mutex<()>,
 }
 
-struct CacheState<K> {
+struct CacheState<K, T> {
     used_bytes: usize,
     tick: u64,
-    entries: HashMap<K, CacheEntry>,
+    entries: HashMap<K, CacheEntry<T>>,
     #[cfg(test)]
     hits: usize,
     #[cfg(test)]
     builds: usize,
 }
 
-struct CacheEntry {
-    value: Arc<DenseWeight>,
+struct CacheEntry<T> {
+    value: Arc<DenseWeight<T>>,
     bytes: usize,
     last_used: u64,
 }
 
-impl<K> Default for CacheState<K> {
+impl<K, T> Default for CacheState<K, T> {
     fn default() -> Self {
         Self {
             used_bytes: 0,
@@ -129,7 +132,9 @@ impl<K> Default for CacheState<K> {
     }
 }
 
-impl<K: DenseWeightKey> Default for DenseWeightCache<K> {
+impl<K: DenseWeightKey, T: Copy + Default + Send + Sync + 'static> Default
+    for DenseWeightCache<K, T>
+{
     fn default() -> Self {
         Self::new(
             DerivedWeightMemory::default(),
@@ -138,7 +143,7 @@ impl<K: DenseWeightKey> Default for DenseWeightCache<K> {
     }
 }
 
-impl<K: DenseWeightKey> DenseWeightCache<K> {
+impl<K: DenseWeightKey, T: Copy + Default + Send + Sync + 'static> DenseWeightCache<K, T> {
     pub(super) fn new(memory: DerivedWeightMemory, max_bytes: usize) -> Self {
         let inner = Arc::new(Mutex::new(CacheState::default()));
         if max_bytes != 0 {
@@ -166,7 +171,7 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
         self.max_bytes
     }
 
-    fn lookup(&self, specs: &[DenseWeightSpec<'_, K>]) -> Vec<Option<Arc<DenseWeight>>> {
+    fn lookup(&self, specs: &[DenseWeightSpec<'_, K>]) -> Vec<Option<Arc<DenseWeight<T>>>> {
         let mut inner = self
             .inner
             .lock()
@@ -195,7 +200,7 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
         values
     }
 
-    fn ready_hits(values: Vec<Option<Arc<DenseWeight>>>) -> DenseWeightLoad {
+    fn ready_hits(values: Vec<Option<Arc<DenseWeight<T>>>>) -> DenseWeightLoad<T> {
         let statuses = vec![DenseWeightCacheStatus::Hit; values.len()];
         DenseWeightLoad::Ready(LoadedDenseWeights {
             weights: values
@@ -211,15 +216,15 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
     pub(super) fn load_group(
         &self,
         specs: &[DenseWeightSpec<'_, K>],
-        mut build: impl FnMut(usize, &mut [f32]) -> Result<()>,
-    ) -> Result<DenseWeightLoad> {
+        mut build: impl FnMut(usize, &mut [T]) -> Result<()>,
+    ) -> Result<DenseWeightLoad<T>> {
         self.load_group_owned(specs, |index| {
-            let elements = specs[index].bytes / std::mem::size_of::<f32>();
-            let mut payload = super::decoded_projection::zeroed_f32(
-                "dense projection",
-                "admitted weight payload",
-                elements,
-            )?;
+            let elements = specs[index].bytes / std::mem::size_of::<T>();
+            let mut payload = Vec::new();
+            payload.try_reserve_exact(elements).map_err(|error| EpError::KernelFailed(format!(
+                "dense weight payload allocation of {} bytes failed: {error}; reduce derived weight dimensions or memory pressure", specs[index].bytes
+            )))?;
+            payload.resize(elements, T::default());
             build(index, &mut payload)?;
             Ok(payload)
         })
@@ -231,20 +236,21 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
     pub(super) fn load_group_owned(
         &self,
         specs: &[DenseWeightSpec<'_, K>],
-        mut build: impl FnMut(usize) -> Result<Vec<f32>>,
-    ) -> Result<DenseWeightLoad> {
+        mut build: impl FnMut(usize) -> Result<Vec<T>>,
+    ) -> Result<DenseWeightLoad<T>> {
         for (index, spec) in specs.iter().enumerate() {
             if spec.build_peak_bytes < spec.bytes {
                 return Err(EpError::KernelFailed(format!(
-                    "dense projection {index} build peak {} is below its {}-byte payload; account for every simultaneously live f32 weight buffer",
+                    "dense projection {index} build peak {} is below its {}-byte payload; account for every simultaneously live weight buffer",
                     spec.build_peak_bytes, spec.bytes
                 )));
             }
-            if spec.bytes > isize::MAX as usize
-                || !spec.bytes.is_multiple_of(std::mem::size_of::<f32>())
+            if std::mem::size_of::<T>() == 0
+                || spec.bytes > isize::MAX as usize
+                || !spec.bytes.is_multiple_of(std::mem::size_of::<T>())
             {
                 return Err(EpError::KernelFailed(format!(
-                    "dense projection {index} requests {} bytes, which is not an addressable f32 buffer; use an f32-aligned byte count no larger than isize::MAX",
+                    "dense projection {index} requests {} bytes, which is not an addressable typed buffer; use an element-aligned byte count no larger than isize::MAX",
                     spec.bytes
                 )));
             }
@@ -329,11 +335,11 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
             }
             let child = grant.split_off(spec.bytes)?;
             let payload = build(index)?;
-            if payload.len().checked_mul(std::mem::size_of::<f32>()) != Some(spec.bytes)
-                || payload.capacity().checked_mul(std::mem::size_of::<f32>()) != Some(spec.bytes)
+            if payload.len().checked_mul(std::mem::size_of::<T>()) != Some(spec.bytes)
+                || payload.capacity().checked_mul(std::mem::size_of::<T>()) != Some(spec.bytes)
             {
                 return Err(EpError::KernelFailed(format!(
-                    "dense projection {index} builder returned length {} and capacity {} for {} admitted bytes; return an exactly sized f32 payload",
+                    "dense projection {index} builder returned length {} and capacity {} for {} admitted bytes; return an exactly sized typed payload",
                     payload.len(),
                     payload.capacity(),
                     spec.bytes
@@ -411,7 +417,7 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
 
     /// A dependent derived object that uses a payload's address as identity
     /// must keep that payload alive for as long as its address-keyed entry lives.
-    pub(super) fn owner_of(&self, values: &[f32]) -> Option<Arc<DenseWeight>> {
+    pub(super) fn owner_of(&self, values: &[T]) -> Option<Arc<DenseWeight<T>>> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -425,7 +431,7 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
     }
 
     #[cfg(test)]
-    pub(super) fn test_get(&self, key: &K) -> Option<Arc<DenseWeight>> {
+    pub(super) fn test_get(&self, key: &K) -> Option<Arc<DenseWeight<T>>> {
         self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -435,7 +441,7 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
     }
 
     #[cfg(test)]
-    pub(super) fn test_first(&self) -> Option<Arc<DenseWeight>> {
+    pub(super) fn test_first(&self) -> Option<Arc<DenseWeight<T>>> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -467,8 +473,8 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
     pub(super) fn test_get_or_insert_with(
         &self,
         key: &K,
-        build: impl FnOnce() -> Result<Vec<f32>>,
-    ) -> Result<(Arc<DenseWeight>, DenseWeightCacheStatus)> {
+        build: impl FnOnce() -> Result<Vec<T>>,
+    ) -> Result<(Arc<DenseWeight<T>>, DenseWeightCacheStatus)> {
         let mut build = Some(build);
         match self.load_group_owned(&[DenseWeightSpec::cached(key)?], |_| {
             build.take().expect("single fixture builder")()
@@ -481,7 +487,7 @@ impl<K: DenseWeightKey> DenseWeightCache<K> {
     }
 }
 
-impl<K: DenseWeightKey> IdleWeightCache for Mutex<CacheState<K>> {
+impl<K: DenseWeightKey, T: Send + Sync + 'static> IdleWeightCache for Mutex<CacheState<K, T>> {
     fn reclaim_idle(&self, want: usize) -> Result<usize> {
         let (retired, released) = {
             let mut inner = self
@@ -504,8 +510,8 @@ impl<K: DenseWeightKey> IdleWeightCache for Mutex<CacheState<K>> {
     }
 }
 
-fn oldest_unused<K: DenseWeightKey>(
-    inner: &CacheState<K>,
+fn oldest_unused<K: DenseWeightKey, T>(
+    inner: &CacheState<K, T>,
     specs: &[DenseWeightSpec<'_, K>],
     inactive_only: bool,
 ) -> Option<K> {
@@ -520,7 +526,7 @@ fn oldest_unused<K: DenseWeightKey>(
         .map(|(key, _)| key.clone())
 }
 
-fn remove_entry<K: DenseWeightKey>(inner: &mut CacheState<K>, key: &K) -> CacheEntry {
+fn remove_entry<K: DenseWeightKey, T>(inner: &mut CacheState<K, T>, key: &K) -> CacheEntry<T> {
     let entry = inner
         .entries
         .remove(key)
@@ -893,7 +899,7 @@ mod tests {
             assert!(failure.to_string().contains(if mode == 2 {
                 "fixture decode failure"
             } else {
-                "exactly sized f32 payload"
+                "exactly sized typed payload"
             }));
             assert_eq!(governor.used(Tier::Host), 0);
             assert_eq!(cache.stats(), (0, 0));
@@ -923,7 +929,7 @@ mod tests {
                 )
                 .err()
                 .expect("invalid f32 buffer size");
-            assert!(failure.to_string().contains("addressable f32 buffer"));
+            assert!(failure.to_string().contains("addressable typed buffer"));
         }
     }
 
