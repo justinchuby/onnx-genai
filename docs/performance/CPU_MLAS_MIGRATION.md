@@ -223,6 +223,15 @@ Ordered by *decode-path impact × distance from parity*, which is also
    #1104 absorbed int4 acc0 decode (1.36× / 1.56×); prefill is the remainder,
    and `MoE` follows it.
 
+Native SiLU now shares the runtime's existing chunk scheduler, including host
+pool preference and nested-pool avoidance. The ARM64 exp-based SIMD kernel is
+restricted to the validated finite `[-18, 18]` band; outside it, bounded blocks
+use the existing stable scalar formula, preserving the staged f32 negative tail
+and special-value semantics instead of relying on a clamped `exp(-x)`.
+This absorbs correction/blocking/scheduling structure, not the remaining MLAS
+inner primitive. It does not graduate SiLU or establish a performance advantage;
+the optional MLAS research route and its existing guards remain intact.
+
 Generic f32 GEMM's thin-M column-parallel path now borrows the original B
 stride and caller-owned output rows. It retains the same scalar register tiles
 and K-panel accumulation order, replacing full B/output element copies with
