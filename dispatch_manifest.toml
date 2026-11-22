@@ -419,3 +419,12 @@ minimum_tier = "tier2"
 counter = "GELU_NEON_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/simd_activations_neon.rs"
 description = "Native exact f32 GELU fuses the NEON Erf polynomial without intermediate allocation"
+
+[[claim]]
+op = "Softmax"
+variant = "f32_native_contiguous_rows"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "SOFTMAX_NEON_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon.rs"
+description = "Native contiguous f32 rows with d>=4 use NEON max/exp/sum/normalize, including gradual underflow and scalar partial tails"
