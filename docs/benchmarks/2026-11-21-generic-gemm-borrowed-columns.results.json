@@ -6,7 +6,7 @@
   "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
   "measurement_base_commit": "cef77f9f25b2b1379ee8d9339878b26eabe057cd",
   "source_sha256": "b16f5890ab58463febc99949f6c8436d8ef72e571eb4605870f040abff031e54",
-  "allocation_probe_sha256": "77ec9572e2adb2d67767e02f2a9b6b16a4634749bfda9de41cac73b5be3dec07",
+  "allocation_probe_sha256": "a172b3761a143817db6b7076ff294bcfc15d5dd21cd19b55ba270963373a39d1",
   "samples_per_arm": 21,
   "scope": "Complete Generic GEMM calls, including internal copies/metadata and pool dispatch; excludes outer tensor preparation/MatMul/session. Whole-command RSS is not per-arm memory evidence.",
   "allocation_observer": {
@@ -15,7 +15,11 @@
     "positive_control_bytes": 1053700,
     "cold_large_bytes": 0,
     "four_warmed_calls_large_bytes": 0,
-    "restored_copy_mutation_rejected_first_call_bytes": 1053700
+    "restored_copy_mutation_rejected_first_call_bytes": 1053700,
+    "base_commit": "d265b33bed7cdc50a6f793b8ce8c51569b2c03c3",
+    "constant_b": true,
+    "debug_and_release_passed": true,
+    "final_named_mutation_rejected": true
   },
   "sweeps": [
     {
@@ -2100,5 +2104,19 @@
         }
       ]
     }
-  ]
+  ],
+  "integrated_validation": {
+    "base_commit": "d265b33bed7cdc50a6f793b8ce8c51569b2c03c3",
+    "native_library_passed": 1922,
+    "native_library_ignored": 18,
+    "optional_mlas_matmul_inventory": 74,
+    "optional_mlas_matmul_passed": 72,
+    "optional_mlas_matmul_ignored": 2,
+    "public_allocation_probe_passed": true,
+    "native_and_mlas_all_target_strict_clippy": true,
+    "dispatch_counters": 42,
+    "dispatch_claims": 31,
+    "unchanged_exclusions": 3,
+    "unchanged_feature_gate_exemptions": 1
+  }
 }

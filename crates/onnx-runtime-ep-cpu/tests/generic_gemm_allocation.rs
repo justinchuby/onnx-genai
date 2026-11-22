@@ -105,7 +105,8 @@ fn generic_matmul_borrows_weight_columns_without_large_allocations() {
     let y_shape = [m, n];
     let a_strides = [k as i64, 1];
     let b_strides = [n as i64, 1];
-    let kernel = MatMulKernel::default();
+    let mut kernel = MatMulKernel::default();
+    kernel.set_constant_inputs(&[false, true]);
     let mut run = || {
         // The owned vectors outlive each view, and y is exclusively borrowed
         // until this synchronous execution (including every worker) returns.

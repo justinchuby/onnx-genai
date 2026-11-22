@@ -604,8 +604,9 @@ the governed factory path; raw transformed-layout builders also execute on hosts
 without their corresponding instruction-set route. That does not prove x86 ISA
 execution or multi-node NUMA placement on this Apple host.
 
-Optional MLAS-owned packs and scratch/activation allocations still need their
-own integration. Retained native OnceLock entries are not yet idle-reclaimable.
+The optional MLAS pack admission is described below. Scratch/activation
+allocations still need their own integration. Retained native OnceLock entries
+are not yet idle-reclaimable.
 Physical Host/Device book reconciliation and process-wide limits remain work.
 No speedup, placement performance or CUDA runtime claim is made.
 
@@ -649,3 +650,28 @@ tile/activation scratch are separate scopes and remain ungoverned. Native/MLAS
 OnceLock retention still needs idle reclamation; process-wide quota, physical
 Host/Device book reconciliation and CUDA runtime proof remain unfinished. No
 RSS, throughput or multi-node placement claim is made.
+
+
+### Generic f32 GEMM borrows column panels
+
+The thin-M column-parallel fallback no longer creates per-call B element copies
+and secondary output strips. B keeps the original matrix stride; workers own
+disjoint mutable row slices of the caller output. Dense row blocks and column
+strips share the original register tile and K-panel accumulation through a
+monomorphized row-access interface. No unsafe aliasing, persistent cache or
+additional quota policy is needed for those borrowed elements.
+
+Row-reference descriptors still allocate `O(M * min(N, threads))` metadata;
+this is not zero allocation or full scratch governance. A public-kernel
+allocator probe marks B as a constant initializer, registers the caller and
+every explicit pool worker, observes
+an intentional weight-sized positive control, and proves no allocations above
+64 KiB on the first and repeated calls for its test geometry. Restoring the
+old copy path makes the named guard fail on the first call. Exact panel-order,
+partial-tile, output-bound and special-value checks preserve the previous
+arithmetic, including empty-K +0 initialization.
+
+See the [scoped diagnostic and allocation proof](../benchmarks/2026-11-21-generic-gemm-borrowed-columns.md).
+This removes one family of ungoverned matrix copies; mutable MLAS workspace,
+other transient scratch, idle OnceLock reclamation, process quota and physical
+Host/Device reconciliation remain unfinished.

@@ -34,7 +34,8 @@ numerical tolerance or test is weakened. A counter/manifest entry checks the
 actual Generic column route. The original M=1 reference test remains intact.
 
 The separate `generic_gemm_allocation` integration binary uses the public
-`MatMulKernel` with a child-process `generic` backend override. A global allocator
+`MatMulKernel` with B explicitly marked as a constant initializer and a
+child-process `generic` backend override. A global allocator
 observes only the dispatching thread and all four explicitly registered Rayon
 workers, excluding libtest's own bookkeeping. A deliberate 1,053,700-byte worker
 allocation proves the observer is live. At M=3, K=1025, N=257, the first call and
@@ -137,3 +138,13 @@ The final source also passes native/MLAS all-target strict Clippy, dispatch
 reachability/manifest, feature-gate coverage, platform naming, formatting and
 whitespace checks. No existing correctness test was newly ignored.
 
+
+After integrating merged #2397 (`d265b33bed7cdc50a6f793b8ce8c51569b2c03c3`), the
+full native library passes 1,922 tests / 18 ignored, optional MLAS MatMul again
+passes 72 / 2 ignored, and the public allocation guard again passes. Both strict
+all-target Clippy configurations and the combined dispatch guards pass (42
+counters, 31 claims, 3 unchanged exclusions, 1 unchanged feature exemption).
+The manifest's append-only conflict retained both new claims. The GEMM source
+remained byte-identical across rebase. The final allocation-probe hash includes
+the explicit constant-B fixture, which also passes debug/release and rejects the
+restored old copy path after integration.
