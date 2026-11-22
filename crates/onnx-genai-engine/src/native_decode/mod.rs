@@ -297,18 +297,22 @@ pub struct CompressedStatePathStats {
 
 /// Deep-copy of host-owned native state at a prefix or transaction boundary.
 ///
-/// Host-native decoding keeps dense KV and recurrent state in the same `past`
-/// map, so the production snapshot stores the whole map to make restoring a
-/// boundary actually executable. Hidden-state conditioning belongs to the same
-/// boundary and is restored alongside the tensors.
+/// Host-native state includes the `past` tensor map and optional in-place CPU
+/// KV bindings. The snapshot retains both, together with hidden conditioning,
+/// so restoring a boundary restores executable state rather than just lengths.
 pub(crate) struct NativePastSnapshot {
     past: HashMap<String, Tensor>,
     len: usize,
     bytes: u64,
     last_hidden: Option<Vec<f32>>,
+    cpu_kv: Option<cpu::CpuKvSnapshot>,
 }
 
 impl NativePastSnapshot {
+    #[cfg(test)]
+    pub(crate) fn cpu_kv_snapshot(&self) -> Option<&cpu::CpuKvSnapshot> {
+        self.cpu_kv.as_ref()
+    }
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -739,7 +743,7 @@ impl NativeDecodeSession {
     }
 
     pub(crate) fn supports_past_snapshots(&self) -> bool {
-        self.cuda.is_none() && self.cpu_kv.is_none() && self.compressed_state.is_empty()
+        self.cuda.is_none() && self.compressed_state.is_empty()
     }
 
     fn recurrent_past_names(&self) -> HashSet<String> {
@@ -804,6 +808,13 @@ impl NativeDecodeSession {
             sum.checked_add(u64::try_from(tensor.as_bytes().len())?)
                 .context("native state snapshot byte count overflow")
         })?;
+        let past = past
+            .checked_add(
+                self.cpu_kv
+                    .as_ref()
+                    .map_or(Ok(0), DecodeCpuKvState::snapshot_bytes)?,
+            )
+            .context("native in-place KV snapshot byte count overflow")?;
         let hidden = self.last_hidden.as_ref().map_or(0, |hidden| hidden.len());
         past.checked_add(
             u64::try_from(hidden)?
@@ -813,7 +824,7 @@ impl NativeDecodeSession {
         .context("native complete state snapshot byte count overflow")
     }
 
-    pub(crate) fn snapshot_past(&self) -> anyhow::Result<NativePastSnapshot> {
+    pub(crate) fn snapshot_past(&mut self) -> anyhow::Result<NativePastSnapshot> {
         if let Some(error) = self.compressed_state_refusal(NativeStateOperation::Snapshot, None) {
             return Err(error);
         }
@@ -827,6 +838,11 @@ impl NativeDecodeSession {
             bail!("cannot snapshot recurrent prefix before all recurrent tensors are materialized");
         }
         let bytes = self.past_snapshot_bytes()?;
+        let cpu_kv = self
+            .cpu_kv
+            .as_mut()
+            .map(DecodeCpuKvState::snapshot)
+            .transpose()?;
         let mut past = HashMap::with_capacity(self.past.len());
         for (name, tensor) in &self.past {
             past.insert(
@@ -839,6 +855,7 @@ impl NativeDecodeSession {
             len: self.current_len,
             bytes,
             last_hidden: self.last_hidden.clone(),
+            cpu_kv,
         })
     }
 
@@ -863,6 +880,7 @@ impl NativeDecodeSession {
                 tensor.try_clone().map_err(anyhow::Error::from)?,
             );
         }
+        self.restore_cpu_snapshot(snapshot.cpu_kv.as_ref())?;
         self.past = restored;
         self.current_len = snapshot.len;
         self.last_hidden = snapshot.last_hidden.clone();
@@ -878,10 +896,24 @@ impl NativeDecodeSession {
             self.supports_past_snapshots(),
             "complete native state restore requires host-owned past tensors without compressed record cursors"
         );
+        self.restore_cpu_snapshot(snapshot.cpu_kv.as_ref())?;
         self.past = snapshot.past;
         self.current_len = snapshot.len;
         self.last_hidden = snapshot.last_hidden;
         Ok(())
+    }
+
+    fn restore_cpu_snapshot(
+        &mut self,
+        snapshot: Option<&cpu::CpuKvSnapshot>,
+    ) -> anyhow::Result<()> {
+        match (self.cpu_kv.as_mut(), snapshot) {
+            (Some(state), Some(snapshot)) => state.restore_snapshot(snapshot),
+            (None, None) => Ok(()),
+            _ => bail!(
+                "native state snapshot uses a different CPU KV storage mode; restore with the original decoder"
+            ),
+        }
     }
 
     /// Snapshot native state that cannot be token-prefix-sliced as of the last

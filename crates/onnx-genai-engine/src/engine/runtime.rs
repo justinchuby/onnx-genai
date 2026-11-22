@@ -4382,8 +4382,7 @@ mod tests {
 
     #[cfg(feature = "native-backend")]
     #[test]
-    fn native_prompt_replacement_without_complete_snapshot_refuses_before_mutation()
-    -> anyhow::Result<()> {
+    fn native_inplace_prompt_replacement_restores_complete_snapshot() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-native-scalar-gqa");
         let mut engine = Engine::from_dir(
@@ -4400,24 +4399,45 @@ mod tests {
         request.options.temperature = 0.0;
         request.options.stop_on_eos = false;
         engine.generate_in_session(session, request.clone())?;
-        let native = engine.native_session.as_ref().unwrap();
+        let native = engine.native_session.as_mut().unwrap();
+        let baseline = native.snapshot_past()?;
         assert!(
-            !native.supports_past_snapshots(),
+            baseline.cpu_kv_snapshot().is_some(),
             "fixture must exercise an in-place backend"
         );
         let materialized = native.current_len();
         assert!(materialized > 0);
         let tokens = engine.native_sessions[&session].tokens.clone();
         let stamp = engine.native_sessions[&session].last_access;
+        let authority = crate::GenerationControl::new();
+        let cancel = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == crate::GenerationBoundary::BeforeSemanticCommit {
+                assert!(cancel.cancel());
+            }
+            Ok(())
+        });
+        let mut replacement = request.clone();
+        replacement.prompt = GeneratePrompt::TokenIds(vec![1]);
+        replacement.options.max_new_tokens = 4;
         let error = engine
-            .generate_in_session(session, request.clone())
-            .expect_err("unsafe replacement must be refused");
+            .generate_in_session_with_control_callbacks(
+                session,
+                replacement.clone(),
+                control,
+                None,
+                None,
+            )
+            .expect_err("cancelled replacement must abort");
         assert!(
-            matches!(
-                error.downcast_ref::<PackageExecutionError>(),
-                Some(PackageExecutionError::NativePromptReplacementUnavailable)
-            ),
+            error.downcast_ref::<crate::GenerationCancelled>().is_some(),
             "{error:#}"
+        );
+        let restored = engine.native_session.as_mut().unwrap().snapshot_past()?;
+        assert_eq!(
+            restored.cpu_kv_snapshot(),
+            baseline.cpu_kv_snapshot(),
+            "cancelled replacement must restore every live in-place KV row"
         );
         assert_eq!(
             engine.native_session.as_ref().unwrap().current_len(),
@@ -4426,6 +4446,14 @@ mod tests {
         assert_eq!(engine.native_sessions[&session].tokens, tokens);
         assert_eq!(engine.native_sessions[&session].last_access, stamp);
         assert_eq!(engine.scheduler.running_count(), 0);
+        replacement.options.max_new_tokens = 1;
+        assert_eq!(
+            engine
+                .generate_in_session(session, replacement)?
+                .token_ids
+                .len(),
+            1
+        );
         // Stateless requests own only a discardable implementation cache, so
         // replacing it must keep working even without conversation snapshots.
         assert_eq!(engine.generate(request.clone())?.token_ids.len(), 1);

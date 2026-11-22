@@ -282,3 +282,17 @@ Full native-enabled engine library: 790 passed / 1 inherited ignore. Final
 focused runs selected and passed exact KV/resource restoration, in-place refusal
 plus stateless replacement, and rollback-failure poisoning. The typed server
 409 mapping test passes; strict native engine and server all-target Clippy pass.
+
+In-place CPU checkpoint milestone: complete native snapshots now retain live
+rows from the persistent GQA bindings, in addition to host tensors and hidden
+conditioning. Per-binding geometry and dtype come from the actual binding;
+snapshot size excludes unused capacity. Restore preflights every port, dtype,
+non-sequence axis and row length before writing, and maps each batch/head block
+onto the current physical capacity, including after cache growth. Native engine
+tests now exercise successful named-conversation replacement and cancellation
+with exact CPU KV snapshot comparison. Stateless replacement remains supported.
+Separate multi-head/multi-binding tests overwrite and grow the destination before
+restoring, and prove a later incompatible binding cannot partially overwrite an
+earlier valid one. Full native engine library: 792 passed / 1 inherited ignore;
+strict native engine and server all-target Clippy pass. Device and compressed
+state checkpoints and the broader compatibility rows remain unfinished.

@@ -4967,6 +4967,121 @@ fn assert_kv_prefix_intact(
     }
 }
 
+#[test]
+fn cpu_kv_snapshot_restores_live_rows_after_overwrite_and_growth() -> anyhow::Result<()> {
+    let session = tiny_decoder(false);
+    let (heads, head_dim, capacity, live) = (3usize, 4usize, 8usize, 5usize);
+    let pairs = vec![
+        (
+            "present.0.key".to_string(),
+            "past_key_values.0.key".to_string(),
+        ),
+        (
+            "present.0.value".to_string(),
+            "past_key_values.0.value".to_string(),
+        ),
+    ];
+    let bindings = pairs
+        .iter()
+        .enumerate()
+        .map(|(salt, pair)| {
+            seeded_kv_binding(&session, pair, heads, capacity, head_dim, live, salt)
+        })
+        .collect();
+    let mut state =
+        DecodeCpuKvState::from_parts_for_test(bindings, pairs, DataType::Float32, capacity, live);
+    let bytes = u64::try_from(2 * heads * live * head_dim * std::mem::size_of::<f32>())?;
+    assert_eq!(
+        state.snapshot_bytes()?,
+        bytes,
+        "snapshot only owns live rows, not capacity"
+    );
+    let snapshot = state.snapshot()?;
+    for index in 0..2 {
+        state.binding_for_test(index).write_bytes(
+            0,
+            &vec![0xa5; heads * capacity * head_dim * std::mem::size_of::<f32>()],
+        )?;
+    }
+    state.set_logical_len(0)?;
+    state.grow_to(&session, capacity + 1, 0)?;
+    state.restore_snapshot(&snapshot)?;
+    for index in 0..2 {
+        assert_kv_prefix_intact(
+            state.binding_for_test(index),
+            heads,
+            head_dim,
+            live,
+            index,
+            "snapshot restore after growth",
+        );
+        assert_eq!(
+            state.binding_for_test(index).logical_shape(),
+            [1, heads, live, head_dim]
+        );
+    }
+    assert_eq!(state.snapshot_bytes()?, bytes);
+    Ok(())
+}
+
+#[test]
+fn cpu_kv_snapshot_preflights_every_binding_before_writing() -> anyhow::Result<()> {
+    let session = tiny_decoder(false);
+    let (heads, capacity, head_dim, live) = (2usize, 4usize, 3usize, 2usize);
+    let pairs = vec![
+        (
+            "present.0.key".to_string(),
+            "past_key_values.0.key".to_string(),
+        ),
+        (
+            "present.0.value".to_string(),
+            "past_key_values.0.value".to_string(),
+        ),
+    ];
+    let source = pairs
+        .iter()
+        .enumerate()
+        .map(|(salt, pair)| {
+            seeded_kv_binding(&session, pair, heads, capacity, head_dim, live, salt)
+        })
+        .collect();
+    let snapshot = DecodeCpuKvState::from_parts_for_test(
+        source,
+        pairs.clone(),
+        DataType::Float32,
+        capacity,
+        live,
+    )
+    .snapshot()?;
+    let mut different = pairs;
+    different[1] = ("present.other".to_string(), "past.other".to_string());
+    let bindings = different
+        .iter()
+        .enumerate()
+        .map(|(salt, pair)| {
+            seeded_kv_binding(&session, pair, heads, capacity, head_dim, live, salt + 10)
+        })
+        .collect();
+    let mut destination = DecodeCpuKvState::from_parts_for_test(
+        bindings,
+        different,
+        DataType::Float32,
+        capacity,
+        live,
+    );
+    let before = destination.binding_for_test(0).read_bytes()?;
+    let error = destination
+        .restore_snapshot(&snapshot)
+        .expect_err("a later mismatched binding must reject the whole restore");
+    assert!(error.to_string().contains("mismatched ports"), "{error:#}");
+    assert_eq!(
+        destination.binding_for_test(0).read_bytes()?,
+        before,
+        "the valid first binding must not be overwritten before later validation"
+    );
+    Ok(())
+}
+
 /// The production trigger is a *full* cache: token 4097 arrives with
 /// `past_len == max_len`, so the copy spans every row of every block with no
 /// slack. The original test left slack (live 5 of 8) and would not have caught
