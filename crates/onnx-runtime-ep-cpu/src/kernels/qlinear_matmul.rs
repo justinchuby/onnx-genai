@@ -1547,9 +1547,29 @@ fn requantize_byte(accumulated: i32, scale: f32, zero: i32, dtype: DataType) -> 
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
+static QLINEAR_REQUANT_NEON_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(test, target_arch = "aarch64"))]
+static QLINEAR_ROW_REQUANT_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Directory-level proof counts one real vector dispatch per batch. The local
+/// witnesses below additionally prevent another thread/mode satisfying a test.
+#[cfg(all(test, target_arch = "aarch64"))]
+fn record_requantization_dispatch<const RESCALE: bool>(row: usize, prefix: usize) {
+    if row == 0 && prefix > 0 {
+        if RESCALE {
+            QLINEAR_ROW_REQUANT_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            QLINEAR_REQUANT_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
 thread_local! {
     // Separate calling-thread witnesses for shared and per-row scale routes.
-    static QLINEAR_REQUANT_NEON_TEST_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+    static QLINEAR_REQUANT_NEON_THREAD_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
 
 /// Convert eight lanes at a time, returning the prefix length written. Tail
@@ -1640,7 +1660,7 @@ fn requantize_per_row_portable_row(
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(test, target_arch = "aarch64"))]
 #[inline]
 fn requantize_neon_row(
     accumulators: &[i32],
@@ -1649,10 +1669,10 @@ fn requantize_neon_row(
     dtype: DataType,
     bytes: &mut [u8],
 ) {
-    requantize_neon_row_impl::<false>(accumulators, scales, 1.0, 1.0, zero, dtype, bytes);
+    let _ = requantize_neon_row_impl::<false>(accumulators, scales, 1.0, 1.0, zero, dtype, bytes);
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(test, target_arch = "aarch64"))]
 #[inline]
 fn requantize_per_row_neon_row(
     accumulators: &[i32],
@@ -1663,7 +1683,15 @@ fn requantize_per_row_neon_row(
     dtype: DataType,
     bytes: &mut [u8],
 ) {
-    requantize_neon_row_impl::<true>(accumulators, b_scales, a_scale, y_scale, zero, dtype, bytes);
+    let _ = requantize_neon_row_impl::<true>(
+        accumulators,
+        b_scales,
+        a_scale,
+        y_scale,
+        zero,
+        dtype,
+        bytes,
+    );
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1675,7 +1703,7 @@ fn requantize_neon_row_impl<const RESCALE: bool>(
     zero: i32,
     dtype: DataType,
     bytes: &mut [u8],
-) {
+) -> usize {
     let mut start = 0;
     if scales.len() == accumulators.len() && bytes.len() == accumulators.len() {
         let valid_zero = match dtype {
@@ -1700,7 +1728,7 @@ fn requantize_neon_row_impl<const RESCALE: bool>(
             };
             #[cfg(test)]
             if start > 0 {
-                QLINEAR_REQUANT_NEON_TEST_HITS.with(|hits| {
+                QLINEAR_REQUANT_NEON_THREAD_HITS.with(|hits| {
                     let mut counts = hits.get();
                     counts[RESCALE as usize] += 1;
                     hits.set(counts);
@@ -1727,6 +1755,7 @@ fn requantize_neon_row_impl<const RESCALE: bool>(
             &mut bytes[start..],
         );
     }
+    start
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1790,8 +1819,20 @@ fn requantize_rows(
             // portable loop without entering a vector dispatcher per row.
             #[cfg(target_arch = "aarch64")]
             if n >= 8 {
-                apply_requantization_rows(products, destination, n, |_, acc, out| {
-                    requantize_neon_row(acc, &scales, y_zero_point, dtype, out);
+                apply_requantization_rows(products, destination, n, |row, acc, out| {
+                    let prefix = requantize_neon_row_impl::<false>(
+                        acc,
+                        &scales,
+                        1.0,
+                        1.0,
+                        y_zero_point,
+                        dtype,
+                        out,
+                    );
+                    #[cfg(test)]
+                    record_requantization_dispatch::<false>(row, prefix);
+                    #[cfg(not(test))]
+                    let _ = (row, prefix);
                 });
                 return Ok(());
             }
@@ -1803,7 +1844,7 @@ fn requantize_rows(
             #[cfg(target_arch = "aarch64")]
             if n >= 8 {
                 apply_requantization_rows(products, destination, n, |row, acc, out| {
-                    requantize_per_row_neon_row(
+                    let prefix = requantize_neon_row_impl::<true>(
                         acc,
                         b_scales,
                         a_quant.at(a_batch, row).0,
@@ -1812,6 +1853,10 @@ fn requantize_rows(
                         dtype,
                         out,
                     );
+                    #[cfg(test)]
+                    record_requantization_dispatch::<true>(row, prefix);
+                    #[cfg(not(test))]
+                    let _ = prefix;
                 });
                 return Ok(());
             }
@@ -2121,10 +2166,12 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn shared_requantization_reaches_neon_for_native_rows() {
+        use std::sync::atomic::Ordering;
         if !std::arch::is_aarch64_feature_detected!("neon") {
             return;
         }
-        let before = QLINEAR_REQUANT_NEON_TEST_HITS.with(|hits| hits.get()[0]);
+        let before = QLINEAR_REQUANT_NEON_THREAD_HITS.with(|hits| hits.get()[0]);
+        let dispatch_before = QLINEAR_REQUANT_NEON_TEST_HITS.load(Ordering::Relaxed);
         let a_quant = QuantParams {
             scales: vec![0.5],
             zero_points: vec![0],
@@ -2145,16 +2192,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(actual, [2; 17]);
-        assert!(QLINEAR_REQUANT_NEON_TEST_HITS.with(|hits| hits.get()[0]) > before);
+        assert!(QLINEAR_REQUANT_NEON_THREAD_HITS.with(|hits| hits.get()[0]) > before);
+        assert!(QLINEAR_REQUANT_NEON_TEST_HITS.load(Ordering::Relaxed) > dispatch_before);
     }
 
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn per_row_requantization_reaches_neon_with_exact_tail_outputs() {
+        use std::sync::atomic::Ordering;
         if !std::arch::is_aarch64_feature_detected!("neon") {
             return;
         }
-        let before = QLINEAR_REQUANT_NEON_TEST_HITS.with(|hits| hits.get()[1]);
+        let before = QLINEAR_REQUANT_NEON_THREAD_HITS.with(|hits| hits.get()[1]);
+        let dispatch_before = QLINEAR_ROW_REQUANT_TEST_HITS.load(Ordering::Relaxed);
         let a_quant = QuantParams {
             scales: vec![0.5, 2., 0.25],
             zero_points: vec![0; 3],
@@ -2183,9 +2233,10 @@ mod tests {
             );
         }
         assert!(
-            QLINEAR_REQUANT_NEON_TEST_HITS.with(|hits| hits.get()[1]) > before,
+            QLINEAR_REQUANT_NEON_THREAD_HITS.with(|hits| hits.get()[1]) > before,
             "native per-row scales must execute a vector block, not just the scalar loop"
         );
+        assert!(QLINEAR_ROW_REQUANT_TEST_HITS.load(Ordering::Relaxed) > dispatch_before);
     }
 
     #[test]
@@ -2386,7 +2437,7 @@ mod tests {
                 });
                 let mut buffers = [vec![0; n], vec![0; n], vec![0; n]];
                 let iterations = (2_000_000 / n).max(1);
-                let before = QLINEAR_REQUANT_NEON_TEST_HITS.with(|hits| hits.get()[1]);
+                let before = QLINEAR_REQUANT_NEON_THREAD_HITS.with(|hits| hits.get()[1]);
                 for repetition in 0..21 {
                     for offset in 0..3 {
                         let arm = (repetition + offset) % 3;
@@ -2422,7 +2473,7 @@ mod tests {
                         );
                     }
                 }
-                let hits = QLINEAR_REQUANT_NEON_TEST_HITS.with(|counts| counts.get()[1]) - before;
+                let hits = QLINEAR_REQUANT_NEON_THREAD_HITS.with(|counts| counts.get()[1]) - before;
                 assert_eq!(
                     hits > 0,
                     n >= 8,

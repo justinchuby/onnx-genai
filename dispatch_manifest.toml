@@ -394,6 +394,15 @@ file = "crates/onnx-runtime-ep-cpu/src/kernels/qlinear_matmul.rs"
 description = "Native QLinearMatMul requantizes shared-A-scale rows with exact eight-lane NEON rounding/clipping and scalar tails; no MLAS call or packed copy"
 
 [[claim]]
+op = "QLinearMatMul"
+variant = "per_row_scale_requantization"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "QLINEAR_ROW_REQUANT_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/qlinear_matmul.rs"
+description = "Native per-row activation scales use exact NEON multiply/divide association and shared rounding/clipping/packing, with portable short rows and tails and no scale-vector allocation"
+
+[[claim]]
 op = "MatMul"
 variant = "generic_borrowed_column_strips"
 platform = "all"
