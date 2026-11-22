@@ -6580,6 +6580,53 @@ mod native_compat {
     }
 
     #[tokio::test]
+    async fn native_tts_executes_declared_speech_and_rejects_ignored_controls() {
+        let router = app(speech_state());
+        for field in ["input", "prompt"] {
+            let mut body = json!({"raw_prompt":false,"speed":1,"seed":-1});
+            body[field] = json!("hello world");
+            let response = request(router.clone(), "/tts", body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "audio/wav");
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert_eq!(&bytes[..4], b"RIFF");
+            assert_eq!(&bytes[8..12], b"WAVE");
+            assert!(bytes.len() > 44);
+        }
+        let response = request(
+            router.clone(),
+            "/tts",
+            json!({"input":"hello world","raw_prompt":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "audio/wav");
+        for body in [
+            json!({"input":"hi","prompt":"hi"}),
+            json!({"input":"hi","raw_prompt":true,"instructions":"conflict"}),
+            json!({"input":"hi","voice":"unconfigured"}),
+            json!({"input":"hi","speed":2}),
+        ] {
+            let response = request(router.clone(), "/tts", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(json_body(response).await["error"]["message"].is_string());
+        }
+        let response = request(
+            router,
+            "/v1/audio/speech",
+            json!({"model":"speech-wav","input":"hi","voice":"unconfigured"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("voice")
+        );
+    }
+
+    #[tokio::test]
     async fn alternate_protocols_use_real_generation_and_usage() {
         let router = app(tiny_state());
         for (path, body, protocol) in [

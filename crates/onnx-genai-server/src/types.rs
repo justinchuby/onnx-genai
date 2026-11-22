@@ -5,9 +5,13 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AudioSpeechRequest {
     pub model: String,
     pub input: String,
+    /// Bypass declared text assembly when the caller supplies the complete raw prompt.
+    #[serde(default)]
+    pub raw_prompt: bool,
     #[serde(default)]
     pub instructions: String,
     #[serde(default = "default_wav_response_format")]

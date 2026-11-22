@@ -61,3 +61,9 @@ Clippy passes. The real Chrome smoke now verifies chat, persisted conversation
 and byte-identical replay after reload, with no browser errors. CLI library tests:
 71 passed. Vendored asset and documented environment-variable checks pass.
 No merge has been performed.
+
+Speech follow-up: native `/tts` now lowers input/prompt into the existing declared
+speech workflow and returns real PCM WAV. Explicit raw prompts bypass text
+assembly while retaining resource limits. Unsupported voice and synthesis fields
+are rejected, including on the OpenAI speech API. All 13 selected speech tests
+pass, including actual native synthesis; strict server all-target Clippy passes.

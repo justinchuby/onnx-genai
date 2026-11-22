@@ -30,9 +30,18 @@ pub(crate) async fn audio_speech(
         ))
     })?;
     let processor = &capability.processor;
-    let prompt = processor
-        .assemble(&request.input, &request.instructions)
-        .map_err(|error| ApiError::bad_request(format!("invalid speech input: {error:#}")))?;
+    let prompt = if request.raw_prompt {
+        if !request.instructions.is_empty() {
+            return Err(ApiError::invalid_request(
+                "raw_prompt=true bypasses text assembly; omit instructions or supply the complete assembled prompt as input",
+            ));
+        }
+        request.input.clone()
+    } else {
+        processor
+            .assemble(&request.input, &request.instructions)
+            .map_err(|error| ApiError::bad_request(format!("invalid speech input: {error:#}")))?
+    };
     let token_ids = handle.tokenizer.encode(&prompt).map_err(|error| {
         ApiError::bad_request(format!("failed to tokenize speech input: {error}"))
     })?;

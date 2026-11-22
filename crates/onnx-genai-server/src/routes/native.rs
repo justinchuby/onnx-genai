@@ -378,6 +378,45 @@ fn normalize_embedding(vector: &mut [f32], norm: i64) {
     }
 }
 
+/// Native speech shares the package-declared text assembly and PCM contract.
+pub(crate) async fn tts(
+    State(state): State<AppState>,
+    ApiJson(mut body): ApiJson<Map<String, Value>>,
+) -> Result<Response, ApiError> {
+    if let Some(prompt) = body.remove("prompt")
+        && body.insert("input".into(), prompt).is_some()
+    {
+        return Err(ApiError::invalid_request(
+            "send input or prompt to /tts, not both",
+        ));
+    }
+    body.entry("model").or_insert(json!(""));
+    for (key, neutral) in [
+        ("speed", json!(1.0)),
+        ("top_k", json!(0)),
+        ("top_p", json!(0)),
+        ("seed", json!(-1)),
+        ("loudness", json!(0)),
+        ("cfg_scale", json!(0)),
+        ("flow_steps", json!(0)),
+    ] {
+        if let Some(value) = body.remove(key) {
+            let accepted = value == neutral
+                || value
+                    .as_f64()
+                    .zip(neutral.as_f64())
+                    .is_some_and(|(a, b)| a == b);
+            if !accepted {
+                return Err(ApiError::invalid_request(format!(
+                    "/tts field '{key}' requires {neutral} for this package's speech contract; omit it to use declared model settings"
+                )));
+            }
+        }
+    }
+    let request = serde_json::from_value(Value::Object(body)).map_err(|err| ApiError::invalid_request(format!("invalid native speech request: {err}; send input/prompt and optional model; voice cloning and undeclared synthesis controls require a capable package contract")))?;
+    super::audio_speech(State(state), ApiJson(request)).await
+}
+
 #[cfg(test)]
 mod normalization_tests {
     use super::normalize_embedding;

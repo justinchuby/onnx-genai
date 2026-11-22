@@ -119,6 +119,7 @@ pub fn app(state: AppState) -> Router {
         .route("/completion", post(routes::native::completions))
         .route("/completions", post(routes::native::completions))
         .route("/infill", post(routes::native::infill))
+        .route("/tts", post(routes::native::tts))
         .route("/embedding", post(routes::native::embeddings))
         .route("/embeddings", post(routes::native::embeddings))
         .route("/tokenize", post(routes::llama::tokenize))

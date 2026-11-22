@@ -35,7 +35,7 @@ model inspection, profiling and command-line streaming remain available.
 | GET, DELETE | `/v1/stream` | Byte-offset replay or explicit producer cancellation by `conv_id` |
 | POST | `/v1/streams/lookup` | Lookup only requested conversation IDs, including model-qualified IDs |
 | POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Existing multipart transcription contract |
-| POST | `/v1/audio/speech`, `/audio/speech` | Existing speech contract |
+| POST | `/v1/audio/speech`, `/audio/speech`, `/tts` | Declared buffered speech workflow; native input/prompt and raw-prompt handling |
 | GET | `/models/sse` | Initial state and changes to committed model load status; one-second polling, no invented progress |
 | POST | `/models/load`, `/models/unload` | Configured model IDs; requires `--enable-admin-endpoints` |
 | GET | `/metrics` | Existing nxrt Prometheus metrics when compiled with `metrics`; names are not llama metric aliases |
@@ -97,12 +97,18 @@ Responses continuation/storage, hosted tools and explicit thinking budgets are
 rejected. Streaming adapters preserve reasoning, tool argument deltas, usage and
 termination, and report upstream stream failures as errors.
 
+Native `/tts` accepts `input` or `prompt`, optional model, and the package's
+bounded WAV workflow. `raw_prompt=true` bypasses text assembly and requires empty
+`instructions`; token and output-unit limits still apply. Voice cloning,
+undeclared voices/languages, and active synthesis controls are rejected rather
+than ignored. The OpenAI speech request also rejects unknown controls.
+
 ## Remaining differences
 
 This is a functional Llama Chat integration, not a claim of complete llama-server
 parity. These upstream protocols are still unimplemented:
 
-- Reranking, `/tts`, realtime audio/WebSocket inference and `/v1/systemone`.
+- Reranking, realtime audio/WebSocket inference and `/v1/systemone`.
 - Slot save/restore, LoRA hot swapping and realtime reasoning control.
 - GGUF/Hugging Face model downloads and deletion.
 
