@@ -846,8 +846,11 @@ mod tanh_c {
 
 /// `MlasLogisticConstants`, `onnxruntime/core/mlas/lib/logistic.cpp`.
 ///
-/// `x86_64`-only for the same reason as [`tanh_c`].
-#[cfg(target_arch = "x86_64")]
+/// Shared by AVX2 sigmoid and native ARM64 fused SiLU.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", any(not(feature = "mlas"), test))
+))]
 mod logistic_c {
     pub(super) const LOWER: f32 = -18.0;
     pub(super) const UPPER: f32 = 18.0;
@@ -862,6 +865,50 @@ mod logistic_c {
     pub(super) const BETA_4: f32 = 1.70198817374094e-03;
     pub(super) const BETA_2: f32 = 1.16817656904453e-01;
     pub(super) const BETA_0: f32 = 9.93151921023180e-01;
+}
+
+/// Fused ARM64 SiLU using the MLAS logistic rational, followed by x*sigmoid(x).
+/// The caller repairs out-of-band/non-finite lanes with stable scalar semantics.
+/// Adapted from ONNX Runtime MLAS logistic.cpp, copyright Microsoft Corporation.
+/// MIT license and permission notice: crate-root MLAS_LICENSE (retained independently
+/// of the optional vendor/reference crate).
+///
+/// # Safety
+/// Requires ARM64 NEON. No memory access is performed by this vector primitive.
+#[cfg(all(target_arch = "aarch64", any(not(feature = "mlas"), test)))]
+#[inline]
+pub(super) unsafe fn silu_neon_vector(
+    x: std::arch::aarch64::float32x4_t,
+) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        let v = vminq_f32(
+            vdupq_n_f32(logistic_c::UPPER),
+            vmaxq_f32(vdupq_n_f32(logistic_c::LOWER), x),
+        );
+        let v2 = vmulq_f32(v, v);
+        let mut p = vfmaq_f32(
+            vdupq_n_f32(logistic_c::ALPHA_7),
+            v2,
+            vdupq_n_f32(logistic_c::ALPHA_9),
+        );
+        p = vfmaq_f32(vdupq_n_f32(logistic_c::ALPHA_5), p, v2);
+        p = vfmaq_f32(vdupq_n_f32(logistic_c::ALPHA_3), p, v2);
+        p = vfmaq_f32(vdupq_n_f32(logistic_c::ALPHA_1), p, v2);
+        p = vmulq_f32(p, v);
+        let mut q = vfmaq_f32(
+            vdupq_n_f32(logistic_c::BETA_8),
+            v2,
+            vdupq_n_f32(logistic_c::BETA_10),
+        );
+        q = vfmaq_f32(vdupq_n_f32(logistic_c::BETA_6), q, v2);
+        q = vfmaq_f32(vdupq_n_f32(logistic_c::BETA_4), q, v2);
+        q = vfmaq_f32(vdupq_n_f32(logistic_c::BETA_2), q, v2);
+        q = vfmaq_f32(vdupq_n_f32(logistic_c::BETA_0), q, v2);
+        let sigmoid = vaddq_f32(vdivq_f32(p, q), vdupq_n_f32(0.5));
+        let sigmoid = vminq_f32(vdupq_n_f32(1.0), vmaxq_f32(vdupq_n_f32(0.0), sigmoid));
+        vmulq_f32(x, sigmoid)
+    }
 }
 
 /// `MlasErfConstants`, `onnxruntime/core/mlas/lib/erf.cpp`.

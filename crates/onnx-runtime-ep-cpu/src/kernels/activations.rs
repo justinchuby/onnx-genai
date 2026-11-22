@@ -178,7 +178,7 @@ fn silu_f64(x: f64) -> f64 {
 
 /// Both SIMD approximations are validated on this finite input band. Outside
 /// it, use the stable scalar formula: MLAS clamps its logistic input and the
-/// native exp(-x) reconstruction would otherwise distort negative tails.
+/// a clamped logistic value would otherwise distort negative tails.
 #[cfg(any(feature = "mlas", target_arch = "aarch64"))]
 const SILU_APPROX_SAFE_BOUND: f32 = 18.0;
 
@@ -435,6 +435,24 @@ fn contiguous_f32(
 #[cfg(any(feature = "mlas", target_arch = "aarch64"))]
 const SILU_CORRECTION_BLOCK: usize = 8192;
 
+/// Shared repair rule for both approximations. The OR-reduction vectorizes;
+/// ordinary blocks never load or rewrite output in this correction pass.
+#[cfg(any(feature = "mlas", target_arch = "aarch64"))]
+#[inline]
+fn correct_silu_block(input: &[f32], output: &mut [f32]) {
+    let mut needs_correction = 0u32;
+    for &x in input {
+        needs_correction |= u32::from(!x.is_finite() || x.abs() > SILU_APPROX_SAFE_BOUND);
+    }
+    if needs_correction != 0 {
+        for (o, &x) in output.iter_mut().zip(input) {
+            if !x.is_finite() || x.abs() > SILU_APPROX_SAFE_BOUND {
+                *o = silu(x);
+            }
+        }
+    }
+}
+
 /// MLAS's fused SiLU with its out-of-band results corrected, blocked so the
 /// correction stays in cache.
 ///
@@ -456,17 +474,7 @@ fn silu_mlas_corrected(input: &[f32], output: &mut [f32]) {
         .zip(output.chunks_mut(SILU_CORRECTION_BLOCK))
     {
         mlas_sys::compute_silu(xs, ys);
-        let mut needs_correction = 0u32;
-        for &x in xs {
-            needs_correction |= u32::from(!x.is_finite() || x.abs() > SILU_APPROX_SAFE_BOUND);
-        }
-        if needs_correction != 0 {
-            for (o, &i) in ys.iter_mut().zip(xs) {
-                if !i.is_finite() || i.abs() > SILU_APPROX_SAFE_BOUND {
-                    *o = silu(i);
-                }
-            }
-        }
+        correct_silu_block(xs, ys);
     }
 }
 
@@ -500,84 +508,29 @@ fn silu_native_chunk(input: &[f32], output: &mut [f32]) {
     }
 }
 
-/// NEON-vectorized SiLU: `x / (1 + exp(-x))`, processing 4 floats per iteration.
-///
-/// Uses a Cephes-style exp polynomial with Cody-Waite range reduction. Measured
-/// worst-case exp error ~28 ULP on the normal f32 range. Use this
-/// approximation only for finite |x| <= 18: outside that band the stable
-/// scalar formula preserves negative subnormal tails and positive limits.
+/// Native NEON fused SiLU: share the absorbed logistic coefficients and
+/// rational evaluation with AVX2, multiply in registers, then repair lanes
+/// outside the validated band. No intermediate sigmoid buffer is stored.
 #[cfg(all(target_arch = "aarch64", any(not(feature = "mlas"), test)))]
 fn silu_f32_neon(input: &[f32], output: &mut [f32]) {
     use std::arch::aarch64::*;
-
     debug_assert_eq!(input.len(), output.len());
-
     let len = input.len();
     let mut i = 0;
-
-    // Process 4 elements at a time using NEON intrinsics.
-    // exp(-x) is computed via Cody-Waite range reduction + degree-5 polynomial.
-    #[allow(clippy::excessive_precision)]
-    unsafe {
-        // Constants for exp computation:
-        let log2ef = vdupq_n_f32(std::f32::consts::LOG2_E);
-        let c1 = vdupq_n_f32(0.693359375_f32); // ln(2) high part (exact in f32)
-        let c2 = vdupq_n_f32(-2.12194440e-4_f32); // ln(2) low part
-        let one = vdupq_n_f32(1.0_f32);
-        // Polynomial coefficients for exp(r) on [-ln2/2, ln2/2]:
-        // exp(r) ≈ 1 + r*(1 + r*(c2 + r*(c3 + r*(c4 + r*c5))))
-        let p2 = vdupq_n_f32(0.500000000_f32); // 1/2!
-        let p3 = vdupq_n_f32(0.166666667_f32); // 1/3!
-        let p4 = vdupq_n_f32(0.041666666_f32); // 1/4!
-        let p5 = vdupq_n_f32(0.008333333_f32); // 1/5!
-        // Clamp range to prevent overflow in 2^n reconstruction.
-        let exp_lo = vdupq_n_f32(-87.3_f32);
-        let exp_hi = vdupq_n_f32(88.7_f32);
-
-        while i + 4 <= len {
+    while i + 4 <= len {
+        // SAFETY: ARM64 provides NEON and both slices contain these four
+        // elements. The vector primitive does not access memory itself.
+        unsafe {
             let x = vld1q_f32(input.as_ptr().add(i));
-            let neg_x = vnegq_f32(x);
-
-            // Clamp -x to prevent exp overflow/underflow.
-            let clamped = vmaxq_f32(vminq_f32(neg_x, exp_hi), exp_lo);
-
-            // Range reduction: n = round(clamped * log2(e))
-            let nf = vrndnq_f32(vmulq_f32(clamped, log2ef));
-            // r = clamped - n * ln(2), using Cody-Waite split for precision.
-            let r = vsubq_f32(vsubq_f32(clamped, vmulq_f32(nf, c1)), vmulq_f32(nf, c2));
-
-            // Horner's method: exp(r) ≈ 1 + r*(1 + r*(p2 + r*(p3 + r*(p4 + r*p5))))
-            let poly = vfmaq_f32(p4, r, p5);
-            let poly = vfmaq_f32(p3, r, poly);
-            let poly = vfmaq_f32(p2, r, poly);
-            let poly = vfmaq_f32(one, r, poly);
-            let poly = vfmaq_f32(one, r, poly);
-
-            // Reconstruct: exp(clamped) = poly * 2^n.
-            // Add n to the IEEE754 exponent by adding n << 23 to the bit pattern.
-            let ni = vcvtq_s32_f32(nf);
-            let scale = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(ni, vdupq_n_s32(127))));
-            let exp_neg_x = vmulq_f32(poly, scale);
-
-            // SiLU: x / (1 + exp(-x))
-            let denom = vaddq_f32(one, exp_neg_x);
-            let result = vdivq_f32(x, denom);
-
-            // Repair values outside the validated numerical band below;
-            // clamping protects the speculative SIMD exponent reconstruction.
+            let result = super::simd_activations::silu_neon_vector(x);
             vst1q_f32(output.as_mut_ptr().add(i), result);
-            i += 4;
         }
+        i += 4;
     }
 
-    // Keep corrections local to the caller's bounded block. In particular,
-    // exp(-x) overflows for negative tails where x*exp(x) is still nonzero.
-    let neon_end = i;
-    for j in 0..neon_end {
-        if !input[j].is_finite() || input[j].abs() > SILU_APPROX_SAFE_BOUND {
-            output[j] = silu(input[j]);
-        }
-    }
+    // The same bounded repair rule as the research path, restricted to the
+    // SIMD prefix so the already-stable scalar tail is computed only once.
+    correct_silu_block(&input[..i], &mut output[..i]);
     // Scalar tail for remaining elements.
     while i < len {
         output[i] = silu(input[i]);
@@ -1536,6 +1489,48 @@ mod native_silu_contract {
                 (got as f64 - want).abs() <= 2e-6 * want.abs().max(1.0),
                 "x={x}: got {got}, want {want}"
             );
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "mlas"))]
+    #[test]
+    fn native_neon_silu_vector_lanes_match_mlas_reference_bitwise() {
+        let specials = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            -18.000002,
+            18.000002,
+            -103.0,
+            f32::MIN,
+            f32::MAX,
+        ];
+        // Whole vector lanes in each 8192-element block: scalar tails retain
+        // their independent, stable f64-exp semantics and need not match the
+        // MLAS scalar rational's rounding.
+        let input: Vec<f32> = (0..131072)
+            .map(|i| {
+                if i % 257 == 0 {
+                    specials[(i / 257) % specials.len()]
+                } else {
+                    -18.0 + 36.0 * (i % 65537) as f32 / 65536.0
+                }
+            })
+            .collect();
+        let mut reference = vec![0.0; input.len()];
+        let mut native = vec![0.0; input.len()];
+        serial_scope(|| silu_f32_slice(&input, &mut reference));
+        serial_scope(|| silu_native_f32_slice(&input, &mut native));
+        for (i, (&got, &want)) in native.iter().zip(&reference).enumerate() {
+            if want.is_nan() {
+                assert!(got.is_nan());
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "index={i} x={}", input[i]);
+            }
         }
     }
 
