@@ -33,6 +33,7 @@ pub mod runtime_trace;
 pub mod sampling;
 pub(crate) mod session;
 pub mod speculative;
+pub mod tokenization;
 
 pub use onnx_genai_scheduler::SchedulerAdmissionError;
 

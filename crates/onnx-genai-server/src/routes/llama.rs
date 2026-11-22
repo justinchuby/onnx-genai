@@ -137,21 +137,22 @@ pub(crate) async fn tokenize(
                 "content tokenization failed: {err}; check the model tokenizer.json"
             ))
         })?;
-    let tokens = if request.with_pieces {
+    let tokens: Vec<Value> = if request.with_pieces {
+        let pieces = onnx_genai_engine::tokenization::token_pieces(&handle.tokenizer, &encoding)
+            .map_err(|err| {
+                ApiError::invalid_request(format!("token pieces could not be decoded: {err:#}"))
+            })?;
         encoding
             .iter()
-            .map(|id| {
-                let piece = handle
-                    .tokenizer
-                    .decode_with_special_tokens(&[*id])
-                    .map_err(|err| {
-                        ApiError::invalid_request(format!(
-                            "token {id} could not be rendered as a piece: {err}"
-                        ))
-                    })?;
-                Ok(json!({"id": id, "piece": piece}))
+            .zip(pieces)
+            .map(|(id, piece)| {
+                let piece = match std::str::from_utf8(&piece) {
+                    Ok(text) => json!(text),
+                    Err(_) => json!(piece),
+                };
+                json!({"id":id,"piece":piece})
             })
-            .collect::<Result<Vec<_>, ApiError>>()?
+            .collect()
     } else {
         encoding.iter().map(|id| json!(id)).collect()
     };

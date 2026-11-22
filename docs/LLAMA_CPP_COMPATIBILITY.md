@@ -53,6 +53,9 @@ rejected because these models execute in-process with explicit nxrt settings.
 - `/tokenize` can parse registered special tokens or treat their spelling as
   ordinary text. This is independent of inserting BOS/EOS tokens, and each
   request keeps its policy isolated from other requests.
+- `with_pieces` returns Unicode strings when valid, or byte arrays for incomplete
+  UTF-8 token fragments. Byte-level/fallback pieces preserve raw bytes, including
+  `0xff`, and omit the grammar adapter's internal special-token framing.
 - `model` can be omitted for the default chat model.
 - `max_tokens: -1` uses the configured server output cap; context limits still apply.
 - `seed: -1` selects an unseeded request; unsigned 64-bit seeds remain accepted.
@@ -121,7 +124,6 @@ This is a functional Llama Chat integration, not a claim of complete llama-serve
 parity. These upstream protocols are still unimplemented:
 
 - Reranking, realtime audio/WebSocket inference and `/v1/systemone`.
-- Byte-array token pieces for tokens containing incomplete UTF-8.
 - Slot save/restore, LoRA hot swapping and realtime reasoning control.
 - GGUF/Hugging Face model downloads and deletion.
 

@@ -85,4 +85,11 @@ permission classifications. Messages errors include the Anthropic envelope even
 for JSON extraction failures, retain retry headers, and late SSE errors preserve
 the original status/category across adapters. Full server: 375 passed, 2 inherited
 ignores; strict all-target Clippy passes. The active-generation browser reconnect
-scenario and exact byte-valued token pieces still need work.
+scenario still needs work.
+
+Byte-piece follow-up: native with_pieces now preserves incomplete UTF-8 using
+byte arrays. The existing byte vocabulary adapter is invoked once per requested
+batch and special framing is removed only when it matches marker+spelling;
+literal 0xff remains intact. ByteFallback and ByteLevel engine tests, special-token
+framing, invalid-id checks and an HTTP Unicode round-trip pass. Strict server
+all-target Clippy passes.

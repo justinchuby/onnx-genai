@@ -6737,6 +6737,40 @@ mod native_compat {
     }
 
     #[tokio::test]
+    async fn native_token_pieces_preserve_incomplete_utf8_bytes_over_http() {
+        let scratch = tempfile::tempdir().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        copy_tree(&fixtures.join("tiny-llm"), scratch.path());
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut vocab = tokenizer["model"]["vocab"].as_object().unwrap().clone();
+        vocab.remove("hello");
+        vocab.remove("world");
+        vocab.insert("<0xC3>".into(), json!(4));
+        vocab.insert("<0xA9>".into(), json!(5));
+        tokenizer["model"] = json!({"type":"BPE","unk_token":"<unk>","byte_fallback":true,"vocab":vocab,"merges":[]});
+        tokenizer["decoder"] = json!({"type":"ByteFallback"});
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("byte-pieces".into())).unwrap());
+        let response = request(
+            router.clone(),
+            "/tokenize",
+            json!({"content":"é","with_pieces":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["tokens"],
+            json!([{"id":4,"piece":[195]},{"id":5,"piece":[169]}])
+        );
+        let response = request(router, "/detokenize", json!({"tokens":[4,5]})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["content"], "é");
+    }
+
+    #[tokio::test]
     async fn native_tokenization_can_treat_special_tokens_as_plain_text() {
         let scratch = tempfile::tempdir().unwrap();
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
