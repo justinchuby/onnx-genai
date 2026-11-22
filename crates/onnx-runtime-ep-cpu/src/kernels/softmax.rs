@@ -391,6 +391,11 @@ mod exp_coefficients {
     pub(super) const C6: f32 = 1.383_684_6e-3_f32;
 }
 
+// Two complete four-lane vectors amortize the polynomial/mask prologue.
+// Measured 4/7-element rows do not benefit; keep their original scalar body.
+#[cfg(target_arch = "aarch64")]
+const MIN_NEON_SOFTMAX_ROW: usize = 8;
+
 #[cfg(target_arch = "aarch64")]
 #[path = "softmax_neon.rs"]
 mod softmax_neon;
@@ -468,7 +473,7 @@ unsafe fn softmax_row_core(src: *const f32, dst: *mut f32, d: usize) {
         }
     }
     #[cfg(target_arch = "aarch64")]
-    if d >= 4 && std::arch::is_aarch64_feature_detected!("neon") {
+    if d >= MIN_NEON_SOFTMAX_ROW && std::arch::is_aarch64_feature_detected!("neon") {
         // SAFETY: runtime detection proves NEON; preserve the identical-or-
         // disjoint source/destination contract and the complete row bounds.
         unsafe { softmax_neon::softmax_row(src, dst, d) };

@@ -31,7 +31,11 @@ FIELDS = [
     "checksum",
 ]
 BASE_ARMS = {"0": "scalar_before", "1": "native", "2": "native_aa", "3": "mlas"}
-ARM_SCHEMAS = {1: BASE_ARMS, 2: BASE_ARMS | {"4": "neon_initial_before"}}
+ARM_SCHEMAS = {
+    1: BASE_ARMS,
+    2: BASE_ARMS | {"4": "neon_initial_before"},
+    3: BASE_ARMS | {"4": "neon_initial_before"},
+}
 
 LOCK = Path("/tmp/onnx-genai-hostlock-darwin.flock")
 
@@ -50,6 +54,8 @@ def analyze(raw, metadata):
     require(schema in ARM_SCHEMAS, "unsupported diagnostic schema")
     arm_labels = ARM_SCHEMAS[schema]
     arm_count = len(arm_labels)
+    if schema == 3:
+        require(metadata["native_neon_min_cols"] == 8, "native NEON row seam differs")
     require(
         metadata["arms"] == arm_labels,
         "explicit diagnostic schema/arms differ",
@@ -180,18 +186,20 @@ def analyze(raw, metadata):
         require(
             tokens[(n, d, 1)] == tokens[(n, d, 2)], "native A/A sample tokens differ"
         )
-    if schema == 2:
+    if schema >= 2:
         for cell in cells:
             cell["initial_neon_over_native"] = (
                 cell["median_wall_ns"]["4"] / cell["median_wall_ns"]["1"]
             )
         for n, d in SHAPES:
+            before = 0 if schema == 3 and d < 8 else 4
             require(
-                hashes[(n, d, 4)] == hashes[(n, d, 1)],
-                "initial/new NEON full hashes differ",
+                hashes[(n, d, before)] == hashes[(n, d, 1)],
+                "selected before/native full hashes differ",
             )
             require(
-                tokens[(n, d, 4)] == tokens[(n, d, 1)], "initial/new NEON tokens differ"
+                tokens[(n, d, before)] == tokens[(n, d, 1)],
+                "selected before/native tokens differ",
             )
     return {
         "schema": schema,
@@ -265,8 +273,9 @@ def run(directory, binary, cargo_receipt, reps, sweeps):
         "freeze the entire checkout before measuring; commit or move pending source/artifact files",
     )
     metadata = {
-        "schema": 2,
-        "arms": ARM_SCHEMAS[2],
+        "schema": 3,
+        "arms": ARM_SCHEMAS[3],
+        "native_neon_min_cols": 8,
         "repetitions": reps,
         "sweeps": sweeps,
         "binary_sha256": sha(binary.read_bytes()),

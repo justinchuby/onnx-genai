@@ -134,7 +134,9 @@ fn initial_neon(src: &[f32], dst: &mut [f32], _n: usize, d: usize) {
 fn scalar_before(src: &[f32], dst: &mut [f32], _n: usize, d: usize) {
     for (input, output) in src.chunks(d).zip(dst.chunks_mut(d)) {
         // Match the native arm's test-only per-row bookkeeping.
-        SOFTMAX_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if d >= super::MIN_NEON_SOFTMAX_ROW {
+            SOFTMAX_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // SAFETY: disjoint complete rows; exact historical scalar arithmetic.
         unsafe { super::softmax_row_scalar(input.as_ptr(), output.as_mut_ptr(), d) };
     }
@@ -255,7 +257,7 @@ mod tests {
                 // SAFETY: initialized equal-length slices, NEON host.
                 unsafe {
                     super::super::softmax_row_scalar(input.as_ptr(), scalar.as_mut_ptr(), d);
-                    if d >= 4 {
+                    if d >= super::super::MIN_NEON_SOFTMAX_ROW {
                         softmax_row(input.as_ptr(), direct.as_mut_ptr(), d);
                     } else {
                         super::super::softmax_row_scalar(input.as_ptr(), direct.as_mut_ptr(), d);
@@ -267,7 +269,7 @@ mod tests {
                         .zip(&direct)
                         .all(|(a, b)| a.to_bits() == b.to_bits())
                 );
-                witness |= d >= 4
+                witness |= d >= super::super::MIN_NEON_SOFTMAX_ROW
                     && direct
                         .iter()
                         .zip(&scalar)
