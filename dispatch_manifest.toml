@@ -437,3 +437,12 @@ minimum_tier = "tier2"
 counter = "SOFTMAX_NEON_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon.rs"
 description = "Native contiguous f32 rows with d>=8 use NEON max/exp/sum/normalize, including gradual underflow and scalar partial tails"
+
+[[claim]]
+op = "MatMulNBits"
+variant = "apple_dense_nt"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "ACCELERATE_NT_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/accelerate_gemm.rs"
+description = "Apple transposed-B SGEMM reads cached NK weights without a KN copy; buffer extents and BLAS ABI dimensions are checked before framework dispatch"

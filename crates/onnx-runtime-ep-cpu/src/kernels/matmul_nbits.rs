@@ -3379,10 +3379,10 @@ impl MatMulNBitsKernel {
     /// It is available on every backend with an NT GEMM — MLAS's cache-tiled
     /// `sgemm` with `trans_b`, and, now, the native `SimdX86` packer that reads
     /// `B_nk` row-wise into an L1-resident pack tile (the same idea, ported off
-    /// MLAS). [`super::matmul::nt_gemm_supported`] is the single legality
-    /// predicate; [`super::matmul::gemm_nt_with_backend`] is proven
-    /// bit-identical to the `Kn` dense route for the same inputs, because
-    /// `B_nk[n, k]` is exactly the weight the `Kn` path stores transposed.
+    /// MLAS), plus Apple Accelerate's transposed-B SGEMM. The single legality
+    /// predicate is [`super::matmul::nt_gemm_supported`]. Both layouts represent
+    /// the same matrix, but f32 reduction order can differ; f64-oracle tests
+    /// validate numerical error rather than inferring bit identity from layout.
     #[allow(clippy::too_many_arguments)]
     fn try_prefill_nk_nt(
         &self,
@@ -3418,8 +3418,8 @@ impl MatMulNBitsKernel {
         let weight_nk = weight.as_slice();
 
         // C[m, n] = A[m, k] * B_nk[n, k]^T -- reads the Nk weight as the
-        // transposed operand without materializing a Kn copy. Bit-identical to
-        // the direct-`Kn` dense GEMM the caller would otherwise run. Timed on
+        // transposed operand without materializing a Kn copy. The selected
+        // backend may reduce f32 products differently from NN. Timed on
         // the same `gemv` phase the `Kn` route reports, so a profile taken
         // across the two routes compares like with like.
         mm_profile::time_gemv(|| {
@@ -13023,6 +13023,58 @@ mod tests {
         drop(kernel);
         assert_eq!(books.used(Tier::Host), bytes as u64);
         drop(retained);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn apple_dense_prefill_reuses_one_nk_expansion() {
+        let _probe = lock_dispatch_probe();
+        #[cfg(feature = "mlas")]
+        let _env = backend_env_lock().lock().unwrap();
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        assert_eq!(
+            crate::backend::CpuBackend::auto_detect(),
+            crate::backend::CpuBackend::Accelerate
+        );
+        let (books, resources) = governed_dense_resources(396, 396);
+        let mut kernel = MatMulNBitsFactory::new(resources)
+            .create(&governed_dense_node(33, 3, 4, 16), &[vec![3, 33]])
+            .unwrap();
+        kernel.set_constant_inputs(&[false, true, true, false, true]);
+        let b = Owned::u8(&[3, 3, 8], &[0x98; 72]);
+        let scales = Owned::f32(&[3, 3], &[0.125; 9]);
+        let groups = Owned::i32(&[33], &(0..33).map(|i| i / 16).collect::<Vec<_>>());
+        for _ in 0..3 {
+            let a = Owned::f32(&[3, 33], &[0.25; 99]);
+            let mut y = Owned::zeros_f32(&[3, 3]);
+            kernel
+                .execute(
+                    &[
+                        a.view(),
+                        b.view(),
+                        scales.view(),
+                        TensorView::absent(DataType::Uint8),
+                        groups.view(),
+                    ],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            assert_eq!(y.to_f32(), [0.5; 9]);
+            let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+            assert!(
+                cached_dense_weight(concrete).is_some(),
+                "Apple prefill must use the retained NK expansion rather than rebuilding KN"
+            );
+            assert_eq!(
+                concrete.dense_weights.activity().1,
+                1,
+                "warm prefill must decode only once"
+            );
+            assert_eq!(books.used(Tier::Host), 396);
+        }
+        drop(kernel);
         assert_eq!(books.used(Tier::Host), 0);
     }
 

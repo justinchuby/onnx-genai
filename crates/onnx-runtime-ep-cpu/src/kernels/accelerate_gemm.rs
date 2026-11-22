@@ -1,9 +1,9 @@
 //! Apple Accelerate + NEON GEMV for the M=1 decode hot path,
 //! plus BNNS fp16→f32 MatMul for M≥2 prefill/batch-decode (reaches AMX).
 //!
-//! Four routes, selected per-op by matrix geometry:
+//! Routes selected per-op by matrix geometry:
 //!
-//! - `sgemm`: Accelerate `cblas_sgemm` for M>1 f32 prefill (reaches AMX).
+//! - `sgemm` / `sgemm_nt`: Accelerate NN / transposed-B f32 GEMM.
 //! - `bnns_matmul_f16`: BNNS `BNNSFilterCreateLayerBroadcastMatMul` for M≥2
 //!   fp16→f32 prefill/batch-decode (~2451 GFLOPS on M1 Max via AMX).
 //! - `neon_gemv_col_parallel`: Column-parallel NEON GEMV on pre-transposed B
@@ -11,8 +11,11 @@
 //! - `neon_gemv_parallel`: Row-parallel NEON GEMV fallback for M=1 when
 //!   pre-transposed B is not available.
 
+use onnx_runtime_ep_api::{EpError, Result};
+
 const CBLAS_ROW_MAJOR: i32 = 101;
 const CBLAS_NO_TRANS: i32 = 111;
+const CBLAS_TRANS: i32 = 112;
 
 #[link(name = "Accelerate", kind = "framework")]
 unsafe extern "C" {
@@ -34,29 +37,120 @@ unsafe extern "C" {
     );
 }
 
-/// C[m,n] = A[m,k] @ B[k,n] via Accelerate `cblas_sgemm`.
-pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    debug_assert_eq!(a.len(), m * k);
-    debug_assert_eq!(b.len(), k * n);
-    debug_assert_eq!(c.len(), m * n);
-    unsafe {
-        cblas_sgemm(
-            CBLAS_ROW_MAJOR,
-            CBLAS_NO_TRANS,
-            CBLAS_NO_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
-            1.0,
-            a.as_ptr(),
-            k as i32,
-            b.as_ptr(),
-            n as i32,
-            0.0,
-            c.as_mut_ptr(),
-            n as i32,
-        );
+/// Validated row-major operands for either NN or NT SGEMM. Both layouts have
+/// K*N B elements; only the physical leading dimension changes at the C ABI.
+struct GemmOperands<'a> {
+    a: &'a [f32],
+    b: &'a [f32],
+    c: &'a mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+}
+impl<'a> GemmOperands<'a> {
+    fn new(
+        a: &'a [f32],
+        b: &'a [f32],
+        c: &'a mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Self> {
+        let fail = |reason: String| {
+            EpError::KernelFailed(format!(
+                "Apple GEMM rejected M={m}, K={k}, N={n}: {reason}; supply exact contiguous A[M,K], B[K,N] (NN) or B[N,K] (NT), C[M,N] buffers with addressable matrix extents"
+            ))
+        };
+        for (name, actual, rows, columns) in [
+            ("A", a.len(), m, k),
+            ("B", b.len(), k, n),
+            ("C", c.len(), m, n),
+        ] {
+            let expected = rows
+                .checked_mul(columns)
+                .ok_or_else(|| fail(format!("{name} element count overflows usize")))?;
+            if actual != expected {
+                return Err(fail(format!(
+                    "{name} has {actual} elements, expected {expected}"
+                )));
+            }
+        }
+        Ok(Self { a, b, c, m, k, n })
     }
+
+    fn run<const TRANSPOSED_B: bool>(self) -> Result<()> {
+        // ABI limits apply only when selecting BLAS; the native GEMV path
+        // below consumes extent-checked usize dimensions directly.
+        let dimension = |name, value| {
+            i32::try_from(value).map_err(|_| EpError::KernelFailed(format!(
+            "Apple GEMM rejected {name}={value}: exceeds i32::MAX for the BLAS ABI; use dimensions within the signed 32-bit interface"
+        )))
+        };
+        let (m, k, n) = (
+            dimension("M", self.m)?,
+            dimension("K", self.k)?,
+            dimension("N", self.n)?,
+        );
+        if m == 0 || n == 0 {
+            return Ok(());
+        }
+        if k == 0 {
+            self.c.fill(0.0);
+            return Ok(());
+        }
+        // SAFETY: construction checked extents; the conversions above checked
+        // the i32 ABI limits.
+        // All leading dimensions are positive here, and the exclusively
+        // borrowed output remains valid until synchronous SGEMM returns.
+        unsafe {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                if TRANSPOSED_B {
+                    CBLAS_TRANS
+                } else {
+                    CBLAS_NO_TRANS
+                },
+                m,
+                n,
+                k,
+                1.0,
+                self.a.as_ptr(),
+                k,
+                self.b.as_ptr(),
+                if TRANSPOSED_B { k } else { n },
+                0.0,
+                self.c.as_mut_ptr(),
+                n,
+            );
+        }
+        #[cfg(test)]
+        if TRANSPOSED_B {
+            ACCELERATE_NT_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+static ACCELERATE_NT_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// C[M,N] = A[M,K] @ B[K,N], with validated buffers and ABI dimensions.
+pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) -> Result<()> {
+    GemmOperands::new(a, b, c, m, k, n)?.run::<false>()
+}
+
+/// C[M,N] = A[M,K] @ B[N,K]^T, borrowing NK weights without a KN copy.
+pub(super) fn sgemm_nt(
+    a: &[f32],
+    b_nk: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<()> {
+    GemmOperands::new(a, b_nk, c, m, k, n)?.run::<true>()
 }
 
 // ─── BNNS fp16→f32 MatMul (prefill / batch-decode, M≥2) ─────────────
@@ -471,20 +565,17 @@ fn neon_dot(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Row-parallel: partitions K so each thread reads contiguous B rows.
 /// Uses 4\u00d7 K-unrolled outer product to reduce partial-sum traffic.
-pub fn neon_gemv_parallel(x: &[f32], b: &[f32], y: &mut [f32], k: usize, n: usize) {
+pub fn neon_gemv_parallel(x: &[f32], b: &[f32], y: &mut [f32], k: usize, n: usize) -> Result<()> {
     use rayon::prelude::*;
 
-    debug_assert_eq!(x.len(), k);
-    debug_assert_eq!(b.len(), k * n);
-    debug_assert_eq!(y.len(), n);
-
+    let call = GemmOperands::new(x, b, y, 1, k, n)?;
     let threads = rayon::current_num_threads();
 
     // For small matrices, Accelerate sgemm has lower overhead.
     if threads <= 1 || k * n < 500_000 {
-        sgemm(x, b, y, 1, k, n);
-        return;
+        return call.run::<false>();
     }
+    let GemmOperands { a: x, b, c: y, .. } = call;
 
     let rows_per_thread = k.div_ceil(threads);
 
@@ -521,6 +612,7 @@ pub fn neon_gemv_parallel(x: &[f32], b: &[f32], y: &mut [f32], k: usize, n: usiz
             *yi += pi;
         }
     }
+    Ok(())
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1098,12 +1190,142 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn sgemm_nt_matches_f64_across_layouts_tails_and_offset_slices() {
+        use std::sync::atomic::Ordering;
+        let before = ACCELERATE_NT_TEST_HITS.load(Ordering::Relaxed);
+        let mut state = 0x7124_abcdu32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 - 8_388_608.) / 16_777_216.
+        };
+        let (mut cells, mut values, mut changed) = (0, 0, 0);
+        let mut max_error = 0.0f64;
+        for m in [1, 2, 3, 7, 17, 33, 65] {
+            for k in [1, 3, 16, 33, 127, 257] {
+                for n in [1, 3, 9, 33, 129] {
+                    let mut a = vec![7.; m * k + 2];
+                    a[1..m * k + 1].iter_mut().for_each(|v| *v = next());
+                    let b: Vec<_> = (0..k * n).map(|_| next()).collect();
+                    let mut nk = vec![7.; n * k + 2];
+                    for p in 0..k {
+                        for j in 0..n {
+                            nk[1 + j * k + p] = b[p * n + j];
+                        }
+                    }
+                    let mut nn = vec![0.; m * n];
+                    let mut nt = vec![7.; m * n + 2];
+                    sgemm(&a[1..m * k + 1], &b, &mut nn, m, k, n).unwrap();
+                    sgemm_nt(
+                        &a[1..m * k + 1],
+                        &nk[1..n * k + 1],
+                        &mut nt[1..m * n + 1],
+                        m,
+                        k,
+                        n,
+                    )
+                    .unwrap();
+                    assert_eq!((nt[0], nt[m * n + 1]), (7., 7.));
+                    assert_eq!((a[0], a[m * k + 1], nk[0], nk[n * k + 1]), (7., 7., 7., 7.));
+                    for i in 0..m {
+                        for j in 0..n {
+                            let (mut reference, mut magnitude) = (0.0f64, 0.0f64);
+                            for p in 0..k {
+                                let product =
+                                    f64::from(a[1 + i * k + p]) * f64::from(nk[1 + j * k + p]);
+                                reference += product;
+                                magnitude += product.abs();
+                            }
+                            let bound = (2 * k + 4) as f64 * f64::from(f32::EPSILON) * magnitude;
+                            let index = i * n + j;
+                            for actual in [nn[index], nt[1 + index]] {
+                                assert!(
+                                    (f64::from(actual) - reference).abs() <= bound,
+                                    "M={m} K={k} N={n} ({i},{j}): {actual} vs {reference}, bound {bound}"
+                                );
+                            }
+                            max_error = max_error.max((f64::from(nt[1 + index]) - reference).abs());
+                            changed += usize::from(nn[index].to_bits() != nt[1 + index].to_bits());
+                            values += 1;
+                        }
+                    }
+                    cells += 1;
+                }
+            }
+        }
+        assert_eq!((cells, values), (210, 134_400));
+        assert!(ACCELERATE_NT_TEST_HITS.load(Ordering::Relaxed) > before);
+        eprintln!(
+            "APPLE_NT_NUMERICS cells={cells} outputs={values} nn_nt_bit_differences={changed} max_nt_abs_error_vs_f64={max_error:.9e}"
+        );
+    }
+
+    #[test]
+    fn sgemm_layouts_reject_bad_buffers_and_abi_dimensions_before_writing() {
+        for transposed in [false, true] {
+            let run = if transposed { sgemm_nt } else { sgemm };
+            for (a_len, b_len, c_len, rejected) in [
+                (5, 12, 8, "A"),
+                (7, 12, 8, "A"),
+                (6, 11, 8, "B"),
+                (6, 13, 8, "B"),
+                (6, 12, 7, "C"),
+                (6, 12, 9, "C"),
+            ] {
+                let mut c = vec![7.; c_len];
+                let error = run(&vec![1.; a_len], &vec![1.; b_len], &mut c, 2, 3, 4)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(&format!("{rejected} has"))
+                        && error.contains("expected")
+                        && error.contains("supply exact"),
+                    "{error}"
+                );
+                assert_eq!(c, vec![7.; c_len]);
+            }
+            for (m, k, n, axis) in [
+                (i32::MAX as usize + 1, 0, 0, "M"),
+                (0, usize::MAX, 0, "K"),
+                (0, 0, i32::MAX as usize + 1, "N"),
+            ] {
+                let mut c = [];
+                let error = run(&[], &[], &mut c, m, k, n).unwrap_err().to_string();
+                assert!(
+                    error.contains(axis)
+                        && error.contains("exceeds i32::MAX")
+                        && error.contains("BLAS ABI"),
+                    "{error}"
+                );
+                assert!(c.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn sgemm_layouts_handle_empty_axes_and_nonfinite_values() {
+        for transposed in [false, true] {
+            let run = if transposed { sgemm_nt } else { sgemm };
+            for (m, k, n) in [(0, 3, 4), (2, 0, 4), (2, 3, 0), (0, 0, 0)] {
+                let mut c = vec![7.; m * n];
+                run(&vec![1.; m * k], &vec![1.; k * n], &mut c, m, k, n).unwrap();
+                assert_eq!(c, vec![0.; m * n]);
+            }
+            let mut c = [0.; 6];
+            run(&[f32::NAN, f32::INFINITY], &[1., -1., 0.], &mut c, 2, 1, 3).unwrap();
+            assert!(c[..3].iter().all(|v| v.is_nan()));
+            assert_eq!((c[3], c[4]), (f32::INFINITY, f32::NEG_INFINITY));
+            assert!(c[5].is_nan());
+        }
+    }
+
+    #[test]
     fn sgemm_matches_reference() {
         let (m, k, n) = (4, 8, 6);
         let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.1).collect();
         let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.05).collect();
         let mut c = vec![0.0f32; m * n];
-        sgemm(&a, &b, &mut c, m, k, n);
+        sgemm(&a, &b, &mut c, m, k, n).unwrap();
         // Verify against naive
         for i in 0..m {
             for j in 0..n {
@@ -1149,7 +1371,7 @@ mod tests {
         let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01).collect();
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 100) as f32) * 0.001).collect();
         let mut y = vec![0.0f32; n];
-        neon_gemv_parallel(&x, &b, &mut y, k, n);
+        neon_gemv_parallel(&x, &b, &mut y, k, n).unwrap();
         let ref_y = reference_gemv(&x, &b, k, n);
         let max_err = y
             .iter()
