@@ -401,3 +401,21 @@ minimum_tier = "tier3"
 counter = "GENERIC_BORROWED_COLS_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs"
 description = "Generic f32 GEMM parallel column strips borrow source B and caller output rows; only row-reference metadata is allocated, with the existing scalar register tile and K-panel accumulation order"
+
+[[claim]]
+op = "Erf"
+variant = "f32_native_polynomial"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "ERF_NEON_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/simd_activations_neon.rs"
+description = "Native f32 slices at SIMD_MIN_LEN use the NEON Erf polynomial including tails"
+
+[[claim]]
+op = "Gelu"
+variant = "f32_native_exact_polynomial"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "GELU_NEON_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/simd_activations_neon.rs"
+description = "Native exact f32 GELU fuses the NEON Erf polynomial without intermediate allocation"

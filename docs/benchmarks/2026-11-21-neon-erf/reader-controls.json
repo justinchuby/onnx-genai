@@ -1,0 +1,42 @@
+[
+  {
+    "control": "raw_checksum",
+    "rejected": true,
+    "reason": "raw CSV checksum differs"
+  },
+  {
+    "control": "duplicate_identity",
+    "rejected": true,
+    "reason": "duplicate or unexpected sample identity"
+  },
+  {
+    "control": "wrong_width_same_count",
+    "rejected": true,
+    "reason": "duplicate or unexpected sample identity"
+  },
+  {
+    "control": "wrong_batch",
+    "rejected": true,
+    "reason": "sample work batch differs"
+  },
+  {
+    "control": "missing_full_validation",
+    "rejected": true,
+    "reason": "missing full-buffer validation"
+  },
+  {
+    "control": "no_worker_participation",
+    "rejected": true,
+    "reason": "parallel validation lacks actual worker participation"
+  },
+  {
+    "control": "native_aa_full_hash",
+    "rejected": true,
+    "reason": "full output hash changes with pool/sweep/mode"
+  },
+  {
+    "control": "changed_saved_median",
+    "rejected": true,
+    "reason": "saved results differ from raw-data reanalysis"
+  }
+]
