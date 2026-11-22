@@ -272,10 +272,17 @@ def run(directory, binary, cargo_receipt, reps, sweeps):
         capture_output=True,
     )
     subprocess.run(
-        ["git", "diff", "HEAD", "--exit-code", "--", *tracked],
+        ["git", "diff", "HEAD", "--exit-code"],
         cwd=root,
         check=True,
         capture_output=True,
+    )
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=all"], cwd=root, text=True
+    )
+    require(
+        not status,
+        "freeze the entire checkout before measuring; commit or move pending source/artifact files",
     )
     metadata = {
         "schema": 2,
@@ -288,6 +295,9 @@ def run(directory, binary, cargo_receipt, reps, sweeps):
         "rustc": subprocess.check_output(["rustc", "-Vv"], text=True),
         "source_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip(),
+        "source_tree": subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True
         ).strip(),
         "source_sha256": {name: sha((root / name).read_bytes()) for name in sources},
         "runner_sha256": sha(Path(__file__).read_bytes()),
