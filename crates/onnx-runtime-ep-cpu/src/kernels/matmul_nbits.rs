@@ -2637,6 +2637,7 @@ impl Kernel for MatMulNBitsKernel {
             // materialize ~51 MB per prefill for a 3584x3584 8-bit node. The
             // fused pack allocates only per-strip scratch, so consult it first
             // whenever NT would not keep the weight resident.
+            #[cfg(target_arch = "x86_64")]
             let nt_keeps_weight_resident = self.can_retain_dense(can_prepack, &self.dense_key()?);
             #[cfg(target_arch = "x86_64")]
             let used_gebp_first = !nt_keeps_weight_resident
@@ -2649,14 +2650,8 @@ impl Kernel for MatMulNBitsKernel {
                     m,
                     result,
                 );
-            // Non-x86-64 has no fused GEBP microkernel, so the NT route is
-            // consulted unconditionally there and the residency verdict has no
-            // consumer; bind it so it is not an unused variable.
             #[cfg(not(target_arch = "x86_64"))]
-            let used_gebp_first = {
-                let _ = nt_keeps_weight_resident;
-                false
-            };
+            let used_gebp_first = false;
             let used_fast_nt = !used_gebp_first
                 && self.try_prefill_nk_nt(
                     &inputs[1],
@@ -3379,8 +3374,9 @@ impl MatMulNBitsKernel {
     /// It is available on every backend with an NT GEMM — MLAS's cache-tiled
     /// `sgemm` with `trans_b`, and, now, the native `SimdX86` packer that reads
     /// `B_nk` row-wise into an L1-resident pack tile (the same idea, ported off
-    /// MLAS), plus Apple Accelerate's transposed-B SGEMM. The single legality
-    /// predicate is [`super::matmul::nt_gemm_supported`]. Both layouts represent
+    /// MLAS), plus Apple Accelerate's transposed-B SGEMM. The resolved
+    /// capability is [`super::matmul::NtGemm`], including its weight-reuse
+    /// policy. Apple prefill uses NT only with admitted NK retention. Both layouts represent
     /// the same matrix, but f32 reduction order can differ; f64-oracle tests
     /// validate numerical error rather than inferring bit identity from layout.
     #[allow(clippy::too_many_arguments)]
@@ -3402,7 +3398,12 @@ impl MatMulNBitsKernel {
         if backend == CpuBackend::Accelerate && tests::legacy_apple_kn_forced() {
             return Ok(false);
         }
-        if !super::matmul::nt_gemm_supported(backend) {
+        let Some(gemm) = super::matmul::NtGemm::resolve(backend) else {
+            return Ok(false);
+        };
+        if gemm.requires_retained_weights()
+            && !self.can_retain_dense(can_prepack, &self.dense_key()?)
+        {
             return Ok(false);
         }
 
@@ -3426,17 +3427,11 @@ impl MatMulNBitsKernel {
         // backend may reduce f32 products differently from NN. Timed on
         // the same `gemv` phase the `Kn` route reports, so a profile taken
         // across the two routes compares like with like.
-        mm_profile::time_gemv(|| {
-            super::matmul::gemm_nt_with_backend(
-                backend,
-                activations,
-                weight_nk,
-                result,
-                m,
-                self.k,
-                self.n,
-            )
-        })?;
+        mm_profile::time_gemv(|| gemm.run(activations, weight_nk, result, m, self.k, self.n))?;
+        #[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+        if backend == CpuBackend::Accelerate {
+            tests::record_apple_nt_success();
+        }
         Ok(true)
     }
 
@@ -13033,10 +13028,19 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     thread_local! {
         static LEGACY_APPLE_KN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static APPLE_NT_SUCCESSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(super) fn legacy_apple_kn_forced() -> bool {
         LEGACY_APPLE_KN.with(std::cell::Cell::get)
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(super) fn record_apple_nt_success() {
+        APPLE_NT_SUCCESSES.with(|calls| calls.set(calls.get() + 1));
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn apple_nt_successes() -> usize {
+        APPLE_NT_SUCCESSES.with(std::cell::Cell::get)
     }
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     struct AppleKnDiagnosticScope(bool);
@@ -13172,6 +13176,7 @@ mod tests {
                     Owned::zeros_f32(&[m, n]),
                     Owned::zeros_f32(&[m, n]),
                 ];
+                let nt_before = apple_nt_successes();
                 let iterations = (8_000_000 / (m * k * n)).clamp(4, 2048);
                 // Six orders balance positions and every predecessor pair,
                 // including round boundaries, for interleaved worker pools.
@@ -13228,7 +13233,7 @@ mod tests {
                         let checksum = output_checksum(&actual);
                         assert_eq!(checksum, expected_checksum);
                         println!(
-                            "ANT_SAMPLE,1,{m},{k},{n},{},{round},{arm},{iterations},{cpu_ns:.0},{wall_ns},{checksum}",
+                            "ANT_SAMPLE,2,{m},{k},{n},{},{round},{arm},{iterations},{cpu_ns:.0},{wall_ns},{checksum}",
                             usize::from(retained)
                         );
                     }
@@ -13249,8 +13254,10 @@ mod tests {
                     new_books.used(Tier::Host),
                     if retained { bytes as u64 } else { 0 }
                 );
+                let nt_calls = apple_nt_successes() - nt_before;
+                assert_eq!(nt_calls, if retained { 48 * (iterations + 1) } else { 0 });
                 println!(
-                    "ANT_WITNESS,1,{m},{k},{n},{},{old_builds},{new_builds},{},{}",
+                    "ANT_WITNESS,2,{m},{k},{n},{},{old_builds},{new_builds},{},{},{nt_calls}",
                     usize::from(retained),
                     old_books.used(Tier::Host),
                     new_books.used(Tier::Host)
@@ -13262,6 +13269,57 @@ mod tests {
             }
         }
         assert!(!legacy_apple_kn_forced());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn apple_dense_prefill_without_reuse_keeps_kn_and_no_nt_calls() {
+        let _probe = lock_dispatch_probe();
+        #[cfg(feature = "mlas")]
+        let _env = backend_env_lock().lock().unwrap();
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        assert_eq!(
+            crate::backend::CpuBackend::auto_detect(),
+            crate::backend::CpuBackend::Accelerate
+        );
+        for (limit, constant_groups) in [(0, true), (395, true), (396, false)] {
+            let (books, resources) = governed_dense_resources(792, limit);
+            let mut kernel = MatMulNBitsFactory::new(resources)
+                .create(&governed_dense_node(33, 3, 4, 16), &[vec![3, 33]])
+                .unwrap();
+            kernel.set_constant_inputs(&[false, true, true, false, constant_groups]);
+            let a = Owned::f32(&[3, 33], &[0.25; 99]);
+            let b = Owned::u8(&[3, 3, 8], &[0x98; 72]);
+            let scales = Owned::f32(&[3, 3], &[0.125; 9]);
+            let groups = Owned::i32(&[33], &(0..33).map(|i| i / 16).collect::<Vec<_>>());
+            let before = apple_nt_successes();
+            for _ in 0..3 {
+                let mut output = Owned::zeros_f32(&[3, 3]);
+                kernel
+                    .execute(
+                        &[
+                            a.view(),
+                            b.view(),
+                            scales.view(),
+                            TensorView::absent(DataType::Uint8),
+                            groups.view(),
+                        ],
+                        &mut [output.view_mut()],
+                    )
+                    .unwrap();
+                assert_eq!(output.to_f32(), [0.5; 9]);
+                assert_eq!(books.used(Tier::Host), 0);
+            }
+            assert_eq!(
+                apple_nt_successes(),
+                before,
+                "no reuse must keep the established KN route"
+            );
+            let concrete = kernel.as_any().downcast_ref::<MatMulNBitsKernel>().unwrap();
+            assert!(cached_dense_weight(concrete).is_none());
+            assert_eq!(concrete.dense_weights.activity().1, 3);
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]

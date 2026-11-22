@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate protocol-1 real Apple NBits KN/NT execute diagnostics.
+"""Validate protocol-2 real Apple NBits KN/current-policy execute diagnostics.
 
 Keep failed A/A cells visible, qualified independently for CPU and wall clocks.
 """
@@ -35,7 +35,7 @@ def analyze(records: TextIO) -> dict:
 
     def bad(line: int, reason: str) -> NoReturn:
         raise ValueError(
-            f"Apple execute record {line}: {reason}; preserve complete protocol-1 "
+            f"Apple execute record {line}: {reason}; preserve complete protocol-2 "
             "output from one exact named diagnostic, without merging runs"
         )
 
@@ -49,7 +49,7 @@ def analyze(records: TextIO) -> dict:
         return parsed
 
     for line, row in enumerate(csv.reader(records), 1):
-        if len(row) < 6 or row[1] != "1":
+        if len(row) < 6 or row[1] != "2":
             bad(line, "missing fields or unsupported protocol version")
         shape = tuple(integer(row[i], line, "shape", 2048) for i in (2, 3, 4))
         retained = integer(row[5], line, "retention", 1)
@@ -72,7 +72,7 @@ def analyze(records: TextIO) -> dict:
                 bad(line, f"duplicate sample {key}")
             samples[key] = (cpu, wall, checksum)
             sequence.append(("sample", *key))
-        elif row[0] == "ANT_WITNESS" and len(row) == 10:
+        elif row[0] == "ANT_WITNESS" and len(row) == 11:
             observed = tuple(integer(v, line, "witness") for v in row[6:])
             _, k, n = shape
             expected = (
@@ -80,6 +80,7 @@ def analyze(records: TextIO) -> dict:
                 1 if retained else 2 * ROUNDS * (count + 1),
                 0,
                 k * n * 4 if retained else 0,
+                2 * ROUNDS * (count + 1) if retained else 0,
             )
             if cell in witnesses or observed != expected:
                 bad(line, f"duplicate or incorrect builds/Host witness for {cell}")
@@ -117,7 +118,7 @@ def analyze(records: TextIO) -> dict:
                 "k": shape[1],
                 "n": shape[2],
                 "retained": retained,
-                "builds_and_host_bytes": witnesses[key],
+                "builds_host_bytes_and_nt_calls": witnesses[key],
             }
             for metric, index in (("cpu", 0), ("wall", 1)):
                 medians = [
@@ -136,7 +137,7 @@ def analyze(records: TextIO) -> dict:
                 }
             cells.append(cell)
     return {
-        "protocol": 1,
+        "protocol": 2,
         "sample_count": len(samples),
         "cell_count": len(cells),
         "cells": cells,

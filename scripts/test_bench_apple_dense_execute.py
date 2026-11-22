@@ -22,7 +22,7 @@ def corpus():
                                 str,
                                 [
                                     "ANT_SAMPLE",
-                                    1,
+                                    2,
                                     m,
                                     k,
                                     n,
@@ -43,7 +43,7 @@ def corpus():
                         str,
                         [
                             "ANT_WITNESS",
-                            1,
+                            2,
                             m,
                             k,
                             n,
@@ -52,6 +52,7 @@ def corpus():
                             1 if retained else 2 * reader.ROUNDS * (count + 1),
                             0,
                             k * n * 4 if retained else 0,
+                            2 * reader.ROUNDS * (count + 1) if retained else 0,
                         ],
                     )
                 )
@@ -101,7 +102,7 @@ class ReaderControls(unittest.TestCase):
 
     def test_wrong_version(self):
         rows = corpus()
-        rows[0][1] = "2"
+        rows[0][1] = "1"
         with self.assertRaises(ValueError):
             analyze(rows)
 
@@ -134,7 +135,7 @@ class ReaderControls(unittest.TestCase):
             analyze(rows)
 
     def test_wrong_witness(self):
-        for index in (6, 7, 8, 9):
+        for index in (6, 7, 8, 9, 10):
             rows = corpus()
             witness = next(row for row in rows if row[0] == "ANT_WITNESS")
             witness[index] = str(int(witness[index]) + 1)
