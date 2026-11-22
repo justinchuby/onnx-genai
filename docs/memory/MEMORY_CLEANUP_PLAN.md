@@ -771,6 +771,26 @@ own Host grants through their final reader. No primitive arithmetic or productio
 backend choice changes. See the
 [reference ownership contract](../performance/CPU_MLAS_MIGRATION.md#node-scoped-ownership-for-optional-sqnbit-reference-packs).
 
-This does not yet make reference memos or layout maps reclaimable under idle
-Host pressure; that is a separate remaining lifecycle step. Serialized prepacked
-sources retain their existing exclusion from node-state adoption.
+Reference layout maps now participate in idle Host pressure reclamation and
+per-kernel strong memos are removed, as described in the follow-up below.
+Serialized prepacked sources retain their existing exclusion from node-state
+adoption.
+
+
+### Idle SQNBit layouts join Host pressure reclamation
+
+The optional reference's node maps now enroll weakly with the same derived-weight
+source as native caches. Per-call `Arc` readers replace permanent per-kernel
+memo ownership. Lookup and idle exclusion use the same map mutex; removed
+payloads and their grants drop after all map locks are released. Reclamation
+never takes a construction gate, including when a pack's own admission visits
+its cache. Real KV reservations/growth and other node admissions can now reclaim
+an idle reference pack without clearing any live session globally.
+
+The bounded factory regression includes sharded, full-width, serialized and
+noncontiguous-scale preparation, active readers, concurrent execute/pressure,
+retry and final-owner refund. Logical constant slots preserve strided preparation
+reuse inside the explicit node owner. MLAS scratch/workspace is not covered by
+this payload accounting, and serialized bytes still require capacity for a
+reference pack rather than taking a wire fallback. No CUDA execution or new
+performance claim is involved.
