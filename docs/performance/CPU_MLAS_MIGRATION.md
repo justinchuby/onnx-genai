@@ -179,10 +179,21 @@ work. No shipped build reaches any of these.
 
 | primitive | why not |
 |---|---|
-| `MlasEltwiseAdd` | measured no better than our dense SIMD `Add`; `Elementwise` is graduated |
 | `MlasComputeTanh` | native beat MLAS-plus-clamp by up to **1.39×** at 256 Ki (#1121) — de-graduated from MLAS deliberately |
 | `MlasComputeLogistic` for `Sigmoid` | same measurement as Tanh; the route was removed |
 | `MlasComputeActivation` (fused) | our fusions cover more op pairs and keep the epilogue native |
+
+### Retired reference capabilities
+
+`Elementwise` is graduated. Add now always uses its existing native vDSP/dense
+or general dtype/broadcast path, including when the remaining MLAS reference is
+linked. Its former optional route, Rust/C binding, f32/fp16 MLAS Add templates
+and Add-only ARM dispatch/header/source leaves have been deleted. No compatibility
+API remains. Native same-shape and suffix-broadcast route guards run in both
+feature configurations, with IEEE special-value, tail and empty-storage checks.
+Add validates both input views and the output before native pointer access,
+preserves typed validation causes, and rejects non-Host-accessible storage.
+The MLAS multiplication primitive remains required by the independent SiLU reference.
 
 ### Gaps — MLAS has no primitive
 

@@ -1227,16 +1227,7 @@ MlasComputeSoftcap(
     T cap
     );
 
-template <typename T>
-void
-MLASCALL
-MlasEltwiseAdd(
-    const T* left,
-    const T* right,
-    T* output,
-    size_t N
-    );
-
+// nxrt-mlas-add-retirement: Add is native; retain Mul for the SiLU reference.
 template <typename T>
 void
 MLASCALL
