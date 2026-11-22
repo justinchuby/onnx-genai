@@ -108,9 +108,6 @@ pub use kernels::matmul_nbits::{
     mlas_sqnbit_packed_live_bytes, nbits_decode_f32_retention_candidate,
     planned_nbits_node_retained_bytes, planned_nbits_retained_bytes,
 };
-// Half transposes obtain actual Host grants and belong to node-owned caches.
-// This diagnostic describes only the remaining legacy f32 global store.
-pub use kernels::matmul::legacy_f32_weight_transpose_cache_bytes;
 // Retention forecasting does not replace actual derived-weight admission.
 pub use kernels::matmul::weight_transpose_cache_predicted_bytes;
 // #1056: the node-owned `MatMulPrepack::dense` widened-f32 cache is the fourth

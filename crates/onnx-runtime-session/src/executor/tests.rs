@@ -14082,10 +14082,6 @@ fn weight_derived_cache_owners_are_released_before_their_buffers_are_freed() {
         .expect("Executor has a Drop impl")
         .1;
     assert!(
-        !drop_body.contains("clear_legacy_f32_weight_transpose_cache()"),
-        "dropping one executor must not clear another session's warmed transposes"
-    );
-    assert!(
         !drop_body.contains("clear_mlas_packed_caches()"),
         "dropping one executor must not clear another session's reference packs"
     );
@@ -14527,7 +14523,16 @@ fn matmul_shape_variants_share_node_weights_without_crossing_nodes_or_sessions()
         // Enough for four node/session owners, too small for an optional native
         // SGEMM panel. No pressure registration can hide duplicate preparation
         // or let a denied optional pack evict another node's idle dense payload.
-        let books = FixedBooks(LedgerGovernor::new(LeaseLedger::new(0, 96, 0)));
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let retains_transpose = onnx_runtime_ep_cpu::backend::CpuBackend::auto_detect()
+            == onnx_runtime_ep_cpu::backend::CpuBackend::Accelerate;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let retains_transpose = false;
+        let books = FixedBooks(LedgerGovernor::new(LeaseLedger::new(
+            0,
+            if retains_transpose { 192 } else { 96 },
+            0,
+        )));
         let memory =
             onnx_runtime_ep_cpu::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap();
         let resources =
@@ -14542,7 +14547,11 @@ fn matmul_shape_variants_share_node_weights_without_crossing_nodes_or_sessions()
         )
         .unwrap();
         assert_eq!(books.used(Tier::Host), 0);
+        let mut resident_expected = expected;
         for m in [3, 1, 5, 2, 4, 1] {
+            if retains_transpose && m == 1 {
+                resident_expected = 2 * expected;
+            }
             let input = Tensor::from_raw(
                 DataType::Float64,
                 vec![m, 3],
@@ -14560,7 +14569,7 @@ fn matmul_shape_variants_share_node_weights_without_crossing_nodes_or_sessions()
             }
             assert_eq!(
                 books.used(Tier::Host),
-                expected,
+                resident_expected,
                 "activation shape changes cannot multiply node-owned weights"
             );
         }
@@ -14578,11 +14587,11 @@ fn matmul_shape_variants_share_node_weights_without_crossing_nodes_or_sessions()
         assert_eq!(peer.run(&[("a", &input)]).unwrap().len(), nodes);
         assert_eq!(
             books.used(Tier::Host),
-            2 * expected,
+            2 * resident_expected,
             "sessions must own separate node preparations"
         );
         drop(executor);
-        assert_eq!(books.used(Tier::Host), expected);
+        assert_eq!(books.used(Tier::Host), resident_expected);
         drop(peer);
         assert_eq!(books.used(Tier::Host), 0);
     }

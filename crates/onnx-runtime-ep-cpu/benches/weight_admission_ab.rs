@@ -1,6 +1,6 @@
 //! Real CPU MatMul A/B for derived-weight accounting. Warm-up is excluded.
-//! Interleave governed/local arms, a duplicate local A/A arm and an unaffected
-//! contiguous-f32 control. Retained and transient policies are separate rows.
+//! Interleave governed/local arms, a duplicate local A/A arm, a constant-f32
+//! comparison and an unaffected runtime-only f32 control. Retained and transient policies are separate rows.
 //! This is a CPU/tier-scoped measurement, not proof of zero cost on every EP.
 //! Run under the host lock with RAYON_NUM_THREADS=1; inspect full ranges/nulls.
 
@@ -44,6 +44,7 @@ impl Case {
         format: WeightFormat,
         governed: bool,
         retained: bool,
+        constant: bool,
     ) -> Self {
         let governor = LedgerGovernor::new(LeaseLedger::new(0, (k * n * 16) as u64, 0));
         let memory = if governed {
@@ -59,7 +60,7 @@ impl Case {
         let mut kernel = provider
             .get_kernel(&node, &[vec![m, k], vec![k, n]], 17)
             .unwrap();
-        kernel.set_constant_inputs(&[false, true]);
+        kernel.set_constant_inputs(&[false, constant]);
         let mut case = Self {
             kernel,
             a: vec![0.25; m * k],
@@ -78,6 +79,7 @@ impl Case {
         assert!(case.output.iter().all(|&v| v == k as f32 * 0.125));
         #[cfg(feature = "mlas")]
         let panel_bytes = if retained
+            && constant
             && onnx_runtime_ep_cpu::backend::CpuBackend::auto_detect()
                 == onnx_runtime_ep_cpu::backend::CpuBackend::Mlas
         {
@@ -91,19 +93,48 @@ impl Case {
         // transpose is uncharged. Record its actual bytes outside the timer;
         // public provider tests separately require the new half grant.
         println!(
-            "footprint\t{m}\t{k}\t{n}\t{format:?}\t{governed}\t{retained}\t{}",
+            "footprint\t{m}\t{k}\t{n}\t{format:?}\t{governed}\t{retained}\t{constant}\t{}",
             case.governor.used(Tier::Host)
         );
+        // This assertion-only input selects the old or new expected footprint
+        // in before/current runs; it never changes runtime policy or compute.
+        let expect_transpose = match std::env::var("NXRT_ADMISSION_EXPECT_F32_TRANSPOSE_GRANT")
+            .as_deref()
+        {
+            Ok("0") => false,
+            Ok("1") | Err(_) => true,
+            Ok(value) => panic!(
+                "NXRT_ADMISSION_EXPECT_F32_TRANSPOSE_GRANT={value:?}; choose 0 or 1 for the expected footprint"
+            ),
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let transpose_bytes = if constant
+            && retained
+            && expect_transpose
+            && m == 1
+            && onnx_runtime_ep_cpu::backend::CpuBackend::auto_detect()
+                == onnx_runtime_ep_cpu::backend::CpuBackend::Accelerate
+        {
+            (k * n * 4) as u64
+        } else {
+            0
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let transpose_bytes = {
+            let _ = expect_transpose;
+            0u64
+        };
         if format != WeightFormat::F16 {
             assert_eq!(
                 case.governor.used(Tier::Host),
-                if governed && retained {
+                if governed && retained && constant {
                     (if format == WeightFormat::F64 {
                         k * n * 4
                     } else {
                         0
                     }) as u64
                         + panel_bytes
+                        + transpose_bytes
                 } else {
                     0
                 }
@@ -188,26 +219,27 @@ fn main() {
     for (m, k, n) in [(1, 16, 16), (1, 128, 256), (8, 128, 256)] {
         for retained in [true, false] {
             let mut cases = [
-                Case::new(m, k, n, format, false, retained),
-                Case::new(m, k, n, format, true, retained),
-                Case::new(m, k, n, format, false, retained),
-                Case::new(m, k, n, WeightFormat::F32, false, retained),
-                Case::new(m, k, n, WeightFormat::F32, true, retained),
+                Case::new(m, k, n, format, false, retained, true),
+                Case::new(m, k, n, format, true, retained, true),
+                Case::new(m, k, n, format, false, retained, true),
+                Case::new(m, k, n, WeightFormat::F32, false, retained, true),
+                Case::new(m, k, n, WeightFormat::F32, true, retained, true),
+                Case::new(m, k, n, WeightFormat::F32, true, retained, false),
             ];
             let ns = cases[0].batch(256).0;
             let iterations = ((10_000_000. / ns) as usize).clamp(16, 100_000);
-            let mut walls: [Vec<f64>; 5] = Default::default();
-            let mut cpus: [Vec<f64>; 5] = Default::default();
+            let mut walls: [Vec<f64>; 6] = Default::default();
+            let mut cpus: [Vec<f64>; 6] = Default::default();
             for round in 0..11 {
-                for offset in 0..5 {
-                    let arm = (round + offset) % 5;
+                for offset in 0..6 {
+                    let arm = (round + offset) % 6;
                     let (wall, cpu) = cases[arm].batch(iterations);
                     walls[arm].push(wall);
                     cpus[arm].push(cpu);
                 }
             }
             // Keep every sample outside timed regions for noise/null auditing.
-            for arm in 0..5 {
+            for arm in 0..6 {
                 for round in 0..11 {
                     println!(
                         "sample\t{m}\t{k}\t{n}\t{retained}\t{arm}\t{round}\t{:.2}\t{:.2}",
@@ -221,6 +253,7 @@ fn main() {
                 "wide_local_null",
                 "f32_local_control",
                 "f32_governed_control",
+                "runtime_f32_control",
             ]
             .iter()
             .enumerate()

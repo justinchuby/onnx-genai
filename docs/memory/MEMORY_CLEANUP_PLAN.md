@@ -1093,3 +1093,53 @@ fixture, injected with only a test observer into parent `95de9fef1`, compiles,
 selects one test, and fails at the first funding assertion: actual Host usage
 is 0 instead of 70 bytes. The current fixture also validates inference after
 reclamation and exact final refunds. No CUDA or other-ISA execution is claimed.
+
+### Fund the remaining f32 B transpose payloads
+
+The f32 B transpose now uses node-owned `WeightCache` storage too. Identity is
+the original logical view (effective address, dtype, shape, signed strides) plus
+requested matrix geometry. It never uses a recyclable widening allocation as
+identity and does not pin that allocation. Widened sources and transposes carry
+independent grants; an executing transpose remains valid after the source copy
+is reclaimed. Construction writes directly into the admitted transpose output.
+
+The global f32 store, installation/eviction memos, global clear/byte diagnostics,
+and the conversion-owner lookup are removed. `weight_transpose.rs` contains
+only the shared transpose algorithm. Node owners share preparation across
+shape kernels, while separate nodes/sessions cannot inherit entries at recycled
+original addresses. Empty matrices retain nothing.
+
+MatMul's optional f32 transpose can be refused and uses existing raw-layout
+arithmetic. Gemm with `transB` requires a row-major B copy for its backend;
+disabling retention now funds that copy transiently, and exhaustion returns an
+actionable admission error before building. Other call-owned layout/scratch
+allocations, including Gemm's A transpose, remain separate work. This step also
+does not fuse source widening into transpose construction: a converted B may
+still be materialized before looking up an existing transpose.
+
+Forecasts now include the fused MatMul+bias+Relu f32 route on Apple and promoted
+vector B operands. The registry forecast check describes declared routes;
+actual provider and Gemm tests independently reconcile their Host grants. Source
+validation, geometry/overflow, dtype isolation and pure transpose correctness
+checks remain. Old global-map storage/clear/installation tests are replaced at
+the actual node/cache seam: deterministic address reuse across node lifetimes,
+grow/shrink/equal extents, concurrent equal/distinct geometries, shared owners,
+pressure refusal/retry, independent readers and exact final refunds.
+
+On Apple M1 Max, native CPU 1,984 / 20 ignored and optional MLAS CPU 2,024 /
+35 ignored pass; sessions pass 277 / 279, with strict all-target Clippy in both
+configurations. Public MatMul, FusedMatMulBias, Gemm and FusedGemm tests cover
+matrix B; the MatMul family also covers vector B. Each admitted warm case makes
+zero further claims/releases over 4,096 executions. The old public provider
+fixture on parent `43055b185` compiles, selects one test and fails at its first
+funding assertion: actual 0 versus required 140 Host bytes. No CUDA or other-ISA
+execution or model-throughput result is implied.
+
+A subsequent warm-path optimization uses only a weak last-hit slot for a
+single-layout f32 cache. It cannot keep a payload or grant alive after idle
+reclamation; multi-layout nodes retain canonical lookup/recency. The initial
+full-key lookup added about 100 ns to a tiny case; the final coordinated run
+reduces the overall increment to about 13 ns for f64 and 20 ns for f32 on this
+Apple host. This remains measurable bookkeeping cost even though warm quota
+requests/refunds are zero. CPU_MLAS_MIGRATION.md records the control arms and
+ranges; no end-to-end model or other-tier performance is inferred.

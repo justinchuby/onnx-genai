@@ -1632,3 +1632,54 @@ and `/tmp/nxrt-half-transpose-performance-{metadata,summary}.json`. The harness
 selects f16 with `NXRT_ADMISSION_WEIGHT_FORMAT=f16`; default f64/f32 controls
 keep their exact footprint assertions. The wrapper's wall/CPU totals describe
 build-plus-sweep resource use and are not kernel latency.
+
+The remaining f32 B transposes now obtain real grants through the same node
+cache protocol. The key uses the original logical view and geometry; retiring
+a widened source does not invalidate or pin its transpose. Global f32 state and
+its APIs are removed, so normal native transpose payloads no longer depend on a
+process-wide store. The existing slice compute parameters remain intact;
+preparation additionally carries the borrowed original view through compute.
+Gemm's required B transpose is funded even when call-owned. Optional native
+MatMul refusal keeps raw-layout arithmetic. Widening-before-transpose scheduling
+and other temporary layouts remain further optimization/funding work.
+
+The benchmark adds a runtime-only f32 control whose constant flag is false.
+The retained constant-f32 arm now receives the changed cache treatment, so it
+must not be described as an unaffected control. The identical before/current
+harness checks each version's expected payload footprint outside the timer via
+`NXRT_ADMISSION_EXPECT_F32_TRANSPOSE_GRANT=0|1`; this input changes only the
+assertion, never runtime policy, allocation or computation. Output validation,
+A/A samples, all individual rounds and the transient policy rows remain.
+
+The first f32 candidate made the new complete-key map lookup on every warm
+call. In a coordinated three-pair sweep, tiny retained governed f64 moved
+305.50→405.45 ns (+32.7%) while the runtime-only f32 control moved only +2.0%;
+the local-accounting and A/A arms moved similarly to governed. This is a real
+shared cache-path regression, not evidence of quota callbacks. Those samples
+and metadata are retained separately under `/tmp/nxrt-f32-transpose-initial-*`.
+
+A single-entry weak last-hit slot removes repeated key construction/hashing.
+It owns no payload/grant, expires when a reclaimed payload dies, refreshes after
+rebuild, and is disabled for multi-layout nodes so their canonical LRU metadata
+still receives each hit. Pressure, concurrent distinct geometries and exact
+refund controls cover the slot. No raw-pointer publication or extra source
+payload pinning is introduced.
+
+The final coordinated sweep holds the stable flock for both release builds
+plus three interleaved before/current process pairs (140.39 seconds total).
+On Apple M1 Max / Accelerate / Rayon=1, M=1,K=N=16 retained governed f64 is
+305.94 ns [303.96–306.31] before and 319.28 ns [319.18–321.02] after
+(+13.34 ns / +4.36%). Current local accounting is 319.42 ns and its duplicate
+319.47 ns. The exposed f32 constant arm is 250.77→271.22 ns (+20.45 ns),
+with current local 271.20 ns. The unaffected runtime-only f32 control is
+270.31→269.47 ns (-0.31%). At K=128,N=256 the governed f64 median moves
+2113.82→2176.02 ns (+2.94%), local +1.03%, duplicate +0.90%, and runtime
+control +1.20%; these movements do not support a universal throughput claim.
+Warm quota callbacks remain zero independently of these timing comparisons.
+
+Final round samples and full ranges remain at
+`/tmp/nxrt-f32-transpose-perf-{before,current}-{0,1,2}.tsv`; metadata and summary
+are `/tmp/nxrt-f32-transpose-performance-{metadata,summary}.json`. Metadata is
+marked complete only after all 36 checked rows per process and every footprint
+and output assertion pass. Failed builds are not timing evidence. Wrapper
+resource totals include compilation and must not be reported as kernel latency.
