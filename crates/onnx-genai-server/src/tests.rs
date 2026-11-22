@@ -2487,8 +2487,11 @@ async fn admin_vram_override_requires_engine_runtime_override() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["type"], "permission_error");
+    assert_eq!(body["error"]["code"], 403);
     assert!(
-        json_body(response).await["error"]["message"]
+        body["error"]["message"]
             .as_str()
             .unwrap()
             .contains("allow_runtime_override")
@@ -3592,7 +3595,7 @@ async fn admin_unload_distinguishes_poisoned_registry_from_absent_model() {
             .unwrap(),
     )
     .unwrap();
-    assert_well_formed_error_without_internal_path(&body);
+    assert_well_formed_error_without_internal_path(&body, "not_found_error");
     assert_eq!(error_message(&body), "model 'model-b' is not loaded");
 
     let poisoned_registry_state = lazy_state(ServerConfig {
@@ -3620,7 +3623,7 @@ async fn admin_unload_distinguishes_poisoned_registry_from_absent_model() {
             .unwrap(),
     )
     .unwrap();
-    assert_well_formed_error_without_internal_path(&body);
+    assert_well_formed_error_without_internal_path(&body, "server_error");
     assert_eq!(error_message(&body), "model registry failed");
 }
 
@@ -3836,12 +3839,12 @@ fn error_message(body: &Value) -> String {
         .to_string()
 }
 
-fn assert_well_formed_error_without_internal_path(body: &Value) {
+fn assert_well_formed_error_without_internal_path(body: &Value, expected_kind: &str) {
     let message = body["error"]["message"]
         .as_str()
         .expect("error response must contain a message");
     assert!(!message.is_empty());
-    assert_eq!(body["error"]["type"], "server_error");
+    assert_eq!(body["error"]["type"], expected_kind);
     assert!(
         !message.contains(env!("CARGO_MANIFEST_DIR")),
         "error must not expose the crate path: {body}"
@@ -3957,7 +3960,7 @@ async fn poisoned_model_registry_returns_http_500() {
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_well_formed_error_without_internal_path(&body);
+    assert_well_formed_error_without_internal_path(&body, "server_error");
     assert_eq!(error_message(&body), "model registry failed");
 }
 
@@ -6629,6 +6632,137 @@ mod native_compat {
                 .unwrap()
                 .contains("voice")
         );
+    }
+
+    #[tokio::test]
+    async fn client_request_failures_have_protocol_invalid_request_types() {
+        let router = app(tiny_state());
+        for (path, body) in [
+            ("/v1/chat/completions", json!({"messages":[]})),
+            (
+                "/v1/completions",
+                json!({"model":"tiny-llm","prompt":"hi","max_tokens":0}),
+            ),
+            ("/v1/embeddings", json!({"model":"tiny-llm","input":[]})),
+        ] {
+            let response = request(router.clone(), path, body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["type"],
+                "invalid_request_error"
+            );
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"].as_str().unwrap().contains("JSON"));
+    }
+
+    #[tokio::test]
+    async fn messages_errors_include_anthropic_envelopes_for_handlers_and_extractors() {
+        let router = app(tiny_state());
+        for (path, body, status, kind) in [
+            (
+                "/v1/messages",
+                json!({"messages":[],"max_tokens":1}),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+            (
+                "/v1/messages",
+                json!({"model":"absent","messages":[{"role":"user","content":"hi"}],"max_tokens":1}),
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+            ),
+            (
+                "/v1/messages/count_tokens",
+                json!({}),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+        ] {
+            let response = request(router.clone(), path, body).await;
+            assert_eq!(response.status(), status);
+            let body = json_body(response).await;
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], kind);
+            assert!(body["error"]["message"].is_string());
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn not_found_errors_use_native_protocol_classifications() {
+        let router = app(tiny_state());
+        let response = request(
+            router.clone(),
+            "/v1/chat/completions",
+            json!({"model":"absent","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(body["error"]["code"], 404);
+        let response = request(router, "/not-served", json!({})).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(body["error"]["code"], 404);
+    }
+
+    #[tokio::test]
+    async fn native_tokenization_can_treat_special_tokens_as_plain_text() {
+        let scratch = tempfile::tempdir().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        copy_tree(&fixtures.join("tiny-llm"), scratch.path());
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        tokenizer["added_tokens"] = json!([{"id":31,"content":"tok31","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}]);
+        std::fs::write(path, serde_json::to_string(&tokenizer).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("special-policy".into())).unwrap());
+        for (parse, add, expected) in [
+            (true, false, json!([4, 31, 5])),
+            (false, false, json!([1])),
+            (true, true, json!([2, 4, 31, 5, 3])),
+            (false, true, json!([2, 1, 3])),
+            (true, false, json!([4, 31, 5])),
+        ] {
+            let response = request(
+                router.clone(),
+                "/tokenize",
+                json!({"content":"hellotok31world","parse_special":parse,"add_special":add}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["tokens"], expected);
+        }
     }
 
     #[tokio::test]

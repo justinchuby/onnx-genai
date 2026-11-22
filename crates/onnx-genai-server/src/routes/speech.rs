@@ -13,18 +13,18 @@ pub(crate) async fn audio_speech(
     ApiJson(request): ApiJson<AudioSpeechRequest>,
 ) -> Result<Response, ApiError> {
     if request.stream {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "stream=true is not supported for buffered audio workflows",
         ));
     }
     if !request.response_format.eq_ignore_ascii_case("wav") {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "only response_format=wav is supported",
         ));
     }
     let handle = resolve_model(&state.registry, &request.model).await?;
     let capability = handle.speech.as_ref().ok_or_else(|| {
-        ApiError::bad_request(format!(
+        ApiError::invalid_request(format!(
             "model '{}' does not declare both a text-assembly adapter and compatible buffered PCM16 WAV output",
             handle.id
         ))
@@ -40,26 +40,28 @@ pub(crate) async fn audio_speech(
     } else {
         processor
             .assemble(&request.input, &request.instructions)
-            .map_err(|error| ApiError::bad_request(format!("invalid speech input: {error:#}")))?
+            .map_err(|error| {
+                ApiError::invalid_request(format!("invalid speech input: {error:#}"))
+            })?
     };
     let token_ids = handle.tokenizer.encode(&prompt).map_err(|error| {
-        ApiError::bad_request(format!("failed to tokenize speech input: {error}"))
+        ApiError::invalid_request(format!("failed to tokenize speech input: {error}"))
     })?;
     if token_ids.len() > processor.max_input_tokens {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "speech prompt contains {} tokens, exceeding the declared maximum of {}",
             token_ids.len(),
             processor.max_input_tokens
         )));
     }
     let token_rows = processor.token_rows(token_ids).map_err(|error| {
-        ApiError::bad_request(format!("invalid speech guidance rows: {error:#}"))
+        ApiError::invalid_request(format!("invalid speech guidance rows: {error:#}"))
     })?;
     let output_units = request
         .max_output_units
         .unwrap_or(processor.max_output_units);
     if output_units == 0 || output_units > processor.max_output_units {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "max_output_units must be between 1 and {}",
             processor.max_output_units
         )));

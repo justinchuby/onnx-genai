@@ -45,7 +45,7 @@ through the admitted engine driver. A real tiny-model HTTP test covers both
 alternate protocols and their streamed usage; synthetic stream tests pin reasoning,
 tool indices and incomplete-stream rejection.
 
-This milestone does not check off the full rows above: browser refresh/reconnect,
+This milestone does not check off the full rows above: active-generation browser refresh/reconnect,
 native batching/prefill-only, timing/progress, additional
 sampling and runtime-backed state/adapter/ranking work still need completion.
 
@@ -54,7 +54,7 @@ pairs into one typed engine processor, including explicit bans. Token vocabulary
 validation is shared by the server and engine. Real tiny-model generation and
 engine processor tests pass, including the greedy/device-shortcut guard.
 
-Latest verified checkpoint: server library 369 passed / 2 inherited ignores,
+Latest verified checkpoint: server library 375 passed / 2 inherited ignores,
 4 protocol-history tests, real logit-bias HTTP and engine tests, 6 DRY engine
 tests, and the multi-token DRY request mapping test pass. Strict server all-target
 Clippy passes. The real Chrome smoke now verifies chat, persisted conversation
@@ -76,3 +76,13 @@ that Chat, Responses and Anthropic media counts equal real generation usage;
 the OpenAI count routes also return the required response.input_tokens object.
 Full server validation: 369 passed, 2 inherited ignores; strict all-target
 Clippy passes.
+
+Tokenizer/error follow-up: native parse_special=false now treats registered
+special-token spellings as ordinary text, independently of BOS/EOS insertion,
+without mutating shared tokenizer state. Core library and real HTTP tests pass.
+Explicit API errors now carry numeric HTTP code and native request/not-found/
+permission classifications. Messages errors include the Anthropic envelope even
+for JSON extraction failures, retain retry headers, and late SSE errors preserve
+the original status/category across adapters. Full server: 375 passed, 2 inherited
+ignores; strict all-target Clippy passes. The active-generation browser reconnect
+scenario and exact byte-valued token pieces still need work.

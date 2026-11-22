@@ -13,7 +13,7 @@ pub(crate) async fn audio_transcriptions(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|err| ApiError::bad_request(format!("invalid multipart form: {err}")))?
+        .map_err(|err| ApiError::invalid_request(format!("invalid multipart form: {err}")))?
     {
         let name = field.name().unwrap_or_default().to_string();
         match name.as_str() {
@@ -24,26 +24,25 @@ pub(crate) async fn audio_transcriptions(
                         .bytes()
                         .await
                         .map_err(|err| {
-                            ApiError::bad_request(format!("failed to read audio file: {err}"))
+                            ApiError::invalid_request(format!("failed to read audio file: {err}"))
                         })?
                         .to_vec(),
                 );
             }
             "language" => {
                 language = Some(field.text().await.map_err(|err| {
-                    ApiError::bad_request(format!("invalid language field: {err}"))
+                    ApiError::invalid_request(format!("invalid language field: {err}"))
                 })?);
             }
             "response_format" => {
                 response_format = field.text().await.map_err(|err| {
-                    ApiError::bad_request(format!("invalid response_format field: {err}"))
+                    ApiError::invalid_request(format!("invalid response_format field: {err}"))
                 })?;
             }
             "model" => {
-                model_name = field
-                    .text()
-                    .await
-                    .map_err(|err| ApiError::bad_request(format!("invalid model field: {err}")))?;
+                model_name = field.text().await.map_err(|err| {
+                    ApiError::invalid_request(format!("invalid model field: {err}"))
+                })?;
             }
             _ => {}
         }
@@ -51,9 +50,10 @@ pub(crate) async fn audio_transcriptions(
 
     let handle = resolve_model(&state.registry, &model_name).await?;
 
-    let bytes = file.ok_or_else(|| ApiError::bad_request("multipart field 'file' is required"))?;
+    let bytes =
+        file.ok_or_else(|| ApiError::invalid_request("multipart field 'file' is required"))?;
     if !matches!(response_format.as_str(), "json" | "text") {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "unsupported response_format '{response_format}'; expected 'json' or 'text'"
         )));
     }
@@ -61,7 +61,7 @@ pub(crate) async fn audio_transcriptions(
         .as_deref()
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(".mp3"))
     {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "MP3 audio is not supported yet; provide a PCM16 WAV file",
         ));
     }
@@ -70,7 +70,7 @@ pub(crate) async fn audio_transcriptions(
         .as_ref()
         .and_then(|multimodal| multimodal.audio.as_ref())
         .ok_or_else(|| {
-            ApiError::bad_request(format!(
+            ApiError::invalid_request(format!(
                 "What: audio transcription was rejected for model '{}'. \
                  Why: no component of its package declares an `input_features` audio input. \
                  How: serve a speech package.",
@@ -78,7 +78,7 @@ pub(crate) async fn audio_transcriptions(
             ))
         })?;
     let input = MultimodalInput::from_wav(spec, &bytes)
-        .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
+        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err}")))?;
     let max_tokens = spec
         .max_tokens
         .unwrap_or(state.config.max_output_tokens)

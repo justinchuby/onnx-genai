@@ -5,6 +5,23 @@ use std::path::Path;
 use crate::{OrtError, Result};
 use serde_json::Value;
 
+/// Independent controls for inserted and recognized special tokens.
+#[derive(Debug, Clone, Copy)]
+pub struct TokenizationOptions {
+    /// Apply the tokenizer's BOS/EOS post-processing.
+    pub add_special: bool,
+    /// Recognize special-token spellings in input instead of treating them as text.
+    pub parse_special: bool,
+}
+impl Default for TokenizationOptions {
+    fn default() -> Self {
+        Self {
+            add_special: false,
+            parse_special: true,
+        }
+    }
+}
+
 /// Thin wrapper around `tokenizers::Tokenizer` for prompt/token id conversion.
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
@@ -22,6 +39,30 @@ impl Tokenizer {
             inner,
             legacy_eos_token_ids,
         })
+    }
+
+    /// Encode text with an explicit special-token policy without mutating shared state.
+    pub fn encode_with_options(
+        &self,
+        content: &str,
+        options: TokenizationOptions,
+    ) -> Result<Vec<u32>> {
+        let mut tokenizer = std::borrow::Cow::Borrowed(&self.inner);
+        let treat_special_as_text = !options.parse_special;
+        if tokenizer.get_encode_special_tokens() != treat_special_as_text {
+            tokenizer
+                .to_mut()
+                .set_encode_special_tokens(treat_special_as_text);
+        }
+        tokenizer
+            .encode(content, options.add_special)
+            .map(|encoding| encoding.get_ids().to_vec())
+            .map_err(|err| {
+                OrtError::Tokenizer(format!(
+                    "text encoding with add_special={} and parse_special={} failed: {err}",
+                    options.add_special, options.parse_special
+                ))
+            })
     }
 
     /// Encode a prompt to token ids, including model-defined special tokens.
@@ -183,5 +224,61 @@ fn push_unique_token_id(ids: &mut Vec<u32>, tokenizer: &tokenizers::Tokenizer, t
 fn push_unique_id(ids: &mut Vec<u32>, id: u32) {
     if !ids.contains(&id) {
         ids.push(id);
+    }
+}
+
+#[cfg(test)]
+mod tokenization_policy_tests {
+    use super::*;
+    #[test]
+    fn inserted_and_parsed_special_tokens_are_independent_and_request_local() {
+        let mut json: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/tiny-llm/tokenizer.json"
+        )))
+        .unwrap();
+        json["added_tokens"] = serde_json::json!([{"id":31,"content":"tok31","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}]);
+        let tokenizer = Tokenizer {
+            inner: tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&json).unwrap()).unwrap(),
+            legacy_eos_token_ids: vec![3],
+        };
+        let text = "hellotok31world";
+        assert_eq!(
+            tokenizer
+                .encode_with_options(text, TokenizationOptions::default())
+                .unwrap(),
+            vec![4, 31, 5]
+        );
+        assert_eq!(
+            tokenizer
+                .encode_with_options(
+                    text,
+                    TokenizationOptions {
+                        parse_special: false,
+                        ..Default::default()
+                    }
+                )
+                .unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            tokenizer
+                .encode_with_options(
+                    text,
+                    TokenizationOptions {
+                        add_special: true,
+                        ..Default::default()
+                    }
+                )
+                .unwrap(),
+            vec![2, 4, 31, 5, 3]
+        );
+        assert!(!tokenizer.inner.get_encode_special_tokens());
+        assert_eq!(
+            tokenizer
+                .encode_with_options(text, TokenizationOptions::default())
+                .unwrap(),
+            vec![4, 31, 5]
+        );
     }
 }

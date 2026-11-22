@@ -1,7 +1,7 @@
 //! Responses and Anthropic are wire adapters over the same chat transaction.
 //! Model admission, media processing, tool validation and sampling stay in chat.
 use super::*;
-use axum::body::to_bytes;
+use axum::body::{Body, to_bytes};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use tokio_stream::StreamExt;
@@ -47,6 +47,41 @@ pub(crate) async fn messages_tokens(
     Ok(Json(
         json!({"input_tokens": super::llama::count_input_tokens(&state, &request).await?}),
     ))
+}
+
+fn anthropic_error_kind(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::NOT_FOUND => "not_found_error",
+        StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        StatusCode::SERVICE_UNAVAILABLE => "overloaded_error",
+        status if status.is_client_error() => "invalid_request_error",
+        _ => "api_error",
+    }
+}
+
+/// Wrap handler and extractor failures alike in the Messages error envelope.
+pub(crate) async fn anthropic_error_response(response: Response) -> Response {
+    if !response.status().is_client_error() && !response.status().is_server_error() {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let message = match to_bytes(body,8*1024*1024).await {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => value["error"]["message"].as_str().unwrap_or("server returned an error without a message; inspect server logs before retrying").to_owned(),
+            Err(err) => { parts.status=StatusCode::INTERNAL_SERVER_ERROR; format!("could not encode the Messages error response: invalid internal error JSON: {err}; inspect server logs") },
+        },
+        Err(err) => { parts.status=StatusCode::INTERNAL_SERVER_ERROR; format!("could not read the Messages error response: {err}; reduce request size or inspect server logs") },
+    };
+    let value = json!({"type":"error","error":{"type":anthropic_error_kind(parts.status),"message":message}});
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    Response::from_parts(parts, Body::from(value.to_string()))
 }
 
 fn required(body: &mut Map<String, Value>, key: &str) -> Result<Value, ApiError> {
@@ -744,6 +779,26 @@ impl StreamEncoder {
         Ok(events)
     }
 }
+struct AdaptedStreamFailure {
+    status: StatusCode,
+    kind: Option<String>,
+    message: String,
+}
+impl From<String> for AdaptedStreamFailure {
+    fn from(message: String) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            kind: None,
+            message,
+        }
+    }
+}
+impl From<&str> for AdaptedStreamFailure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
 fn stream_response(response: Response, protocol: Protocol) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(16);
     tokio::spawn(async move {
@@ -751,7 +806,7 @@ fn stream_response(response: Response, protocol: Protocol) -> Response {
         let mut pending = Vec::new();
         let mut encoder = StreamEncoder::new(protocol, None);
         let mut completed = false;
-        let outcome: Result<(), String> = async {
+        let outcome: Result<(), AdaptedStreamFailure> = async {
             loop {
                 let next = tokio::select! {_ = tx.closed()=>return Ok(()),next=source.next()=>next};
                 let Some(bytes) = next else { break };
@@ -779,10 +834,8 @@ fn stream_response(response: Response, protocol: Protocol) -> Response {
                         let value: Value = serde_json::from_str(&data)
                             .map_err(|err| format!("invalid chat SSE JSON: {err}"))?;
                         if !value["error"].is_null() {
-                            return Err(value["error"]["message"]
-                                .as_str()
-                                .unwrap_or("chat generation failed")
-                                .to_string());
+                            let status=value["error"]["code"].as_u64().and_then(|code| u16::try_from(code).ok()).and_then(|code| StatusCode::from_u16(code).ok()).filter(|status| status.is_client_error() || status.is_server_error()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                            return Err(AdaptedStreamFailure {status,kind:value["error"]["type"].as_str().map(str::to_owned),message:value["error"]["message"].as_str().unwrap_or("chat generation failed; inspect the server log before retrying").to_string()});
                         }
                         encoder.chunk(value)?
                     };
@@ -799,11 +852,16 @@ fn stream_response(response: Response, protocol: Protocol) -> Response {
             Ok(())
         }
         .await;
-        if let Err(message) = outcome {
-            let event = encoder.event(
-                "error",
-                json!({"error":{"type":"server_error","message":message}}),
-            );
+        if let Err(failure) = outcome {
+            let kind = match protocol {
+                Protocol::Anthropic => anthropic_error_kind(failure.status),
+                Protocol::Responses => failure.kind.as_deref().unwrap_or("server_error"),
+            };
+            let mut error = json!({"type":kind,"message":failure.message});
+            if matches!(protocol, Protocol::Responses) {
+                error["code"] = json!(failure.status.as_u16());
+            }
+            let event = encoder.event("error", json!({"error":error}));
             let _ = tx.send(Ok(event)).await;
         }
     });
@@ -897,6 +955,58 @@ mod transport_tests {
         );
         assert_eq!(request.messages[0].tool_calls.as_ref().unwrap().len(), 2);
         assert_eq!(request.messages[1].tool_call_id.as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn messages_error_conversion_preserves_retry_headers_and_valid_content_length() {
+        let response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "3")],
+            Json(json!({"error":{"message":"queue is full","type":"resource_limit_error"}})),
+        )
+            .into_response();
+        let response = anthropic_error_response(response).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "3");
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["type"], "rate_limit_error");
+        assert_eq!(value["error"]["message"], "queue is full");
+        let mut encoder = StreamEncoder::new(Protocol::Anthropic, Some(1));
+        let event=encoder.event("error",json!({"error":{"type":anthropic_error_kind(StatusCode::INTERNAL_SERVER_ERROR),"message":"failed"}}));
+        let event = wire(vec![event]).await;
+        assert!(event.contains("\"type\":\"api_error\""));
+    }
+
+    #[tokio::test]
+    async fn adapted_stream_errors_preserve_source_status_and_protocol_kind() {
+        for protocol in [Protocol::Responses, Protocol::Anthropic] {
+            let source = Response::new(Body::from(
+                "event: error\ndata: {\"error\":{\"code\":429,\"type\":\"resource_limit_error\",\"message\":\"capacity exhausted\"}}\n\n",
+            ));
+            let response = stream_response(source, protocol);
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let value: Value = serde_json::from_str(
+                text.lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(value["type"], "error");
+            assert_eq!(value["error"]["message"], "capacity exhausted");
+            match protocol {
+                Protocol::Responses => {
+                    assert_eq!(value["error"]["type"], "resource_limit_error");
+                    assert_eq!(value["error"]["code"], 429);
+                }
+                Protocol::Anthropic => {
+                    assert_eq!(value["error"]["type"], "rate_limit_error");
+                    assert!(value["error"].get("code").is_none());
+                }
+            }
+            assert!(!text.contains("response.completed"));
+        }
     }
 
     #[test]

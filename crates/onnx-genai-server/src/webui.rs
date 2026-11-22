@@ -1,7 +1,7 @@
 //! Exact-path static hosting of the pinned upstream Llama Chat build.
 //! No filesystem access or network download occurs when a server starts.
 use axum::{
-    http::{StatusCode, Uri, header},
+    http::{Uri, header},
     response::{IntoResponse, Response},
 };
 include!(concat!(env!("OUT_DIR"), "/llama_chat_assets.rs"));
@@ -10,9 +10,11 @@ pub(crate) async fn serve(uri: Uri) -> Response {
     let path = uri.path().strip_prefix('/').unwrap_or(uri.path());
     let path = if path.is_empty() { "index.html" } else { path };
     let Some(body) = asset(path) else {
-        return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error": {
-            "type": "not_found_error", "message": format!("path '{}' is not served; open / for Llama Chat or /v1/models for model discovery", uri.path())
-        }}))).into_response();
+        return crate::routes::ApiError::not_found(format!(
+            "path '{}' is not served; open / for Llama Chat or /v1/models for model discovery",
+            uri.path()
+        ))
+        .into_response();
     };
     let content_type = match path.rsplit('.').next().unwrap_or("") {
         "html" => "text/html; charset=utf-8",

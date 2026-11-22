@@ -123,15 +123,15 @@ pub(crate) async fn tokenize(
     ApiJson(request): ApiJson<TokenizeRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
-    if request.parse_special == Some(false) {
-        return Err(ApiError::invalid_request(
-            "parse_special=false is unsupported by the package tokenizer; omit it or use parse_special=true",
-        ));
-    }
     let encoding = handle
         .tokenizer
-        .inner()
-        .encode(request.content.as_str(), request.add_special)
+        .encode_with_options(
+            &request.content,
+            onnx_genai_ort::TokenizationOptions {
+                add_special: request.add_special,
+                parse_special: request.parse_special.unwrap_or(true),
+            },
+        )
         .map_err(|err| {
             ApiError::invalid_request(format!(
                 "content tokenization failed: {err}; check the model tokenizer.json"
@@ -139,7 +139,6 @@ pub(crate) async fn tokenize(
         })?;
     let tokens = if request.with_pieces {
         encoding
-            .get_ids()
             .iter()
             .map(|id| {
                 let piece = handle
@@ -154,7 +153,7 @@ pub(crate) async fn tokenize(
             })
             .collect::<Result<Vec<_>, ApiError>>()?
     } else {
-        encoding.get_ids().iter().map(|id| json!(id)).collect()
+        encoding.iter().map(|id| json!(id)).collect()
     };
     Ok(Json(json!({"tokens": tokens})))
 }

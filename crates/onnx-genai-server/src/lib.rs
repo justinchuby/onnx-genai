@@ -76,10 +76,17 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/health", get(routes::health))
         .route("/v1/responses", post(routes::transports::responses))
         .route("/responses", post(routes::transports::responses))
-        .route("/v1/messages", post(routes::transports::messages))
+        .route(
+            "/v1/messages",
+            post(routes::transports::messages).layer(middleware::map_response(
+                routes::transports::anthropic_error_response,
+            )),
+        )
         .route(
             "/v1/messages/count_tokens",
-            post(routes::transports::messages_tokens),
+            post(routes::transports::messages_tokens).layer(middleware::map_response(
+                routes::transports::anthropic_error_response,
+            )),
         )
         .route(
             "/v1/responses/input_tokens",

@@ -10,12 +10,12 @@ pub(crate) async fn completions(
     validate_completion_request(&request, &state.config)?;
     let session_id = session_id_from_headers(&headers)?;
     if request.suffix.is_some() && handle.fim_config.is_none() {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "FIM is not supported by this model because its tokenizer configuration does not declare recognized FIM tokens",
         ));
     }
     if request.suffix.is_some() && session_id.is_some() {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "X-Session-Id is not supported for FIM completions",
         ));
     }
@@ -93,14 +93,14 @@ fn validate_embedding_request(
     tokenizer: &Tokenizer,
 ) -> Result<(), ApiError> {
     if request.dimensions == Some(0) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "dimensions must be greater than zero",
         ));
     }
 
     let validate_tokens = |tokens: &[u32]| {
         if tokens.is_empty() {
-            Err(ApiError::bad_request(
+            Err(ApiError::invalid_request(
                 "embedding input must contain at least one token",
             ))
         } else {
@@ -110,19 +110,19 @@ fn validate_embedding_request(
     match &request.input {
         EmbeddingInput::String(input) => {
             let tokens = tokenizer.encode(input).map_err(|err| {
-                ApiError::bad_request(format!("input tokenization failed: {err}"))
+                ApiError::invalid_request(format!("input tokenization failed: {err}"))
             })?;
             validate_tokens(&tokens)
         }
         EmbeddingInput::Strings(inputs) => {
             if inputs.is_empty() {
-                return Err(ApiError::bad_request(
+                return Err(ApiError::invalid_request(
                     "embedding input array must not be empty",
                 ));
             }
             for input in inputs {
                 let tokens = tokenizer.encode(input).map_err(|err| {
-                    ApiError::bad_request(format!("input tokenization failed: {err}"))
+                    ApiError::invalid_request(format!("input tokenization failed: {err}"))
                 })?;
                 validate_tokens(&tokens)?;
             }
@@ -131,7 +131,7 @@ fn validate_embedding_request(
         EmbeddingInput::Tokens(tokens) => validate_tokens(tokens),
         EmbeddingInput::TokenArrays(inputs) => {
             if inputs.is_empty() {
-                return Err(ApiError::bad_request(
+                return Err(ApiError::invalid_request(
                     "embedding input array must not be empty",
                 ));
             }
@@ -309,6 +309,7 @@ async fn stream_completion(
                 tx.send(Ok(Event::default().event("error").data(
                     serde_json::to_string(&ErrorResponse {
                         error: ErrorBody {
+                            code: error.status.as_u16(),
                             message: error.message,
                             kind: error.kind,
                         },
@@ -372,7 +373,7 @@ async fn prepare_chat_input(
         handle.tool_protocol.as_ref(),
         handle.tool_protocol_metadata_path.as_deref(),
     )
-    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    .map_err(|error| ApiError::invalid_request(error.to_string()))?;
     let image_urls = request.image_urls();
     let input_audio = request.input_audio();
     crate::multimodal::admit_attachments(
@@ -409,7 +410,7 @@ async fn prepare_chat_input(
                     .as_ref()
                     .and_then(|multimodal| multimodal.vision.as_ref())
                     .ok_or_else(|| {
-                        ApiError::bad_request(
+                        ApiError::invalid_request(
                             "image input requires a model with a declared vision input",
                         )
                     })?,
@@ -837,6 +838,7 @@ async fn stream_chat_completion(
                 tx.send(Ok(Event::default().event("error").data(
                     serde_json::to_string(&ErrorResponse {
                         error: ErrorBody {
+                            code: error.status.as_u16(),
                             message: error.message,
                             kind: error.kind,
                         },
@@ -983,6 +985,7 @@ async fn stream_declared_tool_chat_completion(
             tx.send(Ok(Event::default().event("error").data(
                 serde_json::to_string(&ErrorResponse {
                     error: ErrorBody {
+                        code: error.status.as_u16(),
                         message: error.message,
                         kind: error.kind,
                     },
@@ -1144,16 +1147,16 @@ fn preprocess_chat_audio(
     handle: &ModelHandle,
 ) -> Result<MultimodalInput, ApiError> {
     let bytes = crate::audio_input::decode_chat_audio(input)
-        .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
+        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err}")))?;
     let spec = handle
         .multimodal
         .as_ref()
         .and_then(|multimodal| multimodal.audio.as_ref())
         .ok_or_else(|| {
-            ApiError::bad_request("audio input requires a model with a declared audio input")
+            ApiError::invalid_request("audio input requires a model with a declared audio input")
         })?;
     MultimodalInput::from_wav(spec, &bytes)
-        .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))
+        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err}")))
 }
 
 async fn preprocess_chat_images(
@@ -1165,10 +1168,10 @@ async fn preprocess_chat_images(
 ) -> Result<MultimodalInput, ApiError> {
     let max_prompt_tokens =
         crate::multimodal::expansion_token_budget(model_max_context, max_tokens)
-            .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+            .map_err(|err| ApiError::invalid_request(format!("{err:#}")))?;
     let images = crate::image_input::fetch_images(image_urls)
         .await
-        .map_err(|err| ApiError::bad_request(format!("invalid image input: {err:#}")))?;
+        .map_err(|err| ApiError::invalid_request(format!("invalid image input: {err:#}")))?;
     let GeneratePrompt::TokenIds(mut token_ids) = std::mem::replace(
         &mut prepared.request.prompt,
         GeneratePrompt::TokenIds(Vec::new()),
@@ -1178,7 +1181,7 @@ async fn preprocess_chat_images(
         ));
     };
     let input = MultimodalInput::from_images(spec, &images, &mut token_ids, max_prompt_tokens)
-        .map_err(|err| ApiError::bad_request(format!("invalid image input: {err:#}")))?;
+        .map_err(|err| ApiError::invalid_request(format!("invalid image input: {err:#}")))?;
     prepared.prompt_tokens = token_ids.len();
     prepared.request.prompt = GeneratePrompt::TokenIds(token_ids);
     Ok(input)
@@ -1206,16 +1209,16 @@ pub(super) fn validate_request(
     config: &ServerConfig,
 ) -> Result<(), ApiError> {
     if request.messages.is_empty() {
-        return Err(ApiError::bad_request("messages must not be empty"));
+        return Err(ApiError::invalid_request("messages must not be empty"));
     }
     if let Some((field, requested)) = request.requested_output_budget() {
         if requested == 0 {
-            return Err(ApiError::bad_request(format!(
+            return Err(ApiError::invalid_request(format!(
                 "{field} must be greater than zero"
             )));
         }
         if requested > config.max_output_tokens {
-            return Err(ApiError::bad_request(format!(
+            return Err(ApiError::invalid_request(format!(
                 "{field} must be less than or equal to the server cap of {}",
                 config.max_output_tokens
             )));
@@ -1224,66 +1227,68 @@ pub(super) fn validate_request(
     validate_sampling_range(request.temperature, "temperature")?;
     validate_sampling_range(request.top_p, "top_p")?;
     if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "min_p must be finite and between 0 and 1",
         ));
     }
     if !request.top_a.is_finite() || !(0.0..=1.0).contains(&request.top_a) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "top_a must be finite and between 0 and 1",
         ));
     }
     if !request.typical_p.is_finite() || !(0.0..=1.0).contains(&request.typical_p) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "typ_p must be finite and between 0 and 1",
         ));
     }
     if !request.repetition_penalty.is_finite() || request.repetition_penalty <= 0.0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "repeat_penalty must be finite and greater than zero",
         ));
     }
     if !request.frequency_penalty.is_finite() {
-        return Err(ApiError::bad_request("frequency_penalty must be finite"));
+        return Err(ApiError::invalid_request(
+            "frequency_penalty must be finite",
+        ));
     }
     if !request.presence_penalty.is_finite() {
-        return Err(ApiError::bad_request("presence_penalty must be finite"));
+        return Err(ApiError::invalid_request("presence_penalty must be finite"));
     }
     if !request.dry_multiplier.is_finite() || request.dry_multiplier < 0.0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "dry_multiplier must be finite and non-negative",
         ));
     }
     if !request.dry_base.is_finite() || request.dry_base < 1.0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "dry_base must be finite and at least 1",
         ));
     }
     if request.dry_allowed_length == 0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "dry_allowed_length must be greater than zero",
         ));
     }
     if request.mirostat > 2 {
-        return Err(ApiError::bad_request("mirostat must be 0, 1, or 2"));
+        return Err(ApiError::invalid_request("mirostat must be 0, 1, or 2"));
     }
     if !request.mirostat_tau.is_finite() || request.mirostat_tau <= 0.0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "mirostat_tau must be finite and greater than zero",
         ));
     }
     if !request.mirostat_eta.is_finite() || request.mirostat_eta <= 0.0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "mirostat_eta must be finite and greater than zero",
         ));
     }
     if !request.xtc_probability.is_finite() || !(0.0..=1.0).contains(&request.xtc_probability) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "xtc_probability must be finite and between 0 and 1",
         ));
     }
     if !request.xtc_threshold.is_finite() || !(0.0..=1.0).contains(&request.xtc_threshold) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "xtc_threshold must be finite and between 0 and 1",
         ));
     }
@@ -1291,12 +1296,12 @@ pub(super) fn validate_request(
         .top_logprobs
         .is_some_and(|count| count > MAX_CHAT_TOP_LOGPROBS)
     {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "top_logprobs must be between 0 and {MAX_CHAT_TOP_LOGPROBS}"
         )));
     }
     if request.top_logprobs.is_some() && !request.logprobs {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "top_logprobs requires logprobs to be true",
         ));
     }
@@ -1309,12 +1314,12 @@ fn validate_completion_request(
     config: &ServerConfig,
 ) -> Result<(), ApiError> {
     if request.max_tokens == 0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "max_tokens must be greater than zero",
         ));
     }
     if request.max_tokens > config.max_output_tokens {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "max_tokens must be less than or equal to the server cap of {}",
             config.max_output_tokens
         )));
@@ -1322,21 +1327,23 @@ fn validate_completion_request(
     validate_sampling_range(request.temperature, "temperature")?;
     validate_sampling_range(request.top_p, "top_p")?;
     if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "min_p must be finite and between 0 and 1",
         ));
     }
     if !request.frequency_penalty.is_finite() {
-        return Err(ApiError::bad_request("frequency_penalty must be finite"));
+        return Err(ApiError::invalid_request(
+            "frequency_penalty must be finite",
+        ));
     }
     if !request.presence_penalty.is_finite() {
-        return Err(ApiError::bad_request("presence_penalty must be finite"));
+        return Err(ApiError::invalid_request("presence_penalty must be finite"));
     }
     if request
         .logprobs
         .is_some_and(|count| count > MAX_COMPLETION_LOGPROBS)
     {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "logprobs must be between 0 and {MAX_COMPLETION_LOGPROBS}"
         )));
     }
@@ -1368,7 +1375,7 @@ pub(super) fn admit_output_budget(
         .checked_sub(prompt_tokens)
         .filter(|remaining| *remaining > 0)
         .ok_or_else(|| {
-            ApiError::bad_request(format!(
+            ApiError::invalid_request(format!(
                 "What: request admission exceeded the model context limit. \
                  Why: final prefill length ({prompt_tokens}) after placeholder expansion leaves no room to decode within {model_max_context}. \
                  How: shorten the prompt or reduce the image count/expansion size."
@@ -1397,12 +1404,12 @@ fn enforce_context_cap(
     let total = prompt_tokens
         .checked_add(max_tokens)
         .ok_or_else(|| {
-            ApiError::bad_request(
+            ApiError::invalid_request(
                 "What: request admission length overflowed. Why: final prefill length plus max_tokens does not fit usize. How: reduce the prompt, image expansion size, or max_tokens.",
             )
         })?;
     if total > model_max_context {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "What: request admission exceeded the model context limit. \
              Why: final prefill length ({prompt_tokens}) after placeholder expansion plus max_tokens ({max_tokens}) is {total}, above {model_max_context}. \
              How: reduce the prompt, image count/expansion size, or max_tokens."
@@ -1422,14 +1429,14 @@ fn validate_tool_choice(request: &ChatCompletionRequest) -> Result<(), ApiError>
                 .as_ref()
                 .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "function"))
             {
-                return Err(ApiError::bad_request(
+                return Err(ApiError::invalid_request(
                     "tool_choice required requires at least one function tool",
                 ));
             }
         }
         ToolChoice::Specific(choice) => {
             if choice.kind != "function" {
-                return Err(ApiError::bad_request(
+                return Err(ApiError::invalid_request(
                     "specific tool_choice type must be function",
                 ));
             }
@@ -1438,7 +1445,7 @@ fn validate_tool_choice(request: &ChatCompletionRequest) -> Result<(), ApiError>
                     tool.kind == "function" && tool.function.name == choice.function.name
                 })
             }) {
-                return Err(ApiError::bad_request(format!(
+                return Err(ApiError::invalid_request(format!(
                     "tool_choice function '{}' was not provided in tools",
                     choice.function.name
                 )));
@@ -1455,13 +1462,13 @@ fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErr
     };
     let session_id = value
         .to_str()
-        .map_err(|_| ApiError::bad_request("X-Session-Id must be valid UTF-8"))?
+        .map_err(|_| ApiError::invalid_request("X-Session-Id must be valid UTF-8"))?
         .trim();
     if session_id.is_empty() {
-        return Err(ApiError::bad_request("X-Session-Id must not be empty"));
+        return Err(ApiError::invalid_request("X-Session-Id must not be empty"));
     }
     if session_id.len() > MAX_SESSION_ID_LEN {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "X-Session-Id must be at most {MAX_SESSION_ID_LEN} bytes"
         )));
     }
@@ -1703,7 +1710,7 @@ pub(crate) fn prepare_completion(
         let fim_config = handle
             .fim_config
             .as_ref()
-            .ok_or_else(|| ApiError::bad_request("FIM is not supported by this model"))?;
+            .ok_or_else(|| ApiError::invalid_request("FIM is not supported by this model"))?;
         let prompt = fim_config.format_prompt(&request.prompt, suffix);
         let prompt_tokens = tokenize_prompt(&handle.tokenizer, &prompt)?;
         Ok(PreparedCompletion {
@@ -1754,7 +1761,7 @@ async fn submit_completion(
             let fim_config = handle
                 .fim_config
                 .clone()
-                .ok_or_else(|| ApiError::bad_request("FIM is not supported by this model"))?;
+                .ok_or_else(|| ApiError::invalid_request("FIM is not supported by this model"))?;
             handle
                 .engine
                 .generate_fim(prefix, suffix, fim_config, options)
@@ -2055,9 +2062,9 @@ const NEUTRAL_SAMPLING: f32 = 1.0;
 /// package's business rather than a value to judge.
 fn validate_sampling_range(value: Option<f32>, field: &str) -> Result<(), ApiError> {
     match value {
-        Some(value) if !value.is_finite() || value < 0.0 => Err(ApiError::bad_request(format!(
-            "{field} must be finite and non-negative"
-        ))),
+        Some(value) if !value.is_finite() || value < 0.0 => Err(ApiError::invalid_request(
+            format!("{field} must be finite and non-negative"),
+        )),
         _ => Ok(()),
     }
 }

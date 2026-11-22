@@ -220,7 +220,7 @@ pub(crate) async fn admin_set_vram_limit(
     Json(request): Json<SetVramLimitRequest>,
 ) -> Result<Response, ApiError> {
     let limit = parse_resource_limit(&request.limit)
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+        .map_err(|err| ApiError::invalid_request(err.to_string()))?;
     let snapshot = state.registry.set_vram_limit(limit).await.map_err(|err| {
         if matches!(
             err.downcast_ref::<EngineGovernorError>(),

@@ -21,7 +21,7 @@ model inspection, profiling and command-line streaming remain available.
 | GET | `/health`, `/v1/health` | Existing nxrt health response |
 | GET | `/models`, `/v1/models` | Configured models, committed load status, input modalities and context length when known |
 | GET | `/props` | Model generation defaults, chat template, declared input modalities; router role for multiple configured models |
-| POST | `/tokenize` | `content`, `add_special`, `with_pieces`, optional `model`; package vocabulary/tokenizer |
+| POST | `/tokenize` | `content`, independent `add_special` / `parse_special`, `with_pieces`, optional `model`; package vocabulary/tokenizer |
 | POST | `/detokenize` | `tokens`, optional `model`; preserves special tokens, rejects absent vocabulary IDs |
 | POST | `/apply-template` | Chat request fields; same prompt renderer as chat inference |
 | POST | `/v1/chat/completions`, `/chat/completions` | Buffered/streaming text, tools, reasoning, declared image/audio inputs |
@@ -50,6 +50,9 @@ rejected because these models execute in-process with explicit nxrt settings.
 
 ## Request compatibility
 
+- `/tokenize` can parse registered special tokens or treat their spelling as
+  ordinary text. This is independent of inserting BOS/EOS tokens, and each
+  request keeps its policy isolated from other requests.
 - `model` can be omitted for the default chat model.
 - `max_tokens: -1` uses the configured server output cap; context limits still apply.
 - `seed: -1` selects an unseeded request; unsigned 64-bit seeds remain accepted.
@@ -104,12 +107,21 @@ bounded WAV workflow. `raw_prompt=true` bypasses text assembly and requires empt
 undeclared voices/languages, and active synthesis controls are rejected rather
 than ignored. The OpenAI speech request also rejects unknown controls.
 
+Explicit API failures carry numeric HTTP `code`, `message` and protocol `type`.
+Invalid JSON/parameters use `invalid_request_error`; absent models/routes use
+`not_found_error`, and permission refusals use `permission_error`. Internal faults
+retain `server_error`. Messages routes wrap handler and extractor failures in
+Anthropic's `type: error` envelope and preserve retry headers. Stream adapters
+preserve the source error's status and protocol classification after headers
+have been sent.
+
 ## Remaining differences
 
 This is a functional Llama Chat integration, not a claim of complete llama-server
 parity. These upstream protocols are still unimplemented:
 
 - Reranking, realtime audio/WebSocket inference and `/v1/systemone`.
+- Byte-array token pieces for tokens containing incomplete UTF-8.
 - Slot save/restore, LoRA hot swapping and realtime reasoning control.
 - GGUF/Hugging Face model downloads and deletion.
 

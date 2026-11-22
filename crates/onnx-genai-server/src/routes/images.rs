@@ -172,13 +172,13 @@ impl ApplicationTensor {
         shape_symbols: &mut BTreeMap<String, i64>,
     ) -> Result<ImageInputValue, ApiError> {
         if self.dtype != contract.dtype {
-            return Err(ApiError::bad_request(format!(
+            return Err(ApiError::invalid_request(format!(
                 "application input dtype '{}' does not match metadata dtype '{}'",
                 self.dtype, contract.dtype
             )));
         }
         if self.shape.len() != contract.rank() {
-            return Err(ApiError::bad_request(format!(
+            return Err(ApiError::invalid_request(format!(
                 "application input rank {} does not match required metadata shape {:?} (rank {})",
                 self.shape.len(),
                 contract.shape,
@@ -187,7 +187,7 @@ impl ApplicationTensor {
         }
         let dtype = parse_application_dtype(&self.dtype)?;
         if self.shape.iter().any(|dimension| *dimension < 0) {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::invalid_request(
                 "application input shapes must contain only non-negative dimensions",
             ));
         }
@@ -195,7 +195,7 @@ impl ApplicationTensor {
         for (axis, (actual, expected)) in self.shape.iter().zip(contract_shape).enumerate() {
             match expected {
                 TensorDimension::Fixed(expected) if actual != expected => {
-                    return Err(ApiError::bad_request(format!(
+                    return Err(ApiError::invalid_request(format!(
                         "application input shape {:?} does not match metadata shape {:?}: axis {axis} must be {expected}, got {actual}",
                         self.shape, contract_shape
                     )));
@@ -203,7 +203,7 @@ impl ApplicationTensor {
                 TensorDimension::Symbol(symbol) => {
                     if let Some(bound) = shape_symbols.get(symbol) {
                         if actual != bound {
-                            return Err(ApiError::bad_request(format!(
+                            return Err(ApiError::invalid_request(format!(
                                 "application input shape {:?} violates metadata symbol '{symbol}': expected {bound} at axis {axis}, got {actual}",
                                 self.shape
                             )));
@@ -217,20 +217,21 @@ impl ApplicationTensor {
             }
         }
         let elements = self.shape.iter().try_fold(1_usize, |total, dimension| {
-            let dimension = usize::try_from(*dimension)
-                .map_err(|_| ApiError::bad_request("application input dimension is too large"))?;
-            total
-                .checked_mul(dimension)
-                .ok_or_else(|| ApiError::bad_request("application input element count overflowed"))
+            let dimension = usize::try_from(*dimension).map_err(|_| {
+                ApiError::invalid_request("application input dimension is too large")
+            })?;
+            total.checked_mul(dimension).ok_or_else(|| {
+                ApiError::invalid_request("application input element count overflowed")
+            })
         })?;
         let expected = elements
             .checked_mul(dtype.size_of())
-            .ok_or_else(|| ApiError::bad_request("application input byte count overflowed"))?;
+            .ok_or_else(|| ApiError::invalid_request("application input byte count overflowed"))?;
         let bytes = STANDARD.decode(&self.data_b64).map_err(|error| {
-            ApiError::bad_request(format!("application input data_b64 is invalid: {error}"))
+            ApiError::invalid_request(format!("application input data_b64 is invalid: {error}"))
         })?;
         if bytes.len() != expected {
-            return Err(ApiError::bad_request(format!(
+            return Err(ApiError::invalid_request(format!(
                 "application input contains {} decoded bytes, expected {expected} for dtype '{}' and shape {:?}",
                 bytes.len(),
                 self.dtype,
@@ -302,17 +303,17 @@ pub(crate) async fn openai_images(
 ) -> Result<Json<OpenAiImageResponse>, ApiError> {
     validate_count(request.n)?;
     if request.quality.is_some() {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "the loaded workflow declares no image quality runtime role; `quality` cannot be honored",
         ));
     }
     if request.style.is_some() {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "the loaded workflow declares no image style runtime role; `style` cannot be honored",
         ));
     }
     if matches!(request.response_format, OpenAiResponseFormat::Url) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "`response_format: url` is unsupported because this server has no persistent image asset store; use `b64_json`",
         ));
     }
@@ -320,17 +321,17 @@ pub(crate) async fn openai_images(
         request.output_format,
         Some(OpenAiOutputFormat::Jpeg | OpenAiOutputFormat::Webp)
     ) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "only `output_format: png` is supported by the loaded image encoder",
         ));
     }
     if matches!(request.background, Some(OpenAiBackground::Transparent)) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "`background: transparent` cannot be honored because the workflow emits RGB without alpha",
         ));
     }
     if request.moderation.is_some() {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "`moderation` cannot be honored because no image moderation pipeline is configured",
         ));
     }
@@ -380,7 +381,7 @@ pub(crate) async fn a1111_txt2img(
     ApiJson(request): ApiJson<A1111ImageRequest>,
 ) -> Result<Json<A1111ImageResponse>, ApiError> {
     if !request.init_images.is_empty() || request.denoising_strength.is_some() {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "txt2img does not accept `init_images` or `denoising_strength`; use /sdapi/v1/img2img",
         ));
     }
@@ -403,7 +404,7 @@ async fn execute_a1111(
     let count = request
         .batch_size
         .checked_mul(request.n_iter)
-        .ok_or_else(|| ApiError::bad_request("batch_size * n_iter overflowed"))?;
+        .ok_or_else(|| ApiError::invalid_request("batch_size * n_iter overflowed"))?;
     validate_count(count)?;
     let handle = resolve_model(&state.registry, "").await?;
     let uses_application_inputs = !request.application_inputs.is_empty();
@@ -418,12 +419,12 @@ async fn execute_a1111(
     let (width, height) = resolve_dimensions(spec, request.width, request.height)?;
     let init_image = if img2img {
         let _media = spec.media.as_ref().ok_or_else(|| {
-            ApiError::bad_request(
+            ApiError::invalid_request(
                 "the loaded workflow declares no semantic image/media input, so img2img is unavailable",
             )
         })?;
         if request.init_images.len() != 1 {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::invalid_request(
                 "img2img requires exactly one base64 entry in `init_images`",
             ));
         }
@@ -500,17 +501,17 @@ async fn execute_a1111(
 
 fn reject_a1111_unsupported(request: &A1111ImageRequest) -> Result<(), ApiError> {
     if request.save_images {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "`save_images: true` is unsupported because the server has no configured image asset store",
         ));
     }
     if request.subseed != -1 || request.subseed_strength != 0.0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "subseed variation is not exposed by the loaded workflow",
         ));
     }
     if !request.extra.is_empty() {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "unsupported A1111 fields (scripts/extensions/control inputs are never silently ignored): {}",
             request.extra.keys().cloned().collect::<Vec<_>>().join(", ")
         )));
@@ -523,14 +524,14 @@ fn image_spec(
     require_http_roles: bool,
 ) -> Result<&ImagePipelineSpec, ApiError> {
     let spec = handle.image_pipeline.as_ref().ok_or_else(|| {
-        ApiError::bad_request(
+        ApiError::invalid_request(
             "the selected model does not declare a pipeline image output in inference metadata",
         )
     })?;
     if require_http_roles
         && (spec.prompt_tokens.is_none() || spec.steps.is_none() || spec.seed.is_none())
     {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "the image workflow must declare prompt_tokens, max_iterations, and seed runtime roles for HTTP generation",
         ));
     }
@@ -560,7 +561,7 @@ fn lower(
     if let Some(sampler) = request.sampler.as_deref()
         && !spec.samplers.iter().any(|declared| declared == sampler)
     {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "sampler '{sampler}' is not the solver declared by the loaded workflow"
         )));
     }
@@ -569,14 +570,14 @@ fn lower(
     let mut shape_symbols = BTreeMap::from([("batch".to_string(), 1)]);
     for (name, binding) in &spec.application_inputs {
         if binding.required && !request.application_inputs.contains_key(name) {
-            return Err(ApiError::bad_request(format!(
+            return Err(ApiError::invalid_request(format!(
                 "required metadata application input '{name}' was not provided"
             )));
         }
     }
     for (name, tensor) in &request.application_inputs {
         let binding = spec.application_inputs.get(name).ok_or_else(|| {
-            ApiError::bad_request(format!(
+            ApiError::invalid_request(format!(
                 "application input '{name}' is not declared by workflow metadata"
             ))
         })?;
@@ -588,20 +589,20 @@ fn lower(
     let prompt_binding = spec.prompt_tokens.as_ref();
     if let Some(binding) = prompt_binding {
         prompt = handle.tokenizer.encode(&request.prompt).map_err(|error| {
-            ApiError::bad_request(format!("failed to tokenize prompt: {error}"))
+            ApiError::invalid_request(format!("failed to tokenize prompt: {error}"))
         })?;
         inputs.push((
             binding.name.clone(),
             token_input(binding, &prompt)
-                .map_err(|error| ApiError::bad_request(format!("{error:#}")))?,
+                .map_err(|error| ApiError::invalid_request(format!("{error:#}")))?,
         ));
     } else if !request.prompt.is_empty() || request.application_inputs.is_empty() {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "the image workflow declares no prompt_tokens runtime input; omit `prompt` and provide every required application input",
         ));
     }
     if !request.negative_prompt.is_empty() && spec.negative_prompt_tokens.is_none() {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "the loaded workflow has no negative_prompt_tokens input; omit `negative_prompt`",
         ));
     }
@@ -611,7 +612,9 @@ fn lower(
                 .tokenizer
                 .encode(&request.negative_prompt)
                 .map_err(|error| {
-                    ApiError::bad_request(format!("failed to tokenize negative prompt: {error}"))
+                    ApiError::invalid_request(format!(
+                        "failed to tokenize negative prompt: {error}"
+                    ))
                 })?;
             Some((binding, tokens))
         } else {
@@ -645,28 +648,28 @@ fn lower(
         lowered.inputs.push((
             binding.name.clone(),
             token_input(binding, &tokens)
-                .map_err(|error| ApiError::bad_request(format!("{error:#}")))?,
+                .map_err(|error| ApiError::invalid_request(format!("{error:#}")))?,
         ));
     }
     if let Some(binding) = &spec.seed {
         lowered.inputs.push((
             binding.name.clone(),
             scalar_i64(binding, request.seed as i64)
-                .map_err(|error| ApiError::bad_request(format!("{error:#}")))?,
+                .map_err(|error| ApiError::invalid_request(format!("{error:#}")))?,
         ));
     }
     if let Some(binding) = &spec.steps {
         lowered.inputs.push((
             binding.name.clone(),
             scalar_i64(binding, request.steps as i64)
-                .map_err(|error| ApiError::bad_request(format!("{error:#}")))?,
+                .map_err(|error| ApiError::invalid_request(format!("{error:#}")))?,
         ));
     }
     if let Some(binding) = &spec.guidance_scale {
         lowered.inputs.push((
             binding.name.clone(),
             scalar_f32(binding, request.guidance_scale)
-                .map_err(|error| ApiError::bad_request(format!("{error:#}")))?,
+                .map_err(|error| ApiError::invalid_request(format!("{error:#}")))?,
         ));
     }
     for (binding, value) in [
@@ -677,13 +680,13 @@ fn lower(
             lowered.inputs.push((
                 binding.name.clone(),
                 scalar_i64(binding, value)
-                    .map_err(|error| ApiError::bad_request(format!("{error:#}")))?,
+                    .map_err(|error| ApiError::invalid_request(format!("{error:#}")))?,
             ));
         }
     }
     if let Some(bytes) = &request.init_image {
         let binding = spec.media.as_ref().ok_or_else(|| {
-            ApiError::bad_request("the loaded workflow declares no image/media input")
+            ApiError::invalid_request("the loaded workflow declares no image/media input")
         })?;
         lowered
             .inputs
@@ -693,7 +696,7 @@ fn lower(
         lowered.inputs.push((
             binding.name.clone(),
             scalar_f32(binding, value)
-                .map_err(|error| ApiError::bad_request(format!("{error:#}")))?,
+                .map_err(|error| ApiError::invalid_request(format!("{error:#}")))?,
         ));
     }
     Ok(lowered)
@@ -713,7 +716,7 @@ fn parse_application_dtype(dtype: &str) -> Result<DataType, ApiError> {
         "uint32" => Ok(DataType::Uint32),
         "uint64" => Ok(DataType::Uint64),
         "bool" => Ok(DataType::Bool),
-        _ => Err(ApiError::bad_request(format!(
+        _ => Err(ApiError::invalid_request(format!(
             "unsupported application input dtype '{dtype}'"
         ))),
     }
@@ -807,7 +810,7 @@ fn encode_png(image: ProducedImage, value_range: PixelValueRange) -> Result<Vec<
 
 fn validate_count(count: usize) -> Result<(), ApiError> {
     if !(1..=MAX_IMAGES_PER_REQUEST).contains(&count) {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "image count must be between 1 and {MAX_IMAGES_PER_REQUEST}"
         )));
     }
@@ -817,16 +820,16 @@ fn validate_count(count: usize) -> Result<(), ApiError> {
 
 fn parse_size(size: &str) -> Result<(u32, u32), ApiError> {
     let (width, height) = size.split_once('x').ok_or_else(|| {
-        ApiError::bad_request(
+        ApiError::invalid_request(
             "size must use the OpenAI `WIDTHxHEIGHT` form, for example `1024x1024`",
         )
     })?;
     let width = width
         .parse()
-        .map_err(|_| ApiError::bad_request("size width must be a positive integer"))?;
+        .map_err(|_| ApiError::invalid_request("size width must be a positive integer"))?;
     let height = height
         .parse()
-        .map_err(|_| ApiError::bad_request("size height must be a positive integer"))?;
+        .map_err(|_| ApiError::invalid_request("size height must be a positive integer"))?;
     Ok((width, height))
 }
 
@@ -851,7 +854,7 @@ fn resolve_seed(seed: i64) -> Result<u64, ApiError> {
         return Ok(seed as u64);
     }
     if seed != -1 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "seed must be -1 or a non-negative integer",
         ));
     }
@@ -863,26 +866,26 @@ fn resolve_seed(seed: i64) -> Result<u64, ApiError> {
 
 fn resolve_steps(spec: &ImagePipelineSpec, steps: Option<usize>) -> Result<usize, ApiError> {
     if steps.is_some() && spec.steps.is_none() {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "the loaded workflow exposes no max_iterations role, so requested `steps` cannot be bound",
         ));
     }
     let steps = steps.unwrap_or_else(|| request_steps(spec));
     if steps == 0 {
-        return Err(ApiError::bad_request("steps must be greater than zero"));
+        return Err(ApiError::invalid_request("steps must be greater than zero"));
     }
     Ok(steps)
 }
 
 fn resolve_guidance(spec: &ImagePipelineSpec, value: Option<f32>) -> Result<f32, ApiError> {
     if value.is_some() && spec.guidance_scale.is_none() {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "the loaded workflow exposes no guidance_scale role, so requested `cfg_scale` cannot be bound",
         ));
     }
     let value = value.unwrap_or_else(|| request_guidance(spec));
     if !value.is_finite() || value < 0.0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "cfg_scale must be finite and non-negative",
         ));
     }
@@ -898,14 +901,14 @@ fn resolve_dimensions(
         (None, None) => Ok((None, None)),
         (Some(width), Some(height)) if spec.width.is_some() && spec.height.is_some() => {
             if width == 0 || height == 0 {
-                Err(ApiError::bad_request(
+                Err(ApiError::invalid_request(
                     "width and height must be greater than zero",
                 ))
             } else {
                 Ok((Some(width), Some(height)))
             }
         }
-        _ => Err(ApiError::bad_request(
+        _ => Err(ApiError::invalid_request(
             "requested width/height cannot be bound because the loaded workflow does not expose both semantic dimension roles",
         )),
     }
@@ -919,7 +922,7 @@ fn resolve_sampler(
     if let (Some(name), Some(index)) = (sampler_name, sampler_index)
         && normalize_sampler(name) != normalize_sampler(index)
     {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "`sampler_name` and `sampler_index` request different samplers",
         ));
     }
@@ -933,7 +936,7 @@ fn resolve_sampler(
         .cloned()
         .map(Some)
         .ok_or_else(|| {
-            ApiError::bad_request(format!(
+            ApiError::invalid_request(format!(
                 "sampler '{requested}' is unsupported; available samplers: {}",
                 spec.samplers.join(", ")
             ))
@@ -958,12 +961,12 @@ fn resolve_denoising_strength(
     }
     let value = value.unwrap_or(0.75);
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "denoising_strength must be between 0 and 1",
         ));
     }
     if spec.denoising_strength.is_none() {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "the loaded workflow declares an image input but no denoising_strength runtime role",
         ));
     }
@@ -973,10 +976,11 @@ fn resolve_denoising_strength(
 fn decode_base64_image(input: &str) -> Result<Vec<u8>, ApiError> {
     let encoded = input.split_once(',').map_or(input, |(_, payload)| payload);
     let bytes = STANDARD.decode(encoded).map_err(|error| {
-        ApiError::bad_request(format!("init image is not valid base64: {error}"))
+        ApiError::invalid_request(format!("init image is not valid base64: {error}"))
     })?;
-    image::load_from_memory(&bytes)
-        .map_err(|error| ApiError::bad_request(format!("init image is not decodable: {error}")))?;
+    image::load_from_memory(&bytes).map_err(|error| {
+        ApiError::invalid_request(format!("init image is not decodable: {error}"))
+    })?;
     Ok(bytes)
 }
 

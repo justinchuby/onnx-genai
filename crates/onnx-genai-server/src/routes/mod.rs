@@ -407,6 +407,7 @@ struct ErrorResponse {
 
 #[derive(Debug, Serialize)]
 struct ErrorBody {
+    code: u16,
     message: String,
     #[serde(rename = "type")]
     kind: &'static str,
@@ -449,15 +450,6 @@ pub(crate) const CONFLICT_ERROR_KIND: &str = "conflict_error";
 pub(crate) const INVALID_REQUEST_ERROR_KIND: &str = "invalid_request_error";
 
 impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-            kind: "server_error",
-            retry_after_secs: None,
-        }
-    }
-
     /// A request the loaded package cannot serve, and no retry will change.
     pub(crate) fn invalid_request(message: impl Into<String>) -> Self {
         Self {
@@ -490,7 +482,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
-            kind: "server_error",
+            kind: "not_found_error",
             retry_after_secs: None,
         }
     }
@@ -499,7 +491,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
-            kind: "server_error",
+            kind: "permission_error",
             retry_after_secs: None,
         }
     }
@@ -658,7 +650,9 @@ where
             Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
                 Err(ApiError::payload_too_large(rejection.body_text()))
             }
-            Err(rejection) => Err(ApiError::bad_request(describe_json_rejection(&rejection))),
+            Err(rejection) => Err(ApiError::invalid_request(describe_json_rejection(
+                &rejection,
+            ))),
         }
     }
 }
@@ -704,6 +698,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(ErrorResponse {
             error: ErrorBody {
+                code: self.status.as_u16(),
                 message: self.message,
                 kind: self.kind,
             },
@@ -778,7 +773,7 @@ fn audio_decoder_prompt(
     language: Option<&str>,
 ) -> Result<Vec<u32>, ApiError> {
     crate::multimodal::audio_decoder_prompt(tokenizer, language)
-        .map_err(|error| ApiError::bad_request(format!("{error:#}")))
+        .map_err(|error| ApiError::invalid_request(format!("{error:#}")))
 }
 
 /// Close a session the registry let go of, on the model that owns it, under the
