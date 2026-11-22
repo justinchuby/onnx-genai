@@ -1442,3 +1442,158 @@ Clippy pass again. Downstream native-backend engine load and memory-strategy
 groups each pass 29 tests with the cached ORT library. The temporary negative
 control worktree and consumed editing scripts are removed; validation drivers,
 raw logs and the stable host-lock inode remain.
+
+
+### Materialized copy identity follows the complete source view
+
+Dense f32 and contiguous f16 copies now share a cache-key implementation with
+effective address, source dtype, shape and signed strides. Immutable storage
+does not make all its logical views identical. The previous keys could return
+the first copy when a runtime view changed strides without changing address or
+element count. Shape must also participate: equal-size views can have identical
+stride vectors but different row boundaries.
+
+The direct control exercises both dense operand slots and native-width half
+copies across positive, broadcast and negative strides, a same-strides shape
+change, and a nonzero byte offset. Five distinct views hold five actual payload
+grants (24 bytes each for dense f32, 12 for f16); after node-owner adoption,
+five identical views hit the original allocations without new grants and final
+drop refunds all bytes. A public-provider control executes MatMul, Gemm,
+FusedMatMulBias and FusedGemm for both immutable operand slots, changes layout
+through a shared preparation owner, then returns to the original layout.
+
+Both unchanged controls fail numerically on parent 5bc65dce7. In the public
+MatMul operand-A case, the changed view incorrectly repeats [6,6,18,18] instead
+of [9,9,12,12]. These are correctness/ownership controls, not performance results;
+CUDA and other CPU ISAs were not exercised on the Apple host.
+
+Validation after an explicit CPU/session package clean on Apple M1 Max ARM64
+macOS / Rust 1.98: native CPU 1,986 passed / 20 ignored and session 277 passed;
+optional-MLAS CPU 2,023 passed / 35 ignored and session 279 passed. Strict
+all-target Clippy passes for both crates in both configurations. Formatting and
+dispatch manifest/reachability/platform/feature checks pass. Both exact new
+controls selected one test and passed before the old-version negative controls;
+the rebuilt full suites include both afterward. Consumed insertion fragments
+and the temporary baseline worktree are removed; validation drivers/logs and
+the stable host lock remain.
+
+
+### Derived-weight admission stays off warm cache hits
+
+Ordinary dense/half materialization uses a single cache lookup on a warm hit,
+with common-rank full-layout keys stored inline. It does not allocate group
+result/status containers or call the accountant. Cold fills retain the existing
+transactional group admission, serialized construction, reader lifetime and
+pressure reclamation. Higher ranks spill correctly; the inline capacity is no
+semantic rank restriction.
+
+A public-provider control counts every claim (including zero-byte requests)
+and release. After setup and the cold preparation, 4,096 real MatMul executions
+make no further accounting calls. The fixture admits any checked optional MLAS
+panel as well as the dense copy, so reference-backend admission failures cannot
+pollute a warm-hit measurement. Retention-off execution is an active control:
+each real transient allocation claims and refunds its bytes. Teardown refunds
+all retained payloads exactly once.
+
+The `weight_admission_ab` benchmark uses public factory/execute calls, rotated
+local/governed/A-A/f32-control arms, retained and transient policies, warm-up
+outside measurement, per-round samples, wall and process CPU time. On Apple
+M1 Max ARM64 macOS / Rust 1.98 / native Accelerate / one Rayon worker, three
+interleaved process pairs compare parent b0bf6f71e against this implementation.
+Each process contributes eleven rotated rounds. The stable Darwin host lock
+covers both builds and all six process runs. Numbers below are medians of the
+three process medians; brackets give their full range, in nanoseconds per call.
+
+| M,K,N | Policy | Governed before | Governed after |
+| --- | --- | --- | --- |
+| 1,16,16 | retained | 371.63 [370.52–372.18] | 256.76 [256.28–269.02] |
+| 1,128,256 | retained | 2213.30 [2211.08–2253.82] | 2078.89 [2039.26–2098.07] |
+| 8,128,256 | retained | 1482.05 [1477.93–1484.22] | 1361.20 [1353.46–1453.46] |
+| 1,16,16 | transient | 1058.90 [1056.08–1059.16] | 1023.58 [1018.27–1024.60] |
+| 1,128,256 | transient | 74640.66 [74592.97–74670.43] | 74597.33 [74556.19–74752.49] |
+| 8,128,256 | transient | 80850.41 [80842.14–80986.46] | 80977.30 [80883.47–81164.88] |
+
+The tiny retained case improves about 31%; its duplicate local arm improves
+similarly, while its governed f32 control moves about 1.4%. This supports a
+metadata-path improvement on that CPU/workload, not a model-wide speedup.
+Larger M=8 local A/A arms show substantial layout/scheduling variation, and a
+transient f32 control moves about 6%; those rows do not establish general
+speedups or regressions. All timing rows retain numerical output checks.
+
+Admission is not universally free: in the three current tiny transient runs,
+governed execution costs 14.83–19.13 ns (1.47–1.90%) more than local ownership,
+above that case's A/A difference. Warm hits have structurally zero accountant
+calls, but actual cold/transient allocations, pressure misses and final release
+still require truthful accounting. No CUDA, other-ISA, pressure-path or
+end-to-end LLM latency claim follows from this benchmark.
+
+Validation: full native CPU 1,988 passed / 20 ignored and session 277 passed;
+optional-MLAS CPU 2,025 passed / 35 ignored and session 279 passed. Strict
+all-target Clippy passes for both CPU/session configurations. After strengthening
+the callback observer to include zero-byte requests and admitting the checked
+research panel, the exact callback control and CPU Clippy pass again in both
+configurations; explicitly forced MLAS and Generic callback controls each select
+and pass one test. The high-rank fallback control passes as well. Formatting and
+dispatch/platform/feature gates pass. The temporary baseline worktree, consumed
+insertion fragment and copied benchmark executables are removed; raw timing
+samples, metadata, validation drivers/logs and the stable host lock remain.
+
+
+### Panel identity survives conversion reclamation
+
+Optional SGEMM preparation now receives the typed DenseOperand through the
+shared compute helper. A converted f32 source uses a weak Arc-owner identity;
+borrowed original storage uses its complete logical layout. Weak identities
+retain only flat-vector control-block metadata. They do not pin source data or
+grants, allocate another identity object, scan caches, or consult a global
+counter. An ungoverned call-owned conversion declines optional retention and
+runs the existing unpacked arithmetic. The raw-slice packed-B interface is gone.
+
+The recycled-source control moves a Vec allocation out of its retired owner and
+into a new, fully funded conversion. This establishes the same buffer address
+on every allocator while allowing different owner identities. A test-only
+payload/grant extractor keeps the handoff conservative: the old grant remains
+live until the new grant funds the reused allocation. Old panel readers remain
+numerically valid independently of the new source and all bytes refund at the
+last relevant owner/reader drop.
+
+Both unchanged regressions fail numerically on parent c24ad9497 (with only the
+test fixture and test-only extractor injected). Recycled conversion storage
+incorrectly returns [0.375;4] instead of [1.125;4]; two half views with different
+strides over the same backing incorrectly return [15,18] instead of [6,15].
+Current controls pass, including a separate call-owned unpacked fallback case.
+
+Validation after preserving the original native slice compute interface:
+native CPU 1,988 passed / 20 ignored, optional-MLAS CPU 2,028 passed / 35 ignored;
+native/session 277 passed and MLAS/session 279 passed. Strict all-target Clippy
+passes for both CPU/session configurations. A forced-MLAS public-provider
+accounting control selects and passes one test: after cold preparation, 4,096
+warm executions still issue no accountant calls. The vector-only identity's
+three exact controls and strict CPU/MLAS Clippy also pass after narrowing its
+type so weak identity cannot accidentally retain a large inline payload.
+
+The first native before/after timing run was taken before coordination with the
+concurrent llama.cpp work. Its tiny retained governed median moved +10.1%, but
+the A/A arm moved +11.3% and the f32 control +9.7%, with much larger within-arm
+ranges. It is inconclusive and establishes neither a regression nor absence of
+one. All original data is retained. Subsequent heavy builds/tests and timing
+runs share the stable Darwin flock with the llama.cpp session; a busy lock
+returns status=busy/exit 75 without executing the command. Fresh coordinated
+measurement is kept separate from that earlier run.
+
+After both sessions acknowledged the shared lock and the llama.cpp session
+explicitly yielded a window, the fresh run held that same inode for its full
+74.92 seconds of release build plus six interleaved measurement processes.
+The retained tiny governed case is 256.48 ns [254.89–258.94] before and
+256.25 ns [255.37–256.49] after (three process medians, eleven rounds each).
+Its A/A arm moves -0.07% and f32 control -0.26%. The larger retained M=8 row
+moves +5.65% while its governed f32 control moves +5.62%, so it does not isolate
+a packing-identity cost or establish an all-workload no-regression claim.
+The callback invariant remains independently verified: 4,096 warm executions
+make zero further quota calls, including under forced optional MLAS.
+
+Coordination provenance and raw samples are separate from the earlier noisy
+run. The wrapper's busy branch was exercised against the other session's live
+lock and refused execution with exit 75. Release completion was verified from
+the terminal handle and final rusage before notifying the other session to
+resume; neither participant relies on an announcement as proof of ownership.

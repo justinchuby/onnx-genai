@@ -2316,6 +2316,7 @@ dependencies = [
  "onnx-runtime-quantization",
  "onnx-runtime-tracer",
  "rayon",
+ "smallvec",
  "thiserror 2.0.19",
  "tracing",
  "windows-sys 0.61.2",

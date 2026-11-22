@@ -39,7 +39,43 @@ pub(super) struct GrantedWeight<P = Vec<f32>> {
     _grant: DerivedWeightGrant,
 }
 
+/// A flat-vector owner identity reserves only the Arc control block.
+/// Heap elements and their grant can retire while dependent cache keys live;
+/// the reserved control block keeps its identity address from being recycled.
+#[cfg(feature = "mlas")]
+pub(super) struct WeightIdentity<T = f32>(std::sync::Weak<GrantedWeight<Vec<T>>>);
+#[cfg(feature = "mlas")]
+impl<T> WeightIdentity<T> {
+    pub(super) fn of(owner: &Arc<GrantedWeight<Vec<T>>>) -> Self {
+        Self(Arc::downgrade(owner))
+    }
+}
+#[cfg(feature = "mlas")]
+impl<T> Clone for WeightIdentity<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+#[cfg(feature = "mlas")]
+impl<T> PartialEq for WeightIdentity<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+#[cfg(feature = "mlas")]
+impl<T> Eq for WeightIdentity<T> {}
+#[cfg(feature = "mlas")]
+impl<T> Hash for WeightIdentity<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_ptr().hash(state);
+    }
+}
+
 impl<P> GrantedWeight<P> {
+    #[cfg(all(test, feature = "mlas"))]
+    pub(super) fn test_into_parts(self) -> (P, DerivedWeightGrant) {
+        (self.values, self._grant)
+    }
     #[cfg(feature = "mlas")]
     pub(super) fn payload(&self) -> &P {
         &self.values
@@ -207,7 +243,7 @@ impl<K: WeightCacheKey, P: WeightPayload> WeightCache<K, P> {
         self.max_bytes
     }
 
-    #[cfg(feature = "mlas")]
+    /// A single warm reader needs no group containers or accounting callbacks.
     pub(super) fn get(&self, key: &K) -> Option<Arc<GrantedWeight<P>>> {
         let mut inner = self
             .inner
