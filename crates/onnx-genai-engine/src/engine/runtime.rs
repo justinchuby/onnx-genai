@@ -3902,18 +3902,6 @@ impl Engine {
                 )?
             };
             result.budget_cap = budget_cap;
-            let last_access = self.touch_native_session();
-
-            let state = self
-                .native_sessions
-                .get_mut(&session_id)
-                .with_context(|| format!("session {session_id} not found"))?;
-            state.tokens.truncate(prefix_len);
-            state.tokens.extend_from_slice(&prompt_tokens[prefix_len..]);
-            state.tokens.extend_from_slice(&result.token_ids);
-            state.last_access = last_access;
-            self.evict_native_sessions(session_id);
-
             Ok(result)
         })();
         let result = result.and_then(|result| {
@@ -3925,10 +3913,22 @@ impl Engine {
         });
         let result = match result {
             Ok(result) => {
+                // Staging validation and cancellation must finish before any
+                // durable history or retention policy changes. The exclusive
+                // engine borrow keeps this admitted session present until here.
+                let last_access = self.touch_native_session();
+                let state = self
+                    .native_sessions
+                    .get_mut(&session_id)
+                    .expect("admitted native session remains until turn resolution");
+                state.tokens.clone_from(&prompt_tokens);
+                state.tokens.extend_from_slice(&result.token_ids);
+                state.last_access = last_access;
                 let _outcome = turn.commit()?;
                 if let Some(control) = control {
                     control.finish_commit();
                 }
+                self.evict_native_sessions(session_id);
                 Ok(result)
             }
             Err(error) => {
@@ -4032,6 +4032,7 @@ mod tests {
 
     fn assert_decoder_cancellation_preserves_session(
         make_engine: impl Fn() -> anyhow::Result<Engine>,
+        cancel_before_commit: bool,
     ) -> anyhow::Result<()> {
         use crate::pipeline::{GenerationBoundary, GenerationCancelled, GenerationControl};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4043,15 +4044,27 @@ mod tests {
         request.options.stop_on_eos = false;
         engine.generate_in_session(session, request.clone())?;
         let baseline = engine.session_token_count(session)?;
+        #[cfg(feature = "native-backend")]
+        let native_baseline = engine.native_sessions.get(&session).map(|state| {
+            (
+                state.tokens.clone(),
+                state.last_access,
+                engine.native_access_counter,
+            )
+        });
         request.options.max_new_tokens = 4;
         let forwards = Arc::new(AtomicUsize::new(0));
         let observed = forwards.clone();
         let authority = GenerationControl::new();
         let cancellation = authority.clone();
         let control = authority.with_checkpoint(move |boundary| {
-            if boundary == GenerationBoundary::AfterDecoderForward
-                && observed.fetch_add(1, Ordering::SeqCst) + 1 == 2
-            {
+            if boundary == GenerationBoundary::AfterDecoderForward {
+                let count = observed.fetch_add(1, Ordering::SeqCst) + 1;
+                if !cancel_before_commit && count == 2 {
+                    assert!(cancellation.cancel());
+                }
+            }
+            if cancel_before_commit && boundary == GenerationBoundary::BeforeSemanticCommit {
                 assert!(cancellation.cancel());
             }
             Ok(())
@@ -4068,22 +4081,38 @@ mod tests {
                     Ok(())
                 }),
             )
-            .expect_err("cancellation after the second real forward must abort");
-        assert!(
-            matches!(
-                error.downcast_ref::<GenerationCancelled>(),
-                Some(GenerationCancelled {
-                    boundary: GenerationBoundary::AfterDecoderForward,
-                })
-            ),
+            .expect_err("request cancellation must abort before semantic commit");
+        let expected_boundary = if cancel_before_commit {
+            GenerationBoundary::BeforeSemanticCommit
+        } else {
+            GenerationBoundary::AfterDecoderForward
+        };
+        assert_eq!(
+            error
+                .downcast_ref::<GenerationCancelled>()
+                .map(|error| error.boundary),
+            Some(expected_boundary),
             "{error:#}"
         );
-        assert_eq!(forwards.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            forwards.load(Ordering::SeqCst),
+            if cancel_before_commit { 4 } else { 2 }
+        );
         assert!(
             published.is_empty(),
             "aborted tokens must never reach the transport"
         );
         assert_eq!(engine.session_token_count(session)?, baseline);
+        #[cfg(feature = "native-backend")]
+        assert_eq!(
+            engine.native_sessions.get(&session).map(|state| (
+                state.tokens.clone(),
+                state.last_access,
+                engine.native_access_counter
+            )),
+            native_baseline,
+            "cancelled native turns must preserve both token history and LRU stamps"
+        );
         assert_eq!(engine.scheduler.running_count(), 0);
         let actual = engine.generate_in_session(session, request.clone())?;
         let mut independent = make_engine()?;
@@ -4101,18 +4130,31 @@ mod tests {
 
     #[test]
     fn request_cancellation_stops_ort_decoder_and_restores_session() -> anyhow::Result<()> {
-        assert_decoder_cancellation_preserves_session(|| {
-            Engine::from_dir(
-                &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm"),
-                EngineConfig::default(),
-            )
-        })
+        for cancel_before_commit in [false, true] {
+            assert_decoder_cancellation_preserves_session(
+                || {
+                    Engine::from_dir(
+                        &Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../tests/fixtures/tiny-llm"),
+                        EngineConfig::default(),
+                    )
+                },
+                cancel_before_commit,
+            )?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "native-backend")]
     #[test]
     fn request_cancellation_stops_native_decoder_and_restores_session() -> anyhow::Result<()> {
-        assert_decoder_cancellation_preserves_session(tiny_native_cold_engine)
+        for cancel_before_commit in [false, true] {
+            assert_decoder_cancellation_preserves_session(
+                tiny_native_cold_engine,
+                cancel_before_commit,
+            )?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "native-backend")]

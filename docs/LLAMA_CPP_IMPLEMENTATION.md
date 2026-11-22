@@ -13,7 +13,7 @@ name or a successful empty response is not an implemented capability.
 - [x] Discovery, model properties/management, tokenizer and chat-template endpoints.
 - [x] Preserve the noninteractive generation/transcription/profiling commands.
 - [x] Create working branch and draft PR; incorporate current main before further work.
-- [x] Resumable SSE: byte-exact replay, explicit cancellation, replacement, bounded history, expiry, frontend refresh/reconnect.
+- [ ] Resumable SSE: byte-exact replay, explicit cancellation, replacement, bounded history, expiry, frontend refresh/reconnect; finish destructive native-cache rollback audit.
 - [ ] Native completion/embedding/infill protocols and native request parameters.
 - [x] Token-counting protocols using the inference preparation path, including declared media.
 - [ ] Responses and Anthropic Messages, including tools and streamed event contracts.
@@ -228,10 +228,33 @@ long generation, observes DELETE /v1/stream returning 204, waits for active_turn
 to reach zero and verifies the cancelled replay returns 404. Basic chat, completed
 byte replay, injected reader disconnect, active reload, exact final token count
 and zero browser errors all pass with the same built server. The full resumable
-SSE row is now checked; remaining compatibility rows and PR merge stay open.
+SSE transport/browser checks pass; the destructive native-cache rollback audit
+below still gates the complete row. Remaining compatibility rows and PR merge stay open.
 
 Decoder validation: full engine library 614 passed / 1 inherited ignore; native
 feature set 787 passed / 1 inherited ignore. The final focused run selects and
 passes three tests covering warm ORT/native sessions, cold native generation and
 native prompt lookup. Full server library 392 passed / 2 inherited ignores;
 strict server and native-enabled engine all-target Clippy pass.
+
+Commit-boundary self-review: native session generation published its logical
+token history and LRU stamp before staged-output validation and the cancellation
+commit gate. A new regression reproduced a cancelled warm session growing from
+2 to 5 tokens. Logical history is now published only after validation and the
+commit race succeed; retention eviction follows transaction commit. The ORT and
+native regressions now cover both cancellation after two forwards and cancellation
+at BeforeSemanticCommit, including exact token-history/access-stamp preservation
+and scheduler release.
+
+Before closing cancellation, audit physical KV restoration when a native request
+replaces or rewinds an existing prompt, rather than appending to its cached
+prefix. The tiny native fixture has constant logits, so matching retry token IDs
+alone cannot prove that old KV bytes were restored. Add a content-dependent state
+oracle and verify the backend checkpoint/rollback boundary directly. Native
+prefill-only support must use that same trustworthy state boundary; n_predict=0
+must evaluate the prompt without sampling, not merely return an empty success.
+
+Commit-boundary validation: the new native case failed before the fix (5 retained
+tokens versus the committed 2), then all three selected cancellation tests passed
+with both boundary cases. Full native-enabled engine library: 788 passed / 1
+inherited ignore. Strict native-enabled engine all-target Clippy passes.

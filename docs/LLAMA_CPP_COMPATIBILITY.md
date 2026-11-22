@@ -122,6 +122,8 @@ races semantic commit atomically; after commit it affects delivery rather than
 rolling back durable state. Replay DELETE removes the producer and retained bytes.
 The real Chrome smoke verifies the frontend Stop request, worker release and
 cancelled-history removal, alongside active refresh and reader recovery.
+Direct KV restoration checks for destructive native prompt replacement remain
+an open conformance item in the implementation ledger.
 
 Native generation accepts text, token IDs, mixed text/token rows and prompt
 batches, including text-only `prompt_string` objects. Only a first text segment
