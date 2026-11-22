@@ -1143,3 +1143,36 @@ reduces the overall increment to about 13 ns for f64 and 20 ns for f32 on this
 Apple host. This remains measurable bookkeeping cost even though warm quota
 requests/refunds are zero. CPU_MLAS_MIGRATION.md records the control arms and
 ranges; no end-to-end model or other-tier performance is inferred.
+
+### Prepare f32 transposes from original views
+
+B preparation no longer accepts a separately materialized f32 slice. Its only
+source is the validated original matrix/vector view. Conversion and transposition
+share the tiled transpose traversal and write directly into the admitted final
+f32 payload. This avoids a second matrix-sized allocation and removes the API
+state in which supplied dense values could disagree with their identity view.
+Contiguous aligned f32 keeps the existing tiled copy fast path; strided, reversed
+and other float formats use original coordinates with unaligned numeric reads.
+
+The shared prepacked compute path tries the prepared B before asking for a dense
+B. Mandatory activation materialization still precedes optional B admission, so
+an optional transpose cannot consume memory needed by A. Direct-output execution
+keeps its original destination without a result-vector staging allocation. The
+low-level slice compute context again carries only the prepack; optional MLAS
+packing keeps its typed operand, unchanged.
+
+Decode-only widened B now needs one `4*K*N` derived representation. A session
+that also uses ordinary prefill may retain its independent dense B as well, but
+KV pressure can reclaim that idle copy without decode rebuilding it or making
+new quota calls. Gemm transB also builds its required retained/transient layout
+directly from the original view. Other scratch and conservative graph forecasts
+remain separate work.
+
+Public factory controls cover MatMul, both fused MatMul forms and Gemm: a one-
+representation budget succeeds from cold, 4,096 warm executions issue no further
+claims/refunds, and decode continues with no quota calls after KV pressure
+reclaims prefill's dense copy. The same test-only fixture compiles and selects
+one test on parent `404fd04c4`, then fails at cold requests 3 versus expected 2
+(including the setup anchor). All 65,536 bit patterns of f16 and bf16 are compared
+bit-for-bit against the old conversion followed by an independent transpose;
+f32/f64 special values and before-write extent checks are included too.

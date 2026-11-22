@@ -1683,3 +1683,45 @@ are `/tmp/nxrt-f32-transpose-performance-{metadata,summary}.json`. Metadata is
 marked complete only after all 36 checked rows per process and every footprint
 and output assertion pass. Failed builds are not timing evidence. Wrapper
 resource totals include compilation and must not be reported as kernel latency.
+
+Original-view f32 transpose preparation now fuses conversion with the existing
+tiled traversal. The prepacked dispatcher consults/builds this representation
+before materializing B; mandatory A preparation still runs first. Warm decode
+can therefore use the final representation after prefill's idle dense copy is
+reclaimed. A fresh decode-only f64 B needs one `4*K*N` grant instead of two.
+The benchmark's assertion-only `NXRT_ADMISSION_EXPECT_DENSE_B_COPY=1|0` selects
+old/current expected footprints; runtime policy and computation are unchanged
+by that input. Both versions keep transpose-grant assertions enabled.
+
+A coordinated 144.81-second build/sweep uses parent `404fd04c4`, the identical
+harness, Accelerate, Rayon=1, and three interleaved process pairs (11 rounds and
+36 checked rows each). Tiny retained governed f64 moves 324.54 ns
+[324.43–331.84] to 264.42 ns [260.05–268.51], -18.52%; local and duplicate
+move -18.51% / -18.31%. The constant-f32 comparison moves 273.18→262.28 ns
+(-3.99%), while runtime-only f32 moves 273.53→278.96 ns (+1.99%). At
+K=128,N=256, governed f64 moves 2213.49→2091.41 ns (-5.52%), local -5.90%,
+duplicate -3.60%, and runtime control +0.24%. These are scoped CPU warm-kernel
+measurements, not cold-load or end-to-end model-throughput results.
+
+Public factory tests enforce a one-representation budget from cold and zero
+warm quota callbacks both before and after source-copy reclamation. They also
+pin admission order: optional B cannot take space required by constant A.
+All f16/bf16 bit patterns, f32/f64 special values, reversed strides with an
+interior byte offset, and validation before any mapped read/write are covered.
+Native CPU 1,986 / 20 ignored and optional MLAS CPU 2,026 / 35 ignored pass;
+sessions pass 277 / 279 with strict all-target Clippy. Additional exact factory
+checks and strict CPU Clippy pass in both modes after the admission-order test,
+plus engine load/memory-strategy filters of 29 tests each.
+
+Raw rounds and footprint rows are `/tmp/nxrt-direct-transpose-perf-{before,current}-{0,1,2}.tsv`;
+complete build/provenance metadata and summary are
+`/tmp/nxrt-direct-transpose-performance-{metadata,summary}.json`. The old public
+fixture compiles and selects one test on unchanged parent production code, then
+fails with cold claims 3 versus expected 2. Consumed generators/worktrees and
+executables can be removed; validation drivers, fixture patch and all logs stay.
+
+After measurement, two `dead_code` allowances document the existing x86/Apple
+half-transpose consumers on other architectures; removing just these attributes
+reproduces the measured MatMul source hash exactly. No Apple code changes after
+timing. Host-lock conformance passes all 124 tests after registering both new
+benchmark invocations. Linux/Windows ARM64 execution remains CI-only locally.

@@ -124,11 +124,29 @@ impl Case {
             let _ = expect_transpose;
             0u64
         };
+        // Assertion-only baseline selector; direct preparation does not keep
+        // a second dense B on the admitted Accelerate decode route.
+        let expected_staging = match std::env::var("NXRT_ADMISSION_EXPECT_DENSE_B_COPY").as_deref()
+        {
+            Ok("1") => true,
+            Ok("0") | Err(_) => false,
+            Ok(value) => panic!(
+                "NXRT_ADMISSION_EXPECT_DENSE_B_COPY={value:?}; choose 0 or 1 for the expected footprint"
+            ),
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let direct_decode = constant
+            && retained
+            && m == 1
+            && onnx_runtime_ep_cpu::backend::CpuBackend::auto_detect()
+                == onnx_runtime_ep_cpu::backend::CpuBackend::Accelerate;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let direct_decode = false;
         if format != WeightFormat::F16 {
             assert_eq!(
                 case.governor.used(Tier::Host),
                 if governed && retained && constant {
-                    (if format == WeightFormat::F64 {
+                    (if format == WeightFormat::F64 && (!direct_decode || expected_staging) {
                         k * n * 4
                     } else {
                         0

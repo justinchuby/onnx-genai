@@ -278,7 +278,6 @@ impl Kernel for GemmKernel {
             half_output
         } else {
             let a = self.prepack.dense(0, &inputs[0])?;
-            let b = self.prepack.dense(1, &inputs[1])?;
 
             // The shared GEMM consumes row-major `A[M,K]` and `B[K,N]`, so an
             // operand stored transposed is materialized in that layout first.
@@ -290,22 +289,21 @@ impl Kernel for GemmKernel {
                 Cow::Borrowed(&a)
             };
             let cached_b = if self.trans_b {
-                Some(self.prepack.required_transposed_b(&inputs[1], &b, n, k)?)
+                Some(self.prepack.required_transposed_b(&inputs[1], n, k)?)
             } else {
                 None
             };
-            let b_rm: Cow<'_, [f32]> = if self.trans_b {
-                match &cached_b {
-                    Some(cached) => Cow::Borrowed(cached.as_slice()),
-                    None => Cow::Owned(transpose_row_major(&b, n, k)),
-                }
+            let dense_b;
+            let b_rm = if let Some(cached) = &cached_b {
+                cached.as_slice()
             } else {
-                Cow::Borrowed(&b)
+                dense_b = self.prepack.dense(1, &inputs[1])?;
+                dense_b.as_ref()
             };
 
             let mut output = vec![0.0f32; m * n];
             if m != 0 && n != 0 && k != 0 {
-                matmul::gemm(&a_rm, &b_rm, &mut output, m, k, n)?;
+                matmul::gemm(&a_rm, b_rm, &mut output, m, k, n)?;
             }
             if self.alpha != 1.0 {
                 for value in &mut output {

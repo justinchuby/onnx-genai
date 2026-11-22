@@ -35,6 +35,23 @@ pub(crate) fn transpose_row_major_into<T: Copy + Default + Send + Sync>(
             out.len()
         )));
     }
+    transpose_map_into(k, n, out, |i, j| src[i * n + j])
+}
+
+/// Share tiled traversal with conversion: each output element is produced
+/// directly from its original source coordinate, without a dense staging copy.
+pub(crate) fn transpose_map_into<T: Copy + Send + Sync>(
+    k: usize,
+    n: usize,
+    out: &mut [T],
+    read: impl Fn(usize, usize) -> T + Send + Sync,
+) -> Result<()> {
+    if k.checked_mul(n) != Some(out.len()) {
+        return Err(EpError::KernelFailed(format!(
+            "weight transpose [{k}, {n}] cannot fill {} output elements; provide the complete matrix destination",
+            out.len()
+        )));
+    }
     if out.is_empty() {
         return Ok(());
     }
@@ -52,7 +69,7 @@ pub(crate) fn transpose_row_major_into<T: Copy + Default + Send + Sync>(
                 for jj in 0..chunk_n {
                     let j = j0 + jj;
                     for i in i0..ie {
-                        chunk[jj * k + i] = src[i * n + j];
+                        chunk[jj * k + i] = read(i, j);
                     }
                 }
             }
@@ -83,6 +100,17 @@ mod tests {
         transpose_row_major_into(&source, 2, 3, &mut output).unwrap();
         assert_eq!(output, [1, 4, 2, 5, 3, 6]);
         transpose_row_major_into::<u16>(&[], 0, 7, &mut []).unwrap();
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let mut short = [99u16; 5];
+        assert!(
+            transpose_map_into(2, 3, &mut short, |_, _| {
+                reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                0
+            })
+            .is_err()
+        );
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(short, [99; 5]);
     }
 
     fn reference_transpose(src: &[f32], k: usize, n: usize) -> Vec<f32> {

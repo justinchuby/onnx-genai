@@ -14587,11 +14587,11 @@ fn matmul_shape_variants_share_node_weights_without_crossing_nodes_or_sessions()
         assert_eq!(peer.run(&[("a", &input)]).unwrap().len(), nodes);
         assert_eq!(
             books.used(Tier::Host),
-            2 * resident_expected,
-            "sessions must own separate node preparations"
+            resident_expected + expected,
+            "the decode-only peer owns one independent final B representation"
         );
         drop(executor);
-        assert_eq!(books.used(Tier::Host), resident_expected);
+        assert_eq!(books.used(Tier::Host), expected);
         drop(peer);
         assert_eq!(books.used(Tier::Host), 0);
     }
