@@ -505,6 +505,7 @@ thread_local! {
     // Calling-thread observation only: tests use serial_scope, so other tests
     // and pool workers cannot make an ordinary block look repaired.
     static NATIVE_SILU_REPAIR_ELEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NATIVE_SILU_DENSE_REPAIR_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// NEON-vectorized SiLU: `x / (1 + exp(-x))`, processing 4 floats per iteration.
@@ -521,6 +522,15 @@ fn silu_f32_neon<const PRECISE_REPAIR_MASK: bool, const OBSERVE_REPAIRS: bool>(
     use std::arch::aarch64::*;
     debug_assert_eq!(input.len(), output.len());
     let len = input.len();
+    // No complete SIMD vector exists: preserve the direct stable scalar path
+    // before setting up any repair bitmap or vector constants.
+    if PRECISE_REPAIR_MASK && len < 4 {
+        let output = &mut output[..len];
+        for (out, &x) in output.iter_mut().zip(input) {
+            *out = silu(x);
+        }
+        return;
+    }
     let neon_end = len / 4 * 4;
     let mut i = 0;
     // One bit per vector, independently for each of the four SIMD lanes.
@@ -595,24 +605,41 @@ fn silu_f32_neon<const PRECISE_REPAIR_MASK: bool, const OBSERVE_REPAIRS: bool>(
                 i += 4;
             }
             if PRECISE_REPAIR_MASK && vmaxvq_u32(lane_bits) != 0 {
-                let mut masks = [0u32; 4];
-                vst1q_u32(masks.as_mut_ptr(), lane_bits);
-                #[cfg(test)]
-                if OBSERVE_REPAIRS {
-                    let repaired: usize = masks.iter().map(|bits| bits.count_ones() as usize).sum();
-                    NATIVE_SILU_REPAIR_ELEMENTS.with(|count| count.set(count.get() + repaired));
-                }
-                for (lane, mut bits) in masks.into_iter().enumerate() {
-                    while bits != 0 {
-                        // At most 32 vectors were recorded, so every set bit
-                        // maps to a lane in [first, end). No input rescan.
-                        let index = first + bits.trailing_zeros() as usize * 4 + lane;
-                        debug_assert!(index < end);
-                        // SAFETY: bit j was recorded only for vector j of
-                        // this group, so index < end <= neon_end <= len.
-                        // Both slices have the caller-validated equal length.
-                        *output.get_unchecked_mut(index) = silu(*input.get_unchecked(index));
-                        bits &= bits - 1;
+                // Every lane mask is a subset of these recorded-vector bits.
+                // Their minimum equals valid_bits iff all lanes need repair.
+                let vectors = ((end - first) / 4) as u32;
+                let valid_bits = u32::MAX >> (u32::BITS - vectors);
+                if vminvq_u32(lane_bits) == valid_bits {
+                    #[cfg(test)]
+                    if OBSERVE_REPAIRS {
+                        NATIVE_SILU_REPAIR_ELEMENTS
+                            .with(|count| count.set(count.get() + end - first));
+                        NATIVE_SILU_DENSE_REPAIR_BLOCKS.with(|count| count.set(count.get() + 1));
+                    }
+                    for (out, &x) in output[first..end].iter_mut().zip(&input[first..end]) {
+                        *out = silu(x);
+                    }
+                } else {
+                    let mut masks = [0u32; 4];
+                    vst1q_u32(masks.as_mut_ptr(), lane_bits);
+                    #[cfg(test)]
+                    if OBSERVE_REPAIRS {
+                        let repaired: usize =
+                            masks.iter().map(|bits| bits.count_ones() as usize).sum();
+                        NATIVE_SILU_REPAIR_ELEMENTS.with(|count| count.set(count.get() + repaired));
+                    }
+                    for (lane, mut bits) in masks.into_iter().enumerate() {
+                        while bits != 0 {
+                            // At most 32 vectors were recorded, so every set bit
+                            // maps to a lane in [first, end). No input rescan.
+                            let index = first + bits.trailing_zeros() as usize * 4 + lane;
+                            debug_assert!(index < end);
+                            // SAFETY: bit j was recorded only for vector j of
+                            // this group, so index < end <= neon_end <= len.
+                            // Both slices have the caller-validated equal length.
+                            *output.get_unchecked_mut(index) = silu(*input.get_unchecked(index));
+                            bits &= bits - 1;
+                        }
                     }
                 }
             }
@@ -1670,6 +1697,27 @@ mod native_silu_contract {
                     input[slot] = 0.5;
                 }
             }
+            // A full repair set takes a contiguous walk rather than decoding
+            // each bit; partial groups include exactly their live vector bits.
+            input.fill(-20.0);
+            let before = NATIVE_SILU_REPAIR_ELEMENTS.with(std::cell::Cell::get);
+            let dense_before = NATIVE_SILU_DENSE_REPAIR_BLOCKS.with(std::cell::Cell::get);
+            silu_f32_neon::<true, true>(&input, &mut storage[1..n + 1]);
+            assert_eq!(
+                NATIVE_SILU_REPAIR_ELEMENTS.with(std::cell::Cell::get) - before,
+                vector_end
+            );
+            assert_eq!(
+                NATIVE_SILU_DENSE_REPAIR_BLOCKS.with(std::cell::Cell::get) - dense_before,
+                vector_end.div_ceil(4 * u32::BITS as usize)
+            );
+            assert!(
+                storage[1..n + 1]
+                    .iter()
+                    .all(|x| x.to_bits() == silu(-20.0).to_bits())
+            );
+            assert_eq!(storage[0], 123.0);
+            assert_eq!(storage[n + 1], 123.0);
         }
     }
 
