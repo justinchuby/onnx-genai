@@ -66,6 +66,20 @@ After re-vendoring from upstream, these patches **MUST** be re-applied:
 grep the old tree for `nxrt-mlas-mt` first to locate them, and keep this
 section in sync with the patched files.
 
+## Retired native capabilities
+
+`nxrt-mlas-add-retirement` marks the removal of the already absorbed Add
+reference. `inc/mlas.h`, `lib/eltwise.cpp`, `lib/mlasi.h` and `lib/platform.cpp`
+remove its f32/fp16 templates and the Add-only ARM dispatch table. The unused
+`lib/eltwise.h`, `lib/eltwise_kernel_neon.h`, `lib/eltwise_kernel_neon.cpp` and
+`lib/eltwise_kernel_neon_fp16.cpp` are deleted, including their build entries.
+The Rust binding and local `shim.cpp` Add wrapper are also removed. There is no
+compatibility entry point. Do not restore this route during re-vendoring.
+
+`MlasEltwiseMul<float>` stays in `lib/eltwise.cpp`: the still-supported SiLU
+reference calls it after logistic. Its implementation and license notice remain
+unchanged. Retiring Add does not retire or weaken that independent capability.
+
 ## How it is built
 
 `build.rs` compiles the needed MLAS source groups with the `cc` crate (no

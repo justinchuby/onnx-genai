@@ -1575,9 +1575,7 @@ extern const MLAS_HGEMM_DISPATCH MlasHGemmDispatchNeon;
 struct MLAS_SOFTMAX_DISPATCH;
 extern const MLAS_SOFTMAX_DISPATCH MlasSoftmaxDispatchNeon;
 
-// eltwise dispatch structure
-struct MLAS_ELTWISE_DISPATCH;
-extern const MLAS_ELTWISE_DISPATCH MlasEltwiseDispatchNeon;
+// nxrt-mlas-add-retirement: the Add-only dispatch table has been removed.
 
 //
 // Quantized KV-cache GEMM dispatch structure (QKGemm / SVGemm).
@@ -1830,7 +1828,6 @@ MLAS_COMPUTE_TANH_FP16_KERNEL* TanhFP16KernelRoutine = nullptr;
     const MLAS_ROPE_DISPATCH* RopeDispatch{nullptr};
     const MLAS_HGEMM_DISPATCH* HGemmDispatch{nullptr};
     const MLAS_SOFTMAX_DISPATCH* SoftmaxDispatch{nullptr};
-    const MLAS_ELTWISE_DISPATCH* EltwiseDispatch{nullptr};
     const MLAS_KV_QUANT_GEMM_DISPATCH* KVQuantGemmDispatch{nullptr};
 };
 

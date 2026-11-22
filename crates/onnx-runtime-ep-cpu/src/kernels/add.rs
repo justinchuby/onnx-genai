@@ -7,8 +7,6 @@ use onnx_runtime_ir::{DataType, Node, compute_contiguous_strides};
 
 use super::check_arity;
 use crate::dispatch_arith;
-#[cfg(feature = "mlas")]
-use crate::dtype::to_dense_f32_widen;
 use crate::dtype::{ComputeDomain, NumericElem, to_dense, write_dense};
 use crate::strided::{next_index, numel};
 
@@ -100,22 +98,44 @@ pub static ADD_VDSP_TEST_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 pub static ADD_SCALAR_TEST_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Dispatch counter for the explicitly linked MLAS reference path.
-#[cfg(all(test, feature = "mlas"))]
-static ADD_MLAS_REF_TEST_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The shared native dense walk must remain reachable in reference builds too.
+#[cfg(test)]
+static ADD_DENSE_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl Kernel for AddKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Add", inputs, outputs, 2, 2, 1)?;
-        crate::trace::record_kernel_metrics(inputs, outputs, || outputs[0].numel() as u64);
-        #[cfg(feature = "mlas")]
-        if add_contiguous_f32(inputs, &mut outputs[0])? {
-            #[cfg(test)]
-            ADD_MLAS_REF_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(());
+        // Validate at the operator boundary before either native fast
+        // path forms typed slices. Removing a reference route must not remove
+        // its input-view checks or permit implicit cross-device access.
+        for (label, input) in ["Add input 0", "Add input 1"].into_iter().zip(inputs) {
+            if !input.device.is_host_accessible() {
+                return Err(EpError::KernelFailed(format!(
+                    "{label}: {:?} tensor on {:?} is not Host-accessible; explicitly transfer it to Host-accessible storage before CPU Add",
+                    input.dtype, input.device,
+                )));
+            }
+            input.validate().map_err(|source| EpError::Backend {
+                operation: label,
+                source: Box::new(source),
+            })?;
         }
+        if !outputs[0].device.is_host_accessible() {
+            return Err(EpError::KernelFailed(format!(
+                "Add output 0: {:?} tensor on {:?} is not Host-accessible; provide Host-accessible output storage for CPU Add",
+                outputs[0].dtype, outputs[0].device,
+            )));
+        }
+        outputs[0].validate().map_err(|source| EpError::Backend {
+            operation: "Add output 0",
+            source: Box::new(source),
+        })?;
+        crate::trace::record_kernel_metrics(inputs, outputs, || outputs[0].numel() as u64);
+        // Empty results still validate dtype/broadcast semantics in the
+        // general walk, without forming typed slices from zero-size backing.
+        let has_elements = outputs[0].numel() != 0;
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if add_vdsp_f32(inputs, &mut outputs[0])? {
+        if has_elements && add_vdsp_f32(inputs, &mut outputs[0])? {
             ADD_VDSP_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
@@ -123,7 +143,9 @@ impl Kernel for AddKernel {
         // the EP; covers same-shape and suffix-broadcast (including a scalar)
         // operands. Without it even a same-shape f32 Add fell to `add_typed`,
         // which allocates a whole-tensor accumulator and walks it three times.
-        if super::elementwise::add_dense_fast_path(inputs, &mut outputs[0]) {
+        if has_elements && super::elementwise::add_dense_fast_path(inputs, &mut outputs[0]) {
+            #[cfg(test)]
+            ADD_DENSE_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
         ADD_SCALAR_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -133,39 +155,6 @@ impl Kernel for AddKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
-}
-
-#[cfg(feature = "mlas")]
-fn add_contiguous_f32(inputs: &[TensorView], output: &mut TensorMut) -> Result<bool> {
-    if inputs[0].dtype != DataType::Float32
-        || inputs[1].dtype != DataType::Float32
-        || output.dtype != DataType::Float32
-        || inputs[0].shape != inputs[1].shape
-        || inputs[0].shape != output.shape
-        || !inputs[0].is_contiguous()
-        || !inputs[1].is_contiguous()
-        || !output.is_contiguous()
-    {
-        return Ok(false);
-    }
-    let output_start = output.data_ptr_mut::<u8>() as usize;
-    let output_end = output_start.saturating_add(output.byte_size());
-    if inputs.iter().any(|input| {
-        let start = input.data_ptr::<u8>() as usize;
-        let end = start.saturating_add(input.byte_size());
-        output_start < end && start < output_end
-    }) {
-        return Ok(false);
-    }
-    let left = to_dense_f32_widen("Add", &inputs[0])?;
-    let right = to_dense_f32_widen("Add", &inputs[1])?;
-    let output_len = output.numel();
-    // SAFETY: all three views are validated contiguous Float32 tensors with
-    // identical shapes, and the range check proves the output does not alias.
-    let output =
-        unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), output_len) };
-    mlas_sys::eltwise_add(&left, &right, output);
-    Ok(true)
 }
 
 /// Dtype-generic Add: widen both operands to the compute domain, broadcast-add,
@@ -395,13 +384,10 @@ mod tests {
 
     // ─── Dispatch reachability ───────────────────────────────────────────
 
-    #[cfg(any(feature = "mlas", target_os = "macos", target_os = "ios"))]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
-    fn add_contiguous_f32_same_shape_uses_selected_backend() {
+    fn add_contiguous_f32_same_shape_uses_vdsp() {
         use std::sync::atomic::Ordering;
-        #[cfg(feature = "mlas")]
-        let read_hits = || super::ADD_MLAS_REF_TEST_HITS.load(Ordering::Relaxed);
-        #[cfg(not(feature = "mlas"))]
         let read_hits = || super::ADD_VDSP_TEST_HITS.load(Ordering::Relaxed);
         let before = read_hits();
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
@@ -413,9 +399,146 @@ mod tests {
         let after = read_hits();
         assert!(
             after > before,
-            "Contiguous f32 same-shape Add did not reach the selected MLAS/vDSP path"
+            "Contiguous f32 same-shape Add did not reach the native vDSP path"
         );
         assert_eq!(out.to_f32(), vec![11., 22., 33., 44., 55., 66.]);
+    }
+
+    #[test]
+    fn add_suffix_broadcast_reaches_native_dense_in_every_build() {
+        use std::sync::atomic::Ordering;
+        let before = super::ADD_DENSE_TEST_HITS.load(Ordering::Relaxed);
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[3], &[10., 20., 30.]);
+        let mut output = Owned::zeros_f32(&[2, 3]);
+        AddKernel
+            .execute(&[a.view(), b.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert!(super::ADD_DENSE_TEST_HITS.load(Ordering::Relaxed) > before);
+        assert_eq!(output.to_f32(), vec![11., 22., 33., 14., 25., 36.]);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn add_contiguous_f32_same_shape_uses_native_dense() {
+        use std::sync::atomic::Ordering;
+        let before = super::ADD_DENSE_TEST_HITS.load(Ordering::Relaxed);
+        let a = Owned::f32(&[3], &[1., 2., 3.]);
+        let b = Owned::f32(&[3], &[10., 20., 30.]);
+        let mut output = Owned::zeros_f32(&[3]);
+        AddKernel
+            .execute(&[a.view(), b.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert!(super::ADD_DENSE_TEST_HITS.load(Ordering::Relaxed) > before);
+        assert_eq!(output.to_f32(), vec![11., 22., 33.]);
+    }
+
+    #[test]
+    fn add_native_f32_preserves_ieee_values_and_tails_in_every_build() {
+        let pairs = [
+            (-0.0f32, -0.0f32),
+            (-0.0, 0.0),
+            (f32::MAX, f32::MAX),
+            (f32::MAX, -f32::MAX),
+            (f32::INFINITY, f32::NEG_INFINITY),
+            (f32::INFINITY, 1.0),
+            (f32::NEG_INFINITY, -1.0),
+            (f32::MIN_POSITIVE, f32::from_bits(1)),
+            (f32::from_bits(1), f32::from_bits(1)),
+            (f32::NAN, 1.0),
+            (1.0, f32::NAN),
+            (1.25, -0.5),
+        ];
+        for n in [1, 3, 4, 7, 8, 17, 65, 1025] {
+            let left: Vec<f32> = (0..n).map(|i| pairs[i % pairs.len()].0).collect();
+            let right: Vec<f32> = (0..n).map(|i| pairs[i % pairs.len()].1).collect();
+            let a = Owned::f32(&[n], &left);
+            let b = Owned::f32(&[n], &right);
+            let mut out = Owned::zeros_f32(&[n]);
+            AddKernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            for (i, got) in out.to_f32().into_iter().enumerate() {
+                let expected = left[i] + right[i];
+                if expected.is_nan() {
+                    assert!(got.is_nan(), "n={n} index={i}: expected NaN, got {got}");
+                } else {
+                    assert_eq!(got.to_bits(), expected.to_bits(), "n={n} index={i}");
+                }
+            }
+        }
+        let a_empty = Owned::f32(&[0], &[]);
+        let b_empty = Owned::f32(&[0], &[]);
+        let mut out_empty = Owned::zeros_f32(&[0]);
+        AddKernel
+            .execute(
+                &[a_empty.view(), b_empty.view()],
+                &mut [out_empty.view_mut()],
+            )
+            .unwrap();
+        assert!(out_empty.bytes.is_empty());
+        // Back a zero-element view with an aligned, live f32 allocation. It
+        // must leave sentinel storage untouched, including in reference builds.
+        let mut a = Owned::f32(&[1], &[1.0]);
+        let mut b = Owned::f32(&[1], &[2.0]);
+        let mut out = Owned::f32(&[1], &[123.0]);
+        a.shape[0] = 0;
+        b.shape[0] = 0;
+        out.shape[0] = 0;
+        AddKernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.bytes, 123.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn add_rejects_invalid_view_metadata_before_native_pointer_access() {
+        let a = Owned::f32(&[2], &[1.0, 2.0]);
+        let b = Owned::f32(&[2], &[3.0, 4.0]);
+        for slot in 0..3 {
+            let mut out = Owned::f32(&[2], &[123.0, 456.0]);
+            let mut inputs = [a.view(), b.view()];
+            let mut output = out.view_mut();
+            match slot {
+                0 => inputs[0].byte_offset = 2,
+                1 => inputs[1].strides = &[],
+                _ => output.byte_offset = 2,
+            }
+            let error = AddKernel.execute(&inputs, &mut [output]).unwrap_err();
+            let source = std::error::Error::source(&error).unwrap();
+            assert!(matches!(
+                source.downcast_ref::<EpError>(),
+                Some(EpError::InvalidTensorView { .. })
+            ));
+            let label = ["Add input 0", "Add input 1", "Add output 0"][slot];
+            assert!(error.to_string().contains(label), "{error}");
+            assert_eq!(out.to_f32(), vec![123.0, 456.0]);
+        }
+    }
+
+    #[test]
+    fn add_rejects_non_host_views_without_a_cuda_device() {
+        let a = Owned::f32(&[2], &[1.0, 2.0]);
+        let b = Owned::f32(&[2], &[3.0, 4.0]);
+        for slot in 0..3 {
+            let mut out = Owned::f32(&[2], &[123.0, 456.0]);
+            let mut inputs = [a.view(), b.view()];
+            let mut output = out.view_mut();
+            // Only the device annotation changes; no CUDA allocation or API
+            // is needed to prove rejection before a CPU data access.
+            match slot {
+                0 | 1 => inputs[slot].device = onnx_runtime_ep_api::DeviceId::cuda(0),
+                _ => output.device = onnx_runtime_ep_api::DeviceId::cuda(0),
+            }
+            let error = AddKernel.execute(&inputs, &mut [output]).unwrap_err();
+            let label = ["Add input 0", "Add input 1", "Add output 0"][slot];
+            let message = error.to_string();
+            assert!(
+                message.contains(label) && message.contains("Host-accessible"),
+                "{message}"
+            );
+            assert_eq!(out.to_f32(), vec![123.0, 456.0]);
+        }
     }
 
     /// An **interior** size-1 axis is not a right-aligned suffix, so it cannot
@@ -449,8 +572,8 @@ mod tests {
     /// watching `ADD_SCALAR_TEST_HITS`: that counter is process-global and other
     /// tests in the same binary increment it concurrently, so an equality
     /// assertion on it would be racy. `AddKernel::execute` reaches the counter
-    /// only after `add_dense_fast_path` declines, and the two earlier arms
-    /// (`mlas`, vDSP) both require identical operand shapes, so a broadcasting
+    /// only after `add_dense_fast_path` declines, and the earlier arm
+    /// (vDSP) requires identical operand shapes, so a broadcasting
     /// input that this predicate accepts provably never reaches the fallback.
     #[test]
     fn add_suffix_broadcast_uses_the_dense_fast_path() {
