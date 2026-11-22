@@ -1965,6 +1965,114 @@ pub fn sqnbit_packed_b_size(
     (size != 0).then_some(size)
 }
 
+/// Invalid SQNBit packing input or a failed packed allocation. Unsupported
+/// host kernels remain `Ok(None)`; malformed inputs never enter C++ packing.
+#[derive(Debug)]
+pub enum SQNBitPackError {
+    Geometry {
+        n: usize,
+        k: usize,
+        bits: usize,
+        block: usize,
+        reason: &'static str,
+    },
+    Length {
+        input: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    Layout {
+        bytes: usize,
+        source: std::alloc::LayoutError,
+    },
+    Allocation {
+        bytes: usize,
+        alignment: usize,
+    },
+}
+impl std::fmt::Display for SQNBitPackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Geometry { n, k, bits, block, reason } => write!(f, "SQNBit packing rejects N={n}, K={k}, bits={bits}, block_size={block}: {reason}; use nonzero addressable dimensions and byte-aligned 2/4/8-bit blocks"),
+            Self::Length { input, expected, actual } => write!(f, "SQNBit {input} has {actual} elements, expected {expected}; supply the complete N-row block layout including the final K block's padding"),
+            Self::Layout { bytes, source } => write!(f, "SQNBit packed allocation of {bytes} bytes cannot use 64-byte alignment: {source}; use addressable weight dimensions"),
+            Self::Allocation { bytes, alignment } => write!(f, "SQNBit cannot allocate {bytes} packed bytes aligned to {alignment}; release memory or reduce the weight footprint"),
+        }
+    }
+}
+impl std::error::Error for SQNBitPackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Layout { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+struct SQNBitInputSizes {
+    weight_bytes: usize,
+    scales: usize,
+    zero_points: usize,
+}
+impl SQNBitInputSizes {
+    fn new(n: usize, k: usize, bits: usize, block: usize) -> Result<Self, SQNBitPackError> {
+        let invalid = |reason| SQNBitPackError::Geometry {
+            n,
+            k,
+            bits,
+            block,
+            reason,
+        };
+        if n == 0 || k == 0 || block == 0 || !matches!(bits, 2 | 4 | 8) {
+            return Err(invalid("zero dimensions or invalid quantization width"));
+        }
+        let block_bits = block
+            .checked_mul(bits)
+            .ok_or_else(|| invalid("block bit count overflows usize"))?;
+        if !block_bits.is_multiple_of(8) {
+            return Err(invalid("a packed block must occupy whole bytes"));
+        }
+        let blocks = k.div_ceil(block);
+        let scales = n
+            .checked_mul(blocks)
+            .ok_or_else(|| invalid("scale element count overflows usize"))?;
+        let weight_bytes = scales
+            .checked_mul(block_bits / 8)
+            .ok_or_else(|| invalid("padded weight byte count overflows usize"))?;
+        let point_row_bits = blocks
+            .checked_mul(bits)
+            .ok_or_else(|| invalid("zero-point row bit count overflows usize"))?;
+        let zero_points = n
+            .checked_mul(point_row_bits.div_ceil(8))
+            .ok_or_else(|| invalid("zero-point element count overflows usize"))?;
+        scales
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| invalid("scale byte count overflows usize"))?;
+        Ok(Self {
+            weight_bytes,
+            scales,
+            zero_points,
+        })
+    }
+    fn check(input: &'static str, actual: usize, expected: usize) -> Result<(), SQNBitPackError> {
+        if actual != expected {
+            return Err(SQNBitPackError::Length {
+                input,
+                expected,
+                actual,
+            });
+        }
+        Ok(())
+    }
+    fn metadata(&self, scale: &[f32], zp: Option<&[u8]>) -> Result<(), SQNBitPackError> {
+        Self::check("scales", scale.len(), self.scales)?;
+        if let Some(zp) = zp {
+            Self::check("zero_points", zp.len(), self.zero_points)?;
+        }
+        Ok(())
+    }
+}
+
 /// MLAS-packed blockwise-quantized B weight for [`sqnbit_gemm`], mirroring how
 /// ORT pre-packs the constant `MatMulNBits` initializer once and reuses it.
 ///
@@ -1986,12 +2094,12 @@ pub struct SQNBitPackedB {
     blk_len: usize,
     comp: SQNBitComputeType,
     has_zp: bool,
-    scale: Vec<f32>,
-    zp: Option<Vec<u8>>,
+    scale: Box<[f32]>,
+    zp: Option<Box<[u8]>>,
 }
 
 // SAFETY: identical rationale to `PackedB`: construction fully initializes the
-// packed allocation and the owned scale/zp vectors, all of which are immutable
+// packed allocation and the owned scale/zp buffers, all of which are immutable
 // afterward. `sqnbit_gemm` only reads them, so sharing across threads (e.g.
 // MLAS's own tile parallelism) is race-free.
 unsafe impl Send for SQNBitPackedB {}
@@ -2015,11 +2123,11 @@ pub fn sqnbit_packed_live_bytes() -> usize {
 
 impl SQNBitPackedB {
     /// Heap bytes this instance owns: the packed allocation plus the scale and
-    /// optional zero-point copies MLAS's `Fp32` path consumes at GEMM time.
+    /// optional zero-point copies retained alongside the packed allocation.
     pub fn owned_heap_bytes(&self) -> usize {
         self.layout.size()
-            + self.scale.capacity() * std::mem::size_of::<f32>()
-            + self.zp.as_ref().map_or(0, Vec::capacity)
+            + self.scale.len() * std::mem::size_of::<f32>()
+            + self.zp.as_ref().map_or(0, |zp| zp.len())
     }
 
     fn account_alloc(&self) {
@@ -2029,9 +2137,10 @@ impl SQNBitPackedB {
         );
     }
 
-    /// Pack a blockwise-quantized B weight, returning `None` when MLAS reports
+    /// Pack a blockwise-quantized B weight, returning `Ok(None)` when MLAS reports
     /// no packing/kernel is available for this shape on the current host (the
-    /// caller must then fall back to another path).
+    /// caller must then fall back to another path). Invalid geometry or slice lengths
+    /// return an error before invoking the packing kernel.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         n: usize,
@@ -2042,12 +2151,27 @@ impl SQNBitPackedB {
         quant_b_data: &[u8],
         scale: &[f32],
         zp: Option<&[u8]>,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, SQNBitPackError> {
+        let inputs = SQNBitInputSizes::new(n, k, bits, blk_len)?;
+        inputs.metadata(scale, zp)?;
+        SQNBitInputSizes::check("quant_b_data", quant_b_data.len(), inputs.weight_bytes)?;
         let has_zp = zp.is_some();
-        let size = sqnbit_packed_b_size(n, k, bits, blk_len, has_zp, comp)?;
-        let layout = std::alloc::Layout::from_size_align(size, 64).unwrap();
+        let Some(size) = sqnbit_packed_b_size(n, k, bits, blk_len, has_zp, comp) else {
+            return Ok(None);
+        };
+        let layout = std::alloc::Layout::from_size_align(size, 64).map_err(|source| {
+            SQNBitPackError::Layout {
+                bytes: size,
+                source,
+            }
+        })?;
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        assert!(!ptr.is_null(), "SQNBit packed-B allocation failed");
+        if ptr.is_null() {
+            return Err(SQNBitPackError::Allocation {
+                bytes: size,
+                alignment: 64,
+            });
+        }
         let zp_ptr = zp.map_or(std::ptr::null(), |z| z.as_ptr()) as *const c_void;
         unsafe {
             mlas_qnbit_gemm_pack_b(
@@ -2072,11 +2196,11 @@ impl SQNBitPackedB {
             blk_len,
             comp,
             has_zp,
-            scale: scale.to_vec(),
-            zp: zp.map(<[u8]>::to_vec),
+            scale: scale.into(),
+            zp: zp.map(Box::<[u8]>::from),
         };
         packed.account_alloc();
-        Some(packed)
+        Ok(Some(packed))
     }
 
     /// Reconstruct an MLAS packed weight from a previously packed buffer.
@@ -2085,7 +2209,8 @@ impl SQNBitPackedB {
     /// `MlasQNBitGemmPackQuantBData`) for the same host dispatch, dimensions,
     /// quantization parameters, and compute type. The buffer is copied into a
     /// 64-byte-aligned allocation so MLAS's internal aligned offsets remain
-    /// valid.
+    /// valid. Invalid metadata and serialized lengths return an error; unavailable
+    /// host layouts return `Ok(None)`. Bytes are host-specific, not portable ONNX.
     #[allow(clippy::too_many_arguments)]
     pub fn from_prepacked(
         n: usize,
@@ -2096,15 +2221,27 @@ impl SQNBitPackedB {
         packed: &[u8],
         scale: &[f32],
         zp: Option<&[u8]>,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, SQNBitPackError> {
+        let inputs = SQNBitInputSizes::new(n, k, bits, blk_len)?;
+        inputs.metadata(scale, zp)?;
         let has_zp = zp.is_some();
-        let size = sqnbit_packed_b_size(n, k, bits, blk_len, has_zp, comp)?;
-        if packed.len() != size {
-            return None;
-        }
-        let layout = std::alloc::Layout::from_size_align(size, 64).unwrap();
+        let Some(size) = sqnbit_packed_b_size(n, k, bits, blk_len, has_zp, comp) else {
+            return Ok(None);
+        };
+        SQNBitInputSizes::check("prepacked B", packed.len(), size)?;
+        let layout = std::alloc::Layout::from_size_align(size, 64).map_err(|source| {
+            SQNBitPackError::Layout {
+                bytes: size,
+                source,
+            }
+        })?;
         let ptr = unsafe { std::alloc::alloc(layout) };
-        assert!(!ptr.is_null(), "SQNBit prepacked-B allocation failed");
+        if ptr.is_null() {
+            return Err(SQNBitPackError::Allocation {
+                bytes: size,
+                alignment: 64,
+            });
+        }
         unsafe { std::ptr::copy_nonoverlapping(packed.as_ptr(), ptr, size) };
         let repacked = Self {
             ptr,
@@ -2115,11 +2252,11 @@ impl SQNBitPackedB {
             blk_len,
             comp,
             has_zp,
-            scale: scale.to_vec(),
-            zp: zp.map(<[u8]>::to_vec),
+            scale: scale.into(),
+            zp: zp.map(Box::<[u8]>::from),
         };
         repacked.account_alloc();
-        Some(repacked)
+        Ok(Some(repacked))
     }
 
     /// Serialized bytes of this host- and compute-type-specific MLAS layout.
@@ -2391,6 +2528,133 @@ pub unsafe fn sqnbit_gemm_into_with_threadpool(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn sqnbit_pack_rejects_malformed_inputs_before_dispatch() {
+        use super::{SQNBitComputeType as C, SQNBitPackError as E, SQNBitPackedB as B};
+        // K=33 needs two full 32-value blocks for each of three columns.
+        let weights = [0u8; 96];
+        let scales = [1.0f32; 6];
+        let zp = [0u8; 3];
+        for len in [0, 95, 97] {
+            let bytes = vec![0u8; len];
+            let err = B::new(3, 33, 4, 32, C::Fp32, &bytes, &scales, Some(&zp))
+                .err()
+                .unwrap();
+            assert!(
+                matches!(err, E::Length { input: "quant_b_data", expected: 96, actual } if actual == len)
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains(&len.to_string())
+                    && message.contains("96")
+                    && message.contains("padding")
+            );
+        }
+        for len in [0, 5, 7] {
+            let values = vec![1.0f32; len];
+            for prepacked in [false, true] {
+                let result = if prepacked {
+                    B::from_prepacked(3, 33, 4, 32, C::Fp32, &[], &values, None)
+                } else {
+                    B::new(3, 33, 4, 32, C::Fp32, &weights, &values, None)
+                };
+                assert!(
+                    matches!(result, Err(E::Length { input: "scales", expected: 6, actual }) if actual == len)
+                );
+            }
+        }
+        for len in [0, 2, 4] {
+            let points = vec![0u8; len];
+            assert!(
+                matches!(B::new(3, 33, 4, 32, C::Fp32, &weights, &scales, Some(&points)), Err(E::Length { input: "zero_points", expected: 3, actual }) if actual == len)
+            );
+            assert!(
+                matches!(B::from_prepacked(3, 33, 4, 32, C::Fp32, &[], &scales, Some(&points)), Err(E::Length { input: "zero_points", expected: 3, actual }) if actual == len)
+            );
+        }
+    }
+
+    #[test]
+    fn sqnbit_pack_checks_geometry_and_tail_layout() {
+        use super::{
+            SQNBitComputeType as C, SQNBitInputSizes as S, SQNBitPackError as E, SQNBitPackedB as B,
+        };
+        for (n, k, bits, block) in [
+            (0, 32, 4, 32),
+            (1, 0, 4, 32),
+            (1, 32, 4, 0),
+            (1, 32, 3, 32),
+            (1, 32, 4, 3),
+            (1, 32, 8, usize::MAX),
+            (usize::MAX, 33, 4, 32),
+            (1, usize::MAX, 4, 2),
+            (usize::MAX / 4, 1, 8, 32),
+        ] {
+            assert!(matches!(
+                B::new(n, k, bits, block, C::Fp32, &[], &[], None),
+                Err(E::Geometry { .. })
+            ));
+            assert!(matches!(
+                B::from_prepacked(n, k, bits, block, C::Fp32, &[], &[], None),
+                Err(E::Geometry { .. })
+            ));
+        }
+        for bits in [2, 4, 8] {
+            let sizes = S::new(3, 65, bits, 32).unwrap();
+            assert_eq!(sizes.weight_bytes, 3 * 3 * 32 * bits / 8);
+            assert_eq!(sizes.scales, 9);
+            assert_eq!(sizes.zero_points, 3 * (3usize * bits).div_ceil(8));
+        }
+    }
+
+    #[test]
+    fn sqnbit_valid_but_unsupported_block_is_distinct_from_bad_input() {
+        use super::{SQNBitComputeType as C, SQNBitPackError as E, SQNBitPackedB as B};
+        // The vendor capability resolver has no eight-value block variant.
+        assert!(!super::sqnbit_gemm_available(4, 8, C::Fp32));
+        assert!(B::new(1, 8, 4, 8, C::Fp32, &[0; 4], &[1.0], None)
+            .unwrap()
+            .is_none());
+        assert!(B::from_prepacked(1, 8, 4, 8, C::Fp32, &[], &[1.0], None)
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            B::new(1, 8, 4, 8, C::Fp32, &[], &[1.0], None),
+            Err(E::Length {
+                input: "quant_b_data",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sqnbit_prepacked_requires_exact_host_size_and_preserves_errors() {
+        use super::{SQNBitComputeType as C, SQNBitPackError as E, SQNBitPackedB as B};
+        let weights = [0u8; 32];
+        let scales = [1.0f32; 2];
+        let Some(packed) = B::new(2, 32, 4, 32, C::Fp32, &weights, &scales, None).unwrap() else {
+            assert!(B::from_prepacked(2, 32, 4, 32, C::Fp32, &[], &scales, None)
+                .unwrap()
+                .is_none());
+            return;
+        };
+        let size = packed.as_bytes().len();
+        for len in [size - 1, size + 1] {
+            assert!(
+                matches!(B::from_prepacked(2, 32, 4, 32, C::Fp32, &vec![0; len], &scales, None), Err(E::Length { input: "prepacked B", expected, actual }) if expected == size && actual == len)
+            );
+        }
+        let restored = B::from_prepacked(2, 32, 4, 32, C::Fp32, packed.as_bytes(), &scales, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.as_bytes(), packed.as_bytes());
+        let source = std::alloc::Layout::from_size_align(1, 3).unwrap_err();
+        let error = E::Layout { bytes: 1, source };
+        assert!(std::error::Error::source(&error)
+            .unwrap()
+            .is::<std::alloc::LayoutError>());
+    }
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -2518,8 +2782,9 @@ mod tests {
             let zp_bytes = zp_slice.map_or(0, <[u8]>::len);
             let expected_owned = packed_size + scale_bytes + zp_bytes;
 
-            let whole =
-                SQNBitPackedB::new(n, k, 4, blk, comp, &packed_b, &scales, zp_slice).unwrap();
+            let whole = SQNBitPackedB::new(n, k, 4, blk, comp, &packed_b, &scales, zp_slice)
+                .expect("valid SQNBit packing inputs")
+                .unwrap();
             assert_eq!(
                 whole.owned_heap_bytes(),
                 expected_owned,
@@ -2540,7 +2805,9 @@ mod tests {
                     let per_row = blocks.div_ceil(2);
                     &z[start * per_row..(start + len) * per_row]
                 });
-                let shard = SQNBitPackedB::new(len, k, 4, blk, comp, ps, ss, zs).unwrap();
+                let shard = SQNBitPackedB::new(len, k, 4, blk, comp, ps, ss, zs)
+                    .expect("valid SQNBit packing inputs")
+                    .unwrap();
                 shard_owned += shard.owned_heap_bytes();
                 start += len;
             }
@@ -3052,7 +3319,9 @@ mod tests {
             &packed_b,
             &scales,
             zps.as_deref(),
-        ) {
+        )
+        .expect("valid SQNBit packing inputs")
+        {
             Some(p) => p,
             None => {
                 eprintln!(
@@ -3099,7 +3368,8 @@ mod tests {
             .collect();
         let bias: Vec<f32> = (0..n).map(|i| (i as f32 * 0.03).sin()).collect();
 
-        let packed = SQNBitPackedB::new(n, k, 8, block_size, comp, &packed_b, &scales, Some(&zps));
+        let packed = SQNBitPackedB::new(n, k, 8, block_size, comp, &packed_b, &scales, Some(&zps))
+            .expect("valid SQNBit packing inputs");
         if packed.is_none() {
             eprintln!("SQNBit bits=8 blk=128 comp={comp:?} unavailable on host; skipping");
             return;
@@ -3143,7 +3413,9 @@ mod tests {
             &packed_b,
             &scales,
             zps.as_deref(),
-        ) {
+        )
+        .expect("valid SQNBit packing inputs")
+        {
             Some(p) => p,
             None => {
                 eprintln!("SQNBit bounded-pool check comp={comp:?} unavailable on host; skipping");
@@ -3220,7 +3492,9 @@ mod tests {
             &packed_b,
             &scales,
             zps.as_deref(),
-        ) {
+        )
+        .expect("valid SQNBit packing inputs")
+        {
             Some(p) => p,
             None => {
                 eprintln!("SQNBit Int8 unavailable on host; skipping backend stats test");
@@ -3335,7 +3609,9 @@ mod tests {
                             &packed_b,
                             &scales,
                             zps.as_deref(),
-                        ) {
+                        )
+                        .expect("valid SQNBit packing inputs")
+                        {
                             Some(p) => p,
                             None => {
                                 eprintln!("SQNBit blk={block_size} unavailable; skipping");
@@ -3384,6 +3660,7 @@ mod tests {
                                     sc,
                                     zp,
                                 )
+                                .expect("valid SQNBit packing inputs")
                                 .expect("shard packs when the full weight packs");
                                 let bias_shard = bias.as_deref().map(|b| &b[start..start + len]);
                                 // SAFETY: shards own disjoint contiguous column ranges
@@ -3458,7 +3735,9 @@ mod tests {
                     &packed_b,
                     &scales,
                     zps.as_deref(),
-                ) {
+                )
+                .expect("valid SQNBit packing inputs")
+                {
                     Some(p) => p,
                     None => {
                         eprintln!("SQNBit blk={block_size} unavailable; skipping");
@@ -3489,6 +3768,7 @@ mod tests {
                             sc,
                             zp,
                         )
+                        .expect("valid SQNBit packing inputs")
                         .expect("shard packs when the full weight packs");
                         // SAFETY: disjoint contiguous column ranges; start+len <= n.
                         unsafe {
@@ -3610,7 +3890,9 @@ mod tests {
             let weights: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.017).sin()).collect();
             let (packed_b, scales, _zps, _d) = quantize_int4(&weights, n, k, 32, false);
             for comp in [SQNBitComputeType::Fp32, SQNBitComputeType::Int8] {
-                let packed = match SQNBitPackedB::new(n, k, 4, 32, comp, &packed_b, &scales, None) {
+                let packed = match SQNBitPackedB::new(n, k, 4, 32, comp, &packed_b, &scales, None)
+                    .expect("valid SQNBit packing inputs")
+                {
                     Some(p) => p,
                     None => continue,
                 };

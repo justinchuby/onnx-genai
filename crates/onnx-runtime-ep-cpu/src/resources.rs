@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex, Weak};
 use onnx_runtime_ep_api::{EpError, Result};
 use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
 use onnx_runtime_memory_governor::{
-    HolderId, MemoryGovernor, MemoryLease, PressureRegistration, PressureResponder,
+    HolderId, MemoryAuthorityId, MemoryGovernor, MemoryLease, PressureRegistration,
+    PressureResponder,
 };
 
 use crate::CpuCacheRetention;
@@ -30,7 +31,7 @@ impl Default for CpuWeightCacheLimits {
 }
 
 /// Immutable CPU weight resources. Full f32 block-format/NBits expansions,
-/// owned native NBits preparations and retained or transient QMoE experts
+/// owned native/optional-MLAS NBits preparations and retained or transient QMoE experts
 /// use one Host grant source. Private fields
 /// prevent a shared expert cache from being paired with a different authority.
 /// Cache ceilings and the legacy planned-family verdict only admit retention;
@@ -143,6 +144,7 @@ struct DerivedWeightSource {
 
 struct DerivedWeightDomain {
     anchor: MemoryLease,
+    authority: MemoryAuthorityId,
     idle_caches: Mutex<IdleCacheRegistry>,
 }
 
@@ -177,6 +179,7 @@ impl DerivedWeightMemory {
         governor: &dyn MemoryGovernor,
         holder: HolderId,
     ) -> std::result::Result<Self, MemoryError> {
+        let authority = governor.authority_id(Tier::Host);
         let anchor = governor.reserve(Tier::Host, 0, MemoryRole::Weights, holder)?;
         if anchor.tier() != Tier::Host
             || anchor.role() != MemoryRole::Weights
@@ -191,7 +194,7 @@ impl DerivedWeightMemory {
         }
         if anchor
             .authority_id()
-            .is_some_and(|actual| actual != governor.authority_id(Tier::Host))
+            .is_some_and(|actual| actual != authority)
         {
             return Err(MemoryError::InvalidRequest {
                 tier: Tier::Host.name(),
@@ -201,10 +204,11 @@ impl DerivedWeightMemory {
         }
         let domain = Arc::new(DerivedWeightDomain {
             anchor,
+            authority,
             idle_caches: Mutex::new(IdleCacheRegistry::default()),
         });
         let registration = if let Some(registry) = governor.pressure_registry(Tier::Host) {
-            registry.validate(governor.authority_id(Tier::Host), Tier::Host)?;
+            registry.validate(authority, Tier::Host)?;
             let responder: Arc<dyn PressureResponder> = domain.clone();
             Some(registry.register(&responder)?)
         } else {
@@ -216,6 +220,13 @@ impl DerivedWeightMemory {
                 _registration: registration,
             })),
         })
+    }
+
+    /// Physical Host books that fund this source; `None` is explicitly local,
+    /// ungoverned ownership. Independently constructed sources over the same
+    /// books return the same identity, even with different holders.
+    pub fn host_authority_id(&self) -> Option<MemoryAuthorityId> {
+        self.owner.as_ref().map(|owner| owner.domain.authority)
     }
 
     pub fn is_governed(&self) -> bool {

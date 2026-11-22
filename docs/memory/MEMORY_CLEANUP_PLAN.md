@@ -608,3 +608,44 @@ Optional MLAS-owned packs and scratch/activation allocations still need their
 own integration. Retained native OnceLock entries are not yet idle-reclaimable.
 Physical Host/Device book reconciliation and process-wide limits remain work.
 No speedup, placement performance or CUDA runtime claim is made.
+
+
+### Owned MLAS SQNBit payloads share Host admission
+
+The optional reference route now obtains actual `DerivedWeightMemory` grants
+before allocating standard, N-sharded or imported-prepacked SQNBit weights.
+A resolved input plan carries borrowed contiguous Host bytes/f32 scales or
+explicit gather/widen work. The grant covers the real packed allocation and
+all retained scale/zero-point metadata, plus any overlapping owned input and
+portable half-widening buffers during construction. Contiguous wire inputs do
+not require a second whole-weight copy. Scale/zero-point storage in `mlas-sys`
+is boxed to make the owned payload size exact, including on CompInt8, which
+currently retains these copies too. Each packed object keeps its grant until
+the final Arc owner drops, after data and metadata have been freed.
+
+Shared-store keys include the physical Host authority, wire versus serialized
+source encoding, and scale dtype in addition to the existing operand identities
+and quantization geometry. Independently constructed sources/holders on the
+same books can pay once. A different authority or explicitly ungoverned source
+cannot reuse that paid allocation. The source snapshots its governor identity
+even when custom lease accounting has no optional stamp; `host_authority_id()`
+exposes this provenance. Weak per-key cold-fill gates prevent duplicate packs
+under a one-payload budget, without serializing unrelated keys or locking value
+maps during builders. Error/capacity refusals are retryable. Removal, clearing
+and losing-candidate destruction return grants outside value-map/registration
+locks; clearing membership does not revoke an active Arc's ownership.
+
+A standard-layout MLAS packing capacity refusal lets the existing native
+bounded fallback run and leaves the static capability memo unset, so the same
+kernel can try packing after capacity returns. Other typed failures still
+propagate. A serialized `weight_prepacked=1` operand cannot use the wire decoder:
+its capacity failure remains an error, and an incorrect byte length is rejected
+before a grant or data allocation. No new compatibility interface, quantization
+algorithm, ISA predicate or dispatch threshold was introduced.
+
+This covers the packed payload and retained scale/zero-point copies. Mutable
+MLAS GEMM workspace, including the existing eager M=1 workspace, and transient
+tile/activation scratch are separate scopes and remain ungoverned. Native/MLAS
+OnceLock retention still needs idle reclamation; process-wide quota, physical
+Host/Device book reconciliation and CUDA runtime proof remain unfinished. No
+RSS, throughput or multi-node placement claim is made.
