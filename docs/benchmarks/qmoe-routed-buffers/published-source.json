@@ -1,0 +1,19 @@
+{
+  "timed_base": "08634f19a81ee9150951f66254c03fc1b221c52f",
+  "candidate_commit": "4275d49215156bc6ff9ee3218f461f0234a8b917",
+  "unchanged_timed_cpu": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "3f2e47080170b8225b0950b85b63caa5fe9482b52440ee7922d81d805c7039ef"
+  },
+  "test_only_correction": {
+    "file": "crates/onnx-runtime-ep-cuda/tests/qmoe_gpu.rs",
+    "measured_sha256": "3a05dc3f33dcddf25f19b2c7f1232963f637b6f21b907b8796345290c7266141",
+    "final_sha256": "e0bdecec3478285e5cc13c1edf85bd80edc4a859fb8d30fad88d2c65b0b0feca",
+    "reason": "Reverted a duplicate host test; existing qmoe_cpu_oracle is the correct separate target. This test file is not a dependency of the timing probe."
+  },
+  "oracle_selection": {
+    "correct_target": "qmoe_cpu_oracle",
+    "name": "cpu_qmoe_oracle_prepares_declared_workspace_without_cuda",
+    "result": "1 passed; 0 failed; 0 ignored; --exact"
+  },
+  "acceptance": "Draft until the measurable single-row overhead is resolved; no default auto-merge."
+}

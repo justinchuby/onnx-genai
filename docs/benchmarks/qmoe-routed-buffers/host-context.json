@@ -1,0 +1,11 @@
+{
+  "recorded_utc": "2026-11-23T15:16:54.177273+00:00",
+  "hardware": "Apple M1 Max",
+  "os": "ProductName:\t\tmacOS\nProductVersion:\t\t27.0.1\nBuildVersion:\t\t26A434\n",
+  "base": "08634f19a81ee9150951f66254c03fc1b221c52f",
+  "source": "Timed CPU source remains unchanged; see published-source.json for the test-target correction",
+  "scope": "native CPU synthetic public session, not CUDA or model throughput",
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "process_snapshots": "Start snapshots in /tmp/nxrt-qmoe-contribution-perf/*-host.log; not continuous foreign-CPU observation",
+  "binaries": "Retained locally for the next fixed common-lane attribution experiment; hashes pinned in provenance.json"
+}

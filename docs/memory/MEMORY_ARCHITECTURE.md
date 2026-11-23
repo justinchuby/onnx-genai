@@ -136,6 +136,26 @@ remain separate allocations, so this is not a complete process-memory bound. Den
 separate existing weight-cache operation. No new public EP API is required.
 
 
+### Integer QMoE routed-buffer candidate
+
+The proposed routed-buffer layout puts serial gather, route-ordered
+contributions and the final accumulator in one admitted lane. Bounds are
+`rows>1 ? rows*hidden : 0`, `rows*top_k*hidden`, and `rows*hidden` f32 elements,
+respectively, with a checked composite sum and no expert-count multiplier.
+All regions remain main-thread scratch across the prefetch worker join;
+expert writes retain original slot identities and final reduction order.
+Singletons still borrow their input, but now require a nonempty execution lane
+for contributions/output. Larger retained backing stays charged at physical
+capacity when a later logical request shrinks.
+
+This candidate is not accepted for default merging yet. Its
+[source-scoped experiment](../benchmarks/qmoe-routed-buffers/README.md) preserves
+zero warm workspace issuer callbacks but finds about +1.717 microseconds
+(+1.99%) on an H64 single-row synthetic session with a near-zero null delta.
+The [active-lane proposal](ACTIVE_EXECUTION_LANE_DESIGN.md) records the next
+public-path attribution and ownership work; it is not an implemented performance
+claim. Do not bypass accounting or add private kernel pools to conceal the cost.
+
 ### CPU float MoE projection banks
 
 Float MoE uses the same declared-workspace seam for gather, FC1/optional FC3,
