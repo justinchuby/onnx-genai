@@ -195,8 +195,16 @@ impl ChatTemplate {
         } else {
             None
         };
+        Self::from_model_assets(model_dir, tokenizer_config_value.as_ref())
+    }
+
+    /// Select the chat template from an already-parsed tokenizer configuration.
+    /// Lets serving resolve chat and response contracts from one file snapshot.
+    pub fn from_model_assets(
+        model_dir: &Path,
+        tokenizer_config_value: Option<&Value>,
+    ) -> Result<Self> {
         let (bos_token, eos_token) = tokenizer_config_value
-            .as_ref()
             .map(special_tokens)
             .unwrap_or_default();
 

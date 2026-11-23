@@ -425,6 +425,7 @@ pub(crate) struct ApiError {
 
 struct PreparedGenerateRequest {
     request: GenerateRequest,
+    response_prefix: Option<String>,
     prompt_tokens: usize,
 }
 

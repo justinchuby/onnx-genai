@@ -2173,6 +2173,8 @@ dependencies = [
  "onnx-runtime-memory-governor",
  "onnx-runtime-virtual-memory",
  "regex",
+ "regex-automata",
+ "regex-syntax",
  "reqwest",
  "serde",
  "serde_json",

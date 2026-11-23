@@ -11,18 +11,33 @@ use tokenizers::decoders::DecoderWrapper;
 )]
 struct NonMonotonicText;
 
+/// Whether protocol markers participate in incremental output text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpecialTokenHandling {
+    #[default]
+    Skip,
+    Preserve,
+}
+
 /// Request-local incremental detokenization state. Retains the decoder's
 /// necessary lookbehind rather than repeatedly decoding the whole generation.
 #[derive(Default)]
-pub(crate) struct TokenTextDecoder {
+pub struct TokenTextDecoder {
+    special_tokens: SpecialTokenHandling,
     ids: Vec<u32>,
     prefix: String,
     prefix_index: usize,
 }
 impl TokenTextDecoder {
-    pub(crate) fn step(&mut self, tokenizer: &Tokenizer, id: u32) -> anyhow::Result<String> {
+    pub fn new(special_tokens: SpecialTokenHandling) -> Self {
+        Self {
+            special_tokens,
+            ..Default::default()
+        }
+    }
+    pub fn step(&mut self, tokenizer: &Tokenizer, id: u32) -> anyhow::Result<String> {
         tokenizers::tokenizer::step_decode_stream(
-            tokenizer.inner(), id, true, &mut self.ids, &mut self.prefix, &mut self.prefix_index,
+            tokenizer.inner(), id, self.special_tokens==SpecialTokenHandling::Skip, &mut self.ids, &mut self.prefix, &mut self.prefix_index,
         ).map(|text| text.unwrap_or_default()).map_err(|error| {
             if error.is::<tokenizers::tokenizer::DecodeStreamError>() {
                 anyhow::Error::new(NonMonotonicText)
@@ -33,10 +48,12 @@ impl TokenTextDecoder {
     }
     /// Emit pending bytes at the terminal boundary, including the tokenizer's
     /// replacement text for an incomplete final UTF-8 sequence.
-    pub(crate) fn finish(&mut self, tokenizer: &Tokenizer) -> anyhow::Result<String> {
-        let decoded = tokenizer
-            .decode(&self.ids)
-            .context("decode pending terminal token text")?;
+    pub fn finish(&mut self, tokenizer: &Tokenizer) -> anyhow::Result<String> {
+        let decoded = match self.special_tokens {
+            SpecialTokenHandling::Skip => tokenizer.decode(&self.ids),
+            SpecialTokenHandling::Preserve => tokenizer.decode_with_special_tokens(&self.ids),
+        }
+        .context("decode pending terminal token text")?;
         let tail = decoded
             .strip_prefix(&self.prefix)
             .ok_or(NonMonotonicText)?
@@ -224,6 +241,37 @@ mod tests {
         let path = scratch.path().join("tokenizer.json");
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         Tokenizer::from_file(path).unwrap()
+    }
+    #[test]
+    fn protocol_decoder_preserves_specials_and_split_unicode() {
+        for byte_level in [false, true] {
+            let tokenizer = tokenizer(byte_level);
+            for ids in [vec![31, 4, 5, 31], vec![4]] {
+                let mut decoder = TokenTextDecoder::new(SpecialTokenHandling::Preserve);
+                let mut text = String::new();
+                for id in &ids {
+                    text.push_str(&decoder.step(&tokenizer, *id).unwrap());
+                }
+                text.push_str(&decoder.finish(&tokenizer).unwrap_or_else(|error| {
+                    panic!("byte_level={byte_level}, ids={ids:?}, emitted={text:?}: {error:#}")
+                }));
+                assert_eq!(text, tokenizer.decode_with_special_tokens(&ids).unwrap());
+            }
+        }
+    }
+    #[test]
+    fn protocol_decoder_refuses_to_retract_published_unicode() {
+        let tokenizer = tokenizer(false);
+        let mut decoder = TokenTextDecoder::new(SpecialTokenHandling::Preserve);
+        assert_eq!(decoder.step(&tokenizer, 4).unwrap(), "");
+        assert_eq!(decoder.step(&tokenizer, 5).unwrap(), "é");
+        assert_eq!(decoder.step(&tokenizer, 16).unwrap(), "");
+        assert!(
+            decoder
+                .finish(&tokenizer)
+                .unwrap_err()
+                .is::<NonMonotonicText>()
+        );
     }
     #[test]
     fn metaspace_pieces_preserve_initial_space_without_mutating_text_decoding() {

@@ -665,16 +665,27 @@ wire forms, field/part-aware auto resolution, the public Rust builder and real
 HTTP string-content count/generation/SSE paths. Full server library: 406 passed /
 2 inherited ignores. Strict server all-target Clippy passed on the final tree.
 
-Next parser audit: `registry::declares_private_channels` currently checks only
-`response_template.fields.reasoning_content.open_pattern`, while
-`PrivateChannelGate` assumes ATEM addresses. A declared literal `open` is missed,
-and arbitrary declared patterns are not interpreted. Replace this presence flag
-with a validated declared parser and initialize it from the actual rendered
-prompt before admitting reasoning continuation. The upstream
-[response-parsing specification](https://github.com/huggingface/transformers/blob/be48e7a0b63d2ff22ce1ebccbccbd0374c1592ef/docs/source/en/chat_response_parsing.md)
-requires final-turn anchoring and prefix state, with bounded handling of partial
-stream boundaries. This remains an open compatibility requirement, not a
-completed reasoning capability.
+Declared response parsing milestone: replaced the private-channel presence flag
+and hardcoded ATEM text filters with a compiled `response_template` descriptor.
+Chat and response contracts load from one strict tokenizer-configuration snapshot
+before starting workers. Literal and regex boundaries, last-turn anchoring,
+prefill state, split delimiters, repeated text fields, stripping and defaults
+follow the pinned
+[response-parsing specification](https://github.com/huggingface/transformers/blob/be48e7a0b63d2ff22ce1ebccbccbd0374c1592ef/docs/source/en/chat_response_parsing.md).
+The parser excludes original prefix bytes, withholds opaque structured fields,
+and fails explicitly on unsupported transforms, invalid declarations, buffer
+exhaustion or nonmonotonic streamed replacement. Structured-field projection into
+tool calls remains open; an XML tool declaration alone does not prove a chat
+recipient protocol.
+
+Buffered chat, live SSE and logprob SSE consume the same declared parser and the
+actual rendered text prefix. A canonical incremental decoder preserves protocol
+specials and split UTF-8. Declared chat templates own their special tokens, so
+encoding does not add a second tokenizer postprocessor BOS/EOS. Undeclared output
+remains ordinary text. Parser failures produce explicit SSE error events rather
+than a successful terminal chunk. The parser byte budget uses the configured
+per-response replay buffer limit. Reasoning continuation admission and lazy
+reasoning/JSON grammar activation still remain open requirements.
 
 JSON-failure truthfulness milestone: removed all three transport branches that
 converted an incomplete JSON generation error into `{}`, successful `stop` and
@@ -692,3 +703,11 @@ Native-enabled engine library: 842 passed / 1 inherited ignore. Full server:
 passed, as did strict engine/server all-target Clippy. Parser-module work remains
 uncommitted until runtime wiring is finished. JSON-object budget-prefix/length
 parity remains open; removing a false success is not claimed to finish that item.
+
+Declared-parser validation: full server library 407 passed / 2 inherited ignores;
+the final prompt-special-token regression passed separately (1 selected), and
+all 12 response-template selections passed, including real generated buffered,
+SSE and logprob SSE output. Both new protocol-decoder tests passed. Strict
+engine/server all-target Clippy passed. These checks use the local ORT runtime;
+no performance claim is made. Reasoning continuation remains explicitly refused
+until its admission and prompt-boundary proof are implemented.

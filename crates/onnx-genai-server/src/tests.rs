@@ -641,7 +641,14 @@ async fn streaming_chat_and_completion_chunks_include_logprobs() {
     assert_eq!(content_events.len(), 2);
     for event in content_events {
         let record = &event["choices"][0]["logprobs"]["content"][0];
-        assert_eq!(event["choices"][0]["delta"]["content"], record["token"]);
+        // Decoder context can add a boundary space that isolated token spelling lacks.
+        assert_eq!(
+            event["choices"][0]["delta"]["content"]
+                .as_str()
+                .unwrap()
+                .trim_start(),
+            record["token"].as_str().unwrap()
+        );
         assert_eq!(record["top_logprobs"].as_array().unwrap().len(), 1);
         assert!(record["bytes"].is_array());
     }
@@ -8427,5 +8434,93 @@ mod native_compat {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn declared_response_template_projects_real_generation_for_buffered_and_streamed_chat() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+        }
+    }
+    let path = scratch.path().join("tokenizer.json");
+    let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+    let old = vocab
+        .iter()
+        .find(|(_, id)| id.as_u64() == Some(22))
+        .unwrap()
+        .0
+        .clone();
+    vocab.remove(&old);
+    vocab.insert("<think>秘密</think>答案".into(), json!(22));
+    std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+    std::fs::write(
+        scratch.path().join("tokenizer_config.json"),
+        json!({
+            "chat_template":"{% for m in messages %}{{ m.content }}{% endfor %}<assistant>",
+            "response_template":{"start_anchor":"<assistant>","fields":{
+                "content":{"content":"text"},
+                "reasoning_content":{"open":"<think>","close":"</think>","content":"text"}
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let router = app(AppState::load(scratch.path(), Some("declared-output".into())).unwrap());
+    for stream in [false, true] {
+        for logprobs in [false, true] {
+            let body = json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1,"temperature":0,
+                "logit_bias":{"22":1000},"stream":stream,"logprobs":logprobs});
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            if stream {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let mut content = String::new();
+                let mut reasoning = String::new();
+                for line in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                    if line == "[DONE]" {
+                        continue;
+                    }
+                    let chunk: Value = serde_json::from_str(line).unwrap();
+                    assert!(chunk.get("error").is_none(), "{chunk}");
+                    content.push_str(
+                        chunk["choices"][0]["delta"]["content"]
+                            .as_str()
+                            .unwrap_or(""),
+                    );
+                    reasoning.push_str(
+                        chunk["choices"][0]["delta"]["reasoning_content"]
+                            .as_str()
+                            .unwrap_or(""),
+                    );
+                }
+                assert_eq!(content, "答案", "{text}");
+                assert_eq!(reasoning, "秘密", "{text}");
+            } else {
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["choices"][0]["message"]["content"], "答案", "{value}");
+                assert_eq!(
+                    value["choices"][0]["message"]["reasoning_content"], "秘密",
+                    "{value}"
+                );
+            }
+        }
     }
 }

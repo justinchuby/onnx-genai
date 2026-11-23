@@ -630,22 +630,66 @@ fn infer_model_id(model_dir: &Path) -> String {
         .to_string()
 }
 
-fn load_chat_template(model_dir: &Path) -> anyhow::Result<Option<ChatTemplate>> {
-    let standalone = model_dir.join("chat_template.jinja");
-    let tokenizer_config = model_dir.join("tokenizer_config.json");
-    let has_template = standalone.is_file()
-        || tokenizer_config.is_file()
-            && std::fs::read_to_string(&tokenizer_config)
-                .ok()
-                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-                .and_then(|value| value.get("chat_template").cloned())
-                .and_then(|value| value.as_str().map(ToString::to_string))
-                .is_some();
-    if has_template {
-        Ok(Some(ChatTemplate::from_model_dir(model_dir)?))
+struct LoadedPromptContracts {
+    chat_template: Option<ChatTemplate>,
+    response_template: Option<Arc<crate::response_template::ResponseTemplate>>,
+}
+
+fn load_prompt_contracts(model_dir: &Path) -> anyhow::Result<LoadedPromptContracts> {
+    let path = model_dir.join("tokenizer_config.json");
+    let config = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(
+            serde_json::from_str::<serde_json::Value>(&text).with_context(|| {
+                format!(
+                    "invalid tokenizer configuration {}; repair this JSON file",
+                    path.display()
+                )
+            })?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "read tokenizer configuration {}; repair the path and read permissions",
+                    path.display()
+                )
+            });
+        }
+    };
+    let declared = config
+        .as_ref()
+        .and_then(|value| value.get("chat_template"))
+        .filter(|value| !value.is_null());
+    let standalone = model_dir.join("chat_template.jinja").is_file();
+    anyhow::ensure!(
+        standalone || declared.is_none_or(serde_json::Value::is_string),
+        "{} chat_template must currently be a string; provide chat_template.jinja for a selected named template",
+        path.display()
+    );
+    let chat_template = if standalone || declared.is_some() {
+        Some(
+            ChatTemplate::from_model_assets(model_dir, config.as_ref())
+                .with_context(|| format!("load chat template in {}", model_dir.display()))?,
+        )
     } else {
-        Ok(None)
-    }
+        None
+    };
+    let response_template = config
+        .as_ref()
+        .and_then(|value| value.get("response_template"))
+        .filter(|value| !value.is_null())
+        .map(crate::response_template::ResponseTemplate::compile)
+        .transpose()
+        .with_context(|| {
+            format!(
+                "compile response_template in {}; repair its declared boundaries",
+                path.display()
+            )
+        })?;
+    Ok(LoadedPromptContracts {
+        chat_template,
+        response_template,
+    })
 }
 
 fn load_model_max_context(metadata_path: Option<&Path>) -> anyhow::Result<Option<usize>> {
@@ -736,7 +780,7 @@ pub(crate) fn build_handle_with_authorities(
 ) -> anyhow::Result<ModelHandle> {
     let model_dir = spec.path.as_path();
     let model_id = spec.id.clone();
-    let chat_template = load_chat_template(model_dir)?;
+    let prompt_contracts = load_prompt_contracts(model_dir)?;
     // Every package declares a workflow, including a single decoder — so
     // "declares a workflow" no longer distinguishes a composed pipeline. Layer
     // 1 of the shared classification answers "does this package need multimodal
@@ -768,7 +812,7 @@ pub(crate) fn build_handle_with_authorities(
             model_id,
             config,
             model_max_context,
-            chat_template,
+            prompt_contracts,
             directory,
             authorities,
         );
@@ -829,10 +873,10 @@ pub(crate) fn build_handle_with_authorities(
     };
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
-        model_dir: model_dir.to_path_buf(),
         engine: engine_driver,
         tokenizer: Arc::new(tokenizer),
-        chat_template: chat_template.map(Arc::new),
+        chat_template: prompt_contracts.chat_template.map(Arc::new),
+        response_template: prompt_contracts.response_template,
         tool_protocol,
         tool_protocol_metadata_path,
         model_max_context,
@@ -849,7 +893,7 @@ fn build_pipeline_handle(
     model_id: String,
     config: &ServerConfig,
     model_max_context: Option<usize>,
-    chat_template: Option<ChatTemplate>,
+    prompt_contracts: LoadedPromptContracts,
     directory: PipelineModelDirectory,
     authorities: Arc<ServerMemoryAuthorities>,
 ) -> anyhow::Result<ModelHandle> {
@@ -923,10 +967,10 @@ fn build_pipeline_handle(
     )?;
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
-        model_dir: model_dir.to_path_buf(),
         engine: engine_driver,
         tokenizer: Arc::new(tokenizer),
-        chat_template: chat_template.map(Arc::new),
+        chat_template: prompt_contracts.chat_template.map(Arc::new),
+        response_template: prompt_contracts.response_template,
         tool_protocol,
         tool_protocol_metadata_path,
         model_max_context,
@@ -1127,5 +1171,44 @@ mod authority_tests {
             .authority(&DeviceCompatibilityDomain::Cuda(2), 50)
             .unwrap();
         assert_eq!(future.limit_bytes(), 50);
+    }
+}
+
+#[cfg(test)]
+mod prompt_contract_tests {
+    use super::*;
+    #[test]
+    fn absent_contracts_remain_absent_and_literal_channels_are_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let contracts = load_prompt_contracts(dir.path()).unwrap();
+        assert!(contracts.chat_template.is_none());
+        assert!(contracts.response_template.is_none());
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            serde_json::json!({
+                "chat_template":"{{ bos_token }}{{ messages[0].content }}",
+                "bos_token":"<begin>",
+                "response_template":{"start_anchor":"<assistant>","fields":{
+                    "content":{"content":"text"},
+                    "reasoning_content":{"open":"<think>","close":"</think>","content":"text"}
+                }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let contracts = load_prompt_contracts(dir.path()).unwrap();
+        assert!(contracts.chat_template.is_some());
+        assert!(contracts.response_template.is_some());
+    }
+    #[test]
+    fn invalid_contracts_name_the_configuration_and_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer_config.json");
+        std::fs::write(&path, "{").unwrap();
+        let error = load_prompt_contracts(dir.path()).err().unwrap();
+        assert!(format!("{error:#}").contains("tokenizer_config.json"));
+        std::fs::write(&path, r#"{"response_template":{"fields":{}}}"#).unwrap();
+        let error = load_prompt_contracts(dir.path()).err().unwrap();
+        assert!(format!("{error:#}").contains("response_template"));
     }
 }

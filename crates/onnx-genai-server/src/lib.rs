@@ -35,6 +35,7 @@ mod models_config;
 pub mod multimodal;
 mod registry;
 mod replay;
+mod response_template;
 mod routes;
 pub mod runtime_args;
 mod session;
