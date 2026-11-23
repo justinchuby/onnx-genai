@@ -46,6 +46,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod affine_gather;
 mod arena;
 mod device;
 mod domain;
