@@ -1884,3 +1884,99 @@ raw rounds, first-failure evidence and summaries remain under
 `/tmp/nxrt-nbits-activation-*`. Consumed build helpers, probe binaries and the
 baseline worktree are removed after recording provenance; source probes and
 reproduction/validation drivers remain.
+
+
+### Preserve the workspace ownership box across warm loans
+
+HostWorkspacePool now creates a Box<ManagedAllocation> only with new physical
+backing. Idle storage, checkout, DeviceBuffer and completed return pass that
+same box without unpacking or allocating another wrapper. This does not move
+physical charging into a different domain or pin idle storage: capacity growth,
+Host/KV pressure, verified release and refund keep their existing ownership path.
+Foreign and outstanding-view failures retain the original box for recovery.
+
+The common ownership handoff preserves DeviceBuffer's existing Box for ordinary
+Binding owners too. Otherwise boxing only Managed would leave a 216-byte
+Binding alternative beside an 8-byte Managed alternative; preserving both boxes
+keeps the handoff compact without a lint exemption or a new allocation. Plain
+binding allocation/release mechanics are unchanged. CUDA's cold managed
+constructors explicitly box their fresh owner once, where DeviceBuffer used to
+do it internally. Host-only queue tests and source compilation cover these
+callers; they do not establish CUDA runtime behavior.
+
+The duplicate into_bound_owner / into_bound_ownership and into_raw_with_owner /
+into_raw_with_bound_ownership interfaces are reduced to the explicit ownership
+names, with every caller and error/doc reference updated. No alias remains.
+EPs still transfer the same complete owner and settlement token; there is no
+second workspace protocol. Kernel arithmetic and workspace layouts are unchanged.
+
+Warm checkout still enters the provider context, rejecting retirement or
+termination. Return still validates binding, holder/role and outstanding views.
+Those guards are required and are not traded for timing. Existing tests retain
+active-lane isolation, pressure reclamation, failed physical-release accounting
+and exact warm issuer-callback checks. Additional assertions track the owner
+Box through smaller-capacity reuse, raw/owned EP handoff and recoverable errors.
+
+A separate CPU integration counter covers 4,096 complete provider
+allocate_workspace/deallocate_workspace pairs after cold setup. It observes
+both heap allocation and free, with a positive Box allocation/free control, and
+requires zero calls plus stable owner/backing identities. Checking only an
+address would be insufficient because an allocator could recycle the address
+of a wrapper freed and reallocated each time. This counter is not a claim that
+whole inference or its unrelated parameter vectors make zero allocations.
+
+
+The identical CPU allocation probe fails on 1c95431c6 with exactly 4,096
+allocations and 4,096 frees, and passes with zero of each after the change in
+both debug feature configurations and release. Pointer checks are collected
+without aborting mid-loan, then asserted after storage is returned and trimmed;
+this keeps a deliberately failing baseline from abandoning an active handle.
+Before/after timing binaries also verify the carrier's actual size: 232 versus
+16 bytes on this target, detecting an accidentally reused API artifact.
+
+Final host validation passes: governor 77, EP API 99, plugin adapter 384,
+native CPU 1,997 + 63 integration tests / session 286, optional MLAS CPU 2,038 +
+64 integration tests / session 288. Three manual CUDA workspace queue tests
+pass without a device. Strict all-target Clippy covers governor/API/CPU/session/
+plugin/CUDA/engine, plus the reference feature configuration. The CPU heap
+counter also passes release. Production code hashes remain unchanged across
+the final allocation-test cleanup.
+
+Paired M1 Max / ARM64 / macOS 27 release controls compare 1c95431c6 with this
+stage. Both arms use the same real 64 MiB Host cap and inputs. The tiny session
+is one int4 MatMulNBits (M=1,K=64,N=8, block 32, accuracy 0, constant B/scales),
+with exact numeric outputs checked. f16 needs a 256-byte execution lane; f32
+requests NONE and is a control for unrelated executor/code-generation drift.
+Reference controls explicitly force MLAS/SQNBit and require the same actual
+320-byte resident pack in both arms. The borrow-only row executes the public
+CPU provider allocation/return pair, including its guards, without arithmetic.
+
+Each process warms 1,000 calls and takes 15 batches; borrow/return uses 20,000
+repetitions per batch, public session 2,000. Report the median of three isolated
+process medians per arm, ordered before/after/after/before/before/after. Identical
+Rayon/MLAS/OMP/VECLIB/decode settings of 1 are configuration, not a measured
+worker-count claim. The shared stable host flock excludes the llama.cpp batch.
+
+| Mode | Native before → after (us) | Forced MLAS before → after (us) |
+| --- | --- | --- |
+| Complete 256-byte borrow + return | 0.1105 → 0.0529 | 0.1093 → 0.0533 |
+| Tiny f16 public session run | 3.4224 → 3.3991 | 3.2130 → 3.1082 |
+| Tiny f16 public prepare + run | 3.6510 → 3.6045 | 3.3955 → 3.2800 |
+| Tiny f32 public session run (no workspace) | 3.1819 → 3.1834 | 2.9502 → 2.9684 |
+| Tiny f32 public prepare + run (no workspace) | 3.3941 → 3.3657 | 3.1556 → 3.1728 |
+
+Complete borrow/return falls about 51–52% (roughly 110 to 53 ns). The native
+f16 public run saves about 23 ns and prepare + run 47 ns; reference saves about
+105 / 115 ns. f32 controls move by about -28 to +18 ns. Public-session deltas
+are much smaller and backend-dependent; this is not a 52% inference-speedup
+claim and does not eliminate the entire previous ~0.2 us tiny-session residual.
+There is no whole-model, RSS, cold-start or CUDA performance claim.
+
+Source-arm switching explicitly cleans the changed governor/API/CPU packages
+for debug checks and governor/API/CPU/session for release timing builds. The
+allocation counter caught one stale shared-target debug reuse before any timing;
+that evidence and the clean rebuild result are retained. Exact source/driver/
+probe/binary hashes, raw rounds, allocation falsification and summaries remain
+under `/tmp/nxrt-workspace-boxes-*`. Consumed generators, benchmark executables
+and baseline checkout are removed after provenance; reproduction sources and
+drivers remain.

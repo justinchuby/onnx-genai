@@ -935,7 +935,7 @@ mod tests {
         }
 
         fn deallocate(&self, buffer: onnx_runtime_ep_api::provider::DeviceBuffer) -> EpResult<()> {
-            let owner = buffer.into_bound_owner().map_err(|_| {
+            let owner = buffer.into_bound_ownership().map_err(|_| {
                 EpError::KernelFailed("mock GPU buffer lost its bound owner".into())
             })?;
             let outcome = match owner {

@@ -3441,7 +3441,10 @@ impl CudaExecutionProvider {
             )
             .map_err(|error| manager_failure("allocation transaction failed", error))?;
         self.ep_allocations.fetch_add(1, Ordering::Relaxed);
-        Ok(DeviceBuffer::from_managed_allocation(managed, self.device))
+        Ok(DeviceBuffer::from_managed_allocation(
+            Box::new(managed),
+            self.device,
+        ))
     }
 
     fn allocate_with_mapped_growth_for_role(
@@ -3560,7 +3563,10 @@ impl CudaExecutionProvider {
                 manager_failure("mapped-growth allocation transaction failed", error)
             })?;
         self.ep_allocations.fetch_add(1, Ordering::Relaxed);
-        Ok(DeviceBuffer::from_managed_allocation(managed, self.device))
+        Ok(DeviceBuffer::from_managed_allocation(
+            Box::new(managed),
+            self.device,
+        ))
     }
 
     /// Refuse new provider-owned work after shutdown or teardown.
@@ -6136,7 +6142,7 @@ extern "C" __global__ void spin_delay(long long spin) {
             )
             .unwrap();
         WorkspaceAllocation::new(
-            DeviceBuffer::from_managed_allocation(owner, DeviceId::cpu()),
+            DeviceBuffer::from_managed_allocation(Box::new(owner), DeviceId::cpu()),
             None,
         )
     }
@@ -6144,7 +6150,7 @@ extern "C" __global__ void spin_delay(long long spin) {
     fn release_managed_workspace(workspace: WorkspaceAllocation) {
         let (buffer, lease) = workspace.into_parts();
         assert!(lease.is_none());
-        let BoundBufferOwnership::Managed(owner) = buffer.into_bound_owner().unwrap() else {
+        let BoundBufferOwnership::Managed(owner) = buffer.into_bound_ownership().unwrap() else {
             panic!("test workspace lost manager ownership");
         };
         assert!(owner.release_now().unwrap().is_complete());
@@ -6206,7 +6212,7 @@ extern "C" __global__ void spin_delay(long long spin) {
     ) {
         let (buffer, lease) = workspace.into_parts();
         assert!(lease.is_none());
-        let BoundBufferOwnership::Managed(owner) = buffer.into_bound_owner().unwrap() else {
+        let BoundBufferOwnership::Managed(owner) = buffer.into_bound_ownership().unwrap() else {
             panic!("test workspace lost manager ownership");
         };
         let prepared = owner.prepare_release().unwrap();
