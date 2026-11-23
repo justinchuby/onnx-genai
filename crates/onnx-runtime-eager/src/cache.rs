@@ -11,7 +11,7 @@
 //! (`onnx-runtime-ep-api/src/kernel.rs`), so a bare `Arc<dyn Kernel>` is not
 //! `Send` and could not live inside the process-global, `Sync`
 //! [`EagerContext`](crate::EagerContext). We therefore store
-//! `Arc<Mutex<Box<dyn Kernel>>>`: the `Mutex` restores `Send + Sync` while
+//! `Arc<Mutex<PreparedKernel>>`: the `Mutex` restores `Send + Sync` while
 //! preserving the design's "share one compiled kernel across calls" intent.
 //! `Kernel::execute` takes `&self`, so the lock only serialises reuse of the
 //! *same* cached kernel; distinct ops/shapes dispatch concurrently.
@@ -24,12 +24,18 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use crate::workspace::PreparedKernel;
 use onnx_runtime_ep_api::Kernel;
 use onnx_runtime_ir::{DataType, DeviceId};
 
 /// A cached, compiled kernel, shareable across dispatches. See the module docs
-/// for why this is `Arc<Mutex<Box<dyn Kernel>>>` rather than `Arc<dyn Kernel>`.
-pub type CachedKernel = Arc<Mutex<Box<dyn Kernel>>>;
+/// for why this is `Arc<Mutex<PreparedKernel>>` rather than `Arc<dyn Kernel>`. Entries also retain persistent workspace.
+pub(crate) type CachedKernel = Arc<Mutex<PreparedKernel>>;
+
+pub(crate) struct CacheLookup {
+    pub(crate) kernel: CachedKernel,
+    pub(crate) retired: Vec<CachedKernel>,
+}
 
 /// The cache key (`docs/execution/EAGER.md` §8.2 `KernelCacheKey`).
 ///
@@ -41,7 +47,7 @@ pub type CachedKernel = Arc<Mutex<Box<dyn Kernel>>>;
 /// change a variadic-output kernel's contract. Canonicalized attributes are
 /// included because factories may specialize a kernel on them.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct KernelCacheKey {
+pub(crate) struct KernelCacheKey {
     pub op_type: String,
     pub domain: String,
     pub opset: u64,
@@ -64,7 +70,7 @@ pub struct CacheStats {
 }
 
 /// A bounded LRU of compiled kernels (`docs/execution/EAGER.md` §8.2).
-pub struct KernelCache {
+pub(crate) struct KernelCache {
     capacity: usize,
     map: HashMap<KernelCacheKey, CachedKernel>,
     /// Recency order, least-recently-used at the front.
@@ -92,19 +98,22 @@ impl KernelCache {
         &mut self,
         key: KernelCacheKey,
         create: impl FnOnce() -> Result<Box<dyn Kernel>, E>,
-    ) -> Result<CachedKernel, E> {
+    ) -> Result<CacheLookup, E> {
         if let Some(kernel) = self.map.get(&key) {
             let kernel = kernel.clone();
             self.hits += 1;
             self.touch(&key);
-            return Ok(kernel);
+            return Ok(CacheLookup {
+                kernel,
+                retired: Vec::new(),
+            });
         }
         self.misses += 1;
-        let kernel: CachedKernel = Arc::new(Mutex::new(create()?));
+        let kernel: CachedKernel = Arc::new(Mutex::new(PreparedKernel::new(create()?)));
         self.map.insert(key.clone(), kernel.clone());
         self.order.push_back(key);
-        self.evict_if_needed();
-        Ok(kernel)
+        let retired = self.evict_if_needed();
+        Ok(CacheLookup { kernel, retired })
     }
 
     /// Current cache statistics.
@@ -126,14 +135,18 @@ impl KernelCache {
     }
 
     /// Evict least-recently-used entries until within capacity.
-    fn evict_if_needed(&mut self) {
+    fn evict_if_needed(&mut self) -> Vec<CachedKernel> {
+        let mut retired = Vec::new();
         while self.map.len() > self.capacity {
             if let Some(lru) = self.order.pop_front() {
-                self.map.remove(&lru);
+                if let Some(kernel) = self.map.remove(&lru) {
+                    retired.push(kernel);
+                }
             } else {
                 break;
             }
         }
+        retired
     }
 }
 

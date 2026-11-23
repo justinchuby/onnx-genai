@@ -2286,6 +2286,7 @@ dependencies = [
  "onnx-runtime-memory-api",
  "onnx-runtime-memory-governor",
  "onnx-runtime-shape-inference",
+ "smallvec",
  "thiserror 2.0.19",
 ]
 

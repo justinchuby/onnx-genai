@@ -20,7 +20,7 @@
 //!
 //! Implemented: [`EagerContext`], [`EagerContext::dispatch`] (single-op CPU
 //! dispatch), the [`DomainRegistry`](domain::DomainRegistry), opset resolution
-//! ([`opset`]), and the compiled-[`KernelCache`](cache::KernelCache).
+//! ([`opset`]), and the internal compiled-kernel cache.
 //!
 //! DEFERRED (each is flagged at its hook point):
 //! * PyO3 / Python bindings (§11), including the `Tensor` single→tensor /
@@ -37,8 +37,8 @@ mod domain;
 mod error;
 mod opset;
 mod tensor;
+mod workspace;
 
-use std::sync::Arc;
 use std::sync::{Mutex, OnceLock, RwLock};
 
 use onnx_runtime_ep_api::{EpConfig, ExecutionProvider};
@@ -46,11 +46,13 @@ use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::DeviceId;
 use onnx_runtime_shape_inference::InferenceRegistry;
 
-pub use cache::{CacheStats, KernelCache, KernelCacheKey};
+pub use cache::CacheStats;
+use cache::KernelCache;
 pub use domain::{DomainInfo, DomainRegistry};
 pub use error::{EagerError, Result};
 pub use opset::{LATEST_ONNX_OPSET, resolve_opset};
 pub use tensor::Tensor;
+use workspace::SynchronousProvider;
 
 /// Default compiled-kernel cache capacity (`docs/execution/EAGER.md` §13: per-process LRU,
 /// 4096).
@@ -63,8 +65,9 @@ const DEFAULT_CACHE_CAPACITY: usize = 4096;
 /// locking so it can back the [`global_context`] singleton.
 pub struct EagerContext {
     /// Available EPs, auto-detected at initialization. CPU only in Phase-1;
-    /// GPU EPs are added here as a *registration*, not a rewrite.
-    pub(crate) eps: Vec<Arc<dyn ExecutionProvider>>,
+    /// Every registration proves synchronous completion; asynchronous EPs need
+    /// their own completion/retirement contract before eager support is enabled.
+    pub(crate) eps: Vec<SynchronousProvider>,
     /// Compiled-kernel cache (keyed by op + shapes + dtypes + device).
     pub(crate) cache: Mutex<KernelCache>,
     /// Domain registry (standard + custom).
@@ -78,14 +81,15 @@ pub struct EagerContext {
 /// Auto-detect the available execution providers (`docs/execution/EAGER.md` §10.1
 /// `detect_available_eps`).
 ///
-/// Phase-1: the always-available CPU EP only. Adding a GPU EP later is a matter
-/// of pushing another initialized provider here — the dispatch path selects an
-/// EP generically by device, with no hardcoded backend/vendor name.
-fn detect_available_eps() -> Result<Vec<Arc<dyn ExecutionProvider>>> {
+/// Phase-1 registers the synchronous CPU provider. Registration carries the
+/// completion witness once; dispatch never infers it from a provider/device name.
+/// Future asynchronous registration needs an explicit workspace completion and
+/// retirement contract before it may enter this execution path.
+fn detect_available_eps() -> Result<Vec<SynchronousProvider>> {
     // DEFERRED (EAGER.md §4.3 / §2.2): GPU/CUDA EP discovery + auto-transfer.
     let mut cpu = CpuExecutionProvider::new();
     cpu.initialize(&EpConfig::default())?;
-    Ok(vec![Arc::new(cpu) as Arc<dyn ExecutionProvider>])
+    Ok(vec![SynchronousProvider::cpu(cpu)])
 }
 
 impl EagerContext {
@@ -94,7 +98,7 @@ impl EagerContext {
         let eps = detect_available_eps()?;
         let default_device = eps
             .first()
-            .map(|ep| ep.device_id())
+            .map(|ep| ep.ep().device_id())
             .unwrap_or_else(DeviceId::cpu);
         Ok(Self {
             eps,
@@ -143,12 +147,10 @@ impl EagerContext {
         resolve_device_from_ids(&devices, self.default_device)
     }
 
-    /// Get the EP (as an owned `Arc` clone) that owns `device`.
-    pub(crate) fn ep_for_device(&self, device: DeviceId) -> Result<Arc<dyn ExecutionProvider>> {
+    pub(crate) fn synchronous_provider(&self, device: DeviceId) -> Result<&SynchronousProvider> {
         self.eps
             .iter()
-            .find(|ep| ep.device_id() == device)
-            .cloned()
+            .find(|provider| provider.ep().device_id() == device)
             .ok_or(EagerError::NoEpForDevice(device))
     }
 }
@@ -207,7 +209,10 @@ mod tests {
     fn resolve_device_same_device_ok() {
         let ctx = EagerContext::new().unwrap();
         let a = Tensor::from_raw_in(
-            ctx.ep_for_device(DeviceId::cpu()).unwrap(),
+            ctx.synchronous_provider(DeviceId::cpu())
+                .unwrap()
+                .ep()
+                .clone(),
             onnx_runtime_ir::DataType::Float32,
             vec![2],
             &1.0f32.to_le_bytes().repeat(2),
