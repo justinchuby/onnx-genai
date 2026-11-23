@@ -3,18 +3,27 @@ mod common;
 use DataType::{BFloat16, Float16, Float32, Float64, Int32, Int64, Uint8, Uint32};
 use common::{
     Tensor, absent_input, decode_floats, float_input, input, require_cuda, try_run_cpu,
-    try_run_cuda,
+    try_run_cuda_with_origin_offset,
 };
 use onnx_runtime_ep_api::ExecutionProvider;
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId, static_shape};
 
-fn test_provider(ep: Option<&CudaExecutionProvider>) {
+fn test_provider(ep: Option<&CudaExecutionProvider>, origin_offset: usize) {
     let run =
         |op, inputs: &[Tensor], outputs: &[(DataType, Vec<usize>)], attrs: &[(&str, Attribute)]| {
             match ep {
-                Some(ep) => try_run_cuda(ep, op, "", 29, inputs, outputs, attrs),
+                Some(ep) => try_run_cuda_with_origin_offset(
+                    ep,
+                    op,
+                    "",
+                    29,
+                    inputs,
+                    outputs,
+                    attrs,
+                    origin_offset,
+                ),
                 None => try_run_cpu(op, "", 29, inputs, outputs, attrs),
             }
             .map(|mut y| y.remove(0))
@@ -300,6 +309,7 @@ fn test_provider(ep: Option<&CudaExecutionProvider>) {
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA; enable gpu-tests")]
 fn packed_routed_native_cpu_and_cuda() {
     let ep = require_cuda();
-    test_provider(None);
-    test_provider(Some(&ep));
+    test_provider(None, 0);
+    test_provider(Some(&ep), 0);
+    test_provider(Some(&ep), 1);
 }

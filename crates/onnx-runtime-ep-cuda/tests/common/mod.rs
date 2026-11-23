@@ -280,6 +280,20 @@ pub fn try_run_cuda(
     outputs: &[(DataType, Vec<usize>)],
     attrs: &[(&str, Attribute)],
 ) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
+    try_run_cuda_with_origin_offset(ep, op, domain, opset, inputs, outputs, attrs, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_run_cuda_with_origin_offset(
+    ep: &CudaExecutionProvider,
+    op: &str,
+    domain: &str,
+    opset: u64,
+    inputs: &[Tensor],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+    offset: usize,
+) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
     let (graph, node_id) = build_graph(op, domain, opset, inputs, outputs, attrs);
     let model = Model::new(&graph);
     let concrete_shapes = inputs
@@ -321,11 +335,16 @@ pub fn try_run_cuda(
     let input_buffers = inputs
         .iter()
         .map(|tensor| {
-            let buffer = ep.allocate(tensor.bytes.len().max(1), 256).unwrap();
+            let buffer = ep
+                .allocate(tensor.bytes.len().max(1) + offset, 256)
+                .unwrap();
             if !tensor.bytes.is_empty() {
                 unsafe {
                     ep.runtime()
-                        .htod(&tensor.bytes, cuptr(buffer.as_ptr()))
+                        .htod(
+                            &tensor.bytes,
+                            cuptr(buffer.as_ptr().cast::<u8>().wrapping_add(offset).cast()),
+                        )
                         .unwrap()
                 };
             }
@@ -345,7 +364,7 @@ pub fn try_run_cuda(
                 return TensorView::absent(tensor.dtype);
             }
             TensorView::new(
-                DevicePtr(buffer.as_ptr()),
+                DevicePtr(buffer.as_ptr().cast::<u8>().wrapping_add(offset).cast()),
                 tensor.dtype,
                 &tensor.shape,
                 strides,
@@ -356,8 +375,11 @@ pub fn try_run_cuda(
     let mut output_buffers = outputs
         .iter()
         .map(|(dtype, shape)| {
-            ep.allocate(dtype.storage_bytes(shape.iter().product()).max(1), 256)
-                .unwrap()
+            ep.allocate(
+                dtype.storage_bytes(shape.iter().product()).max(1) + offset,
+                256,
+            )
+            .unwrap()
         })
         .collect::<Vec<DeviceBuffer>>();
     let output_strides = outputs
@@ -370,7 +392,7 @@ pub fn try_run_cuda(
         .zip(&output_strides)
         .map(|(((dtype, shape), buffer), strides)| {
             TensorMut::new(
-                DevicePtrMut(buffer.as_mut_ptr()),
+                DevicePtrMut(buffer.as_mut_ptr().cast::<u8>().wrapping_add(offset).cast()),
                 *dtype,
                 shape,
                 strides,
@@ -396,7 +418,10 @@ pub fn try_run_cuda(
                 if !bytes.is_empty() {
                     unsafe {
                         ep.runtime()
-                            .dtoh(&mut bytes, cuptr(buffer.as_ptr()))
+                            .dtoh(
+                                &mut bytes,
+                                cuptr(buffer.as_ptr().cast::<u8>().wrapping_add(offset).cast()),
+                            )
                             .unwrap()
                     };
                 }

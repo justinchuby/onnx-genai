@@ -4,12 +4,35 @@ using B = unsigned char;
 
 __device__ U mask(int bits) { return (1ull << bits) - 1; }
 
+// Tensor origins may be unaligned, even when the elements are contiguous.
+template<typename T> __device__ T read(const B* base, U i) {
+    const B* p = base + i * sizeof(T);
+    if ((reinterpret_cast<U>(p) & (alignof(T) - 1)) == 0)
+        return *reinterpret_cast<const T*>(p);
+    T value;
+    B* bytes = reinterpret_cast<B*>(&value);
+    #pragma unroll
+    for (int j = 0; j < sizeof(T); ++j) bytes[j] = p[j];
+    return value;
+}
+
+template<typename T> __device__ void write(B* base, U i, T value) {
+    B* p = base + i * sizeof(T);
+    if ((reinterpret_cast<U>(p) & (alignof(T) - 1)) == 0) {
+        *reinterpret_cast<T*>(p) = value;
+        return;
+    }
+    const B* bytes = reinterpret_cast<const B*>(&value);
+    #pragma unroll
+    for (int j = 0; j < sizeof(T); ++j) p[j] = bytes[j];
+}
+
 template<typename Word, bool unpack>
-__device__ void packing(const B* input, B* output, const long long* count_input,
+__device__ void packing(const B* input, B* output, const B* count_input,
                         unsigned* status, U lanes, U count, U words, U inner,
                         U radix, U group, U bits, U limit) {
     constexpr U width = sizeof(Word) * 8;
-    if (unpack && *count_input != (long long)count) {
+    if (unpack && read<long long>(count_input, 0) != (long long)count) {
         if (blockIdx.x == 0 && threadIdx.x == 0) *status = 2;
         return;
     }
@@ -24,7 +47,7 @@ __device__ void packing(const B* input, B* output, const long long* count_input,
             for (U used = 0; used < bits;) {
                 const U off = bit % width;
                 const U take = min(bits - used, width - off);
-                const U word = reinterpret_cast<const Word*>(input)[(outer * words + bit / width) * inner + lane];
+                const U word = read<Word>(input, (outer * words + bit / width) * inner + lane);
                 index |= ((word >> off) & mask(take)) << used;
                 used += take;
                 bit += take;
@@ -50,13 +73,13 @@ __device__ void packing(const B* input, B* output, const long long* count_input,
                 const U bit = g * bits;
                 value |= bit < word_bit ? index >> (word_bit - bit) : index << (bit - word_bit);
             }
-            reinterpret_cast<Word*>(output)[i] = value;
+            write<Word>(output, i, value);
         }
     }
 }
 
 #define PACK_ENTRY(WORD, NAME, UNPACK) \
-extern "C" __global__ void NAME(const B* x, B* y, const long long* count_input, unsigned* status, \
+extern "C" __global__ void NAME(const B* x, B* y, const B* count_input, unsigned* status, \
                   U lanes, U count, U words, U inner, U radix, U group, U bits, U limit) { \
     packing<WORD, UNPACK>(x,y,count_input,status,lanes,count,words,inner,radix,group,bits,limit); \
 }
@@ -81,11 +104,11 @@ template<> __device__ float load<float, __nv_bfloat16>(__nv_bfloat16 v) { return
 #endif
 
 template<typename S, typename F, typename I>
-__device__ void grouped(const S* x, const S* w, const I* indices, const S* b, S* y,
+__device__ void grouped(const B* x, const B* w, const B* indices, const B* b, B* y,
                        unsigned* status, U routes, U lanes, U groups, U selections, U k, U n, int transB) {
     GRID(i, n == 0 ? routes : lanes) {
         const U route = n == 0 ? i : i / n;
-        const I group = indices[route];
+        const I group = read<I>(indices, route);
         if (group < 0 || (U)group >= groups) {
             atomicOr(status, 1u);
             continue;
@@ -96,15 +119,15 @@ __device__ void grouped(const S* x, const S* w, const I* indices, const S* b, S*
         F sum = F(0);
         for (U j = 0; j < k; ++j) {
             const U offset = transB ? col * k + j : j * n + col;
-            sum += load<F>(x[token * k + j]) * load<F>(w[(U)group * k * n + offset]);
+            sum += load<F>(read<S>(x, token * k + j)) * load<F>(read<S>(w, (U)group * k * n + offset));
         }
         const S dot = store<S>(sum);
-        y[i] = b ? store<S>(load<F>(dot) + load<F>(b[(U)group * n + col])) : dot;
+        write<S>(y, i, b ? store<S>(load<F>(dot) + load<F>(read<S>(b, (U)group * n + col))) : dot);
     }
 }
 
 #define GROUP_ENTRY(S, F, I, NAME) \
-extern "C" __global__ void NAME(const S* x, const S* w, const I* idx, const S* b, S* y, \
+extern "C" __global__ void NAME(const B* x, const B* w, const B* idx, const B* b, B* y, \
                     unsigned* status, U routes, U lanes, U groups, U selections, U k, U n, int transB) { \
     grouped<S, F, I>(x,w,idx,b,y,status,routes,lanes,groups,selections,k,n,transB); \
 }
