@@ -7,12 +7,12 @@ self-review and merge PR #2427.
 The upstream baseline is pinned in `vendor/llama-chat/UPSTREAM`. A matching route
 name or a successful empty response is not an implemented capability.
 
-## Integration decision
+## Current goal status
 
-The user authorized merging the validated compatibility implementation on
-2026-11-22, with llguidance/tokenizers upgraded to current stable releases.
-Unchecked rows below remain follow-up compatibility work; earlier draft/merge
-notes record milestone status at the time and are not the current merge gate.
+PR #2427 delivered the first compatibility implementation and is merged. This
+is not completion of the original goal. The user requested continuing all
+remaining work on 2026-11-23. Unchecked acceptance items below remain required;
+a successful merge or an endpoint name alone does not close them.
 The supported surface and explicit limitations are documented in
 [`LLAMA_CPP_COMPATIBILITY.md`](LLAMA_CPP_COMPATIBILITY.md).
 
@@ -1085,3 +1085,26 @@ real KV rollback oracle both pass; strict native-engine library/tests Clippy
 passes. Production inference behavior is unchanged. Both required Linux checks
 passed on the preceding head; the Windows test correction is validated locally
 before restoring automatic integration on the updated head.
+
+
+## Follow-up: byte-prefix regex response boundaries
+
+JSON-channel sampling now accepts boundaries with resolved byte DFAs. The
+publication parser and candidate sampler share byte-prefix reachability,
+including pending UTF-8 bytes. EOF and look assertions see those bytes before
+any scalar is published. A delayed accepting state does not by itself keep a
+shorter delimiter open; possible later acceptance and EOF-dependent matches do.
+Regex alternative priority and greedy/lazy behavior remain those of the compiled
+expression. Look-behind roots and reverse acceptance reachability are computed
+once with explicit analysis allocation bounds. Unsupported DFA constructions
+retain their backend cause in a typed capability refusal; ordinary buffered
+parsing remains available for those expressions.
+
+Validation so far: all 23 original/expanded classifier cases and seven processor
+cases passed; full native-enabled engine 897 passed / one inherited ignore and
+full server 404 passed / two inherited ignores. Real ONNX HTTP generation covers
+regex-framed reasoning+Schema in buffered and logprob SSE paths, masking the
+higher-scoring invalid value. Final 25 classifier cases, seven processor cases and strict engine/server
+all-target Clippy pass. Literal boundaries use a distinct resolved matcher and do
+not construct unused DFA analyses. Unicode word assertions, decoder sequences,
+escaped JSON generation and all other unchecked delivery items remain open.
