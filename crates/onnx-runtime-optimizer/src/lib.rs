@@ -40,6 +40,7 @@ mod dead_node;
 mod error;
 mod fusion;
 mod pass;
+pub mod quantized_matmul;
 pub mod recognition;
 
 pub use constant_folding::ConstantFolding;

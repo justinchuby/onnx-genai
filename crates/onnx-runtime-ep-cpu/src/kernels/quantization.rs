@@ -28,6 +28,7 @@ impl KernelFactory for QuantizeLinearFactory {
 pub struct DequantizeLinearKernel {
     axis: i64,
     block_size: Option<usize>,
+    output_dtype: Option<DataType>,
 }
 
 pub struct DequantizeLinearFactory;
@@ -41,6 +42,21 @@ impl KernelFactory for DequantizeLinearFactory {
                 .and_then(|a| a.as_int())
                 .filter(|&n| n > 0)
                 .map(|n| n as usize),
+            output_dtype: match node
+                .attr("output_dtype")
+                .and_then(|a| a.as_int())
+                .unwrap_or(0)
+            {
+                0 => None,
+                1 => Some(DataType::Float32),
+                10 => Some(DataType::Float16),
+                16 => Some(DataType::BFloat16),
+                dtype => {
+                    return Err(EpError::KernelFailed(format!(
+                        "DequantizeLinear: output_dtype={dtype} is unsupported on CPU; use FLOAT, FLOAT16 or BFLOAT16"
+                    )));
+                }
+            },
         }))
     }
 }
@@ -105,10 +121,11 @@ impl Kernel for DequantizeLinearKernel {
         check_arity("DequantizeLinear", inputs, outputs, 2, 3, 1)?;
         let x = read_integers("DequantizeLinear", &inputs[0])?;
         let scale = read_floats("DequantizeLinear", &inputs[1])?;
-        if outputs[0].dtype != inputs[1].dtype {
+        let output_dtype = self.output_dtype.unwrap_or(inputs[1].dtype);
+        if outputs[0].dtype != output_dtype {
             return Err(EpError::KernelFailed(format!(
-                "DequantizeLinear: output dtype {:?} must match scale dtype {:?}",
-                outputs[0].dtype, inputs[1].dtype
+                "DequantizeLinear: output dtype {:?} must match resolved dtype {output_dtype:?}",
+                outputs[0].dtype
             )));
         }
         let zp = if inputs.len() == 3 && !inputs[2].is_absent() {
@@ -188,6 +205,7 @@ struct Params {
     inner: usize,
     block_size: usize,
     count: usize,
+    blocked: bool,
 }
 
 impl Params {
@@ -202,11 +220,6 @@ impl Params {
         axis: i64,
         block_size: Option<usize>,
     ) -> Result<Self> {
-        if scale_shape.len() > 1 || (scale_shape.is_empty() && scale.len() != 1) {
-            return Err(EpError::KernelFailed(format!(
-                "{op}: scale must be a scalar or 1-D tensor"
-            )));
-        }
         if scale.iter().any(|&s| s <= 0.0 || !s.is_finite()) {
             return Err(EpError::KernelFailed(format!(
                 "{op}: scale values must be finite and positive"
@@ -218,18 +231,19 @@ impl Params {
             )));
         }
         if let Some(shape) = zp_shape
-            && shape.len() > 1
+            && shape != scale_shape
         {
             return Err(EpError::KernelFailed(format!(
-                "{op}: zero_point must be a scalar or 1-D tensor"
+                "{op}: zero_point shape {shape:?} must match scale shape {scale_shape:?}"
             )));
         }
-        if scale.len() == 1 {
+        if block_size.is_none() && scale_shape.is_empty() && scale.len() == 1 {
             return Ok(Self {
                 axis_dim: 1,
                 inner: 1,
                 block_size: 1,
                 count: 1,
+                blocked: false,
             });
         }
         let rank = x_shape.len();
@@ -241,12 +255,20 @@ impl Params {
         }
         let axis = normalized_axis as usize;
         let axis_dim = x_shape[axis];
+        let blocked = block_size.is_some();
         let block_size = block_size.unwrap_or(1);
         let expected = axis_dim.div_ceil(block_size);
-        if scale.len() != expected {
+        let mut expected_shape = if blocked {
+            x_shape.to_vec()
+        } else {
+            vec![axis_dim]
+        };
+        if blocked {
+            expected_shape[axis] = expected;
+        }
+        if scale_shape != expected_shape {
             return Err(EpError::KernelFailed(format!(
-                "{op}: scale length {} does not match expected blocked axis length {expected}",
-                scale.len()
+                "{op}: scale shape {scale_shape:?} must be {expected_shape:?} for axis {axis} and block_size {block_size}"
             )));
         }
         Ok(Self {
@@ -254,12 +276,18 @@ impl Params {
             inner: x_shape[axis + 1..].iter().product(),
             block_size,
             count: scale.len(),
+            blocked,
         })
     }
 
     fn at(&self, linear_index: usize) -> usize {
         if self.count == 1 {
             0
+        } else if self.blocked {
+            let outer = linear_index / self.inner / self.axis_dim;
+            let axis = (linear_index / self.inner) % self.axis_dim;
+            (outer * self.axis_dim.div_ceil(self.block_size) + axis / self.block_size) * self.inner
+                + linear_index % self.inner
         } else {
             ((linear_index / self.inner) % self.axis_dim) / self.block_size
         }
@@ -295,6 +323,45 @@ fn read_floats(op: &str, view: &TensorView) -> Result<Vec<f32>> {
     })
 }
 
+fn read_integers(op: &str, view: &TensorView) -> Result<Vec<i64>> {
+    if matches!(view.dtype, DataType::Int4 | DataType::Uint4) {
+        view.validate()?;
+        if !view.device.is_host_accessible() || !view.is_contiguous() {
+            return Err(EpError::KernelFailed(format!(
+                "{op}: sub-byte inputs must be contiguous and host-accessible"
+            )));
+        }
+        // SAFETY: validated contiguous packed storage contains ceil(numel/2) bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(view.data_ptr::<u8>(), view.byte_size()) };
+        return Ok((0..view.numel())
+            .map(|i| {
+                let code = (bytes[i / 2] >> ((i % 2) * 4)) & 15;
+                if view.dtype == DataType::Int4 {
+                    i64::from((code ^ 8) as i8 - 8)
+                } else {
+                    i64::from(code)
+                }
+            })
+            .collect());
+    }
+    let bytes = to_dense_bytes(view)?;
+    Ok(match view.dtype {
+        DataType::Int8 => bytes.iter().map(|&b| b as i8 as i64).collect(),
+        DataType::Uint8 => bytes.into_iter().map(i64::from).collect(),
+        DataType::Int32 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| i32::from_le_bytes(*b) as i64)
+            .collect(),
+        other => {
+            return Err(EpError::KernelFailed(format!(
+                "{op}: expected Int4, Uint4, Int8, Uint8, or Int32 quantized tensors, got {other:?}"
+            )));
+        }
+    })
+}
+
 fn write_floats(out: &mut TensorMut, data: &[f32]) -> Result<()> {
     let mut bytes = Vec::with_capacity(data.len() * out.dtype.byte_size());
     match out.dtype {
@@ -320,25 +387,6 @@ fn write_floats(out: &mut TensorMut, data: &[f32]) -> Result<()> {
         }
     }
     write_dense_bytes(out, &bytes)
-}
-
-fn read_integers(op: &str, view: &TensorView) -> Result<Vec<i64>> {
-    let bytes = to_dense_bytes(view)?;
-    Ok(match view.dtype {
-        DataType::Int8 => bytes.iter().map(|&b| b as i8 as i64).collect(),
-        DataType::Uint8 => bytes.into_iter().map(i64::from).collect(),
-        DataType::Int32 => bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| i32::from_le_bytes(*b) as i64)
-            .collect(),
-        other => {
-            return Err(EpError::KernelFailed(format!(
-                "{op}: only Int8, Uint8, and Int32 quantized tensors are supported, got {other:?}"
-            )));
-        }
-    })
 }
 
 fn write_integer(bytes: &mut Vec<u8>, dtype: DataType, value: i64) -> Result<()> {
@@ -377,6 +425,7 @@ mod tests {
         let scale = Owned::f32(&[], &[0.5]);
         let mut out = Owned::zeros_f32(&[3]);
         DequantizeLinearKernel {
+            output_dtype: None,
             axis: 1,
             block_size: None,
         }
@@ -392,6 +441,7 @@ mod tests {
         let zp = Owned::u8(&[2], &[2, 4]);
         let mut out = Owned::zeros_f32(&[2, 2]);
         DequantizeLinearKernel {
+            output_dtype: None,
             axis: 1,
             block_size: None,
         }
@@ -429,6 +479,7 @@ mod tests {
         assert_eq!(q.to_u8(), vec![4, 8, 6, 12]);
         let mut round_trip = Owned::zeros_f32(&[2, 2]);
         DequantizeLinearKernel {
+            output_dtype: None,
             axis: 1,
             block_size: None,
         }
@@ -443,10 +494,11 @@ mod tests {
     #[test]
     fn dequantize_blocked_axis() {
         let x = Owned::u8(&[1, 4], &[2, 4, 6, 8]);
-        let scale = Owned::f32(&[2], &[0.5, 0.25]);
-        let zp = Owned::u8(&[2], &[2, 4]);
+        let scale = Owned::f32(&[1, 2], &[0.5, 0.25]);
+        let zp = Owned::u8(&[1, 2], &[2, 4]);
         let mut out = Owned::zeros_f32(&[1, 4]);
         DequantizeLinearKernel {
+            output_dtype: None,
             axis: 1,
             block_size: Some(2),
         }
@@ -495,6 +547,7 @@ mod tests {
             let zero_point = Owned::u8(&[], &[113]);
             let mut output = Owned::zeros(DataType::BFloat16, &[rows, 8]);
             DequantizeLinearKernel {
+                output_dtype: None,
                 axis: 1,
                 block_size: None,
             }
