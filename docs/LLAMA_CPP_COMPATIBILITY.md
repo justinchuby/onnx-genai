@@ -171,6 +171,11 @@ assistant prefix as partial JSON and constrains prefix plus new suffix at each
 step. EOS, stop sequences and output-budget completion use that same complete
 value; only newly generated suffix bytes and tokens appear in the response.
 Invalid JSON prefixes are rejected before inference admission.
+A grammar that leaves no finite model candidate fails before token selection.
+JSON generation failures propagate as buffered errors or SSE error events; they
+are never replaced with an ungenerated `{}` and a successful stop. JSON-object
+budget/context exhaustion before completion still needs the upstream partial-
+output/length behavior; that remaining compatibility item is not considered done.
 Continuation intent follows the pinned upstream wire forms: `false`/`null` disable
 explicit continuation, `true` selects content unless the final message contains
 only reasoning, and `"content"` / `"reasoning_content"` select their named fields.

@@ -675,3 +675,20 @@ prompt before admitting reasoning continuation. The upstream
 requires final-turn anchoring and prefix state, with bounded handling of partial
 stream boundaries. This remains an open compatibility requirement, not a
 completed reasoning capability.
+
+JSON-failure truthfulness milestone: removed all three transport branches that
+converted an incomplete JSON generation error into `{}`, successful `stop` and
+zero generated tokens. Buffered and both stream paths now use ordinary typed
+failure propagation. Constraint processing refuses an all-masked/nonfinite
+candidate set before selection, with grammar name, generated offset and a repair
+for incompatible vocabulary or bans; greedy selection cannot fabricate token 0.
+
+The HTTP JSON success fixtures now explicitly declare an actual JSON token and
+a tokenizer-special EOS. They run real generation and assert nonzero completion
+usage in buffered and streamed responses. A separate original text-only fixture
+proves real buffered HTTP 500/SSE error envelopes, with no fabricated JSON delta.
+Native-enabled engine library: 842 passed / 1 inherited ignore. Full server:
+407 passed / 2 inherited ignores. Both selected public HTTP JSON integration cases
+passed, as did strict engine/server all-target Clippy. Parser-module work remains
+uncommitted until runtime wiring is finished. JSON-object budget-prefix/length
+parity remains open; removing a false success is not claimed to finish that item.

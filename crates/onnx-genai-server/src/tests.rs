@@ -6438,6 +6438,53 @@ mod llama_compat {
     }
 
     #[tokio::test]
+    async fn json_grammar_failure_is_not_replaced_with_fabricated_success() {
+        let router = app(tiny_state());
+        let mut body = json!({"messages":[{"role":"user","content":"hello"}],"response_format":{"type":"json_object"},"max_tokens":1,"temperature":0});
+        let (status, error) =
+            call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no finite selectable token"),
+            "{error}"
+        );
+        assert!(error.get("choices").is_none(), "{error}");
+        body["stream"] = json!(true);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let events = sse_json_events(&bytes);
+        assert!(
+            events.iter().any(|event| event["error"]["code"] == 500
+                && event["error"]["message"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("no finite selectable token"))),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["choices"][0]["delta"]["content"] == "{}"),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[tokio::test]
     async fn upstream_chat_payload_streams_usage_and_rejects_unsupported_controls() {
         let router = app(tiny_state());
         let body = json!({

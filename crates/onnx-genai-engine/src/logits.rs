@@ -494,6 +494,12 @@ impl LogitProcessor for ConstraintProcessor {
                 *logit = f32::NEG_INFINITY;
             }
         }
+        anyhow::ensure!(
+            logits.iter().any(|logit| logit.is_finite()),
+            "{} leaves no finite selectable token at generated offset {}; verify the tokenizer vocabulary can continue the grammar and relax incompatible token bans or constraints",
+            self.constraint.name(),
+            context.generated_tokens.len()
+        );
         Ok(())
     }
 
@@ -506,7 +512,7 @@ impl LogitProcessor for ConstraintProcessor {
 ///
 /// This validates the generated prefix plus each candidate token and only allows
 /// tokens that keep the prefix valid and completable. EOS is allowed only after
-/// a complete, balanced JSON value. JSON Schema constraints are future work.
+/// a complete, balanced JSON value. JSON Schema uses the llguidance recognizer.
 #[derive(Debug, Clone, Default)]
 pub struct JsonConstraint {
     prefix: String,
@@ -4849,6 +4855,26 @@ mod tests {
             .unwrap();
         assert!(logits[14].is_finite());
         assert_eq!(logits[1], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn grammar_has_no_finite_candidate_returns_an_actionable_error_before_selection() {
+        let processor = ConstraintProcessor::new(
+            Box::new(JsonConstraint::default()),
+            vec![Some("word".into()), Some("<eos>".into())],
+            vec![1],
+        );
+        let error = processor
+            .process(&mut [1.0, 2.0], &ProcessorContext::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("json_constraint")
+                && error.contains("no finite selectable token")
+                && error.contains("offset 0")
+                && error.contains("tokenizer vocabulary"),
+            "{error}"
+        );
     }
 
     #[test]

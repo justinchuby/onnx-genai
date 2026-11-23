@@ -715,7 +715,6 @@ async fn run_chat_completion(
     // command that carries the turn, and the token count is read after that turn
     // has ended and released it.
     let session_for_count = session_lookup.as_ref().map(SessionLeaseGuard::placement);
-    let wants_constrained_json = request.wants_constrained_json();
     // One submission. The driver resolves how to execute it from the runtime it
     // owns, so this route no longer branches on which package shape was loaded.
     let generation = handle
@@ -745,51 +744,33 @@ async fn run_chat_completion(
         None
     };
 
-    let mut workflow_outputs = Vec::new();
-    let mut stop_sequence = None;
-    let (content, tool_calls, completion_tokens, finish_reason, logprobs, reasoning) = match result
-    {
-        Ok(collected) => {
-            workflow_outputs = collected.publications;
-            let result = collected.result;
-            if let FinishReason::StopSequence { index } = &result.finish_reason {
-                stop_sequence = request
-                    .stop
-                    .as_ref()
-                    .and_then(|stop| stop.clone().into_texts().get(*index).cloned());
-            }
-            let default_finish_reason = finish_reason_label(&result.finish_reason);
-            let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
-                .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
-            let output = assistant_output_text(&result, &tokenizer);
-            let tool_calls = committed_chat_tool_calls(&result);
-            let content = if tool_calls.is_some() {
-                None
-            } else {
-                Some(atem_visible_content(&output).unwrap_or(output.clone()))
-            };
-            let reasoning = tool_calls
-                .is_none()
-                .then(|| atem_reasoning_content(&output))
-                .flatten()
-                .filter(|thought| !thought.is_empty());
-            (
-                content,
-                tool_calls,
-                result.token_ids.len(),
-                default_finish_reason,
-                logprobs,
-                reasoning,
-            )
-        }
-        Err(err)
-            if wants_constrained_json
-                && json_constraint_stopped_incomplete_message(&err.message) =>
-        {
-            (Some("{}".to_string()), None, 0, "stop", None, None)
-        }
-        Err(err) => return Err(err),
+    let collected = result?;
+    let workflow_outputs = collected.publications;
+    let result = collected.result;
+    let stop_sequence = if let FinishReason::StopSequence { index } = &result.finish_reason {
+        request
+            .stop
+            .as_ref()
+            .and_then(|stop| stop.clone().into_texts().get(*index).cloned())
+    } else {
+        None
     };
+    let finish_reason = finish_reason_label(&result.finish_reason);
+    let completion_tokens = result.token_ids.len();
+    let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
+        .map_err(|error| ApiError::internal(format!("logprobs conversion failed: {error}")))?;
+    let output = assistant_output_text(&result, &tokenizer);
+    let tool_calls = committed_chat_tool_calls(&result);
+    let content = if tool_calls.is_some() {
+        None
+    } else {
+        Some(atem_visible_content(&output).unwrap_or(output.clone()))
+    };
+    let reasoning = tool_calls
+        .is_none()
+        .then(|| atem_reasoning_content(&output))
+        .flatten()
+        .filter(|thought| !thought.is_empty());
     let total_tokens = prompt_tokens + completion_tokens;
     Ok(ChatCompletionResponse {
         id,
@@ -899,7 +880,6 @@ async fn stream_chat_completion(
                 handle.private_channels,
                 requested_top_logprobs,
                 &user_stop_sequences,
-                wants_constrained_json,
                 &mut driver_rx,
                 prompt_tokens,
                 request.stream_options.include_usage,
@@ -1041,17 +1021,6 @@ async fn stream_chat_completion(
                     .await?;
                 }
             }
-            Err(StreamOutputFailure::Driver(err))
-                if wants_constrained_json
-                    && json_constraint_stopped_incomplete_message(&err.message) =>
-            {
-                send_stream_chunk(
-                    &tx,
-                    content_chunk(&id, created, &model, "{}".to_string(), None),
-                )
-                .await?;
-                send_stream_chunk(&tx, done_chunk(&id, created, &model, "stop")).await?;
-            }
             Err(StreamOutputFailure::Driver(err)) => {
                 let error = generation_failure(err);
                 tx.send(Ok(Event::default().event("error").data(
@@ -1086,7 +1055,6 @@ async fn stream_declared_tool_chat_completion(
     private_channels: bool,
     requested_top_logprobs: Option<usize>,
     user_stop_sequences: &[String],
-    wants_constrained_json: bool,
     driver_rx: &mut mpsc::Receiver<DriverEvent>,
     prompt_tokens: usize,
     include_usage: bool,
@@ -1187,17 +1155,6 @@ async fn stream_declared_tool_chat_completion(
             if include_usage {
                 send_usage(tx, response, prompt_tokens, result.token_ids.len()).await?;
             }
-        }
-        Err(StreamOutputFailure::Driver(err))
-            if wants_constrained_json
-                && json_constraint_stopped_incomplete_message(&err.message) =>
-        {
-            send_stream_chunk(
-                tx,
-                content_chunk(id, created, model, "{}".to_string(), None),
-            )
-            .await?;
-            send_stream_chunk(tx, done_chunk(id, created, model, "stop")).await?;
         }
         Err(StreamOutputFailure::Driver(err)) => {
             let error = generation_failure(err);
@@ -2397,10 +2354,6 @@ pub(super) fn build_generate_options_with_tokenizer(
         }
     }
     Ok(options)
-}
-
-fn json_constraint_stopped_incomplete_message(message: &str) -> bool {
-    message.contains("JSON constrained decoding stopped before a complete JSON value")
 }
 
 fn build_session_prompt(messages: &[ChatMessage], image_placeholder: Option<&str>) -> String {
