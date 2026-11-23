@@ -1,0 +1,4 @@
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cpu)
+   Compiling onnx-runtime-session v0.1.0-dev.6 (/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-session)
+   Compiling nxrt-qmoe-warm-fit-probe v0.0.0 (/tmp/nxrt-qmoe-warm-fit-attribution/probe)
+    Finished `release` profile [optimized] target(s) in 20.32s

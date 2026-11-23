@@ -1,0 +1,22 @@
+{
+  "base": "388c818906b49580870baee0a96bedf2d1dfd139",
+  "source_path": "/tmp/nxrt-qmoe-workspace",
+  "candidate_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "3f2e47080170b8225b0950b85b63caa5fe9482b52440ee7922d81d805c7039ef"
+  },
+  "probe_sha256": "c909fcdeb9eed327dedf021efbc9883317697135f23fabfe72dd22dbdf7c2911",
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "binaries": {
+    "baseline": {
+      "sha256": "f74935696f8ab2e913c4ad3b9a45d883640775c5138866d6cc358e1cc7f61189",
+      "symbol_count": 25042,
+      "mlas_symbols": 0
+    },
+    "after": {
+      "sha256": "6fa79fe422088692f7a010e43e7caaa611fce45e0f66250b846a90323dd73154",
+      "symbol_count": 25058,
+      "mlas_symbols": 0
+    }
+  }
+}

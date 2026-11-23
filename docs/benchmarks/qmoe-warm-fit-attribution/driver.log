@@ -1,0 +1,34 @@
+{"status": "queued", "pid": 18798, "action": "Wait for the peer batch on the shared stable flock; no heavy process has started."}
+{"status": "acquired", "pid": 18798, "command": ["python", "/tmp/nxrt-qmoe-warm-fit-attribution/driver.py"]}
+{"stage": "build", "arm": "baseline"}
+{"stage": "build", "arm": "after"}
+source restored
+{"stage": "pilots", "reps": {"(1, 32, 32, 1, 0)": 3494, "(1, 64, 64, 1, 0)": 1174, "(1, 256, 256, 1, 0)": 84}}
+{"stage": "run", "index": 0, "label": "baseline", "shape": [1, 32, 32, 1, 0], "cpu_us": 28.51373783629079}
+{"stage": "run", "index": 0, "label": "after", "shape": [1, 32, 32, 1, 0], "cpu_us": 28.624499141385215}
+{"stage": "run", "index": 0, "label": "null", "shape": [1, 32, 32, 1, 0], "cpu_us": 28.416428162564404}
+{"stage": "run", "index": 0, "label": "baseline", "shape": [1, 64, 64, 1, 0], "cpu_us": 85.96933560477004}
+{"stage": "run", "index": 0, "label": "after", "shape": [1, 64, 64, 1, 0], "cpu_us": 86.14224872231694}
+{"stage": "run", "index": 0, "label": "null", "shape": [1, 64, 64, 1, 0], "cpu_us": 85.42759795570693}
+{"stage": "run", "index": 0, "label": "baseline", "shape": [1, 256, 256, 1, 0], "cpu_us": 1194.0952380952374}
+{"stage": "run", "index": 0, "label": "after", "shape": [1, 256, 256, 1, 0], "cpu_us": 1195.738095238095}
+{"stage": "run", "index": 0, "label": "null", "shape": [1, 256, 256, 1, 0], "cpu_us": 1215.6071428571427}
+{"stage": "run", "index": 1, "label": "after", "shape": [1, 32, 32, 1, 0], "cpu_us": 28.716943331425274}
+{"stage": "run", "index": 1, "label": "null", "shape": [1, 32, 32, 1, 0], "cpu_us": 28.461934745277627}
+{"stage": "run", "index": 1, "label": "baseline", "shape": [1, 32, 32, 1, 0], "cpu_us": 28.539210074413287}
+{"stage": "run", "index": 1, "label": "after", "shape": [1, 64, 64, 1, 0], "cpu_us": 85.91822827938667}
+{"stage": "run", "index": 1, "label": "null", "shape": [1, 64, 64, 1, 0], "cpu_us": 86.32538330494032}
+{"stage": "run", "index": 1, "label": "baseline", "shape": [1, 64, 64, 1, 0], "cpu_us": 85.88330494037479}
+{"stage": "run", "index": 1, "label": "after", "shape": [1, 256, 256, 1, 0], "cpu_us": 1195.833333333334}
+{"stage": "run", "index": 1, "label": "null", "shape": [1, 256, 256, 1, 0], "cpu_us": 1194.1904761904757}
+{"stage": "run", "index": 1, "label": "baseline", "shape": [1, 256, 256, 1, 0], "cpu_us": 1193.9999999999993}
+{"stage": "run", "index": 2, "label": "null", "shape": [1, 32, 32, 1, 0], "cpu_us": 28.377504293073837}
+{"stage": "run", "index": 2, "label": "baseline", "shape": [1, 32, 32, 1, 0], "cpu_us": 28.59187178019462}
+{"stage": "run", "index": 2, "label": "after", "shape": [1, 32, 32, 1, 0], "cpu_us": 28.759015455065835}
+{"stage": "run", "index": 2, "label": "null", "shape": [1, 64, 64, 1, 0], "cpu_us": 85.53747870528116}
+{"stage": "run", "index": 2, "label": "baseline", "shape": [1, 64, 64, 1, 0], "cpu_us": 85.44378194207839}
+{"stage": "run", "index": 2, "label": "after", "shape": [1, 64, 64, 1, 0], "cpu_us": 85.71890971039183}
+{"stage": "run", "index": 2, "label": "null", "shape": [1, 256, 256, 1, 0], "cpu_us": 1213.7380952380952}
+{"stage": "run", "index": 2, "label": "baseline", "shape": [1, 256, 256, 1, 0], "cpu_us": 1194.4761904761915}
+{"stage": "run", "index": 2, "label": "after", "shape": [1, 256, 256, 1, 0], "cpu_us": 1194.5595238095232}
+{"stage": "summary", "cells": [{"shape": [1, 32, 32, 1, 0], "full_output_equal": true, "argmax_equal": true, "arms": {"baseline": {"cpu_us_median": 28.539210074413287, "cpu_us_range": [28.51373783629079, 28.59187178019462], "wall_us_median": 28.53961562678878, "wall_us_range": [28.514834859759585, 28.59296880366342], "control_ms_median": 90.03200000000011, "workspace_bytes": [0]}, "after": {"cpu_us_median": 28.716943331425274, "cpu_us_range": [28.624499141385215, 28.759015455065835], "wall_us_median": 28.7180881511162, "wall_us_range": [28.625357756153406, 28.759432741843156], "control_ms_median": 90.93500000000022, "workspace_bytes": [384]}, "null": {"cpu_us_median": 28.416428162564404, "cpu_us_range": [28.377504293073837, 28.461934745277627], "wall_us_median": 28.41731081854608, "wall_us_range": [28.37868488838008, 28.461994275901546], "control_ms_median": 95.09000000000012, "workspace_bytes": [0]}}, "after_over_baseline": 1.0062276866300282, "null_over_baseline": 0.9956977817000281, "control_after_over_baseline": 1.0100297671938878, "control_null_over_baseline": 1.0561800248800426, "minimum_cpu_wall_ratio": 0.6978659288989335, "duration_pass": true, "control_5pct_pass": false}, {"shape": [1, 64, 64, 1, 0], "full_output_equal": true, "argmax_equal": true, "arms": {"baseline": {"cpu_us_median": 85.88330494037479, "cpu_us_range": [85.44378194207839, 85.96933560477004], "wall_us_median": 85.8857538330494, "wall_us_range": [85.44658517887564, 85.97086201022147], "control_ms_median": 90.90900000000013, "workspace_bytes": [0]}, "after": {"cpu_us_median": 85.91822827938667, "cpu_us_range": [85.71890971039183, 86.14224872231694], "wall_us_median": 85.92064224872232, "wall_us_range": [85.71929982964224, 86.14246166950596], "control_ms_median": 89.947, "workspace_bytes": [768]}, "null": {"cpu_us_median": 85.53747870528116, "cpu_us_range": [85.42759795570693, 86.32538330494032], "wall_us_median": 85.53996337308348, "wall_us_range": [85.43033049403748, 86.37066950596252], "control_ms_median": 91.81400000000006, "workspace_bytes": [0]}}, "after_over_baseline": 1.0004066371110907, "null_over_baseline": 0.9959733008023652, "control_after_over_baseline": 0.989417989417988, "control_null_over_baseline": 1.0099550099550092, "minimum_cpu_wall_ratio": 0.9960986794296793, "duration_pass": true, "control_5pct_pass": true}, {"shape": [1, 256, 256, 1, 0], "full_output_equal": true, "argmax_equal": true, "arms": {"baseline": {"cpu_us_median": 1194.0952380952374, "cpu_us_range": [1193.9999999999993, 1194.4761904761915], "wall_us_median": 1194.1240119047618, "wall_us_range": [1194.046130952381, 1194.4786666666666], "control_ms_median": 89.84299999999989, "workspace_bytes": [0]}, "after": {"cpu_us_median": 1195.738095238095, "cpu_us_range": [1194.5595238095232, 1195.833333333334], "wall_us_median": 1195.783726190476, "wall_us_range": [1194.591273809524, 1195.9300595238094], "control_ms_median": 91.2280000000001, "workspace_bytes": [3072]}, "null": {"cpu_us_median": 1213.7380952380952, "cpu_us_range": [1194.1904761904757, 1215.6071428571427], "wall_us_median": 1213.7584404761906, "wall_us_range": [1194.236607142857, 1215.6622023809525], "control_ms_median": 90.56499999999978, "workspace_bytes": [0]}}, "after_over_baseline": 1.0013758175147556, "null_over_baseline": 1.016449992024247, "control_after_over_baseline": 1.0154157808621729, "control_null_over_baseline": 1.0080362409981845, "minimum_cpu_wall_ratio": 0.9948092337537339, "duration_pass": true, "control_5pct_pass": true}]}

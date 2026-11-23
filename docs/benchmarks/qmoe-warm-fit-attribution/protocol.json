@@ -1,0 +1,39 @@
+{
+  "shapes": [
+    [
+      1,
+      32,
+      32,
+      1,
+      0
+    ],
+    [
+      1,
+      64,
+      64,
+      1,
+      0
+    ],
+    [
+      1,
+      256,
+      256,
+      1,
+      0
+    ]
+  ],
+  "arms": [
+    "baseline",
+    "after",
+    "null"
+  ],
+  "processes_per_arm_shape": 3,
+  "batches": 9,
+  "target_cpu_ms": 100,
+  "minimum_cpu_ms": 20,
+  "minimum_cpu_wall_ratio": 0.9,
+  "control_gate_percent": 5,
+  "attempts": 1,
+  "hypothesis": "Repeat single-row QMoE comparison on shared runtime with immutable charge attribution and cached context scope; no new lifecycle APIs",
+  "probe_source": "byte-identical original routed-buffer probe"
+}
