@@ -150,7 +150,14 @@ fn measure(device: &str, build: impl Fn(Graph) -> InferenceSession) {
     ] {
         for format in [Format::Q8_0, Format::Q4K] {
             let (g, inputs, decoded_bytes) = fixture(workload, format, false);
-            let (baseline, _, _) = fixture(workload, format, true);
+            let control = device == "cuda" && matches!(workload, Workload::MatMul(64));
+            let baseline = if control {
+                // CUDA prefill does not fuse. Compare the exact same graph in both arms
+                // so a Reshape or its layout effects cannot move the A/A control.
+                g.clone()
+            } else {
+                fixture(workload, format, true).0
+            };
             let mut candidate = build(g);
             let mut baseline = build(baseline);
             let selected = candidate
@@ -158,10 +165,7 @@ fn measure(device: &str, build: impl Fn(Graph) -> InferenceSession) {
                 .nodes
                 .values()
                 .any(|node| node.op_type == fused_op);
-            assert_eq!(
-                selected,
-                !(device == "cuda" && matches!(workload, Workload::MatMul(64)))
-            );
+            assert_eq!(selected, !control);
             assert!(
                 baseline
                     .graph()
