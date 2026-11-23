@@ -1091,23 +1091,29 @@ fn expert_bias<'a>(
 
 /// Per-expert projections have already added bias; grouped projections add it
 /// here, including their existing +0 operation when an optional bias is absent.
-#[derive(Clone, Copy)]
-enum ActivationBias<'a> {
-    Applied,
-    Pending {
-        fc1: Option<&'a [f32]>,
-        linear: Option<&'a [f32]>,
-    },
+/// Distinct static states keep that decision out of the element loop.
+trait ActivationBias: Copy {
+    fn value(self, linear: bool, index: usize, value: f32) -> f32;
 }
-impl ActivationBias<'_> {
+
+#[derive(Clone, Copy)]
+struct AppliedActivationBias;
+
+impl ActivationBias for AppliedActivationBias {
+    fn value(self, _linear: bool, _index: usize, value: f32) -> f32 {
+        value
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingActivationBias<'a> {
+    fc1: Option<&'a [f32]>,
+    linear: Option<&'a [f32]>,
+}
+
+impl ActivationBias for PendingActivationBias<'_> {
     fn value(self, linear: bool, index: usize, value: f32) -> f32 {
-        match self {
-            Self::Applied => value,
-            Self::Pending {
-                fc1,
-                linear: linear_bias,
-            } => value + if linear { linear_bias } else { fc1 }.map_or(0.0, |bias| bias[index]),
-        }
+        value + if linear { self.linear } else { self.fc1 }.map_or(0.0, |bias| bias[index])
     }
 }
 
@@ -1117,7 +1123,7 @@ fn gated_activation_row(
     fc3: Option<&[f32]>,
     inter: usize,
     attributes: &MoeAttributes,
-    bias: ActivationBias<'_>,
+    bias: impl ActivationBias,
 ) {
     let linear = fc3.unwrap_or(fc1);
     for (index, value) in output.iter_mut().enumerate() {
@@ -1153,7 +1159,7 @@ fn apply_gated_activation(
             fc3,
             inter,
             attributes,
-            ActivationBias::Pending {
+            PendingActivationBias {
                 fc1: fc1_bias,
                 linear: linear_bias,
             },
@@ -1233,7 +1239,7 @@ impl MoeWorkspace<'_> {
                         fc3.map(|linear| &linear[row * inter..(row + 1) * inter]),
                         inter,
                         attributes,
-                        ActivationBias::Applied,
+                        AppliedActivationBias,
                     );
                 }
             }
@@ -1780,6 +1786,72 @@ mod tests {
     use onnx_runtime_loader::Model;
     use std::hint::black_box;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn gated_row_bias_states_preserve_layouts_and_signed_zero() {
+        let gate = [-0.0, -2.0, 3.0];
+        let linear = [1.0, 2.0, -3.0];
+        let gate_bias = [0.0, 0.25, -0.5];
+        let linear_bias = [0.0, -0.5, 0.75];
+        for fusion in 0..=2 {
+            let attributes = MoeAttributes {
+                k: 1,
+                activation: Activation::Swiglu,
+                normalize_routing_weights: false,
+                swiglu_fusion: fusion,
+                activation_alpha: 1.0,
+                activation_beta: 0.0,
+                swiglu_limit: DEFAULT_SWIGLU_LIMIT,
+            };
+            let arrange = |a: &[f32], b: &[f32]| match fusion {
+                0 => a.to_vec(),
+                1 => a.iter().zip(b).flat_map(|(&a, &b)| [a, b]).collect(),
+                _ => [a, b].concat(),
+            };
+            let fc1 = arrange(&gate, &linear);
+            let fc3 = (fusion == 0).then_some(&linear[..]);
+            let mut applied = [29.0; 3];
+            gated_activation_row(
+                &mut applied,
+                &fc1,
+                fc3,
+                3,
+                &attributes,
+                AppliedActivationBias,
+            );
+            let expected =
+                std::array::from_fn::<_, 3, _>(|i| attributes.swiglu(gate[i], linear[i]));
+            assert_eq!(applied.map(f32::to_bits), expected.map(f32::to_bits));
+            assert_eq!(applied[0].to_bits(), (-0.0f32).to_bits());
+            for biased in [false, true] {
+                let fc1_bias = arrange(&gate_bias, &linear_bias);
+                let mut pending = [29.0; 3];
+                gated_activation_row(
+                    &mut pending,
+                    &fc1,
+                    fc3,
+                    3,
+                    &attributes,
+                    PendingActivationBias {
+                        fc1: biased.then_some(fc1_bias.as_slice()),
+                        linear: biased.then_some(if fusion == 0 {
+                            &linear_bias[..]
+                        } else {
+                            fc1_bias.as_slice()
+                        }),
+                    },
+                );
+                let expected = std::array::from_fn::<_, 3, _>(|i| {
+                    attributes.swiglu(
+                        gate[i] + if biased { gate_bias[i] } else { 0.0 },
+                        linear[i] + if biased { linear_bias[i] } else { 0.0 },
+                    )
+                });
+                assert_eq!(pending.map(f32::to_bits), expected.map(f32::to_bits));
+                assert_eq!(pending[0].to_bits(), 0.0f32.to_bits());
+            }
+        }
+    }
 
     fn model_node(
         input_shapes: &[Option<&[usize]>],
