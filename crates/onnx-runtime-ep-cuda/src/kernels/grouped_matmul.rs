@@ -68,7 +68,7 @@ fn packed_source() -> &'static str {
     static SOURCE: OnceLock<String> = OnceLock::new();
     SOURCE.get_or_init(|| {
         let mut source = super::dequantize_packed::decoder_source().to_owned();
-        source.push_str(include_str!("packed_routed.cu"));
+        source.push_str(include_str!("packed_kernel_prelude.cuh"));
         source.push_str(PACKED_SOURCE);
         source
     })
