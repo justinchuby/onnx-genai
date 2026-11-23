@@ -377,9 +377,9 @@ fn allowlisted_unconditional_syncs() -> BTreeSet<String> {
         "gemm.rs::run".to_string(),
         "matmul_nbits.rs::run".to_string(),
         "mod_op.rs::run".to_string(),
-        // Declares CaptureSupport::unsupported: the Phase-2a workspace path
-        // allocates per-call scratch and drains the trailing transpose before
-        // returning it to the pool. Same shape as packed_varlen_attention below.
+        // Declares CaptureSupport::unsupported: MHA drains the Phase-2a core
+        // and trailing output transpose before returning borrowed workspace.
+        // Prepared backing does not make these host waits capturable.
         "multi_head_attention.rs::synchronize_runtime".to_string(),
         "nary.rs::run".to_string(),
         // DeviceWorkspace prepare must copy the scalar count D2H so ORT can

@@ -165,10 +165,25 @@ scratch. Phase-2a rejects a missing workspace rather than allocating outside
 preparation. Eager registration currently exposes only CPU execution; future
 asynchronous registration needs an explicit completion/retirement contract.
 
-The shared Phase-2a engine still retains temporary scratch ownership for its
-MHA/GQA callers pending migration of their complete composite layouts. The
-remaining MHA/GQA resource migration is not complete.
+`com.microsoft::MultiHeadAttention` also uses one step-scoped prepared workspace.
+Its disjoint regions cover query/output BNSH staging, optional temporary K/V,
+additive mask, padding upload, and the complete Phase-2a scores/cuBLASLt region.
+The factory preserves declared optional output slots, and execution checks that
+those slots agree before omitting temporary K/V. Metadata and execution share
+checked geometry; region binding requests no individual quota grants.
 
-The fallback still synchronizes its CUDA stream and remains unavailable during
-capture. The parity tests use the public provider workspace preparation path,
+MHA no longer allocates or frees device scratch. Its stream-use guard preserves
+the runtime's existing synchronization policy and reports both submission and
+sync-policy failures. A deferred sync returning Ok is not a completion witness:
+backing and funding remain owned by the executor/provider until its recorded
+fences and settlement prove release. A failed legacy-default-stream padding
+upload latches that stream into subsequent provider release fences, so compute
+and copy completion alone cannot retire an unsettled upload destination. The host-resolved padding mask is
+still an owned Host Vec; this is not a complete process-memory bound.
+
+The shared Phase-2a engine still retains temporary scratch ownership for its
+GQA caller pending migration of that complete composite layout.
+
+The fallback retains its runtime synchronization policy and remains unavailable
+during capture. The parity tests use the public provider workspace preparation path,
 and the benchmark reuses its admitted backing across warm iterations.

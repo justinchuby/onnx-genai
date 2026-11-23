@@ -880,6 +880,10 @@ pub struct CudaRuntime {
     /// default (eager decode is made consistent with the captured path, which
     /// already elides these); disable via `ONNX_GENAI_DEFER_EAGER_SYNC=0`.
     defer_eager_sync: AtomicBool,
+    /// Latched after a legacy-default-stream upload fails without a completion
+    /// proof. Future final releases also fence that stream; success cannot clear
+    /// an earlier failure's pending use.
+    legacy_upload_unsettled: AtomicBool,
     /// Capture-gate section covering this runtime's teardown, acquired in
     /// [`Drop::drop`] rather than at construction.
     ///
@@ -1155,6 +1159,7 @@ impl CudaRuntime {
             validation_reset_pause: AtomicBool::new(false),
             #[cfg(feature = "gpu-tests")]
             validation_reset_claimed: AtomicBool::new(false),
+            legacy_upload_unsettled: AtomicBool::new(false),
             defer_eager_sync: AtomicBool::new(
                 // On by default; only an explicit falsey value restores the old
                 // always-sync eager path (escape hatch for debugging).
@@ -3197,19 +3202,22 @@ impl CudaRuntime {
             )
         })?;
         // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract.
-        unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }
-            .map_err(|e| driver_err("cuMemcpyHtoD", e))?;
+        let copy = unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }
+            .map_err(|e| driver_err("cuMemcpyHtoD", e));
+        track_legacy_upload(&self.legacy_upload_unsettled, copy)?;
         // SAFETY: a null CUstream selects the current context's legacy default
         // stream. Calling the raw API avoids constructing an allocating Arc
         // wrapper on every request-boundary validation reset.
-        unsafe { cudarc::driver::result::stream::synchronize(std::ptr::null_mut()) }.map_err(
-            |e| {
-                driver_err(
-                    "cuStreamSynchronize(default) after synchronous cuMemcpyHtoD",
-                    e,
-                )
-            },
-        )?;
+        let completion =
+            unsafe { cudarc::driver::result::stream::synchronize(std::ptr::null_mut()) }.map_err(
+                |e| {
+                    driver_err(
+                        "cuStreamSynchronize(default) after synchronous cuMemcpyHtoD",
+                        e,
+                    )
+                },
+            );
+        track_legacy_upload(&self.legacy_upload_unsettled, completion)?;
         self.host_to_device_copies.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -3283,6 +3291,13 @@ impl CudaRuntime {
     // stream after a prior consumer (`copy_wait_fence`). No primitive blocks the
     // host; ordering is entirely through CUDA events so a prefetch of the next
     // expert's weights overlaps the current wave's kernels.
+
+    /// Release queues must fence the legacy default stream after a failed
+    /// synchronous upload. This is not a completion witness and is never reset
+    /// within the same runtime/context.
+    pub(crate) fn legacy_upload_needs_release_fence(&self) -> bool {
+        self.legacy_upload_unsettled.load(Ordering::Acquire)
+    }
 
     /// Enqueue an asynchronous host → device copy of `src` on the dedicated
     /// transfer stream (not the compute stream), so it overlaps compute.
@@ -3735,10 +3750,38 @@ pub fn raw_ptr(dptr: CUdeviceptr) -> *mut c_void {
     dptr as usize as *mut c_void
 }
 
+fn track_legacy_upload<T>(unsettled: &AtomicBool, result: Result<T>) -> Result<T> {
+    if result.is_err() {
+        unsettled.store(true, Ordering::Release);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cudarc::driver::PushKernelArg;
+
+    #[test]
+    fn failed_legacy_upload_latches_release_fence_until_context_retirement() {
+        let unsettled = AtomicBool::new(false);
+        track_legacy_upload(&unsettled, Ok(())).unwrap();
+        assert!(!unsettled.load(Ordering::Acquire));
+        let error = track_legacy_upload::<()>(
+            &unsettled,
+            Err(EpError::KernelFailed(
+                "injected legacy completion failure".into(),
+            )),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("legacy completion failure"));
+        assert!(unsettled.load(Ordering::Acquire));
+        track_legacy_upload(&unsettled, Ok(())).unwrap();
+        assert!(
+            unsettled.load(Ordering::Acquire),
+            "success must not erase an earlier unsettled transfer"
+        );
+    }
 
     #[test]
     fn validation_generation_exhaustion_fails_without_wrap_or_aba() {

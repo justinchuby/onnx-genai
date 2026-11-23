@@ -58,17 +58,22 @@
 //! reduced precision — an inherent property of the shared core (which GQA and
 //! `Attention` also use), not a defect of this adapter.
 
+use std::alloc::Layout;
 use std::ffi::c_void;
 use std::sync::Arc;
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceLayout, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node, Shape};
 
-use super::attention::{AttentionDtype, run_attention_phase2a};
+use super::attention::{
+    AttentionDtype, PHASE2A_SCRATCH_ALIGN, Phase2aScratch, phase2a_scratch_layout,
+    run_attention_phase2a,
+};
 use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -197,90 +202,338 @@ fn synchronize_runtime(runtime: &CudaRuntime) -> Result<()> {
     runtime.synchronize()
 }
 
-trait MhaScratchRuntime {
-    fn allocate_scratch(&self, bytes: usize) -> Result<CUdeviceptr>;
-
-    /// # Safety
-    /// `ptr` must be a live allocation returned by `allocate_scratch` on this runtime.
-    unsafe fn free_scratch(&self, ptr: CUdeviceptr) -> Result<()>;
-
-    /// # Safety
-    /// `dst` must cover `src.len()` bytes.
-    unsafe fn upload_scratch(&self, src: &[u8], dst: CUdeviceptr) -> Result<()>;
-
-    fn synchronize_scratch_stream(&self) -> Result<()>;
+/// Shape-derived geometry shared by preparation and execution. No tensor data
+/// or runtime/device query participates in workspace admission.
+#[derive(Clone, Copy, Debug)]
+struct MhaGeometry {
+    dtype: AttentionDtype,
+    batch: usize,
+    heads: usize,
+    q_seq: usize,
+    q_hidden: usize,
+    head_size: usize,
+    k_is_bnsh: bool,
+    v_is_bnsh: bool,
+    cur_seq: usize,
+    past_seq: usize,
+    total_seq: usize,
+    q_elements: usize,
+    kv_elements: usize,
+    mask_elements: usize,
+    pad_elements: usize,
+    mask_planes: usize,
 }
 
-impl MhaScratchRuntime for CudaRuntime {
-    fn allocate_scratch(&self, bytes: usize) -> Result<CUdeviceptr> {
-        self.alloc_raw(bytes)
+impl MhaGeometry {
+    fn from_inputs(heads: usize, inputs: &[TensorMetadata<'_>]) -> Result<Self> {
+        require_positive(heads, "num_heads")?;
+        let required = |index: usize, name: &str| {
+            inputs
+                .get(index)
+                .filter(|input| input.present)
+                .ok_or_else(|| {
+                    mha_error(format!(
+                        "separate {name} input {index} is required; packed QKV/KV is unsupported"
+                    ))
+                })
+        };
+        let q = required(0, "query")?;
+        let k = required(1, "key")?;
+        let v = required(2, "value")?;
+        let dtype = AttentionDtype::from_onnx(q.dtype).map_err(|error| {
+            mha_error(format!("query dtype {:?} is unsupported: {error}", q.dtype))
+        })?;
+        if q.shape.len() != 3 {
+            return Err(mha_error(format!(
+                "query must be rank 3 (B, S, hidden); packed-QKV layouts (rank {}) are unsupported",
+                q.shape.len()
+            )));
+        }
+        if k.shape.len() != v.shape.len() || !matches!(k.shape.len(), 3 | 4) {
+            return Err(mha_error(format!(
+                "key and value must both be rank 3 (B, L, hidden) or rank 4 (B, N, L, head_size), got key rank {}, value rank {}",
+                k.shape.len(),
+                v.shape.len()
+            )));
+        }
+        for (name, input) in [("query", q), ("key", k), ("value", v)] {
+            if input.dtype != q.dtype {
+                return Err(mha_error(format!(
+                    "{name} dtype {:?} must match query dtype {:?}",
+                    input.dtype, q.dtype
+                )));
+            }
+            for (axis, &dim) in input.shape.iter().enumerate() {
+                require_positive(dim, &format!("{name} dim {axis}"))?;
+                checked_i32(dim, &format!("{name} dim {axis}"))?;
+            }
+            checked_bytes(
+                checked_product(input.shape, &format!("{name} element count"))?,
+                dtype.element_size() as usize,
+                name,
+            )?;
+        }
+        checked_i32(heads, "num_heads")?;
+        let (batch, q_seq, q_hidden) = (q.shape[0], q.shape[1], q.shape[2]);
+        if !q_hidden.is_multiple_of(heads) {
+            return Err(mha_error(format!(
+                "query hidden {q_hidden} not divisible by num_heads {heads}"
+            )));
+        }
+        let head_size = q_hidden / heads;
+        let kv = |input: &TensorMetadata<'_>, name: &str| -> Result<(bool, usize)> {
+            if input.shape[0] != batch {
+                return Err(mha_error(format!(
+                    "{name} batch {} must equal query batch {batch}",
+                    input.shape[0]
+                )));
+            }
+            let (bnsh, seq, dim) = if input.shape.len() == 3 {
+                if !input.shape[2].is_multiple_of(heads) {
+                    return Err(mha_error(format!(
+                        "{name} hidden {} not divisible by num_heads {heads}",
+                        input.shape[2]
+                    )));
+                }
+                (false, input.shape[1], input.shape[2] / heads)
+            } else {
+                if input.shape[1] != heads {
+                    return Err(mha_error(format!(
+                        "rank-4 {name} dim 1 ({}) must equal num_heads {heads}",
+                        input.shape[1]
+                    )));
+                }
+                (true, input.shape[2], input.shape[3])
+            };
+            if dim != head_size {
+                return Err(mha_error(format!(
+                    "{name} head_size {dim} must equal query head_size {head_size} (v_head_size must equal qk_head_size for the shared attention core)"
+                )));
+            }
+            Ok((bnsh, seq))
+        };
+        let (k_is_bnsh, cur_seq) = kv(k, "key")?;
+        let (v_is_bnsh, v_seq) = kv(v, "value")?;
+        if cur_seq != v_seq {
+            return Err(mha_error(format!("key seq {cur_seq} != value seq {v_seq}")));
+        }
+        let optional = |index: usize| inputs.get(index).filter(|input| input.present);
+        if optional(8).is_some() || optional(9).is_some() {
+            return Err(mha_error(
+                "DecoderMaskedMultiHeadAttention inputs (past_sequence_length / cache_indirection) are not supported",
+            ));
+        }
+        let past_seq = match (optional(6), optional(7)) {
+            (None, None) => 0,
+            (Some(pk), Some(pv)) => {
+                for (name, input) in [("past_key", pk), ("past_value", pv)] {
+                    if input.dtype != q.dtype
+                        || input.shape.len() != 4
+                        || input.shape[0] != batch
+                        || input.shape[1] != heads
+                        || input.shape[3] != head_size
+                    {
+                        return Err(mha_error(format!(
+                            "{name} must match query dtype {:?} and rank-4 shape [B={batch}, N={heads}, P, H={head_size}], got {:?} {:?}",
+                            q.dtype, input.dtype, input.shape
+                        )));
+                    }
+                    for (axis, &dim) in input.shape.iter().enumerate() {
+                        require_positive(dim, &format!("{name} dim {axis}"))?;
+                        checked_i32(dim, &format!("{name} dim {axis}"))?;
+                    }
+                    checked_bytes(
+                        checked_product(input.shape, &format!("{name} element count"))?,
+                        dtype.element_size() as usize,
+                        name,
+                    )?;
+                }
+                if pk.shape[2] != pv.shape[2] {
+                    return Err(mha_error("past_key and past_value seq lengths differ"));
+                }
+                pk.shape[2]
+            }
+            _ => {
+                return Err(mha_error(
+                    "past_key and past_value must be provided together",
+                ));
+            }
+        };
+        let total_seq = checked_add(past_seq, cur_seq, "past_seq + current key sequence")?;
+        checked_i32(total_seq, "total sequence length")?;
+        let q_elements = checked_product(&[batch, heads, q_seq, head_size], "query BNSH elements")?;
+        let kv_elements = checked_product(
+            &[batch, heads, total_seq, head_size],
+            "present KV BNSH elements",
+        )?;
+        let mask_elements =
+            checked_product(&[batch, heads, q_seq, total_seq], "attention mask elements")?;
+        let pad_elements = checked_product(&[batch, q_seq, total_seq], "padding mask elements")?;
+        let mask_planes = checked_product(&[batch, heads], "attention mask planes")?;
+        checked_i32(mask_planes, "attention mask planes")?;
+        checked_i32(
+            checked_product(&[mask_planes, q_seq], "attention rows")?,
+            "attention rows",
+        )?;
+        for (elements, name) in [
+            (q_elements, "query BNSH scratch"),
+            (kv_elements, "present KV storage"),
+            (mask_elements, "attention mask scratch"),
+        ] {
+            checked_bytes(elements, dtype.element_size() as usize, name)?;
+            checked_grid(elements, &format!("{name} launch"))?;
+        }
+        Ok(Self {
+            dtype,
+            batch,
+            heads,
+            q_seq,
+            q_hidden,
+            head_size,
+            k_is_bnsh,
+            v_is_bnsh,
+            cur_seq,
+            past_seq,
+            total_seq,
+            q_elements,
+            kv_elements,
+            mask_elements,
+            pad_elements,
+            mask_planes,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MhaWorkspace {
+    regions: WorkspaceLayout<7>,
+    phase2a: WorkspaceLayout<2>,
+}
+
+impl MhaWorkspace {
+    fn new(g: MhaGeometry, present: [bool; 2], pad: bool, bias: bool) -> Result<Self> {
+        let elem = g.dtype.element_size() as usize;
+        let region = |elements, width, name| {
+            let bytes = checked_bytes(elements, width, name)?;
+            Layout::from_size_align(bytes, PHASE2A_SCRATCH_ALIGN).map_err(|_| {
+                mha_error(format!(
+                    "{name} workspace layout exceeds addressable capacity; reduce the input shape"
+                ))
+            })
+        };
+        let phase2a = phase2a_scratch_layout(g.dtype, g.batch, g.heads, g.q_seq, g.total_seq)
+            .map_err(|error| mha_error(format!("Phase-2a workspace planning failed: {error}")))?;
+        let regions = WorkspaceLayout::new([
+            region(g.q_elements, elem, "query BNSH")?,
+            region(
+                if present[0] { 0 } else { g.kv_elements },
+                elem,
+                "temporary key",
+            )?,
+            region(
+                if present[1] { 0 } else { g.kv_elements },
+                elem,
+                "temporary value",
+            )?,
+            region(g.q_elements, elem, "output BNSH")?,
+            region(
+                if pad || bias { g.mask_elements } else { 0 },
+                elem,
+                "additive mask",
+            )?,
+            region(
+                if pad { g.pad_elements } else { 0 },
+                std::mem::size_of::<f32>(),
+                "padding upload",
+            )?,
+            Layout::from_size_align(phase2a.bytes(), phase2a.alignment())
+                .map_err(|_| mha_error("Phase-2a workspace layout exceeds addressable capacity"))?,
+        ])
+        .map_err(|error| mha_error(format!("composite workspace planning failed: {error}")))?;
+        Ok(Self { regions, phase2a })
     }
 
-    unsafe fn free_scratch(&self, ptr: CUdeviceptr) -> Result<()> {
-        // SAFETY: forwarded from the trait contract.
-        unsafe { self.free_raw(ptr) }
+    fn bind(&self, workspace: Option<WorkspaceView>) -> Result<[WorkspaceView; 7]> {
+        self.regions.bind(workspace).map_err(|error| mha_error(format!(
+            "cannot bind prepared workspace: {error}; query workspace_requirement and pass executor-owned backing to execute_with_workspace"
+        )))
     }
+}
 
-    unsafe fn upload_scratch(&self, src: &[u8], dst: CUdeviceptr) -> Result<()> {
-        // SAFETY: forwarded from the trait contract.
-        unsafe { self.htod(src, dst) }
+/// Output presence is a compile-time fact; never omit scratch based on an
+/// output buffer that a different runtime invocation might fail to supply.
+fn present_output_slots(node: &Node) -> Result<[bool; 2]> {
+    if !(1..=3).contains(&node.outputs.len()) || node.outputs[0].is_none() {
+        return Err(mha_error(
+            "declare the required output and at most two optional present KV output slots",
+        ));
     }
+    Ok(std::array::from_fn(|index| {
+        node.outputs.get(index + 1).is_some_and(Option::is_some)
+    }))
+}
 
-    fn synchronize_scratch_stream(&self) -> Result<()> {
+fn check_present_slots(compiled: [bool; 2], actual: [bool; 2]) -> Result<()> {
+    if actual != compiled {
+        return Err(mha_error(format!(
+            "runtime present KV output slots {actual:?} differ from compiled slots {compiled:?}; execute the kernel with its declared positional outputs"
+        )));
+    }
+    Ok(())
+}
+
+trait MhaStreamRuntime {
+    fn apply_sync_policy(&self) -> Result<()>;
+}
+impl MhaStreamRuntime for CudaRuntime {
+    fn apply_sync_policy(&self) -> Result<()> {
         synchronize_runtime(self)
     }
 }
 
-/// Owns every per-call MHA allocation until all stream users have completed.
-struct MhaScratch<'a, R: MhaScratchRuntime + ?Sized> {
+/// Stream-use guard only: runtime policy may defer its sync. An Ok result is
+/// not a completion witness. Physical retirement stays with provider fences.
+struct MhaStreamUse<'a, R: MhaStreamRuntime + ?Sized> {
     runtime: &'a R,
-    allocations: Vec<CUdeviceptr>,
-    stream_may_use_allocations: bool,
+    active: bool,
 }
-
-impl<'a, R: MhaScratchRuntime + ?Sized> MhaScratch<'a, R> {
+impl<'a, R: MhaStreamRuntime + ?Sized> MhaStreamUse<'a, R> {
     fn new(runtime: &'a R) -> Self {
         Self {
             runtime,
-            allocations: Vec::new(),
-            stream_may_use_allocations: false,
+            active: false,
         }
     }
-
-    fn allocate(&mut self, bytes: usize) -> Result<CUdeviceptr> {
-        let ptr = self.runtime.allocate_scratch(bytes.max(1))?;
-        self.allocations.push(ptr);
-        Ok(ptr)
-    }
-
-    fn upload(&self, src: &[u8], dst: CUdeviceptr) -> Result<()> {
-        // SAFETY: callers only pass a pointer owned by this object and sized
-        // from the same checked byte count as `src`.
-        unsafe { self.runtime.upload_scratch(src, dst) }
-    }
-
     fn mark_stream_use(&mut self) {
-        self.stream_may_use_allocations = true;
+        self.active = true;
     }
-
-    fn finish_stream_use(&mut self) -> Result<()> {
-        if self.stream_may_use_allocations {
-            self.runtime.synchronize_scratch_stream()?;
-            self.stream_may_use_allocations = false;
+    fn finish(mut self, result: Result<()>) -> Result<()> {
+        let completion = if self.active {
+            self.active = false;
+            self.runtime.apply_sync_policy()
+        } else {
+            Ok(())
+        };
+        match (result, completion) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(mha_error(format!(
+                "workspace stream sync policy failed: {error}; settle the failed execution context before retrying"
+            ))),
+            (Err(error), Err(completion)) => Err(mha_error(format!(
+                "execution failed: {error}; workspace stream sync policy also failed: {completion}; settle the failed execution context before retrying"
+            ))),
         }
-        Ok(())
     }
 }
-
-impl<R: MhaScratchRuntime + ?Sized> Drop for MhaScratch<'_, R> {
+impl<R: MhaStreamRuntime + ?Sized> Drop for MhaStreamUse<'_, R> {
     fn drop(&mut self) {
-        if self.stream_may_use_allocations {
-            let _ = self.runtime.synchronize_scratch_stream();
-        }
-        for ptr in self.allocations.drain(..).rev() {
-            // SAFETY: allocation ownership is recorded only after a successful
-            // allocation, drained once here, and never copied out as ownership.
-            let _ = unsafe { self.runtime.free_scratch(ptr) };
+        if self.active
+            && let Err(error) = self.runtime.apply_sync_policy()
+        {
+            eprintln!(
+                "cuda_ep MultiHeadAttention: applying stream sync policy during unwinding failed: {error}; backing remains caller/provider owned and needs execution-context settlement"
+            );
         }
     }
 }
@@ -415,6 +668,7 @@ pub struct MultiHeadAttentionKernel {
     mask_filter_value: f32,
     /// Apply a causal (lower-triangular) mask when the query length is `> 1`.
     unidirectional: bool,
+    present_outputs: [bool; 2],
 }
 
 /// Factory for [`MultiHeadAttentionKernel`], reading the contrib-op attributes.
@@ -830,6 +1084,7 @@ impl KernelFactory for MultiHeadAttentionFactory {
             scale: attrs.scale,
             mask_filter_value: attrs.mask_filter_value,
             unidirectional: attrs.unidirectional,
+            present_outputs: present_output_slots(node)?,
         }))
     }
 }
@@ -910,8 +1165,13 @@ impl MultiHeadAttentionKernel {
     }
 }
 
-impl Kernel for MultiHeadAttentionKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+impl MultiHeadAttentionKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if inputs.len() < 3 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep MultiHeadAttention: expected at least query/key/value, got {} inputs",
@@ -933,141 +1193,43 @@ impl Kernel for MultiHeadAttentionKernel {
         let query = &inputs[0];
         let key = &inputs[1];
         let value = &inputs[2];
+        let metadata: [_; 8] = std::array::from_fn(|index| match inputs.get(index) {
+            Some(input) => TensorMetadata::new(input.dtype, input.shape, !input.is_absent()),
+            None => TensorMetadata::new(DataType::Undefined, &[], false),
+        });
+        let geometry = MhaGeometry::from_inputs(self.num_heads, &metadata)?;
+        let MhaGeometry {
+            batch,
+            heads: num_heads,
+            q_seq,
+            q_hidden,
+            head_size,
+            k_is_bnsh,
+            v_is_bnsh,
+            cur_seq,
+            past_seq,
+            total_seq,
+            q_elements,
+            kv_elements: _,
+            mask_elements,
+            pad_elements: _,
+            mask_planes,
+            dtype: attn_dtype,
+        } = geometry;
         let dtype = query.dtype;
-        let attn_dtype = AttentionDtype::from_onnx(dtype)?;
         let elem = attn_dtype.element_size() as usize;
+        let v_head_size = head_size;
+        let v_hidden = q_hidden;
+        let is_cross_bnsh = k_is_bnsh;
         if dtype != DataType::Float32 {
             self.runtime
                 .require_nvrtc_half_headers("MultiHeadAttention")?;
         }
-
-        if query.shape.len() != 3 {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep MultiHeadAttention: query must be rank 3 (B, S, hidden); packed-QKV layouts (rank {}) are unsupported",
-                query.shape.len()
-            )));
-        }
-        if key.is_absent() || value.is_absent() {
-            return Err(EpError::KernelFailed(
-                "cuda_ep MultiHeadAttention: separate key and value inputs are required (packed QKV/KV is unsupported)".into(),
-            ));
-        }
-        if key.shape.len() != value.shape.len() || !(key.shape.len() == 3 || key.shape.len() == 4) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep MultiHeadAttention: key and value must both be rank 3 (B, L, hidden) or rank 4 (B, N, L, head_size), got key rank {}, value rank {}",
-                key.shape.len(),
-                value.shape.len()
-            )));
-        }
-        for (name, v) in [("query", query), ("key", key), ("value", value)] {
-            if v.dtype != dtype {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep MultiHeadAttention: {name} dtype {:?} must match query dtype {dtype:?}",
-                    v.dtype
-                )));
-            }
-            if !v.is_contiguous() {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep MultiHeadAttention: {name} must be contiguous"
-                )));
+        for (name, input) in [("query", query), ("key", key), ("value", value)] {
+            if !input.is_contiguous() {
+                return Err(mha_error(format!("{name} must be contiguous")));
             }
         }
-
-        let num_heads = self.num_heads;
-        let batch = query.shape[0];
-        let q_seq = query.shape[1];
-        let q_hidden = query.shape[2];
-        require_positive(batch, "query batch")?;
-        require_positive(q_seq, "query sequence length")?;
-        require_positive(q_hidden, "query hidden")?;
-        checked_i32(batch, "batch")?;
-        checked_i32(num_heads, "num_heads")?;
-        checked_i32(q_seq, "query sequence length")?;
-        checked_i32(q_hidden, "query hidden")?;
-        checked_bytes(
-            checked_product(query.shape, "query element count")?,
-            attn_dtype.element_size() as usize,
-            "query",
-        )?;
-        if !q_hidden.is_multiple_of(num_heads) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep MultiHeadAttention: query hidden {q_hidden} not divisible by num_heads {num_heads}"
-            )));
-        }
-        let head_size = q_hidden / num_heads;
-        require_positive(head_size, "query head_size")?;
-        checked_i32(head_size, "query head_size")?;
-        let is_cross_bnsh = key.shape.len() == 4;
-
-        // Resolve the current K/V geometry and validate the equal-head-size
-        // requirement the shared Phase-2a core imposes on Q/K/V/O.
-        let resolve_kv = |v: &TensorView, name: &str| -> Result<(bool, usize, usize)> {
-            if v.shape[0] != batch {
-                return Err(mha_error(format!(
-                    "{name} batch {} must equal query batch {batch}",
-                    v.shape[0]
-                )));
-            }
-            match v.shape.len() {
-                3 => {
-                    let hidden = v.shape[2];
-                    require_positive(v.shape[1], &format!("{name} sequence length"))?;
-                    require_positive(hidden, &format!("{name} hidden"))?;
-                    if !hidden.is_multiple_of(num_heads) {
-                        return Err(EpError::KernelFailed(format!(
-                            "cuda_ep MultiHeadAttention: {name} hidden {hidden} not divisible by num_heads {num_heads}"
-                        )));
-                    }
-                    Ok((false, v.shape[1], hidden / num_heads))
-                }
-                4 => {
-                    if v.shape[1] != num_heads {
-                        return Err(EpError::KernelFailed(format!(
-                            "cuda_ep MultiHeadAttention: rank-4 {name} dim 1 ({}) must equal num_heads {num_heads}",
-                            v.shape[1]
-                        )));
-                    }
-                    require_positive(v.shape[2], &format!("{name} sequence length"))?;
-                    require_positive(v.shape[3], &format!("{name} head_size"))?;
-                    Ok((true, v.shape[2], v.shape[3]))
-                }
-                other => Err(EpError::KernelFailed(format!(
-                    "cuda_ep MultiHeadAttention: {name} rank {other} unsupported"
-                ))),
-            }
-        };
-        let (k_is_bnsh, k_seq, k_dim) = resolve_kv(key, "key")?;
-        let (v_is_bnsh, v_seq, v_head_size) = resolve_kv(value, "value")?;
-        for (name, view) in [("key", key), ("value", value)] {
-            for (axis, &value) in view.shape.iter().enumerate() {
-                checked_i32(value, &format!("{name} dim {axis}"))?;
-            }
-        }
-        if k_dim != head_size {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep MultiHeadAttention: key head_size {k_dim} != query head_size {head_size}"
-            )));
-        }
-        if k_seq != v_seq {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep MultiHeadAttention: key seq {k_seq} != value seq {v_seq}"
-            )));
-        }
-        if v_head_size != head_size {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep MultiHeadAttention: v_head_size {v_head_size} must equal qk_head_size {head_size} (the shared attention core assumes one head dimension)"
-            )));
-        }
-        for (name, view) in [("key", key), ("value", value)] {
-            checked_bytes(
-                checked_product(view.shape, &format!("{name} element count"))?,
-                attn_dtype.element_size() as usize,
-                name,
-            )?;
-        }
-        let v_hidden = checked_product(&[num_heads, v_head_size], "value hidden")?;
-        checked_i32(v_hidden, "value hidden")?;
-        let cur_seq = k_seq;
 
         // Optional bias `(D + D + D_v)` split into per-projection slices.
         let bias_in = optional(3);
@@ -1127,73 +1289,19 @@ impl Kernel for MultiHeadAttentionKernel {
         // Optional in-op KV cache (inputs 6 and 7), rank-4 (B, N, P, H).
         let past_key = optional(6);
         let past_value = optional(7);
-        if past_key.is_some() != past_value.is_some() {
-            return Err(EpError::KernelFailed(
-                "cuda_ep MultiHeadAttention: past_key and past_value must be provided together"
-                    .into(),
-            ));
-        }
-        let past_seq = match past_key {
-            Some(pk) => {
-                for (name, p) in [("past_key", pk), ("past_value", past_value.unwrap())] {
-                    if p.dtype != dtype {
-                        return Err(EpError::KernelFailed(format!(
-                            "cuda_ep MultiHeadAttention: {name} dtype {:?} must match query dtype {dtype:?}",
-                            p.dtype
-                        )));
-                    }
-                    if p.shape.len() != 4 || p.shape[0] != batch || p.shape[1] != num_heads {
-                        return Err(EpError::KernelFailed(format!(
-                            "cuda_ep MultiHeadAttention: {name} must be rank-4 (B={batch}, N={num_heads}, P, H), got {:?}",
-                            p.shape
-                        )));
-                    }
-                    if !p.is_contiguous() {
-                        return Err(EpError::KernelFailed(format!(
-                            "cuda_ep MultiHeadAttention: {name} must be contiguous"
-                        )));
-                    }
-                    for (axis, &value) in p.shape.iter().enumerate() {
-                        require_positive(value, &format!("{name} dim {axis}"))?;
-                        checked_i32(value, &format!("{name} dim {axis}"))?;
-                    }
-                    checked_bytes(
-                        checked_product(p.shape, &format!("{name} element count"))?,
-                        elem,
-                        name,
-                    )?;
-                }
-                if pk.shape[3] != head_size {
-                    return Err(EpError::KernelFailed(format!(
-                        "cuda_ep MultiHeadAttention: past_key head_size {} != query head_size {head_size}",
-                        pk.shape[3]
-                    )));
-                }
-                if past_value.unwrap().shape[3] != v_head_size {
-                    return Err(EpError::KernelFailed(format!(
-                        "cuda_ep MultiHeadAttention: past_value head_size {} != v_head_size {v_head_size}",
-                        past_value.unwrap().shape[3]
-                    )));
-                }
-                if past_value.unwrap().shape[2] != pk.shape[2] {
-                    return Err(EpError::KernelFailed(
-                        "cuda_ep MultiHeadAttention: past_key and past_value seq lengths differ"
-                            .into(),
-                    ));
-                }
-                pk.shape[2]
+        for (name, past) in [("past_key", past_key), ("past_value", past_value)] {
+            if let Some(past) = past
+                && !past.is_contiguous()
+            {
+                return Err(mha_error(format!("{name} must be contiguous")));
             }
-            None => 0,
-        };
-        let total_seq = checked_add(past_seq, cur_seq, "past_seq + current key sequence")?;
-        checked_i32(past_seq, "past sequence length")?;
-        checked_i32(cur_seq, "current key sequence length")?;
-        checked_i32(total_seq, "total sequence length")?;
+        }
 
         // present_key / present_value outputs share the built cache buffers, so
         // build them directly into the output allocations when requested.
         let want_present_k = outputs.len() >= 2 && !outputs[1].is_absent();
         let want_present_v = outputs.len() >= 3 && !outputs[2].is_absent();
+        check_present_slots(self.present_outputs, [want_present_k, want_present_v])?;
         for (index, name) in [(0usize, "output"), (1, "present_key"), (2, "present_value")] {
             if let Some(output) = outputs.get(index)
                 && !output.is_absent()
@@ -1235,37 +1343,7 @@ impl Kernel for MultiHeadAttentionKernel {
                 outputs[0].shape
             )));
         }
-        let q_elements =
-            checked_product(&[batch, num_heads, q_seq, head_size], "query BNSH elements")?;
-        let present_k_elements = checked_product(
-            &[batch, num_heads, total_seq, head_size],
-            "present_key BNSH elements",
-        )?;
-        let present_v_elements = checked_product(
-            &[batch, num_heads, total_seq, v_head_size],
-            "present_value BNSH elements",
-        )?;
-        let output_elements = checked_product(
-            &[batch, num_heads, q_seq, head_size],
-            "output BNSH elements",
-        )?;
-        let mask_elements = checked_product(
-            &[batch, num_heads, q_seq, total_seq],
-            "attention mask elements",
-        )?;
-        let pad_elements = checked_product(&[batch, q_seq, total_seq], "padding mask elements")?;
-        let mask_planes = checked_product(&[batch, num_heads], "attention mask planes")?;
-        checked_i32(mask_planes, "attention mask planes")?;
-        for (elements, name) in [
-            (q_elements, "query BNSH scratch"),
-            (present_k_elements, "present_key storage"),
-            (present_v_elements, "present_value storage"),
-            (output_elements, "output BNSH scratch"),
-            (mask_elements, "attention mask scratch"),
-        ] {
-            checked_bytes(elements, elem, name)?;
-            checked_grid(elements, &format!("{name} launch"))?;
-        }
+        let output_elements = q_elements;
         checked_bytes(
             checked_product(outputs[0].shape, "output element count")?,
             elem,
@@ -1286,6 +1364,23 @@ impl Kernel for MultiHeadAttentionKernel {
             )?;
         }
         checked_grid(mask_elements, "attention mask launch")?;
+
+        let layout = MhaWorkspace::new(
+            geometry,
+            self.present_outputs,
+            optional(4).is_some(),
+            optional(5).is_some(),
+        )?;
+        let [
+            q_region,
+            k_region,
+            v_region,
+            o_region,
+            mask_region,
+            pad_region,
+            phase2a_region,
+        ] = layout.bind(workspace)?;
+        let phase2a_scratch = Phase2aScratch::bind(&layout.phase2a, Some(phase2a_region))?;
 
         // Resolve key_padding_mask on the host (small, integer) exactly like
         // ORT's PrepareMask, into an additive [B, S, total] f32 buffer.
@@ -1345,44 +1440,28 @@ impl Kernel for MultiHeadAttentionKernel {
         let (build_entry, transpose_entry, mask_entry) = stems(dtype);
         let want_mask = pad_additive.is_some() || attn_bias.is_some();
 
-        let q_bytes = checked_bytes(q_elements, elem, "query BNSH scratch")?;
-        let present_k_bytes = checked_bytes(present_k_elements, elem, "present_key BNSH scratch")?;
-        let present_v_bytes =
-            checked_bytes(present_v_elements, elem, "present_value BNSH scratch")?;
-        let output_bytes = checked_bytes(output_elements, elem, "output BNSH scratch")?;
-        let mask_bytes = checked_bytes(mask_elements, elem, "attention mask scratch")?;
-        let pad_bytes = checked_bytes(
-            pad_elements,
-            std::mem::size_of::<f32>(),
-            "padding mask scratch",
-        )?;
-
-        let mut scratch = MhaScratch::new(self.runtime.as_ref());
-        let q_bnsh = scratch.allocate(q_bytes)?;
+        let mut submission = MhaStreamUse::new(self.runtime.as_ref());
+        let q_bnsh = cuptr(q_region.ptr().0.cast_const());
         let present_k = if want_present_k {
             cuptr(outputs[1].data_ptr_mut::<u8>() as *const c_void)
         } else {
-            scratch.allocate(present_k_bytes)?
+            cuptr(k_region.ptr().0.cast_const())
         };
         let present_v = if want_present_v {
             cuptr(outputs[2].data_ptr_mut::<u8>() as *const c_void)
         } else {
-            scratch.allocate(present_v_bytes)?
+            cuptr(v_region.ptr().0.cast_const())
         };
-        let o_bnsh = scratch.allocate(output_bytes)?;
+        let o_bnsh = cuptr(o_region.ptr().0.cast_const());
         let mask_ptr = if want_mask {
-            scratch.allocate(mask_bytes)?
+            cuptr(mask_region.ptr().0.cast_const())
         } else {
             0
         };
-        let pad_ptr = match &pad_additive {
-            Some(p) => {
-                let ptr = scratch.allocate(pad_bytes)?;
-                let bytes = bytemuck_f32_bytes(p);
-                scratch.upload(&bytes, ptr)?;
-                ptr
-            }
-            None => 0,
+        let pad_ptr = if pad_additive.is_some() {
+            cuptr(pad_region.ptr().0.cast_const())
+        } else {
+            0
         };
         let abias_ptr = attn_bias
             .map(|m| cuptr(m.data_ptr::<u8>() as *const c_void))
@@ -1399,133 +1478,163 @@ impl Kernel for MultiHeadAttentionKernel {
             .unwrap_or(0);
         let o_out = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        self.build_bnsh(
-            build_entry,
-            q_base,
-            false,
-            0,
-            false,
-            q_bias,
-            q_bias != 0,
-            q_bnsh,
-            batch,
-            num_heads,
-            q_seq,
-            0,
-            head_size,
-        )?;
-        scratch.mark_stream_use();
-        self.build_bnsh(
-            build_entry,
-            k_base,
-            k_is_bnsh,
-            past_k_base,
-            past_key.is_some(),
-            k_bias,
-            k_bias != 0,
-            present_k,
-            batch,
-            num_heads,
-            cur_seq,
-            past_seq,
-            head_size,
-        )?;
-        scratch.mark_stream_use();
-        self.build_bnsh(
-            build_entry,
-            v_base,
-            v_is_bnsh,
-            past_v_base,
-            past_value.is_some(),
-            v_bias,
-            v_bias != 0,
-            present_v,
-            batch,
-            num_heads,
-            cur_seq,
-            past_seq,
-            v_head_size,
-        )?;
-        scratch.mark_stream_use();
+        submission.mark_stream_use();
+        let result = (|| -> Result<()> {
+            if let Some(padding) = &pad_additive {
+                let bytes = bytemuck_f32_bytes(padding);
+                // SAFETY: the checked region covers all uploaded bytes. htod
+                // stages the source synchronously; unsettled destination DMA
+                // is latched for default-stream fencing by provider retirement.
+                unsafe { self.runtime.htod(&bytes, pad_ptr) }?;
+            }
+            self.build_bnsh(
+                build_entry,
+                q_base,
+                false,
+                0,
+                false,
+                q_bias,
+                q_bias != 0,
+                q_bnsh,
+                batch,
+                num_heads,
+                q_seq,
+                0,
+                head_size,
+            )?;
+            self.build_bnsh(
+                build_entry,
+                k_base,
+                k_is_bnsh,
+                past_k_base,
+                past_key.is_some(),
+                k_bias,
+                k_bias != 0,
+                present_k,
+                batch,
+                num_heads,
+                cur_seq,
+                past_seq,
+                head_size,
+            )?;
+            self.build_bnsh(
+                build_entry,
+                v_base,
+                v_is_bnsh,
+                past_v_base,
+                past_value.is_some(),
+                v_bias,
+                v_bias != 0,
+                present_v,
+                batch,
+                num_heads,
+                cur_seq,
+                past_seq,
+                v_head_size,
+            )?;
 
-        let mask_planes_i = if want_mask {
-            let (batch_i, heads_i, sq_i, total_i) = (
+            let mask_planes_i = if want_mask {
+                let (batch_i, heads_i, sq_i, total_i) = (
+                    checked_i32(batch, "batch")?,
+                    checked_i32(num_heads, "num_heads")?,
+                    checked_i32(q_seq, "query sequence length")?,
+                    checked_i32(total_seq, "total sequence length")?,
+                );
+                let has_abias_i = i32::from(attn_bias.is_some());
+                let abias_d0_i = checked_i32(abias_d0, "attention_bias dim 0")?;
+                let abias_d1_i = checked_i32(abias_d1, "attention_bias dim 1")?;
+                let has_pad_i = i32::from(pad_additive.is_some());
+                mha_launch_1d!(self, mask_entry, mask_elements, builder, {
+                    builder
+                        .arg(&mask_ptr)
+                        .arg(&abias_ptr)
+                        .arg(&has_abias_i)
+                        .arg(&abias_d0_i)
+                        .arg(&abias_d1_i)
+                        .arg(&pad_ptr)
+                        .arg(&has_pad_i)
+                        .arg(&batch_i)
+                        .arg(&heads_i)
+                        .arg(&sq_i)
+                        .arg(&total_i);
+                });
+                checked_i32(mask_planes, "attention mask planes")?
+            } else {
+                0
+            };
+
+            // The shared core can fail after submitting an earlier phase, so arm
+            // stream-ordered cleanup before entering it.
+            run_attention_phase2a(
+                &self.runtime,
+                attn_dtype,
+                num_heads,
+                num_heads,
+                causal,
+                batch,
+                q_seq,
+                total_seq,
+                head_size,
+                total_seq,
+                1,
+                scale,
+                q_bnsh,
+                present_k,
+                present_v,
+                o_bnsh,
+                mask_ptr,
+                mask_planes_i,
+                0,
+                0,
+                0,
+                0.0,
+                Some(phase2a_scratch),
+            )?;
+
+            let (batch_i, heads_i, sq_i, dim_i) = (
                 checked_i32(batch, "batch")?,
                 checked_i32(num_heads, "num_heads")?,
                 checked_i32(q_seq, "query sequence length")?,
-                checked_i32(total_seq, "total sequence length")?,
+                checked_i32(head_size, "head_size")?,
             );
-            let has_abias_i = i32::from(attn_bias.is_some());
-            let abias_d0_i = checked_i32(abias_d0, "attention_bias dim 0")?;
-            let abias_d1_i = checked_i32(abias_d1, "attention_bias dim 1")?;
-            let has_pad_i = i32::from(pad_additive.is_some());
-            mha_launch_1d!(self, mask_entry, mask_elements, builder, {
+            mha_launch_1d!(self, transpose_entry, output_elements, builder, {
                 builder
-                    .arg(&mask_ptr)
-                    .arg(&abias_ptr)
-                    .arg(&has_abias_i)
-                    .arg(&abias_d0_i)
-                    .arg(&abias_d1_i)
-                    .arg(&pad_ptr)
-                    .arg(&has_pad_i)
+                    .arg(&o_bnsh)
+                    .arg(&o_out)
                     .arg(&batch_i)
                     .arg(&heads_i)
                     .arg(&sq_i)
-                    .arg(&total_i);
+                    .arg(&dim_i);
             });
-            scratch.mark_stream_use();
-            checked_i32(mask_planes, "attention mask planes")?
-        } else {
-            0
-        };
 
-        // The shared core can fail after submitting an earlier phase, so arm
-        // stream-ordered cleanup before entering it.
-        scratch.mark_stream_use();
-        run_attention_phase2a(
-            &self.runtime,
-            attn_dtype,
-            num_heads,
-            num_heads,
-            causal,
-            batch,
-            q_seq,
-            total_seq,
-            head_size,
-            total_seq,
-            1,
-            scale,
-            q_bnsh,
-            present_k,
-            present_v,
-            o_bnsh,
-            mask_ptr,
-            mask_planes_i,
-            0,
-            0,
-            0,
-            0.0,
-            None,
-        )?;
+            Ok(())
+        })();
+        submission.finish(result)
+    }
+}
 
-        let (batch_i, heads_i, sq_i, dim_i) = (
-            checked_i32(batch, "batch")?,
-            checked_i32(num_heads, "num_heads")?,
-            checked_i32(q_seq, "query sequence length")?,
-            checked_i32(head_size, "head_size")?,
-        );
-        mha_launch_1d!(self, transpose_entry, output_elements, builder, {
-            builder
-                .arg(&o_bnsh)
-                .arg(&o_out)
-                .arg(&batch_i)
-                .arg(&heads_i)
-                .arg(&sq_i)
-                .arg(&dim_i);
-        });
-        scratch.mark_stream_use();
-
-        scratch.finish_stream_use()
+impl Kernel for MultiHeadAttentionKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        let geometry = MhaGeometry::from_inputs(self.num_heads, inputs)?;
+        let present = |index: usize| inputs.get(index).is_some_and(|input| input.present);
+        let layout = MhaWorkspace::new(geometry, self.present_outputs, present(4), present(5))?;
+        Ok(WorkspaceRequirement {
+            bytes: u64::try_from(layout.regions.bytes())
+                .map_err(|_| mha_error("workspace bytes exceed u64; reduce the input shape"))?,
+            alignment: layout.regions.alignment(),
+            lifetime: WorkspaceLifetime::StepScoped,
+        })
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -1535,10 +1644,10 @@ impl Kernel for MultiHeadAttentionKernel {
     }
 
     fn capture_support(&self) -> CaptureSupport {
-        // The Phase-2a core performs an unconditional trailing synchronize and
-        // this kernel allocates/frees per-call scratch — neither is capturable.
+        // The Phase-2a core and final output transpose require stream completion.
+        // Prepared backing does not make these synchronization points capturable.
         CaptureSupport::unsupported(
-            "cuda_ep MultiHeadAttention uses the per-call Phase-2a workspace path (allocates scratch and synchronizes)",
+            "cuda_ep MultiHeadAttention retains non-capturable Phase-2a, padding and output-transpose synchronization paths",
         )
     }
 }
@@ -1706,100 +1815,8 @@ fn check_present(
 mod tests {
     use super::*;
     use onnx_runtime_ir::{Attribute, NodeId, static_shape};
-    use std::cell::{Cell, RefCell};
-    use std::collections::BTreeMap;
+    use std::cell::Cell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-
-    #[derive(Default)]
-    struct FaultScratchRuntime {
-        fail_allocation_at: Cell<usize>,
-        allocation_attempts: Cell<usize>,
-        fail_upload: Cell<bool>,
-        next_pointer: Cell<CUdeviceptr>,
-        committed_bytes: Cell<usize>,
-        live_sizes: RefCell<BTreeMap<CUdeviceptr, usize>>,
-        free_counts: RefCell<BTreeMap<CUdeviceptr, usize>>,
-        events: RefCell<Vec<&'static str>>,
-    }
-
-    impl FaultScratchRuntime {
-        fn failing_allocation(attempt: usize) -> Self {
-            Self {
-                fail_allocation_at: Cell::new(attempt),
-                next_pointer: Cell::new(1),
-                ..Self::default()
-            }
-        }
-
-        fn failing_upload() -> Self {
-            Self {
-                fail_upload: Cell::new(true),
-                next_pointer: Cell::new(1),
-                ..Self::default()
-            }
-        }
-
-        fn assert_cleaned_once(&self, successful_allocations: usize) {
-            assert_eq!(
-                self.committed_bytes.get(),
-                0,
-                "committed scratch bytes must return to the baseline"
-            );
-            assert!(
-                self.live_sizes.borrow().is_empty(),
-                "no scratch allocation may remain live"
-            );
-            let frees = self.free_counts.borrow();
-            assert_eq!(frees.len(), successful_allocations);
-            assert!(
-                frees.values().all(|&count| count == 1),
-                "every allocation must be deallocated exactly once: {frees:?}"
-            );
-        }
-    }
-
-    impl MhaScratchRuntime for FaultScratchRuntime {
-        fn allocate_scratch(&self, bytes: usize) -> Result<CUdeviceptr> {
-            let attempt = self.allocation_attempts.get() + 1;
-            self.allocation_attempts.set(attempt);
-            if attempt == self.fail_allocation_at.get() {
-                return Err(mha_error(format!(
-                    "injected scratch allocation failure at attempt {attempt}"
-                )));
-            }
-            let pointer = self.next_pointer.get();
-            self.next_pointer.set(pointer + 1);
-            self.live_sizes.borrow_mut().insert(pointer, bytes);
-            self.committed_bytes.set(self.committed_bytes.get() + bytes);
-            self.events.borrow_mut().push("allocate");
-            Ok(pointer)
-        }
-
-        unsafe fn free_scratch(&self, ptr: CUdeviceptr) -> Result<()> {
-            let bytes = self
-                .live_sizes
-                .borrow_mut()
-                .remove(&ptr)
-                .expect("free must name a live scratch allocation");
-            self.committed_bytes.set(self.committed_bytes.get() - bytes);
-            *self.free_counts.borrow_mut().entry(ptr).or_default() += 1;
-            self.events.borrow_mut().push("free");
-            Ok(())
-        }
-
-        unsafe fn upload_scratch(&self, _src: &[u8], _dst: CUdeviceptr) -> Result<()> {
-            if self.fail_upload.get() {
-                return Err(mha_error("injected H2D failure"));
-            }
-            self.events.borrow_mut().push("upload");
-            Ok(())
-        }
-
-        fn synchronize_scratch_stream(&self) -> Result<()> {
-            self.events.borrow_mut().push("synchronize");
-            Ok(())
-        }
-    }
 
     fn node(attrs: &[(&str, Attribute)]) -> Node {
         let mut node = Node::new(NodeId(0), "MultiHeadAttention", vec![], vec![]);
@@ -1910,55 +1927,252 @@ mod tests {
         assert!(unsupported_reason(&n, &s, &dtypes).is_none());
     }
 
-    #[test]
-    fn scratch_raii_returns_committed_bytes_after_each_late_allocation_failure() {
-        const ALLOCATIONS: usize = 6;
-        for failed_attempt in 2..=ALLOCATIONS {
-            let runtime = FaultScratchRuntime::failing_allocation(failed_attempt);
-            let result = (|| -> Result<()> {
-                let mut scratch = MhaScratch::new(&runtime);
-                for _ in 0..ALLOCATIONS {
-                    scratch.allocate(64)?;
-                }
+    #[derive(Default)]
+    struct SyncPolicyRuntime {
+        calls: Cell<usize>,
+        fail: Cell<bool>,
+    }
+    impl MhaStreamRuntime for SyncPolicyRuntime {
+        fn apply_sync_policy(&self) -> Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            if self.fail.get() {
+                Err(mha_error("injected sync policy failure"))
+            } else {
                 Ok(())
-            })();
-            assert!(result.is_err(), "attempt {failed_attempt} must fail");
-            runtime.assert_cleaned_once(failed_attempt - 1);
+            }
+        }
+    }
+    fn planned_geometry(dtype: DataType, cross: bool, past: bool) -> MhaGeometry {
+        let q = [2, 5, 12];
+        let kv = if cross {
+            vec![2, 3, 7, 4]
+        } else {
+            vec![2, 7, 12]
+        };
+        let cache = [2, 3, 2, 4];
+        let absent = TensorMetadata::new(DataType::Undefined, &[], false);
+        MhaGeometry::from_inputs(
+            3,
+            &[
+                TensorMetadata::new(dtype, &q, true),
+                TensorMetadata::new(dtype, &kv, true),
+                TensorMetadata::new(dtype, &kv, true),
+                absent,
+                absent,
+                absent,
+                TensorMetadata::new(dtype, &cache, past),
+                TensorMetadata::new(dtype, &cache, past),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn prepared_composite_layout_covers_all_live_regions_and_output_modes() {
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            for cross in [false, true] {
+                for past in [false, true] {
+                    let geometry = planned_geometry(dtype, cross, past);
+                    assert_eq!(geometry.total_seq, if past { 9 } else { 7 });
+                    for present in [[false, false], [true, false], [false, true], [true, true]] {
+                        for (pad, bias) in
+                            [(false, false), (true, false), (false, true), (true, true)]
+                        {
+                            let layout = MhaWorkspace::new(geometry, present, pad, bias).unwrap();
+                            // Opaque device backing: layout binding must not read it.
+                            let base = 0x10000usize;
+                            let backing = WorkspaceView::new(
+                                onnx_runtime_ep_api::DevicePtrMut(base as *mut _),
+                                layout.regions.bytes(),
+                            );
+                            let views = layout.bind(Some(backing)).unwrap();
+                            let kv_bytes = 2 * 3 * geometry.total_seq * 4 * dtype.byte_size();
+                            let mask_bytes = 2 * 3 * 5 * geometry.total_seq * dtype.byte_size();
+                            assert_eq!(
+                                views.map(|view| view.bytes()),
+                                [
+                                    2 * 3 * 5 * 4 * dtype.byte_size(),
+                                    if present[0] { 0 } else { kv_bytes },
+                                    if present[1] { 0 } else { kv_bytes },
+                                    2 * 3 * 5 * 4 * dtype.byte_size(),
+                                    if pad || bias { mask_bytes } else { 0 },
+                                    if pad {
+                                        2 * 5 * geometry.total_seq * 4
+                                    } else {
+                                        0
+                                    },
+                                    mask_bytes.next_multiple_of(PHASE2A_SCRATCH_ALIGN)
+                                        + crate::blas::WORKSPACE_BYTES,
+                                ]
+                            );
+                            let mut end = base;
+                            for region in views.into_iter().filter(|view| view.bytes() != 0) {
+                                let start = region.ptr().0 as usize;
+                                assert!(
+                                    start >= end && start.is_multiple_of(PHASE2A_SCRATCH_ALIGN)
+                                );
+                                end = start + region.bytes();
+                                assert!(end <= base + layout.regions.bytes());
+                            }
+                            assert!(Phase2aScratch::bind(&layout.phase2a, Some(views[6])).is_ok());
+                        }
+                    }
+                }
+            }
         }
     }
 
     #[test]
-    fn scratch_raii_returns_committed_bytes_after_h2d_failure() {
-        let runtime = FaultScratchRuntime::failing_upload();
-        let result = (|| -> Result<()> {
-            let mut scratch = MhaScratch::new(&runtime);
-            for _ in 0..6 {
-                scratch.allocate(64)?;
-            }
-            scratch.upload(&[0; 64], 6)
-        })();
-        assert!(result.is_err());
-        runtime.assert_cleaned_once(6);
+    fn prepared_composite_rejects_missing_short_misaligned_and_wrapping_backing() {
+        let layout = MhaWorkspace::new(
+            planned_geometry(DataType::Float32, false, true),
+            [false; 2],
+            true,
+            true,
+        )
+        .unwrap();
+        for backing in [
+            None,
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(std::ptr::null_mut()),
+                layout.regions.bytes(),
+            )),
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(256usize as *mut _),
+                layout.regions.bytes() - 1,
+            )),
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(257usize as *mut _),
+                layout.regions.bytes(),
+            )),
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut((usize::MAX - 255) as *mut _),
+                layout.regions.bytes(),
+            )),
+        ] {
+            let message = layout.bind(backing).unwrap_err().to_string();
+            assert!(
+                message.contains("MultiHeadAttention")
+                    && message.contains("execute_with_workspace"),
+                "{message}"
+            );
+        }
     }
 
     #[test]
-    fn scratch_raii_is_panic_safe_and_orders_stream_completion_before_free() {
-        let runtime = FaultScratchRuntime {
-            next_pointer: Cell::new(1),
-            ..FaultScratchRuntime::default()
-        };
-        let panic = catch_unwind(AssertUnwindSafe(|| {
-            let mut scratch = MhaScratch::new(&runtime);
-            scratch.allocate(64).unwrap();
-            scratch.mark_stream_use();
-            panic!("injected panic after stream submission");
-        }));
-        assert!(panic.is_err());
-        runtime.assert_cleaned_once(1);
+    fn geometry_rejects_invalid_input_without_a_runtime_or_allocation() {
+        let q_shape = [2, 5, 12];
+        let kv_shape = [2, 7, 12];
+        let q = TensorMetadata::new(DataType::Float32, &q_shape, true);
+        let kv = TensorMetadata::new(DataType::Float32, &kv_shape, true);
+        for (heads, inputs, expected) in [
+            (0, vec![q, kv, kv], "num_heads"),
+            (3, vec![q], "key"),
+            (5, vec![q, kv, kv], "not divisible"),
+            (
+                3,
+                vec![
+                    q,
+                    kv,
+                    TensorMetadata::new(DataType::Float16, &kv_shape, true),
+                ],
+                "dtype",
+            ),
+            (
+                3,
+                vec![
+                    q,
+                    kv,
+                    TensorMetadata::new(DataType::Float32, &[2, 7, 15], true),
+                ],
+                "head_size",
+            ),
+        ] {
+            let message = MhaGeometry::from_inputs(heads, &inputs)
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(expected), "{message}");
+        }
+        let huge = [1, i32::MAX as usize, 4];
+        let inputs = [TensorMetadata::new(DataType::Float32, &huge, true); 3];
+        let message = MhaGeometry::from_inputs(4, &inputs)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("attention rows"), "{message}");
+    }
+
+    #[test]
+    fn declared_present_output_slots_preserve_omitted_positions() {
+        use onnx_runtime_ir::ValueId;
+        let node =
+            |outputs| Node::new_with_output_slots(NodeId(0), "MultiHeadAttention", vec![], outputs);
         assert_eq!(
-            runtime.events.borrow().as_slice(),
-            ["allocate", "synchronize", "free"]
+            present_output_slots(&node(vec![Some(ValueId(0)), None, Some(ValueId(2))])).unwrap(),
+            [false, true]
         );
+        assert_eq!(
+            present_output_slots(&node(vec![Some(ValueId(0))])).unwrap(),
+            [false; 2]
+        );
+        assert!(present_output_slots(&node(vec![None])).is_err());
+        assert!(present_output_slots(&node(vec![])).is_err());
+        for compiled in [[false; 2], [true, false], [false, true], [true; 2]] {
+            assert!(check_present_slots(compiled, compiled).is_ok());
+            let mismatched = [!compiled[0], compiled[1]];
+            let message = check_present_slots(compiled, mismatched)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("compiled slots")
+                    && message.contains("declared positional outputs"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn submission_sync_policy_preserves_both_errors_and_is_not_retried() {
+        let runtime = SyncPolicyRuntime::default();
+        runtime.fail.set(true);
+        let mut submission = MhaStreamUse::new(&runtime);
+        submission.mark_stream_use();
+        let message = submission
+            .finish(Err(mha_error("injected launch failure")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("launch failure") && message.contains("sync policy failure"),
+            "{message}"
+        );
+        assert_eq!(runtime.calls.get(), 1);
+    }
+
+    #[test]
+    fn submission_guard_applies_runtime_policy_on_success_error_and_panic() {
+        let runtime = SyncPolicyRuntime::default();
+        MhaStreamUse::new(&runtime)
+            .finish(Err(mha_error("before submission")))
+            .unwrap_err();
+        assert_eq!(runtime.calls.get(), 0);
+        let mut submission = MhaStreamUse::new(&runtime);
+        submission.mark_stream_use();
+        submission.finish(Ok(())).unwrap();
+        assert_eq!(runtime.calls.get(), 1);
+        let mut submission = MhaStreamUse::new(&runtime);
+        submission.mark_stream_use();
+        submission
+            .finish(Err(mha_error("after submission")))
+            .unwrap_err();
+        assert_eq!(runtime.calls.get(), 2);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let mut submission = MhaStreamUse::new(&runtime);
+                submission.mark_stream_use();
+                panic!("injected panic after launch");
+            }))
+            .is_err()
+        );
+        assert_eq!(runtime.calls.get(), 3);
     }
 
     #[test]
