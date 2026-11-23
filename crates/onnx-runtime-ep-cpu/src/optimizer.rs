@@ -130,6 +130,13 @@ pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     // operator group, so without either feature plain Conv kernels run instead.
     #[cfg(all(feature = "mlas", feature = "ops-cnn"))]
     passes.push(Box::new(crate::nchwc_layout::NchwcLayoutPropagation::new()));
+    passes.push(Box::new(
+        onnx_runtime_optimizer::quantized_matmul::AffineMatMulFusion {
+            single_row_only: false,
+            max_columns: usize::MAX,
+            gguf_layout: crate::kernels::block_quantized_matmul::packed_matmul_layout,
+        },
+    ));
     passes
 }
 

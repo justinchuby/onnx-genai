@@ -49,7 +49,7 @@ const QUANTIZE_ACCURACY4_BLOCKWISE_ENTRY: &str = "matmul_nbits_quantize_accuracy
 const GEMV_ACCURACY4_BLOCKWISE_ENTRY: &str = "matmul_nbits_gemv_accuracy4_blockwise";
 const ACCURACY4_MODULE: &str = "matmul_nbits_accuracy4";
 const ACCURACY4_ENTRY: &str = "matmul_nbits_accuracy4";
-const BLOCK_THREADS: u32 = 256;
+pub(crate) const BLOCK_THREADS: u32 = 256;
 const GEMV_ACCURACY4_THREADS: u32 = 256;
 const GEMV_ACCURACY4_COLUMNS_PER_BLOCK: usize = 8;
 const GEMV_ACCURACY4_SHARED_BYTES: u32 = 32 * 32;
@@ -569,7 +569,8 @@ extern "C" __global__ void matmul_nbits_gemv_f32(
     const int k_blocks,
     const int blob_size,
     const int zp_row_bytes,
-    const int bits)
+    const int bits,
+    const int round_affine_weights)
 {
     const int column = (int)blockIdx.x;
     if (column >= n) {
@@ -577,28 +578,33 @@ extern "C" __global__ void matmul_nbits_gemv_f32(
     }
 
     float value = 0.0f;
-    for (int depth = (int)threadIdx.x; depth < k; depth += (int)blockDim.x) {
-        const int block = depth / block_size;
+    for (long long depth = threadIdx.x; depth < k; depth += blockDim.x) {
+        const int block = (int)(depth / block_size);
         const int within = depth - block * block_size;
-        const long blob_base = ((long)column * k_blocks + block) * blob_size;
+        const long long blob_base = ((long long)column * k_blocks + block) * blob_size;
         int quantized;
         int zero_point;
         if (bits == 8) {
             quantized = (int)packed[blob_base + within];
             zero_point =
-                zero_points ? (int)zero_points[(long)column * k_blocks + block] : 128;
+                zero_points ? (int)zero_points[(long long)column * k_blocks + block] : 128;
         } else {
             const unsigned char byte = packed[blob_base + within / 2];
             quantized = (within & 1) ? (byte >> 4) : (byte & 15);
             zero_point = 8;
             if (zero_points) {
                 const unsigned char zp =
-                    zero_points[(long)column * zp_row_bytes + block / 2];
+                    zero_points[(long long)column * zp_row_bytes + block / 2];
                 zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
             }
         }
-        value += activation[depth] * ((float)quantized - (float)zero_point)
-            * scales[(long)column * k_blocks + block];
+        const float delta = (float)(quantized - zero_point);
+        const float scale = scales[(long long)column * k_blocks + block];
+        if (round_affine_weights) {
+            value = fmaf(activation[depth], __fmul_rn(delta, scale), value);
+        } else {
+            value += activation[depth] * delta * scale;
+        }
     }
 
     value = block_sum(value);
@@ -6717,6 +6723,10 @@ impl KernelFactory for MatMulNBitsFactory {
             block_size,
             accuracy_level,
             accuracy4_workspace,
+            round_affine_weights: node
+                .attr(onnx_runtime_optimizer::quantized_matmul::ROUND_AFFINE_WEIGHTS)
+                .and_then(|attr| attr.as_int())
+                == Some(1),
             marlin_repack_cache: marlin_gemm::RepackCache::new(self.runtime.clone()),
             constant_inputs: [false; 8],
             fold_bias_post_round: node
@@ -6959,6 +6969,7 @@ pub struct MatMulNBitsKernel {
     block_size: usize,
     accuracy_level: i64,
     accuracy4_workspace: Option<Mutex<Accuracy4Workspace>>,
+    round_affine_weights: bool,
     /// Repacked immutable weights owned by this kernel. Owner scoping prevents a
     /// later kernel from hitting stale contents when CUDA reuses an address.
     marlin_repack_cache: marlin_gemm::RepackCache,
@@ -7151,6 +7162,19 @@ impl MatMulNBitsKernel {
             .store(m == 1 && group_indices.is_none(), Ordering::Relaxed);
         if m == 1 && group_indices.is_none() {
             self.release_marlin_repack_for_decode();
+            if self.round_affine_weights {
+                return self.launch_f32_gemv(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    bias,
+                    &mut outputs[0],
+                    k_blocks,
+                    blob_size,
+                    zp_row_bytes,
+                );
+            }
             if self.bits == 4
                 && self.block_size == 128
                 && let Some(zero_points) = zero_points
@@ -10577,6 +10601,7 @@ impl MatMulNBitsKernel {
         let blob_size = as_i32("block blob size", blob_size)?;
         let zp_row_bytes = as_i32("zero-point row size", zp_row_bytes)?;
         let bits = as_i32("bits", self.bits)?;
+        let round_affine_weights = i32::from(self.round_affine_weights);
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
             .arg(&activation_ptr)
@@ -10591,7 +10616,8 @@ impl MatMulNBitsKernel {
             .arg(&k_blocks)
             .arg(&blob_size)
             .arg(&zp_row_bytes)
-            .arg(&bits);
+            .arg(&bits)
+            .arg(&round_affine_weights);
         // SAFETY: validated dense tensors cover the complete M=1 operation and
         // the scalar ABI matches `matmul_nbits_gemv_f32`.
         unsafe {
@@ -11583,6 +11609,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -11830,6 +11857,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -12079,6 +12107,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -12473,6 +12502,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -12678,6 +12708,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -13265,6 +13296,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -13705,6 +13737,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -14429,6 +14462,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -14584,6 +14618,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
                 fold_bias_post_round: false,
@@ -15181,6 +15216,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
                 fold_bias_post_round: false,
@@ -15457,6 +15493,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
                 fold_bias_post_round: false,
@@ -16135,6 +16172,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -16397,6 +16435,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -16670,6 +16709,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -16689,6 +16729,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: true,
@@ -16951,6 +16992,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
                 fold_bias_post_round: false,
@@ -17341,6 +17383,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -17830,6 +17873,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -17849,6 +17893,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -18408,6 +18453,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
                 fold_bias_post_round: false,
@@ -18427,6 +18473,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
                 fold_bias_post_round: false,
@@ -18788,6 +18835,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             block_size,
                             accuracy_level: 4,
                             accuracy4_workspace: None,
+                            round_affine_weights: false,
                             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                             constant_inputs: [true; 8],
                             fold_bias_post_round: false,
@@ -19245,6 +19293,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
+                round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
                 fold_bias_post_round: fold,
@@ -19612,6 +19661,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 0,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -19860,6 +19910,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 0,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -20125,6 +20176,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             block_size,
             accuracy_level: 0,
             accuracy4_workspace: None,
+            round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
             fold_bias_post_round: false,
@@ -20579,6 +20631,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                     block_size: BLOCK,
                     accuracy_level: 4,
                     accuracy4_workspace: None,
+                    round_affine_weights: false,
                     marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                     constant_inputs: [true; 8],
                     fold_bias_post_round: false,

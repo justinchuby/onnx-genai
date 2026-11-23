@@ -684,6 +684,7 @@ pub struct MatMulNBitsKernel {
     bits: usize,
     block_size: usize,
     accuracy_level: i64,
+    round_affine_weights: bool,
     /// Structural FLOPs (`2*rows*N*K`) when the activation's leading dims were
     /// static at build time; `None` otherwise (issue #995 — never fabricated).
     flops: Option<u64>,
@@ -1807,6 +1808,10 @@ impl KernelFactory for MatMulNBitsFactory {
             bits: bits as usize,
             block_size,
             accuracy_level,
+            round_affine_weights: node
+                .attr(onnx_runtime_optimizer::quantized_matmul::ROUND_AFFINE_WEIGHTS)
+                .and_then(|attr| attr.as_int())
+                == Some(1),
             flops,
             weight_prepacked: weight_prepacked == 1,
             constant_inputs: [false; 5],
@@ -2103,6 +2108,31 @@ impl MatMulNBitsKernel {
             owned_result = vec![0.0f32; result_len];
             &mut owned_result
         };
+        if self.round_affine_weights {
+            // A standalone DequantizeLinear rounds each weight before MatMul;
+            // the factored block dot cannot replace that rounding boundary.
+            self.project_dense_rows(
+                &inputs[1],
+                &inputs[2],
+                zero_points,
+                group_indices,
+                &activations,
+                m,
+                result,
+            )?;
+            if let Some(bias) = bias {
+                for row in result.chunks_exact_mut(self.n) {
+                    for (value, bias) in row.iter_mut().zip(&bias) {
+                        *value += bias;
+                    }
+                }
+            }
+            return if direct_result {
+                Ok(())
+            } else {
+                write_compute_f32(&mut outputs[0], result)
+            };
+        }
         let dot_kernel = selected_dot_kernel();
         if self.bits == 4
             && self.accuracy_level == 0
@@ -15310,6 +15340,7 @@ mod tests {
             bits: 4,
             block_size,
             accuracy_level: 0,
+            round_affine_weights: false,
             flops: None,
             weight_prepacked: false,
             constant_inputs: [false; 5],

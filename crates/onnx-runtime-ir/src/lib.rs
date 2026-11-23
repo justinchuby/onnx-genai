@@ -59,9 +59,11 @@ mod graph_view;
 mod layout;
 mod node;
 pub mod onnx;
+pub mod packed_matmul;
 pub mod packed_routed;
 pub mod pattern;
 pub mod quantized_grouped;
+pub mod quantized_matmul;
 pub mod standard_math;
 
 /// Descriptor for the same vendored schema that defines [`onnx`].
