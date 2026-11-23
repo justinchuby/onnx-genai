@@ -248,7 +248,7 @@ impl MoEKernel {
         shape: &[usize],
         inter: usize,
         has_fc3: bool,
-    ) -> Result<WorkspaceLayout<2>> {
+    ) -> Result<WorkspaceLayout<3>> {
         if !matches!(shape.len(), 2 | 3) {
             return Err(error(format!(
                 "input must be 2-D [rows, hidden] or 3-D [batch, sequence, hidden], got {shape:?}"
@@ -266,7 +266,8 @@ impl MoEKernel {
             .ok_or_else(invalid)?;
         let hidden = shape[shape.len() - 1];
         let input_elements = rows.checked_mul(hidden).ok_or_else(invalid)?;
-        std::alloc::Layout::array::<f32>(input_elements).map_err(|_| invalid())?;
+        let accumulator =
+            std::alloc::Layout::array::<f32>(input_elements).map_err(|_| invalid())?;
         let fc1 = self.attributes.checked_fc1_size(inter, "MoE")?;
         let grouped_possible =
             projection_work_units(rows, fc1, hidden, inter) >= self.grouped_min_work;
@@ -295,7 +296,7 @@ impl MoEKernel {
             std::alloc::Layout::array::<f32>(elements).map_err(|_| invalid())
         });
         let [a, b] = regions;
-        WorkspaceLayout::new([a?, b?])
+        WorkspaceLayout::new([a?, b?, accumulator])
     }
 }
 
@@ -491,7 +492,7 @@ impl Kernel for MoEKernel {
 
         let layout = self.workspace_layout(x_shape, inter, has_fc3)?;
         // SAFETY: exclusive Host backing lives through this synchronous call.
-        let [input, projection] = unsafe {
+        let [input, projection, mut accumulator] = unsafe {
             ProjectionScratch::bind_layout("MoE execution workspace", layout, workspace)?
         };
         let mut scratch = MoeWorkspace { input, projection };
@@ -534,8 +535,9 @@ impl Kernel for MoEKernel {
             inter,
             &self.attributes,
             &mut scratch,
+            &mut accumulator,
         )?;
-        write_dense_f32_narrow("MoE", &mut outputs[0], &output)
+        write_dense_f32_narrow("MoE", &mut outputs[0], output)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -897,7 +899,7 @@ fn grouped_min_work() -> u64 {
 /// inside a group are in ascending row order, so this is **bit-identical** to
 /// the grouped driver rather than merely close.
 #[allow(clippy::too_many_arguments)]
-fn run_moe_per_expert(
+fn run_moe_per_expert<'out>(
     plan: &RoutingPlan,
     x: &[f32],
     fc1_weights: &[f32],
@@ -911,8 +913,9 @@ fn run_moe_per_expert(
     inter: usize,
     attributes: &MoeAttributes,
     scratch: &mut MoeWorkspace<'_>,
-) -> Result<Vec<f32>> {
-    let mut output = vec![0.0f32; plan.rows * hidden];
+    accumulator: &'out mut ProjectionScratch<'_>,
+) -> Result<&'out [f32]> {
+    let output = accumulator.zeroed_prefix(plan.rows * hidden)?;
     if plan.slots() == 0 || hidden == 0 {
         return Ok(output);
     }
@@ -957,7 +960,7 @@ fn run_moe_per_expert(
 /// stage is one pass over one buffer, so the only serial work left is the
 /// routing itself.
 #[allow(clippy::too_many_arguments)]
-fn run_moe_grouped(
+fn run_moe_grouped<'out>(
     plan: &RoutingPlan,
     x: &[f32],
     fc1_weights: &[f32],
@@ -971,9 +974,10 @@ fn run_moe_grouped(
     inter: usize,
     attributes: &MoeAttributes,
     scratch: &mut MoeWorkspace<'_>,
-) -> Result<Vec<f32>> {
+    accumulator: &'out mut ProjectionScratch<'_>,
+) -> Result<&'out [f32]> {
     let slots = plan.slots();
-    let mut output = vec![0.0f32; plan.rows * hidden];
+    let output = accumulator.zeroed_prefix(plan.rows * hidden)?;
     if slots == 0 || hidden == 0 {
         return Ok(output);
     }
@@ -1044,7 +1048,7 @@ fn run_moe_grouped(
         &plan.slot_expert,
         plan.k,
     );
-    for_each_row(&mut output, hidden, |row, destination| {
+    for_each_row(output, hidden, |row, destination| {
         for &slot in &row_slots[row * k..(row + 1) * k] {
             if slot == u32::MAX {
                 continue;
@@ -1814,6 +1818,22 @@ mod tests {
         (graph, node)
     }
 
+    fn test_accumulator(backing: &mut [f32]) -> ProjectionScratch<'_> {
+        let bytes = std::mem::size_of_val(backing);
+        // SAFETY: this initialized Host slice is exclusively lent by the test.
+        unsafe {
+            ProjectionScratch::bind(
+                "MoE test accumulator",
+                bytes,
+                Some(WorkspaceView::new(
+                    onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+                    bytes,
+                )),
+            )
+        }
+        .unwrap()
+    }
+
     fn test_scratch(backing: &mut [f32]) -> MoeWorkspace<'_> {
         let mid = backing.len() / 2;
         let (a, b) = backing.split_at_mut(mid);
@@ -1892,7 +1912,7 @@ mod tests {
         // plus an explicit grouped override; policy lives in the kernel.
         for threshold in [97, 96, 0] {
             let kernel = workspace_kernel(threshold);
-            let bytes = ROWS * (H + H) * 4 * if threshold <= 96 { K } else { 1 };
+            let bytes = ROWS * (H + H) * 4 * if threshold <= 96 { K } else { 1 } + ROWS * H * 4;
             let books = RecordingGovernor::new_host(bytes as u64);
             let manager = ProcessMemoryManager::new().unwrap();
             let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
@@ -2016,8 +2036,8 @@ mod tests {
         };
         for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
             assert_eq!(requirement(&[0, 4], dtype, true).unwrap().bytes, 0);
-            assert_eq!(requirement(&[1, 4], dtype, true).unwrap().bytes, 32);
-            assert_eq!(requirement(&[2, 3, 4], dtype, true).unwrap().bytes, 192);
+            assert_eq!(requirement(&[1, 4], dtype, true).unwrap().bytes, 48);
+            assert_eq!(requirement(&[2, 3, 4], dtype, true).unwrap().bytes, 288);
         }
         for shape in [
             &[][..],
@@ -2050,7 +2070,7 @@ mod tests {
         let grouped = workspace_kernel(0);
         assert_eq!(
             grouped.workspace_layout(&[1, 4], 4, false).unwrap().bytes(),
-            64
+            80
         );
         assert!(
             grouped
@@ -2165,7 +2185,7 @@ mod tests {
                         } else {
                             hidden + inter
                         };
-                        assert_eq!(req.bytes, (bound * widths * 4) as u64);
+                        assert_eq!(req.bytes, ((bound * widths + rows * hidden) * 4) as u64);
                         let books = RecordingGovernor::new_host(req.bytes);
                         let manager = ProcessMemoryManager::new().unwrap();
                         let backing_pool =
@@ -2233,6 +2253,123 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn accumulator_preserves_strided_f32_f16_and_bf16_outputs() {
+        const ROWS: usize = 3;
+        const H: usize = 4;
+        const E: usize = 4;
+        fn tensor(dtype: DataType, shape: &[usize], values: &[f32]) -> Owned {
+            match dtype {
+                DataType::Float32 => Owned::f32(shape, values),
+                DataType::Float16 => Owned::f16(shape, values),
+                DataType::BFloat16 => Owned::bf16(shape, values),
+                _ => unreachable!(),
+            }
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            for threshold in [0, u64::MAX] {
+                let kernel = workspace_kernel(threshold);
+                let input = tensor(
+                    dtype,
+                    &[ROWS, H],
+                    &[1., 1., 1., 1., 2., 2., 2., 2., 3., 3., 3., 3.],
+                );
+                let router = tensor(dtype, &[ROWS, E], &[4., 4., 0., 0.].repeat(ROWS));
+                let fc1 = tensor(dtype, &[E, H, H], &[1.; E * H * H]);
+                let fc2 = tensor(dtype, &[E, H, H], &[1.; E * H * H]);
+                let mut output = tensor(dtype, &[ROWS, H * 2], &[-123.; ROWS * H * 2])
+                    .with_view(&[ROWS, H], &[(H * 2) as i64, 2]);
+                pool.install(|| {
+                    kernel.execute_prepared(
+                        &[
+                            input.view(),
+                            router.view(),
+                            fc1.view(),
+                            TensorView::absent(dtype),
+                            fc2.view(),
+                        ],
+                        &mut [output.view_mut()],
+                    )
+                })
+                .unwrap();
+                let physical = match dtype {
+                    DataType::Float32 => output.to_f32(),
+                    DataType::Float16 => output.to_f16_as_f32(),
+                    DataType::BFloat16 => output.to_bf16_as_f32(),
+                    _ => unreachable!(),
+                };
+                for (index, value) in physical.into_iter().enumerate() {
+                    assert_eq!(
+                        value,
+                        if index % 2 == 0 {
+                            16. * (index / (2 * H) + 1) as f32
+                        } else {
+                            -123.
+                        },
+                        "dtype={dtype:?}, offset={index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn accumulator_finishes_reading_input_before_writing_an_aliased_output() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::DeviceId;
+        let shape = [3, 4];
+        let strides = [4, 1];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let router = Owned::f32(&[3, 4], &[4., 4., 0., 0.].repeat(3));
+        let fc1 = Owned::f32(&[4, 4, 4], &[1.; 64]);
+        let fc2 = Owned::f32(&[4, 4, 4], &[1.; 64]);
+        for threshold in [0, u64::MAX] {
+            let kernel = workspace_kernel(threshold);
+            let mut values: Vec<f32> = vec![1., 1., 1., 1., 2., 2., 2., 2., 3., 3., 3., 3.];
+            pool.install(|| {
+                let pointer = values.as_mut_ptr().cast::<std::ffi::c_void>();
+                // Both views share live Host backing. The kernel stages all
+                // contributions before its final write, preserving this alias.
+                let input = TensorView::new(
+                    DevicePtr(pointer.cast_const()),
+                    DataType::Float32,
+                    &shape,
+                    &strides,
+                    DeviceId::cpu(),
+                );
+                let output = TensorMut::new(
+                    DevicePtrMut(pointer),
+                    DataType::Float32,
+                    &shape,
+                    &strides,
+                    DeviceId::cpu(),
+                );
+                kernel.execute_prepared(
+                    &[
+                        input,
+                        router.view(),
+                        fc1.view(),
+                        TensorView::absent(DataType::Float32),
+                        fc2.view(),
+                    ],
+                    &mut [output],
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                values,
+                [16., 16., 16., 16., 32., 32., 32., 32., 48., 48., 48., 48.]
+            );
         }
     }
 
@@ -2833,6 +2970,10 @@ mod tests {
                     plan.build_row_slots();
                     let mut backing = vec![0f32; plan.slots() * (HIDDEN + 3 * INTER) * 2];
                     let mut scratch = test_scratch(&mut backing);
+                    let mut grouped_backing = vec![f32::NAN; rows * HIDDEN];
+                    let mut grouped_accumulator = test_accumulator(&mut grouped_backing);
+                    let mut expert_backing = vec![f32::NAN; rows * HIDDEN];
+                    let mut expert_accumulator = test_accumulator(&mut expert_backing);
                     let grouped = run_moe_grouped(
                         &plan,
                         &x,
@@ -2847,6 +2988,7 @@ mod tests {
                         INTER,
                         &attributes,
                         &mut scratch,
+                        &mut grouped_accumulator,
                     )
                     .unwrap();
                     let per_expert = run_moe_per_expert(
@@ -2863,6 +3005,7 @@ mod tests {
                         INTER,
                         &attributes,
                         &mut scratch,
+                        &mut expert_accumulator,
                     )
                     .unwrap();
                     assert_eq!(
@@ -3089,6 +3232,8 @@ mod tests {
                     plan.build_row_slots();
                     let mut backing = vec![0f32; plan.slots() * (HIDDEN + 3 * INTER) * 2];
                     let mut scratch = test_scratch(&mut backing);
+                    let mut result_backing = vec![f32::NAN; rows * HIDDEN];
+                    let mut result_accumulator = test_accumulator(&mut result_backing);
                     let got = run_moe_grouped(
                         &plan,
                         &input,
@@ -3103,6 +3248,7 @@ mod tests {
                         INTER,
                         &attributes,
                         &mut scratch,
+                        &mut result_accumulator,
                     )
                     .unwrap();
                     assert_eq!(
