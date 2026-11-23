@@ -105,6 +105,13 @@ pub(crate) async fn props(
             "reranking": handle.engine.reranking.is_some()
         }
     });
+    if let Some(source) = handle
+        .chat_template
+        .as_ref()
+        .and_then(|template| template.tool_source())
+    {
+        properties["chat_template_tool_use"] = json!(source);
+    }
     if !handle.engine.runtime_sampling
         && let Some(params) = properties["default_generation_settings"]["params"].as_object_mut()
     {

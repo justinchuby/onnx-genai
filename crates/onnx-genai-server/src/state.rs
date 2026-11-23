@@ -656,24 +656,8 @@ fn load_prompt_contracts(model_dir: &Path) -> anyhow::Result<LoadedPromptContrac
             });
         }
     };
-    let declared = config
-        .as_ref()
-        .and_then(|value| value.get("chat_template"))
-        .filter(|value| !value.is_null());
-    let standalone = model_dir.join("chat_template.jinja").is_file();
-    anyhow::ensure!(
-        standalone || declared.is_none_or(serde_json::Value::is_string),
-        "{} chat_template must currently be a string; provide chat_template.jinja for a selected named template",
-        path.display()
-    );
-    let chat_template = if standalone || declared.is_some() {
-        Some(
-            ChatTemplate::from_model_assets(model_dir, config.as_ref())
-                .with_context(|| format!("load chat template in {}", model_dir.display()))?,
-        )
-    } else {
-        None
-    };
+    let chat_template = ChatTemplate::from_model_assets(model_dir, config.as_ref())
+        .with_context(|| format!("load chat templates in {}", model_dir.display()))?;
     let response_template = config
         .as_ref()
         .and_then(|value| value.get("response_template"))

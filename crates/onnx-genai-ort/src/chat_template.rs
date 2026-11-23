@@ -17,6 +17,7 @@ const DEFAULT_CHAT_TEMPLATE: &str = r#"{% for message in messages %}{{ message.r
 #[derive(Debug, Clone)]
 pub struct ChatTemplate {
     template: String,
+    tool_template: Option<String>,
     bos_token: Option<String>,
     eos_token: Option<String>,
 }
@@ -143,13 +144,18 @@ impl ChatMessage {
 }
 
 impl ChatTemplate {
-    /// The template source this model ships.
+    /// The resolved base/default template source this model ships.
     ///
     /// Exposed so a front end can read the conventions a package declares —
     /// reasoning delimiters, for instance — from the model's own data rather
     /// than inferring them from its name.
     pub fn source(&self) -> &str {
         &self.template
+    }
+
+    /// The explicit tool-use source, if this package ships a separate variant.
+    pub fn tool_source(&self) -> Option<&str> {
+        self.tool_template.as_deref()
     }
 
     /// A `ChatTemplate` backed by the built-in default (`DEFAULT_CHAT_TEMPLATE`).
@@ -161,6 +167,7 @@ impl ChatTemplate {
     pub fn builtin_default() -> Self {
         Self {
             template: DEFAULT_CHAT_TEMPLATE.to_string(),
+            tool_template: None,
             bos_token: None,
             eos_token: None,
         }
@@ -174,6 +181,7 @@ impl ChatTemplate {
     pub fn from_source(template: impl Into<String>) -> Self {
         Self {
             template: template.into(),
+            tool_template: None,
             bos_token: None,
             eos_token: None,
         }
@@ -195,43 +203,111 @@ impl ChatTemplate {
         } else {
             None
         };
-        Self::from_model_assets(model_dir, tokenizer_config_value.as_ref())
-    }
-
-    /// Select the chat template from an already-parsed tokenizer configuration.
-    /// Lets serving resolve chat and response contracts from one file snapshot.
-    pub fn from_model_assets(
-        model_dir: &Path,
-        tokenizer_config_value: Option<&Value>,
-    ) -> Result<Self> {
+        if let Some(template) = Self::from_model_assets(model_dir, tokenizer_config_value.as_ref())?
+        {
+            return Ok(template);
+        }
         let (bos_token, eos_token) = tokenizer_config_value
+            .as_ref()
             .map(special_tokens)
             .unwrap_or_default();
-
-        let standalone = model_dir.join("chat_template.jinja");
-        if standalone.is_file() {
-            return Ok(Self {
-                template: std::fs::read_to_string(standalone)?,
-                bos_token,
-                eos_token,
-            });
-        }
-
-        if let Some(value) = tokenizer_config_value
-            && let Some(template) = value.get("chat_template").and_then(Value::as_str)
-        {
-            return Ok(Self {
-                template: template.to_string(),
-                bos_token,
-                eos_token,
-            });
-        }
-
         Ok(Self {
-            template: DEFAULT_CHAT_TEMPLATE.to_string(),
+            template: DEFAULT_CHAT_TEMPLATE.into(),
+            tool_template: None,
             bos_token,
             eos_token,
         })
+    }
+
+    /// Load declared single/named templates from one tokenizer-config snapshot.
+    /// Independent Jinja assets take precedence over config entries. Absence is
+    /// explicit so a caller may choose its own documented fallback formatter.
+    pub fn from_model_assets(model_dir: &Path, config: Option<&Value>) -> Result<Option<Self>> {
+        let (bos_token, eos_token) = config.map(special_tokens).unwrap_or_default();
+        let mut templates = std::collections::BTreeMap::new();
+        let base = model_dir.join("chat_template.jinja");
+        if let Some(source) = read_optional_template(&base)? {
+            templates.insert("default".to_owned(), source);
+        }
+        let directory = model_dir.join("chat_templates");
+        match std::fs::read_dir(&directory) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|error| template_io_error(&directory, error))?;
+                    let path = entry.path();
+                    if path
+                        .extension()
+                        .is_none_or(|extension| extension != "jinja")
+                    {
+                        continue;
+                    }
+                    let name=path.file_stem().and_then(|name|name.to_str()).filter(|name|!name.is_empty())
+                    .ok_or_else(||OrtError::InvalidArgument(format!("chat template {} needs a nonempty UTF-8 name; rename the Jinja file",path.display())))?;
+                    let source = std::fs::read_to_string(&path)
+                        .map_err(|error| template_io_error(&path, error))?;
+                    if templates.insert(name.to_owned(), source).is_some() {
+                        return Err(OrtError::InvalidArgument(format!(
+                            "duplicate chat template name {name:?} in {}; keep one independent Jinja source for this name",
+                            model_dir.display()
+                        )));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(template_io_error(&directory, error)),
+        }
+        if templates.is_empty() {
+            let Some(value) = config
+                .and_then(|config| config.get("chat_template"))
+                .filter(|value| !value.is_null())
+            else {
+                return Ok(None);
+            };
+            if let Some(source) = value.as_str() {
+                if source.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(Self {
+                    template: source.to_owned(),
+                    tool_template: None,
+                    bos_token,
+                    eos_token,
+                }));
+            }
+            let scope = format!(
+                "{} chat_template",
+                model_dir.join("tokenizer_config.json").display()
+            );
+            if let Some(map) = value.as_object() {
+                for (name, source) in map {
+                    insert_named_template(&mut templates, name, source, &scope)?;
+                }
+            } else if let Some(entries) = value.as_array() {
+                for (index, entry) in entries.iter().enumerate() {
+                    let entry_scope = format!("{scope}[{index}]");
+                    let name=entry.get("name").and_then(Value::as_str).ok_or_else(||OrtError::InvalidArgument(format!("{entry_scope}.name must be a nonempty string; declare the template name")))?;
+                    let source=entry.get("template").ok_or_else(||OrtError::InvalidArgument(format!("{entry_scope}.template must be a Jinja string; provide the named source")))?;
+                    insert_named_template(&mut templates, name, source, &entry_scope)?;
+                }
+            } else {
+                return Err(OrtError::InvalidArgument(format!(
+                    "{scope} must be a Jinja string, name-to-source object or list of name/template objects; repair the declared templates"
+                )));
+            }
+        }
+        if templates.values().all(String::is_empty) {
+            return Ok(None);
+        }
+        let template=templates.get("default").filter(|source|!source.is_empty()).or_else(||templates.get("tool_use").filter(|source|!source.is_empty()))
+            .ok_or_else(||OrtError::InvalidArgument(format!("chat templates in {} need a default or tool_use source; available names are {:?}; provide chat_template.jinja or name the base template default",model_dir.display(),templates.keys().collect::<Vec<_>>())))?.clone();
+        Ok(Some(Self {
+            template,
+            tool_template: templates
+                .remove("tool_use")
+                .filter(|source| !source.is_empty()),
+            bos_token,
+            eos_token,
+        }))
     }
 
     /// Render chat messages using this template.
@@ -320,7 +396,18 @@ impl ChatTemplate {
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_filter("tojson", tojson);
         env.add_function("raise_exception", raise_exception);
-        let template_source = normalize_hf_jinja(&self.template);
+        let has_tools=match &tools {
+            Value::Null=>false,
+            Value::Array(tools)=>!tools.is_empty(),
+            Value::Object(tools)=>!tools.is_empty(),
+            _=>return Err(OrtError::InvalidArgument("chat-template tools must be a JSON array, object or null; provide structured tool definitions".into())),
+        };
+        let source = if has_tools {
+            self.tool_template.as_deref().unwrap_or(&self.template)
+        } else {
+            &self.template
+        };
+        let template_source = normalize_hf_jinja(source);
         env.add_template("chat", &template_source)
             .map_err(|err| OrtError::InvalidArgument(format!("invalid chat template: {err}")))?;
         let template = env
@@ -339,6 +426,59 @@ impl ChatTemplate {
             })
             .map_err(|err| OrtError::InvalidArgument(format!("chat template render failed: {err}")))
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "read chat template asset {path}: {source}; check the asset path, UTF-8 encoding and read permissions"
+)]
+struct TemplateAssetReadError {
+    path: std::path::PathBuf,
+    #[source]
+    source: std::io::Error,
+}
+fn template_io_error(path: &Path, error: std::io::Error) -> OrtError {
+    std::io::Error::new(
+        error.kind(),
+        TemplateAssetReadError {
+            path: path.to_owned(),
+            source: error,
+        },
+    )
+    .into()
+}
+fn read_optional_template(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(source) => Ok(Some(source)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(template_io_error(path, error)),
+    }
+}
+fn insert_named_template(
+    templates: &mut std::collections::BTreeMap<String, String>,
+    name: &str,
+    source: &Value,
+    scope: &str,
+) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(OrtError::InvalidArgument(format!(
+            "{scope} template name must not be empty; give each source a unique name"
+        )));
+    }
+    let source = source.as_str().ok_or_else(|| {
+        OrtError::InvalidArgument(format!(
+            "{scope} template {name:?} must contain a Jinja string; repair its source"
+        ))
+    })?;
+    if templates
+        .insert(name.to_owned(), source.to_owned())
+        .is_some()
+    {
+        return Err(OrtError::InvalidArgument(format!(
+            "{scope} duplicates template {name:?}; keep one source per name"
+        )));
+    }
+    Ok(())
 }
 
 /// Parenthesize the single-keyword conditional form emitted by some Hugging
@@ -556,6 +696,169 @@ mod tests {
     }
 
     #[test]
+    fn named_templates_select_declared_default_and_nonempty_tool_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = "{{ bos_token }}plain:{{ messages[0].content }}";
+        let tool = "{{ bos_token }}tools={{ tools|length }}:{{ messages[0].content }}";
+        for named in [
+            serde_json::json!({"default":base,"tool_use":tool}),
+            serde_json::json!([
+                {"name":"default","template":base},{"name":"tool_use","template":tool}
+            ]),
+        ] {
+            let config = serde_json::json!({"chat_template":named,"bos_token":{"content":"<B>"}});
+            let template = ChatTemplate::from_model_assets(dir.path(), Some(&config))
+                .unwrap()
+                .unwrap();
+            assert_eq!(template.source(), base);
+            assert_eq!(template.tool_source(), Some(tool));
+            let messages = [ChatMessage::user("hello")];
+            for tools in [None, Some("[]"), Some("{}"), Some("null")] {
+                assert_eq!(
+                    template.render(&messages, tools, false).unwrap(),
+                    "<B>plain:hello"
+                );
+            }
+            assert_eq!(
+                template
+                    .render(&messages, Some(r#"[{"type":"function"}]"#), false)
+                    .unwrap(),
+                "<B>tools=1:hello"
+            );
+            for invalid in ["42", "true", "[invalid"] {
+                assert!(
+                    template
+                        .render(&messages, Some(invalid), false)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("tools")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn named_template_assets_override_config_and_tool_only_assets_supply_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("chat_templates")).unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{{ bos_token }}file-base",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("chat_templates/tool_use.jinja"),
+            "file-tools",
+        )
+        .unwrap();
+        let config = serde_json::json!({"chat_template":false,"bos_token":"<B>"});
+        let loaded = ChatTemplate::from_model_assets(dir.path(), Some(&config))
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.render(&[], None, false).unwrap(), "<B>file-base");
+        assert_eq!(
+            loaded.render(&[], Some("[{}]"), false).unwrap(),
+            "file-tools"
+        );
+        std::fs::remove_file(dir.path().join("chat_template.jinja")).unwrap();
+        let loaded = ChatTemplate::from_model_assets(dir.path(), Some(&config))
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.source(), "file-tools");
+        assert_eq!(loaded.render(&[], None, false).unwrap(), "file-tools");
+    }
+
+    #[test]
+    fn named_template_configuration_errors_name_the_source_and_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        for (named, expected) in [
+            (serde_json::json!(42), "must be a Jinja string"),
+            (
+                serde_json::json!({"default":42}),
+                "must contain a Jinja string",
+            ),
+            (serde_json::json!([{ "template":"base"}]), ".name must be"),
+            (
+                serde_json::json!([{ "name":"default"}]),
+                ".template must be",
+            ),
+            (
+                serde_json::json!([{ "name":"default","template":"a"},{"name":"default","template":"b"}]),
+                "duplicates template",
+            ),
+            (serde_json::json!({"":"base"}), "name must not be empty"),
+            (serde_json::json!({"custom":"base"}), "available names"),
+        ] {
+            let error = ChatTemplate::from_model_assets(
+                dir.path(),
+                Some(&serde_json::json!({"chat_template":named})),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{named}: {error}");
+            assert!(error.contains(&dir.path().display().to_string()), "{error}");
+        }
+        let loaded = ChatTemplate::from_model_assets(
+            dir.path(),
+            Some(&serde_json::json!({"chat_template":{"default":"base","tool_use":""}})),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded.tool_source(), None);
+        assert_eq!(loaded.render(&[], Some("[{}]"), false).unwrap(), "base");
+    }
+
+    #[test]
+    fn empty_named_template_assets_remain_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        for declaration in [
+            serde_json::json!(""),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!({"default":"","tool_use":""}),
+        ] {
+            assert!(
+                ChatTemplate::from_model_assets(
+                    dir.path(),
+                    Some(&serde_json::json!({"chat_template":declaration}))
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        std::fs::write(dir.path().join("chat_template.jinja"), "").unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"bos_token":"<B>","chat_template":42}"#,
+        )
+        .unwrap();
+        let fallback = ChatTemplate::from_model_dir(dir.path()).unwrap();
+        assert_eq!(fallback.source(), DEFAULT_CHAT_TEMPLATE);
+        assert_eq!(fallback.bos_token.as_deref(), Some("<B>"));
+    }
+
+    #[test]
+    fn named_template_asset_errors_preserve_the_io_cause() {
+        use std::error::Error as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("chat_template.jinja")).unwrap();
+        let error = ChatTemplate::from_model_assets(dir.path(), None).unwrap_err();
+        assert!(matches!(error, OrtError::Io(_)));
+        assert!(error.to_string().contains("chat_template.jinja"));
+        assert!(error.source().is_some());
+        std::fs::remove_dir(dir.path().join("chat_template.jinja")).unwrap();
+        std::fs::write(dir.path().join("chat_template.jinja"), "base").unwrap();
+        std::fs::create_dir(dir.path().join("chat_templates")).unwrap();
+        std::fs::write(dir.path().join("chat_templates/default.jinja"), "duplicate").unwrap();
+        assert!(
+            ChatTemplate::from_model_assets(dir.path(), None)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate chat template name")
+        );
+    }
+
+    #[test]
     fn standalone_template_loads_string_and_object_special_tokens() {
         let dir = test_dir("special-tokens");
         fs::create_dir_all(&dir).unwrap();
@@ -591,6 +894,7 @@ mod tests {
                 "|{{ '\n keep \n'.strip('\n') }}"
             )
             .to_string(),
+            tool_template: None,
             bos_token: None,
             eos_token: None,
         };
@@ -609,6 +913,7 @@ mod tests {
         let template = ChatTemplate {
             template: "{% for m in messages %}{{ m.get('name') or m.get('tool_call_id') or '?' }}|{% endfor %}"
                 .to_string(),
+            tool_template: None,
             bos_token: None,
             eos_token: None,
         };
@@ -636,6 +941,7 @@ mod tests {
                 "|{{ reasoning_strength if reasoning_strength is defined and reasoning_strength else 'unset' }}"
             )
             .to_string(),
+            tool_template: None,
             bos_token: None,
             eos_token: None,
         };
@@ -659,6 +965,7 @@ mod tests {
                 "{{ state.name }}"
             )
             .to_string(),
+            tool_template: None,
             bos_token: None,
             eos_token: None,
         };
@@ -682,6 +989,7 @@ mod tests {
         // model was trained to recognize.
         let template = ChatTemplate {
             template: "{{ tools | tojson }}".to_string(),
+            tool_template: None,
             bos_token: None,
             eos_token: None,
         };
@@ -696,6 +1004,7 @@ mod tests {
     fn tojson_honors_the_indent_argument() {
         let template = ChatTemplate {
             template: "{{ tools | tojson(indent=2) }}".to_string(),
+            tool_template: None,
             bos_token: None,
             eos_token: None,
         };
@@ -709,6 +1018,7 @@ mod tests {
     fn raise_exception_returns_render_error() {
         let template = ChatTemplate {
             template: "{{ raise_exception('invalid messages') }}".to_string(),
+            tool_template: None,
             bos_token: None,
             eos_token: None,
         };
@@ -721,6 +1031,7 @@ mod tests {
     fn render_uses_hugging_face_block_whitespace_controls() {
         let template = ChatTemplate {
             template: "before\n    {% if true %}\n    value\n    {% endif %}\nafter".to_string(),
+            tool_template: None,
             bos_token: None,
             eos_token: None,
         };

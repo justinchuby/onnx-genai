@@ -6205,6 +6205,126 @@ mod llama_compat {
     }
 
     #[tokio::test]
+    async fn named_templates_drive_props_prompt_counts_and_real_tool_generation() {
+        let base = "ordinary";
+        let tool = "assistant {{ tools[0].function.name }}";
+        for format in ["list", "map", "files"] {
+            let scratch = tempfile::tempdir().unwrap();
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-tool-call");
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+                }
+            }
+            let config = match format {
+                "list" => {
+                    json!({"chat_template":[{"name":"default","template":base},{"name":"tool_use","template":tool}]})
+                }
+                "map" => json!({"chat_template":{"default":base,"tool_use":tool}}),
+                _ => {
+                    std::fs::write(scratch.path().join("chat_template.jinja"), base).unwrap();
+                    std::fs::create_dir(scratch.path().join("chat_templates")).unwrap();
+                    std::fs::write(scratch.path().join("chat_templates/tool_use.jinja"), tool)
+                        .unwrap();
+                    json!({"chat_template":"ignored config source"})
+                }
+            };
+            std::fs::write(
+                scratch.path().join("tokenizer_config.json"),
+                config.to_string(),
+            )
+            .unwrap();
+            let router = app(AppState::load(scratch.path(), Some("named-tools".into())).unwrap());
+            let (status, props) = call(router.clone(), "GET", "/props", Value::Null).await;
+            assert_eq!(status, StatusCode::OK, "{props}");
+            assert_eq!(props["chat_template"], base);
+            assert_eq!(props["chat_template_tool_use"], tool);
+            for has_tools in [false, true] {
+                let mut body = json!({"messages":[{"role":"user","content":"ordinary"}],"max_tokens":1,"temperature":0});
+                if has_tools {
+                    body["tools"] = json!([{"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]);
+                    body["logit_bias"] = json!({"5":1000});
+                } else {
+                    body["tools"] = json!([]);
+                    body["logit_bias"] = json!({"7":1000});
+                }
+                let (status, prompt) =
+                    call(router.clone(), "POST", "/apply-template", body.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{prompt}");
+                assert_eq!(
+                    prompt["prompt"],
+                    if has_tools { "assistant weather" } else { base }
+                );
+                let (status, count) = call(
+                    router.clone(),
+                    "POST",
+                    "/v1/chat/completions/input_tokens",
+                    body.clone(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{count}");
+                assert_eq!(count["input_tokens"], if has_tools { 2 } else { 1 });
+                let (status, result) =
+                    call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{format}: {result}");
+                assert_eq!(result["usage"]["prompt_tokens"], count["input_tokens"]);
+                assert_eq!(result["usage"]["completion_tokens"], 1);
+                if has_tools {
+                    assert_eq!(
+                        result["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                        "weather",
+                        "{result}"
+                    );
+                    body["stream"] = json!(true);
+                    body["stream_options"] = json!({"include_usage":true});
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/v1/chat/completions")
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(body.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                    let events = sse_json_events(&bytes);
+                    assert!(
+                        !events.iter().any(|event| event.get("error").is_some()),
+                        "{events:?}"
+                    );
+                    assert!(events.iter().any(|event|event["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]=="weather"),"{events:?}");
+                    assert!(
+                        events
+                            .iter()
+                            .all(|event| event["choices"][0]["delta"]["content"]
+                                .as_str()
+                                .is_none_or(str::is_empty)),
+                        "{events:?}"
+                    );
+                    assert!(
+                        events
+                            .iter()
+                            .any(|event| event["usage"]["prompt_tokens"] == 2
+                                && event["usage"]["completion_tokens"] == 1),
+                        "{events:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        result["choices"][0]["message"]["content"], "Results accepted.",
+                        "{result}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn template_endpoint_renders_model_template_and_protects_structural_variables() {
         let router = app(tiny_state());
         let (status, result) = call(

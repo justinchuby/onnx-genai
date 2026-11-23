@@ -158,6 +158,17 @@ error. Ending roles do not imply special-token types: only tokenizer-declared
 special pieces are suppressed during prefix matching.
 The selector requires lossless tokenizer byte pieces and declared ending roles.
 
+Chat-template assets accept a single source, a `default`/`tool_use` name-to-source
+object, or a list of `{name, template}` entries. Independent `chat_template.jinja`
+and `chat_templates/*.jinja` files take precedence over config entries. Nonempty
+offered tools select `tool_use` when available; otherwise rendering uses the base
+source. A tool-only declaration also supplies the base, matching upstream.
+Duplicate names, invalid source types and nonempty named sets without a recognized
+base report actionable asset errors. Empty declarations retain the documented
+no-template fallback. `/props` reports an explicit tool source as
+`chat_template_tool_use`; that source does not create tool execution capability
+without a registered model protocol.
+
 Explicit continuation accepts `true`, `"content"` or `"reasoning_content"` and
 suppresses `add_generation_prompt` even when that flag is true/default, matching
 upstream. The selected final assistant text must be nonempty. A template probe

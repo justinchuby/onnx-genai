@@ -761,3 +761,30 @@ output, default-true generation-prompt suppression, closed-channel rejection,
 missing declarations and constrained-grammar refusal. Full server library:
 412 passed / 2 inherited ignores. Strict server all-target Clippy passed.
 The unchanged engine layer was not remeasured for this server-only milestone.
+
+Named-template milestone: one loader now owns template presence and asset
+selection. It accepts config strings, named objects and name/template lists, plus
+independent default and `chat_templates/*.jinja` files. Standalone asset sets take
+priority over config entries. The model-free directory API retains its documented
+built-in fallback; serving consumes explicit absence from the shared-snapshot
+loader instead of repeating filesystem/type presence checks.
+
+Base/tool selection follows the pinned
+[`common/chat.cpp`](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/chat.cpp#L1519)
+nonempty-tool policy and tool-only base fallback. Asset forms and independent-file
+priority follow the declared Hugging Face tokenizer format
+([pinned loader](https://github.com/huggingface/transformers/blob/be48e7a0b63d2ff22ce1ebccbccbd0374c1592ef/src/transformers/tokenization_utils_base.py#L1822)).
+Empty declarations remain absent; nonempty sets need a recognized default/tool-use
+base. Duplicate declarations and bad types fail with names and repair guidance;
+I/O failures retain their actual path and causal error. `/props` exposes the
+explicit tool-use source while existing protocol metadata remains authoritative
+for tool execution. Named-template presence does not invent a tool parser.
+
+Named-template validation: full ORT library 187 passed, full server 413 passed /
+2 inherited ignores and CLI library 71 passed. After the final empty-asset
+refinement, all 17 chat-template cases passed, including the new absence case.
+The real HTTP named-template case passed for config lists, maps and independent
+files, checking `/props`, exact rendered prompts, tokenizer counts, actual plain/
+tool generation and tool-call SSE (with true usage and no raw-tag content leak).
+Strict ORT/server/CLI all-target Clippy passed on the final source. No performance
+claim is made. Remaining delivery rows and PR merge remain open.
