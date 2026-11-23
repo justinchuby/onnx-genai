@@ -12392,6 +12392,25 @@ mod weight_cache_accounting {
                 NoWeightCache("owns a separately governed packed-weight cache")
             }
 
+            "Expm1" | "GeGLU" | "Log1p" | "LogCumSumExp" | "SwiGLU" => {
+                NoWeightCache("elementwise and scan buffers are local to each execution")
+            }
+            "Pack" | "Unpack" => {
+                NoWeightCache("packing and unpacking write outputs without retaining packed data")
+            }
+            "DequantizePacked" => {
+                NoWeightCache("decodes each block into stack scratch and writes the caller output")
+            }
+            "GroupedMatMul" => NoWeightCache(
+                "indexes weight layouts directly using execution-local dense views or copies",
+            ),
+            "AffineQuantizedGather" => NoWeightCache(
+                "dequantizes selected codes per call without retaining decoded weights",
+            ),
+            "AffineQuantizedGroupedMatMul" => NoWeightCache(
+                "decodes packed weights on demand in the dot product without prepacking",
+            ),
+
             // Attention/MoE fusions call the shared GEMM on *activations*
             // (Q·K^T, ·V), whose operands are not graph-constant, so no
             // constant weight ever reaches a transpose cache.
