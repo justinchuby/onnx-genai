@@ -5,24 +5,107 @@ definitions or parses text once into immutable plans, and matches an unchanged
 `Graph` through a prepared `MatchSession`. There is no rewriting, partition
 selection, constant folding, kernel dispatch, or C++/Python dependency.
 
+## Authoring convention
+
+**Use text for fixed declarative graph patterns; use the typed Rust builder for
+generated or programmatically composed patterns.** Keep the graph topology
+visible: one named SSA assignment per meaningful step, explicit domains, and
+alternatives in the intended search order. Do not translate a fixed readable
+graph into a long sequence of builder calls merely for type safety. Conversely,
+do not interpolate untrusted names or generate increasingly complicated source
+strings when typed handles express the composition directly.
+
+Both frontends remain supported and feed the **same compiler and executor**.
+Choose `parse_ort` for the portable subset below and `parse_native` when the
+pattern needs native extensions. CPU/CUDA/shared built-ins use `LazyLock` to
+parse and verify fixed text once, not once per graph, node or match attempt.
+`RecognitionRule::parse` selects the native frontend and an explicit provider
+traversal anchor; `from_pattern` also accepts a generated builder pattern.
+Eligibility predicates and mutation stay separate from either notation.
+
+This complete example compiles a fixed pattern once, prepares one graph, and
+inspects the selected capture:
+
+```rust
+use std::sync::LazyLock;
+use onnx_runtime_ir::{DataType, Graph, Node, NodeId};
+use onnx_runtime_ir::pattern::{
+    BoundaryPolicy, MatchBudget, MatchBudgetScope, MatchOptions, MatchSession, Pattern,
+};
+
+static SILU: LazyLock<Pattern> = LazyLock::new(|| {
+    Pattern::parse_ort(r"
+        (x) => {
+            sigmoid = Sigmoid(x)
+            out = Mul(x, sigmoid) | Mul(sigmoid, x)
+            return out
+        }
+    ").expect("built-in SiLU pattern must compile; fix its textual definition")
+});
+
+let mut graph = Graph::new();
+let x = graph.create_value(DataType::Float32, vec![]);
+graph.set_inputs(vec![x]);
+let s = graph.create_value(DataType::Float32, vec![]);
+graph.insert_node(Node::new(NodeId(0), "Sigmoid", vec![Some(x)], vec![s]));
+let y = graph.create_value(DataType::Float32, vec![]);
+let root = graph.insert_node(Node::new(NodeId(0), "Mul", vec![Some(x), Some(s)], vec![y]));
+graph.set_outputs(vec![y]);
+
+let session = MatchSession::new(&graph)?;
+let options = MatchOptions {
+    boundary: BoundaryPolicy::OrtBoundary,
+    budget_scope: MatchBudgetScope::Root,
+    budget: MatchBudget { steps: 10_000, ..Default::default() },
+};
+let found = session.match_at(&SILU, root, options)?.expect("fixture should match");
+assert_eq!(found.value("x")?.unwrap().id(), x);
+assert_eq!(found.value("sigmoid")?.unwrap().id(), s);
+// Drop matches/session before mutating graph; rebuild indexes after a rewrite.
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The core is match-only: this recognizes a decomposition, not a proof of
+numerical or rewrite safety. Run the complete Rust snippets in this guide
+with rustdoc from the repository root (the `rust,ignore` fragments below
+require an existing caller graph/match and are intentionally excluded):
+
+```sh
+cargo build --locked -p onnx-runtime-ir --target-dir target
+rustdoc --edition=2024 --test docs/architecture/IR_PATTERNS.md \
+  --extern onnx_runtime_ir=target/debug/libonnx_runtime_ir.rlib \
+  -L dependency=target/debug/deps
+```
+
 ## Typed Rust builder
 
-The ordinary Rust builder authors the same immutable plans without generating
-or reparsing text. It shares the text compiler's SSA, connectivity, arity,
+The builder is appropriate when Rust control flow determines the pattern. It
+authors the same immutable plans without generating or reparsing text and
+shares the text compiler's SSA, connectivity, arity,
 annotation and graph-body validation, capture API and matcher:
 
-```rust,ignore
-let mut p = Pattern::builder();
-let [x, w, scale] = p.inputs(["x", "w", "scale"]);
-let weight = p.op("DequantizeLinear", [w, scale]);
-let y = p.op("MatMul", [x, weight]);
-let pattern = p.finish(y)?;
+```rust
+use onnx_runtime_ir::pattern::{Pattern, PatternError};
+
+fn activation_chain(operators: &[&str]) -> Result<Pattern, PatternError> {
+    let mut p = Pattern::builder();
+    let mut value = p.input("x");
+    for operator in operators {
+        value = p.op(operator, [value]);
+    }
+    p.capture("out", value);
+    p.finish(value)
+}
+
+let pattern = activation_chain(&["Sigmoid", "Neg"])?;
+let _out = pattern.value_capture("out")?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Defaults are the standard ONNX domain, one output and exact ordered inputs.
-Input names are already captures: `pattern.value_capture("w")?` and
-`matched.value("w")?` work normally. Intermediate names are internal; name only
-those you need with `p.capture("weight", weight)` (before or after their uses).
+Input names are already captures: `pattern.value_capture("x")?` and
+`matched.value("x")?` work normally. Intermediate names are internal; name only
+those you need with `p.capture("out", value)` (before or after their uses).
 This also names the operator instance for nested `instance("name.body")` access.
 Each binding can be explicitly named once; duplicate names across value and
 attribute kinds are errors, not overwrites. With multiple outputs, the first
@@ -30,7 +113,8 @@ output's name names the operator instance.
 
 Uncommon constraints stay explicit:
 
-```rust,ignore
+```rust
+use onnx_runtime_ir::pattern::{AttributeType, Pattern};
 let mut p = Pattern::builder();
 let x = p.input("x");
 let axis = p.optional_attribute("axis", AttributeType::Int);
@@ -41,6 +125,7 @@ let [left, right] = p.node("Split", [x])
     .outputs();
 let y = p.op("Add", [left, right]);
 let pattern = p.finish(y)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Attribute literals support `i64`, `f32`, `&str`, `Vec<i64>` and `Vec<f32>`;
@@ -63,7 +148,8 @@ the declared operator signatures must match the graph exactly.
 Operator and passthrough alternatives preserve declaration order and share the
 compiler's rollback and 64-plan expansion budget:
 
-```rust,ignore
+```rust
+use onnx_runtime_ir::pattern::{Input, Pattern};
 let mut p = Pattern::builder();
 let x = p.input("x");
 let args = p.slot_sequence("args", 0, None);
@@ -75,6 +161,7 @@ let y = p.node("Mul", [activation, x])
     .or_node("Mul", [x, activation])
     .output();
 let pattern = p.finish(y)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `slot_sequence(name, min, max)` captures an ordered sequence including missing
@@ -90,7 +177,8 @@ that the operators commute or are numerically equivalent.
 Build control-flow bodies in independent builders. Finished bodies are immutable
 and reusable; each attribute matches in its own scope:
 
-```rust,ignore
+```rust
+use onnx_runtime_ir::pattern::Pattern;
 let mut branch = Pattern::builder();
 let x = branch.input("x");
 let y = branch.op("Identity", [x]);
@@ -104,6 +192,7 @@ let y = p.node("If", [c])
     .output();
 p.capture("selected", y);
 let pattern = p.finish(y)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `finish` requires a connected operator entry with distinct produced returns.
@@ -123,8 +212,8 @@ source text. A node must be completed with `output()` or `outputs()`; dropping
 one records an error rather than losing its constraints. No constructor panics
 on invalid pattern definitions. Graph nesting is bounded at 32 levels.
 
-Built-in CPU/CUDA/shared recognizers use typed construction, retaining the text
-frontend for external definitions and compatibility fixtures. The builder covers
+Built-in CPU/CUDA/shared recognizers use fixed text; generated Rust rules use
+the builder. The builder covers
 structural operators, ordered expression alternatives, optional/variadic slots,
 attributes, multiple outputs and GRAPH bodies, not every text feature.
 Use text for named calls/definition alternatives, tensor annotations/literals,
@@ -153,6 +242,106 @@ annotation-alternative behavior. Fixtures under
 with MIT attribution. Rust fixtures reproduce those published expectations;
 they **do not** execute or build the upstream ORT implementation.
 
+### Grammar quick reference
+
+The following describes the recommended implemented spellings, not the full
+upstream ORT grammar. `?`, `*`, and braces in this **EBNF** mean optional,
+repetition, and grouping; quoted punctuation is literal. Rules labelled
+**native** require `parse_native` / `PatternLibrary::parse_native`.
+Legacy port/interface forms are described after the coverage table.
+
+```text
+inline       = parameters "=>" (body | statements "return" returns ";"?)
+body         = "{" statements "return" returns ";"? "}"
+statements   = { ";" | targets "=" expression ";"? }
+parameters   = "(" [parameter {"," parameter}] ")"
+parameter    = identifier [":" constraint {"|" constraint}]
+targets      = target {"," target}
+target       = parameter | "_" | "None"
+returns      = expression {"," expression}
+expression   = atom {"|" atom}
+atom         = scoped_name | "_" | "None" | literal | call | "(" expression ")"
+call         = operator_or_pattern "(" [operands] [attributes] ")"
+attributes   = [","] identifier "=" expression {"," identifier "=" expression}
+operands     = expression {"," expression}
+scoped_name  = identifier {("." | "::") identifier}
+literal      = int64 | finite_float32 | quoted_string | numeric_list
+numeric_list = "[" [int64 {"," int64} | finite_float32 {"," finite_float32}] "]"
+constraint   = ["const"] tensor_type [shape] | attribute_type ["|" "None"]
+             | "None"
+tensor_type  = element_type | "tensor" ["<" identifier ">"]
+shape        = "[" [dimension {"," dimension} ["," "..."] | "..."] "]"
+dimension    = nonnegative_integer | identifier | "_"
+attribute_type = "int" | "float" | "string" | "ints" | "floats" | "strings" | "tensor"
+
+library      = { interface | definition | group | ";" }
+interface    = "interface" identifier parameters "->" parameters
+definition   = "pattern" identifier parameters ["->" parameters] body
+             | "pattern" identifier "implements" identifier body
+group        = "pattern" identifier "=" identifier {"|" identifier} ";"?
+
+# Native additions:
+atom         += "..." identifier | "[" identifier {"," identifier} "]"
+operator_or_pattern += "*"
+constraint   += ["const"] "value"
+              | ("values" | "slots") "[" min ":" (max | "*") "]"
+```
+
+`identifier` is ASCII `[A-Za-z_][A-Za-z0-9_]*`; `_` and `None` cannot name
+bindings. Names are case-sensitive. Whitespace/newlines and `#` line comments
+separate tokens, but do not terminate statements; semicolons are optional.
+Commas are required between slots, attributes and returns, with no trailing comma.
+Attributes follow all positional operands, even in zero-input calls such as
+`Constant(value=payload)`. Qualified operator names use the last component as
+the op and the preceding components as the domain; `vendor.Op` and `vendor::Op`
+are equivalent. A qualified **value** name instead selects a composed instance's
+port. `*` is an operator wildcard, not an infix arithmetic operator.
+
+The grammar admits expressions recursively, but the **compiler rejects nested
+calls in positional operands**. Write `a = Sigmoid(x); return Mul(a, x)`, not
+`return Mul(Sigmoid(x), x)`. Expression alternatives are ordered, not automatic
+commutative matching. `v = x` is an alias, not a new graph node.
+Native graph lists are attribute constraints such as `bodies=[Body, Body]`,
+not tensor lists; empty `[]` is an empty int64 list literal.
+
+Syntax alone does not determine the annotation's role: the compiler classifies
+a named parameter used as a keyword attribute capture separately from a tensor
+value. For example `perm:ints | None` captures an optional INTS attribute;
+`x:float[N]` constrains a float32 tensor. `int` is an attribute kind,
+whereas `int64` is a tensor element type. Shape notation deliberately differs
+from ordinary array notation:
+
+| Annotation | Meaning |
+|---|---|
+| `x` | Present value, no implicit tensor metadata requirement |
+| `x:float` | Known float32 scalar (rank zero) |
+| `x:float[]` or `x:float[...]` | Known float32 tensor of any rank |
+| `x:tensor<T>[N,_,...]` | Dense tensor; shared dtype variable `T`, rank at least two, first dimension bound as `N` |
+| `x:const float[N]` | Tensor constraint plus immutable constant storage |
+| `x:tensor[...] \| None` | Dense tensor of any dtype/rank, or absent slot |
+| `x:value \| None` (native) | Present SSA value without metadata constraints, or absent slot |
+| `xs:slots[1:*]` (native) | At least one ordered slot; missing elements retained |
+| `xs:values[0:4]` (native) | Zero to four ordered present values |
+
+An unannotated **input** `_` is a fresh present wildcard on each occurrence;
+`None` requires a hole (including a truncated optional input tail). In
+`a, _, None = custom.Op(x)`, the second output must exist but is unnamed, and the
+third must be absent. Exact output arity/identity remains enforced; the engine
+does not infer an operator schema or insert optional slots. Named repeated
+bindings assert identity, not merely equal producers. Sequence length is
+determined by actual arity after the fixed prefix and suffix, never a search
+over arbitrary splits; at most one spread per operator is permitted.
+
+Literal operands match immutable dense scalar/rank-one int64 or float32 values,
+not arbitrary expressions; strings are attribute literals, not tensor operands.
+Quoted strings accept UTF-8 with escaped quotes/backslashes, not JSON escape
+sequences. Attribute literals support scalars and flat homogeneous numeric
+lists. A named typed attribute capture can borrow a tensor/string-list payload;
+sparse/type metadata has no new recursive literal syntax. No default
+attributes, schema/opset resolution, broadcasting or constant folding is implied.
+The detailed boundary and unsupported-feature rules below remain part of the
+language contract.
+
 ### Supported envelope
 
 | Construct | Behavior |
@@ -177,11 +366,27 @@ they **do not** execute or build the upstream ORT implementation.
 Libraries require an operator-registry callback to disambiguate unresolved bare
 calls from misspelled pattern names. This avoids an IR-to-schema dependency:
 
-```rust,ignore
+```rust
+use onnx_runtime_ir::pattern::PatternLibrary;
+
+let source = r"
+    interface Unary(x) -> (y)
+    pattern Copy implements Unary { return Identity(x) }
+    pattern Negate(x) { copied = Copy(x); return Neg(copied) }
+    pattern Branch(x) { return Identity(x) }
+    pattern Choose(c) {
+        out = If(c, then_branch=Branch, else_branch=Branch)
+        return out
+    }
+";
 let library = PatternLibrary::parse_ort(source, &|domain, op| {
-    schemas.contains_operator(domain, op) // supplied by the consumer
+    // A real consumer supplies its operator registry, not a catch-all `true`.
+    domain.is_empty() && matches!(op, "Identity" | "Neg" | "If")
 })?;
-let pattern = library.pattern("QdqMatMul")?;
+let _pattern = library.pattern("Negate")?;
+let _control_flow = library.pattern("Choose")?;
+let _whole_body = library.graph_pattern("Branch")?; // use session.match_graph(...)
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The callback runs during compilation only, not during graph matching. Qualified
@@ -258,6 +463,24 @@ calls and whole-graph interfaces, output variadics, node/graph wildcard captures
 negative-pattern syntax and general producer-path expressions are deferred.
 An operator `*` still has the exact output arity declared by its assignment and
 must explicitly constrain all owned bodies.
+
+For example, select the native frontend explicitly; portable parsing reports an
+unsupported feature rather than silently changing the meaning:
+
+```rust
+use onnx_runtime_ir::pattern::{Pattern, PatternErrorKind};
+
+let source = r"
+    (head, xs:slots[0:*], tail) => {
+        a = custom.First(head, ...xs, tail)
+        return custom.Second(a, ...xs, tail)
+    }
+";
+let pattern = Pattern::parse_native(source)?;
+assert_eq!(Pattern::parse_ort(source).unwrap_err().kind, PatternErrorKind::Unsupported);
+// After matching, matched.sequence("xs")? preserves order and absent slots.
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 ## Using the core
 
@@ -540,6 +763,15 @@ Callbacks return `Result<bool, PatternError>`: false rejects a candidate with
 fresh bindings for the next one; errors propagate. The library cannot bound
 arbitrary callback work; callbacks must remain read-only and bounded.
 
+`PatternError::kind` is one of `Syntax`, `Unsupported`, `InvalidPattern`,
+`InvalidGraph`, `MissingMetadata`, `InvalidCapture`, `Predicate` or
+`BudgetExceeded`. Parser/compiler errors include half-open UTF-8 byte spans
+and an actionable message; graph/matcher and builder errors have no textual
+source location. Do not turn errors into `None` with `.ok().flatten()`: fix an
+invalid definition/graph, supply required metadata, or explicitly revise the
+budget. A candidate rejected by an eligibility predicate is `Ok(false)`;
+`PatternError::predicate(...)` reports failure to evaluate that predicate.
+
 Compilation bounds source to 1 MiB / 65,536 tokens, 256 definitions, 64 concrete
 plans/nodes/type combinations/dimensions, and 256 values/annotation occurrences/
 expanded calls. Definition and graph nesting are limited to **32**, expression
@@ -552,6 +784,7 @@ in `find_matches`; alternatives, nested bodies and predicates at each root still
 share one budget. Trusted built-in full-graph scans select `Root`, so model size
 alone cannot exhaust a small single-query candidate cap. Total work and retained
 matches still scale with the graph; this does not make discovery allocation-free.
+Defaults are 100,000 steps, 10,000 candidates and 1 MiB comparison bytes.
 Tensor comparison accounting includes names, dimensions, string payloads and
 per-string metadata, not just numeric data buffers.
 There is no recursive user pattern or unbounded variadic splitting.
