@@ -1350,7 +1350,7 @@ mod tests {
     #[test]
     fn projected_content_schema_checks_use_the_first_declared_channel_boundary() {
         use crate::json_cursor::{JsonByteCursor, JsonCandidate};
-        use crate::logits::canonical_json_prefix;
+        use crate::json_prefix::JsonPrefix;
         let spec = ResponseTemplate::compile(&serde_json::json!({"start_anchor":"A","fields":{
             "reasoning_content":{"open":"[r]","close":"[/r]"}, "content":{}
         }}))
@@ -1371,7 +1371,7 @@ mod tests {
             let accepted = parser
                 .with_preview(candidate.as_bytes(), true, |view| {
                     let content = view.field_chunks("content", true).collect::<String>();
-                    let canonical = canonical_json_prefix(&content)?;
+                    let canonical = JsonPrefix::parse(&content)?.canonical;
                     Ok(matches!(
                         json_cursor.preview(canonical.as_bytes())?,
                         JsonCandidate::Viable { complete: true }
