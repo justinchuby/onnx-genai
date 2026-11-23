@@ -482,6 +482,8 @@ pub(crate) struct Executor {
     /// build; dynamic (symbol-shaped) values are allocated per run and cached
     /// here so a run whose resolved shape is unchanged reuses the allocation.
     pub(super) buffers: HashMap<ValueId, DeviceBuffer>,
+    pub(super) string_initializers: HashMap<ValueId, Tensor>,
+    pub(super) string_values: HashMap<ValueId, Tensor>,
     /// The concrete shape each live buffer in [`Self::buffers`] is currently
     /// sized for — the reuse key for run-scoped buffers.
     pub(super) buffer_shapes: HashMap<ValueId, Vec<usize>>,
@@ -758,6 +760,8 @@ pub(crate) struct Executor {
     pub(super) provider_artifact_readiness: ProviderArtifactReadiness,
     pub(super) persistent_workspace: Option<PreparedWorkspace>,
     pub(super) step_workspace: Option<PreparedWorkspace>,
+    pub(super) workspace_reuse: WorkspaceReuse,
+    pub(super) workspace_completion: WorkspaceCompletion,
     /// When set, [`Executor::release_step_workspace`] is a no-op: the StepScoped
     /// `step_workspace` buffer is kept alive between runs instead of being freed
     /// after each one. A captured device graph bakes the physical address of the
@@ -766,8 +770,8 @@ pub(crate) struct Executor {
     /// speculative verify forward reserves a bigger scratch than the M=1 decode),
     /// the replay reads a stale pointer and produces non-finite logits (#1647).
     /// Pinning the workspace at the M=K peak keeps the pointer stable across
-    /// replays. Inert by default (`false`) so every non-verify executor frees its
-    /// StepScoped scratch exactly as before.
+    /// replays. Ordinary completed scratch instead enters reclaimable idle
+    /// storage when the provider exposes its physical pressure registry.
     pub(super) pin_step_workspace: bool,
     /// Non-owning view of an enclosing executor's prepared workspace. Nested
     /// control-flow executors run sequentially, so they may reuse the parent's

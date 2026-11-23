@@ -68,6 +68,9 @@ libc = "0.2"
 # off near zero and failed the upstream conformance suite's tight tolerance.
 libm = "0.2"
 
+[build-dependencies]
+cc = "1"
+
 # Linux and Android use the crate-local, syscall-ABI-typed futex wrapper. Other
 # platforms retain atomic-wait's __ulock/WaitOnAddress/_umtx implementations.
 [target.'cfg(not(any(target_os = "linux", target_os = "android")))'.dependencies]

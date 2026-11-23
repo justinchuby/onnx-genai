@@ -61,7 +61,7 @@ mod tests {
     fn moving_tensor_into_sequence_preserves_allocation_pointer() {
         let tensor = Tensor::from_raw(DataType::Uint8, vec![2], &[4, 5]).unwrap();
         let pointer = tensor.device_ptr();
-        let element = SeqTensor::new(tensor);
+        let element = SeqTensor::new(tensor).unwrap();
         assert_eq!(element.as_ptr(), pointer);
         let sequence = SequenceValue::construct(vec![element.clone()]).unwrap();
         assert_eq!(sequence.at(0).unwrap().as_ptr(), pointer);

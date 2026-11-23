@@ -7,7 +7,8 @@ use onnx_runtime_ep_api::{
     ExecutorArtifactReport, ExecutorArtifactState, ExecutorRouteResidencyConfig, Fence, Kernel,
     NegotiatedWeight,
 };
-use onnx_runtime_memory_api::MemoryRole;
+use onnx_runtime_memory_api::{MemoryRole, Tier};
+use onnx_runtime_memory_governor::MemoryGovernor;
 
 use super::*;
 
@@ -75,6 +76,7 @@ fn count_host_allocations<T>(operation: impl FnOnce() -> T) -> (T, u64) {
 }
 
 struct DeferredValidationKernel {
+    workspace_bytes: Arc<AtomicUsize>,
     fail_next: Arc<AtomicBool>,
     panic_next: Arc<AtomicBool>,
     validation_latch: Arc<AtomicU32>,
@@ -82,6 +84,41 @@ struct DeferredValidationKernel {
 }
 
 impl Kernel for DeferredValidationKernel {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        Ok(WorkspaceRequirement {
+            bytes: (self.workspace_bytes.load(Ordering::Relaxed)
+                * inputs
+                    .first()
+                    .map_or(0, |input| input.shape.iter().product::<usize>()))
+                as u64,
+            alignment: 64,
+            lifetime: WorkspaceLifetime::StepScoped,
+        })
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let required = self.workspace_bytes.load(Ordering::Relaxed)
+            * inputs
+                .first()
+                .map_or(0, |input| input.shape.iter().product::<usize>());
+        if required != 0 {
+            let scratch =
+                workspace.ok_or_else(|| EpError::KernelFailed("test workspace missing".into()))?;
+            assert!(scratch.bytes() >= required);
+            // SAFETY: this Host fixture exclusively borrows the checked scratch extent.
+            unsafe { std::ptr::write_bytes(scratch.ptr().0.cast::<u8>(), 0xA5, required) };
+        }
+        self.execute(inputs, outputs)
+    }
+
     fn execute(
         &self,
         inputs: &[TensorView],
@@ -114,6 +151,12 @@ impl Kernel for DeferredValidationKernel {
 }
 
 struct DeferredValidationEp {
+    workspace_bytes: Arc<AtomicUsize>,
+    workspace_registry: Option<onnx_runtime_memory_governor::PressureRegistry>,
+    workspace_allocations: AtomicUsize,
+    workspace_releases: AtomicUsize,
+    workspace_registry_calls: AtomicUsize,
+    fail_workspace_release: AtomicBool,
     cpu: CpuExecutionProvider,
     fail_next: Arc<AtomicBool>,
     validation_latch: Arc<AtomicU32>,
@@ -206,6 +249,12 @@ impl DeferredValidationEp {
         cpu.initialize(&EpConfig::default()).unwrap();
         Self {
             cpu,
+            workspace_bytes: Arc::new(AtomicUsize::new(0)),
+            workspace_registry: None,
+            workspace_allocations: AtomicUsize::new(0),
+            workspace_releases: AtomicUsize::new(0),
+            workspace_registry_calls: AtomicUsize::new(0),
+            fail_workspace_release: AtomicBool::new(false),
             fail_next: Arc::new(AtomicBool::new(true)),
             validation_latch: Arc::new(AtomicU32::new(0)),
             executions: Arc::new(AtomicUsize::new(0)),
@@ -330,11 +379,58 @@ impl ExecutionProvider for DeferredValidationEp {
         _opset: u64,
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
         Ok(Box::new(DeferredValidationKernel {
+            workspace_bytes: Arc::clone(&self.workspace_bytes),
             fail_next: Arc::clone(&self.fail_next),
             panic_next: Arc::clone(&self.panic_next),
             validation_latch: Arc::clone(&self.validation_latch),
             executions: Arc::clone(&self.executions),
         }))
+    }
+
+    fn workspace_pressure_registry(
+        &self,
+    ) -> onnx_runtime_ep_api::Result<Option<onnx_runtime_memory_governor::PressureRegistry>> {
+        self.workspace_registry_calls
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(self.workspace_registry.clone())
+    }
+
+    fn allocate_workspace(
+        &self,
+        size: usize,
+        alignment: usize,
+        role: MemoryRole,
+    ) -> onnx_runtime_ep_api::Result<WorkspaceAllocation> {
+        self.workspace_allocations.fetch_add(1, Ordering::Relaxed);
+        self.cpu.allocate_workspace(size, alignment, role)
+    }
+
+    fn deallocate_workspace(
+        &self,
+        workspace: WorkspaceAllocation,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.workspace_releases.fetch_add(1, Ordering::Relaxed);
+        if self.fail_workspace_release.swap(false, Ordering::Relaxed) {
+            return Err(EpError::KernelFailed(
+                "forced workspace release failure; ownership remains quarantined".into(),
+            ));
+        }
+
+        if self.workspace_registry.is_none() {
+            return self.cpu.deallocate_workspace(workspace);
+        }
+        let onnx_runtime_ep_api::BoundBufferOwnership::Managed(owner) = workspace
+            .into_buffer()
+            .into_bound_ownership()
+            .expect("managed test workspace")
+        else {
+            panic!("managed test workspace");
+        };
+        let outcome = (*owner)
+            .release_now()
+            .map_err(|error| EpError::KernelFailed(error.to_string()))?;
+        assert!(outcome.is_complete());
+        Ok(())
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
@@ -3649,6 +3745,15 @@ fn capacity_form_attention_mask_input_classifier() {
         "a frozen causal additive mask carries the valid length at its last-row frontier, \
          so the causal capacity-form Attention is a valid frozen-mask leaf"
     );
+    causal
+        .attributes
+        .insert("left_window_size".into(), Attribute::Int(-1));
+    assert!(is_capacity_form_attention_mask_input(&causal, 3));
+    causal
+        .attributes
+        .insert("right_window_size".into(), Attribute::Int(0));
+    assert!(!kernel_input_uses_physical_capacity(&causal, 4));
+    assert!(!is_capacity_form_attention_mask_input(&causal, 3));
 
     // A masked `Attention` with no past KV bindings (inputs 4/5 absent) is not a
     // capacity-form leaf regardless of causality.
@@ -16452,4 +16557,487 @@ fn a_false_no_workspace_declaration_is_rejected_before_late_allocation() {
         "{error}"
     );
     assert!(executor.step_workspace.is_none());
+}
+
+#[derive(Debug)]
+struct WorkspaceAccounting {
+    inner: onnx_runtime_memory_governor::LedgerGovernor,
+    claims: AtomicUsize,
+    returns: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct WorkspaceCountingAuthority(Arc<WorkspaceAccounting>);
+
+impl WorkspaceCountingAuthority {
+    fn callbacks(&self) -> (usize, usize) {
+        (
+            self.0.claims.load(Ordering::Relaxed),
+            self.0.returns.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl onnx_runtime_memory_governor::LeaseAccounting for WorkspaceAccounting {
+    fn authority_id(&self) -> Option<onnx_runtime_memory_governor::MemoryAuthorityId> {
+        Some(self.inner.authority_id(Tier::Host))
+    }
+    fn try_claim(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+    ) -> std::result::Result<(), onnx_runtime_memory_api::MemoryError> {
+        self.claims.fetch_add(1, Ordering::Relaxed);
+        onnx_runtime_memory_governor::LeaseAccounting::try_claim(
+            self.inner.ledger().as_ref(),
+            tier,
+            bytes,
+            role,
+        )
+    }
+    fn release(&self, tier: Tier, bytes: u64) {
+        self.returns.fetch_add(1, Ordering::Relaxed);
+        onnx_runtime_memory_governor::LeaseAccounting::release(
+            self.inner.ledger().as_ref(),
+            tier,
+            bytes,
+        );
+    }
+}
+
+impl MemoryGovernor for WorkspaceCountingAuthority {
+    fn authority_id(&self, tier: Tier) -> onnx_runtime_memory_governor::MemoryAuthorityId {
+        self.0.inner.authority_id(tier)
+    }
+    fn pressure_registry(
+        &self,
+        tier: Tier,
+    ) -> Option<onnx_runtime_memory_governor::PressureRegistry> {
+        self.0.inner.pressure_registry(tier)
+    }
+    fn reserve(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> std::result::Result<
+        onnx_runtime_memory_governor::MemoryLease,
+        onnx_runtime_memory_api::MemoryError,
+    > {
+        onnx_runtime_memory_governor::LeaseAccounting::try_claim(
+            self.0.as_ref(),
+            tier,
+            bytes,
+            role,
+        )?;
+        Ok(onnx_runtime_memory_governor::MemoryLease::new(
+            tier,
+            bytes,
+            role,
+            holder,
+            self.0.clone(),
+        ))
+    }
+    fn available(&self, tier: Tier) -> u64 {
+        self.0.inner.available(tier)
+    }
+    fn used(&self, tier: Tier) -> u64 {
+        self.0.inner.used(tier)
+    }
+}
+
+fn completed_workspace_fixture(
+    expose_registry: bool,
+) -> (
+    Executor,
+    Arc<DeferredValidationEp>,
+    Arc<WorkspaceCountingAuthority>,
+    onnx_runtime_memory_governor::ProcessMemoryManager,
+) {
+    use onnx_runtime_memory_api::DeviceKey;
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
+    let books = Arc::new(WorkspaceCountingAuthority(Arc::new(WorkspaceAccounting {
+        inner: LedgerGovernor::new(LeaseLedger::new_for_device(DeviceKey::HOST, 0, 4096, 0)),
+        claims: AtomicUsize::new(0),
+        returns: AtomicUsize::new(0),
+    })));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(books.as_ref(), HolderId::new(19))
+            .unwrap(),
+        Default::default(),
+    )
+    .unwrap()
+    .with_workspace_pool(pool)
+    .unwrap();
+    let mut ep = DeferredValidationEp::new();
+    ep.cpu = CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+    ep.workspace_bytes.store(32, Ordering::Relaxed);
+    ep.workspace_registry = expose_registry.then(|| books.pressure_registry(Tier::Host).unwrap());
+    ep.fail_next.store(false, Ordering::Relaxed);
+    let ep = Arc::new(ep);
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let elements = graph.create_symbol(None);
+    let input = graph.create_named_value("input", DataType::Float32, vec![Dim::Symbolic(elements)]);
+    let output =
+        graph.create_named_value("output", DataType::Float32, vec![Dim::Symbolic(elements)]);
+    graph.add_input(input);
+    graph.add_output(output);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    let executor = Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    (executor, ep, books, manager)
+}
+
+fn completed_workspace_input(elements: usize) -> Tensor {
+    Tensor::from_raw(
+        DataType::Float32,
+        vec![elements],
+        &vec![3.0f32; elements]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn completed_workspace_warm_runs_retain_original_owner_and_charge() {
+    let (mut executor, ep, books, manager) = completed_workspace_fixture(true);
+    let input = completed_workspace_input(2);
+    let mut identity = None;
+    let before = books.callbacks();
+    for iteration in 0..8 {
+        let before_sync = ep.sync_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            executor.run(&[("input", &input)]).unwrap()[0].as_bytes(),
+            input.as_bytes()
+        );
+        let used_syncs = ep.sync_calls.load(Ordering::Relaxed) - before_sync;
+        if iteration > 0 {
+            assert_eq!(
+                used_syncs, 1,
+                "only the existing request completion boundary"
+            );
+        }
+        let allocations = manager.snapshot().unwrap().allocations;
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(
+            *identity.get_or_insert(allocations[0].identity),
+            allocations[0].identity
+        );
+        assert_eq!(books.used(Tier::Host), 64);
+        assert_eq!(manager.process_used(Tier::Host), 64);
+        assert_eq!(
+            ep.workspace_allocations.load(Ordering::Relaxed),
+            1,
+            "iteration {iteration}"
+        );
+        assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 0);
+        assert_eq!(ep.workspace_registry_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            books.callbacks(),
+            (before.0 + 1, before.1),
+            "warm fitting runs must make zero issuer callbacks, including zero-byte calls"
+        );
+    }
+    drop(executor);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(books.used(Tier::Host), 0);
+    assert_eq!(manager.process_used(Tier::Host), 0);
+}
+
+#[test]
+fn completed_workspace_pressure_releases_idle_but_cannot_take_active_owner() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    let input = completed_workspace_input(2);
+    executor.run(&[("input", &input)]).unwrap();
+    let registry = ep.workspace_registry.as_ref().unwrap();
+    assert_eq!(registry.reclaim(0).unwrap(), 0);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 0);
+    executor.restore_completed_step_workspace();
+    assert_eq!(registry.reclaim(1).unwrap(), 0);
+    assert_eq!(books.used(Tier::Host), 64);
+    executor.release_step_workspace().unwrap();
+    assert_eq!(registry.reclaim(1).unwrap(), 64);
+    assert_eq!(books.used(Tier::Host), 0);
+    executor.run(&[("input", &input)]).unwrap();
+    assert_eq!(ep.workspace_allocations.load(Ordering::Relaxed), 2);
+    assert_eq!(books.used(Tier::Host), 64);
+    drop(executor);
+    assert_eq!(registry.reclaim(1).unwrap(), 0);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn completed_workspace_growth_replaces_only_the_lane_capacity() {
+    let (mut executor, ep, books, manager) = completed_workspace_fixture(true);
+    for (elements, expected_capacity, allocations) in [(2, 64, 1), (4, 128, 2), (1, 128, 2)] {
+        let input = completed_workspace_input(elements);
+        executor.run(&[("input", &input)]).unwrap();
+        assert_eq!(books.used(Tier::Host), expected_capacity);
+        assert_eq!(manager.snapshot().unwrap().allocations.len(), 1);
+        assert_eq!(
+            ep.workspace_allocations.load(Ordering::Relaxed),
+            allocations
+        );
+    }
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    drop(executor);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn completed_workspace_deferred_binding_run_retires_without_new_sync() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    let mut bindings = vec![
+        executor
+            .allocate_device_binding("input".into(), None, DataType::Float32, vec![2], vec![2])
+            .unwrap(),
+        executor
+            .allocate_device_output_binding("output".into(), DataType::Float32, vec![2], vec![2])
+            .unwrap(),
+    ];
+    bindings[0]
+        .write_bytes(0, completed_workspace_input(2).as_bytes())
+        .unwrap();
+    executor
+        .prepare_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    let syncs = ep.sync_calls.load(Ordering::Relaxed);
+    executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    assert_eq!(ep.sync_calls.load(Ordering::Relaxed), syncs);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(books.used(Tier::Host), 0);
+    assert!(matches!(
+        executor.workspace_reuse,
+        WorkspaceReuse::Uninitialized
+    ));
+}
+
+#[test]
+fn completed_workspace_failed_validation_cannot_publish_idle_owner() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    ep.fail_next.store(true, Ordering::Relaxed);
+    let error = executor
+        .run(&[("input", &completed_workspace_input(2))])
+        .unwrap_err();
+    assert!(error.to_string().contains("0x40"), "{error}");
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(books.used(Tier::Host), 0);
+    assert!(executor.workspace_reuse.take().is_none());
+}
+
+#[test]
+fn completed_workspace_installed_capture_is_never_pressure_idle() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    executor
+        .run(&[("input", &completed_workspace_input(2))])
+        .unwrap();
+    executor.restore_completed_step_workspace();
+    executor.slot_capture[0].device_graph_token = Some(DeviceGraphToken::new(
+        executor.graph_owner,
+        DeviceGraphSlot::Primary,
+        1,
+    ));
+    executor.release_step_workspace().unwrap();
+    assert!(executor.step_workspace.is_some());
+    assert_eq!(
+        ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
+        0
+    );
+    assert_eq!(books.used(Tier::Host), 64);
+    executor.slot_capture[0].device_graph_token = None;
+    executor.release_step_workspace().unwrap();
+    assert_eq!(
+        ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
+        64
+    );
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn completed_workspace_restore_and_pressure_have_one_owner() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    let input = completed_workspace_input(2);
+    for _ in 0..16 {
+        executor.run(&[("input", &input)]).unwrap();
+        let reuse = &executor.workspace_reuse;
+        let registry = ep.workspace_registry.as_ref().unwrap();
+        let (owner, reclaimed) = std::thread::scope(|scope| {
+            let take = scope.spawn(|| reuse.take());
+            let pressure = scope.spawn(|| registry.reclaim(1).unwrap());
+            (take.join().unwrap(), pressure.join().unwrap())
+        });
+        if let Some(owner) = owner {
+            assert_eq!(reclaimed, 0);
+            assert_eq!(books.used(Tier::Host), 64);
+            ep.deallocate_workspace(owner.buffer).unwrap();
+        } else {
+            assert_eq!(reclaimed, 64);
+        }
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+}
+
+#[test]
+fn completed_workspace_no_pressure_capability_keeps_original_retirement() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(false);
+    let input = completed_workspace_input(2);
+    for _ in 0..3 {
+        executor.run(&[("input", &input)]).unwrap();
+    }
+    assert_eq!(ep.workspace_registry_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(ep.workspace_allocations.load(Ordering::Relaxed), 3);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 3);
+    assert!(matches!(executor.workspace_reuse, WorkspaceReuse::Disabled));
+    // The underlying CPU pool, rather than the executor, still retains charge.
+    assert_eq!(books.used(Tier::Host), 64);
+}
+
+#[test]
+fn completed_workspace_zero_requirement_never_enrolls_or_allocates() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    ep.workspace_bytes.store(0, Ordering::Relaxed);
+    let before = books.callbacks();
+    executor
+        .run(&[("input", &completed_workspace_input(2))])
+        .unwrap();
+    assert_eq!(ep.workspace_registry_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(books.callbacks(), before);
+    assert_eq!(ep.workspace_allocations.load(Ordering::Relaxed), 0);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 0);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn completed_workspace_failed_release_is_not_retried_or_refunded() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    executor
+        .run(&[("input", &completed_workspace_input(2))])
+        .unwrap();
+    ep.fail_workspace_release.store(true, Ordering::Relaxed);
+    let registry = ep.workspace_registry.as_ref().unwrap();
+    let error = registry.reclaim(1).unwrap_err();
+    assert!(
+        error.to_string().contains("workspace release failure"),
+        "{error}"
+    );
+    assert_eq!(books.used(Tier::Host), 64);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(registry.reclaim(1).unwrap(), 0);
+    drop(executor);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(books.used(Tier::Host), 64);
+}
+
+#[test]
+fn completed_workspace_preparation_without_execution_stays_active_until_drop() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    executor
+        .prepare_with_device_bindings(&[("input", &completed_workspace_input(2))], &mut [])
+        .unwrap();
+    assert!(executor.step_workspace.is_some());
+    assert_eq!(
+        ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
+        0
+    );
+    assert_eq!(books.used(Tier::Host), 64);
+    drop(executor);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn completed_workspace_capture_refuses_prepare_growth_until_all_slots_retire() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    executor
+        .run(&[("input", &completed_workspace_input(2))])
+        .unwrap();
+    executor.restore_completed_step_workspace();
+    let original = executor.step_workspace.as_ref().unwrap().buffer.as_ptr();
+    executor.slot_capture[1].device_graph_token = Some(DeviceGraphToken::new(
+        executor.graph_owner,
+        DeviceGraphSlot::Verify,
+        1,
+    ));
+    let bigger = completed_workspace_input(4);
+    let error = executor
+        .prepare_with_device_bindings(&[("input", &bigger)], &mut [])
+        .unwrap_err();
+    assert!(error.to_string().contains("reset_device_graph"), "{error}");
+    assert_eq!(
+        executor.step_workspace.as_ref().unwrap().buffer.as_ptr(),
+        original
+    );
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 0);
+    assert_eq!(books.used(Tier::Host), 64);
+    executor.slot_capture[1].device_graph_token = None;
+    assert_eq!(
+        executor
+            .prepare_with_device_bindings(&[("input", &bigger)], &mut [])
+            .unwrap()
+            .bytes,
+        128
+    );
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(books.used(Tier::Host), 128);
+}
+
+#[test]
+fn completed_workspace_capture_refuses_eager_growth_and_alignment_changes() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    executor
+        .run(&[("input", &completed_workspace_input(2))])
+        .unwrap();
+    executor.restore_completed_step_workspace();
+    let original = executor.step_workspace.as_ref().unwrap().buffer.as_ptr();
+    executor.slot_capture[0].device_graph_token = Some(DeviceGraphToken::new(
+        executor.graph_owner,
+        DeviceGraphSlot::Primary,
+        1,
+    ));
+    let error = executor
+        .run(&[("input", &completed_workspace_input(4))])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("installed device graph"),
+        "{error}"
+    );
+    assert_eq!(
+        executor.step_workspace.as_ref().unwrap().buffer.as_ptr(),
+        original
+    );
+    let alignment = executor.step_workspace.as_ref().unwrap().alignment * 2;
+    let error = WorkspaceReplacement::for_captures(&executor.slot_capture)
+        .check(
+            executor.step_workspace.as_ref(),
+            WorkspaceRequirement {
+                bytes: 64,
+                alignment,
+                lifetime: WorkspaceLifetime::StepScoped,
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("aligned to"), "{error}");
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 0);
+    assert_eq!(books.used(Tier::Host), 64);
+    executor.slot_capture[0].device_graph_token = None;
+    executor
+        .run(&[("input", &completed_workspace_input(4))])
+        .unwrap();
+    assert_eq!(books.used(Tier::Host), 128);
 }

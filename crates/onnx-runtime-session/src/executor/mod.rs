@@ -765,6 +765,8 @@ fn record_dense_prefetch_gap(nodes_between: u64) {
 #[derive(Debug)]
 pub(crate) struct NodePlan {
     pub node_id: NodeId,
+    /// String values have managed host storage and cannot use raw dispatch.
+    pub managed_strings: bool,
     /// Accepted whole-graph claim; compile and dispatch through the provider.
     pub graph_kernel: bool,
     pub workspace_planning: onnx_runtime_ep_api::WorkspacePlanning,
@@ -1048,6 +1050,8 @@ impl Drop for Executor {
                 drop(buf);
             }
         }
+        self.workspace_reuse
+            .retire(self.ep.as_ref(), safe_to_release);
         if let Some(workspace) = self.persistent_workspace.take() {
             if safe_to_release {
                 let _ = self.ep.deallocate_workspace(workspace.buffer);
@@ -1098,6 +1102,8 @@ mod dynamic_shapes;
 mod geometry;
 use dynamic_shapes::*;
 use geometry::*;
+mod workspace_reuse;
+use workspace_reuse::{WorkspaceCompletion, WorkspaceReplacement, WorkspaceReuse};
 mod bindings;
 #[cfg(test)]
 use bindings::{AxisBound, PlannedInputShape};
@@ -1105,6 +1111,7 @@ mod build;
 mod capture;
 mod control_flow;
 mod dispatch;
+mod host_strings;
 mod platform;
 mod prefetch;
 mod run;

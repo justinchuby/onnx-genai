@@ -33,6 +33,10 @@ fn build_kernel_registry_entries() -> Vec<KernelRegistryEntry> {
     let (_registry, descriptors) = build_cpu_registry_with_descriptors();
     descriptors
         .into_iter()
+        // The plugin ABI exposes only fixed-width raw tensor buffers. Native
+        // managed-string kernels stay available to the in-process executor but
+        // cannot honestly be advertised as ORT plugin kernels.
+        .filter(|descriptor| descriptor.supports_raw_tensor_abi)
         .map(|d| {
             // Clamp since_version to i32 range (always fits for ONNX opsets).
             let since = d.since_version as i32;

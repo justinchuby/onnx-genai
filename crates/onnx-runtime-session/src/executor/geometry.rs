@@ -431,6 +431,10 @@ pub(super) fn kernel_input_uses_physical_capacity(node: &Node, input_index: usiz
         && node.op_type == "Attention"
         && matches!(input_index, 4 | 5)
         && node.inputs.get(3).is_some_and(Option::is_some)
+        // An arbitrary mask intersected with a window does not encode the
+        // logical position of the query. Keep logical past extents available.
+        && onnx_runtime_ep_api::attention_window::AttentionWindow::from_node(node, 25)
+            .is_ok_and(|window| !window.is_active())
         || (
             // `pkg.nxrt::IndexShare` mirrors the mask-driven Attention treatment.
             // Its capacity form emits the 3-output present that ALIASES the

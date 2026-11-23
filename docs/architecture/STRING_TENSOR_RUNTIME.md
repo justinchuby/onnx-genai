@@ -386,14 +386,20 @@ broaden an operator schema.
 
 ### String-semantic and tokenizer-adjacent operations
 
-- standard-domain `StringNormalizer` and current string operators such as `StringConcat`,
-  `StringSplit`, and `RegexFullMatch` where the selected ONNX opset defines them;
+- Standard opset-20 `StringConcat`, `StringSplit`, and `RegexFullMatch` execute
+  through the native host kernel boundary. Rust callers use `Tensor::from_strings`
+  and `Tensor::as_strings`; Python session feeds accept NumPy string or object
+  arrays and return object arrays. A CUDA-requested text graph uses the session's reported
+  CPU fallback; no string values are copied to the GPU or available through raw
+  device bindings or the EP plugin ABI. `StringSplit` determines its added axis
+  from the current input values, not the previous run's output. String sequence
+  elements and string-valued control-flow boundaries are not supported.
+- Standard-domain `StringNormalizer` remains separate from this family;
 - `ai.onnx.ml::CategoryMapper` and `ai.onnx.ml::LabelEncoder` for label maps;
 - `com.microsoft` tokenizer/string contrib operators used by exported text pipelines.
 
-Place their CPU factories in a new focused `kernels/string.rs` (or per-op modules) and register by
-their exact domain/opset in `build_cpu_registry`. Add corresponding handlers in a focused
-shape-inference `handlers/string.rs`. Do not register string kernels on CUDA until a deliberate
+The standard text factories live in `kernels/text.rs`, with shape rules in
+`handlers/text.rs`. Do not register string kernels on CUDA until a deliberate
 device representation exists.
 
 ## 9. Phased implementation plan

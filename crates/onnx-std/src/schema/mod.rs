@@ -423,6 +423,7 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/dequantize_packed.yaml"),
     include_str!("../../schemas/standard/dynamic_quantize_linear.yaml"),
     include_str!("../../schemas/standard/attention.yaml"),
+    include_str!("../../schemas/standard/attention_v25.yaml"),
     include_str!("../../schemas/standard/cast_like.yaml"),
     include_str!("../../schemas/standard/cum_sum.yaml"),
     include_str!("../../schemas/standard/greater_or_equal.yaml"),
@@ -463,6 +464,9 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/selu.yaml"),
     include_str!("../../schemas/standard/thresholded_relu.yaml"),
     include_str!("../../schemas/standard/unique.yaml"),
+    include_str!("../../schemas/standard/regex_full_match.yaml"),
+    include_str!("../../schemas/standard/string_concat.yaml"),
+    include_str!("../../schemas/standard/string_split.yaml"),
 ];
 
 // FOLLOW-UP §7.4: complete the standard and ONNX-ML YAML catalogues.
@@ -733,8 +737,8 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 108);
-        assert_eq!(registry.iter().count(), 120);
+        assert_eq!(registry.schemas.len(), 111);
+        assert_eq!(registry.iter().count(), 124);
 
         for (name, since_version) in [
             ("DequantizePacked", 29),
@@ -751,6 +755,9 @@ type_constraints:
             ("Selu", 6),
             ("ThresholdedRelu", 10),
             ("Unique", 11),
+            ("RegexFullMatch", 20),
+            ("StringConcat", 20),
+            ("StringSplit", 20),
         ] {
             assert!(
                 registry.lookup(name, "", since_version - 1).is_none(),
@@ -1052,6 +1059,11 @@ type_constraints:
         }
 
         let attention = registry.lookup("Attention", "", 24).unwrap();
+        let attention25 = registry.lookup("Attention", "", 25).unwrap();
+        assert_eq!(attention25.since_version, 25);
+        assert_eq!(attention25.inputs.len(), attention.inputs.len());
+        assert_eq!(attention25.outputs.len(), attention.outputs.len());
+        assert_eq!(attention25.attributes.len(), attention.attributes.len() + 2);
         assert!(attention.inputs[3..].iter().all(|input| input.optional));
         assert!(attention.outputs[1..].iter().all(|output| output.optional));
         assert_eq!(
