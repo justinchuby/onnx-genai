@@ -15,6 +15,8 @@ impl KernelFactory for Factory {
 
 struct MathKernel(Math);
 
+const GELU_TANH_SCALE: f64 = 0.797_884_560_802_865_4;
+
 macro_rules! evaluate {
     ($name:ident, $float:ty, $erf:path) => {
         fn $name(
@@ -40,8 +42,7 @@ macro_rules! evaluate {
                     for (a, &b) in data.iter_mut().zip(b) {
                         let x = *a;
                         let v = if tanh {
-                            ((0.797_884_560_802_865_4_f64 as $float)
-                                * (x + (0.044715 as $float) * x * x * x))
+                            ((GELU_TANH_SCALE as $float) * (x + (0.044715 as $float) * x * x * x))
                                 .tanh()
                         } else {
                             $erf(x / (std::f64::consts::SQRT_2 as $float))
@@ -145,7 +146,7 @@ mod tests {
         let y = y.to_f32();
         assert_eq!(&y[..2], &[0., 1000.]);
         assert!((y[2] - 9.357_623e-14).abs() < 1e-19);
-        assert!((y[3] - 1000.693_2).abs() < 1e-4);
+        assert!((y[3] - 1_000.693_2).abs() < 1e-4);
     }
 
     #[test]

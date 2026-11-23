@@ -740,6 +740,15 @@ pub fn build_cuda_registry_with_metrics(
     let mut reg = OpRegistry::new();
     reg.register(
         OpKey::new(
+            onnx_runtime_ir::quantized_grouped::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(packed_routed::AffineFactory(runtime.clone())),
+    );
+    reg.register(
+        OpKey::new(
             onnx_runtime_ir::affine_gather::OP,
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
