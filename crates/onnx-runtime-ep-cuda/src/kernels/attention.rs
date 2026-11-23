@@ -393,7 +393,10 @@ pub(super) struct Phase2aScratch {
 }
 
 impl Phase2aScratch {
-    fn bind(layout: &WorkspaceLayout<2>, workspace: Option<WorkspaceView>) -> Result<Self> {
+    pub(super) fn bind(
+        layout: &WorkspaceLayout<2>,
+        workspace: Option<WorkspaceView>,
+    ) -> Result<Self> {
         let [scores, blas] = layout.bind(workspace).map_err(|error| {
             EpError::KernelFailed(format!(
                 "cuda_ep Attention: cannot bind prepared scores/cuBLASLt workspace: {error}; call workspace_requirement and execute_with_workspace using executor-prepared backing"

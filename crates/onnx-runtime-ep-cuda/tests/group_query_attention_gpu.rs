@@ -1598,9 +1598,12 @@ fn benchmark_gqa_case(
     )
     .unwrap()
     .with_backend(backend);
+    let requirement = common::runtime_workspace_requirement(&kernel, &inputs).unwrap();
+    let mut workspace = None;
+    let workspace_view = common::prepare_workspace(ep, requirement, &mut workspace).unwrap();
     let mut run = || {
         kernel
-            .execute(
+            .execute_with_workspace(
                 &inputs,
                 &mut [
                     TensorMut::new(
@@ -1625,19 +1628,27 @@ fn benchmark_gqa_case(
                         device,
                     ),
                 ],
+                workspace_view,
             )
             .unwrap();
     };
     run();
+    ep.sync().unwrap();
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
+        // Measures dispatch through actual device completion. Preparation and
+        // cold allocations precede timing; deferred per-op sync is no proof.
         let start = Instant::now();
         run();
+        ep.sync().unwrap();
         samples.push(start.elapsed().as_secs_f64() * 1_000.0);
     }
     samples.sort_by(f64::total_cmp);
     let median = samples[samples.len() / 2];
     drop(run);
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
     drop(inputs);
     for buffer in [q, k, v, cache_k, cache_v, seqlens, total_length, output] {
         ep.deallocate(buffer).unwrap();
@@ -3637,6 +3648,62 @@ fn gqa_gpu_prepared_reference_scores_ignore_present_cache_padding() {
                     let value = if head == 0 { [1., 2.] } else { [3., 4.] };
                     close(&outputs[2][offset..offset + 2], &value);
                 }
+            }
+        }
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn gqa_gpu_prepared_general_half_uses_arbitrary_head_dim_and_padded_cache() {
+    let ep = require_cuda();
+    let (heads, kv_heads, dim, seq, capacity) = (4, 2, 7, 2, 8);
+    let q = vec![0.; seq * heads * dim];
+    let k = vec![0.; seq * kv_heads * dim];
+    let v: Vec<f32> = (0..seq)
+        .flat_map(|_| (0..kv_heads).flat_map(|head| vec![1. + 2. * head as f32; dim]))
+        .collect();
+    let expected: Vec<f32> = (0..seq)
+        .flat_map(|_| (0..heads).flat_map(|head| vec![1. + 2. * (head / 2) as f32; dim]))
+        .collect();
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        let inputs = base_inputs_dtype(
+            dtype,
+            &[1, seq, heads * dim],
+            &q,
+            &[1, seq, kv_heads * dim],
+            &k,
+            &v,
+            None,
+            None,
+            &[1],
+            2,
+        );
+        let outputs = run_with_backend(
+            &ep,
+            &attrs(&[]),
+            &inputs,
+            &[
+                vec![1, seq, heads * dim],
+                vec![1, kv_heads, capacity, dim],
+                vec![1, kv_heads, capacity, dim],
+            ],
+            Some(GroupQueryAttentionBackend::Phase2a),
+        )
+        .unwrap();
+        assert_close(&outputs[0], &expected, 0.002, 0.002);
+        for head in 0..kv_heads {
+            for position in 0..seq {
+                let offset = (head * capacity + position) * dim;
+                assert_close(
+                    &outputs[2][offset..offset + dim],
+                    &vec![1. + 2. * head as f32; dim],
+                    0.,
+                    0.,
+                );
             }
         }
     }

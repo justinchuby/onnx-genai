@@ -165,10 +165,22 @@ scratch. Phase-2a rejects a missing workspace rather than allocating outside
 preparation. Eager registration currently exposes only CPU execution; future
 asynchronous registration needs an explicit completion/retirement contract.
 
-The shared Phase-2a engine still retains temporary scratch ownership for its
-MHA/GQA callers pending migration of their complete composite layouts. The
-remaining MHA/GQA resource migration is not complete.
+GroupQueryAttention's general half/bf16 fallback also borrows the complete
+Phase-2a score/32 MiB BLAS region from its existing composite workspace. One
+route classifier drives KV-read support, execution and scratch planning. The
+input-derived `past_capacity + current_key_length` bound covers every legal
+valid length without inspecting device length values during preparation. Auto
+planning can reserve fallback scratch even when a shorter individual invocation
+selects fused; guaranteed-fused and dedicated decode shapes reserve neither
+matrix nor BLAS scratch. Missing or invalid fallback backing is an error.
 
-The fallback still synchronizes its CUDA stream and remains unavailable during
-capture. The parity tests use the public provider workspace preparation path,
-and the benchmark reuses its admitted backing across warm iterations.
+GQA's remaining private preparation metadata and temporary KV/staging slots
+still need migration; its composite retains its existing lifetime for now.
+The shared Phase-2a engine still retains temporary ownership for MHA pending
+that caller's complete composite migration.
+
+The fallback retains the existing runtime synchronization policy and capture
+exclusion. The parity tests use the public provider workspace preparation path.
+The benchmark prepares and reuses its admitted backing outside timing, then
+explicitly waits for device completion before recording each wall-clock sample;
+its samples include dispatch through completion, rather than enqueue latency.
