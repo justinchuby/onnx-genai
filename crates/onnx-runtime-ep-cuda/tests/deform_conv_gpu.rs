@@ -91,7 +91,8 @@ fn cases() -> Vec<Case> {
                 float_input(BFloat16, &[1, 3, 2], &[1., 2., 1., 1., 1., 1.]),
             ],
             output: (BFloat16, vec![1, 2, 2]),
-            expected: vec![19., 30., 15., 28.],
+            // At position 1, the last offset group samples at 1 - 0.5.
+            expected: vec![19., 30., 15., 50.],
             attrs: vec![
                 ("group", Attribute::Int(2)),
                 ("offset_group", Attribute::Int(3)),
