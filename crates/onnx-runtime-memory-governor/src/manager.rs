@@ -1900,26 +1900,28 @@ impl ScopedMemoryBinding {
                 authority: self.authority.id,
                 serial: self.manager.next()?,
             });
-        let charge = Arc::new(ChargeCell::new(ChargeState {
-            identity: owner.identity(),
-            authority: self.authority.id,
-            authority_label: Arc::clone(&self.authority.label),
-            memory_authority: self.authority.memory_authority,
-            holder: request.holder.record.id,
-            holder_label: Arc::clone(&request.holder.record.label),
-            tier: request.tier,
-            role: request.role,
-            mode: request.charge_mode,
-            state: ManagedAllocationState::Live,
-            process_lease,
-            authority_lease,
-            charged_bytes: publication.charged_bytes,
-            process_reserved_bytes: publication.process_reserved_bytes,
-            physical_bytes: publication.physical_bytes,
-            mapped_bytes: publication.mapped_bytes,
-            unattributed_bytes: publication.unattributed_bytes,
-            shared_physical,
-        }));
+        let charge = Arc::new(ChargeCell::new(
+            request.holder.record.id,
+            request.role,
+            ChargeState {
+                identity: owner.identity(),
+                authority: self.authority.id,
+                authority_label: Arc::clone(&self.authority.label),
+                memory_authority: self.authority.memory_authority,
+                holder_label: Arc::clone(&request.holder.record.label),
+                tier: request.tier,
+                mode: request.charge_mode,
+                state: ManagedAllocationState::Live,
+                process_lease,
+                authority_lease,
+                charged_bytes: publication.charged_bytes,
+                process_reserved_bytes: publication.process_reserved_bytes,
+                physical_bytes: publication.physical_bytes,
+                mapped_bytes: publication.mapped_bytes,
+                unattributed_bytes: publication.unattributed_bytes,
+                shared_physical,
+            },
+        ));
         self.manager.book.publish(&charge);
         drop(quota_gate);
         let settlement = AllocationSettlementToken::new(Arc::clone(&self.manager.book), charge);
@@ -2186,33 +2188,35 @@ impl ScopedMemoryBinding {
             authority: self.authority.id,
             serial: self.manager.next().unwrap_or(u64::MAX),
         };
-        let charge = Arc::new(ChargeCell::new(ChargeState {
-            identity: owner.identity(),
-            authority: self.authority.id,
-            authority_label: Arc::clone(&self.authority.label),
-            memory_authority: self.authority.memory_authority,
-            holder: request.holder.record.id,
-            holder_label: Arc::clone(&request.holder.record.label),
-            tier: request.tier,
-            role: request.role,
-            mode: request.charge_mode,
-            state: ManagedAllocationState::Provisional,
-            process_lease,
-            authority_lease,
-            charged_bytes: request.authority_reserve_bytes,
-            process_reserved_bytes: request.process_reserve_bytes,
-            // Virtual span length is not proof of committed physical residency.
-            // The failure callback supplied no publication facts, so remain
-            // unknown rather than equating address space with physical bytes.
-            physical_bytes: None,
-            mapped_bytes: None,
-            unattributed_bytes: if request.charge_mode == AllocationChargeMode::Compatibility {
-                owner.len() as u64
-            } else {
-                0
+        let charge = Arc::new(ChargeCell::new(
+            request.holder.record.id,
+            request.role,
+            ChargeState {
+                identity: owner.identity(),
+                authority: self.authority.id,
+                authority_label: Arc::clone(&self.authority.label),
+                memory_authority: self.authority.memory_authority,
+                holder_label: Arc::clone(&request.holder.record.label),
+                tier: request.tier,
+                mode: request.charge_mode,
+                state: ManagedAllocationState::Provisional,
+                process_lease,
+                authority_lease,
+                charged_bytes: request.authority_reserve_bytes,
+                process_reserved_bytes: request.process_reserve_bytes,
+                // Virtual span length is not proof of committed physical residency.
+                // The failure callback supplied no publication facts, so remain
+                // unknown rather than equating address space with physical bytes.
+                physical_bytes: None,
+                mapped_bytes: None,
+                unattributed_bytes: if request.charge_mode == AllocationChargeMode::Compatibility {
+                    owner.len() as u64
+                } else {
+                    0
+                },
+                shared_physical,
             },
-            shared_physical,
-        }));
+        ));
         let managed = ManagedAllocation {
             owner: Some(owner),
             settlement: AllocationSettlementToken::new(Arc::clone(&self.manager.book), charge),
@@ -2681,10 +2685,8 @@ struct ChargeState {
     authority: ProcessAuthorityId,
     authority_label: Arc<str>,
     memory_authority: Option<crate::MemoryAuthorityId>,
-    holder: HolderId,
     holder_label: Arc<str>,
     tier: Tier,
-    role: MemoryRole,
     mode: AllocationChargeMode,
     state: ManagedAllocationState,
     process_lease: Option<ProcessQuotaLease>,
@@ -2699,6 +2701,10 @@ struct ChargeState {
 
 #[derive(Debug)]
 struct ChargeCell {
+    // Admission fixes ownership attribution for the allocation's full lifetime.
+    // Settlement changes quantities/state, never the holder or resource role.
+    holder: HolderId,
+    role: MemoryRole,
     state: Mutex<ChargeState>,
     wake: Condvar,
     settlement_tokens: AtomicUsize,
@@ -2706,8 +2712,10 @@ struct ChargeCell {
 }
 
 impl ChargeCell {
-    fn new(state: ChargeState) -> Self {
+    fn new(holder: HolderId, role: MemoryRole, state: ChargeState) -> Self {
         Self {
+            holder,
+            role,
             state: Mutex::new(state),
             wake: Condvar::new(),
             settlement_tokens: AtomicUsize::new(0),
@@ -2852,10 +2860,10 @@ impl ChargeCell {
             authority: state.authority,
             authority_label: Arc::clone(&state.authority_label),
             memory_authority: state.memory_authority,
-            holder: state.holder,
+            holder: self.holder,
             holder_label: Arc::clone(&state.holder_label),
             tier: state.tier,
-            role: state.role,
+            role: self.role,
             charge_mode: state.mode,
             state: state.state,
             charged_bytes: state.charged_bytes,
@@ -3283,8 +3291,7 @@ impl ManagedAllocation {
     }
 
     pub(crate) fn holder_and_role(&self) -> (HolderId, MemoryRole) {
-        let state = self.settlement.charge.lock();
-        (state.holder, state.role)
+        (self.settlement.charge.holder, self.settlement.charge.role)
     }
 
     pub fn identity(&self) -> AllocationIdentity {

@@ -1,0 +1,11 @@
+    Checking zerocopy v0.8.55
+    Checking serde_json v1.0.151
+    Checking onnx-runtime-memory-governor v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-memory-governor)
+    Checking onnx-runtime-memory-api v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-memory-api)
+    Checking onnx-runtime-virtual-memory v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-virtual-memory)
+    Checking tinytemplate v1.2.1
+    Checking half v2.7.1
+    Checking ciborium-ll v0.2.2
+    Checking ciborium v0.2.2
+    Checking criterion v0.5.1
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.76s

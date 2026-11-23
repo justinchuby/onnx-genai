@@ -1,0 +1,26 @@
+{
+  "base": "c0d4fabd9c96070d06deb5624a93555d30bae6b2",
+  "candidate": {
+    "crates/onnx-runtime-memory-governor/src/manager.rs": "15587b2140118f60a2486b96744129f86b78fd753a1294b3137fbc8c09921a8e",
+    "crates/onnx-runtime-memory-governor/src/workspace.rs": "8988f765d78478aef9d7ab7047698bcf0c73146f4044d19eb55cbc33440c8c4a"
+  },
+  "probe_sha256": "9956b77a7b5ffdcf50d3503379db5b00ee7fab34cdabdffd54fa155e031ba0f0",
+  "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "binaries": {
+    "baseline": {
+      "sha256": "84881f380272825b75f46e3aaeeb2f3f20953b3719bb1e455338cd7711b8b69f",
+      "size_bytes": 8984176,
+      "mlas_symbols": 0
+    },
+    "after": {
+      "sha256": "de90104f5e57c4af62ce114c1c23133a57b434b4e8902d5bfd14bb7ccdb3bdce",
+      "size_bytes": 8984128,
+      "mlas_symbols": 0
+    },
+    "null": {
+      "sha256": "84881f380272825b75f46e3aaeeb2f3f20953b3719bb1e455338cd7711b8b69f",
+      "size_bytes": 8984176,
+      "mlas_symbols": 0
+    }
+  }
+}

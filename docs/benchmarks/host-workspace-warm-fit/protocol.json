@@ -1,0 +1,53 @@
+{
+  "cases": [
+    [
+      "pool",
+      64
+    ],
+    [
+      "pool",
+      768
+    ],
+    [
+      "pool",
+      1048576
+    ],
+    [
+      "ep",
+      64
+    ],
+    [
+      "ep",
+      768
+    ],
+    [
+      "ep",
+      1048576
+    ]
+  ],
+  "orders": [
+    [
+      "baseline",
+      "after",
+      "null"
+    ],
+    [
+      "after",
+      "null",
+      "baseline"
+    ],
+    [
+      "null",
+      "baseline",
+      "after"
+    ]
+  ],
+  "processes_per_arm_case": 3,
+  "batches": 9,
+  "target_cpu_ms": 100,
+  "minimum_cpu_ms": 20,
+  "control_gate_percent": 5,
+  "minimum_cpu_wall_ratio": 0.9,
+  "attempts": 1,
+  "payload": "not touched; allocator/ownership mechanism only, not inference throughput"
+}
