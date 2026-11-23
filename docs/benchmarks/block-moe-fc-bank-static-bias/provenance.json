@@ -1,0 +1,22 @@
+{
+  "candidate": "f0a2cd11582b320a59504797ba809b597583b1ed",
+  "old_bank_head": "71b105629d3bb65e8c11a4eaba9f5e804143b92b",
+  "baseline": "509144567bc6f74d899385aacee5717d20811cc0",
+  "binary_sha256": "ed4020cb0b4e000c0a023c52520dd367000d8ca89401964075a2c9cdc0af7e39",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/Cargo.toml": "70c4ec0649517c90f3d1157b58d209ca8813b4af0fedd3b2e95a0b7a134cf32f",
+    "crates/onnx-runtime-ep-cpu/src/kernels/mod.rs": "cda9ae30d4fda35174a2f3daf5b80079581e94734ff06c7f129da6e3fe754d35",
+    "crates/onnx-runtime-ep-cpu/src/lib.rs": "438c9597327b2ad35d9c9a168c720999ca1f2fa49e2cd96276fc54d4a83ee64e",
+    "crates/onnx-runtime-ep-cpu/src/provider.rs": "4cc78be23f378882275a6415b687451b0d7ee0cd1f92ff2321242a16ac046268",
+    "crates/onnx-runtime-ep-cpu/src/kernels/expert_bank_probe.rs": "6d411ce41ecb1a4701376c285a78ccdf63d3bb6bf06b93056184aeb6990acc10",
+    "crates/onnx-runtime-ep-cpu/src/kernels/probe_before_block_quantized_moe.rs": "f189d26595cd339cdf2656e1b8a575b3823146be9dc5df2c5caafb851aacd4a1",
+    "crates/onnx-runtime-ep-cpu/src/kernels/probe_before_moe.rs": "e900c90321aa0d4731d67576511b7d11589ff45a925a1478dbc97a9038b11a75",
+    "crates/onnx-runtime-ep-cpu/src/kernels/probe_original_banks_block_quantized_moe.rs": "b362108672966e917f3d4e20edf8f1e766b2a3d2169ff3fc0784431826fe6879",
+    "crates/onnx-runtime-ep-cpu/src/kernels/probe_original_banks_moe.rs": "cb968e4eb774b68864faeaef8f434cf093bde472bbbb426a2d5e16935101fd5e"
+  },
+  "probe_sha256": "e78678932bffdc5f390630e31c5001b1706dfdf9068cd271e46305cc9a9466ca",
+  "applied_specializations": [
+    "__RINvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_rowNtB2_21AppliedActivationBiasEB6_"
+  ],
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n"
+}

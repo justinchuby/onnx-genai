@@ -1,0 +1,626 @@
+[
+  {
+    "shape": [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      "block"
+    ],
+    "qualified": false,
+    "processes": [
+      {
+        "rotation": 0,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.2787812866505517,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 1.0010489008631416,
+          "static": 1.007779811487289,
+          "null": 1.026210457357696
+        },
+        "AA_cpu_ratio": 0.996415650293075,
+        "comparisons": {
+          "static/original": {
+            "cpu": 1.0077612840303,
+            "wall": 1.0201192278123146
+          },
+          "original/before": {
+            "cpu": 1.014631987820015,
+            "wall": 1.1048608357857979
+          },
+          "static/before": {
+            "cpu": 1.0229276533438472,
+            "wall": 1.1307001799513396
+          },
+          "null/before": {
+            "cpu": 0.996415650293075,
+            "wall": 0.9872713294061097
+          }
+        }
+      },
+      {
+        "rotation": 1,
+        "qualified": false,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.432121888909259,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 0.9436187145275726,
+          "static": 0.9767264134629692,
+          "null": 0.9644732306298314
+        },
+        "AA_cpu_ratio": 1.0057750325048664,
+        "comparisons": {
+          "static/original": {
+            "cpu": 1.0065817768785896,
+            "wall": 1.0134501746888387
+          },
+          "original/before": {
+            "cpu": 1.0225848042537327,
+            "wall": 1.1306120347367168
+          },
+          "static/before": {
+            "cpu": 1.0322511355439654,
+            "wall": 1.1524732800047737
+          },
+          "null/before": {
+            "cpu": 1.0057750325048664,
+            "wall": 1.0193885977555337
+          }
+        }
+      },
+      {
+        "rotation": 2,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.329970346825005,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 0.9919657630775491,
+          "static": 0.9911491706186748,
+          "null": 0.9699141122460693
+        },
+        "AA_cpu_ratio": 0.9788837482340393,
+        "comparisons": {
+          "static/original": {
+            "cpu": 1.0114147813040755,
+            "wall": 1.0116714461420577
+          },
+          "original/before": {
+            "cpu": 1.0104081403174117,
+            "wall": 1.0903816163305458
+          },
+          "static/before": {
+            "cpu": 1.02280155827328,
+            "wall": 1.0947866289389019
+          },
+          "null/before": {
+            "cpu": 0.9788837482340393,
+            "wall": 0.9988332624136418
+          }
+        }
+      },
+      {
+        "rotation": 3,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.3528449814575367,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 0.9696968846613618,
+          "static": 0.9738015582569612,
+          "null": 1.0098538431751998
+        },
+        "AA_cpu_ratio": 0.9972192446732351,
+        "comparisons": {
+          "static/original": {
+            "cpu": 0.9973342588991065,
+            "wall": 0.9987630011448381
+          },
+          "original/before": {
+            "cpu": 1.0201284062638991,
+            "wall": 1.1092501548984206
+          },
+          "static/before": {
+            "cpu": 1.0168582980960814,
+            "wall": 1.1075754230533745
+          },
+          "null/before": {
+            "cpu": 0.9972192446732351,
+            "wall": 1.0046459041960882
+          }
+        }
+      }
+    ],
+    "median_ratios": {
+      "static/original": {
+        "cpu": 1.0071715304544449,
+        "wall": 1.0125608104154482
+      },
+      "original/before": {
+        "cpu": 1.0173801970419571,
+        "wall": 1.1070554953421092
+      },
+      "static/before": {
+        "cpu": 1.0228646058085635,
+        "wall": 1.1191378015023572
+      },
+      "null/before": {
+        "cpu": 0.996817447483155,
+        "wall": 1.001739583304865
+      }
+    }
+  },
+  {
+    "shape": [
+      8,
+      128,
+      256,
+      4,
+      1,
+      2,
+      "block"
+    ],
+    "qualified": true,
+    "processes": [
+      {
+        "rotation": 0,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.5371381201469627,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 0.9785786741832301,
+          "static": 0.9833842211832245,
+          "null": 0.9789897986618719
+        },
+        "AA_cpu_ratio": 1.0158512717869728,
+        "comparisons": {
+          "static/original": {
+            "cpu": 0.9451962276700406,
+            "wall": 0.9210111618916661
+          },
+          "original/before": {
+            "cpu": 0.9484298227954949,
+            "wall": 0.8842752912406568
+          },
+          "static/before": {
+            "cpu": 0.9206182262391127,
+            "wall": 0.8167767194938083
+          },
+          "null/before": {
+            "cpu": 1.0158512717869728,
+            "wall": 1.034682245639149
+          }
+        }
+      },
+      {
+        "rotation": 1,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.808355823389962,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 1.0053338849270668,
+          "static": 1.0217225756707395,
+          "null": 0.9912141212601333
+        },
+        "AA_cpu_ratio": 0.998125700963357,
+        "comparisons": {
+          "static/original": {
+            "cpu": 0.9733336749848448,
+            "wall": 0.9379553153296634
+          },
+          "original/before": {
+            "cpu": 0.9216809718753821,
+            "wall": 0.8592861624445102
+          },
+          "static/before": {
+            "cpu": 0.9079969516723433,
+            "wall": 0.8300889886158546
+          },
+          "null/before": {
+            "cpu": 0.998125700963357,
+            "wall": 1.0072683029388907
+          }
+        }
+      },
+      {
+        "rotation": 2,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.7505657267028205,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 1.0089093566067344,
+          "static": 0.9948489859019639,
+          "null": 0.9884901751480282
+        },
+        "AA_cpu_ratio": 1.004024807881334,
+        "comparisons": {
+          "static/original": {
+            "cpu": 0.9569867695327263,
+            "wall": 0.9026300123284803
+          },
+          "original/before": {
+            "cpu": 0.9685494331038869,
+            "wall": 0.9653052099535413
+          },
+          "static/before": {
+            "cpu": 0.8991844423456097,
+            "wall": 0.8363957666734794
+          },
+          "null/before": {
+            "cpu": 1.004024807881334,
+            "wall": 1.04048601478509
+          }
+        }
+      },
+      {
+        "rotation": 3,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.2695633344856736,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 1.011691470716555,
+          "static": 0.9684311072685153,
+          "null": 0.965010914092681
+        },
+        "AA_cpu_ratio": 1.0017197159580606,
+        "comparisons": {
+          "static/original": {
+            "cpu": 0.9689078152322634,
+            "wall": 0.9471676535352309
+          },
+          "original/before": {
+            "cpu": 0.9360593344043499,
+            "wall": 0.8558721973496237
+          },
+          "static/before": {
+            "cpu": 0.8942064535152858,
+            "wall": 0.7796171808460693
+          },
+          "null/before": {
+            "cpu": 1.0017197159580606,
+            "wall": 1.0106155430950152
+          }
+        }
+      }
+    ],
+    "median_ratios": {
+      "static/original": {
+        "cpu": 0.9629472923824949,
+        "wall": 0.9294832386106647
+      },
+      "original/before": {
+        "cpu": 0.9422445785999224,
+        "wall": 0.8717807268425835
+      },
+      "static/before": {
+        "cpu": 0.9035906970089764,
+        "wall": 0.8234328540548315
+      },
+      "null/before": {
+        "cpu": 1.0028722619196975,
+        "wall": 1.022648894367082
+      }
+    }
+  },
+  {
+    "shape": [
+      8,
+      128,
+      256,
+      4,
+      0,
+      3,
+      "block"
+    ],
+    "qualified": true,
+    "processes": [
+      {
+        "rotation": 0,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.427658991706675,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 1.0129913718167693,
+          "static": 1.002135430916484,
+          "null": 0.9784824767163107
+        },
+        "AA_cpu_ratio": 0.999747117434777,
+        "comparisons": {
+          "static/original": {
+            "cpu": 1.0042489566332573,
+            "wall": 1.0065304451157615
+          },
+          "original/before": {
+            "cpu": 0.9917613780462733,
+            "wall": 1.0239741993348832
+          },
+          "static/before": {
+            "cpu": 1.0043247307173855,
+            "wall": 1.030286570575369
+          },
+          "null/before": {
+            "cpu": 0.999747117434777,
+            "wall": 0.9836940728427543
+          }
+        }
+      },
+      {
+        "rotation": 1,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.4836545102458274,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 1.0362216466914047,
+          "static": 0.9859775023182216,
+          "null": 0.9812071645368163
+        },
+        "AA_cpu_ratio": 0.9826792018521131,
+        "comparisons": {
+          "static/original": {
+            "cpu": 0.9656004488921666,
+            "wall": 0.9741411848732509
+          },
+          "original/before": {
+            "cpu": 1.0448392762262468,
+            "wall": 1.069598890127037
+          },
+          "static/before": {
+            "cpu": 1.0007435909970508,
+            "wall": 1.0224060058685236
+          },
+          "null/before": {
+            "cpu": 0.9826792018521131,
+            "wall": 0.9810763259126811
+          }
+        }
+      },
+      {
+        "rotation": 2,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.4554624163019643,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 0.9855235794939926,
+          "static": 0.9967169606709563,
+          "null": 0.9814691543259009
+        },
+        "AA_cpu_ratio": 1.0043246310315044,
+        "comparisons": {
+          "static/original": {
+            "cpu": 1.0042731828616605,
+            "wall": 1.0087849987428088
+          },
+          "original/before": {
+            "cpu": 1.01314618391561,
+            "wall": 1.0412456013367866
+          },
+          "static/before": {
+            "cpu": 1.0160212042685122,
+            "wall": 1.043355358908657
+          },
+          "null/before": {
+            "cpu": 1.0043246310315044,
+            "wall": 1.0108330616138685
+          }
+        }
+      },
+      {
+        "rotation": 3,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.4555980218984077,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 0.9739254371572699,
+          "static": 0.9928673060691087,
+          "null": 1.016193255238115
+        },
+        "AA_cpu_ratio": 1.0057759343207562,
+        "comparisons": {
+          "static/original": {
+            "cpu": 1.0005429187127466,
+            "wall": 1.0006993570840201
+          },
+          "original/before": {
+            "cpu": 1.0070420067052477,
+            "wall": 1.038909092816184
+          },
+          "static/before": {
+            "cpu": 1.0094232707183197,
+            "wall": 1.0435566954732542
+          },
+          "null/before": {
+            "cpu": 1.0057759343207562,
+            "wall": 1.0130104367428778
+          }
+        }
+      }
+    ],
+    "median_ratios": {
+      "static/original": {
+        "cpu": 1.0023959376730018,
+        "wall": 1.003614901099891
+      },
+      "original/before": {
+        "cpu": 1.010094095310429,
+        "wall": 1.0400773470764852
+      },
+      "static/before": {
+        "cpu": 1.0068740007178527,
+        "wall": 1.036820964742013
+      },
+      "null/before": {
+        "cpu": 1.0020358742331408,
+        "wall": 0.9972635672283114
+      }
+    }
+  },
+  {
+    "shape": [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      "float"
+    ],
+    "qualified": true,
+    "processes": [
+      {
+        "rotation": 0,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.690703882855428,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 0.9867829373362804,
+          "static": 1.0070670543124565,
+          "null": 0.9769410141154392
+        },
+        "AA_cpu_ratio": 1.0228756406638015,
+        "comparisons": {
+          "static/original": {
+            "cpu": 0.9114283801682102,
+            "wall": 0.8469795737731527
+          },
+          "original/before": {
+            "cpu": 1.0276545714347103,
+            "wall": 1.0511556937410638
+          },
+          "static/before": {
+            "cpu": 0.9321516211035165,
+            "wall": 0.8879767695237429
+          },
+          "null/before": {
+            "cpu": 1.0228756406638015,
+            "wall": 1.0499089267553745
+          }
+        }
+      },
+      {
+        "rotation": 1,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.6619870309898013,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 0.9759312181489819,
+          "static": 0.9762791144255158,
+          "null": 1.004135144448743
+        },
+        "AA_cpu_ratio": 1.0223923424282555,
+        "comparisons": {
+          "static/original": {
+            "cpu": 0.9304390584834299,
+            "wall": 0.8731864808790559
+          },
+          "original/before": {
+            "cpu": 0.9646136808439914,
+            "wall": 0.9344641170813202
+          },
+          "static/before": {
+            "cpu": 0.8612898277255132,
+            "wall": 0.7650898027098902
+          },
+          "null/before": {
+            "cpu": 1.0223923424282555,
+            "wall": 1.0282097933655496
+          }
+        }
+      },
+      {
+        "rotation": 2,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.9770685422852385,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 0.9962590612894769,
+          "static": 1.0077066842285527,
+          "null": 0.9850886690621283
+        },
+        "AA_cpu_ratio": 0.9815827062010452,
+        "comparisons": {
+          "static/original": {
+            "cpu": 0.9092276489380098,
+            "wall": 0.9091356641082995
+          },
+          "original/before": {
+            "cpu": 1.076416062327399,
+            "wall": 1.1067689340299034
+          },
+          "static/before": {
+            "cpu": 0.9687322099245448,
+            "wall": 0.9970302746636179
+          },
+          "null/before": {
+            "cpu": 0.9815827062010452,
+            "wall": 1.0137931269780607
+          }
+        }
+      },
+      {
+        "rotation": 3,
+        "qualified": true,
+        "duration_pass": true,
+        "minimum_cpu_wall_ratio": 2.930612736571706,
+        "control_ratios": {
+          "before": 1.0,
+          "original": 0.9944586765210898,
+          "static": 1.0025747614864862,
+          "null": 0.9848081455269317
+        },
+        "AA_cpu_ratio": 0.9839055392283407,
+        "comparisons": {
+          "static/original": {
+            "cpu": 0.965876593628026,
+            "wall": 0.9539275890700191
+          },
+          "original/before": {
+            "cpu": 0.9931028152045929,
+            "wall": 1.0118877907642605
+          },
+          "static/before": {
+            "cpu": 0.939596665886328,
+            "wall": 0.9232866525583378
+          },
+          "null/before": {
+            "cpu": 0.9839055392283407,
+            "wall": 1.0205504511526116
+          }
+        }
+      }
+    ],
+    "median_ratios": {
+      "static/original": {
+        "cpu": 0.92093371932582,
+        "wall": 0.8911610724936777
+      },
+      "original/before": {
+        "cpu": 1.0103786933196517,
+        "wall": 1.0315217422526621
+      },
+      "static/before": {
+        "cpu": 0.9358741434949223,
+        "wall": 0.9056317110410403
+      },
+      "null/before": {
+        "cpu": 1.003148940828298,
+        "wall": 1.0243801222590805
+      }
+    }
+  }
+]

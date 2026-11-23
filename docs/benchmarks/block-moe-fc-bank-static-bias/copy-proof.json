@@ -1,0 +1,42 @@
+{
+  "509144567:moe": {
+    "original_full_sha256": "074d4ed5d0c7cf61921b2ea192beeaf4e51ab294a4eb804d5b4688743898b4d6",
+    "copied_sha256": "e900c90321aa0d4731d67576511b7d11589ff45a925a1478dbc97a9038b11a75",
+    "reconstruction_verified": true,
+    "transforms": [
+      "omit test module",
+      "redirect own helper import for Block module",
+      "rustfmt edition 2024"
+    ]
+  },
+  "509144567:block_quantized_moe": {
+    "original_full_sha256": "c285e9499cf0821837597ccdf318175bdc53fe8bfe2c83ed90660ceb22db68dd",
+    "copied_sha256": "f189d26595cd339cdf2656e1b8a575b3823146be9dc5df2c5caafb851aacd4a1",
+    "reconstruction_verified": true,
+    "transforms": [
+      "omit test module",
+      "redirect own helper import for Block module",
+      "rustfmt edition 2024"
+    ]
+  },
+  "71b105629:moe": {
+    "original_full_sha256": "27e39473db50978d72dfe2db5f18d9c39558067a70704ba39069e66ff40c9927",
+    "copied_sha256": "cb968e4eb774b68864faeaef8f434cf093bde472bbbb426a2d5e16935101fd5e",
+    "reconstruction_verified": true,
+    "transforms": [
+      "omit test module",
+      "redirect own helper import for Block module",
+      "rustfmt edition 2024"
+    ]
+  },
+  "71b105629:block_quantized_moe": {
+    "original_full_sha256": "6dd1068dc499fed01476c87f197d2c16f4f9b99271691a8c31afa7f9e6c18e88",
+    "copied_sha256": "b362108672966e917f3d4e20edf8f1e766b2a3d2169ff3fc0784431826fe6879",
+    "reconstruction_verified": true,
+    "transforms": [
+      "omit test module",
+      "redirect own helper import for Block module",
+      "rustfmt edition 2024"
+    ]
+  }
+}

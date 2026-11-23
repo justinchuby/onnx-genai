@@ -1,0 +1,124 @@
+
+/tmp/nxrt-bank-static-bias/static-bias-probe:	file format mach-o arm64
+
+Disassembly of section __TEXT,__text:
+
+000000010019f4e8 <__RINvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_rowNtB2_21AppliedActivationBiasEB6_>:
+10019f4e8: d10383ff    	sub	sp, sp, #0xe0
+10019f4ec: 6d043bef    	stp	d15, d14, [sp, #0x40]
+10019f4f0: 6d0533ed    	stp	d13, d12, [sp, #0x50]
+10019f4f4: 6d062beb    	stp	d11, d10, [sp, #0x60]
+10019f4f8: 6d0723e9    	stp	d9, d8, [sp, #0x70]
+10019f4fc: a9086ffc    	stp	x28, x27, [sp, #0x80]
+10019f500: a90967fa    	stp	x26, x25, [sp, #0x90]
+10019f504: a90a5ff8    	stp	x24, x23, [sp, #0xa0]
+10019f508: a90b57f6    	stp	x22, x21, [sp, #0xb0]
+10019f50c: a90c4ff4    	stp	x20, x19, [sp, #0xc0]
+10019f510: a90d7bfd    	stp	x29, x30, [sp, #0xd0]
+10019f514: 910343fd    	add	x29, sp, #0xd0
+10019f518: aa0603f5    	mov	x21, x6
+10019f51c: f100009f    	cmp	x4, #0x0
+10019f520: a9008fe4    	stp	x4, x3, [sp, #0x8]
+10019f524: 9a850076    	csel	x22, x3, x5, eq
+10019f528: 9a84005a    	csel	x26, x2, x4, eq
+10019f52c: f94004f9    	ldr	x25, [x7, #0x8]
+10019f530: bd4018e8    	ldr	s8, [x7, #0x18]
+10019f534: 1e214109    	fneg	s9, s8
+10019f538: 1e202108    	fcmp	s8, #0.0
+10019f53c: 5400084b    	b.lt	0x10019f644 <__RINvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_rowNtB2_21AppliedActivationBiasEB6_+0x15c>
+10019f540: aa0203f7    	mov	x23, x2
+10019f544: aa0003f4    	mov	x20, x0
+10019f548: d280001b    	mov	x27, #0x0               ; =0
+10019f54c: d280001c    	mov	x28, #0x0               ; =0
+10019f550: d37ef433    	lsl	x19, x1, #2
+10019f554: 2d422cea    	ldp	s10, s11, [x7, #0x10]
+10019f558: 1e28790c    	fminnm	s12, s8, s8
+10019f55c: 1e2e100d    	fmov	s13, #1.00000000
+10019f560: 14000013    	b	0x10019f5ac <__RINvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_rowNtB2_21AppliedActivationBiasEB6_+0xc4>
+10019f564: 1e214000    	fneg	s0, s0
+10019f568: 9418293a    	bl	0x1007a9a50 <dyld_stub_binder+0x1007a9a50>
+10019f56c: 1e2e1001    	fmov	s1, #1.00000000
+10019f570: 1e2d2800    	fadd	s0, s0, s13
+10019f574: 1e201820    	fdiv	s0, s1, s0
+10019f578: 1e2921e0    	fcmp	s15, s9
+10019f57c: 1e2f4d21    	fcsel	s1, s9, s15, mi
+10019f580: 1e282020    	fcmp	s1, s8
+10019f584: 1e21cd01    	fcsel	s1, s8, s1, gt
+10019f588: 1e2009c0    	fmul	s0, s14, s0
+10019f58c: 1e212961    	fadd	s1, s11, s1
+10019f590: 1e200820    	fmul	s0, s1, s0
+10019f594: bd000300    	str	s0, [x24]
+10019f598: 910006b5    	add	x21, x21, #0x1
+10019f59c: 91000b7b    	add	x27, x27, #0x2
+10019f5a0: 9100079c    	add	x28, x28, #0x1
+10019f5a4: f1001273    	subs	x19, x19, #0x4
+10019f5a8: 54000360    	b.eq	0x10019f614 <__RINvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_rowNtB2_21AppliedActivationBiasEB6_+0x12c>
+10019f5ac: aa1403f8    	mov	x24, x20
+10019f5b0: 91001294    	add	x20, x20, #0x4
+10019f5b4: 52800028    	mov	w8, #0x1                ; =1
+10019f5b8: aa1c0508    	orr	x8, x8, x28, lsl #1
+10019f5bc: f100073f    	cmp	x25, #0x1
+10019f5c0: 9a9c0369    	csel	x9, x27, x28, eq
+10019f5c4: 9a95010a    	csel	x10, x8, x21, eq
+10019f5c8: f94007e8    	ldr	x8, [sp, #0x8]
+10019f5cc: f100011f    	cmp	x8, #0x0
+10019f5d0: 9a9c0128    	csel	x8, x9, x28, eq
+10019f5d4: 9a9c0140    	csel	x0, x10, x28, eq
+10019f5d8: f9400be9    	ldr	x9, [sp, #0x10]
+10019f5dc: eb09011f    	cmp	x8, x9
+10019f5e0: 54000362    	b.hs	0x10019f64c <__RINvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_rowNtB2_21AppliedActivationBiasEB6_+0x164>
+10019f5e4: eb16001f    	cmp	x0, x22
+10019f5e8: 54000642    	b.hs	0x10019f6b0 <__RINvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_rowNtB2_21AppliedActivationBiasEB6_+0x1c8>
+10019f5ec: bc687ae0    	ldr	s0, [x23, x8, lsl #2]
+10019f5f0: bc607b4f    	ldr	s15, [x26, x0, lsl #2]
+10019f5f4: 1e207800    	fminnm	s0, s0, s0
+10019f5f8: 1e2c780e    	fminnm	s14, s0, s12
+10019f5fc: 1e2e0940    	fmul	s0, s10, s14
+10019f600: 1e202008    	fcmp	s0, #0.0
+10019f604: 54fffb0a    	b.ge	0x10019f564 <__RINvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_rowNtB2_21AppliedActivationBiasEB6_+0x7c>
+10019f608: 94182912    	bl	0x1007a9a50 <dyld_stub_binder+0x1007a9a50>
+10019f60c: 4ea01c01    	mov.16b	v1, v0
+10019f610: 17ffffd8    	b	0x10019f570 <__RINvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_rowNtB2_21AppliedActivationBiasEB6_+0x88>
+10019f614: a94d7bfd    	ldp	x29, x30, [sp, #0xd0]
+10019f618: a94c4ff4    	ldp	x20, x19, [sp, #0xc0]
+10019f61c: a94b57f6    	ldp	x22, x21, [sp, #0xb0]
+10019f620: a94a5ff8    	ldp	x24, x23, [sp, #0xa0]
+10019f624: a94967fa    	ldp	x26, x25, [sp, #0x90]
+10019f628: a9486ffc    	ldp	x28, x27, [sp, #0x80]
+10019f62c: 6d4723e9    	ldp	d9, d8, [sp, #0x70]
+10019f630: 6d462beb    	ldp	d11, d10, [sp, #0x60]
+10019f634: 6d4533ed    	ldp	d13, d12, [sp, #0x50]
+10019f638: 6d443bef    	ldp	d15, d14, [sp, #0x40]
+10019f63c: 910383ff    	add	sp, sp, #0xe0
+10019f640: d65f03c0    	ret
+10019f644: f9400be8    	ldr	x8, [sp, #0x10]
+10019f648: b50000c8    	cbnz	x8, 0x10019f660 <__RINvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_rowNtB2_21AppliedActivationBiasEB6_+0x178>
+10019f64c: d0004042    	adrp	x2, 0x1009a9000 <_anon.bb412aa3d755ebf1b06cc393c86acc7a.86+0x800>
+10019f650: 912f6042    	add	x2, x2, #0xbd8
+10019f654: aa0803e0    	mov	x0, x8
+10019f658: f9400be1    	ldr	x1, [sp, #0x10]
+10019f65c: 94182793    	bl	0x1007a94a8 <__RNvNtCslWxY2MhVcag_4core9panicking18panic_bounds_check>
+10019f660: f100073f    	cmp	x25, #0x1
+10019f664: 9a9f16a8    	csinc	x8, x21, xzr, ne
+10019f668: f94007e9    	ldr	x9, [sp, #0x8]
+10019f66c: f100013f    	cmp	x9, #0x0
+10019f670: 9a9f0100    	csel	x0, x8, xzr, eq
+10019f674: eb16001f    	cmp	x0, x22
+10019f678: 540001c2    	b.hs	0x10019f6b0 <__RINvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_rowNtB2_21AppliedActivationBiasEB6_+0x1c8>
+10019f67c: 2d0323e9    	stp	s9, s8, [sp, #0x18]
+10019f680: d0002e08    	adrp	x8, 0x100761000 <__RNvXs1_NtNtCslWxY2MhVcag_4core3str5errorNtB5_14ParseBoolErrorNtNtB9_3fmt7Display3fmt+0xc>
+10019f684: 910cf108    	add	x8, x8, #0x33c
+10019f688: 910063e9    	add	x9, sp, #0x18
+10019f68c: a90223e9    	stp	x9, x8, [sp, #0x20]
+10019f690: 910073e9    	add	x9, sp, #0x1c
+10019f694: a90323e9    	stp	x9, x8, [sp, #0x30]
+10019f698: b00035e0    	adrp	x0, 0x10085c000 <_anon.b54f3591f8521b6b5f4ff3cdf20dee84.7+0x62>
+10019f69c: 9137d000    	add	x0, x0, #0xdf4
+10019f6a0: d0004042    	adrp	x2, 0x1009a9000 <_anon.bb412aa3d755ebf1b06cc393c86acc7a.86+0x800>
+10019f6a4: 913f2042    	add	x2, x2, #0xfc8
+10019f6a8: 910083e1    	add	x1, sp, #0x20
+10019f6ac: 941827db    	bl	0x1007a9618 <__RNvNtCslWxY2MhVcag_4core9panicking9panic_fmt>
+10019f6b0: d0004042    	adrp	x2, 0x1009a9000 <_anon.bb412aa3d755ebf1b06cc393c86acc7a.86+0x800>
+10019f6b4: 912fc042    	add	x2, x2, #0xbf0
+10019f6b8: aa1603e1    	mov	x1, x22
+10019f6bc: 9418277b    	bl	0x1007a94a8 <__RNvNtCslWxY2MhVcag_4core9panicking18panic_bounds_check>
