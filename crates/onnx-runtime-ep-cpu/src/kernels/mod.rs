@@ -3409,7 +3409,14 @@ mod tests {
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
         assert_eq!(reg.len(), PHASE1_OPS.len() + 109 + mlas_registrations);
         for op in PHASE1_OPS {
-            assert!(reg.lookup(op, "", 29).is_some(), "missing factory for {op}");
+            let since = reg
+                .earliest_since_version(op, "")
+                .unwrap_or_else(|| panic!("no standard-domain registration for {op}"));
+            let opset = 21.max(since);
+            assert!(
+                reg.lookup(op, "", opset).is_some(),
+                "missing factory for {op} at opset {opset}"
+            );
         }
         // Softmax selects legacy at opset ≤ 12 and per-axis at opset ≥ 13.
         assert!(reg.lookup("Softmax", "", 12).is_some());
