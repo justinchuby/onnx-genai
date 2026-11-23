@@ -236,9 +236,36 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
         }
     }
     if request.continue_final_message {
-        return Err(ApiError::invalid_request(
-            "continue_final_message=true is not supported yet; send a new user turn instead",
-        ));
+        if request.wants_constrained_json() {
+            return Err(ApiError::invalid_request(
+                "continue_final_message with response_format JSON requires grammar state seeded from the assistant prefix; use unconstrained text continuation until prefix-aware grammar admission is available",
+            ));
+        }
+        if request.add_generation_prompt {
+            return Err(ApiError::invalid_request(
+                "continue_final_message=true requires add_generation_prompt=false; continuing an assistant message cannot open another assistant turn",
+            ));
+        }
+        let last = request.messages.last().filter(|m| m.role.trim() == "assistant")
+            .ok_or_else(|| ApiError::invalid_request("continue_final_message=true requires a final assistant message; append the assistant text to continue"))?;
+        if last
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+        {
+            return Err(ApiError::invalid_request(
+                "continue_final_message cannot resume an assistant message containing tool_calls; finish the tool results before continuing",
+            ));
+        }
+        if last
+            .content
+            .as_ref()
+            .is_none_or(|content| content.text().trim().is_empty())
+        {
+            return Err(ApiError::invalid_request(
+                "continue_final_message currently requires nonempty final assistant content; reasoning-only continuation needs a resumable reasoning-parser state",
+            ));
+        }
     }
     Ok(())
 }

@@ -567,3 +567,29 @@ Metaspace correction, all 3 selected tokenization and 7 selected infill cases
 passed. Strict metadata, engine and server all-target Clippy and native benchmark
 library/profiling/no-model benchmark Clippy passed. These are functional checks
 on this macOS ARM64 host; remaining delivery rows above remain open.
+
+Content-continuation follow-up: official Llama Chat's explicit boolean continuation
+request now retains the final assistant prefix instead of opening a new message.
+A differential template render proves its position and rejects dropped,
+duplicated or transformed final content; the built-in formatter preserves the
+same original prefix bytes. Template rendering, count routes and real buffered/
+streamed generation use this shared preparation. Empty/reasoning-only prefixes,
+assistant tool calls and persistent-session replay retain explicit refusals;
+reasoning-parser resumption, string continuation modes and upstream's implicit
+prefill heuristic remain open work rather than an advertised completed row.
+Constrained JSON continuation is also refused until grammar admission consumes
+the existing assistant prefix; starting a fresh JSON grammar for a partial object
+would accept the request while generating the wrong language.
+The behavior is checked against the pinned upstream server's
+`common/chat.cpp` continuation admission and
+`common/chat-auto-parser-generator.cpp` generation-prefix assembly, together with
+Llama Chat's `chat.service.ts` continuation request. Unlike an EOS-name heuristic,
+our renderer verifies the loaded template's actual content boundary.
+
+Continuation validation: 2 selected continuation cases passed, followed by the
+complete server library (402 passed / 2 inherited ignores) and strict server
+all-target Clippy on the final tree. Tests cover exact template/fallback framing,
+Unicode and original whitespace, earlier matching text, dropped/duplicated/
+transformed content, shared count/generation preparation, buffered and SSE HTTP,
+and actionable refusal of conflicting flags, tool-call/reasoning-only prefixes,
+JSON grammar without prefix state, and persistent-session replay.

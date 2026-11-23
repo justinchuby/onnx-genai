@@ -152,15 +152,20 @@ truncations; mask-only stages retain their slots, including masked ending tokens
 The preferred forced ending comes from the package's optional
 `tokenizer.special_tokens.eot_token_id` (schema v1.9+), which must also belong to its EOS set;
 otherwise the effective primary EOS is used. Request EOS overrides remain
-binding. A forced ending may replace an optional filter's exclusion, but a
+binding. A forced ending may replace an optional filter's exclusion, but an
 input model mask, mandatory token ban or grammar exclusion produces an actionable
 error. Ending roles do not imply special-token types: only tokenizer-declared
 special pieces are suppressed during prefix matching.
 The selector requires lossless tokenizer byte pieces and declared ending roles.
 
-Thinking budgets, continuation of a final
-assistant message and other unsupported active controls still return actionable
-request errors.
+Explicit content continuation accepts `continue_final_message=true` with
+`add_generation_prompt=false` and a nonempty final assistant text. The template
+boundary is proven by a second render rather than guessed from an EOS spelling
+or an earlier matching quote; original prefix whitespace is preserved. Template
+rendering, token counting and generation share this prompt. Tool-call messages,
+reasoning-only continuation, constrained JSON without a prefix-seeded grammar,
+and replay into a persistent inference session are still rejected with actionable errors. Thinking budgets and other unsupported
+active controls also remain explicit request errors.
 Optional progress/control subscription fields from Llama Chat are accepted, but
 `/props.nxrt_capabilities` advertises resumable streams and reports realtime
 reasoning control as unavailable. Per-token timing/progress events are not promised.

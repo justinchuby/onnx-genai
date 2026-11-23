@@ -2082,6 +2082,10 @@ fn prepare_generate_request(
     context: &PromptContext<'_>,
     output_budget: usize,
 ) -> anyhow::Result<PreparedGenerateRequest> {
+    anyhow::ensure!(
+        !session || !request.continue_final_message,
+        "continue_final_message cannot append a replayed assistant prefix to a persistent inference session; omit the session header and send the full conversation"
+    );
     let prompt = if session && !request.has_tool_context() {
         build_session_prompt(&request.messages, context.image_placeholder)
     } else {
@@ -2469,20 +2473,57 @@ fn render_prompt(
             .map(|protocol| protocol.render(request))
             .transpose()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-        return chat_template
-            .render_with_kwargs(
-                &messages,
-                rendered_tools
-                    .as_ref()
-                    .and_then(|rendered| rendered.tools_json.as_deref()),
-                request.add_generation_prompt,
-                request
-                    .reasoning_effort
-                    .or(context.default_reasoning_effort)
-                    .map(ReasoningEffort::as_str),
-                &request.chat_template_kwargs,
-            )
-            .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"));
+        let render = |messages: &[TemplateChatMessage]| {
+            chat_template
+                .render_with_kwargs(
+                    messages,
+                    rendered_tools
+                        .as_ref()
+                        .and_then(|rendered| rendered.tools_json.as_deref()),
+                    request.add_generation_prompt,
+                    request
+                        .reasoning_effort
+                        .or(context.default_reasoning_effort)
+                        .map(ReasoningEffort::as_str),
+                    &request.chat_template_kwargs,
+                )
+                .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"))
+        };
+        let rendered = render(&messages)?;
+        if !request.continue_final_message {
+            return Ok(rendered);
+        }
+        // Prove which occurrence belongs to the final message. Searching just
+        // for its text could accidentally select an earlier identical quote
+        // when a template drops the final assistant turn.
+        let mut probe = messages;
+        static NEXT_BOUNDARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let marker = format!(
+            "NXRT_CONTINUATION_BOUNDARY_{}",
+            NEXT_BOUNDARY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        anyhow::ensure!(
+            !rendered.contains(&marker),
+            "continuation template probe collides with literal prompt content; retry the request"
+        );
+        probe
+            .last_mut()
+            .context("continue_final_message requires a final assistant message")?
+            .content = marker.clone();
+        let probe = render(&probe)?;
+        anyhow::ensure!(
+            probe.matches(&marker).count() == 1,
+            "continue_final_message requires a chat template that preserves final assistant content exactly once; repair the template rather than dropping or duplicating that message"
+        );
+        let boundary = probe
+            .find(&marker)
+            .context("continuation template boundary disappeared")?;
+        let prefix = &probe[..boundary];
+        anyhow::ensure!(
+            rendered.starts_with(prefix),
+            "continue_final_message cannot prove the final assistant boundary because template framing changes with its content; use a template with stable assistant framing"
+        );
+        return continue_rendered_prompt(request, rendered, context.image_placeholder, boundary);
     }
     let prefix = context
         .tool_protocol
@@ -2495,6 +2536,38 @@ fn render_prompt(
         &prefix,
         context.image_placeholder,
     ))
+}
+
+/// Remove the template's closing framing after the last assistant content.
+/// Never guess an EOS spelling: the actual rendered content must be preserved.
+fn continue_rendered_prompt(
+    request: &ChatCompletionRequest,
+    mut prompt: String,
+    image_placeholder: Option<&str>,
+    boundary: usize,
+) -> anyhow::Result<String> {
+    if request.continue_final_message {
+        let content = request
+            .messages
+            .last()
+            .and_then(|message| message.content.as_ref())
+            .context("continue_final_message requires final assistant content")?
+            .render(image_placeholder);
+        // Validate the proven boundary against either literal or HF-trimmed
+        // content, then restore the original prefix bytes for continuation.
+        anyhow::ensure!(
+            !content.trim().is_empty(),
+            "continue_final_message requires nonempty assistant content"
+        );
+        anyhow::ensure!(
+            prompt[boundary..].starts_with(&content)
+                || prompt[boundary..].starts_with(content.trim()),
+            "continue_final_message requires the final assistant text to be preserved by the chat template; remove content-transforming filters or use a preserving template"
+        );
+        prompt.truncate(boundary);
+        prompt.push_str(&content);
+    }
+    Ok(prompt)
 }
 
 /// Build the Phase 2 chat prompt with a simple role-tagged template:
@@ -2511,7 +2584,7 @@ fn build_prompt_with_tool_prefix(
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str(tool_prefix);
-    for message in &request.messages {
+    for (index, message) in request.messages.iter().enumerate() {
         prompt.push_str("<|");
         prompt.push_str(message.role.trim());
         prompt.push_str("|>\n");
@@ -2530,7 +2603,9 @@ fn build_prompt_with_tool_prefix(
             prompt
                 .push_str(&serde_json::to_string(tool_calls).unwrap_or_else(|_| "[]".to_string()));
         }
-        prompt.push('\n');
+        if !request.continue_final_message || index + 1 != request.messages.len() {
+            prompt.push('\n');
+        }
     }
     if request.add_generation_prompt {
         prompt.push_str("<|assistant|>\n");
@@ -3133,6 +3208,60 @@ mod prompt_rendering_tests {
         assert_eq!(
             tool_protocol::request_policy(&request),
             onnx_genai_engine::ToolCallPolicy::Required
+        );
+    }
+
+    #[test]
+    fn assistant_continuation_removes_only_final_framing_and_proves_content_position() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"café"},{"role":"assistant","content":" café  "}],
+            "continue_final_message":true,"add_generation_prompt":false
+        }))
+        .unwrap();
+        let template = ChatTemplate::from_source(
+            "{% for message in messages %}[{{ message.role }}]{{ message.content | trim }}[end]{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
+        );
+        assert_eq!(
+            render_prompt(&request, &context(&template, None)).unwrap(),
+            "[user]café[end][assistant] café  "
+        );
+        let dropping = ChatTemplate::from_source(
+            "{% for message in messages %}{% if message.role != 'assistant' %}{{ message.content }}{% endif %}{% endfor %}",
+        );
+        assert!(
+            render_prompt(&request, &context(&dropping, None))
+                .unwrap_err()
+                .to_string()
+                .contains("preserves final assistant content exactly once")
+        );
+        let duplicated = ChatTemplate::from_source(
+            "{% for message in messages %}{{ message.content }}{{ message.content }}{% endfor %}",
+        );
+        assert!(
+            render_prompt(&request, &context(&duplicated, None))
+                .unwrap_err()
+                .to_string()
+                .contains("exactly once")
+        );
+        let transforming = ChatTemplate::from_source(
+            "{% for message in messages %}[{{ message.role }}]{{ message.content | upper }}[end]{% endfor %}",
+        );
+        assert!(
+            render_prompt(&request, &context(&transforming, None))
+                .unwrap_err()
+                .to_string()
+                .contains("preserved")
+        );
+        let builtin = PromptContext {
+            chat_template: None,
+            tool_protocol: None,
+            image_placeholder: None,
+            generation_defaults: None,
+            default_reasoning_effort: None,
+        };
+        assert_eq!(
+            render_prompt(&request, &builtin).unwrap(),
+            "<|user|>\ncafé\n<|assistant|>\n café  "
         );
     }
 

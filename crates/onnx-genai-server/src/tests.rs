@@ -6228,6 +6228,112 @@ mod llama_compat {
     }
 
     #[tokio::test]
+    async fn assistant_continuation_uses_the_same_prompt_for_template_count_and_generation() {
+        let router = app(tiny_state());
+        let mut body = json!({"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"world"}],"continue_final_message":true,"add_generation_prompt":false,"max_tokens":2,"temperature":0});
+        let (status, rendered) =
+            call(router.clone(), "POST", "/apply-template", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{rendered}");
+        assert_eq!(rendered["prompt"], "<|user|>\nhello\n<|assistant|>\nworld");
+        let (status, count) = call(
+            router.clone(),
+            "POST",
+            "/v1/chat/completions/input_tokens",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{count}");
+        let (status, generated) =
+            call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{generated}");
+        assert_eq!(generated["usage"]["prompt_tokens"], count["input_tokens"]);
+        body["stream"] = json!(true);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .ends_with("data: [DONE]\n\n")
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-session-id", "continuation-prefix")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("session"),
+            "{error}"
+        );
+        for (field, value, expected) in [
+            (
+                "response_format",
+                json!({"type":"json_object"}),
+                "grammar state",
+            ),
+            (
+                "add_generation_prompt",
+                json!(true),
+                "add_generation_prompt=false",
+            ),
+            (
+                "messages",
+                json!([{"role":"user","content":"hello"}]),
+                "final assistant",
+            ),
+            (
+                "messages",
+                json!([{"role":"assistant","content":"world","tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]}]),
+                "tool_calls",
+            ),
+            (
+                "messages",
+                json!([{"role":"assistant","content":"","reasoning_content":"unfinished"}]),
+                "reasoning-only",
+            ),
+        ] {
+            let mut invalid = body.clone();
+            invalid[field] = value;
+            let (status, error) =
+                call(router.clone(), "POST", "/v1/chat/completions", invalid).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn upstream_chat_payload_streams_usage_and_rejects_unsupported_controls() {
         let router = app(tiny_state());
         let body = json!({
