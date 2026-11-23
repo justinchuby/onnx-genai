@@ -145,6 +145,21 @@ fn verify(
     assert_eq!(fused.run(&input).unwrap()[0].as_bytes(), got[0].as_bytes());
 }
 
+fn verify_bad_index(mut fused: InferenceSession, mut reference: InferenceSession) {
+    let packed = corpus("q4_0", 18);
+    let weights = Tensor::from_raw(DataType::Uint8, vec![packed.len()], &packed).unwrap();
+    let indices = Tensor::from_i64(&[3], &[0, 4, -1]).unwrap();
+    let input = [("packed", &weights), ("indices", &indices)];
+    let fused_error = fused.run(&input).unwrap_err().to_string();
+    let reference_error = reference.run(&input).unwrap_err().to_string();
+    for error in [&fused_error, &reference_error] {
+        assert!(
+            error.contains("out of range") || error.contains("flags=0x40"),
+            "{error}"
+        );
+    }
+}
+
 #[test]
 fn packed_gather_cpu_all_profiles_fp32() {
     assert_eq!(PROFILES.len(), 27);
@@ -157,6 +172,14 @@ fn packed_gather_cpu_all_profiles_fp32() {
             bytes,
         );
     }
+}
+
+#[test]
+fn packed_gather_cpu_preserves_index_validation() {
+    verify_bad_index(
+        InferenceSession::from_graph(graph("q4_0", 32, DataType::Float32, false)).unwrap(),
+        InferenceSession::from_graph(graph("q4_0", 32, DataType::Float32, true)).unwrap(),
+    );
 }
 
 #[test]
@@ -251,4 +274,23 @@ fn packed_gather_cuda_q4k_mxfp4_admitted_output_dtypes() {
             verify(build(false), build(true), profile, width, bytes);
         }
     }
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn packed_gather_cuda_preserves_index_validation() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+    use std::{path::Path, sync::Arc};
+
+    let build = |expose_decoded| {
+        InferenceSession::from_graph_with_provider(
+            graph("q4_0", 32, DataType::Float32, expose_decoded),
+            Arc::new(onnx_runtime_loader::WeightStore::new()),
+            Path::new("."),
+            Arc::new(CudaExecutionProvider::initialized(0).expect("initialize CUDA")),
+            None,
+        )
+        .unwrap()
+    };
+    verify_bad_index(build(false), build(true));
 }
