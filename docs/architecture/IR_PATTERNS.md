@@ -261,8 +261,8 @@ target       = parameter | "_" | "None"
 returns      = expression {"," expression}
 expression   = atom {"|" atom}
 atom         = scoped_name | "_" | "None" | literal | call | "(" expression ")"
-call         = operator_or_pattern "(" [operands] [attributes] ")"
-attributes   = [","] identifier "=" expression {"," identifier "=" expression}
+call         = operator_or_pattern "(" [operands ["," attributes] | attributes] ")"
+attributes   = identifier "=" expression {"," identifier "=" expression}
 operands     = expression {"," expression}
 scoped_name  = identifier {("." | "::") identifier}
 literal      = int64 | finite_float32 | quoted_string | numeric_list

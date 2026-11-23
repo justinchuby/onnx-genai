@@ -6,42 +6,32 @@ use std::{
     sync::LazyLock,
 };
 
-use onnx_runtime_ir::pattern::{EscapingUse, Input, MatchSession, Pattern, PatternError};
+use onnx_runtime_ir::pattern::{EscapingUse, MatchSession, PatternError};
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, RUNTIME_DOMAIN, ValueId};
 
 use crate::{OptimizationPass, PassContext, Result, recognition::RecognitionRule};
 
-static UNPACK: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    let mut p = Pattern::builder();
-    let packed = p.input("packed");
-    let decoded = p.op("Unpack", [Input::Value(packed), Input::Any]);
-    nibble_rule(p, decoded)
-});
+static UNPACK: LazyLock<RecognitionRule> =
+    LazyLock::new(|| nibble_rule("(packed) => { decoded = Unpack(packed, _); return decoded }"));
 
 static BITWISE_DECODE: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    let mut p = Pattern::builder();
-    let packed = Input::Value(p.input("packed"));
-    let low = p.op("BitwiseAnd", [packed, Input::Any]);
-    let high = p.op("BitShift", [packed, Input::Any]);
-    let low = p.op("Unsqueeze", [Input::Value(low), Input::Any]);
-    let high = p.op("Unsqueeze", [Input::Value(high), Input::Any]);
-    let pairs = p.op("Concat", [low, high]);
-    let decoded = p.op("Reshape", [Input::Value(pairs), Input::Any]);
-    nibble_rule(p, decoded)
+    nibble_rule(
+        "(packed) => {
+            low_bits = BitwiseAnd(packed, _)
+            high_bits = BitShift(packed, _)
+            low = Unsqueeze(low_bits, _)
+            high = Unsqueeze(high_bits, _)
+            pairs = Concat(low, high)
+            decoded = Reshape(pairs, _)
+            return decoded
+        }",
+    )
 });
 
-fn nibble_rule(
-    mut p: onnx_runtime_ir::pattern::PatternBuilder,
-    decoded: onnx_runtime_ir::pattern::PatternValue,
-) -> RecognitionRule {
-    p.capture("decoded", decoded);
-    RecognitionRule::from_pattern(
-        "Affine nibble decode",
-        p.finish(decoded)
-            .expect("built-in nibble decode pattern must compile"),
-        "decoded",
+fn nibble_rule(text: &str) -> RecognitionRule {
+    RecognitionRule::parse("Affine nibble decode", text, "decoded").expect(
+        "built-in nibble decode pattern must compile; fix its textual definition or decoded anchor",
     )
-    .expect("nibble decoder must anchor on its output")
 }
 
 #[derive(Debug)]
