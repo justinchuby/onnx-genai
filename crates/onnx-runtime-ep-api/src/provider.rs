@@ -570,7 +570,7 @@ pub struct EpConfig {
 /// to a different EP. Ownership is unique — no two `DeviceBuffer`s ever alias
 /// the same allocation.
 ///
-/// # Two owning representations
+/// # Owning representations
 ///
 /// * **Raw owning** ([`DeviceBuffer::from_raw_parts`]) — an address plus size
 ///   and alignment. The EP is trusted to pair it with exactly one free. This is
@@ -580,6 +580,10 @@ pub struct EpConfig {
 ///   and allocation generation. Final release goes back through that owner, so
 ///   a stale handle over a reused address cannot free anything, and a release
 ///   can never be attributed to the wrong mechanism.
+/// * **Managed owning** ([`DeviceBuffer::from_managed_allocation`]) — the boxed
+///   process-manager owner, retaining its physical allocation and settlement
+///   token together. Reusable workspace loans carry the same box through this
+///   handle and recover it with [`DeviceBuffer::into_bound_ownership`].
 ///
 /// A bound buffer is still non-`Clone` and still has no `Drop`: the generation
 /// is what makes the release safe, and the owner's own `Drop` quarantines
@@ -769,7 +773,7 @@ impl DeviceBuffer {
     /// The buffer's address, size, and alignment are taken from `owner`, so a
     /// bound buffer can never describe a different region than the owner it
     /// carries. Final release consumes that owner
-    /// ([`into_bound_owner`](Self::into_bound_owner)), which matches the binding
+    /// ([`into_bound_ownership`](Self::into_bound_ownership)), which matches the binding
     /// identity and the allocation generation before anything is freed: a stale
     /// handle over a reused device address is refused instead of freeing a live
     /// allocation.
@@ -794,7 +798,9 @@ impl DeviceBuffer {
     ///
     /// The manager settlement token stays inseparable from physical ownership;
     /// consuming release must use [`into_bound_ownership`](Self::into_bound_ownership).
-    pub fn from_managed_allocation(owner: ManagedAllocation, device: DeviceId) -> Self {
+    /// Keep the existing box intact so reusable execution lanes do not allocate
+    /// an ownership wrapper on every checkout.
+    pub fn from_managed_allocation(owner: Box<ManagedAllocation>, device: DeviceId) -> Self {
         let ptr = owner.as_ptr();
         let size = owner.len();
         let align = owner.alignment().max(1);
@@ -804,7 +810,7 @@ impl DeviceBuffer {
             align,
             ptr: NonNull::new(ptr.as_ptr().cast::<c_void>())
                 .expect("a managed allocation holds a non-null address"),
-            owner: BufferOwner::Managed(Box::new(owner)),
+            owner: BufferOwner::Managed(owner),
         }
     }
 
@@ -850,18 +856,12 @@ impl DeviceBuffer {
     /// physical release. `Err` hands the buffer back untouched when it is not
     /// bound, so a caller that requires generation-checked release can refuse
     /// foreign memory without losing it.
-    pub fn into_bound_owner(self) -> std::result::Result<BoundBufferOwnership, Self> {
+    pub fn into_bound_ownership(self) -> std::result::Result<BoundBufferOwnership, Self> {
         match self.owner {
-            BufferOwner::Bound(owner) => Ok(BoundBufferOwnership::Binding(*owner)),
-            BufferOwner::Managed(owner) => Ok(BoundBufferOwnership::Managed(*owner)),
+            BufferOwner::Bound(owner) => Ok(BoundBufferOwnership::Binding(owner)),
+            BufferOwner::Managed(owner) => Ok(BoundBufferOwnership::Managed(owner)),
             owner => Err(Self { owner, ..self }),
         }
-    }
-
-    /// Consume either binding-issued owning representation without discarding a
-    /// process-manager settlement token.
-    pub fn into_bound_ownership(self) -> std::result::Result<BoundBufferOwnership, Self> {
-        self.into_bound_owner()
     }
 
     /// The device this allocation lives on (and whose EP must free it).
@@ -913,15 +913,15 @@ impl DeviceBuffer {
     /// it without matching the binding identity or the allocation generation —
     /// exactly the stale-pointer free the binding exists to prevent — while the
     /// owner it left behind would quarantine the same bytes. Use
-    /// [`into_raw_with_owner`](Self::into_raw_with_owner) when the raw address
+    /// [`into_raw_with_bound_ownership`](Self::into_raw_with_bound_ownership) when the raw address
     /// *and* the owner are both wanted, or
-    /// [`into_bound_owner`](Self::into_bound_owner) to take ownership back.
+    /// [`into_bound_ownership`](Self::into_bound_ownership) to take ownership back.
     pub fn into_raw(self) -> *mut c_void {
         assert!(
             !self.is_bound(),
             "DeviceBuffer::into_raw: this buffer carries a binding-issued owning allocation, so \
              returning the raw pointer alone would bypass binding-identity and allocation-\
-             generation validation on release. Use into_raw_with_owner or into_bound_owner."
+             generation validation on release. Use into_raw_with_bound_ownership or into_bound_ownership."
         );
         self.ptr.as_ptr()
     }
@@ -934,21 +934,11 @@ impl DeviceBuffer {
     /// in the same step, so the release obligation travels with the pointer
     /// instead of being dropped on the floor. `None` means the buffer was raw
     /// owning or borrowed and the historical raw contract applies.
-    pub fn into_raw_with_owner(self) -> (*mut c_void, Option<BoundBufferOwnership>) {
-        let ptr = self.ptr.as_ptr();
-        match self.owner {
-            BufferOwner::Bound(owner) => (ptr, Some(BoundBufferOwnership::Binding(*owner))),
-            BufferOwner::Managed(owner) => (ptr, Some(BoundBufferOwnership::Managed(*owner))),
-            _ => (ptr, None),
-        }
-    }
-
-    /// Consume the buffer into its raw address and complete binding ownership.
     pub fn into_raw_with_bound_ownership(self) -> (*mut c_void, Option<BoundBufferOwnership>) {
         let ptr = self.ptr.as_ptr();
         match self.owner {
-            BufferOwner::Bound(owner) => (ptr, Some(BoundBufferOwnership::Binding(*owner))),
-            BufferOwner::Managed(owner) => (ptr, Some(BoundBufferOwnership::Managed(*owner))),
+            BufferOwner::Bound(owner) => (ptr, Some(BoundBufferOwnership::Binding(owner))),
+            BufferOwner::Managed(owner) => (ptr, Some(BoundBufferOwnership::Managed(owner))),
             _ => (ptr, None),
         }
     }
@@ -957,8 +947,9 @@ impl DeviceBuffer {
 /// Complete binding-issued ownership carried by a [`DeviceBuffer`].
 #[derive(Debug)]
 pub enum BoundBufferOwnership {
-    Binding(OwningAllocation),
-    Managed(ManagedAllocation),
+    Binding(Box<OwningAllocation>),
+    /// Existing ownership wrapper, preserved across reusable execution loans.
+    Managed(Box<ManagedAllocation>),
 }
 
 impl BoundBufferOwnership {
@@ -2711,7 +2702,8 @@ mod tests {
         );
         // The only way ownership leaves the handle is the consuming extractor,
         // and what comes back is the same generation-checked owner.
-        let BoundBufferOwnership::Binding(recovered) = buffer.into_bound_owner().expect("bound")
+        let BoundBufferOwnership::Binding(recovered) =
+            buffer.into_bound_ownership().expect("bound")
         else {
             panic!("plain binding owner changed representation");
         };
@@ -2777,15 +2769,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(governor.used(Tier::Host), 128);
-        let buffer = DeviceBuffer::from_managed_allocation(owner, DeviceId::cpu());
-        assert!(buffer.is_bound());
-        assert!(buffer.managed_owner().is_some());
-        let BoundBufferOwnership::Managed(owner) =
-            buffer.into_bound_owner().expect("managed ownership")
-        else {
-            panic!("manager ownership changed representation");
-        };
-        owner.release_now().unwrap();
+        let mut owner = Box::new(owner);
+        let wrapper = std::ptr::from_ref(owner.as_ref());
+        let address = owner.as_ptr();
+        for escape in 0..2 {
+            let buffer = DeviceBuffer::from_managed_allocation(owner, DeviceId::cpu());
+            assert!(buffer.is_bound());
+            assert_eq!(std::ptr::from_ref(buffer.managed_owner().unwrap()), wrapper);
+            let ownership = match escape {
+                0 => buffer.into_bound_ownership().expect("managed ownership"),
+                _ => {
+                    let (ptr, ownership) = buffer.into_raw_with_bound_ownership();
+                    assert_eq!(ptr, address.as_ptr().cast());
+                    ownership.unwrap()
+                }
+            };
+            let BoundBufferOwnership::Managed(returned) = ownership else {
+                panic!("manager ownership changed representation");
+            };
+            assert_eq!(std::ptr::from_ref(returned.as_ref()), wrapper);
+            assert_eq!(governor.used(Tier::Host), 128);
+            owner = returned;
+        }
+        (*owner).release_now().unwrap();
         assert_eq!(governor.used(Tier::Host), 0);
     }
 
@@ -2947,7 +2953,7 @@ mod tests {
         assert!(raw.bound_owner().is_none());
         // Failing to extract hands the buffer back untouched rather than losing
         // it, which is what lets a generation-checked path fail closed.
-        let raw = raw.into_bound_owner().expect_err("not bound");
+        let raw = raw.into_bound_ownership().expect_err("not bound");
         assert_eq!(raw.len(), 64);
         host_free(raw);
     }
@@ -2989,7 +2995,7 @@ mod tests {
         let owner = binding.allocate_owning(128, 16).expect("owning allocation");
         let expected = owner.as_ptr().as_ptr() as usize;
         let buffer = DeviceBuffer::from_owning_allocation(owner, DeviceId::cpu());
-        let (ptr, owner) = buffer.into_raw_with_owner();
+        let (ptr, owner) = buffer.into_raw_with_bound_ownership();
         assert_eq!(ptr as usize, expected);
         let BoundBufferOwnership::Binding(owner) =
             owner.expect("the release obligation travels with the pointer")
@@ -3001,7 +3007,7 @@ mod tests {
         // A raw-owning buffer keeps the historical contract: no owner, and the
         // caller still owes the free.
         let raw = host_alloc(32, 8);
-        let (ptr, owner) = raw.into_raw_with_owner();
+        let (ptr, owner) = raw.into_raw_with_bound_ownership();
         assert!(owner.is_none());
         // SAFETY: reconstruct the exact `Box<[u8]>` leaked in `host_alloc`.
         unsafe {

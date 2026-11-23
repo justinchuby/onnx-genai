@@ -696,7 +696,7 @@ impl ExecutionProvider for CpuExecutionProvider {
         if lease.is_some() {
             return Err(EpError::KernelFailed("CPU managed workspace must carry its charge in the backing owner, without an outer lease; return workspace from this provider's allocate_workspace".into()));
         }
-        let onnx_runtime_ep_api::BoundBufferOwnership::Managed(owner)=buffer.into_bound_owner().map_err(|_|EpError::KernelFailed("CPU workspace is missing managed backing ownership; use this provider's allocate_workspace".into()))? else {
+        let onnx_runtime_ep_api::BoundBufferOwnership::Managed(owner)=buffer.into_bound_ownership().map_err(|_|EpError::KernelFailed("CPU workspace is missing managed backing ownership; use this provider's allocate_workspace".into()))? else {
             return Err(EpError::KernelFailed("CPU workspace must retain its managed backing owner; return workspace obtained from this provider's allocate_workspace".into()));
         };
         pool.recycle_completed(owner)
@@ -1111,6 +1111,7 @@ mod tests {
         let role = MemoryRole::Workspace { step_scoped: true };
         let slot = first.allocate_workspace(64, 16, role).unwrap();
         let identity = slot.managed_owner().unwrap().identity();
+        let wrapper = std::ptr::from_ref(slot.managed_owner().unwrap());
         let (buffer, lease) = slot.into_parts();
         assert!(
             lease.is_none(),
@@ -1122,6 +1123,7 @@ mod tests {
         for _ in 0..32 {
             let next = second.allocate_workspace(16, 8, role).unwrap();
             assert_eq!(next.managed_owner().unwrap().identity(), identity);
+            assert_eq!(std::ptr::from_ref(next.managed_owner().unwrap()), wrapper);
             assert_eq!(next.len(), 64);
             second.deallocate_workspace(next).unwrap();
         }

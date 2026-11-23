@@ -63,7 +63,7 @@ pub enum WorkspacePoolError {
 
 #[derive(Debug)]
 struct IdleSlot {
-    owner: ManagedAllocation,
+    owner: Box<ManagedAllocation>,
     role: MemoryRole,
 }
 #[derive(Debug, Default)]
@@ -93,7 +93,7 @@ impl IdleSlots {
     fn release_slot(&self, slot: IdleSlot) -> Result<u64, WorkspacePoolError> {
         let identity = slot.owner.identity();
         let bytes = slot.owner.len() as u64;
-        match slot.owner.release_now() {
+        match (*slot.owner).release_now() {
             Ok(outcome) if outcome.is_complete() => Ok(bytes),
             Ok(outcome) => Err(WorkspacePoolError::IncompleteRelease {
                 identity,
@@ -277,13 +277,14 @@ impl HostWorkspacePool {
     }
 
     /// Obtain one exclusively owned slot, reusing a sufficient idle allocation.
-    /// No allocation/authority callback occurs on an admitted warm checkout.
+    /// The boxed owner travels unchanged through the EP bridge and back, so an
+    /// admitted warm checkout needs neither wrapper allocation nor authority callback.
     pub fn checkout(
         &self,
         mut bytes: usize,
         mut alignment: usize,
         role: MemoryRole,
-    ) -> Result<ManagedAllocation, WorkspacePoolError> {
+    ) -> Result<Box<ManagedAllocation>, WorkspacePoolError> {
         if bytes == 0
             || bytes > isize::MAX as usize
             || alignment == 0
@@ -380,6 +381,7 @@ impl HostWorkspacePool {
         self.0
             .binding
             .allocate(request, publication)
+            .map(Box::new)
             .map_err(Into::into)
     }
 
@@ -387,23 +389,18 @@ impl HostWorkspacePool {
     /// Callers must retain active/pending/pinned owners instead of returning them.
     pub fn recycle_completed(
         &self,
-        allocation: ManagedAllocation,
+        allocation: Box<ManagedAllocation>,
     ) -> Result<(), WorkspacePoolError> {
         let (holder, role) = allocation.holder_and_role();
         if allocation.identity().binding() != self.0.binding.identity()
             || holder != self.0.holder.id()
             || !matches!(role, MemoryRole::Workspace { .. })
         {
-            return Err(WorkspacePoolError::ForeignReturn {
-                allocation: Box::new(allocation),
-            });
+            return Err(WorkspacePoolError::ForeignReturn { allocation });
         }
         let views = allocation.owner_ref().outstanding_views();
         if views != 0 {
-            return Err(WorkspacePoolError::BorrowedReturn {
-                views,
-                allocation: Box::new(allocation),
-            });
+            return Err(WorkspacePoolError::BorrowedReturn { views, allocation });
         }
         self.0
             .idle
@@ -541,16 +538,19 @@ mod tests {
         let (books, manager, _, pool) = fixture(64);
         let owner = pool.checkout(16, 16, ROLE).unwrap();
         let first = owner.identity();
+        let wrapper = std::ptr::from_ref(owner.as_ref());
         assert_eq!(books.used(Tier::Host), 16);
         pool.recycle_completed(owner).unwrap();
         let small = pool.checkout(8, 8, ROLE).unwrap();
         assert_eq!(small.identity(), first);
+        assert_eq!(std::ptr::from_ref(small.as_ref()), wrapper);
         assert_eq!(small.len(), 16);
         pool.recycle_completed(small).unwrap();
         let before = books.callbacks();
         for _ in 0..4096 {
             let owner = pool.checkout(16, 16, ROLE).unwrap();
             assert_eq!(owner.identity(), first);
+            assert_eq!(std::ptr::from_ref(owner.as_ref()), wrapper);
             pool.recycle_completed(owner).unwrap();
         }
         assert_eq!(
@@ -615,14 +615,16 @@ mod tests {
         assert_eq!(aligned.len(), 64);
         assert_eq!(aligned.alignment(), 128);
         let id = aligned.identity();
+        let wrapper = std::ptr::from_ref(aligned.as_ref());
         let view = aligned.view(0, 16).unwrap();
         let error = pool.recycle_completed(aligned).unwrap_err();
         let WorkspacePoolError::BorrowedReturn { allocation, .. } = error else {
             panic!("owned views must keep the slot active")
         };
+        assert_eq!(std::ptr::from_ref(allocation.as_ref()), wrapper);
         assert!(pool.checkout(64, 16, ROLE).is_err());
         drop(view);
-        pool.recycle_completed(*allocation).unwrap();
+        pool.recycle_completed(allocation).unwrap();
         let warm = books.callbacks();
         for _ in 0..32 {
             for (bytes, alignment) in [(64, 16), (16, 128)] {
@@ -696,12 +698,14 @@ mod tests {
         assert_eq!(books.used(Tier::Host), 64);
         assert_eq!(manager.process_used(Tier::Host), 128);
         let (_, _, _, foreign) = fixture(128);
+        let wrapper = std::ptr::from_ref(owner.as_ref());
         let error = foreign.recycle_completed(owner).unwrap_err();
         let WorkspacePoolError::ForeignReturn { allocation } = error else {
             panic!("return must preserve its original owner")
         };
+        assert_eq!(std::ptr::from_ref(allocation.as_ref()), wrapper);
         assert_eq!(books.used(Tier::Host), 64);
-        pool.recycle_completed(*allocation).unwrap();
+        pool.recycle_completed(allocation).unwrap();
         assert_eq!(pool.trim_idle(u64::MAX).unwrap(), 64);
         assert_eq!(books.used(Tier::Host), 0);
         assert_eq!(
