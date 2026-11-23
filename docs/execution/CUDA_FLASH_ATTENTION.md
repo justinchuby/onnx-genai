@@ -183,13 +183,23 @@ and rejects unresolved visible cache geometry when a hidden sibling needs that
 capacity before admission. Complete backing is checked before metadata
 preparation or attention launches.
 
-The three preparation metadata arrays share one real graph-resource owner,
-partitioned by a checked layout at i32 alignment. Fitting calls reuse that owner
-and its capture identity; a smaller batch changes only the active regions.
-Growth retains capture refusal, stream draining and the warm-mutation guard.
-The capture lifetime is not replaced by borrowed pointers, and this owner is
-still managed by GraphDeviceAllocation rather than the public composite. The
-composite retains its existing lifetime for now.
+The three sequence metadata arrays are now a checked final region of that same
+composite. GQA preparation owns no allocation or pool and returns no private
+graph resource.
+During capture, the complete used view must be covered by one registered, real
+workspace pin. Unregistered capture, arbitrary tokens, and insufficient spans
+are refused before metadata preparation. Manual callers pass the workspace
+resource to capture and retire the graph before returning its backing.
+
+Capacity remains SessionPersistent: a deferred device-binding decode can return
+before completion, so step retirement could reintroduce admission on every token.
+Metadata contents remain temporary. This retention policy adds no per-token sync
+or issuer operation. Even an empty metadata group funds one backing byte for its
+legal empty windows rather than relying on every downstream launch being skipped.
+Dedicated split-K attention still uses the NVRTC module-global partial-state
+arrays in `gqa_decode`, `gqa_decode_fp16` and `gqa_decode_bf16`. Those buffers are
+separate from the removed preparation pool and remain to be migrated.
+
 The separate MHA prepared-composite migration is tracked in
 [PR #2481](https://github.com/justinchuby/onnx-genai/pull/2481).
 

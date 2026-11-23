@@ -12,6 +12,8 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
+mod common;
+
 use half::f16;
 use onnx_runtime_ep_api::{
     CaptureSupport, DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, KernelMatch,
@@ -303,107 +305,125 @@ fn fp16_zero_append_shared_cache_matches_cpu_and_replays() {
     let output_strides = compute_contiguous_strides(&output_shape);
     let device = ep.device_id();
 
-    let execute = |key_buffer: &mut DeviceBuffer,
-                   value_buffer: &mut DeviceBuffer,
-                   output_buffer: &mut DeviceBuffer| {
-        let key_input = DevicePtr(key_buffer.as_ptr());
-        let value_input = DevicePtr(value_buffer.as_ptr());
-        let key_output = DevicePtrMut(key_buffer.as_mut_ptr());
-        let value_output = DevicePtrMut(value_buffer.as_mut_ptr());
-        let inputs = [
-            TensorView::new(
-                DevicePtr(query_buffer.as_ptr()),
-                DataType::Float16,
-                &query_shape,
-                &query_strides,
-                device,
-            ),
-            TensorView::new(
-                DevicePtr(empty_key_buffer.as_ptr()),
-                DataType::Float16,
-                &current_shape,
-                &current_strides,
-                device,
-            ),
-            TensorView::new(
-                DevicePtr(empty_value_buffer.as_ptr()),
-                DataType::Float16,
-                &current_shape,
-                &current_strides,
-                device,
-            ),
-            TensorView::new(
-                key_input,
-                DataType::Float16,
-                &cache_shape,
-                &cache_strides,
-                device,
-            ),
-            TensorView::new(
-                value_input,
-                DataType::Float16,
-                &cache_shape,
-                &cache_strides,
-                device,
-            ),
-            TensorView::new(
-                DevicePtr(seqlens_buffer.as_ptr()),
-                DataType::Int32,
-                &seqlens_shape,
-                &seqlens_strides,
-                device,
-            ),
-            TensorView::new(
-                DevicePtr(total_buffer.as_ptr()),
-                DataType::Int32,
-                &scalar_shape,
-                &scalar_strides,
-                device,
-            ),
-            TensorView::new(
-                DevicePtr(cos_buffer.as_ptr()),
-                DataType::Float16,
-                &rotary_shape,
-                &rotary_strides,
-                device,
-            ),
-            TensorView::new(
-                DevicePtr(sin_buffer.as_ptr()),
-                DataType::Float16,
-                &rotary_shape,
-                &rotary_strides,
-                device,
-            ),
-        ];
-        let mut outputs = [
-            TensorMut::new(
-                DevicePtrMut(output_buffer.as_mut_ptr()),
-                DataType::Float16,
-                &output_shape,
-                &output_strides,
-                device,
-            ),
-            TensorMut::new(
-                key_output,
-                DataType::Float16,
-                &cache_shape,
-                &cache_strides,
-                device,
-            ),
-            TensorMut::new(
-                value_output,
-                DataType::Float16,
-                &cache_shape,
-                &cache_strides,
-                device,
-            ),
-        ];
-        kernel.execute(&inputs, &mut outputs)
-    };
+    let mut workspace = None;
+    let execute =
+        |key_buffer: &mut DeviceBuffer,
+         value_buffer: &mut DeviceBuffer,
+         output_buffer: &mut DeviceBuffer,
+         workspace: &mut Option<onnx_runtime_ep_api::WorkspaceAllocation>| {
+            let key_input = DevicePtr(key_buffer.as_ptr());
+            let value_input = DevicePtr(value_buffer.as_ptr());
+            let key_output = DevicePtrMut(key_buffer.as_mut_ptr());
+            let value_output = DevicePtrMut(value_buffer.as_mut_ptr());
+            let inputs = [
+                TensorView::new(
+                    DevicePtr(query_buffer.as_ptr()),
+                    DataType::Float16,
+                    &query_shape,
+                    &query_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(empty_key_buffer.as_ptr()),
+                    DataType::Float16,
+                    &current_shape,
+                    &current_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(empty_value_buffer.as_ptr()),
+                    DataType::Float16,
+                    &current_shape,
+                    &current_strides,
+                    device,
+                ),
+                TensorView::new(
+                    key_input,
+                    DataType::Float16,
+                    &cache_shape,
+                    &cache_strides,
+                    device,
+                ),
+                TensorView::new(
+                    value_input,
+                    DataType::Float16,
+                    &cache_shape,
+                    &cache_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(seqlens_buffer.as_ptr()),
+                    DataType::Int32,
+                    &seqlens_shape,
+                    &seqlens_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(total_buffer.as_ptr()),
+                    DataType::Int32,
+                    &scalar_shape,
+                    &scalar_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(cos_buffer.as_ptr()),
+                    DataType::Float16,
+                    &rotary_shape,
+                    &rotary_strides,
+                    device,
+                ),
+                TensorView::new(
+                    DevicePtr(sin_buffer.as_ptr()),
+                    DataType::Float16,
+                    &rotary_shape,
+                    &rotary_strides,
+                    device,
+                ),
+            ];
+            let mut outputs = [
+                TensorMut::new(
+                    DevicePtrMut(output_buffer.as_mut_ptr()),
+                    DataType::Float16,
+                    &output_shape,
+                    &output_strides,
+                    device,
+                ),
+                TensorMut::new(
+                    key_output,
+                    DataType::Float16,
+                    &cache_shape,
+                    &cache_strides,
+                    device,
+                ),
+                TensorMut::new(
+                    value_output,
+                    DataType::Float16,
+                    &cache_shape,
+                    &cache_strides,
+                    device,
+                ),
+            ];
+            let facts = outputs
+                .iter()
+                .map(onnx_runtime_ep_api::OutputMetadata::from_view)
+                .collect::<Vec<_>>();
+            let requirement = common::runtime_workspace_requirement(&kernel, &inputs, &facts)?;
+            let view = common::prepare_workspace(&ep, requirement, workspace)?;
+            kernel.execute_with_workspace(&inputs, &mut outputs, view)?;
+            Ok::<_, onnx_runtime_ep_api::EpError>(requirement)
+        };
 
-    execute(&mut key_buffer, &mut value_buffer, &mut output_buffer).unwrap();
+    let requirement = execute(
+        &mut key_buffer,
+        &mut value_buffer,
+        &mut output_buffer,
+        &mut workspace,
+    )
+    .unwrap();
     assert_eq!(
-        kernel.read_prepared_metadata_for_test(BATCH).unwrap(),
+        kernel
+            .read_prepared_metadata_for_test(BATCH, workspace.as_ref().unwrap(), requirement)
+            .unwrap(),
         (vec![4096], vec![4096], vec![4095])
     );
     assert!(matches!(
@@ -413,9 +433,25 @@ fn fp16_zero_append_shared_cache_matches_cpu_and_replays() {
 
     let allocations_after_warmup = runtime.allocation_counts();
     runtime
-        .begin_graph_capture(&[&kernel as &dyn onnx_runtime_ep_api::Kernel])
+        .begin_graph_capture_with_resources(
+            &[&kernel as &dyn onnx_runtime_ep_api::Kernel],
+            vec![
+                workspace
+                    .as_ref()
+                    .unwrap()
+                    .device_graph_resource()
+                    .unwrap()
+                    .unwrap(),
+            ],
+        )
         .unwrap();
-    execute(&mut key_buffer, &mut value_buffer, &mut output_buffer).unwrap();
+    execute(
+        &mut key_buffer,
+        &mut value_buffer,
+        &mut output_buffer,
+        &mut workspace,
+    )
+    .unwrap();
     runtime.end_graph_capture().unwrap();
     assert_eq!(
         runtime.allocation_counts(),
@@ -455,6 +491,9 @@ fn fp16_zero_append_shared_cache_matches_cpu_and_replays() {
         "zero-append present value must preserve the shared past cache"
     );
     runtime.reset_graph().unwrap();
+    if let Some(owner) = workspace {
+        ep.deallocate_workspace(owner).unwrap();
+    }
 
     for buffer in [
         output_buffer,

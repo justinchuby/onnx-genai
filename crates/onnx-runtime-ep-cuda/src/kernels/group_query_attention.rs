@@ -15,15 +15,14 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    DeviceGraphResource, DevicePtrMut, EpError, Kernel, KernelFactory, OutputMetadata, Result,
-    TensorMetadata, TensorMut, TensorView, WorkspaceLayout, WorkspaceLifetime,
-    WorkspaceRequirement, WorkspaceView,
+    DevicePtrMut, EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata,
+    TensorMut, TensorView, WorkspaceLayout, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::driver_err;
 use crate::kernels::kv_stride::{KvCachePath, KvCacheStrides};
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, cuptr};
 
 use super::attention::{
     AttentionDtype, Phase2aScratch, phase2a_scratch_layout, run_attention_phase2a,
@@ -1029,7 +1028,8 @@ fn gqa_packed_staging_bytes(
 
 /// Byte layout of the governed GQA session-persistent composite workspace. The
 /// packed Q/K/V projection-staging buffers come first, followed by route-required
-/// Q/output BNSH scratch and complete attention scratch, then hidden KV outputs.
+/// Q/output BNSH scratch and complete attention scratch, then hidden KV outputs
+/// and the sequence metadata group.
 /// Attention uses the input-derived logical bound; hidden KV uses the actual
 /// visible sibling capacity, or that logical bound when both are omitted. Packed `Sq==1` overlays its Q
 /// staging and Q-BNSH roles because fused extraction and unfused splitting are
@@ -1293,10 +1293,24 @@ impl GqaWorkspaceLayout {
         Ok(self)
     }
 
-    fn bind(self, prepared: Option<WorkspaceView>) -> Result<WorkspaceView> {
-        let range = Layout::from_size_align(self.total_bytes, GQA_SCORES_ALIGN).map_err(|_| EpError::KernelFailed(
+    fn checked_layout(self) -> Result<Layout> {
+        Layout::from_size_align(self.total_bytes, GQA_SCORES_ALIGN).map_err(|_| EpError::KernelFailed(
             "cuda_ep GroupQueryAttention: complete workspace exceeds addressable capacity; reduce the prepared geometry".into()
-        ))?;
+        ))
+    }
+
+    fn with_metadata(mut self, batch: usize) -> Result<Self> {
+        let bytes = gqa_metadata_layout(batch)?.bytes().max(1);
+        self.total_bytes = gqa_align_up(self.total_bytes, GQA_SCORES_ALIGN)?
+            .checked_add(bytes).ok_or_else(|| EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: metadata composite size overflow; reduce the batch size or prepared geometry".into()
+            ))?;
+        self.checked_layout()?;
+        Ok(self)
+    }
+
+    fn bind(self, prepared: Option<WorkspaceView>) -> Result<WorkspaceView> {
+        let range = self.checked_layout()?;
         let [view] = WorkspaceLayout::new([range])?.bind(prepared).map_err(|error| EpError::KernelFailed(format!(
             "cuda_ep GroupQueryAttention: cannot bind complete prepared workspace: {error}; call workspace_requirement with the actual output geometry and execute_with_workspace"
         )))?;
@@ -1560,13 +1574,7 @@ pub struct GroupQueryAttentionKernel {
     /// generate their index arithmetic from this descriptor at NVRTC
     /// module-build time; every unconverted path rejects it.
     kv_strides: KvCacheStrides,
-    warm_state: Mutex<GqaWarmState>,
-}
-
-#[derive(Debug)]
-struct GqaWarmState {
-    metadata: GqaMetadataWorkspace,
-    capture_signature: Option<GqaCaptureSignature>,
+    capture_signature: Mutex<Option<GqaCaptureSignature>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1589,7 +1597,7 @@ struct GqaCaptureSignature {
 }
 
 /// All three metadata arrays are live together and have one capture lifetime.
-/// Their checked regions share one real owner, not three independent slots.
+/// Their checked regions share the caller-owned prepared composite.
 fn gqa_metadata_layout(batch: usize) -> Result<WorkspaceLayout<3>> {
     let row = Layout::array::<i32>(batch).map_err(|_| EpError::KernelFailed(format!(
         "cuda_ep GroupQueryAttention: metadata for batch_size {batch} exceeds addressable capacity; reduce the batch size"
@@ -1599,85 +1607,23 @@ fn gqa_metadata_layout(batch: usize) -> Result<WorkspaceLayout<3>> {
     )))
 }
 
-#[derive(Clone, Debug)]
-struct GqaPreparedMetadata {
-    allocation: Arc<GraphDeviceAllocation>,
-    layout: WorkspaceLayout<3>,
-}
-
-impl GqaPreparedMetadata {
-    fn views(&self) -> Result<[WorkspaceView; 3]> {
-        self.layout.bind(Some(WorkspaceView::new(
-            DevicePtrMut(self.allocation.ptr() as *mut c_void),
-            self.allocation.bytes(),
-        )))
-    }
-}
-
-#[derive(Clone, Debug)]
-struct GqaMetadataWorkspace {
-    runtime: Arc<CudaRuntime>,
-    prepared: Option<GqaPreparedMetadata>,
-}
-
-impl GqaMetadataWorkspace {
-    fn new(runtime: Arc<CudaRuntime>) -> Self {
-        Self {
-            runtime,
-            prepared: None,
-        }
-    }
-
-    fn reserve(&mut self, batch: usize) -> Result<[CUdeviceptr; 3]> {
-        let layout = gqa_metadata_layout(batch)?;
-        // Preserve a real owner even for empty metadata windows: callers can
-        // embed its address in capture arguments. Logical zero bytes do not
-        // prove every downstream launch is skipped. Retained capacity is reused.
-        let required = layout.bytes().max(1);
-        let capturing = self.runtime.is_capturing()?;
-        let allocation = match &self.prepared {
-            Some(prepared) if prepared.allocation.bytes() >= required => {
-                if capturing {
-                    self.runtime.require_registered_address_capture(
-                        GraphDeviceAllocation::device_graph_resource(&prepared.allocation)
-                            .identity(),
-                        "GroupQueryAttention metadata allocation",
-                    )?;
-                }
-                Arc::clone(&prepared.allocation)
-            }
-            _ => {
-                if capturing {
-                    return Err(EpError::KernelFailed(format!(
-                        "cuda_ep GroupQueryAttention: metadata for batch_size {batch} requires {} bytes during CUDA graph capture; warm the exact batch before capture",
-                        layout.bytes()
-                    )));
-                }
-                if self.prepared.is_some() {
-                    // Preserve queued uses and graph pins before replacing the
-                    // current owner; captured graphs retain their own Arc.
-                    self.runtime.drain_for_unmap()?;
-                }
-                let allocation = GraphDeviceAllocation::allocate(&self.runtime, required)?;
-                self.runtime
-                    .staged_warm_cache_mutation("GroupQueryAttention metadata allocation")?;
-                allocation
-            }
-        };
-        let prepared = GqaPreparedMetadata { allocation, layout };
-        let pointers = prepared
-            .views()?
-            .map(|view| cuptr(view.ptr().0.cast_const()));
-        self.prepared = Some(prepared);
-        Ok(pointers)
-    }
-
-    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.prepared
-            .iter()
-            .map(|prepared| GraphDeviceAllocation::device_graph_resource(&prepared.allocation))
-            .collect()
-    }
+/// Metadata is the final checked region of this invocation's complete layout.
+/// The caller retains the actual workspace owner through queued work/capture.
+fn bind_gqa_metadata(
+    batch: usize,
+    composite_bytes: usize,
+    prepared: WorkspaceView,
+) -> Result<[WorkspaceView; 3]> {
+    let layout = gqa_metadata_layout(batch)?;
+    let bytes = layout.bytes().max(1);
+    let offset = composite_bytes.checked_sub(bytes).ok_or_else(|| EpError::KernelFailed(
+        "cuda_ep GroupQueryAttention: metadata exceeds its composite layout; reprepare the exact invocation requirement".into()
+    ))?;
+    let address = gqa_carve(prepared, offset, bytes, "sequence metadata")?;
+    layout.bind(Some(WorkspaceView::new(
+        DevicePtrMut(address as *mut c_void),
+        bytes,
+    )))
 }
 
 fn checked_i32(value: usize, name: &str) -> Result<i32> {
@@ -1847,10 +1793,7 @@ impl GroupQueryAttentionKernel {
             ));
         }
         Ok(Self {
-            warm_state: Mutex::new(GqaWarmState {
-                metadata: GqaMetadataWorkspace::new(runtime.clone()),
-                capture_signature: None,
-            }),
+            capture_signature: Mutex::new(None),
             runtime,
             num_heads,
             kv_num_heads,
@@ -1896,49 +1839,39 @@ impl GroupQueryAttentionKernel {
         self
     }
 
-    /// Reads the internal metadata workspace for GPU parity tests.
+    /// Reads metadata from the caller-retained workspace for GPU parity tests.
+    /// `requirement` must describe the exact invocation, even when the physical
+    /// allocation is a larger retained peak. Borrowing its owner keeps readback live.
     #[doc(hidden)]
     pub fn read_prepared_metadata_for_test(
         &self,
         batch: usize,
+        workspace: &onnx_runtime_ep_api::WorkspaceAllocation,
+        requirement: WorkspaceRequirement,
     ) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>)> {
-        let state = self.warm_state.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep GroupQueryAttention: warm-state lock poisoned".into())
-        })?;
-        if batch == 0 {
-            return Ok((Vec::new(), Vec::new(), Vec::new()));
-        }
-        let prepared = state.metadata.prepared.as_ref().ok_or_else(|| EpError::KernelFailed(
-            "cuda_ep GroupQueryAttention: metadata is unavailable; execute the requested batch before reading its prepared metadata".into()
+        let bytes = usize::try_from(requirement.bytes).map_err(|_| EpError::KernelFailed(
+            "cuda_ep GroupQueryAttention: metadata requirement exceeds addressable capacity; reprepare the invocation".into()
         ))?;
-        let views = prepared.views()?;
-        let bytes_len = Layout::array::<i32>(batch)
-            .map_err(|_| {
-                EpError::KernelFailed(
-            "cuda_ep GroupQueryAttention: test metadata size overflow; reduce the batch size".into()
-        )
-            })?
-            .size();
+        let view = WorkspaceView::new(
+            DevicePtrMut(workspace.as_ptr() as *mut c_void),
+            workspace.len(),
+        );
+        let [totals, past, starts] = bind_gqa_metadata(batch, bytes, view)?;
         let read_region = |view: WorkspaceView| -> Result<Vec<i32>> {
-            if view.bytes() < bytes_len {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep GroupQueryAttention: metadata for batch_size {batch} needs {bytes_len} bytes per array, but the prepared batch provides {}; execute the requested batch before reading it",
-                    view.bytes()
-                )));
-            }
-            let mut bytes = vec![0u8; bytes_len];
-            // SAFETY: the owner is held by warm_state and the checked region
-            // covers the requested prefix of the most recently prepared batch.
-            unsafe {
-                self.runtime
-                    .dtoh(&mut bytes, cuptr(view.ptr().0.cast_const()))?;
+            let mut bytes = vec![0u8; view.bytes()];
+            if !bytes.is_empty() {
+                // SAFETY: the caller retains the invocation workspace and the
+                // checked metadata region covers this exact destination extent.
+                unsafe {
+                    self.runtime
+                        .dtoh(&mut bytes, cuptr(view.ptr().0.cast_const()))?;
+                }
             }
             Ok(bytes
                 .chunks_exact(4)
                 .map(|x| i32::from_ne_bytes([x[0], x[1], x[2], x[3]]))
                 .collect())
         };
-        let [totals, past, starts] = views;
         Ok((
             read_region(totals)?,
             read_region(past)?,
@@ -1970,11 +1903,12 @@ impl GroupQueryAttentionKernel {
         outputs: &mut [TensorMut],
         prepared: Option<WorkspaceView>,
     ) -> Result<()> {
-        let mut warm_state = self.warm_state.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep GroupQueryAttention: warm-state lock poisoned".into())
+        let mut warm_signature = self.capture_signature.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: capture-signature lock poisoned".into(),
+            )
         })?;
-        let warmed_signature = warm_state.capture_signature.clone();
-        let mut metadata_candidate = warm_state.metadata.clone();
+        let warmed_signature = warm_signature.clone();
         let capturing = self.runtime.is_capturing()?;
         if !(7..=14).contains(&inputs.len()) || !(1..=3).contains(&outputs.len()) {
             return Err(EpError::KernelFailed(format!(
@@ -2634,7 +2568,8 @@ impl GroupQueryAttentionKernel {
             transpose_scratch.output,
             attention_scratch,
         )?
-        .with_present_scratch(&present_scratch)?;
+        .with_present_scratch(&present_scratch)?
+        .with_metadata(batch)?;
         let prepared_view = composite_layout.bind(prepared)?;
         let attention_route = gqa_attention_route(selected_backend, q.dtype, q_seq, dim);
         let phase2a_scratch = if attention_route == GqaAttentionRoute::Phase2a {
@@ -2647,7 +2582,15 @@ impl GroupQueryAttentionKernel {
             None
         };
         let input_q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
-        let [totals_gpu, past_lengths_gpu, query_starts_gpu] = metadata_candidate.reserve(batch)?;
+        if capturing {
+            self.runtime.require_registered_workspace_capture(
+                prepared_view,
+                "GroupQueryAttention prepared workspace",
+            )?;
+        }
+        let [totals_gpu, past_lengths_gpu, query_starts_gpu] =
+            bind_gqa_metadata(batch, composite_layout.total_bytes, prepared_view)?
+                .map(|view| cuptr(view.ptr().0.cast_const()));
         let metadata_error_gpu = if capture_candidate.is_some() {
             // Capture-safe decode steps latch any bounds violation into the
             // runtime-shared word so every captured GQA layer poisons the same
@@ -2657,8 +2600,8 @@ impl GroupQueryAttentionKernel {
             0
         };
         // Every large temporary region belongs to the one admitted composite.
-        // Metadata retains its real graph-owned allocation until capture ownership
-        // can be supplied by the caller; no private large scratch pool remains.
+        // Capture retains the caller's real workspace pin; the kernel has no
+        // private allocation or metadata owner.
         let stage_packed = packed_qkv && !fuse_prep;
         let (packed_q, packed_k, packed_v) = if stage_packed {
             (
@@ -3401,8 +3344,7 @@ impl GroupQueryAttentionKernel {
             );
         }
         if !capturing {
-            warm_state.metadata = metadata_candidate;
-            warm_state.capture_signature = capture_candidate;
+            *warm_signature = capture_candidate;
         }
         Ok(())
     }
@@ -3434,10 +3376,11 @@ impl GroupQueryAttentionKernel {
     ///   When both are omitted, the input-derived logical bound funds both.
     ///
     /// Runtime remains responsible for complete input validation. The composite
-    /// keeps its existing SessionPersistent declaration; moving it to step reuse
-    /// requires the remaining preparation/capture lifetime migration. The
-    /// executor shares the declared peak across serial dispatches and admits
-    /// growth against the same physical authority.
+    /// retains SessionPersistent capacity because deferred device-binding runs
+    /// can return before completion: retiring a step lane there could add fresh
+    /// admission to every token. Contents are temporary; retained backing avoids
+    /// that churn without adding synchronization. The executor shares the peak
+    /// across serial dispatches and admits growth against the same authority.
     fn composite_workspace_requirement(
         inputs: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
@@ -3531,7 +3474,8 @@ impl GroupQueryAttentionKernel {
             transpose_scratch.output,
             attention_scratch,
         )?
-        .with_present_scratch(&present_scratch)?;
+        .with_present_scratch(&present_scratch)?
+        .with_metadata(batch)?;
         if layout.total_bytes == 0 {
             return Ok(WorkspaceRequirement::NONE);
         }
@@ -3581,20 +3525,11 @@ impl Kernel for GroupQueryAttentionKernel {
         true
     }
 
-    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.warm_state
-            .lock()
-            .map(|state| state.metadata.device_graph_resources())
-            .unwrap_or_default()
-    }
-
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // Eligibility is tied to the exact one-token, fixed-capacity, in-place
         // device-KV decode signature warmed by the most recent successful call.
-        match self.warm_state.lock() {
-            Ok(state) if state.capture_signature.is_some() => {
-                onnx_runtime_ep_api::CaptureSupport::Supported
-            }
+        match self.capture_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "requires a warmed fixed-capacity aliased device-KV signature: either f32/fp16/bf16 q_seq==1 (Phase2a split-K decode) or fp16/bf16 q_seq>1 (fused flash verify/prefill); the current signature was not warmed as capture-safe",
             ),
@@ -3709,15 +3644,15 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(requirement(&[y.clone(), kv.clone(), kv.clone()]).bytes, 0);
-        assert_eq!(requirement(&[y.clone(), kv.clone()]).bytes, 176);
+        assert_eq!(requirement(&[y.clone(), kv.clone(), kv.clone()]).bytes, 12);
+        assert_eq!(requirement(&[y.clone(), kv.clone()]).bytes, 256 + 12);
         assert_eq!(
             requirement(&[y.clone(), OutputMetadata::Absent, kv]).bytes,
-            176
+            256 + 12
         );
         // Fully hidden caches need one element row per KV head, with disjoint
         // 256-aligned destinations; external padding is not charged internally.
-        assert_eq!(requirement(&[y]).bytes, 272);
+        assert_eq!(requirement(&[y]).bytes, 512 + 12);
     }
 
     #[test]
@@ -3924,6 +3859,52 @@ mod tests {
     }
 
     #[test]
+    fn metadata_binds_invocation_extent_inside_larger_retained_capacity() {
+        let layout = GqaWorkspaceLayout {
+            total_bytes: 40,
+            ..Default::default()
+        }
+        .with_metadata(3)
+        .unwrap();
+        assert_eq!(layout.total_bytes, 256 + 36);
+        #[repr(align(256))]
+        struct Backing([u8; 1024]);
+        let mut backing = Backing([0; 1024]);
+        let view = WorkspaceView::new(DevicePtrMut(backing.0.as_mut_ptr().cast()), backing.0.len());
+        let regions = bind_gqa_metadata(3, layout.total_bytes, view).unwrap();
+        assert_eq!(regions[0].ptr().0 as usize, view.ptr().0 as usize + 256);
+        assert_eq!(regions[1].ptr().0 as usize, view.ptr().0 as usize + 268);
+        assert!(regions.iter().all(|region| region.bytes() == 12));
+        assert!(bind_gqa_metadata(3, 35, view).is_err());
+        assert!(
+            bind_gqa_metadata(3, layout.total_bytes, WorkspaceView::new(view.ptr(), 291)).is_err()
+        );
+        let empty = GqaWorkspaceLayout::default().with_metadata(0).unwrap();
+        assert_eq!(empty.total_bytes, 1);
+        let empty_regions = bind_gqa_metadata(0, 1, view).unwrap();
+        assert!(
+            empty_regions
+                .iter()
+                .all(|region| region.bytes() == 0 && region.ptr().0 == view.ptr().0)
+        );
+    }
+
+    #[test]
+    fn metadata_planning_rejects_an_unbindable_complete_layout() {
+        let error = GqaWorkspaceLayout {
+            total_bytes: isize::MAX as usize - 7,
+            ..Default::default()
+        }
+        .with_metadata(1)
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("complete workspace exceeds addressable capacity")
+        );
+    }
+
+    #[test]
     fn metadata_layout_rejects_unaddressable_array_and_combined_footprint() {
         let error = gqa_metadata_layout(usize::MAX).unwrap_err();
         assert!(error.to_string().contains("reduce the batch size"));
@@ -3953,57 +3934,6 @@ mod tests {
             .unwrap();
         assert_eq!(regions[1].ptr().0 as usize - regions[0].ptr().0 as usize, 4);
         assert!(regions.iter().all(|region| region.bytes() == 4));
-    }
-
-    fn runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
-    }
-
-    #[test]
-    fn persistent_workspace_reuses_fixed_shape_allocation() {
-        let Some(runtime) = runtime() else {
-            eprintln!("skipping CUDA GQA workspace test: CUDA runtime unavailable");
-            return;
-        };
-        let before = runtime.allocation_counts();
-        let mut workspace = GqaMetadataWorkspace::new(runtime.clone());
-
-        let first = workspace.reserve(1024).unwrap();
-        let identity = workspace.device_graph_resources()[0].identity();
-        assert_eq!(workspace.device_graph_resources().len(), 1);
-        let allocated = runtime.allocation_counts();
-        assert_eq!(allocated.allocations, before.allocations + 1);
-        assert_eq!(allocated.frees, before.frees);
-
-        assert_eq!(workspace.reserve(1024).unwrap(), first);
-        assert_eq!(workspace.reserve(512).unwrap()[0], first[0]);
-        assert_eq!(runtime.allocation_counts(), allocated);
-        assert_eq!(workspace.device_graph_resources()[0].identity(), identity);
-
-        // Growing releases the old block and takes a larger one. `frees` counts
-        // *driver* calls, and the runtime's allocation pool retains released
-        // blocks rather than returning them to the driver, so the released
-        // 12288-byte block shows up as retained bytes instead of as a `cuMemFree`.
-        // Asserting on the retained total keeps the property this test exists
-        // for -- the old block is released, not leaked -- without pinning which
-        // side of the pool it ends up on.
-        let grown = workspace.reserve(2048).unwrap();
-        assert_ne!(grown, first);
-        let grown_counts = runtime.allocation_counts();
-        assert_eq!(grown_counts.allocations, before.allocations + 2);
-        assert!(
-            runtime.raw_pool_retained_bytes() == 12288 || grown_counts.frees == before.frees + 1,
-            "the 12288-byte block must be released -- retained by the pool or \
-             returned to the driver, but not held by the workspace"
-        );
-
-        drop(workspace);
-        let after = runtime.allocation_counts();
-        assert_eq!(after.allocations, before.allocations + 2);
-        assert!(
-            runtime.raw_pool_retained_bytes() == 12288 + 24576 || after.frees == before.frees + 2,
-            "dropping the workspace must release the 24576-byte block too"
-        );
     }
 
     #[test]
@@ -4332,7 +4262,7 @@ mod tests {
         let expected = (2 * aligned_tensor
             + gqa_reference_scores_bytes(batch, num_heads, q_seq, cache + q_seq).unwrap())
             as u64;
-        assert_eq!(req.bytes, expected);
+        assert_eq!(req.bytes, expected.div_ceil(256) * 256 + 12);
         assert_eq!(req.alignment, GQA_SCORES_ALIGN);
         assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
         assert!(matches!(
@@ -4346,7 +4276,7 @@ mod tests {
         no_past[4] = TensorMetadata::new(DataType::Float32, &[], false);
         assert_eq!(
             requirement(&no_past).unwrap().bytes,
-            (2 * aligned_tensor) as u64,
+            (2 * aligned_tensor) as u64 + 12,
         );
 
         // An unpacked key sequence can differ from the query sequence. The
@@ -4359,7 +4289,9 @@ mod tests {
             requirement(&different_key_length).unwrap().bytes,
             (2 * aligned_tensor
                 + gqa_reference_scores_bytes(batch, num_heads, q_seq, cache + 3).unwrap())
-                as u64,
+            .div_ceil(256) as u64
+                * 256
+                + 12,
         );
 
         // This Auto fp16 geometry is guaranteed fused on the selected tier;
@@ -4377,7 +4309,7 @@ mod tests {
         let f16_tensor = batch * q_seq * num_heads * dim * 2;
         assert_eq!(
             f16_req.bytes,
-            (2 * gqa_align_up(f16_tensor, GQA_SCORES_ALIGN).unwrap()) as u64,
+            (2 * gqa_align_up(f16_tensor, GQA_SCORES_ALIGN).unwrap()) as u64 + 12,
             "fp16 prefill charges only its Q/output transpose scratch"
         );
 
@@ -4404,7 +4336,10 @@ mod tests {
                 .unwrap();
         assert_eq!(
             forced_half.bytes,
-            (2 * gqa_align_up(f16_tensor, GQA_SCORES_ALIGN).unwrap() + core.bytes()) as u64
+            (2 * gqa_align_up(f16_tensor, GQA_SCORES_ALIGN).unwrap() + core.bytes()).div_ceil(256)
+                as u64
+                * 256
+                + 12
         );
 
         // A supported f32 single-token shape is covered by the capture-safe
@@ -4422,7 +4357,7 @@ mod tests {
         ];
         let decode_req = requirement(&decode_inputs).expect("decode requirement");
         assert_eq!(
-            decode_req.bytes, 0,
+            decode_req.bytes, 12,
             "unpacked non-RoPE single-token decode uses direct Q/output and gqa_decode scores"
         );
         for dtype in [DataType::Float16, DataType::BFloat16] {
@@ -4430,7 +4365,7 @@ mod tests {
             for input in &mut half_decode[..5] {
                 input.dtype = dtype;
             }
-            assert_eq!(requirement(&half_decode).unwrap().bytes, 0);
+            assert_eq!(requirement(&half_decode).unwrap().bytes, 12);
         }
     }
 
@@ -4690,7 +4625,7 @@ mod tests {
         let staging_total = align(q_bytes) + 2 * align(kv_bytes);
         assert_eq!(
             req.bytes,
-            (staging_total + transpose_total) as u64,
+            (staging_total + transpose_total) as u64 + 12,
             "fp16 packed prefill charges packed staging plus Q/output transpose scratch"
         );
         assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
@@ -4710,7 +4645,8 @@ mod tests {
         ];
         let unpacked_req = requirement(&f16_unpacked).expect("unpacked requirement");
         assert_eq!(
-            unpacked_req.bytes, transpose_total as u64,
+            unpacked_req.bytes,
+            transpose_total as u64 + 12,
             "unpacked fp16 prefill skips split staging but still needs both transposes"
         );
 
@@ -4730,7 +4666,10 @@ mod tests {
         let scores = gqa_reference_scores_bytes(batch, num_heads, q_seq, cache + q_seq).unwrap();
         assert_eq!(
             f32_req.bytes,
-            (f32_staging + 2 * align(batch * q_seq * (num_heads * dim) * 4) + scores) as u64,
+            (f32_staging + 2 * align(batch * q_seq * (num_heads * dim) * 4) + scores).div_ceil(256)
+                as u64
+                * 256
+                + 12,
             "f32 packed prefill charges staging, both transposes, and reference scores"
         );
     }
@@ -4743,6 +4682,17 @@ mod raw_allocation_guard {
     fn large_scratch_cannot_regain_private_allocation_slots() {
         let source = include_str!("group_query_attention.rs");
         let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        for removed in [
+            "GraphDeviceAllocation",
+            "GqaMetadataWorkspace",
+            "alloc_raw",
+            "fn device_graph_resources",
+        ] {
+            assert!(
+                !production.contains(removed),
+                "GQA must not regain private allocation ownership: {removed}"
+            );
+        }
         for removed in [
             "PACKED_Q",
             "PACKED_K",

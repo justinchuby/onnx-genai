@@ -67,6 +67,27 @@ fn collect_owned_capture_resources(
     Ok(resources)
 }
 
+fn require_workspace_capture_pin(
+    resources: Option<&[DeviceGraphResource]>,
+    workspace: onnx_runtime_ep_api::WorkspaceView,
+    label: &str,
+) -> Result<()> {
+    let address = workspace.ptr().0 as usize;
+    if resources.is_some_and(|resources| {
+        resources.iter().any(|resource| {
+            resource
+                .workspace_span()
+                .is_some_and(|span| span.covers(address, workspace.bytes()))
+        })
+    }) {
+        return Ok(());
+    }
+    Err(EpError::KernelFailed(format!(
+        "cuda_ep: capture did not retain one real workspace owner covering {label} at {address:#x} for {} bytes; pass WorkspaceAllocation::device_graph_resource through owned capture or begin_graph_capture_with_resources and retain the backing until graph retirement",
+        workspace.bytes()
+    )))
+}
+
 /// Immutable owner for a kernel-private allocation whose address may be
 /// embedded in a CUDA graph.
 ///
@@ -2925,6 +2946,27 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Require a registered owner for a borrowed workspace before embedding it
+    /// in a capture. Call only on the capture path; raw/unregistered capture
+    /// must never turn an address or arbitrary token into ownership permission.
+    pub(crate) fn require_registered_workspace_capture(
+        &self,
+        workspace: onnx_runtime_ep_api::WorkspaceView,
+        label: &str,
+    ) -> Result<()> {
+        let resources = self.active_capture_resources.load();
+        let registered = self.registered_capture_active.load(Ordering::Acquire);
+        require_workspace_capture_pin(
+            if registered {
+                resources.as_ref().map(|resources| resources.as_slice())
+            } else {
+                None
+            },
+            workspace,
+            label,
+        )
+    }
+
     /// Number of CUDA graph lifecycle mutex acquisitions by this runtime.
     pub fn graph_lifecycle_lock_acquisition_count(&self) -> u64 {
         self.graph.lock_acquisition_count() + self.verify_graph.lock_acquisition_count()
@@ -4616,6 +4658,65 @@ mod workspace_capture_resources_tests {
             .unwrap();
         registry.select(mechanism).unwrap();
         registry.bind(DeviceKey::HOST).unwrap()
+    }
+
+    #[test]
+    fn workspace_capture_requires_a_real_pin_for_the_complete_used_extent() {
+        let binding = binding();
+        let owner = binding.allocate_owning(128, 16).unwrap();
+        let view = onnx_runtime_ep_api::WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(owner.as_ptr().as_ptr().cast()),
+            128,
+        );
+        let pin = DeviceGraphResource::for_workspace(&owner).unwrap();
+        let resources = [pin];
+        require_workspace_capture_pin(Some(&resources), view, "GQA metadata").unwrap();
+        let subview = onnx_runtime_ep_api::WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(owner.as_ptr().as_ptr().wrapping_add(16).cast()),
+            12,
+        );
+        require_workspace_capture_pin(Some(&resources), subview, "metadata rows").unwrap();
+        let oversized = onnx_runtime_ep_api::WorkspaceView::new(view.ptr(), 129);
+        assert!(
+            require_workspace_capture_pin(Some(&resources), oversized, "full GQA workspace")
+                .is_err()
+        );
+        drop(resources);
+        owner.release_now().unwrap();
+    }
+
+    #[test]
+    fn workspace_capture_refuses_unregistered_fake_and_wrapping_ranges() {
+        let binding = binding();
+        let owner = binding.allocate_owning(64, 16).unwrap();
+        let view = onnx_runtime_ep_api::WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(owner.as_ptr().as_ptr().cast()),
+            64,
+        );
+        let fake = [DeviceGraphResource::new(
+            view.ptr().0 as usize,
+            Arc::new(()),
+        )];
+        for resources in [None, Some(&[][..]), Some(&fake[..])] {
+            let error = require_workspace_capture_pin(resources, view, "GQA prepared metadata")
+                .unwrap_err();
+            assert!(error.to_string().contains("one real workspace owner"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("WorkspaceAllocation::device_graph_resource")
+            );
+        }
+        let real = [DeviceGraphResource::for_workspace(&owner).unwrap()];
+        let wrapping = onnx_runtime_ep_api::WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(usize::MAX as *mut c_void),
+            2,
+        );
+        assert!(
+            require_workspace_capture_pin(Some(&real), wrapping, "GQA prepared metadata").is_err()
+        );
+        drop(real);
+        owner.release_now().unwrap();
     }
 
     struct ResourceKernel {

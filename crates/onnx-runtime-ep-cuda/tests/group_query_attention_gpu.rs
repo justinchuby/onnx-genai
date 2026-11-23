@@ -390,6 +390,28 @@ fn read_bytes(
     Ok(host)
 }
 
+fn begin_workspace_capture(
+    ep: &CudaExecutionProvider,
+    kernels: &[&dyn Kernel],
+    workspace: &Option<WorkspaceAllocation>,
+) -> onnx_runtime_ep_api::Result<()> {
+    let resource = workspace
+        .as_ref()
+        .ok_or_else(|| {
+            onnx_runtime_ep_api::EpError::KernelFailed(
+                "prepare the manual capture workspace before capture".into(),
+            )
+        })?
+        .device_graph_resource()?
+        .ok_or_else(|| {
+            onnx_runtime_ep_api::EpError::KernelFailed(
+                "manual capture needs a binding-owned workspace pin".into(),
+            )
+        })?;
+    ep.runtime()
+        .begin_graph_capture_with_resources(kernels, vec![resource])
+}
+
 // This fixture exercises both one-token decode and a rejected two-token capture.
 // Admit the complete peak before either capture so failure tests reach the kernel.
 fn prepare_in_place_workspace(
@@ -431,7 +453,7 @@ fn execute_in_place_packed_f32_gqa(
     positions: &DeviceBuffer,
     output: &mut DeviceBuffer,
     query_sequence_length: usize,
-) -> onnx_runtime_ep_api::Result<()> {
+) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
     execute_in_place_packed_f32_gqa_with_seqlens_shape(
         kernel,
         workspace,
@@ -466,7 +488,7 @@ fn execute_in_place_packed_f32_gqa_with_seqlens_shape(
     output: &mut DeviceBuffer,
     query_sequence_length: usize,
     seqlens_shape: &[usize],
-) -> onnx_runtime_ep_api::Result<()> {
+) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
     let device = ep.device_id();
     let packed_shape = [1, query_sequence_length, 16];
     let output_shape = [1, query_sequence_length, 8];
@@ -568,7 +590,14 @@ fn execute_in_place_packed_f32_gqa_with_seqlens_shape(
             device,
         ),
     ];
-    common::execute_kernel(ep, kernel, &inputs, &mut outputs, workspace)
+    let facts = outputs
+        .iter()
+        .map(onnx_runtime_ep_api::OutputMetadata::from_view)
+        .collect::<Vec<_>>();
+    let requirement = common::runtime_workspace_requirement(kernel, &inputs, &facts)?;
+    let view = common::prepare_workspace(ep, requirement, workspace)?;
+    kernel.execute_with_workspace(&inputs, &mut outputs, view)?;
+    Ok(requirement)
 }
 
 struct PackedStep {
@@ -2161,9 +2190,35 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     );
     assert!(kernel.cuda_graph_compatible());
 
-    let allocation_counts = runtime.allocation_counts();
+    assert!(kernel.device_graph_resources().is_empty());
     let kernels: [&dyn Kernel; 1] = [&kernel];
     runtime.begin_graph_capture(&kernels).unwrap();
+    let missing_pin = execute_in_place_packed_f32_gqa_with_seqlens_shape(
+        &kernel,
+        &mut workspace,
+        &ep,
+        &packed,
+        &mut cache_k,
+        &mut cache_v,
+        &seqlens,
+        &total,
+        &cos,
+        &sin,
+        &positions,
+        &mut output,
+        1,
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        missing_pin.to_string().contains("one real workspace owner"),
+        "{missing_pin}"
+    );
+    runtime.abort_graph_capture().unwrap();
+
+    let allocation_counts = runtime.allocation_counts();
+    let kernels: [&dyn Kernel; 1] = [&kernel];
+    begin_workspace_capture(&ep, &kernels, &workspace).unwrap();
     execute_in_place_packed_f32_gqa_with_seqlens_shape(
         &kernel,
         &mut workspace,
@@ -2246,7 +2301,7 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     overwrite(&ep, &positions, &prefill_positions_host).unwrap();
     let mut prefill_output = ep.allocate(2 * output_bytes, 256).unwrap();
     let kernels: [&dyn Kernel; 1] = [&kernel];
-    runtime.begin_graph_capture(&kernels).unwrap();
+    begin_workspace_capture(&ep, &kernels, &workspace).unwrap();
     let error = execute_in_place_packed_f32_gqa(
         &kernel,
         &mut workspace,
@@ -2351,7 +2406,7 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
         )
         .unwrap();
         let kernels: [&dyn Kernel; 1] = [&kernel];
-        runtime.begin_graph_capture(&kernels).unwrap();
+        begin_workspace_capture(&ep, &kernels, &workspace).unwrap();
         execute_in_place_packed_f32_gqa(
             &kernel,
             &mut workspace,
@@ -2542,7 +2597,7 @@ fn gqa_gpu_capture_error_latches_until_reset_without_resuming_over_hole() {
     assert!(kernel.cuda_graph_compatible());
 
     let kernels: [&dyn Kernel; 1] = [&kernel];
-    runtime.begin_graph_capture(&kernels).unwrap();
+    begin_workspace_capture(&ep, &kernels, &workspace).unwrap();
     execute_in_place_packed_f32_gqa(
         &kernel,
         &mut workspace,
@@ -3554,7 +3609,7 @@ fn gqa_gpu_fused_decode_prep_matches_unfused_bit_exactly() {
         let mut cache_v = upload(&ep, &cache_v_host).unwrap();
         let mut output = ep.allocate(output_bytes, 256).unwrap();
         let mut workspace = prepare_in_place_workspace(&ep, kernel);
-        execute_in_place_packed_f32_gqa(
+        let requirement = execute_in_place_packed_f32_gqa(
             kernel,
             &mut workspace,
             &ep,
@@ -3571,7 +3626,9 @@ fn gqa_gpu_fused_decode_prep_matches_unfused_bit_exactly() {
         )
         .unwrap();
         runtime.synchronize().unwrap();
-        let metadata = kernel.read_prepared_metadata_for_test(1).unwrap();
+        let metadata = kernel.read_prepared_metadata_for_test(
+            1, workspace.as_ref().unwrap(), requirement,
+        ).unwrap();
         let out = read_bytes(&ep, &output, output_bytes).unwrap();
         let ck = read_bytes(&ep, &cache_k, cache_bytes).unwrap();
         let cv = read_bytes(&ep, &cache_v, cache_bytes).unwrap();

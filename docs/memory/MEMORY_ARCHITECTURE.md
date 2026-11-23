@@ -163,7 +163,7 @@ capture boundary. Inherited child views cannot manufacture a parent owner;
 independent capture must be driven by the executor that owns the backing. Current
 child execution remains scoped execution through the parent's live workspace.
 This bridge adds no allocator, pool, quota ledger, or warm inference callback.
-The remaining GQA metadata owner below has not yet moved into the composite.
+GQA below now consumes this ownership bridge for its complete borrowed composite.
 
 ### CUDA GQA temporary storage
 
@@ -175,17 +175,27 @@ the input-derived length bound funds both. Every region is checked against the
 complete admitted backing before metadata preparation starts. This introduces
 no additional authority, pool, or issuer callback in dispatch.
 
-The three small preparation metadata arrays share one actual graph-resource
-owner. A checked three-region layout derives the current batch offsets and
-extents; physical capacity comes only from that owner. Fitting smaller batches
-keep the same capacity and identity. Growth preserves stream draining, capture
-refusal and the warm-mutation guard, and state is published after successful
-preparation. Empty windows retain a real backing address instead of assuming
-that every downstream launch is skipped. This owner remains explicit pending
-migration of capture ownership; a workspace borrow alone cannot replace its
-pins or prove completion. The
-composite remains SessionPersistent, so this stage does not claim step-scoped
-reuse or CUDA performance validation.
+The three sequence metadata arrays occupy the composite's final checked group:
+`align256(previous_regions) + max(3 * batch * sizeof(i32), 1)` bytes in total.
+There is no GQA private allocation or graph-resource factory. The kernel retains
+only capture-signature facts. Capture requires one registered actual owner span
+to cover the entire used invocation view, rather than just the metadata start
+or the unused larger lane capacity. Empty windows retain their funded backing.
+Readback tests borrow the caller's owner and exact invocation requirement; no
+raw workspace pointer is cached in the kernel.
+
+Capacity remains SessionPersistent while deferred device-binding requests can
+return Pending. Switching to per-step retirement there could force allocation
+and admission on each token even when the shape fits. Scratch contents are
+call-local, but retaining physical capacity is a separate policy. This migration
+does not add per-token synchronization, issuer calls, or a new pool. CUDA capture,
+allocation and throughput validation still require a device runner.
+
+Dedicated split-K decode still has NVRTC module-global `gqa_split_scratch`
+arrays in `gqa_decode.rs`, `gqa_decode_fp16.rs` and `gqa_decode_bf16.rs`. They
+are separate from the removed preparation slot pool and are not covered by this
+migration. Moving their fixed worst-case storage into geometry-sized admitted
+workspace remains further work.
 
 ### CPU compressed-projection scratch
 
@@ -283,6 +293,12 @@ when in fact it is 1955 lines.
 | Paged attention (vLLM-style) | — | **not built, and not the plan** | Verified against the tree: `block_table` does not appear in any CUDA attention kernel. `GroupQueryAttention` takes `past_key`/`past_value` as ordinary contiguous tensors and `CompressedSparseAttention` reads a flat pointer with a computed stride, so there is no input through which a page index could be passed. Making every kernel walk a block table cannot be made uniform across backends — we do not own ORT's kernels — so vAttention-style commit-on-demand under a contiguous virtual range is the chosen route instead (#656) |
 
 ### CUDA raw allocation audit (#736, 2026-08-10)
+
+The dated audit and measurements below preserve historical evidence. The current
+GQA contract above supersedes the old slot allocator, compatibility fallback,
+and score-only composite descriptions; GQA now requires prepared backing for
+sequence metadata as well as its other temporary regions.
+
 
 Updated through #736 (default-domain `Attention` staged K/V) on 2026-08-12.
 
