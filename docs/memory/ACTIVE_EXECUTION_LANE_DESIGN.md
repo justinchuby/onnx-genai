@@ -1,6 +1,6 @@
 # Active execution lane: attribution and ownership proposal
 
-Status: proposed; no implementation or performance result is claimed here.
+Status: not adopted. A restricted prototype exists on the experimental branch; engine integration has not been implemented. The attribution below does not justify default adoption.
 
 ## Problem and evidence
 
@@ -79,3 +79,18 @@ measurable single-row regression rather than merely repeat the zero-issuer
 assertion. Test ordinary reuse, growth/failure, phase/yield return and independent
 capture/asynchronous ownership behavior. Host doubles can validate contracts;
 they do not establish CUDA-device performance or driver correctness.
+
+## First attribution outcome
+
+The [fixed five-arm experiment](../benchmarks/active-execution-lane/README.md)
+retains all 75 process records, setup/finish total costs, source and binary hashes.
+It verifies identical outputs and the functional reduction from eleven run
+checkouts to one scope checkout. However H32 shows essentially no same-binary
+latency difference; H64 is about -0.448% scoped/unscoped with overlapping ranges
+and +1.323% original/null drift. H256 fails its control gate. This does not cleanly
+attribute or erase the earlier single-row cost.
+
+Keep the scope prototype and its failure tests on the experimental branch.
+Do not add a public lifecycle surface or refactor the real engine adapter on
+this evidence alone. Source/mechanism attribution of the existing warm-fit path
+is the next prerequisite; the QMoE routed-buffer draft remains gated.

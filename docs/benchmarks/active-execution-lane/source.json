@@ -1,0 +1,17 @@
+{
+  "base": "eaf9bf17a1338e4af9312582b03008fa29584f24",
+  "validated_and_timed_sha256": {
+    "crates/onnx-runtime-session/src/executor/bindings.rs": "2e1f596e81b8647c8461739eb477ab61f502b49f603e3c2b5e389ca25a3e39ad",
+    "crates/onnx-runtime-session/src/executor/build.rs": "fd3aff68ffa1efdf340139514a8901cbe6519cae33ea1335afc280dbfec61ee8",
+    "crates/onnx-runtime-session/src/executor/run.rs": "e01acbbce0e717d8ff21be13cc61d71f73314ee560343cc1d6dfc1ab6b2c9110",
+    "crates/onnx-runtime-session/src/executor/state.rs": "55b7ea2b97086e79bfa2b8da51fe54183799f1e1dfc1ed917d21d1263867a298",
+    "crates/onnx-runtime-session/src/executor/tests.rs": "6a43f5cee598b9e05b389247a1d95a47dba95fb68f8c74fc4954ff6a4778cd80",
+    "crates/onnx-runtime-session/src/lib.rs": "c0f8a0560b5b8868dd50f1083e51c197f1d623ac7b460fefb270c471b3662a6e",
+    "crates/onnx-runtime-session/src/execution_scope.rs": "a96558a24491fa778948008026beb658aebb9952bc9ab8244cca519c21f3301a"
+  },
+  "new_file": "crates/onnx-runtime-session/src/execution_scope.rs",
+  "engine_integration": false,
+  "default_adoption": false,
+  "source_changes_after_timing": "None; reports only",
+  "raw_binaries": "Still retained in /tmp/nxrt-active-lane-perf and original QMoE folder for diagnostic inspection; hashes are archived"
+}

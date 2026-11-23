@@ -1,0 +1,677 @@
+[
+  {
+    "shape": [
+      1,
+      32,
+      32,
+      1,
+      0
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "original": {
+        "loop_cpu_us_median": 28.593645484949842,
+        "loop_cpu_us_range": [
+          28.405239687848383,
+          29.47770345596433
+        ],
+        "loop_wall_us_median": 28.629981884057976,
+        "loop_wall_us_range": [
+          28.434666387959865,
+          29.484566610925306
+        ],
+        "total_cpu_us_per_call_median": 28.617304595565464,
+        "total_cpu_us_per_call_range": [
+          28.44716957760436,
+          29.450978570543793
+        ],
+        "total_wall_us_per_call_median": 28.662735073702464,
+        "total_wall_us_per_call_range": [
+          28.47709321194104,
+          29.477388641149513
+        ],
+        "control_ms_median": 91.06599999999987,
+        "workspace_bytes": [
+          0
+        ],
+        "setup_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finish_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "routed": {
+        "loop_cpu_us_median": 28.831382385730215,
+        "loop_cpu_us_range": [
+          28.72491638795986,
+          29.298773690078036
+        ],
+        "loop_wall_us_median": 28.8797497212932,
+        "loop_wall_us_range": [
+          28.725752508361207,
+          29.369448996655517
+        ],
+        "total_cpu_us_per_call_median": 28.864486560138726,
+        "total_cpu_us_per_call_range": [
+          28.75551220116438,
+          29.90124489037532
+        ],
+        "total_wall_us_per_call_median": 28.882214108757587,
+        "total_wall_us_per_call_range": [
+          28.802134986993682,
+          32.39451210826211
+        ],
+        "control_ms_median": 90.73199999999981,
+        "workspace_bytes": [
+          384
+        ],
+        "setup_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finish_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "unscoped": {
+        "loop_cpu_us_median": 28.624581939799327,
+        "loop_cpu_us_range": [
+          28.450111482720185,
+          30.002508361204026
+        ],
+        "loop_wall_us_median": 28.62451226309922,
+        "loop_wall_us_range": [
+          28.496040133779264,
+          30.00270596432553
+        ],
+        "total_cpu_us_per_call_median": 28.62560386473429,
+        "total_cpu_us_per_call_range": [
+          28.463891985631115,
+          29.855598909946742
+        ],
+        "total_wall_us_per_call_median": 28.62631744704571,
+        "total_wall_us_per_call_range": [
+          28.505617985878853,
+          29.858423417564723
+        ],
+        "control_ms_median": 89.09800000000013,
+        "workspace_bytes": [
+          384
+        ],
+        "setup_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finish_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "scoped": {
+        "loop_cpu_us_median": 28.5448717948718,
+        "loop_cpu_us_range": [
+          28.49136008918617,
+          29.31020066889637
+        ],
+        "loop_wall_us_median": 28.572916666666668,
+        "loop_wall_us_range": [
+          28.535337792642142,
+          29.312534838350057
+        ],
+        "total_cpu_us_per_call_median": 28.61968908708039,
+        "total_cpu_us_per_call_range": [
+          28.480614393657866,
+          29.38275733927908
+        ],
+        "total_wall_us_per_call_median": 28.677622754861886,
+        "total_wall_us_per_call_range": [
+          28.519861668524708,
+          29.393531431933607
+        ],
+        "control_ms_median": 89.58399999999989,
+        "workspace_bytes": [
+          384
+        ],
+        "setup_cpu_ms": [
+          0,
+          0.001000000000001,
+          0.002000000000002,
+          0.001000000000001,
+          0
+        ],
+        "finish_cpu_ms": [
+          0.0020000000000575113,
+          0.003999999999892978,
+          0.0020000000000575113,
+          0.0029999999999752447,
+          0.0019999999998354667
+        ]
+      },
+      "null": {
+        "loop_cpu_us_median": 28.721850613154952,
+        "loop_cpu_us_range": [
+          28.65133779264215,
+          29.72408026755855
+        ],
+        "loop_wall_us_median": 28.722419732441473,
+        "loop_wall_us_range": [
+          28.681554347826086,
+          29.798773690078033
+        ],
+        "total_cpu_us_per_call_median": 28.802799454973357,
+        "total_cpu_us_per_call_range": [
+          28.641737891737893,
+          29.999597423510462
+        ],
+        "total_wall_us_per_call_median": 28.848077728229903,
+        "total_wall_us_per_call_range": [
+          28.68479165118295,
+          30.341575839217143
+        ],
+        "control_ms_median": 89.32800000000007,
+        "workspace_bytes": [
+          0
+        ],
+        "setup_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finish_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "scoped_over_original": 1.0000833234138793,
+    "scoped_over_unscoped": 0.9997933745718744,
+    "null_over_original": 1.0064819123264543,
+    "duration_pass": true,
+    "control_ratios": {
+      "original": 1.0,
+      "routed": 0.9963323303977328,
+      "unscoped": 0.9783893000680852,
+      "scoped": 0.9837260887707818,
+      "null": 0.9809149408121604
+    },
+    "control_5pct_pass": true
+  },
+  {
+    "shape": [
+      1,
+      64,
+      64,
+      1,
+      0
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "original": {
+        "loop_cpu_us_median": 85.5110921501707,
+        "loop_cpu_us_range": [
+          85.37713310580213,
+          86.7354948805461
+        ],
+        "loop_wall_us_median": 85.52193515358361,
+        "loop_wall_us_range": [
+          85.48919197952219,
+          86.73652559726962
+        ],
+        "total_cpu_us_per_call_median": 85.58333333333333,
+        "total_cpu_us_per_call_range": [
+          85.40178232840348,
+          86.77730375426621
+        ],
+        "total_wall_us_per_call_median": 85.5863115282518,
+        "total_wall_us_per_call_range": [
+          85.52327853621539,
+          86.7799462457338
+        ],
+        "control_ms_median": 89.54299999999992,
+        "workspace_bytes": [
+          0
+        ],
+        "setup_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finish_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "routed": {
+        "loop_cpu_us_median": 85.89163822525602,
+        "loop_cpu_us_range": [
+          85.87286689419795,
+          88.30375426621161
+        ],
+        "loop_wall_us_median": 86.03900085324233,
+        "loop_wall_us_range": [
+          85.88587883959046,
+          88.306704778157
+        ],
+        "total_cpu_us_per_call_median": 86.32802427000381,
+        "total_cpu_us_per_call_range": [
+          85.87229806598407,
+          88.29038680318546
+        ],
+        "total_wall_us_per_call_median": 86.47756295032234,
+        "total_wall_us_per_call_range": [
+          85.87506712172923,
+          88.30296416382252
+        ],
+        "control_ms_median": 90.80500000000002,
+        "workspace_bytes": [
+          768
+        ],
+        "setup_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finish_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "unscoped": {
+        "loop_cpu_us_median": 86.71416382252552,
+        "loop_cpu_us_range": [
+          85.69197952218425,
+          91.07849829351535
+        ],
+        "loop_wall_us_median": 86.89430460750853,
+        "loop_wall_us_range": [
+          85.69521501706485,
+          91.31573549488054
+        ],
+        "total_cpu_us_per_call_median": 86.59044368600682,
+        "total_cpu_us_per_call_range": [
+          85.7007015547971,
+          91.15415244596132
+        ],
+        "total_wall_us_per_call_median": 86.5986601251422,
+        "total_wall_us_per_call_range": [
+          85.7036762419416,
+          91.71654977246871
+        ],
+        "control_ms_median": 90.55300000000011,
+        "workspace_bytes": [
+          768
+        ],
+        "setup_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finish_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "scoped": {
+        "loop_cpu_us_median": 85.59470989761093,
+        "loop_cpu_us_range": [
+          85.27815699658692,
+          86.81058020477816
+        ],
+        "loop_wall_us_median": 85.72735324232082,
+        "loop_wall_us_range": [
+          85.41069453924914,
+          86.81406399317406
+        ],
+        "total_cpu_us_per_call_median": 86.20231323473644,
+        "total_cpu_us_per_call_range": [
+          85.27948426241943,
+          86.83077360637088
+        ],
+        "total_wall_us_per_call_median": 86.33735077739857,
+        "total_wall_us_per_call_range": [
+          85.41075711035268,
+          86.83598786499809
+        ],
+        "control_ms_median": 92.19099999999992,
+        "workspace_bytes": [
+          768
+        ],
+        "setup_cpu_ms": [
+          0.003999999999990123,
+          0.001000000000001,
+          0.0009999999999871223,
+          0.002000000000002,
+          0.001000000000001
+        ],
+        "finish_cpu_ms": [
+          0.0020000000000575113,
+          0.001000000000139778,
+          0.001000000000139778,
+          0.001000000000139778,
+          0.001000000000139778
+        ]
+      },
+      "null": {
+        "loop_cpu_us_median": 86.83191126279858,
+        "loop_cpu_us_range": [
+          85.65102389078498,
+          87.48976109215019
+        ],
+        "loop_wall_us_median": 86.89793088737201,
+        "loop_wall_us_range": [
+          85.79429778156997,
+          87.50664846416382
+        ],
+        "total_cpu_us_per_call_median": 86.71587030716724,
+        "total_cpu_us_per_call_range": [
+          86.22364429275694,
+          88.18610163064088
+        ],
+        "total_wall_us_per_call_median": 86.82941467576792,
+        "total_wall_us_per_call_range": [
+          86.38381702692453,
+          88.29827929465301
+        ],
+        "control_ms_median": 92.02999999999983,
+        "workspace_bytes": [
+          0
+        ],
+        "setup_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finish_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "scoped_over_original": 1.0072324818080207,
+    "scoped_over_unscoped": 0.9955176294894871,
+    "null_over_original": 1.0132331486718664,
+    "duration_pass": true,
+    "control_ratios": {
+      "original": 1.0,
+      "routed": 1.0140937873423952,
+      "unscoped": 1.0112794970014427,
+      "scoped": 1.0295723842176385,
+      "null": 1.027774365388695
+    },
+    "control_5pct_pass": true
+  },
+  {
+    "shape": [
+      1,
+      256,
+      256,
+      1,
+      0
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "original": {
+        "loop_cpu_us_median": 1202.6071428571413,
+        "loop_cpu_us_range": [
+          1192.071428571428,
+          1242.607142857144
+        ],
+        "loop_wall_us_median": 1205.0367023809524,
+        "loop_wall_us_range": [
+          1194.1517857142858,
+          1242.7599166666666
+        ],
+        "total_cpu_us_per_call_median": 1204.8796296296296,
+        "total_cpu_us_per_call_range": [
+          1194.058201058201,
+          1240.829365079365
+        ],
+        "total_wall_us_per_call_median": 1207.0395740740742,
+        "total_wall_us_per_call_range": [
+          1196.0096441798944,
+          1240.9427354497357
+        ],
+        "control_ms_median": 89.5570000000001,
+        "workspace_bytes": [
+          0
+        ],
+        "setup_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finish_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "routed": {
+        "loop_cpu_us_median": 1195.4761904761913,
+        "loop_cpu_us_range": [
+          1193.1547619047622,
+          1214.3452380952383
+        ],
+        "loop_wall_us_median": 1195.5168690476191,
+        "loop_wall_us_range": [
+          1195.0124047619047,
+          1214.3953452380952
+        ],
+        "total_cpu_us_per_call_median": 1195.6984126984128,
+        "total_cpu_us_per_call_range": [
+          1195.0304232804235,
+          1219.687830687831
+        ],
+        "total_wall_us_per_call_median": 1197.678683862434,
+        "total_wall_us_per_call_range": [
+          1195.1306203703703,
+          1219.8138783068782
+        ],
+        "control_ms_median": 90.85500000000013,
+        "workspace_bytes": [
+          3072
+        ],
+        "setup_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finish_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "unscoped": {
+        "loop_cpu_us_median": 1195.452380952381,
+        "loop_cpu_us_range": [
+          1189.7261904761897,
+          1218.9523809523807
+        ],
+        "loop_wall_us_median": 1195.4593214285717,
+        "loop_wall_us_range": [
+          1191.4494047619048,
+          1221.7708333333335
+        ],
+        "total_cpu_us_per_call_median": 1195.457671957672,
+        "total_cpu_us_per_call_range": [
+          1189.333333333333,
+          1221.0648148148148
+        ],
+        "total_wall_us_per_call_median": 1195.4905185185187,
+        "total_wall_us_per_call_range": [
+          1191.0487182539682,
+          1222.2806455026455
+        ],
+        "control_ms_median": 90.50700000000012,
+        "workspace_bytes": [
+          3072
+        ],
+        "setup_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finish_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "scoped": {
+        "loop_cpu_us_median": 1203.6904761904766,
+        "loop_cpu_us_range": [
+          1188.2380952380968,
+          1248.7261904761892
+        ],
+        "loop_wall_us_median": 1205.8506904761905,
+        "loop_wall_us_range": [
+          1189.9429523809524,
+          1248.7891904761905
+        ],
+        "total_cpu_us_per_call_median": 1205.8227513227514,
+        "total_cpu_us_per_call_range": [
+          1188.7883597883597,
+          1252.328042328042
+        ],
+        "total_wall_us_per_call_median": 1208.5216587301588,
+        "total_wall_us_per_call_range": [
+          1190.4139113756612,
+          1252.724537037037
+        ],
+        "control_ms_median": 89.3759999999999,
+        "workspace_bytes": [
+          3072
+        ],
+        "setup_cpu_ms": [
+          0.001000000000001,
+          0,
+          0.0009999999999871223,
+          0.002000000000002,
+          0.001000000000001
+        ],
+        "finish_cpu_ms": [
+          0.0009999999999177334,
+          0.0009999999999177334,
+          0.0019999999998354667,
+          0.0029999999999752447,
+          0.0029999999999752447
+        ]
+      },
+      "null": {
+        "loop_cpu_us_median": 1208.892857142857,
+        "loop_cpu_us_range": [
+          1193.7142857142874,
+          1219.3095238095225
+        ],
+        "loop_wall_us_median": 1209.7529761904761,
+        "loop_wall_us_range": [
+          1193.9816428571428,
+          1221.9518809523809
+        ],
+        "total_cpu_us_per_call_median": 1208.1798941798943,
+        "total_cpu_us_per_call_range": [
+          1192.6574074074078,
+          1219.325396825397
+        ],
+        "total_wall_us_per_call_median": 1208.7244272486773,
+        "total_wall_us_per_call_range": [
+          1194.216107142857,
+          1221.8931878306878
+        ],
+        "control_ms_median": 94.16500000000005,
+        "workspace_bytes": [
+          0
+        ],
+        "setup_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finish_cpu_ms": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "scoped_over_original": 1.0007827517952244,
+    "scoped_over_unscoped": 1.0086703859184791,
+    "null_over_original": 1.0027390823689826,
+    "duration_pass": true,
+    "control_ratios": {
+      "original": 1.0,
+      "routed": 1.0144935627589136,
+      "unscoped": 1.0106077693535962,
+      "scoped": 0.9979789407863127,
+      "null": 1.051453264401442
+    },
+    "control_5pct_pass": false
+  }
+]

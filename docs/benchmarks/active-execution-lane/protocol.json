@@ -1,0 +1,70 @@
+{
+  "shapes": [
+    [
+      1,
+      32,
+      32,
+      1,
+      0
+    ],
+    [
+      1,
+      64,
+      64,
+      1,
+      0
+    ],
+    [
+      1,
+      256,
+      256,
+      1,
+      0
+    ]
+  ],
+  "orders": [
+    [
+      "original",
+      "routed",
+      "unscoped",
+      "scoped",
+      "null"
+    ],
+    [
+      "routed",
+      "unscoped",
+      "scoped",
+      "null",
+      "original"
+    ],
+    [
+      "unscoped",
+      "scoped",
+      "null",
+      "original",
+      "routed"
+    ],
+    [
+      "scoped",
+      "null",
+      "original",
+      "routed",
+      "unscoped"
+    ],
+    [
+      "null",
+      "original",
+      "routed",
+      "unscoped",
+      "scoped"
+    ]
+  ],
+  "processes_per_shape_arm": 5,
+  "batches": 9,
+  "target_batch_cpu_ms": 100,
+  "minimum_batch_cpu_ms": 20,
+  "control_gate_percent": 5,
+  "attempts": 1,
+  "lifecycle": "scope creation and finish measured separately and added to total request CPU/wall work; counters have finite resolution and include timer overhead",
+  "source": "original/null identical old baseline; routed old candidate; unscoped/scoped same new binary with runtime mode selected outside loops"
+}
