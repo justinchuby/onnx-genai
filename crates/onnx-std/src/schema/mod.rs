@@ -730,10 +730,11 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 104);
-        assert_eq!(registry.iter().count(), 116);
+        assert_eq!(registry.schemas.len(), 105);
+        assert_eq!(registry.iter().count(), 117);
 
         for (name, since_version) in [
+            ("DequantizePacked", 29),
             ("BitShift", 11),
             ("BitwiseAnd", 18),
             ("BitwiseOr", 18),
