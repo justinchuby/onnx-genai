@@ -43,7 +43,6 @@ const DECLINED: &[(&str, &str)] = &[
     //       require the whole algorithm. `Unique` and `NonMaxSuppression` have
     //       moved to KernelSizedOutput so selection runs once at Compute time.
     ("", "NonZero"),       // output length = count of non-zeros
-    ("", "Range"),         // length = ceil((limit - start) / delta)
     ("", "OneHot"),        // depth comes from input[1]'s value
     ("", "Pad"),           // pads come from input[1]'s values (opset 11+)
     ("", "TopK"),          // K comes from input[1]'s value (opset 10+)
@@ -98,7 +97,6 @@ const DECLINED: &[(&str, &str)] = &[
     //       from exported models rather than produced by our fusion passes.
     //       ORT has no kernel for these at all, so handing them over does not
     //       get a faster implementation — it gets a load failure.
-    ("", "LinearAttention"),
     ("com.microsoft", "LinearAttention"),
 ];
 
@@ -181,7 +179,7 @@ fn declines(op_type: &str, domain: &str) -> bool {
         );
     }
 
-    const OPSETS: &[i64] = &[1, 13, 18, 22, 23, 28, 29];
+    const OPSETS: &[i64] = &[1, 13, 18, 22, 23, 27, 28, 29];
     const SHAPES: &[&[usize]] = &[&[8], &[4, 8], &[2, 3, 8], &[1, 3, 8, 8]];
     /// The integer attributes `for_node` reads, with values consistent with
     /// `SHAPES` (width 8, so `N`/`K` of 8 and a valid `axis`/`num_groups`).

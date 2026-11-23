@@ -27,6 +27,26 @@ const OP: &str = "CausalConvWithState";
 const DOMAIN: &str = "com.microsoft";
 const OPSET: u64 = 1;
 
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn causal_conv_opset27_empty_chunk_preserves_or_zeros_state() {
+    let ep = require_cuda();
+    let dtype = DataType::Float32;
+    for past in [None, Some([1.0, -2.0])] {
+        let mut inputs = vec![
+            float_input(dtype, &[1, 1, 0], &[]),
+            float_input(dtype, &[1, 1, 3], &[1.0; 3]),
+        ];
+        if let Some(state) = past {
+            inputs.push(common::absent_input(dtype));
+            inputs.push(float_input(dtype, &[1, 1, 2], &state));
+        }
+        let outputs = [(dtype, vec![1, 1, 0]), (dtype, vec![1, 1, 2])];
+        let actual = run_cuda(&ep, OP, "", 27, &inputs, &outputs, &[]);
+        assert_eq!(decode_floats(&actual[1], dtype), past.unwrap_or([0.0; 2]));
+    }
+}
+
 fn tolerance(dtype: DataType, silu: bool) -> f32 {
     match (dtype, silu) {
         (DataType::Float32, false) => 2e-5,

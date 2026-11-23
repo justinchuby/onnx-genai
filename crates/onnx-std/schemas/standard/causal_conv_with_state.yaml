@@ -1,0 +1,17 @@
+domain: ""
+name: CausalConvWithState
+since_version: 27
+until_version: 28
+doc: Stateful causal one-dimensional depthwise convolution.
+attributes:
+  - { name: activation, type: string, default: "none" }
+inputs:
+  - { name: input, type_str: T }
+  - { name: weight, type_str: T }
+  - { name: bias, type_str: T, optional: true }
+  - { name: past_state, type_str: T, optional: true }
+outputs:
+  - { name: output, type_str: T }
+  - { name: present_state, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [float32, float16, bfloat16] }

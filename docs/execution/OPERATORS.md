@@ -79,7 +79,9 @@ plugin EPs (via C ABI bridge) handle them.
 | QLinearMatMul | 10 | Quantized matmul. |
 | Einsum | 12, 28 | Schema-aware universal semantic/index plan for every legal expression, with `Einsum-12` selected for imported opsets 12..27 and `Einsum-28` for opset 28+ (adding BF16). CPU and CUDA execute the full schema dtype set and arbitrary legal 1..N expressions through zero-copy views, reduction/product, MatMul/BMM, bounded exact-DP/greedy trees, or the mandatory GenericNative fallback; CUDA retains capture-safe snapshots and cuBLASLt fast paths when the complete layout/alignment contract matches. See [EINSUM_PLANNING.md](EINSUM_PLANNING.md), [EINSUM_CONFORMANCE.md](../testing/EINSUM_CONFORMANCE.md), and [CUDA_COVERAGE.md](CUDA_COVERAGE.md). |
 | Tile | 6 | Repeat for broadcasting. |
-| Range | 11 | Position IDs generation. |
+| Range | 11, 27 | Arithmetic progression; opset 27 adds FP16/BF16 with FLOAT or DOUBLE intermediates. |
+| CausalConvWithState | 27 | Depthwise causal convolution with optional bias and input carry; emits the last `K−1` samples. |
+| LinearAttention | 27 | Packed recurrent attention, all four update rules, forward GQA, and a separately typed state. Contrib behavior is unchanged. |
 | CumSum | 11 | Position computation. |
 | NonZero | 9 | Sparse operations. |
 | ScatterElements | 11 | CPU implemented for opsets 11/16. |

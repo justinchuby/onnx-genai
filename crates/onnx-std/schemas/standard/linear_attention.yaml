@@ -1,0 +1,24 @@
+domain: ""
+name: LinearAttention
+since_version: 27
+until_version: 28
+doc: Stateful linear attention with packed query, key and value heads.
+attributes:
+  - { name: chunk_size, type: int, default: 64 }
+  - { name: kv_num_heads, type: int, required: true }
+  - { name: q_num_heads, type: int, required: true }
+  - { name: scale, type: float, default: 0.0 }
+  - { name: update_rule, type: string, default: "gated_delta" }
+inputs:
+  - { name: query, type_str: T }
+  - { name: key, type_str: T }
+  - { name: value, type_str: T }
+  - { name: past_state, type_str: S, optional: true }
+  - { name: decay, type_str: T, optional: true }
+  - { name: beta, type_str: T, optional: true }
+outputs:
+  - { name: output, type_str: T }
+  - { name: present_state, type_str: S }
+type_constraints:
+  - { type_param: T, allowed: [float16, bfloat16, float32] }
+  - { type_param: S, allowed: [float16, bfloat16, float32] }

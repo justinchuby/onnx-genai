@@ -9,6 +9,7 @@ keywords = ["onnx", "shape-inference", "symbolic", "inference", "runtime"]
 categories = ["science", "algorithms"]
 
 [dependencies]
+half = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 thiserror = { workspace = true }
 

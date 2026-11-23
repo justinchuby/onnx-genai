@@ -40,10 +40,7 @@ fn build_kernel_registry_entries() -> Vec<KernelRegistryEntry> {
                 op_type: leak_str(&d.op_type),
                 domain: leak_str(&d.domain),
                 since_version: since,
-                // Cover all future opset versions so ORT matches our kernel
-                // regardless of the model's declared opset (e.g. Add@7 must
-                // still match a model at opset 21).
-                end_version: i32::MAX,
+                end_version: i32::try_from(d.end_version).unwrap_or(i32::MAX),
                 supported_dtypes: d.supported_dtypes,
                 input_dtype_constraints:
                     onnx_runtime_ep_cpu::kernels::input_dtype_constraints_for_op(

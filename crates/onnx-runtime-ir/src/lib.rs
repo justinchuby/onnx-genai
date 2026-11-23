@@ -57,6 +57,7 @@ mod error;
 mod graph;
 mod graph_view;
 mod layout;
+pub mod linear_attention;
 mod node;
 pub mod onnx;
 pub mod packed_matmul;

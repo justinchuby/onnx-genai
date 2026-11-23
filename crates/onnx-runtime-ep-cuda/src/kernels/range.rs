@@ -40,6 +40,36 @@ extern "C" __global__ void range_bf16(
        index < elements; index += (unsigned long long)gridDim.x * blockDim.x)
     output[index] = __float2bfloat16_rn(start_value + (float)index * delta_value);
 }
+extern "C" __global__ void range_f16_stash_f64(
+    const __half* start, const __half* delta, __half* output,
+    unsigned long long elements) {
+  const double a = __half2float(*start), d = __half2float(*delta);
+  for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < elements; i += (unsigned long long)gridDim.x * blockDim.x)
+    output[i] = __double2half(__dadd_rn(a, __dmul_rn((double)i, d)));
+}
+extern "C" __global__ void range_bf16_stash_f64(
+    const __nv_bfloat16* start, const __nv_bfloat16* delta, __nv_bfloat16* output,
+    unsigned long long elements) {
+  const double a = __bfloat162float(*start), d = __bfloat162float(*delta);
+  for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < elements; i += (unsigned long long)gridDim.x * blockDim.x)
+    output[i] = __double2bfloat16(__dadd_rn(a, __dmul_rn((double)i, d)));
+}
+extern "C" __global__ void range_f64(
+    const double* start, const double* delta, double* output,
+    unsigned long long elements) {
+  for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < elements; i += (unsigned long long)gridDim.x * blockDim.x)
+    output[i] = __dadd_rn(*start, __dmul_rn((double)i, *delta));
+}
+extern "C" __global__ void range_i16(
+    const short* start, const short* delta, short* output,
+    unsigned long long elements) {
+  for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < elements; i += (unsigned long long)gridDim.x * blockDim.x)
+    output[i] = (short)(*start + (int)i * *delta);
+}
 extern "C" __global__ void range_i64(
     const long long* start, const long long* delta, long long* output,
     unsigned long long elements) {
@@ -62,18 +92,25 @@ extern "C" __global__ void range_i32(
 
 pub struct RangeFactory {
     pub runtime: Arc<CudaRuntime>,
+    pub v27: bool,
 }
 
 impl KernelFactory for RangeFactory {
-    fn create(&self, _: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(RangeKernel {
             runtime: self.runtime.clone(),
+            stash_type: self.v27.then(|| {
+                node.attr("stash_type")
+                    .and_then(|a| a.as_int())
+                    .unwrap_or(1)
+            }),
         }))
     }
 }
 
 struct RangeKernel {
     runtime: Arc<CudaRuntime>,
+    stash_type: Option<i64>,
 }
 
 fn scalar_bytes(runtime: &CudaRuntime, input: &TensorView) -> Result<Vec<u8>> {
@@ -95,6 +132,21 @@ fn float_count(start: f32, limit: f32, delta: f32) -> Result<usize> {
         ));
     }
     Ok(count as usize)
+}
+
+fn double_count(start: f64, limit: f64, delta: f64) -> Result<usize> {
+    if delta == 0.0 {
+        return Err(EpError::KernelFailed(
+            "cuda_ep Range: delta must not be zero".into(),
+        ));
+    }
+    let count = ((limit - start) / delta).ceil();
+    if !count.is_finite() || count >= usize::MAX as f64 {
+        return Err(EpError::KernelFailed(
+            "cuda_ep Range: output length is non-finite or exceeds addressable memory".into(),
+        ));
+    }
+    Ok(count.max(0.0) as usize)
 }
 
 fn int_count(start: i64, limit: i64, delta: i64) -> Result<usize> {
@@ -150,8 +202,10 @@ impl Kernel for RangeKernel {
         if !matches!(
             dtype,
             DataType::Float32
+                | DataType::Float64
                 | DataType::Float16
                 | DataType::BFloat16
+                | DataType::Int16
                 | DataType::Int32
                 | DataType::Int64
         ) {
@@ -161,28 +215,46 @@ impl Kernel for RangeKernel {
             .iter()
             .map(|input| scalar_bytes(&self.runtime, input))
             .collect::<Result<Vec<_>>>()?;
+        let low_precision = matches!(dtype, DataType::Float16 | DataType::BFloat16);
+        let stash_f64 = match (low_precision, self.stash_type.unwrap_or(1)) {
+            (true, 11) => true,
+            (true, invalid) if invalid != 1 => {
+                return Err(EpError::KernelFailed(format!(
+                    "Range-27: stash_type={invalid} is invalid for FP16/BF16; use FLOAT (1) or DOUBLE (11)"
+                )));
+            }
+            _ => false,
+        };
+        let short_bits = |i: usize| u16::from_ne_bytes(values[i][..2].try_into().unwrap());
         let expected = match dtype {
             DataType::Float32 => float_count(
                 f32::from_ne_bytes(values[0][..4].try_into().unwrap()),
                 f32::from_ne_bytes(values[1][..4].try_into().unwrap()),
                 f32::from_ne_bytes(values[2][..4].try_into().unwrap()),
             )?,
-            DataType::Float16 => float_count(
-                half::f16::from_bits(u16::from_ne_bytes(values[0][..2].try_into().unwrap()))
-                    .to_f32(),
-                half::f16::from_bits(u16::from_ne_bytes(values[1][..2].try_into().unwrap()))
-                    .to_f32(),
-                half::f16::from_bits(u16::from_ne_bytes(values[2][..2].try_into().unwrap()))
-                    .to_f32(),
-            )?,
-            DataType::BFloat16 => float_count(
-                half::bf16::from_bits(u16::from_ne_bytes(values[0][..2].try_into().unwrap()))
-                    .to_f32(),
-                half::bf16::from_bits(u16::from_ne_bytes(values[1][..2].try_into().unwrap()))
-                    .to_f32(),
-                half::bf16::from_bits(u16::from_ne_bytes(values[2][..2].try_into().unwrap()))
-                    .to_f32(),
-            )?,
+            DataType::Float16 | DataType::BFloat16 => {
+                let [start, limit, delta] = [0, 1, 2].map(|i| {
+                    if dtype == DataType::Float16 {
+                        half::f16::from_bits(short_bits(i)).to_f32()
+                    } else {
+                        half::bf16::from_bits(short_bits(i)).to_f32()
+                    }
+                });
+                if stash_f64 {
+                    double_count(start.into(), limit.into(), delta.into())?
+                } else {
+                    float_count(start, limit, delta)?
+                }
+            }
+            DataType::Float64 => {
+                let [start, limit, delta] =
+                    [0, 1, 2].map(|i| f64::from_ne_bytes(values[i][..8].try_into().unwrap()));
+                double_count(start, limit, delta)?
+            }
+            DataType::Int16 => {
+                let [start, limit, delta] = [0, 1, 2].map(|i| i64::from(short_bits(i) as i16));
+                int_count(start, limit, delta)?
+            }
             DataType::Int64 => int_count(
                 i64::from_ne_bytes(values[0][..8].try_into().unwrap()),
                 i64::from_ne_bytes(values[1][..8].try_into().unwrap()),
@@ -206,15 +278,19 @@ impl Kernel for RangeKernel {
         }
         let entry = match dtype {
             DataType::Float32 => "range_f32",
+            DataType::Float64 => "range_f64",
+            DataType::Float16 if stash_f64 => "range_f16_stash_f64",
+            DataType::BFloat16 if stash_f64 => "range_bf16_stash_f64",
             DataType::Float16 => "range_f16",
             DataType::BFloat16 => "range_bf16",
+            DataType::Int16 => "range_i16",
             DataType::Int64 => "range_i64",
             DataType::Int32 => "range_i32",
             _ => unreachable!(),
         };
         let function = self
             .runtime
-            .nvrtc_function("range_typed_v2", SOURCE, entry)?;
+            .nvrtc_function("range_typed_v3", SOURCE, entry)?;
         let start_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let delta_ptr = cuptr(inputs[2].data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
@@ -304,6 +380,7 @@ mod claim_probes {
         )];
         RangeKernel {
             runtime: runtime.clone(),
+            stash_type: None,
         }
         .execute(&inputs, &mut outputs)
         .unwrap();

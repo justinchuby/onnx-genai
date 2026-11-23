@@ -2629,6 +2629,7 @@ dependencies = [
 name = "onnx-runtime-shape-inference"
 version = "0.1.0-dev.6"
 dependencies = [
+ "half",
  "onnx-runtime-einsum-conformance",
  "onnx-runtime-ir",
  "thiserror 2.0.19",

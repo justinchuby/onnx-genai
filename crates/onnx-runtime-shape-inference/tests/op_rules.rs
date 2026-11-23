@@ -494,7 +494,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        277,
+        278,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -2238,6 +2238,53 @@ fn tile_rejects_non_vector_repeats_and_extent_overflow() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn opset27_recurrent_outputs_infer_carry_without_past_state() {
+    let t = |shape: &[i64]| tin(DataType::Float16, shape.iter().copied().map(c).collect());
+    let causal = node("CausalConvWithState", 2, 2);
+    let outputs = run(&causal, vec![t(&[2, 4, 1]), t(&[4, 1, 7])], 27);
+    assert_eq!(
+        outputs[1].type_info.as_ref().unwrap().shape,
+        vec![c(2), c(4), c(6)]
+    );
+    let linear = with_attr(
+        with_attr(
+            with_attr(
+                node("LinearAttention", 3, 2),
+                "q_num_heads",
+                Attribute::Int(4),
+            ),
+            "kv_num_heads",
+            Attribute::Int(2),
+        ),
+        "update_rule",
+        Attribute::String(b"linear".to_vec()),
+    );
+    let outputs = run(
+        &linear,
+        vec![t(&[2, 3, 16]), t(&[2, 3, 8]), t(&[2, 3, 10])],
+        27,
+    );
+    assert_eq!(
+        outputs[0].type_info.as_ref().unwrap().shape,
+        vec![c(2), c(3), c(20)]
+    );
+    assert_eq!(
+        outputs[1].type_info.as_ref().unwrap().shape,
+        vec![c(2), c(2), c(4), c(5)]
+    );
+    assert_eq!(
+        outputs[1].type_info.as_ref().unwrap().dtype,
+        DataType::Float16
+    );
+    let registry = InferenceRegistry::default_registry();
+    for op in ["LinearAttention", "CausalConvWithState"] {
+        assert!(registry.get("", op, 26).is_none());
+        assert!(registry.get("", op, 28).is_some());
+        assert!(registry.get("", op, 29).is_none());
+    }
 }
 
 #[test]
@@ -7091,7 +7138,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "LeakyRelu", 1),
     ("", "Less", 1),
     ("", "LessOrEqual", 12),
-    ("", "LinearAttention", 1),
+    ("", "LinearAttention", 27),
     ("", "Log", 1),
     ("", "Log1p", 29),
     ("", "LogCumSumExp", 29),
@@ -7139,6 +7186,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "RandomUniform", 1),
     ("", "RandomUniformLike", 1),
     ("", "Range", 11),
+    ("", "Range", 27),
     ("", "Reciprocal", 1),
     ("", "ReduceL1", 1),
     ("", "ReduceL2", 1),
