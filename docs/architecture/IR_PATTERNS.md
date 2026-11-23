@@ -1,7 +1,7 @@
 # Native IR pattern recognition
 
-`onnx_runtime_ir::pattern` is a reusable **match-only** engine. It parses text
-once, resolves named definitions to immutable plans, and matches an unchanged
+`onnx_runtime_ir::pattern` is a reusable **match-only** engine. It compiles typed
+definitions or parses text once into immutable plans, and matches an unchanged
 `Graph` through a prepared `MatchSession`. There is no rewriting, partition
 selection, constant folding, kernel dispatch, or C++/Python dependency.
 
@@ -49,7 +49,9 @@ integer/float/string scalars and lists, and tensors. `attribute` requires
 presence; `optional_attribute` also admits absence. Reusing the same handle
 requires equal presence/content, just as reusing a text capture does.
 
-`optional_input("zero")` declares `tensor[...] | None`. To demand an absent
+`optional_input("zero")` declares `tensor[...] | None`;
+`optional_value("mask")` instead declares `value | None`, without requiring tensor
+dtype or shape metadata. To demand an absent
 slot, use `None::<PatternValue>` in an `Option<PatternValue>` input array, for
 example `p.op("Clip", [Some(x), None, None])`. Heterogeneous explicit slots use
 `Input::{Value, Absent, Any}`; every `Any` occurrence is a fresh **present**
@@ -57,6 +59,33 @@ wildcard. Repeated value handles require exact scoped SSA identity, not merely
 matching producers; output positions remain distinct. `finish_outputs([a, b])`
 sets exact ordered returns. Arity is structural, not ONNX schema validation:
 the declared operator signatures must match the graph exactly.
+
+Operator and passthrough alternatives preserve declaration order and share the
+compiler's rollback and 64-plan expansion budget:
+
+```rust,ignore
+let mut p = Pattern::builder();
+let x = p.input("x");
+let args = p.slot_sequence("args", 0, None);
+let projection = p.node("MatMulNBits", [
+    Input::Value(x), Input::Sequence(args),
+]).domain("com.microsoft").output();
+let activation = p.alias(projection).or_node("Neg", [projection]).output();
+let y = p.node("Mul", [activation, x])
+    .or_node("Mul", [x, activation])
+    .output();
+let pattern = p.finish(y)?;
+```
+
+`slot_sequence(name, min, max)` captures an ordered sequence including missing
+slots, with inclusive bounds (`None` is unbounded). Reusing its typed handle
+requires the same ordered scoped values and absences. Use it alone in an operand
+array or as `Input::Sequence(args)` among heterogeneous inputs; at most one spread
+is permitted per operator. `matched.sequence("args")?` reads the capture.
+`alias(value)` starts with a passthrough branch; `or_value(value)` appends one.
+`or_node` starts a new operator branch, so subsequent `domain` and `attr` calls
+configure that branch only. These are structural alternatives, not an assertion
+that the operators commute or are numerically equivalent.
 
 Build control-flow bodies in independent builders. Finished bodies are immutable
 and reusable; each attribute matches in its own scope:
@@ -94,12 +123,15 @@ source text. A node must be completed with `output()` or `outputs()`; dropping
 one records an error rather than losing its constraints. No constructor panics
 on invalid pattern definitions. Graph nesting is bounded at 32 levels.
 
-The builder intentionally covers structural operators, optional slots, attributes,
-multiple outputs and GRAPH bodies, not another spelling for every text feature.
-Use text for named calls/alternatives, tensor annotations/literals, variadics
+Built-in CPU/CUDA/shared recognizers use typed construction, retaining the text
+frontend for external definitions and compatibility fixtures. The builder covers
+structural operators, ordered expression alternatives, optional/variadic slots,
+attributes, multiple outputs and GRAPH bodies, not every text feature.
+Use text for named calls/definition alternatives, tensor annotations/literals,
+present-only sequences
 and GRAPHS lists, absent output slots, or a read-only predicate for semantic
 eligibility. Zero-input operators need an explicitly typed empty input array,
-for example `p.op("RandomNormal", [] as [PatternValue; 0])`. Neither
+for example `p.op::<Input>("RandomNormal", [])`. Neither
 authoring path infers schema defaults or changes the matching backend.
 
 ## Text and interoperability
