@@ -224,6 +224,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Transpose` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed byte copy; explicit permutation or default axis reversal. |
 | `Gather` | `` | ✅ | **NVRTC-custom** | Axis-parametric contiguous indexed copy; Int32/Int64 indices, negative index wrap, arbitrary index rank. |
 | `AffineQuantizedGather` | `pkg.nxrt` | ✅ | **NVRTC-custom** | EP fusion for single-use per-tensor FLOAT `DequantizeLinear` on INT8/UINT8 data feeding `Gather`; decodes only selected elements. |
+| `AffineQuantizedGroupedMatMul` | `pkg.nxrt` | ✅ | **NVRTC-custom** | Eager fusion of row-packed unsigned 4-bit affine weights into `GroupedMatMul`; only selected experts are decoded. Routing and intervening MoE operations stay separate. |
 | `GatherElements` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic contiguous element gather with Int64 indices, negative axes/indices, and CPU-matched rank/dimension validation. |
 | `ScatterElements` (v11 & v16) | `` | ✅ | **NVRTC-custom** | Deterministic f32/Int64 updates in row-major input order. Opset 16 supports `none`, `add`, `mul`, `min`, and `max`; duplicate indices therefore preserve CPU last-write/sequential-reduction semantics. |
 | `TopK` (v10) | `` | ✅ | **NVRTC-custom** | Deterministic f32 per-slice selection with input `K`, arbitrary/negative axis, largest/smallest modes, and CPU tie-breaking by lower source index. |
@@ -270,6 +271,23 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Resize`, `GridSample`, `ConvTranspose` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling and transposed-convolution subsets; unsupported coordinate modes, cubic/volumetric cases, and output-shape policies fail closed. |
 
 <!-- CUDA_COVERAGE_MATRIX_END -->
+
+### Exporting quantized expert projections
+
+Use native `UINT4` or `INT4` initializers with `DequantizeLinear` when the
+weights and zero points already have the standard ONNX logical layout. For
+opaque byte-packed rows, prefer opset-29 `Unpack` over hand-written bitwise
+expansion when the axis, logical count, low-nibble-first order, and unsigned
+codes match. `Unpack` yields `UINT8`; use matching zero-point types or cast
+both operands consistently. An omitted ONNX zero point means zero, not the
+Mobius QMoE default of eight.
+
+The native packed projection fusion covers transposed, unbiased FLOAT
+`GroupedMatMul` with last-axis blocked affine weights, accepting either
+`Unpack` or the unsigned nibble expansion used by Mobius. It does not claim
+direct sub-byte initializers, GGUF `DequantizePacked`, or whole-MoE routing,
+activation, and reduction. The original graph remains unchanged when a
+decoded intermediate is shared or the layout cannot be proved.
 
 ## Source-derived coverage audit
 

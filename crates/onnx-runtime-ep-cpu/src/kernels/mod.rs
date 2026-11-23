@@ -1061,6 +1061,15 @@ pub(crate) fn build_cpu_registry_with_resources(
     let mut rec = OpRegistry::new();
     rec.register(
         OpKey::new(
+            onnx_runtime_ir::quantized_grouped::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(packed_routed::AffineFactory),
+    );
+    rec.register(
+        OpKey::new(
             onnx_runtime_ir::affine_gather::OP,
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
@@ -3340,8 +3349,8 @@ mod tests {
     #[test]
     fn registry_has_all_phase1_ops() {
         let reg = build_cpu_registry();
-        // Every Phase-1 op has at least one factory, and each resolves at a
-        // modern opset. `Softmax` is registered twice (legacy v1 + per-axis
+        // Every Phase-1 op has at least one factory at the current opset.
+        // `Softmax` is registered twice (legacy v1 + per-axis
         // v13), and `LayerNormalization`, `FusedMatMulBias`, `FusedGemm`,
         // `FusedAttention` and the fused exact-GELU `Gelu` add contrib
         // (`com.microsoft`) entries. Standard `ai.onnx::Attention` is registered
@@ -3396,9 +3405,9 @@ mod tests {
         // standard-domain `CausalConvWithState` (opset 27) adds one alongside
         // its `com.microsoft` spelling.
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
-        // The EP-owned affine Gather fusion adds one runtime-domain registration.
+        // The EP-owned affine Gather and grouped-projection fusions each add one.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 108 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 109 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")
