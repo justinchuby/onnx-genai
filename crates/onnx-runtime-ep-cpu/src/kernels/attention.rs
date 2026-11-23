@@ -24,17 +24,15 @@
 //! Y      = probs · V
 //! ```
 //!
-//! ## Versioning (opset 23 vs 24–26)
+//! ## Versioning
 //!
-//! `Attention` was added at opset 23 and revised at opset 24 (no newer version
-//! exists, so a single opset-24 kernel serves model opsets 24, 25 and 26). The
-//! one semantic delta handled per registered `since_version`:
+//! `Attention` was added at opset 23 and revised at opsets 24 and 25:
 //!
 //! * `nonpad_kv_seqlen` (7th input) — an external-cache per-batch valid-token
 //!   count — is honored for v24+ and rejected for v23 (it did not exist there).
+//! * Inclusive left/right sliding windows are supported from v25.
 //!
-//! `qk_matmul_output_mode` has the **same** meaning in both versions (the opset
-//! 23 and 24 schema descriptions are identical): `0` = raw QK, `1` = after
+//! `qk_matmul_output_mode` has the same meaning in each revision: `0` = raw QK, `1` = after
 //! softcap (before mask), `2` = after mask+softcap, `3` = after softmax.
 //!
 //! ## Supported vs. unimplemented
@@ -47,7 +45,7 @@
 
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
-    attention_window::AttentionWindow,
+    attention_window::{AttentionWindow, validate_attention_head_attributes},
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -86,13 +84,23 @@ pub struct AttentionFactory {
 /// after ORT has compiled the node onto this EP and is a hard session failure
 /// that no fallback recovers from. Implemented by running the factory's own
 /// attribute parse, so the two cannot disagree.
-pub(crate) fn unsupported_reason(node: &Node, opset: u64) -> Option<String> {
-    attributes_from_node(node, opset as u32)
+pub(crate) fn unsupported_reason(node: &Node, opset: u64, q_rank: Option<usize>) -> Option<String> {
+    attributes_from_node(node, opset as u32, q_rank)
         .err()
         .map(|e| e.to_string())
 }
 
-fn attributes_from_node(node: &Node, since_version: u32) -> Result<AttentionKernel> {
+fn attributes_from_node(
+    node: &Node,
+    since_version: u32,
+    q_rank: Option<usize>,
+) -> Result<AttentionKernel> {
+    validate_attention_head_attributes(
+        u64::from(since_version),
+        q_rank,
+        node.attr("q_num_heads").is_some(),
+        node.attr("kv_num_heads").is_some(),
+    )?;
     // Defensive, not load-bearing: ORT does not stamp this attribute (a
     // real session was instrumented to confirm it arrives absent). But both
     // ORT's kernels and ours read an explicit `scale = 0` as "use
@@ -139,8 +147,40 @@ fn attributes_from_node(node: &Node, since_version: u32) -> Result<AttentionKern
 }
 
 impl KernelFactory for AttentionFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(attributes_from_node(node, self.since_version)?))
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(attributes_from_node(
+            node,
+            self.since_version,
+            input_shapes.first().map(Vec::len),
+        )?))
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn attention25_rejects_head_attributes_for_rank_four() {
+    let mut node = Node::new(onnx_runtime_ir::NodeId(0), "Attention", vec![], vec![]);
+    let shapes = [vec![1, 1, 1, 1]];
+    for attr in ["q_num_heads", "kv_num_heads"] {
+        node.attributes
+            .insert(attr.into(), onnx_runtime_ir::Attribute::Int(1));
+        assert!(
+            AttentionFactory { since_version: 24 }
+                .create(&node, &shapes)
+                .is_ok()
+        );
+        assert!(
+            AttentionFactory { since_version: 25 }
+                .create(&node, &shapes)
+                .is_err()
+        );
+        assert!(
+            unsupported_reason(&node, 25, Some(4))
+                .unwrap()
+                .contains("not valid for 4D Q")
+        );
+        assert!(unsupported_reason(&node, 25, Some(3)).is_none());
+        node.attributes.clear();
     }
 }
 
@@ -420,6 +460,12 @@ impl Kernel for AttentionKernel {
         check_arity("Attention", inputs, outputs, 3, 7, 1)?;
 
         let q_rank = inputs[0].shape.len();
+        validate_attention_head_attributes(
+            u64::from(self.since_version),
+            Some(q_rank),
+            self.q_num_heads.is_some(),
+            self.kv_num_heads.is_some(),
+        )?;
         let q = to_bhsd(&inputs[0], "Q", self.q_num_heads)?;
         let k_cur = to_bhsd(&inputs[1], "K", self.kv_num_heads)?;
         let v_cur = to_bhsd(&inputs[2], "V", self.kv_num_heads)?;

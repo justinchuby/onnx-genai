@@ -578,7 +578,11 @@ impl ExecutionProvider for CpuExecutionProvider {
             ("Attention", "com.microsoft") => {
                 crate::kernels::msft_attention::unsupported_reason(op)
             }
-            ("Attention", "ai.onnx") => crate::kernels::attention::unsupported_reason(op, opset),
+            ("Attention", "ai.onnx") => crate::kernels::attention::unsupported_reason(
+                op,
+                opset,
+                shapes.first().map(|shape| shape.len()),
+            ),
             _ => None,
         };
         if let Some(reason) = attribute_reason {

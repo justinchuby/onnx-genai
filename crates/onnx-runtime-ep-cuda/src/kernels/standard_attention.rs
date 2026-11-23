@@ -53,17 +53,15 @@
 //! performed sequentially by the block's lead thread. No atomics contribute to a
 //! shared accumulator, so results are byte-identical run to run.
 //!
-//! ## Versioning (opset 23 vs 24–26)
+//! ## Versioning
 //!
-//! `Attention` was added at opset 23 and revised at opset 24 (no newer version
-//! exists, so a single opset-24 kernel serves model opsets 24, 25 and 26). The
-//! one semantic delta handled per registered `since_version`:
+//! `Attention` was added at opset 23 and revised at opsets 24 and 25:
 //!
 //! * `nonpad_kv_seqlen` (7th input) — an external-cache per-batch valid-token
 //!   count — is honored for v24+ and rejected for v23 (it did not exist there).
+//! * Inclusive left/right sliding windows are supported from v25.
 //!
-//! `qk_matmul_output_mode` has the **same** meaning in both versions (the opset
-//! 23 and 24 schema descriptions are identical): `0` = raw QK, `1` = after
+//! `qk_matmul_output_mode` has the same meaning in each revision: `0` = raw QK, `1` = after
 //! softcap (before mask), `2` = after mask+softcap, `3` = after softmax.
 //!
 //! ## Supported vs. unimplemented
@@ -84,7 +82,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
     DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
     TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
-    attention_window::AttentionWindow,
+    attention_window::{AttentionWindow, validate_attention_head_attributes},
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -905,7 +903,11 @@ pub(crate) fn unsupported_reason(
     node: &Node,
     opset: u64,
     input_dtypes: &[DataType],
+    q_rank: Option<usize>,
 ) -> Option<Cow<'static, str>> {
+    if let Err(error) = validate_head_attributes(node, opset, q_rank) {
+        return Some(Cow::Owned(error.to_string()));
+    }
     if let Err(error) = AttentionWindow::from_node(node, opset) {
         return Some(Cow::Owned(error.to_string()));
     }
@@ -1016,7 +1018,7 @@ pub struct StandardAttentionKernel {
     /// when output slots 1/2 exist, so prepare-only planning must not charge
     /// their bytes for one-output attention nodes.
     output_count: usize,
-    /// The registered opset version this kernel serves (23, or 24 for 24–26).
+    /// The registered schema revision this kernel serves (23, 24 or 25).
     /// Controls `nonpad_kv_seqlen` acceptance (opset 24+ only).
     since_version: u32,
     /// Persistent device scratch for capture-eligible single-token decode paths
@@ -1541,14 +1543,28 @@ impl StdAttnWorkspace {
 }
 
 /// Factory for [`StandardAttentionKernel`], reading the standard-`Attention`
-/// attributes. `since_version` selects the opset semantics (23 vs 24–26).
+/// attributes. `since_version` selects the opset semantics.
 pub struct StandardAttentionFactory {
     pub runtime: Arc<CudaRuntime>,
     pub since_version: u32,
 }
 
+fn validate_head_attributes(node: &Node, opset: u64, q_rank: Option<usize>) -> Result<()> {
+    validate_attention_head_attributes(
+        opset,
+        q_rank,
+        node.attr("q_num_heads").is_some(),
+        node.attr("kv_num_heads").is_some(),
+    )
+}
+
 impl KernelFactory for StandardAttentionFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        validate_head_attributes(
+            node,
+            u64::from(self.since_version),
+            input_shapes.first().map(Vec::len),
+        )?;
         let scale = node.attr("scale").and_then(|a| a.as_float());
         let is_causal = node.attr("is_causal").and_then(|a| a.as_int()).unwrap_or(0) != 0;
         let q_num_heads = node
@@ -1921,6 +1937,12 @@ impl StandardAttentionKernel {
         }
 
         let q_rank = inputs[0].shape.len();
+        validate_attention_head_attributes(
+            u64::from(self.since_version),
+            Some(q_rank),
+            self.q_num_heads.is_some(),
+            self.kv_num_heads.is_some(),
+        )?;
         let q = resolve_bhsd(&inputs[0], "Q", self.q_num_heads)?;
         let k_cur = resolve_bhsd(&inputs[1], "K", self.kv_num_heads)?;
         let v_cur = resolve_bhsd(&inputs[2], "V", self.kv_num_heads)?;
@@ -3889,12 +3911,17 @@ mod claim_tests {
         let types = [DataType::Float32; 3];
         node.attributes
             .insert("left_window_size".into(), Attribute::Int(0));
-        let reason = unsupported_reason(&node, 24, &types).unwrap();
+        let reason = unsupported_reason(&node, 24, &types, Some(4)).unwrap();
         assert!(reason.contains("requires opset 25"));
-        assert!(unsupported_reason(&node, 25, &types).is_none());
+        assert!(unsupported_reason(&node, 25, &types, Some(4)).is_none());
+        node.attributes
+            .insert("kv_num_heads".into(), Attribute::Int(1));
+        let reason = unsupported_reason(&node, 25, &types, Some(4)).unwrap();
+        assert!(reason.contains("not valid for 4D Q"));
+        assert!(unsupported_reason(&node, 25, &types, Some(3)).is_none());
         node.attributes
             .insert("right_window_size".into(), Attribute::Int(-2));
-        let reason = unsupported_reason(&node, 25, &types).unwrap();
+        let reason = unsupported_reason(&node, 25, &types, Some(3)).unwrap();
         assert!(reason.contains("invalid right_window_size"));
     }
 
@@ -3911,6 +3938,7 @@ mod claim_tests {
                         activation_dtype,
                         DataType::Float32,
                     ],
+                    None,
                 )
                 .is_none(),
                 "{activation_dtype:?} attention should accept an f32 additive mask"

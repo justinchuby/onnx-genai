@@ -1033,7 +1033,6 @@ type_constraints:
         let registry = SchemaRegistry::builtins();
         for (name, since_version, inputs, outputs, attributes) in [
             ("Attention", 24, 7, 4, 7),
-            ("Attention", 25, 7, 4, 9),
             ("CastLike", 24, 2, 1, 2),
             ("CumSum", 14, 2, 1, 2),
             ("GreaterOrEqual", 16, 2, 1, 0),
@@ -1054,6 +1053,11 @@ type_constraints:
         }
 
         let attention = registry.lookup("Attention", "", 24).unwrap();
+        let attention25 = registry.lookup("Attention", "", 25).unwrap();
+        assert_eq!(attention25.since_version, 25);
+        assert_eq!(attention25.inputs.len(), attention.inputs.len());
+        assert_eq!(attention25.outputs.len(), attention.outputs.len());
+        assert_eq!(attention25.attributes.len(), attention.attributes.len() + 2);
         assert!(attention.inputs[3..].iter().all(|input| input.optional));
         assert!(attention.outputs[1..].iter().all(|output| output.optional));
         assert_eq!(

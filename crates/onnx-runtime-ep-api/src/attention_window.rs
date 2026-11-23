@@ -2,6 +2,20 @@ use onnx_runtime_ir::Node;
 
 use crate::{EpError, Result};
 
+pub fn validate_attention_head_attributes(
+    opset: u64,
+    q_rank: Option<usize>,
+    q_heads: bool,
+    kv_heads: bool,
+) -> Result<()> {
+    if opset >= 25 && q_rank == Some(4) && (q_heads || kv_heads) {
+        return Err(EpError::KernelFailed(
+            "Attention: q_num_heads and kv_num_heads are not valid for 4D Q at opset 25 or later; remove both attributes and use the head dimensions from Q and K".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Inclusive, independent bounds relative to the absolute query position.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AttentionWindow {
