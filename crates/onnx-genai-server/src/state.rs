@@ -388,6 +388,7 @@ pub struct AppState {
     pub(crate) registry: ModelRegistry,
     pub(crate) replays: crate::replay::ReplayRegistry,
     pub(crate) sessions: SessionRegistry,
+    pub(crate) completion_controls: crate::completion_control::CompletionControls,
     pub(crate) proxy_connections: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) config: ServerConfig,
 }
@@ -614,6 +615,9 @@ impl AppState {
                 config.replay_buffer_bytes,
             ),
             sessions: SessionRegistry::new(config.max_sessions),
+            completion_controls: crate::completion_control::CompletionControls::new(
+                config.max_queue_depth,
+            ),
             proxy_connections: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 config.mcp_proxy_max_connections.get(),
             )),
@@ -641,6 +645,9 @@ impl AppState {
                 config.replay_buffer_bytes,
             ),
             sessions: SessionRegistry::new(config.max_sessions),
+            completion_controls: crate::completion_control::CompletionControls::new(
+                config.max_queue_depth,
+            ),
             proxy_connections: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 config.mcp_proxy_max_connections.get(),
             )),

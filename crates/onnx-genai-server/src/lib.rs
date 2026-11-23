@@ -26,6 +26,7 @@ const MEDIA_UPLOAD_BODY_LIMIT: usize = 25 * 1024 * 1024;
 
 mod audio_input;
 mod cli;
+mod completion_control;
 mod driver;
 mod image_generation;
 mod image_input;
@@ -127,6 +128,7 @@ pub fn app(state: AppState) -> Router {
             "/chat/completions/input_tokens",
             post(routes::llama::input_tokens),
         )
+        .route("/control", post(completion_control::control))
         .route("/completion", post(routes::native::completions))
         .route("/completions", post(routes::native::completions))
         .route("/infill", post(routes::native::infill))
