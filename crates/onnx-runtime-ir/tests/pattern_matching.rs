@@ -234,6 +234,41 @@ fn builder_sequences_aliases_and_ordered_alternatives_have_text_parity() {
 }
 
 #[test]
+fn builder_sequence_minimum_and_empty_bounds_match_text() {
+    for (min, max, source) in [
+        (1, None, "(x,rest:slots[1:*])=>return Custom(x,...rest)"),
+        (0, Some(0), "(x,rest:slots[0:0])=>return Custom(x,...rest)"),
+    ] {
+        let text = Pattern::parse_native(source).unwrap();
+        let mut p = Pattern::builder();
+        let x = p.input("x");
+        let rest = p.slot_sequence("rest", min, max);
+        let out = p.op("Custom", [Input::Value(x), Input::Sequence(rest)]);
+        let built = p.finish(out).unwrap();
+        for length in 0..=3 {
+            let mut graph = Graph::new();
+            let x = input(&mut graph, "x");
+            let mut inputs = vec![Some(x)];
+            inputs.extend(std::iter::repeat_n(None, length));
+            let (root, outputs) = op(&mut graph, "Custom", &inputs, 1);
+            graph.set_outputs(outputs);
+            let session = MatchSession::new(&graph).unwrap();
+            let actual = session.match_at(&built, root, Default::default()).unwrap();
+            let expected = session.match_at(&text, root, Default::default()).unwrap();
+            assert_eq!(
+                actual.is_some(),
+                length >= min && max.is_none_or(|max| length <= max)
+            );
+            assert_eq!(actual.is_some(), expected.is_some());
+            if let Some(actual) = actual {
+                assert_eq!(actual.sequence("rest").unwrap().len(), length);
+                assert!(actual.sequence("rest").unwrap().iter().all(Option::is_none));
+            }
+        }
+    }
+}
+
+#[test]
 fn builder_alternative_attributes_and_domains_stay_branch_local() {
     let text = Pattern::parse_ort(
         "(x,alpha:float|None)=>{out=Identity(x)|vendor.LeakyRelu(x,alpha=alpha);return out}",
@@ -736,6 +771,12 @@ fn builder_diagnoses_foreign_handles_duplicates_scopes_and_invalid_definitions()
     let slots = p.slot_sequence("bad", 3, Some(2));
     let out = p.op("Custom", [slots]);
     return_builder_error(p.finish(out), "maximum 2 below minimum 3");
+
+    let mut p = Pattern::builder();
+    let first = p.slot_sequence("first", 0, None);
+    let second = p.slot_sequence("second", 0, None);
+    let out = p.op("Custom", [first, second]);
+    return_builder_error(p.finish(out), "only one variadic segment");
 
     let mut p = Pattern::builder();
     let x = p.input("x");
