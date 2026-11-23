@@ -825,8 +825,15 @@ fn canonical_json_prefix(prefix: &str) -> anyhow::Result<std::borrow::Cow<'_, st
                         let decoded: String = serde_json::from_str(&quoted).with_context(|| {
                             format!("existing JSON prefix has an invalid Unicode escape at byte {}; supply a complete valid scalar or surrogate pair", source_offset + at)
                         })?;
-                        let canonical = serde_json::to_string(&decoded)
+                        // The string-value lexer quotes ASCII controls, including DEL;
+                        // serde_json alone leaves DEL literal.
+                        let mut canonical = serde_json::to_string(&decoded)
                             .context("encode canonical JSON prefix escape")?;
+                        if decoded.chars().next().is_some_and(|c| c.is_ascii_control())
+                            && canonical.as_bytes().get(1) != Some(&b'\\')
+                        {
+                            canonical = format!("\"\\u{code:04x}\"");
+                        }
                         output.push_str(&canonical[1..canonical.len() - 1]);
                         at += length;
                         continue;
@@ -5055,9 +5062,53 @@ mod tests {
     }
 
     #[test]
+    fn json_schema_prefill_preserves_escaped_ascii_controls_including_del() {
+        for (character, escape) in [
+            ('\0', r"\u0000"),
+            ('\n', r"\u000a"),
+            ('\u{1f}', r"\u001f"),
+            ('\u{7f}', r"\u007F"),
+        ] {
+            let schema = serde_json::json!({"const":character.to_string()}).to_string();
+            let prefix = format!("\"{escape}");
+            let constraint = LlguidanceConstraint::from_token_bytes_with_prefix(
+                GrammarConstraintKind::JsonSchema,
+                &schema,
+                vec![b"\"".to_vec(), b"<eos>".to_vec()],
+                &[1],
+                &prefix,
+            )
+            .unwrap();
+            let candidates = [
+                TokenCandidate {
+                    token_id: 0,
+                    text: "\"".into(),
+                    is_eos: false,
+                },
+                TokenCandidate {
+                    token_id: 1,
+                    text: String::new(),
+                    is_eos: true,
+                },
+            ];
+            assert_eq!(
+                constraint
+                    .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+                    .unwrap(),
+                [true, false],
+                "{escape}"
+            );
+        }
+    }
+
+    #[test]
     fn json_schema_prefill_accepts_escaped_keys_without_changing_other_grammars() {
         let schema = serde_json::json!({
             "type":"object", "properties":{"n":{"const":1}}, "required":["n"]
+        })
+        .to_string();
+        let control_key_schema = serde_json::json!({
+            "type":"object", "properties":{"\n":{"const":1}}, "required":["\n"]
         })
         .to_string();
         for (kind, grammar, prefix, suffix) in [
@@ -5065,6 +5116,12 @@ mod tests {
                 GrammarConstraintKind::JsonSchema,
                 schema.as_str(),
                 r#"{"\u006e":1"#,
+                "}",
+            ),
+            (
+                GrammarConstraintKind::JsonSchema,
+                control_key_schema.as_str(),
+                r#"{"\u000a":1"#,
                 "}",
             ),
             (GrammarConstraintKind::Regex, r"\\u005bx", r"\u005b", "x"),

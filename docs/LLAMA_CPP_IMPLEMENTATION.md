@@ -947,3 +947,9 @@ Strict native-engine and server all-target Clippy passed. The final literal
 backslash and leading-whitespace diagnostic refinements reran both schema-prefix
 cases and strict native-engine all-target Clippy successfully. Unicode errors
 refer to the original prefix byte offset, including its leading JSON whitespace.
+
+The final escape self-review also preserves ASCII control quoting required by
+the backend string-value lexer, including DEL which ordinary JSON serialization
+can leave literal. NUL/newline/control/DEL values and an escaped newline property
+name now have actual schema next-token checks. All 3 selected schema-prefill
+cases and strict native-engine all-target Clippy passed after this refinement.
