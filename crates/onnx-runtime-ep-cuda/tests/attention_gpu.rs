@@ -26,6 +26,8 @@
 //!   PATH=/conda/env/bin:$PATH LD_LIBRARY_PATH=/conda/env/lib \
 //!     cargo test -p onnx-runtime-ep-cuda --test attention_gpu
 
+mod common;
+
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, ExecutionProvider, Kernel as _, TensorMut, TensorView,
@@ -301,7 +303,12 @@ fn run_gpu_attention_with_backend(
         }
     }
     .unwrap();
-    if let Err(error) = kernel.execute(&inputs, &mut [ov]) {
+    let mut workspace = None;
+    let result = common::execute_kernel(ep, &kernel, &inputs, &mut [ov], &mut workspace);
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
+    if let Err(error) = result {
         let message = format!("{error}");
         ep.deallocate(q_buf.0).unwrap();
         ep.deallocate(k_buf.0).unwrap();
@@ -808,6 +815,7 @@ fn attention_prefill_h200_benchmark() {
         let baseline =
             AttentionKernel::new_phase2a(runtime.clone(), true, h, h, Some(scale)).unwrap();
 
+        let mut workspace = None;
         let mut run = |kernel: &AttentionKernel, output: &mut onnx_runtime_ep_api::DeviceBuffer| {
             let inputs = [
                 TensorView::new(
@@ -839,7 +847,7 @@ fn attention_prefill_h200_benchmark() {
                 &strides,
                 dev,
             );
-            kernel.execute(&inputs, &mut [output]).unwrap();
+            common::execute_kernel(&ep, kernel, &inputs, &mut [output], &mut workspace).unwrap();
         };
 
         // Compile NVRTC and warm allocator/library state before timing.
@@ -879,6 +887,9 @@ fn attention_prefill_h200_benchmark() {
         ep.deallocate(v).unwrap();
         ep.deallocate(fused_out).unwrap();
         ep.deallocate(baseline_out).unwrap();
+        if let Some(workspace) = workspace {
+            ep.deallocate_workspace(workspace).unwrap();
+        }
     }
 }
 

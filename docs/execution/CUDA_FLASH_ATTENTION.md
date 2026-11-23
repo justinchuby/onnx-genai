@@ -149,3 +149,22 @@ baseline for the cached 1024-total-token and both 2048-query cases.
 
 The next performance step is a larger multi-query tile / asynchronous K/V
 pipeline, or a maintained cuDNN frontend SDPA wrapper.
+
+
+### Prepared fallback workspace
+
+The session/plugin path for `com.microsoft::Attention` obtains its Phase-2a
+scores and cuBLASLt scratch through the executor workspace contract. Callers
+obtain the requirement from input metadata and pass an exclusive prepared view
+to `execute_with_workspace`. Planning and binding share `WorkspaceLayout`, with
+checked shape multiplication and alignment. Short, null, misaligned, wrapping,
+or unaddressable prepared workspace is rejected with preparation guidance.
+
+Eager dispatch still calls `execute` without preparation. The shared Phase-2a
+engine therefore retains temporary scratch ownership for that actual caller and
+for MHA/GQA pending migration of their complete composite layouts. Removing this
+path requires updating eager dispatch as well; this work is not complete.
+
+The fallback still synchronizes its CUDA stream and remains unavailable during
+capture. The parity tests use the public provider workspace preparation path,
+and the benchmark reuses its admitted backing across warm iterations.
