@@ -578,28 +578,28 @@ extern "C" __global__ void matmul_nbits_gemv_f32(
     }
 
     float value = 0.0f;
-    for (int depth = (int)threadIdx.x; depth < k; depth += (int)blockDim.x) {
-        const int block = depth / block_size;
+    for (long long depth = threadIdx.x; depth < k; depth += blockDim.x) {
+        const int block = (int)(depth / block_size);
         const int within = depth - block * block_size;
-        const long blob_base = ((long)column * k_blocks + block) * blob_size;
+        const long long blob_base = ((long long)column * k_blocks + block) * blob_size;
         int quantized;
         int zero_point;
         if (bits == 8) {
             quantized = (int)packed[blob_base + within];
             zero_point =
-                zero_points ? (int)zero_points[(long)column * k_blocks + block] : 128;
+                zero_points ? (int)zero_points[(long long)column * k_blocks + block] : 128;
         } else {
             const unsigned char byte = packed[blob_base + within / 2];
             quantized = (within & 1) ? (byte >> 4) : (byte & 15);
             zero_point = 8;
             if (zero_points) {
                 const unsigned char zp =
-                    zero_points[(long)column * zp_row_bytes + block / 2];
+                    zero_points[(long long)column * zp_row_bytes + block / 2];
                 zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
             }
         }
         const float delta = (float)(quantized - zero_point);
-        const float scale = scales[(long)column * k_blocks + block];
+        const float scale = scales[(long long)column * k_blocks + block];
         if (round_affine_weights) {
             value = fmaf(activation[depth], __fmul_rn(delta, scale), value);
         } else {

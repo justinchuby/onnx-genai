@@ -290,6 +290,7 @@ pub(crate) fn cuda_optimization_passes(
                         caps.max_threads_per_block() >= crate::kernels::matmul_nbits::BLOCK_THREADS
                     })
                     .map_or(0, |caps| caps.max_grid_dim_x() as usize),
+                gguf_layout: crate::kernels::block_quantized_matmul::packed_matmul_layout,
             },
         ),
     ]

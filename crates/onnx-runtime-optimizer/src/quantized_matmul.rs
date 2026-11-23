@@ -1,5 +1,6 @@
 //! Provider-selected lowering of immutable standard affine RHS operands.
 
+use onnx_runtime_ir::packed_matmul::PackedMatMul;
 use onnx_runtime_ir::quantized_matmul::{AffineMatMul, Codes};
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
@@ -8,11 +9,13 @@ use onnx_runtime_ir::{
 use crate::{OptimizationPass, PassContext, Result};
 
 pub const ROUND_AFFINE_WEIGHTS: &str = "_nxrt_round_affine_weights";
+pub const STREAM_DECODED_ROWS: &str = "_nxrt_stream_decoded_rows";
 
 pub struct AffineMatMulFusion {
     /// CUDA only uses the packed GEMV when the graph proves one row.
     pub single_row_only: bool,
     pub max_columns: usize,
+    pub gguf_layout: fn(&str) -> Option<(usize, usize)>,
 }
 
 impl OptimizationPass for AffineMatMulFusion {
@@ -35,14 +38,16 @@ impl OptimizationPass for AffineMatMulFusion {
             .collect();
         for id in candidates {
             let Ok(pattern) = AffineMatMul::recognize(graph, graph.node(id), &captured) else {
+                if let Ok(packed) =
+                    PackedMatMul::recognize(graph, graph.node(id), &captured, self.gguf_layout)
+                    && self.accepts(packed.k, packed.n, packed.single_row)
+                {
+                    lower_gguf(graph, id, packed, ctx, &captured);
+                }
                 continue;
             };
-            if pattern.n > self.max_columns
-                || self.single_row_only
-                    && (!pattern.single_row
-                        || [pattern.k, pattern.n, pattern.block]
-                            .iter()
-                            .any(|&v| v > i32::MAX as usize))
+            if !self.accepts(pattern.k, pattern.n, pattern.single_row)
+                || self.single_row_only && pattern.block > i32::MAX as usize
             {
                 continue;
             }
@@ -93,6 +98,73 @@ impl OptimizationPass for AffineMatMulFusion {
             }
         }
         Ok(())
+    }
+}
+
+impl AffineMatMulFusion {
+    fn accepts(&self, k: usize, n: usize, single_row: bool) -> bool {
+        n <= self.max_columns
+            && (!self.single_row_only
+                || single_row && k <= i32::MAX as usize && n <= i32::MAX as usize)
+    }
+}
+
+fn lower_gguf(
+    graph: &mut Graph,
+    id: NodeId,
+    p: PackedMatMul,
+    ctx: &PassContext,
+    captured: &std::collections::HashSet<ValueId>,
+) {
+    let Some(source) = graph.initializers.get(&p.weight) else {
+        return;
+    };
+    if source.dtype() != DataType::Uint8
+        || ctx
+            .initializer_bytes(source)
+            .is_none_or(|b| b.len() != p.packed_shape.iter().product::<usize>())
+    {
+        return;
+    }
+    let owned = graph.num_uses(p.weight) == 1
+        && !captured.contains(&p.weight)
+        && !graph.value(p.weight).is_graph_output
+        && !graph.value(p.weight).is_graph_input;
+    let mut weight = if owned {
+        graph.initializers.remove(&p.weight).expect("checked above")
+    } else {
+        source.clone()
+    };
+    match &mut weight {
+        WeightRef::Inline(t) => t.dims = p.packed_shape.to_vec(),
+        WeightRef::External { dims, .. } => *dims = p.packed_shape.to_vec(),
+    }
+    let packed = graph.create_value(DataType::Uint8, static_shape(p.packed_shape));
+    graph.set_initializer(packed, weight);
+    let mut fused = Node::new(
+        NodeId(0),
+        "BlockQuantizedMatMul",
+        vec![Some(p.activation), Some(packed)],
+        vec![p.output],
+    );
+    fused.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    fused
+        .attributes
+        .insert("K".into(), Attribute::Int(p.k as i64));
+    fused
+        .attributes
+        .insert("N".into(), Attribute::Int(p.n as i64));
+    fused
+        .attributes
+        .insert("format".into(), Attribute::String(p.format.into_bytes()));
+    fused
+        .attributes
+        .insert(STREAM_DECODED_ROWS.into(), Attribute::Int(1));
+    graph.opset_imports.entry(fused.domain.clone()).or_insert(1);
+    graph.replace_node(id, fused);
+    graph.remove_nodes(&p.removed);
+    if owned {
+        graph.gc_value_if_orphan(p.weight);
     }
 }
 

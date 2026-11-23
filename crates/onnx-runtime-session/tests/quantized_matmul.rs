@@ -210,6 +210,86 @@ fn packed_rhs_matches_native_cpu() {
     let build = |g| InferenceSession::from_graph(g).unwrap();
     parity(build, 1);
     parity(build, 3);
+    gguf_parity(build, 3);
+}
+
+fn gguf_parity(build: impl Fn(Graph) -> InferenceSession, m: usize) {
+    let make = |expose, supported| {
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 29);
+        let a = g.create_named_value("A", DataType::Float32, static_shape([m, 64]));
+        g.add_input(a);
+        let mut encoded = Vec::new();
+        for b in 0..10 {
+            encoded
+                .extend_from_slice(&half::f16::from_f32(0.00813 + b as f32 * 0.0007).to_le_bytes());
+            let bytes = if supported { 32 } else { 16 };
+            encoded.extend((0..bytes).map(|i| (i * 13 + b * 17 - 113) as u8));
+        }
+        let data = initializer(&mut g, "packed", DataType::Uint8, &[encoded.len()], encoded);
+        let w = g.create_named_value("decoded", DataType::Float32, static_shape([5, 64]));
+        let rhs = g.create_named_value("rhs", DataType::Float32, static_shape([64, 5]));
+        let y = g.create_named_value("Y", DataType::Float32, static_shape([m, 5]));
+        let mut dq = Node::new(NodeId(0), "DequantizePacked", vec![Some(data)], vec![w]);
+        let format = if supported {
+            b"gguf:q8_0"
+        } else {
+            b"gguf:q4_0"
+        };
+        dq.attributes
+            .insert("format".into(), Attribute::String(format.to_vec()));
+        dq.attributes
+            .insert("shape".into(), Attribute::Ints(vec![5, 64]));
+        g.insert_node(dq);
+        g.insert_node(Node::new(NodeId(0), "Transpose", vec![Some(w)], vec![rhs]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(a), Some(rhs)],
+            vec![y],
+        ));
+        g.add_output(y);
+        if expose {
+            g.add_output(w);
+        }
+        g
+    };
+    let mut baseline = build(make(true, true));
+    let mut fused = build(make(false, true));
+    assert!(
+        baseline
+            .graph()
+            .nodes
+            .values()
+            .any(|n| n.op_type == "DequantizePacked")
+    );
+    assert_eq!(fused.graph().num_nodes(), 1);
+    assert!(
+        fused
+            .graph()
+            .nodes
+            .values()
+            .any(|n| n.op_type == "BlockQuantizedMatMul")
+    );
+    let a: Vec<_> = (0..m * 64)
+        .map(|i| ((i * 7 % 13) as f32 - 6.0) / 7.0)
+        .collect();
+    let a = Tensor::from_f32(&[m, 64], &a).unwrap();
+    let actual = fused.run(&[("A", &a)]).unwrap()[0].to_vec_f32();
+    let reference = baseline.run(&[("A", &a)]).unwrap()[0].to_vec_f32();
+    assert_eq!(actual.len(), m * 5);
+    for (a, b) in actual.into_iter().zip(reference) {
+        assert!((a - b).abs() <= 2e-6 * b.abs().max(1.0), "{a} vs {b}");
+    }
+    let mut unsupported = build(make(false, false));
+    assert!(
+        unsupported
+            .graph()
+            .nodes
+            .values()
+            .any(|n| n.op_type == "DequantizePacked")
+    );
+    assert_eq!(unsupported.run(&[("A", &a)]).unwrap()[0].shape, &[m, 5]);
 }
 
 #[cfg(feature = "cuda")]
@@ -236,6 +316,7 @@ fn packed_rhs_matches_native_cuda() {
         session
     };
     parity(build, 1);
+    gguf_parity(build, 1);
     let m = 3;
     let mut prefill = build(graph(Storage::Uint4, false, true, false, m, 35, 7));
     assert_selection(&prefill, false);

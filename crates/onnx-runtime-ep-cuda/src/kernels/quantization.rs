@@ -115,7 +115,10 @@ extern "C" __global__ void dynamic_quantize_u8(
 "#;
 
 pub fn unsupported_reason(op: &Node, shapes: &[Shape], dtypes: &[DataType]) -> Option<String> {
-    if !(2..=3).contains(&op.inputs.len()) || shapes.len() != op.inputs.len() {
+    let compact_optional_zp = op.inputs.get(2) == Some(&None) && shapes.len() == 2;
+    if !(2..=3).contains(&op.inputs.len())
+        || (shapes.len() != op.inputs.len() && !compact_optional_zp)
+    {
         return Some(format!(
             "{} requires 2 or 3 present inputs with shape metadata",
             op.op_type

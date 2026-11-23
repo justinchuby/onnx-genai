@@ -748,3 +748,27 @@ There is intentionally **no new GPU GitHub Actions workflow**: hosted CI runners
 have no GPU, so the sweep would only ever skip there. The no-GPU audits provide
 the enforcement in CI; the on-device parity sweep is run on a GPU host (e.g. an
 H100/H200 box) as documented above.
+### Standard quantized MatMul patterns
+
+The native CPU and CUDA optimizers fuse FP32 MatMul with a private RHS
+decoded by opset-21+ `DequantizeLinear`. The initializer can be native INT4
+or UINT4, or opset-29 `Unpack` of UINT8 words into UINT8 4-bit codes. Use
+rank-2 weights in `[K,N]` order or `[N,K]` followed by a swap transpose.
+Quantization is blocked along K (including negative axis notation), with
+a power-of-two block size of at least 16, FP32 scales, and an optional
+matching zero-point initializer. An omitted zero point means zero. `Unpack`
+must specify an immutable scalar count equal to K.
+
+For GGUF, emit a flat UINT8 initializer, opset-29 `DequantizePacked` with
+logical shape `[N,K]`, and a swap transpose. Blocks must fit within each
+row without padding. A redundant FLOAT-to-FLOAT Cast before the transpose
+is allowed. The fused formats are `iq1_s`, `iq1_m`, `iq2_xxs`, `iq2_xs`,
+`iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_nl`, `iq4_xs`, `q2_k`, `q3_k`, `q5_k`,
+`q6_k`, and `q8_0`. The other profiles, including `q4_k` and `mxfp4`,
+retain standalone decoding. Precision-changing casts, shared decoded
+values, or other layouts also retain the original graph.
+
+CUDA uses these fusions only when the activation is statically known to
+contain one row and launch geometry permits it. CPU can stream decoded
+rows for multiple activation rows. Neither fused path materializes the
+full decoded weight matrix.
