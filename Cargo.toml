@@ -262,8 +262,10 @@ onnx-runtime-ort-testkit = { path = "crates/onnx-runtime-ort-testkit" }
 # array), and `progressbar` (indicatif). None are reachable from how this
 # workspace uses tokenizers, and the two native builds cost more than the Rust
 # crate itself. `fancy-regex` is the pure-Rust regex backend, which is what
-# llguidance's `toktrie_hf_tokenizers` already selects.
-tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+# llguidance's `toktrie_hf_tokenizers` already selects. Its older tokenizer
+# requirement is isolated behind its public JSON interface; runtime decoding
+# uses this workspace version.
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1.53.3", features = ["full"] }
 tokio-stream = "0.1"
 async-trait = "0.1"

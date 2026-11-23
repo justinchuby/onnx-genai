@@ -625,8 +625,7 @@ impl LlguidanceConstraint {
         vocab_size: usize,
         eos_token_id: Option<TokenId>,
     ) -> anyhow::Result<Self> {
-        let mut byte_tokenizer =
-            toktrie_hf_tokenizers::ByteTokenizer::from_tokenizer(tokenizer.clone())?;
+        let mut byte_tokenizer = crate::tokenization::grammar_byte_tokenizer(tokenizer)?;
         if let Some(eos_token_id) = eos_token_id {
             byte_tokenizer.set_eos_token(eos_token_id);
         }

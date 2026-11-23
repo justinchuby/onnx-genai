@@ -7,6 +7,15 @@ self-review and merge PR #2427.
 The upstream baseline is pinned in `vendor/llama-chat/UPSTREAM`. A matching route
 name or a successful empty response is not an implemented capability.
 
+## Integration decision
+
+The user authorized merging the validated compatibility implementation on
+2026-11-22, with llguidance/tokenizers upgraded to current stable releases.
+Unchecked rows below remain follow-up compatibility work; earlier draft/merge
+notes record milestone status at the time and are not the current merge gate.
+The supported surface and explicit limitations are documented in
+[`LLAMA_CPP_COMPATIBILITY.md`](LLAMA_CPP_COMPATIBILITY.md).
+
 ## Delivery order and acceptance
 
 - [x] Embed Llama Chat, package provenance and licenses, remove REPL and dependencies.
@@ -1036,3 +1045,22 @@ Regex capability rejection is verified as HTTP 400 before SSE. Strict default
 engine/server all-target Clippy passes.
 Native-feature validation also passes all seven processor and six cursor cases,
 plus strict native-engine all-target Clippy.
+
+### Dependency refresh for integration
+
+Upgrade llguidance, toktrie and toktrie_hf_tokenizers to 1.9.1 and workspace
+runtime tokenizers to 0.23.2. The published grammar adapter still requires
+0.21 internally; use its public tokenizer JSON interface rather than mixing
+Rust types from different versions. Byte vocabulary and grammar construction
+share this adapter boundary. Incremental decoding passes the new token-list
+argument while retaining the existing request-local state and token policy.
+
+After the upgrade, complete library runs pass: engine 894 / 1 inherited ignore
+(with native features unified by the server tests), ORT 188, server 404 /
+2 inherited ignores. This includes the Unicode, EOS, response projection,
+constrained continuation, cancellation and HTTP protocol regressions.
+Strict engine/ORT/server all-target Clippy also passes after the dependency
+refresh. Final tokenizer unit and integration regressions pass after preserving
+the serialization error cause. Windows coverage exposed an unrelated MLAS build
+warning: the AVX2 panel-tail helper was compiled when its sole caller was disabled.
+Give the helper the same `not(feature = "mlas")` condition as its caller.

@@ -184,9 +184,16 @@ reasoning and answer text retain separate fields. Content continuation uses the
 same channel-state check when a response template is declared. Plain Rust request
 builders reject reasoning continuation because they have no model parser contract.
 Tool-call messages and replay into a persistent inference session remain rejected.
-JSON or forced output constraints need a channel-aware grammar before reasoning
-continuation can use them; constrained implicit prefill and thinking-budget
-controls remain open compatibility work.
+JSON response formats use a channel-aware generation constraint when a response
+template is declared. The actual rendered prefill seeds the parser, and model
+token candidates constrain only projected content while reasoning remains free.
+This applies to implicit prefill and explicit reasoning continuation, with the
+same projection for buffered, SSE and logprob output. Capabilities are checked
+before generation/SSE admission. Supported combinations currently require literal
+field boundaries and root ByteLevel/ByteFallback or canonical non-byte decoders;
+regex boundaries, contextual byte-decoder sequences and incomplete Unicode escape
+spelling remain open compatibility work. Forced tool/Lark output policies during
+reasoning continuation and thinking-budget controls also remain unsupported.
 
 Without explicit continuation, declared content/reasoning text in the template
 prefill is included in the response, matching upstream session projection.

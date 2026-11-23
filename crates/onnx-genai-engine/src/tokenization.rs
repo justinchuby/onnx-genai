@@ -38,7 +38,7 @@ impl TokenTextDecoder {
     }
     pub fn step(&mut self, tokenizer: &Tokenizer, id: u32) -> anyhow::Result<String> {
         tokenizers::tokenizer::step_decode_stream(
-            tokenizer.inner(), id, self.special_tokens==SpecialTokenHandling::Skip, &mut self.ids, &mut self.prefix, &mut self.prefix_index,
+            tokenizer.inner(), vec![id], self.special_tokens==SpecialTokenHandling::Skip, &mut self.ids, &mut self.prefix, &mut self.prefix_index,
         ).map(|text| text.unwrap_or_default()).map_err(|error| {
             if error.is::<tokenizers::tokenizer::DecodeStreamError>() {
                 anyhow::Error::new(NonMonotonicText)
@@ -148,6 +148,19 @@ fn context_free_decoder(decoder: &DecoderWrapper) -> Option<DecoderWrapper> {
     }
 }
 
+/// The grammar adapter's stable JSON interface isolates its tokenizer version.
+/// Runtime encoding and decoding keep using the workspace tokenizer.
+pub(crate) fn grammar_byte_tokenizer(
+    tokenizer: &tokenizers::Tokenizer,
+) -> anyhow::Result<toktrie_hf_tokenizers::ByteTokenizer> {
+    let json = tokenizer
+        .to_string(false)
+        .map_err(anyhow::Error::from_boxed)
+        .context("serialize declared tokenizer for grammar byte conversion")?;
+    toktrie_hf_tokenizers::ByteTokenizer::from_json_bytes(json.as_bytes())
+        .context("grammar adapter cannot read the declared tokenizer JSON; check decoder support in toktrie_hf_tokenizers")
+}
+
 /// Return exact per-token byte pieces, retaining incomplete UTF-8 fragments.
 ///
 /// Byte codecs use the same vocabulary adapter as constrained decoding. Other
@@ -195,7 +208,7 @@ pub fn token_pieces(tokenizer: &Tokenizer, ids: &[u32]) -> anyhow::Result<Vec<Ve
             "byte piece conversion requires dense vocabulary ids; token {token:?} has id {id} outside the {size} vocabulary entries; repair tokenizer.json or disable the operation that requires lossless token bytes"
         );
     }
-    let vocabulary=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| toktrie_hf_tokenizers::ByteTokenizer::from_tokenizer(tokenizer.inner().clone())))
+    let vocabulary=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| grammar_byte_tokenizer(tokenizer.inner())))
         .map_err(|_| anyhow::anyhow!("byte piece conversion rejected invalid tokenizer codec data; repair tokenizer.json or disable the operation that requires lossless token bytes"))?
         .context("byte piece conversion cannot interpret the declared decoder; repair tokenizer.json or disable the operation that requires lossless token bytes")?
         .token_bytes();
