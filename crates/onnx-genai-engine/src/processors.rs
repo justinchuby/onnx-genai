@@ -85,12 +85,12 @@ pub(crate) fn build_processor_chain(
                     terminal_token_ids(options),
                 )));
             }
-            GenerateConstraint::Lark(grammar) => {
+            GenerateConstraint::Lark { grammar, prefix } => {
                 chain.add(Box::new(ConstraintProcessor::new(
                     build_llguidance_constraint(
                         GrammarConstraintKind::Lark,
                         grammar,
-                        "",
+                        prefix,
                         tokenizer,
                         &token_texts,
                         options.eos_token_id,
@@ -1491,6 +1491,123 @@ mod json_continuation_tests {
         assert_eq!(
             finish_reason_after_token(5, &options, &chain, &context),
             Some(FinishReason::StopSequence { index: 0 })
+        );
+    }
+}
+
+#[cfg(test)]
+mod lark_prefill_tests {
+    use super::*;
+
+    #[test]
+    fn lark_prefill_keeps_explicit_special_token_transitions() {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/tiny-llm/tokenizer.json"
+        )))
+        .unwrap();
+        value["added_tokens"] = serde_json::json!([{
+            "id":31,"content":"tok31","single_word":false,"lstrip":false,
+            "rstrip":false,"normalized":false,"special":true
+        }]);
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let options = GenerateOptions {
+            constraint: Some(GenerateConstraint::Lark {
+                grammar: "start: \"hello\" (<[31]> | \"tok30\") \"world\"\n".into(),
+                prefix: "hello".into(),
+            }),
+            eos_token_id: Some(3),
+            greedy: true,
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let mut logits = vec![0.0; 32];
+        chain
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
+        assert_eq!(
+            logits
+                .iter()
+                .enumerate()
+                .filter_map(|(id, score)| score.is_finite().then_some(id))
+                .collect::<Vec<_>>(),
+            [30, 31]
+        );
+        for token in [31, 30] {
+            let mut logits = vec![0.0; 32];
+            chain
+                .process(
+                    &mut logits,
+                    &ProcessorContext {
+                        generated_tokens: vec![token],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                logits
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, score)| score.is_finite().then_some(id))
+                    .collect::<Vec<_>>(),
+                [5]
+            );
+        }
+    }
+
+    #[test]
+    fn lark_prefill_enters_the_existing_grammar_position_without_resampling_it() {
+        let tokenizer = Tokenizer::from_file(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+        )
+        .unwrap();
+        let options = |prefix: &str| GenerateOptions {
+            constraint: Some(GenerateConstraint::Lark {
+                grammar: "start: \"hello\" \"world\"\n".into(),
+                prefix: prefix.into(),
+            }),
+            eos_token_id: Some(3),
+            greedy: true,
+            ..Default::default()
+        };
+        for (prefix, expected) in [("", 4), ("hello", 5), ("helloworld", 3)] {
+            let chain = build_processor_chain(&options(prefix), Some(&tokenizer), false).unwrap();
+            let mut logits = vec![0.0; 32];
+            chain
+                .process(&mut logits, &ProcessorContext::default())
+                .unwrap();
+            let allowed = logits
+                .iter()
+                .enumerate()
+                .filter_map(|(id, score)| score.is_finite().then_some(id))
+                .collect::<Vec<_>>();
+            assert_eq!(allowed, [expected], "prefix={prefix:?}");
+            if prefix == "hello" {
+                let mut logits = vec![0.0; 32];
+                chain
+                    .process(
+                        &mut logits,
+                        &ProcessorContext {
+                            generated_tokens: vec![5],
+                            generated_text: "world".into(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert!(logits[3].is_finite());
+                assert!(!logits[4].is_finite() && !logits[5].is_finite());
+            }
+        }
+        let error = build_processor_chain(&options("world"), Some(&tokenizer), false)
+            .err()
+            .expect("invalid grammar prefill must be rejected");
+        assert!(
+            error.is::<crate::logits::ConstraintPrefixError>(),
+            "{error:#}"
         );
     }
 }

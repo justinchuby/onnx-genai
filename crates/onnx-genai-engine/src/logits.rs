@@ -593,7 +593,7 @@ impl Constraint for JsonConstraint {
 /// Existing output could not be admitted into a requested grammar.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "existing assistant prefix is rejected by the declared grammar: {source:#}; continue a schema-valid partial value or change the requested grammar"
+    "existing assistant prefix is rejected by the declared grammar: {source:#}; continue a prefix accepted by this grammar or change the requested grammar"
 )]
 pub struct ConstraintPrefixError {
     #[source]

@@ -1697,8 +1697,13 @@ pub enum GenerateConstraint {
     },
     /// Constrain output to text matching the provided Rust regular expression.
     Regex(String),
-    /// Constrain output to the provided llguidance Lark grammar.
-    Lark(String),
+    /// Constrain existing prefix plus output to the provided llguidance Lark grammar.
+    Lark {
+        /// Complete grammar, including any declared response framing.
+        grammar: String,
+        /// Existing text consumed by the grammar, excluded from newly generated output.
+        prefix: String,
+    },
 }
 
 impl GenerateOptions {

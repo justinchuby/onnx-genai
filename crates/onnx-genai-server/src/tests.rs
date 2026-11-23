@@ -6673,7 +6673,7 @@ mod llama_compat {
             error["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("schema-valid partial value"),
+                .contains("prefix accepted by this grammar"),
             "{error}"
         );
         body["stream"] = json!(true);

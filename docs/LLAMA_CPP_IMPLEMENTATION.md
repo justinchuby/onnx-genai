@@ -827,3 +827,23 @@ text. Parser tests cover closed/open repeated regions, Unicode chunk boundaries,
 prefix-only completion and last-anchor selection. All 9 selected continuation
 cases passed. Constrained prefill and reasoning+JSON still require further work;
 this milestone does not enable their missing grammar integration.
+
+Lark-prefill API prerequisite: `GenerateConstraint::Lark` now carries the complete
+grammar and existing text prefix explicitly. Processor construction seeds the
+same byte-oriented recognizer used for schema prefixes; no duplicate old tuple
+API remains. Tool-constraint builders and public HTTP integration tests use an
+explicit empty prefix. Grammar-prefix rejection guidance now describes arbitrary
+grammars rather than assuming every grammar is JSON Schema.
+
+Actual-tokenizer processor tests cover empty/partial/complete Lark prefixes,
+invalid-prefix typed errors, suffix-only next-token selection, EOS eligibility,
+and explicit special-token transitions alongside ordinary literal alternatives.
+This exposes the engine capability needed by response-channel grammar lowering;
+it does not itself enable reasoning+JSON in the server.
+
+Lark-prefill validation: 2 selected engine cases passed under both default and
+native-backend features; 3 public HTTP tool-choice tests and all 6 tool-protocol
+unit cases passed. The real JSON-continuation regression passed with its updated
+generic grammar-prefix repair guidance. Strict default/native engine all-target
+and server all-target Clippy passed. The first HTTP filter selected zero tests;
+it is not counted as coverage and was replaced by the verified 3-case filter.

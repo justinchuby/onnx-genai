@@ -1218,7 +1218,7 @@ fn forced_specific_tool_choice_builds_lark_tool_call_constraint() {
         }
     }));
 
-    let Some(GenerateConstraint::Lark(grammar)) = build_generate_request_with_protocol(
+    let Some(GenerateConstraint::Lark { grammar, prefix }) = build_generate_request_with_protocol(
         &request,
         &declared_protocol("tagged-json"),
         &fixture_tokenizer(),
@@ -1229,6 +1229,7 @@ fn forced_specific_tool_choice_builds_lark_tool_call_constraint() {
     else {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
+    assert!(prefix.is_empty());
     assert!(
         grammar.contains("start: \"<tool_call>\\n\" tool \"\\n</tool_call>\""),
         "{grammar}"
@@ -1268,7 +1269,7 @@ fn required_tool_choice_with_multiple_tools_allows_any_tool_schema() {
         "tool_choice": "required"
     }));
 
-    let Some(GenerateConstraint::Lark(grammar)) = build_generate_request_with_protocol(
+    let Some(GenerateConstraint::Lark { grammar, prefix }) = build_generate_request_with_protocol(
         &request,
         &declared_protocol("tagged-json"),
         &fixture_tokenizer(),
@@ -1279,6 +1280,7 @@ fn required_tool_choice_with_multiple_tools_allows_any_tool_schema() {
     else {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
+    assert!(prefix.is_empty());
     let schema_text = grammar.split_once("tool: %json ").unwrap().1.trim();
     let schema: Value = serde_json::from_str(schema_text).unwrap();
     let any_of = schema["anyOf"].as_array().unwrap();
