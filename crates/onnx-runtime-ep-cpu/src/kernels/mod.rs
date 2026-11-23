@@ -280,6 +280,7 @@ pub fn input_dtype_constraints_for_op(
         (3, F32_ONLY),
     ];
     match (op_type, domain) {
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::INPUT_DTYPES,
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
         ("RotaryEmbedding", "com.microsoft") => MSFT_ROTARY_SLOTS,
@@ -306,6 +307,7 @@ pub fn output_dtype_constraints_for_op(
 ) -> &'static [(usize, &'static [DataType])] {
     static DSA_INDEX_SELECT_OUTPUTS: &[(usize, &[DataType])] = &[(0, I64_ONLY)];
     match (op_type, domain) {
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::OUTPUT_DTYPES,
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
         _ => &[],
     }

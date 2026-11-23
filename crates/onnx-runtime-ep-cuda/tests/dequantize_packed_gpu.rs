@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 
 // Format suffix, values per block, packed bytes per block, half-scale offsets,
 // and digest of the 64 little-endian f32 blocks from the pinned GGML oracle.
+type OracleCase = (&'static str, usize, usize, &'static [usize], &'static str);
 #[rustfmt::skip]
-const CASES: &[(&str, usize, usize, &[usize], &str)] = &[
+const CASES: &[OracleCase] = &[
     ("q4_0", 32, 18, &[0], "09f0f0b2d729e51f2f646e693cc3c6e18b51d795f4b6cbe73097e9be7d87b6e0"),
     ("q4_1", 32, 20, &[0,2], "1b44f52d3d6eb9725387950ae0bd486124a8fd1940edca23eab00bd311132662"),
     ("q5_0", 32, 22, &[0], "31398b6c3cac68a02d7507c3b18ca0793edd16b3110210a0249f88c56e5abc31"),
@@ -104,12 +105,20 @@ fn run(
     if let Some(dtype) = dtype {
         attrs.push(("output_dtype", Attribute::Int(i64::from(dtype.to_onnx()))));
     }
-    match cuda {
+    let result = match cuda {
         Some(ep) => run_cuda(ep, "DequantizePacked", "", 29, &inputs, &outputs, &attrs),
         None => run_cpu("DequantizePacked", "", 29, &inputs, &outputs, &attrs),
     }
     .pop()
-    .unwrap()
+    .unwrap();
+    if cfg!(target_endian = "big") && cuda.is_none() {
+        let mut result = result;
+        for lane in result.chunks_exact_mut(outputs[0].0.byte_size()) {
+            lane.reverse();
+        }
+        return result;
+    }
+    result
 }
 
 fn check_corpus(cuda: Option<&CudaExecutionProvider>) {
@@ -168,6 +177,53 @@ fn check_edges(cuda: Option<&CudaExecutionProvider>) {
             .collect::<Vec<_>>();
         assert_eq!(run(cuda, "mxfp4", &packed, &[32], None), expected);
     }
+
+    // Q8_K uses a binary32 scale directly, ignores the auxiliary sums,
+    // and multiplies before any dtype widening. Check signed zero,
+    // subnormal multiplication, overflow, and arithmetic NaNs.
+    for (scale, expected) in [
+        (-0.0f32, [-0.0, 0.0, -0.0]),
+        (
+            f32::from_bits(1),
+            [f32::from_bits(1), f32::from_bits(0x8000_0002), 0.0],
+        ),
+        (f32::MAX, [f32::MAX, f32::NEG_INFINITY, 0.0]),
+        (f32::INFINITY, [f32::INFINITY, f32::NEG_INFINITY, f32::NAN]),
+        (f32::NAN, [f32::NAN; 3]),
+    ] {
+        let mut packed = vec![0; 292];
+        packed[..4].copy_from_slice(&scale.to_le_bytes());
+        packed[4..7].copy_from_slice(&[1, 254, 0]);
+        packed[260..].fill(0xff);
+        let out = run(cuda, "q8_k", &packed, &[256], Some(DataType::Float64));
+        for (lane, expected) in out.chunks_exact(8).zip(expected) {
+            let value = f64::from_le_bytes(lane.try_into().unwrap());
+            if expected.is_nan() {
+                assert!(
+                    value.is_nan(),
+                    "expected NaN at scale {scale:?}, got {value:?}"
+                );
+            } else {
+                assert_eq!(
+                    value.to_bits(),
+                    f64::from(expected).to_bits(),
+                    "scale {scale:?}"
+                );
+            }
+        }
+    }
+
+    // The full scale byte participates in NVFP4's special case: 0x7f is
+    // zero, but 0xff is the largest magnitude. The sign bit otherwise
+    // does not change subnormal scales.
+    let mut packed = vec![0x7f, 0xff, 0x01, 0x81];
+    packed.extend([0x91; 32]);
+    let expected = [0.0f32, 240.0, 1.0 / 1024.0, 1.0 / 1024.0]
+        .into_iter()
+        .flat_map(|d| [d; 8].into_iter().chain([-d; 8]))
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    assert_eq!(run(cuda, "nvfp4", &packed, &[64], None), expected);
 }
 
 #[test]

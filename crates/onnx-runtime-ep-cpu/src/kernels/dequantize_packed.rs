@@ -67,13 +67,13 @@ impl Kernel for PackedKernel {
             decode(src, values);
             for (&value, output) in values.iter().zip(dst.chunks_exact_mut(element_bytes)) {
                 match metadata.dtype() {
-                    DataType::Float32 => output.copy_from_slice(&value.to_le_bytes()),
-                    DataType::Float64 => output.copy_from_slice(&f64::from(value).to_le_bytes()),
+                    DataType::Float32 => output.copy_from_slice(&value.to_ne_bytes()),
+                    DataType::Float64 => output.copy_from_slice(&f64::from(value).to_ne_bytes()),
                     DataType::Float16 => {
-                        output.copy_from_slice(&half::f16::from_f32(value).to_le_bytes())
+                        output.copy_from_slice(&half::f16::from_f32(value).to_ne_bytes())
                     }
                     DataType::BFloat16 => {
-                        output.copy_from_slice(&half::bf16::from_f32(value).to_le_bytes())
+                        output.copy_from_slice(&half::bf16::from_f32(value).to_ne_bytes())
                     }
                     _ => unreachable!("checked output dtype"),
                 }

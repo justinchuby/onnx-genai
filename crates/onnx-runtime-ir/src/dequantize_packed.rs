@@ -10,6 +10,16 @@ pub const DTYPES: &[DataType] = &[
     DataType::BFloat16,
     DataType::Float64,
 ];
+pub const INPUT_DTYPES: &[(usize, &[DataType])] = &[(0, &[DataType::Uint8])];
+pub const OUTPUT_DTYPES: &[(usize, &[DataType])] = &[(
+    0,
+    &[
+        DataType::Float32,
+        DataType::Float16,
+        DataType::BFloat16,
+        DataType::Float64,
+    ],
+)];
 
 /// Check the metadata and any statically known facts during native EP placement.
 pub fn validate_claim(node: &Node, shapes: &[Shape], dtypes: &[DataType]) -> Result<(), String> {
@@ -137,7 +147,7 @@ impl Metadata {
                 .as_int()
                 .and_then(|value| i32::try_from(value).ok())
                 .and_then(DataType::from_onnx)
-                .filter(|dtype| matches!(dtype, DataType::Float32 | DataType::Float64 | DataType::Float16 | DataType::BFloat16))
+                .filter(|dtype| OUTPUT_DTYPES[0].1.contains(dtype))
                 .ok_or_else(|| format!("attribute 'output_dtype' {raw:?} must be FLOAT, DOUBLE, FLOAT16, or BFLOAT16"))?,
         };
         let elements = if shape.contains(&0) {
