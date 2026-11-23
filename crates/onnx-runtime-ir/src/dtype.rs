@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn unknown_raw_values_return_none() {
         // UNDEFINED and out-of-range/future values.
-        for raw in [0, 27, 100, 9999, -1, i32::MAX, i32::MIN] {
+        for raw in [0, 29, 100, 9999, -1, i32::MAX, i32::MIN] {
             assert_eq!(DataType::from_onnx(raw), None, "raw {raw} should be None");
         }
     }

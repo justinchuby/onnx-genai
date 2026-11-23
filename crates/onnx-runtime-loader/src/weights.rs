@@ -908,16 +908,7 @@ fn resolve_initializer(
                     mmap.mmap.len()
                 )));
             }
-            if dtype.is_float6() {
-                let count = onnx_runtime_ir::checked_numel(dims)
-                    .expect("external reference validated the element count");
-                if dtype.has_invalid_float6_padding(count, &mmap.mmap[offset..offset + length]) {
-                    return Err(LoaderError::GraphBuild(format!(
-                        "external initializer {:?} has nonzero FLOAT6 tail padding; clear the unused high bits of the final byte",
-                        init.name
-                    )));
-                }
-            }
+            validate_float6_tail(dtype, dims, &mmap.mmap[offset..offset + length], &init.name)?;
         }
         Ok(weight)
     } else {
@@ -1002,6 +993,23 @@ fn ordinary_external_reference(
 
 /// Resolve nested graph initializers without putting graph-local ValueIds into
 /// the root weight map. Mappings are shared by path; descriptors stay in scope.
+fn validate_float6_tail(
+    dtype: DataType,
+    dims: &[usize],
+    bytes: &[u8],
+    name: &str,
+) -> Result<(), LoaderError> {
+    if dtype.is_float6()
+        && onnx_runtime_ir::checked_numel(dims)
+            .is_some_and(|count| dtype.has_invalid_float6_padding(count, bytes))
+    {
+        return Err(LoaderError::GraphBuild(format!(
+            "external initializer {name:?} has nonzero FLOAT6 tail padding; clear the unused high bits of the final byte"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_nested_weights(
     graph: &mut onnx_runtime_ir::Graph,
     model_dir: &Path,
@@ -1017,7 +1025,8 @@ pub(crate) fn resolve_nested_weights(
                 path,
                 offset,
                 length,
-                ..
+                dtype,
+                dims,
             } = weight
             else {
                 continue;
@@ -1034,6 +1043,12 @@ pub(crate) fn resolve_nested_weights(
                     resolved.display()
                 )));
             }
+            validate_float6_tail(
+                *dtype,
+                dims,
+                &store.mmaps[&resolved].mmap[*offset..*offset + *length],
+                relative,
+            )?;
             *path = resolved;
         }
         resolve_nested_weights(graph, model_dir, store)

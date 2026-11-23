@@ -318,12 +318,14 @@ fn grid_for(n: usize) -> u32 {
 /// kernel.
 pub struct CastFactory {
     pub runtime: Arc<CudaRuntime>,
+    pub float6: bool,
 }
 
 impl KernelFactory for CastFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(CastKernel {
             runtime: self.runtime.clone(),
+            float6: self.float6,
         }))
     }
 }
@@ -332,6 +334,7 @@ impl KernelFactory for CastFactory {
 #[derive(Debug)]
 pub struct CastKernel {
     runtime: Arc<CudaRuntime>,
+    float6: bool,
 }
 
 impl CastKernel {
@@ -348,6 +351,11 @@ impl CastKernel {
         let x = &inputs[0];
         let src = x.dtype;
         let dst = outputs[0].dtype;
+        if src.is_float6() && !self.float6 {
+            return Err(not_implemented(
+                "FLOAT6 widening requires standard Cast at opset 28 or newer",
+            ));
+        }
         if !cast_pair_supported(src, dst) {
             return Err(not_implemented(format!(
                 "Cast {src:?} to {dst:?}; use f32/f64/f16/bf16/int8-64/uint8-64/bool, or widen a FLOAT6 source to f16, bf16, f32, or f64"

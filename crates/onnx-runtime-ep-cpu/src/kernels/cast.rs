@@ -100,10 +100,13 @@ num_to_int!(to_u64, u64);
 /// resolved; execution errors if it was absent).
 pub struct CastKernel {
     to: Option<DataType>,
+    float6: bool,
 }
 
 /// Factory reading the ONNX `to` attribute (a `TensorProto.DataType` integer).
-pub struct CastFactory;
+pub struct CastFactory {
+    pub float6: bool,
+}
 
 impl KernelFactory for CastFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -111,7 +114,10 @@ impl KernelFactory for CastFactory {
             .attr("to")
             .and_then(|a| a.as_int())
             .and_then(|raw| DataType::from_onnx(raw as i32));
-        Ok(Box::new(CastKernel { to }))
+        Ok(Box::new(CastKernel {
+            to,
+            float6: self.float6,
+        }))
     }
 }
 
@@ -134,7 +140,7 @@ impl Kernel for CastKernel {
         let to = self.to.ok_or_else(|| {
             EpError::KernelFailed("Cast: missing or unsupported `to` attribute".into())
         })?;
-        cast_to("Cast", &inputs[0], &mut outputs[0], to)
+        cast_to("Cast", &inputs[0], &mut outputs[0], to, self.float6)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -146,7 +152,13 @@ impl Kernel for CastLikeKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("CastLike", inputs, outputs, 2, 2, 1)?;
         inputs[1].validate()?;
-        cast_to("CastLike", &inputs[0], &mut outputs[0], inputs[1].dtype)
+        cast_to(
+            "CastLike",
+            &inputs[0],
+            &mut outputs[0],
+            inputs[1].dtype,
+            false,
+        )
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -154,7 +166,13 @@ impl Kernel for CastLikeKernel {
     }
 }
 
-fn cast_to(op: &str, input: &TensorView, output: &mut TensorMut, to: DataType) -> Result<()> {
+fn cast_to(
+    op: &str,
+    input: &TensorView,
+    output: &mut TensorMut,
+    to: DataType,
+    float6: bool,
+) -> Result<()> {
     // Cast to/from STRING is a real ONNX feature, but the ep-cpu stores
     // string tensors out-of-band (String has no fixed-width raw byte
     // layout), so the byte-oriented conversion table below cannot produce or
@@ -177,6 +195,11 @@ fn cast_to(op: &str, input: &TensorView, output: &mut TensorMut, to: DataType) -
         )));
     }
     if input.dtype.is_float6() {
+        if !float6 {
+            return Err(EpError::KernelFailed(format!(
+                "{op}: FLOAT6 widening requires standard Cast at opset 28 or newer"
+            )));
+        }
         return widen_float6(input, output);
     }
 
@@ -869,9 +892,12 @@ mod tests {
     }
 
     fn cast(to: DataType, input: &Owned, out: &mut Owned) {
-        CastKernel { to: Some(to) }
-            .execute(&[input.view()], &mut [out.view_mut()])
-            .unwrap();
+        CastKernel {
+            to: Some(to),
+            float6: true,
+        }
+        .execute(&[input.view()], &mut [out.view_mut()])
+        .unwrap();
     }
 
     #[test]
@@ -883,6 +909,14 @@ mod tests {
             dtype: DataType::Float6E2M3,
         };
         let mut out = Owned::zeros(DataType::Float32, &[3]);
+        let legacy = CastKernel {
+            to: Some(DataType::Float32),
+            float6: false,
+        };
+        let error = legacy
+            .execute(&[packed.view()], &mut [out.view_mut()])
+            .unwrap_err();
+        assert!(error.to_string().contains("opset 28"));
         cast(DataType::Float32, &packed, &mut out);
         assert_eq!(
             out.to_f32().iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
@@ -1067,7 +1101,11 @@ mod tests {
     fn missing_to_attribute_errors() {
         let a = Owned::f32(&[1], &[1.0]);
         let mut out = Owned::zeros(DataType::Int64, &[1]);
-        let err = CastKernel { to: None }.execute(&[a.view()], &mut [out.view_mut()]);
+        let err = CastKernel {
+            to: None,
+            float6: false,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()]);
         assert!(err.is_err());
     }
 
@@ -1079,6 +1117,7 @@ mod tests {
         let mut out = Owned::zeros(DataType::String, &[1]);
         let err = CastKernel {
             to: Some(DataType::String),
+            float6: false,
         }
         .execute(&[a.view()], &mut [out.view_mut()]);
         let msg = format!("{}", err.unwrap_err());
@@ -1093,6 +1132,7 @@ mod tests {
         let mut out = Owned::zeros(DataType::Float32, &[1]);
         let err = CastKernel {
             to: Some(DataType::Float32),
+            float6: false,
         }
         .execute(&[a.view()], &mut [out.view_mut()]);
         let msg = format!("{}", err.unwrap_err());
@@ -1130,9 +1170,12 @@ mod contiguous_fast_path_tests {
         let mut input = Owned::zeros(from, &[n]);
         input.bytes.copy_from_slice(src);
         let mut output = Owned::zeros(to, &[n]);
-        CastKernel { to: Some(to) }
-            .execute(&[input.view()], &mut [output.view_mut()])
-            .unwrap();
+        CastKernel {
+            to: Some(to),
+            float6: false,
+        }
+        .execute(&[input.view()], &mut [output.view_mut()])
+        .unwrap();
         output.bytes
     }
 
@@ -1358,6 +1401,7 @@ mod contiguous_fast_path_tests {
         let mut output = Owned::zeros(DataType::Float32, &[3, 2]);
         CastKernel {
             to: Some(DataType::Float32),
+            float6: false,
         }
         .execute(&[input.view()], &mut [output.view_mut()])
         .unwrap();
