@@ -2163,3 +2163,40 @@ native API/CPU/session/engine/plugin stack and CUDA (`cuda,gpu-tests`, compile
 only). Before/after performance evidence is recorded in [the session workspace report](../benchmarks/session-workspace/README.md): 36 exact-output process runs, qualified controls and overlapping CPU ranges, with no distinguishable regression on this CPU tier.
 CUDA device execution and full-model throughput are not established on the
 current CPU-only host.
+
+
+### Lazy inputs borrow the same execution workspace
+
+The general weight-delivery hook `execute_with_inputs` now accepts the existing
+borrowed `WorkspaceView`. Its resident adapter forwards to
+`execute_with_workspace`; paging-aware implementations consume handles and
+scratch together. The executor no longer rejects this combination after having
+already prepared its workspace. There is no second resource context, allocator,
+lease protocol or public compatibility signature. Resident dispatch keeps its
+existing path without wrapping all views as general inputs.
+
+An unresolved initializer remains logically present during workspace planning.
+Refinement gets dtype/shape from the weight handle while its actual TensorView
+stays absent. Metadata presence never authorizes reading a pointer; runtime
+refinement must check the view before accessing input values. Lookup follows the
+execution plan's complete ValueId slots, including appended captures, rather than
+reconstructing the node descriptor's explicit inputs. This does not extend
+which graph or leaf implementations accept lazy inputs or change dynamic-output
+protocols.
+
+The same lane owner still covers sequential work. Metadata/shape preparation,
+capacity and alignment checks, inherited workspace validation, growth, completion
+and return remain in the common executor path. Warm reuse introduces no new
+pool checkout, claim/refund or zero-byte request. This is a functional admission
+fix, not a measured speedup or a claim of zero total dispatch cost. API forwarding
+and unresolved-input rejection tests plus session regressions cover eager and
+prepared execution, logical geometry, execution-slot lookup, warm address reuse,
+refusal before materialization and successful retry.
+
+Validation on the CPU-only ARM64 host: API 107, session 295 and all 48 public
+executor integration tests pass. Strict all-target Clippy passes for API/CPU/
+session and for CUDA with `cuda,gpu-tests`; no CUDA device execution is claimed.
+The authorized read-only resource-design review found the execution-slot issue
+and confirmed its fix. Validation driver and logs remain
+`/tmp/nxrt-lazy-workspace-check.py` and `/tmp/nxrt-lazy-workspace-*.log`; all
+build/test work held the shared stable host lock.

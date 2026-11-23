@@ -760,7 +760,7 @@ impl Executor {
                 })
                 .collect::<Vec<_>>();
             let (_, workspace) =
-                ctx.prepare_kernel_workspace(kernel, &views, node, workspace_planning)?;
+                ctx.prepare_kernel_workspace(kernel, inputs, &views, node, workspace_planning)?;
             let result = kernel.execute_kernel_sized(&views, &requested, workspace)?;
             validate_kernel_sized_outputs(
                 &result,
@@ -1968,13 +1968,33 @@ impl KernelDispatchContext<'_> {
     fn prepare_kernel_workspace(
         &mut self,
         kernel: &dyn Kernel,
+        inputs: &[Option<ValueId>],
         views: &[TensorView],
         node: &Node,
         workspace_planning: onnx_runtime_ep_api::WorkspacePlanning,
     ) -> Result<(WorkspaceRequirement, Option<WorkspaceView>)> {
         let metadata: SmallVec<[TensorMetadata<'_>; 16]> = views
             .iter()
-            .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
+            .enumerate()
+            .map(|(index, view)| {
+                // A lazy initializer is logically present even while its device
+                // view is absent. Planning must see the same geometry as prepare,
+                // without materializing bytes or inventing a readable pointer.
+                if view.is_absent()
+                    && let Some(handle) = inputs
+                        .get(index)
+                        .copied()
+                        .flatten()
+                        .and_then(|value| self.weight_handles.get(&value))
+                {
+                    let (dtype, shape) = match handle {
+                        WeightHandle::Resident(weight) => (weight.dtype, weight.shape.as_slice()),
+                        WeightHandle::Lazy(weight) => (weight.dtype, weight.shape.as_slice()),
+                    };
+                    return TensorMetadata::new(dtype, shape, true);
+                }
+                TensorMetadata::new(view.dtype, view.shape, !view.is_absent())
+            })
             .collect();
         let requirement = kernel.workspace_requirement_for_execution(views, &metadata)?;
         if requirement.bytes != 0
@@ -2176,13 +2196,10 @@ impl KernelDispatchContext<'_> {
 
         let execution = {
             let _s = phase_span!("exec_kernel.compute");
-            let (requirement, workspace) =
-                self.prepare_kernel_workspace(kernel, views, node, workspace_planning)?;
+            let (_, workspace) =
+                self.prepare_kernel_workspace(kernel, inputs, views, node, workspace_planning)?;
             match &kernel_inputs {
-                Some(inputs) if requirement.bytes == 0 => kernel.execute_with_inputs(inputs, outs),
-                Some(_) => Err(EpError::KernelFailed(
-                    "workspace-bearing lazy-input kernels are not supported".into(),
-                )),
+                Some(inputs) => kernel.execute_with_inputs(inputs, outs, workspace),
                 None => kernel.execute_with_workspace(views, outs, workspace),
             }
         };
