@@ -1444,7 +1444,7 @@ impl InferenceSession {
     }
 
     /// Locations of graph nodes that declare owned kernel workspace.
-    pub fn workspace_node_locations(&self) -> Vec<String> {
+    pub fn workspace_node_locations(&self) -> &[String] {
         self.exec.workspace_node_locations()
     }
 

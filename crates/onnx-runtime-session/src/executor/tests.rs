@@ -1,6 +1,4 @@
-#[cfg(feature = "gpu-tests")]
 use std::alloc::{GlobalAlloc, Layout, System};
-#[cfg(feature = "gpu-tests")]
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -13,17 +11,14 @@ use onnx_runtime_memory_api::MemoryRole;
 
 use super::*;
 
-#[cfg(feature = "gpu-tests")]
 struct CountingAllocator;
 
-#[cfg(feature = "gpu-tests")]
 thread_local! {
     static COUNT_HOST_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
     static HOST_ALLOCATION_COUNT: Cell<u64> = const { Cell::new(0) };
     static HOST_ALLOCATION_SIZES: Cell<[usize; 8]> = const { Cell::new([0; 8]) };
 }
 
-#[cfg(feature = "gpu-tests")]
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         COUNT_HOST_ALLOCATIONS.with(|enabled| {
@@ -68,10 +63,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
 }
 
 #[global_allocator]
-#[cfg(feature = "gpu-tests")]
 static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
 
-#[cfg(feature = "gpu-tests")]
 fn count_host_allocations<T>(operation: impl FnOnce() -> T) -> (T, u64) {
     HOST_ALLOCATION_COUNT.with(|count| count.set(0));
     HOST_ALLOCATION_SIZES.with(|sizes| sizes.set([0; 8]));
@@ -320,6 +313,7 @@ impl ExecutionProvider for DeferredValidationEp {
     ) -> KernelMatch {
         if op.op_type == "DeferredValidation" {
             KernelMatch::Supported {
+                workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
                 cost: Cost::ZERO,
                 required_input_layouts: None,
                 output_layouts: vec![TensorLayout::contiguous()],
@@ -4532,6 +4526,7 @@ impl ExecutionProvider for KvCapacityAppendTestEp {
         if op.domain == "pkg.nxrt" && op.op_type == "KvCacheCapacityAppend" {
             return if self.accept_capacity_append {
                 KernelMatch::Supported {
+                    workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
                     cost: Cost::ZERO,
                     required_input_layouts: None,
                     output_layouts: vec![TensorLayout::contiguous(); op.outputs.len()],
@@ -5445,6 +5440,7 @@ impl ExecutionProvider for WeightDeliveryEp {
         if self.optional_input_contract && op.op_type == "OptionalContract" {
             if input_dtypes == [DataType::Float32, DataType::Undefined, DataType::Bool] {
                 return KernelMatch::Supported {
+                    workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
                     cost: Cost::ZERO,
                     required_input_layouts: None,
                     output_layouts: vec![TensorLayout::contiguous()],
@@ -5459,6 +5455,7 @@ impl ExecutionProvider for WeightDeliveryEp {
             && op.op_type == "IndexShare"
         {
             return KernelMatch::Supported {
+                workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
                 cost: Cost::ZERO,
                 required_input_layouts: None,
                 output_layouts: vec![TensorLayout::contiguous()],
@@ -5470,6 +5467,7 @@ impl ExecutionProvider for WeightDeliveryEp {
             || (op.is_default_domain() && op.op_type == "Identity")
         {
             KernelMatch::Supported {
+                workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
                 cost: Cost::ZERO,
                 required_input_layouts: None,
                 output_layouts: vec![TensorLayout::contiguous()],
@@ -15827,4 +15825,466 @@ fn apple_nbits_prefill_and_decode_share_one_dense_expansion() {
     assert_eq!(books.used(Tier::Host), 396);
     drop(peer);
     assert_eq!(books.used(Tier::Host), 0);
+}
+
+/// Shape-specialized kernels must be planned from their implementation promise,
+/// including compressed projections absent from the old runtime op inventory.
+fn streamed_workspace_graph() -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 24);
+    graph
+        .opset_imports
+        .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+    let rows = graph.create_symbol(None);
+    let a = graph.create_named_value(
+        "a",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(35)],
+    );
+    let y = graph.create_named_value(
+        "y",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(13)],
+    );
+    let b = graph.create_named_value("b", DataType::Uint8, static_shape([13, 2, 17]));
+    let mut packed = vec![0x22; 13 * 2 * 17];
+    for block in packed.chunks_exact_mut(17) {
+        block[0] = 127;
+    }
+    graph.set_initializer(
+        b,
+        WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+            DataType::Uint8,
+            vec![13, 2, 17],
+            packed,
+        )),
+    );
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMatMul",
+        vec![Some(a), Some(b)],
+        vec![y],
+    );
+    node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    node.attributes
+        .insert("K".into(), onnx_runtime_ir::Attribute::Int(35));
+    node.attributes
+        .insert("N".into(), onnx_runtime_ir::Attribute::Int(13));
+    node.attributes.insert(
+        "format".into(),
+        onnx_runtime_ir::Attribute::String(b"mxfp4".to_vec()),
+    );
+    graph.add_input(a);
+    graph.add_output(y);
+    graph.insert_node(node);
+    graph
+}
+
+fn zero_retention_cpu() -> CpuExecutionProvider {
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+        Default::default(),
+        onnx_runtime_ep_cpu::CpuWeightCacheLimits {
+            dense_bytes: 0,
+            expert_bytes: 0,
+        },
+    )
+    .unwrap();
+    CpuExecutionProvider::initialized_with_resources(resources).unwrap()
+}
+
+#[test]
+fn streamed_projection_strict_prepare_and_run_use_the_declared_step_workspace() {
+    use onnx_runtime_memory_api::{DeviceKey, Tier};
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
+    let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+        DeviceKey::HOST,
+        0,
+        1 << 20,
+        0,
+    )));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let memory =
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13))
+            .unwrap();
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+        memory,
+        onnx_runtime_ep_cpu::CpuWeightCacheLimits {
+            dense_bytes: 0,
+            expert_bytes: 0,
+        },
+    )
+    .unwrap()
+    .with_workspace_pool(pool.clone())
+    .unwrap();
+    let cpu = Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+    let mut executor = Executor::build(
+        streamed_workspace_graph(),
+        Arc::new(WeightStore::new()),
+        cpu,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        executor.plan[0].workspace_planning,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata
+    );
+    assert!(
+        executor
+            .workspace_node_locations()
+            .iter()
+            .any(|location| location.contains("BlockQuantizedMatMul"))
+    );
+    for rows in [1, 3, 1, 3] {
+        let input = Tensor::from_raw(
+            DataType::Float32,
+            vec![rows, 35],
+            &[0.25f32.to_le_bytes(); 35].repeat(rows).concat(),
+        )
+        .unwrap();
+        let requirement = executor
+            .prepare_with_device_bindings(&[("a", &input)], &mut [])
+            .unwrap();
+        assert!(requirement.bytes > 0);
+        assert_eq!(requirement.lifetime, WorkspaceLifetime::StepScoped);
+        assert!(manager.process_used(Tier::Host) >= requirement.bytes);
+        let output = executor.run(&[("a", &input)]).unwrap();
+        assert_eq!(output[0].shape, [rows, 13]);
+        assert_eq!(
+            output[0].as_bytes(),
+            &[8.75f32.to_le_bytes(); 13].repeat(rows).concat()
+        );
+        assert_eq!(
+            books.used(Tier::Host),
+            manager.process_used(Tier::Host),
+            "zero retention must fund only physical workspace backing"
+        );
+    }
+    drop(executor);
+    pool.trim_idle(u64::MAX).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn streamed_moe_strict_prepare_funds_one_reused_workspace_across_shapes() {
+    use onnx_runtime_ir::{Attribute, TensorData};
+    use onnx_runtime_memory_api::{DeviceKey, Tier};
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 24);
+    graph
+        .opset_imports
+        .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+    let rows = graph.create_symbol(None);
+    let a = graph.create_named_value(
+        "a",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(32)],
+    );
+    let router = graph.create_named_value(
+        "router",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(4)],
+    );
+    let y = graph.create_named_value(
+        "y",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(32)],
+    );
+    let mut weight = |name: &str| {
+        let id = graph.create_named_value(name, DataType::Uint8, static_shape([4, 32, 1, 17]));
+        let mut bytes = vec![0x22; 4 * 32 * 17];
+        for block in bytes.chunks_exact_mut(17) {
+            block[0] = 127;
+        }
+        graph.set_initializer(
+            id,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Uint8,
+                vec![4, 32, 1, 17],
+                bytes,
+            )),
+        );
+        id
+    };
+    let fc1 = weight("fc1");
+    let fc2 = weight("fc2");
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMoE",
+        vec![Some(a), Some(router), Some(fc1), None, Some(fc2)],
+        vec![y],
+    );
+    node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    for (name, value) in [
+        ("fc1_format", Attribute::String(b"mxfp4".to_vec())),
+        ("fc2_format", Attribute::String(b"mxfp4".to_vec())),
+        ("block_layout_version", Attribute::Int(1)),
+        ("activation_type", Attribute::String(b"identity".to_vec())),
+        ("k", Attribute::Int(2)),
+        ("normalize_routing_weights", Attribute::Int(1)),
+    ] {
+        node.attributes.insert(name.into(), value);
+    }
+    graph.add_input(a);
+    graph.add_input(router);
+    graph.add_output(y);
+    graph.insert_node(node);
+    let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+        DeviceKey::HOST,
+        0,
+        1 << 20,
+        0,
+    )));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let memory =
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13))
+            .unwrap();
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+        memory,
+        onnx_runtime_ep_cpu::CpuWeightCacheLimits {
+            dense_bytes: 0,
+            expert_bytes: 0,
+        },
+    )
+    .unwrap()
+    .with_workspace_pool(pool.clone())
+    .unwrap();
+    let cpu = Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), cpu, None).unwrap();
+    assert_eq!(
+        executor.plan[0].workspace_planning,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata
+    );
+    assert!(
+        executor
+            .workspace_node_locations()
+            .iter()
+            .any(|location| location.contains("BlockQuantizedMoE"))
+    );
+    for rows in [1, 3, 1, 3] {
+        let input = Tensor::from_f32(&[rows, 32], &vec![0.25; rows * 32]).unwrap();
+        // Both chosen experts receive every row. Equal top-two logits make the
+        // normalized route weights exactly 0.5, preserving an exact oracle.
+        let router = Tensor::from_f32(&[rows, 4], &[4., 4., -4., -5.].repeat(rows)).unwrap();
+        let inputs = [("a", &input), ("router", &router)];
+        let req = executor
+            .prepare_with_device_bindings(&inputs, &mut [])
+            .unwrap();
+        assert!(req.bytes > 0);
+        assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
+        let funded = books.used(Tier::Host);
+        for _ in 0..8 {
+            let output = executor.run(&inputs).unwrap();
+            assert_eq!(output[0].shape, [rows, 32]);
+            assert_eq!(
+                output[0].as_bytes(),
+                &[256.0f32.to_le_bytes(); 32].repeat(rows).concat()
+            );
+            assert_eq!(books.used(Tier::Host), funded);
+            assert_eq!(
+                books.used(Tier::Host),
+                manager.process_used(Tier::Host),
+                "zero retention funds only workspace backing"
+            );
+        }
+    }
+    drop(executor);
+    pool.trim_idle(u64::MAX).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+struct WorkspaceDeclarationEp {
+    capability_queries: AtomicUsize,
+    cpu: CpuExecutionProvider,
+    declares_none: bool,
+}
+impl ExecutionProvider for WorkspaceDeclarationEp {
+    fn name(&self) -> &str {
+        "workspace_declaration_test_ep"
+    }
+    fn device_type(&self) -> onnx_runtime_ir::DeviceType {
+        onnx_runtime_ir::DeviceType::Cpu
+    }
+    fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+        onnx_runtime_ir::DeviceId::cpu()
+    }
+    fn initialize(&mut self, config: &EpConfig) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.initialize(config)
+    }
+    fn shutdown(&mut self) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.shutdown()
+    }
+    fn supports_op(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        dtypes: &[DataType],
+        layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        self.capability_queries.fetch_add(1, Ordering::Relaxed);
+        if !self.declares_none
+            && shapes
+                .iter()
+                .flatten()
+                .any(|dim| matches!(dim, Dim::Symbolic(_)))
+        {
+            return KernelMatch::unsupported(
+                "test EP requires concrete shape for this claim; prepare a specialization",
+            );
+        }
+        let mut result = self.cpu.supports_op(op, opset, shapes, dtypes, layouts);
+        if self.declares_none
+            && let KernelMatch::Supported {
+                workspace_planning, ..
+            } = &mut result
+        {
+            *workspace_planning = onnx_runtime_ep_api::WorkspacePlanning::None;
+        }
+        result
+    }
+    fn get_kernel(
+        &self,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        self.cpu.get_kernel(op, shapes, opset)
+    }
+    fn copy(
+        &self,
+        source: &DeviceBuffer,
+        target: &mut DeviceBuffer,
+        bytes: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.copy(source, target, bytes)
+    }
+    fn copy_async(
+        &self,
+        source: &DeviceBuffer,
+        target: &mut DeviceBuffer,
+        bytes: usize,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::Fence> {
+        self.cpu.copy_async(source, target, bytes)
+    }
+    fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.sync()
+    }
+    fn allocate(
+        &self,
+        bytes: usize,
+        alignment: usize,
+    ) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+        self.cpu.allocate(bytes, alignment)
+    }
+    fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.deallocate(buffer)
+    }
+}
+
+#[test]
+fn symbolic_capability_decline_cannot_become_a_no_workspace_promise() {
+    let ep = Arc::new(WorkspaceDeclarationEp {
+        capability_queries: AtomicUsize::new(0),
+        cpu: zero_retention_cpu(),
+        declares_none: false,
+    });
+    let mut executor = Executor::build(
+        streamed_workspace_graph(),
+        Arc::new(WeightStore::new()),
+        ep.clone(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        executor.plan[0].workspace_planning,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata
+    );
+    let queries = ep.capability_queries.load(Ordering::Relaxed);
+    assert!(
+        queries > 0,
+        "positive control: construction must query the EP"
+    );
+    assert!(!executor.workspace_node_locations().is_empty());
+    let (positive, positive_allocations) = count_host_allocations(|| Box::new([1u8; 64]));
+    std::hint::black_box(positive);
+    assert!(
+        positive_allocations > 0,
+        "allocation probe must observe its positive control"
+    );
+    let (_, allocations) = count_host_allocations(|| {
+        for _ in 0..4096 {
+            std::hint::black_box(executor.workspace_node_locations());
+        }
+    });
+    assert_eq!(
+        allocations, 0,
+        "decode's location gate must borrow the existing plan without allocation"
+    );
+    assert_eq!(
+        ep.capability_queries.load(Ordering::Relaxed),
+        queries,
+        "location reads must not repeat capability work"
+    );
+    let input = Tensor::from_raw(
+        DataType::Float32,
+        vec![3, 35],
+        &[0.25f32.to_le_bytes(); 105].concat(),
+    )
+    .unwrap();
+    assert!(
+        executor
+            .prepare_with_device_bindings(&[("a", &input)], &mut [])
+            .unwrap()
+            .bytes
+            > 0
+    );
+    assert_eq!(
+        executor.run(&[("a", &input)]).unwrap()[0].to_vec_f32(),
+        vec![8.75; 39]
+    );
+}
+
+#[test]
+fn a_false_no_workspace_declaration_is_rejected_before_late_allocation() {
+    let ep = Arc::new(WorkspaceDeclarationEp {
+        capability_queries: AtomicUsize::new(0),
+        cpu: zero_retention_cpu(),
+        declares_none: true,
+    });
+    let mut executor = Executor::build(
+        streamed_workspace_graph(),
+        Arc::new(WeightStore::new()),
+        ep,
+        None,
+    )
+    .unwrap();
+    let input = Tensor::from_raw(
+        DataType::Float32,
+        vec![3, 35],
+        &[0.25f32.to_le_bytes(); 105].concat(),
+    )
+    .unwrap();
+    assert_eq!(
+        executor
+            .prepare_with_device_bindings(&[("a", &input)], &mut [])
+            .unwrap()
+            .bytes,
+        0
+    );
+    let error = executor.run(&[("a", &input)]).unwrap_err().to_string();
+    assert!(
+        error.contains("declared no executor workspace")
+            && error.contains("declare Metadata workspace planning"),
+        "{error}"
+    );
+    assert!(executor.step_workspace.is_none());
 }

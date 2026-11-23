@@ -1118,15 +1118,16 @@ pub(super) fn run_expert_grouped(
         fc3.as_ref(),
         fc3_bias,
         attributes,
+        |projection, input, rows, bias| projection.apply(input, rows, bias),
     )
 }
 
-/// A projection owns its representation/compute decision; routing, gating and
-/// expert accumulation remain shared by dense and compressed execution.
+/// Projection geometry shared by dense and compressed expert execution.
+/// The sequential apply callback may borrow one exclusive scratch buffer; each
+/// result remains owned while subsequent projections overwrite that scratch.
 pub(super) trait ExpertProjection {
     fn out_features(&self) -> usize;
     fn in_features(&self) -> usize;
-    fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>>;
 }
 struct DenseExpertProjection<'a> {
     weights: &'a [f32],
@@ -1140,6 +1141,8 @@ impl ExpertProjection for DenseExpertProjection<'_> {
     fn in_features(&self) -> usize {
         self.in_features
     }
+}
+impl DenseExpertProjection<'_> {
     fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
         linear_grouped(
             input,
@@ -1163,6 +1166,7 @@ pub(super) fn run_expert_projections<P: ExpertProjection>(
     fc3: Option<&P>,
     fc3_bias: Option<&[f32]>,
     attributes: &MoeAttributes,
+    mut apply: impl FnMut(&P, &[f32], usize, Option<&[f32]>) -> Result<Vec<f32>>,
 ) -> Result<Vec<f32>> {
     let fc1_size = fc1.out_features();
     let inter = fc2.in_features();
@@ -1171,13 +1175,16 @@ pub(super) fn run_expert_projections<P: ExpertProjection>(
     // token, top-k experts - is the shape that matters most, so the grouped
     // path now serves `rows == 1` too. `run_expert` is retained as the
     // portable reference the tests compare against.
-    let mut fc1_out = fc1.apply(input, rows, fc1_bias)?;
+    let mut fc1_out = apply(fc1, input, rows, fc1_bias)?;
     let activated = match attributes.activation {
         Activation::Swiglu => {
             let (gate_part, linear_part) = if attributes.swiglu_fusion == 0 {
-                let linear = fc3
-                    .expect("validated unfused swiglu FC3")
-                    .apply(input, rows, fc3_bias)?;
+                let linear = apply(
+                    fc3.expect("validated unfused swiglu FC3"),
+                    input,
+                    rows,
+                    fc3_bias,
+                )?;
                 (fc1_out, linear)
             } else {
                 let mut gate = Vec::with_capacity(rows * inter);
@@ -1202,9 +1209,12 @@ pub(super) fn run_expert_projections<P: ExpertProjection>(
                 .collect()
         }
         Activation::Silu if fc3.is_some() => {
-            let linear_part = fc3
-                .expect("validated SiLU gated FC3")
-                .apply(input, rows, fc3_bias)?;
+            let linear_part = apply(
+                fc3.expect("validated SiLU gated FC3"),
+                input,
+                rows,
+                fc3_bias,
+            )?;
             fc1_out
                 .into_iter()
                 .zip(linear_part)
@@ -1218,7 +1228,7 @@ pub(super) fn run_expert_projections<P: ExpertProjection>(
             fc1_out
         }
     };
-    fc2.apply(&activated, rows, fc2_bias)
+    apply(fc2, &activated, rows, fc2_bias)
 }
 
 /// `output[rows, out_features] = input[rows, in_features] * weightsᵀ (+ bias)`.

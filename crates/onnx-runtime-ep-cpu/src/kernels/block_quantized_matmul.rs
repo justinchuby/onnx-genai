@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorBacking, TensorMut, TensorView,
+    EpError, Kernel, KernelFactory, Result, TensorBacking, TensorMetadata, TensorMut, TensorView,
+    WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 use onnx_runtime_quantization::{
@@ -25,10 +26,10 @@ use onnx_runtime_quantization::{
 use rayon::prelude::*;
 
 use super::block_dequant::{decode_e2m1, decode_e8m0_scale};
+use super::decoded_projection::ProjectionScratch;
 use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
-use crate::strided::numel;
 
 const OP: &str = "BlockQuantizedMatMul";
 const DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
@@ -197,6 +198,7 @@ pub struct BlockQuantizedMatMulKernel {
     format: BlockFormat,
     packed_b_constant: bool,
     weight_identity: DenseWeightIdentity,
+    projection_plan: super::decoded_projection::DecodedProjectionPlan,
     weight_cache: WeightCache<DenseWeightCacheKey>,
 }
 
@@ -238,6 +240,7 @@ impl KernelFactory for BlockQuantizedMatMulFactory {
             format,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::new(self.memory.clone(), self.cache_bytes),
         }))
     }
@@ -248,7 +251,80 @@ impl Kernel for BlockQuantizedMatMulKernel {
         self.packed_b_constant = constant_inputs.get(1).copied().unwrap_or(false);
     }
 
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        let Some(a) = inputs.first().filter(|a| a.present) else {
+            return Err(error(
+                "workspace planning needs present activation A metadata; provide the activation shape",
+            ));
+        };
+        let rows = self.projection_rows(a.shape)?;
+        let layout = self.projection_plan.layout(rows, self.k, self.n)?;
+        Ok(WorkspaceRequirement {
+            bytes: layout.bytes() as u64,
+            alignment: layout.alignment(),
+            ..WorkspaceRequirement::NONE
+        })
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.execute_prepared_projection(inputs, outputs, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.execute_prepared_projection(inputs, outputs, workspace)
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
+    }
+}
+
+fn require_compute_dtype(name: &str, got: DataType) -> Result<()> {
+    if matches!(
+        got,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
+        Ok(())
+    } else {
+        Err(error(format!(
+            "{name} has unsupported dtype {got:?}; BlockQuantizedMatMul computes floating-point \
+             activations in Float32 and supports Float32, Float16, or BFloat16 storage. Cast \
+             {name} to one of those dtypes before this operator"
+        )))
+    }
+}
+
+impl BlockQuantizedMatMulKernel {
+    fn projection_rows(&self, shape: &[usize]) -> Result<usize> {
+        if shape.last() != Some(&self.k) {
+            return Err(error(format!(
+                "A workspace shape {shape:?} must end with K={}; provide matching activation dimensions",
+                self.k
+            )));
+        }
+        let axes = &shape[..shape.len() - 1];
+        if axes.contains(&0) {
+            return Ok(0);
+        }
+        axes.iter()
+            .try_fold(1usize, |rows, &extent| rows.checked_mul(extent))
+            .ok_or_else(|| {
+                error(format!(
+                    "A workspace shape {shape:?} overflows token count; reduce batch dimensions"
+                ))
+            })
+    }
+    fn execute_prepared_projection(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         check_arity(OP, inputs, outputs, 2, 3, 1)?;
         require_compute_dtype("A", inputs[0].dtype)?;
         require_dtype("packed_B", inputs[1].dtype, DataType::Uint8)?;
@@ -292,7 +368,7 @@ impl Kernel for BlockQuantizedMatMulKernel {
         };
 
         let activations = to_dense_f32_widen(OP, &inputs[0])?;
-        let m = numel(&a_shape[..a_shape.len() - 1]);
+        let m = self.projection_rows(a_shape)?;
         let dense_bytes = self
             .k
             .checked_mul(self.n)
@@ -366,7 +442,17 @@ impl Kernel for BlockQuantizedMatMulKernel {
         };
         let Some(dense) = dense else {
             let packed = packed_tensor_bytes(&inputs[1])?;
-            let result = linear_packed_grouped(
+            let bytes = self.projection_plan.layout(m, self.k, self.n)?.bytes();
+            // SAFETY: the executor lends valid exclusive Host storage for this
+            // dispatch. The scratch owner and all views stay within this call.
+            let mut scratch = unsafe {
+                ProjectionScratch::bind(
+                    "block-quantized streamed workspace binding",
+                    bytes,
+                    workspace,
+                )
+            }?;
+            let result = linear_packed_prepared(
                 self.format,
                 &packed,
                 &activations,
@@ -374,6 +460,8 @@ impl Kernel for BlockQuantizedMatMulKernel {
                 self.k,
                 self.n,
                 bias.as_deref(),
+                self.projection_plan,
+                scratch.initialized(),
             )?;
             return write_dense_f32_narrow(OP, &mut outputs[0], &result);
         };
@@ -401,27 +489,6 @@ impl Kernel for BlockQuantizedMatMulKernel {
         write_dense_f32_narrow(OP, &mut outputs[0], &result)
     }
 
-    fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        true
-    }
-}
-
-fn require_compute_dtype(name: &str, got: DataType) -> Result<()> {
-    if matches!(
-        got,
-        DataType::Float32 | DataType::Float16 | DataType::BFloat16
-    ) {
-        Ok(())
-    } else {
-        Err(error(format!(
-            "{name} has unsupported dtype {got:?}; BlockQuantizedMatMul computes floating-point \
-             activations in Float32 and supports Float32, Float16, or BFloat16 storage. Cast \
-             {name} to one of those dtypes before this operator"
-        )))
-    }
-}
-
-impl BlockQuantizedMatMulKernel {
     #[cfg(test)]
     fn dequantize_weight_kn(&self, packed: &TensorView) -> Result<Vec<f32>> {
         let packed = packed_tensor_bytes(packed)?;
@@ -797,10 +864,59 @@ pub(super) fn dequantize_weight_kn(
     Ok(output)
 }
 
+pub(super) fn projection_plan() -> super::decoded_projection::DecodedProjectionPlan {
+    super::decoded_projection::DecodedProjectionPlan::for_current_pool(
+        std::num::NonZeroUsize::new(if super::matmul::serial_projection_is_portable() {
+            4
+        } else {
+            1
+        })
+        .unwrap(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn linear_packed_prepared(
+    format: BlockFormat,
+    packed: &[u8],
+    input: &[f32],
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    bias: Option<&[f32]>,
+    plan: super::decoded_projection::DecodedProjectionPlan,
+    scratch: &mut [f32],
+) -> Result<Vec<f32>> {
+    if super::matmul::serial_projection_is_portable() {
+        linear_packed_tiled::<4>(
+            format,
+            packed,
+            input,
+            rows,
+            in_features,
+            out_features,
+            bias,
+            Some((plan, scratch)),
+        )
+    } else {
+        linear_packed_tiled::<1>(
+            format,
+            packed,
+            input,
+            rows,
+            in_features,
+            out_features,
+            bias,
+            Some((plan, scratch)),
+        )
+    }
+}
+
 /// Apply canonical compressed rows without materializing the full f32 weight
 /// matrix. Portable compute keeps at most four decoded rows per worker;
 /// reference/AVX2 routes retain one row. Every tile is reused across tokens.
-pub(super) fn linear_packed_grouped(
+#[cfg(test)]
+fn linear_packed_grouped(
     format: BlockFormat,
     packed: &[u8],
     input: &[f32],
@@ -810,9 +926,27 @@ pub(super) fn linear_packed_grouped(
     bias: Option<&[f32]>,
 ) -> Result<Vec<f32>> {
     if super::matmul::serial_projection_is_portable() {
-        linear_packed_tiled::<4>(format, packed, input, rows, in_features, out_features, bias)
+        linear_packed_tiled::<4>(
+            format,
+            packed,
+            input,
+            rows,
+            in_features,
+            out_features,
+            bias,
+            None,
+        )
     } else {
-        linear_packed_tiled::<1>(format, packed, input, rows, in_features, out_features, bias)
+        linear_packed_tiled::<1>(
+            format,
+            packed,
+            input,
+            rows,
+            in_features,
+            out_features,
+            bias,
+            None,
+        )
     }
 }
 
@@ -825,6 +959,7 @@ fn linear_packed_tiled<const FEATURE_TILE: usize>(
     in_features: usize,
     out_features: usize,
     bias: Option<&[f32]>,
+    prepared: Option<(super::decoded_projection::DecodedProjectionPlan, &mut [f32])>,
 ) -> Result<Vec<f32>> {
     let blocks = in_features.div_ceil(format.qk());
     let packed_stride = blocks
@@ -845,38 +980,62 @@ fn linear_packed_tiled<const FEATURE_TILE: usize>(
         )));
     }
     let decoder = format.decoder();
-    super::decoded_projection::linear_decoded_grouped::<FEATURE_TILE, _>(
-        "block-quantized projection",
-        input,
-        rows,
-        in_features,
-        out_features,
-        bias,
-        || {
-            let mut block = [0.0f32; IQ_SUPER_QK];
-            move |feature, weight_row: &mut [f32]| {
-                let packed_row = &packed[feature * packed_stride..(feature + 1) * packed_stride];
-                for (index, bytes) in packed_row.chunks_exact(format.block_bytes()).enumerate() {
-                    decoder(bytes, &mut block[..format.qk()]);
-                    let start = index * format.qk();
-                    let count = format.qk().min(in_features - start);
-                    weight_row[start..start + count].copy_from_slice(&block[..count]);
-                }
-                Ok(())
+    let make_decoder = || {
+        let mut block = [0.0f32; IQ_SUPER_QK];
+        move |feature, weight_row: &mut [f32]| {
+            let packed_row = &packed[feature * packed_stride..(feature + 1) * packed_stride];
+            for (index, bytes) in packed_row.chunks_exact(format.block_bytes()).enumerate() {
+                decoder(bytes, &mut block[..format.qk()]);
+                let start = index * format.qk();
+                let count = format.qk().min(in_features - start);
+                weight_row[start..start + count].copy_from_slice(&block[..count]);
             }
-        },
-        // C^T = decoded_rows * input^T writes the column-major tile directly.
+            Ok(())
+        }
+    };
+    let project = // C^T = decoded_rows * input^T writes the column-major tile directly.
         // Independent decoded rows provide SIMD outputs even for one token.
-        |input, decoded, output, rows, k, features| {
+        |input: &[f32], decoded: &[f32], output: &mut [f32], rows, k, features| {
             if FEATURE_TILE == 1 {
                 // Preserve the established reference/AVX2 operand geometry.
                 super::matmul::gemm_bt_serial(input, decoded, output, rows, k, 1)
             } else {
                 super::matmul::gemm_bt_serial(decoded, input, output, features, k, rows)
             }
-        },
-        super::decoded_projection::rayon_decoded_columns,
-    )
+        };
+    if let Some((plan, scratch)) = prepared {
+        let (columns, decoded) = plan.split_scratch(rows, in_features, out_features, scratch)?;
+        let elements = rows.checked_mul(out_features).ok_or_else(|| {
+            error("streamed output element count overflows; reduce projection dimensions")
+        })?;
+        let mut output =
+            super::decoded_projection::zeroed_f32(OP, "final output staging", elements)?;
+        plan.project::<FEATURE_TILE, _>(
+            input,
+            rows,
+            in_features,
+            out_features,
+            bias,
+            &mut output,
+            columns,
+            decoded,
+            make_decoder,
+            project,
+        )?;
+        Ok(output)
+    } else {
+        super::decoded_projection::linear_decoded_grouped::<FEATURE_TILE, _>(
+            "block-quantized projection",
+            input,
+            rows,
+            in_features,
+            out_features,
+            bias,
+            make_decoder,
+            project,
+            super::decoded_projection::rayon_decoded_columns,
+        )
+    }
 }
 
 fn decode_mxfp4_block(block: &[u8], output: &mut [f32]) {
@@ -1523,6 +1682,7 @@ mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
+    use crate::kernels::testutil::PreparedTestKernel;
     use onnx_runtime_ep_api::ExecutionProvider;
     use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
     use onnx_runtime_loader::Model;
@@ -1593,6 +1753,63 @@ mod tests {
     }
 
     #[test]
+    fn prepared_projection_overwrites_poisoned_reused_scratch_and_keeps_outputs_owned() {
+        for format in [BlockFormat::Mxfp4, BlockFormat::Q8_0] {
+            for (rows, k, n) in [
+                (0, 32, 13),
+                (1, 32, 13),
+                (3, 35, 13),
+                (3, 32, 1),
+                (3, 0, 13),
+                (3, 32, 0),
+            ] {
+                let packed = packed_for_format(format, 1, n, k);
+                let input: Vec<_> = (0..rows * k).map(|i| (i % 19) as f32 / 100.).collect();
+                let bias: Vec<_> = (0..n).map(|i| i as f32 / 10.).collect();
+                let expected =
+                    linear_packed_grouped(format, &packed, &input, rows, k, n, Some(&bias))
+                        .unwrap();
+                let plan = projection_plan();
+                let mut scratch = vec![f32::NAN; plan.layout(rows, k, n).unwrap().bytes() / 4];
+                let actual = linear_packed_prepared(
+                    format,
+                    &packed,
+                    &input,
+                    rows,
+                    k,
+                    n,
+                    Some(&bias),
+                    plan,
+                    &mut scratch,
+                )
+                .unwrap();
+                assert_eq!(
+                    actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "{format:?} rows={rows} K={k} N={n}"
+                );
+                scratch.fill(f32::NEG_INFINITY);
+                let next = linear_packed_prepared(
+                    format,
+                    &packed,
+                    &input,
+                    rows,
+                    k,
+                    n,
+                    Some(&bias),
+                    plan,
+                    &mut scratch,
+                )
+                .unwrap();
+                assert_eq!(
+                    actual, next,
+                    "later projection overwrites scratch without modifying previous owned output"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn mxfp4_known_block_matches_ocp_e2m1_and_llama_layout() {
         let mut packed = vec![127u8];
         packed.extend((0u8..16).map(|code| code | (code << 4)));
@@ -1603,6 +1820,7 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         let actual = kernel.dequantize_weight_kn(&view.view()).unwrap();
@@ -1705,7 +1923,7 @@ mod tests {
         let bias = Owned::f32(&[n], &bias);
         let mut y = Owned::zeros_f32(&[m, n]);
         kernel
-            .execute(&[a.view(), b.view(), bias.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), bias.view()], &mut [y.view_mut()])
             .unwrap();
         for (actual, expected) in y.to_f32().iter().zip(expected) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
@@ -1725,7 +1943,7 @@ mod tests {
         let mut y = Owned::zeros_f32(&[1, 1]);
 
         kernel
-            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view()], &mut [y.view_mut()])
             .unwrap();
 
         let after =
@@ -1757,6 +1975,7 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         let weight = kernel.dequantize_weight_kn(&packed_weight.view()).unwrap();
@@ -1769,7 +1988,7 @@ mod tests {
             let bias = Owned::bf16(&[n], &[0.375, -0.625]);
             let mut output = Owned::zeros(DataType::BFloat16, &[rows, n]);
             kernel
-                .execute(
+                .execute_prepared(
                     &[activation.view(), packed_weight.view(), bias.view()],
                     &mut [output.view_mut()],
                 )
@@ -1814,6 +2033,7 @@ mod tests {
             format: BlockFormat::Iq4Nl,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -1836,7 +2056,7 @@ mod tests {
         let b = Owned::u8(&[1, 1, 18], &packed);
         let mut y = Owned::zeros_f32(&[1, 1]);
         kernel
-            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view()], &mut [y.view_mut()])
             .unwrap();
         assert!((y.to_f32()[0] - reference).abs() <= 1e-5);
     }
@@ -1854,6 +2074,7 @@ mod tests {
             format: BlockFormat::Iq4Xs,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -1882,6 +2103,7 @@ mod tests {
             format: BlockFormat::Iq3S,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -1915,6 +2137,7 @@ mod tests {
             format: BlockFormat::Iq3Xxs,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -1948,6 +2171,7 @@ mod tests {
             format: BlockFormat::Iq2S,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -1982,6 +2206,7 @@ mod tests {
             format: BlockFormat::Iq2Xs,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2014,6 +2239,7 @@ mod tests {
             format: BlockFormat::Iq2Xxs,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2056,6 +2282,7 @@ mod tests {
             format: BlockFormat::Iq1S,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2083,6 +2310,7 @@ mod tests {
             format: BlockFormat::Iq1M,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2272,6 +2500,89 @@ mod tests {
     }
 
     #[test]
+    fn streamed_workspace_is_required_and_warm_loans_make_no_issuer_calls() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_ep_api::{DevicePtrMut, ExecutionProvider};
+        use onnx_runtime_memory_governor::{HolderId, HostWorkspacePool, ProcessMemoryManager};
+        let (m, k, n) = (3, 35, 13);
+        let packed = packed_for_format(BlockFormat::Mxfp4, 1, n, k);
+        let activations: Vec<f32> = (0..m * k).map(|i| (i % 19) as f32 / 16.).collect();
+        let a = Owned::f32(&[m, k], &activations);
+        let b = Owned::u8(&[n, k.div_ceil(32), MXFP4_BLOCK_BYTES], &packed);
+        let mut y = Owned::zeros_f32(&[m, n]);
+        let books = RecordingGovernor::new_host(1 << 20);
+        let memory = books.weight_memory(HolderId::new(13));
+        let manager = ProcessMemoryManager::new().unwrap();
+        let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
+        let resources = crate::CpuMemoryResources::new(memory.clone(), Default::default())
+            .unwrap()
+            .with_workspace_pool(pool.clone())
+            .unwrap();
+        let cpu = crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+        let kernel = BlockQuantizedMatMulKernel {
+            k,
+            n,
+            format: BlockFormat::Mxfp4,
+            packed_b_constant: false,
+            weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
+            weight_cache: WeightCache::new(memory, 0),
+        };
+        let requirement = kernel
+            .workspace_requirement(&[
+                TensorMetadata::new(DataType::Float32, &[m, k], true),
+                TensorMetadata::new(
+                    DataType::Uint8,
+                    &[n, k.div_ceil(32), MXFP4_BLOCK_BYTES],
+                    true,
+                ),
+            ])
+            .unwrap();
+        assert!(requirement.bytes > 0);
+        let error = kernel
+            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("streamed workspace binding"),
+            "{error}"
+        );
+        let expected =
+            linear_packed_grouped(BlockFormat::Mxfp4, &packed, &activations, m, k, n, None)
+                .unwrap();
+        let mut warm_counts = None;
+        for iteration in 0..65 {
+            let mut loan = cpu
+                .allocate_workspace(
+                    requirement.bytes as usize,
+                    requirement.alignment,
+                    requirement.role(),
+                )
+                .unwrap();
+            let view = WorkspaceView::new(DevicePtrMut(loan.as_mut_ptr()), loan.len());
+            kernel
+                .execute_with_workspace(&[a.view(), b.view()], &mut [y.view_mut()], Some(view))
+                .unwrap();
+            cpu.deallocate_workspace(loan).unwrap();
+            let counts = (books.claims(), books.releases());
+            if iteration == 0 {
+                warm_counts = Some(counts);
+            }
+            assert_eq!(
+                Some(counts),
+                warm_counts,
+                "warm checkout/compute/return must not call the issuer, including zero-byte calls"
+            );
+            assert_eq!(y.to_f32(), expected);
+        }
+        drop(cpu);
+        pool.trim_idle(u64::MAX).unwrap();
+        assert!(
+            books.releases() > warm_counts.unwrap().1,
+            "actual physical trim must return funding"
+        );
+    }
+
+    #[test]
     fn streamed_rows_reject_invalid_extents_before_computation() {
         let (_, packed) = packed_smoke_matrix(BlockFormat::Mxfp4, 1);
         for (bytes, input, bias) in [
@@ -2392,6 +2703,7 @@ mod tests {
                                 format,
                                 packed_b_constant: constant,
                                 weight_identity: DenseWeightIdentity::default(),
+                                projection_plan: projection_plan(),
                                 weight_cache: WeightCache::with_limit_and_memory(bytes, memory),
                             };
                             let streamed = BlockQuantizedMatMulKernel {
@@ -2400,6 +2712,7 @@ mod tests {
                                 format,
                                 packed_b_constant: constant,
                                 weight_identity: DenseWeightIdentity::default(),
+                                projection_plan: projection_plan(),
                                 weight_cache: WeightCache::with_limit(0),
                             };
                             let mut packed = packed_for_format(format, 1, n, k);
@@ -2428,9 +2741,11 @@ mod tests {
                                 let mut expected = Owned::zeros(dtype, &[2, n]);
                                 let mut output = Owned::zeros(dtype, &[2, n]);
                                 streamed
-                                    .execute(&inputs, &mut [expected.view_mut()])
+                                    .execute_prepared(&inputs, &mut [expected.view_mut()])
                                     .unwrap();
-                                actual.execute(&inputs, &mut [output.view_mut()]).unwrap();
+                                actual
+                                    .execute_prepared(&inputs, &mut [output.view_mut()])
+                                    .unwrap();
                                 assert_eq!(
                                     output.bytes, expected.bytes,
                                     "{name}/{dtype:?}, constant={constant}, strided={strided}, budget={budget}, pass={pass}"
@@ -2484,7 +2799,7 @@ mod tests {
         let mut expected = Owned::zeros_f32(&[1, n]);
         let mut actual = Owned::zeros_f32(&[1, n]);
         first
-            .execute(&[input.view(), weights.view()], &mut [expected.view_mut()])
+            .execute_prepared(&[input.view(), weights.view()], &mut [expected.view_mut()])
             .unwrap();
         assert_eq!(governor.used(Tier::Host), bytes + 16);
         let concrete = first
@@ -2500,7 +2815,7 @@ mod tests {
             .unwrap();
         let active = concrete.weight_cache.test_get(&resolved.key).unwrap();
         second
-            .execute(&[input.view(), weights.view()], &mut [actual.view_mut()])
+            .execute_prepared(&[input.view(), weights.view()], &mut [actual.view_mut()])
             .unwrap();
         assert_eq!(actual.to_f32(), expected.to_f32());
         assert_eq!(
@@ -2527,7 +2842,7 @@ mod tests {
         drop(active);
         assert_eq!(governor.used(Tier::Host), 16);
         second
-            .execute(&[input.view(), weights.view()], &mut [actual.view_mut()])
+            .execute_prepared(&[input.view(), weights.view()], &mut [actual.view_mut()])
             .unwrap();
         assert_eq!(governor.used(Tier::Host), bytes + 16);
         assert_eq!(actual.to_f32(), expected.to_f32());
@@ -2579,6 +2894,7 @@ mod tests {
                 format,
                 packed_b_constant: true,
                 weight_identity: DenseWeightIdentity::default(),
+                projection_plan: projection_plan(),
                 weight_cache: WeightCache::with_limit(budget),
             };
             let dense = make(bytes);
@@ -2588,8 +2904,12 @@ mod tests {
                     let mut expected = Owned::zeros_f32(&[2, 3, n]);
                     let mut actual = Owned::zeros_f32(&[2, 3, n]);
                     let inputs = [a.view(), b.view(), bias.view()];
-                    dense.execute(&inputs, &mut [expected.view_mut()]).unwrap();
-                    streamed.execute(&inputs, &mut [actual.view_mut()]).unwrap();
+                    dense
+                        .execute_prepared(&inputs, &mut [expected.view_mut()])
+                        .unwrap();
+                    streamed
+                        .execute_prepared(&inputs, &mut [actual.view_mut()])
+                        .unwrap();
                     for (index, (got, dense_value)) in actual
                         .to_f32()
                         .into_iter()
@@ -2639,6 +2959,7 @@ mod tests {
                 format: BlockFormat::Mxfp4,
                 packed_b_constant: true,
                 weight_identity: DenseWeightIdentity::default(),
+                projection_plan: projection_plan(),
                 weight_cache: WeightCache::with_limit(0),
             };
             let a = floats(&[2, 32], &[1.; 64]);
@@ -2657,7 +2978,7 @@ mod tests {
                 }
                 let mut y = Owned::zeros(dtype, &[2, 2]);
                 kernel
-                    .execute(&[a.view(), b.view(), bias.view()], &mut [y.view_mut()])
+                    .execute_prepared(&[a.view(), b.view(), bias.view()], &mut [y.view_mut()])
                     .unwrap();
                 assert_eq!(
                     compute_values(&y, dtype),
@@ -2684,7 +3005,7 @@ mod tests {
             );
             let mut y = Owned::zeros(dtype, &[2, 2]);
             kernel
-                .execute(&[a.view(), b, bias.view()], &mut [y.view_mut()])
+                .execute_prepared(&[a.view(), b, bias.view()], &mut [y.view_mut()])
                 .unwrap();
             assert_eq!(compute_values(&y, dtype), vec![33.5, 31.5, 33.5, 31.5]);
             assert_eq!(kernel.weight_identity.stats(), (0, 0, 0));
@@ -2700,6 +3021,7 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: true,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::with_limit(1024),
         };
         let a = Owned::f32(&[0, 32], &[]);
@@ -2709,12 +3031,12 @@ mod tests {
         );
         let mut y = Owned::zeros_f32(&[0, 2]);
         kernel
-            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view()], &mut [y.view_mut()])
             .unwrap();
         assert!(y.to_f32().is_empty());
         let wrong_bias = Owned::f32(&[3], &[0.; 3]);
         let error = kernel
-            .execute(
+            .execute_prepared(
                 &[a.view(), b.view(), wrong_bias.view()],
                 &mut [y.view_mut()],
             )
@@ -2758,11 +3080,12 @@ mod tests {
                     format,
                     packed_b_constant: false,
                     weight_identity: DenseWeightIdentity::default(),
+                    projection_plan: projection_plan(),
                     weight_cache: WeightCache::default(),
                 };
                 let mut expected = Owned::zeros(dtype, &[1, n]);
                 uncached
-                    .execute(
+                    .execute_prepared(
                         &[activation.view(), packed_b.view()],
                         &mut [expected.view_mut()],
                     )
@@ -2774,19 +3097,20 @@ mod tests {
                     format,
                     packed_b_constant: false,
                     weight_identity: DenseWeightIdentity::default(),
+                    projection_plan: projection_plan(),
                     weight_cache: WeightCache::default(),
                 };
                 cached.set_constant_inputs(&[false, true]);
                 let hits_before = BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed);
                 let mut actual = Owned::zeros(dtype, &[1, n]);
                 cached
-                    .execute(
+                    .execute_prepared(
                         &[activation.view(), packed_b.view()],
                         &mut [actual.view_mut()],
                     )
                     .unwrap();
                 cached
-                    .execute(
+                    .execute_prepared(
                         &[activation.view(), packed_b.view()],
                         &mut [actual.view_mut()],
                     )
@@ -2838,18 +3162,19 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: true,
             weight_identity: DenseWeightIdentity::default(),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         kernel.set_constant_inputs(&[false, true]);
 
         let hits_before = BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed);
         kernel
-            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view()], &mut [y.view_mut()])
             .unwrap();
         let identity_after_first = kernel.weight_identity.stats();
         let activity_after_first = kernel.weight_cache.activity();
         kernel
-            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view()], &mut [y.view_mut()])
             .unwrap();
 
         assert_eq!(
@@ -3109,6 +3434,7 @@ mod tests {
                 format,
                 packed_b_constant: false,
                 weight_identity: DenseWeightIdentity::default(),
+                projection_plan: projection_plan(),
                 weight_cache: WeightCache::default(),
             };
 

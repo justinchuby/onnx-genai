@@ -1,48 +1,129 @@
 use super::*;
 
-/// Ops whose owned scratch is reserved by prepare-only planning (§736) so that
-/// capacity refusal surfaces before request admission rather than as a late
-/// device OOM. `BlockQuantizedMoE` (#747) reserves a session-persistent
-/// workspace; `IndexShare` (#751) reserves a session-persistent workspace;
-/// `com.microsoft::Attention` reserves a step-scoped Phase-2a scratch; the
-/// default-domain `Attention` (#736) reserves one route-sized composite covering
-/// its always-materialized f32 score matrix plus dense aliased K/V staging only
-/// when used — step-scoped on the per-call prefill/batched route,
-/// session-persistent on the capture-eligible single-token decode route (both
-/// classes, fixed-capacity append and absent present-output staging charge zero);
-/// `Conv` and the cuDNN `ReduceSum`/`ReduceMean` path reserve one
-/// session-persistent cuDNN workspace when the current metadata makes its exact
-/// byte size knowable; `com.microsoft::GroupQueryAttention` (#736) reserves one
-/// session-persistent composite covering packed Q/K/V projection staging,
-/// route-required BSH↔BNSH transpose scratch, and its f32 reference score
-/// buffer; and the cuBLASLt GEMM family shares one session-persistent
-/// heuristic-sized peak. Dynamic-axes reductions still use the same executor
-/// workspace slot, but their first exact size is learned at execution time via
-/// `workspace_requirement_for_execution` after the axes input is warmed.
-pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
-    (node.domain.is_empty()
-        && matches!(
-            node.op_type.as_str(),
-            "MatMul"
-                | "Gemm"
-                | "QLinearMatMul"
-                | "Einsum"
-                | "Attention"
-                | "Conv"
-                | "ReduceSum"
-                | "ReduceMean"
-        ))
-        || (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
-            && matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare"))
-        || (node.domain == "com.microsoft"
-            && matches!(
-                node.op_type.as_str(),
-                "Attention"
-                    | "GroupQueryAttention"
-                    | "MatMulNBits"
-                    | "FusedMatMulBias"
-                    | "FusedGemm"
-            ))
+/// Consume the selected implementation's shape-independent promise before
+/// attempting concrete shape resolution. Unsupported executor-owned structural
+/// nodes have no leaf-kernel requirement. Accepted graph kernels are planned as
+/// one opaque implementation, never by inspecting their internal op names.
+pub(super) fn workspace_planning_for_node(
+    ep: &dyn ExecutionProvider,
+    graph: &Graph,
+    node: &onnx_runtime_ir::Node,
+    graph_kernel: bool,
+    opsets: &Graph,
+) -> onnx_runtime_ep_api::WorkspacePlanning {
+    use onnx_runtime_ep_api::{KernelMatch, WorkspacePlanning};
+    if graph_kernel {
+        return WorkspacePlanning::Metadata;
+    }
+    if is_control_flow_op(&node.op_type, &node.domain)
+        || is_sequence_op(&node.op_type, &node.domain)
+    {
+        return WorkspacePlanning::None;
+    }
+    let shapes = node
+        .inputs
+        .iter()
+        .map(|input| {
+            input
+                .map(|v| graph.value(v).shape.clone())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let dtypes = node
+        .inputs
+        .iter()
+        .map(|input| {
+            input
+                .map(|v| graph.value(v).dtype)
+                .unwrap_or(DataType::Undefined)
+        })
+        .collect::<Vec<_>>();
+    let layouts = node
+        .inputs
+        .iter()
+        .map(|input| {
+            input
+                .map(|v| graph.value(v).layout.clone())
+                .unwrap_or_else(TensorLayout::contiguous)
+        })
+        .collect::<Vec<_>>();
+    match ep.supports_op(
+        node,
+        graph
+            .effective_opset(node)
+            .unwrap_or_else(|| effective_opset(opsets, node)),
+        &shapes,
+        &dtypes,
+        &layouts,
+    ) {
+        KernelMatch::Supported {
+            workspace_planning, ..
+        } => workspace_planning,
+        // A decline for symbolic/partial metadata is not a no-scratch
+        // promise. Concrete preparation must still compile and query it.
+        KernelMatch::Unsupported { .. } => WorkspacePlanning::Metadata,
+    }
+}
+
+pub(super) fn collect_workspace_node_locations(
+    ep: &dyn ExecutionProvider,
+    graph: &Graph,
+    plan: &[NodePlan],
+) -> Result<Vec<String>> {
+    fn collect(
+        ep: &dyn ExecutionProvider,
+        root: &Graph,
+        graph: &Graph,
+        scope: &str,
+        out: &mut Vec<String>,
+    ) -> Result<()> {
+        let claims = onnx_runtime_ep_api::GraphKernelClaims::query(ep, graph)?;
+        for (id, node) in graph.nodes.iter() {
+            if workspace_planning_for_node(ep, graph, node, claims.contains(id), root)
+                == onnx_runtime_ep_api::WorkspacePlanning::Metadata
+            {
+                out.push(format!(
+                    "{scope}node#{} '{}::{}'",
+                    id.0, node.domain, node.op_type
+                ));
+            }
+        }
+        for ((id, attribute), child) in &graph.subgraphs {
+            if !claims.contains(*id) {
+                collect(
+                    ep,
+                    root,
+                    child,
+                    &format!("{scope}node#{}/{attribute}/", id.0),
+                    out,
+                )?;
+            }
+        }
+        Ok(())
+    }
+    let mut locations = plan
+        .iter()
+        .filter(|node| node.workspace_planning == onnx_runtime_ep_api::WorkspacePlanning::Metadata)
+        .map(|node| {
+            let op = graph.node(node.node_id);
+            format!("node#{} '{}::{}'", node.node_id.0, op.domain, op.op_type)
+        })
+        .collect::<Vec<_>>();
+    for ((owner, attribute), child) in &graph.subgraphs {
+        if !plan
+            .iter()
+            .any(|node| node.node_id == *owner && node.graph_kernel)
+        {
+            collect(
+                ep,
+                graph,
+                child,
+                &format!("node#{}/{attribute}/", owner.0),
+                &mut locations,
+            )?;
+        }
+    }
+    Ok(locations)
 }
 
 /// The justification for an upper bound applied to an otherwise-unresolved
@@ -414,27 +495,8 @@ impl Executor {
         self.ep.release_mapped_growth(bytes, role);
     }
 
-    pub(crate) fn workspace_node_locations(&self) -> Vec<String> {
-        fn collect(graph: &Graph, scope: &str, out: &mut Vec<String>) {
-            for (node_id, node) in graph.nodes.iter() {
-                if is_planned_workspace_node(node) {
-                    out.push(format!(
-                        "{scope}node#{} '{}::{}'",
-                        node_id.0, node.domain, node.op_type
-                    ));
-                }
-            }
-            for ((node_id, attribute), child) in &graph.subgraphs {
-                collect(
-                    child,
-                    &format!("{scope}node#{}/{attribute}/", node_id.0),
-                    out,
-                );
-            }
-        }
-        let mut locations = Vec::new();
-        collect(&self.graph, "", &mut locations);
-        locations
+    pub(crate) fn workspace_node_locations(&self) -> &[String] {
+        &self.workspace_node_locations
     }
 
     /// Derive a *provable* upper bound for an unresolved symbolic axis, or
@@ -593,7 +655,7 @@ impl Executor {
         for pi in 0..self.plan.len() {
             let node_id = self.plan[pi].node_id;
             let node = self.graph.node(node_id);
-            if !is_planned_workspace_node(node) {
+            if self.plan[pi].workspace_planning == onnx_runtime_ep_api::WorkspacePlanning::None {
                 continue;
             }
             let planned_shapes = self.plan[pi]
@@ -714,7 +776,18 @@ impl Executor {
             };
             merge_workspace_peak(peak, requirement);
         }
-        let child_graphs = self.graph.subgraphs.values().collect::<Vec<_>>();
+        let child_graphs = self
+            .graph
+            .subgraphs
+            .iter()
+            .filter(|((owner, _), _)| {
+                !self
+                    .plan
+                    .iter()
+                    .any(|node| node.node_id == *owner && node.graph_kernel)
+            })
+            .map(|(_, child)| child)
+            .collect::<Vec<_>>();
         for child in child_graphs {
             self.collect_nested_workspace_requirement(
                 child,
@@ -802,12 +875,21 @@ impl Executor {
         peak_persistent: &mut WorkspaceRequirement,
         peak_step: &mut WorkspaceRequirement,
     ) -> Result<()> {
+        let claims = onnx_runtime_ep_api::GraphKernelClaims::query(self.ep.as_ref(), graph)?;
+        let captures = graph.captured_inputs_by_node();
         for (node_id, node) in graph.nodes.iter() {
-            if !is_planned_workspace_node(node) {
+            let graph_kernel = claims.contains(node_id);
+            if workspace_planning_for_node(self.ep.as_ref(), graph, node, graph_kernel, &self.graph)
+                == onnx_runtime_ep_api::WorkspacePlanning::None
+            {
                 continue;
             }
-            let input_shapes = node
-                .inputs
+            let inputs = if graph_kernel {
+                node.inputs_with_captures(captures.get(&node_id).into_iter().flatten().copied())
+            } else {
+                node.inputs.clone()
+            };
+            let input_shapes = inputs
                 .iter()
                 .enumerate()
                 .map(|(index, input)| {
@@ -830,26 +912,46 @@ impl Executor {
                 }
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let mut kernel = self.ep.get_kernel_for_executor(
-                self.artifact_config.provider(),
-                self.artifact_config.executor(),
-                self.artifact_config.generation(),
-                node,
-                &input_shapes,
-                effective_opset(&self.graph, node),
-            )?;
-            let constant_inputs = node
-                .inputs
+            let mut kernel = if graph_kernel {
+                self.ep.get_graph_kernel(
+                    onnx_runtime_ep_api::GraphKernelRequest {
+                        scope: onnx_runtime_ep_api::GraphKernelScope::Executor {
+                            provider: self.artifact_config.provider(),
+                            executor: self.artifact_config.executor(),
+                            generation: self.artifact_config.generation(),
+                        },
+                        graph,
+                        node,
+                        inputs: &inputs,
+                    },
+                    &input_shapes,
+                    graph
+                        .effective_opset(node)
+                        .unwrap_or_else(|| effective_opset(&self.graph, node)),
+                )?
+            } else {
+                self.ep.get_kernel_for_executor(
+                    self.artifact_config.provider(),
+                    self.artifact_config.executor(),
+                    self.artifact_config.generation(),
+                    node,
+                    &input_shapes,
+                    graph
+                        .effective_opset(node)
+                        .unwrap_or_else(|| effective_opset(&self.graph, node)),
+                )?
+            };
+            let constant_inputs = inputs
                 .iter()
                 .map(|input| input.is_some_and(|value| is_immutable_initializer(graph, value)))
                 .collect::<Vec<_>>();
             kernel.set_constant_inputs(&constant_inputs);
             let constant_values =
-                resolve_kernel_constant_inputs(graph, &self.weights, &node.inputs, &input_shapes)?;
+                resolve_kernel_constant_inputs(graph, &self.weights, &inputs, &input_shapes)?;
             kernel.prepare_constant_inputs(&constant_values, self.ep.as_ref())?;
             let metadata = input_shapes
                 .iter()
-                .zip(&node.inputs)
+                .zip(&inputs)
                 .map(|(shape, input)| {
                     let dtype = input
                         .map(|value| graph.value(value).dtype)
@@ -868,6 +970,9 @@ impl Executor {
             merge_workspace_peak(peak, requirement);
         }
         for ((node_id, attribute), child) in &graph.subgraphs {
+            if claims.contains(*node_id) {
+                continue;
+            }
             self.collect_nested_workspace_requirement(
                 child,
                 symbols,
@@ -1740,35 +1845,56 @@ mod planned_workspace_node_tests {
     use super::*;
     use onnx_runtime_ir::{Node, NodeId};
 
-    fn node(domain: &str, op_type: &str) -> Node {
-        let mut node = Node::new(NodeId(0), op_type, Vec::new(), Vec::new());
-        node.domain = domain.into();
-        node
-    }
-
     #[test]
-    fn centralized_predicate_covers_the_governed_gemm_family() {
-        for (domain, op_type) in [
-            ("", "MatMul"),
-            ("", "Gemm"),
-            ("", "QLinearMatMul"),
-            ("", "Einsum"),
-            ("", "Attention"),
-            ("", "Conv"),
-            ("", "ReduceSum"),
-            ("", "ReduceMean"),
-            ("com.microsoft", "MatMulNBits"),
-            ("com.microsoft", "FusedMatMulBias"),
-            ("com.microsoft", "FusedGemm"),
-            ("com.microsoft", "Attention"),
-            ("com.microsoft", "GroupQueryAttention"),
+    fn preparation_follows_selected_cpu_implementation_instead_of_op_names() {
+        use onnx_runtime_ep_api::WorkspacePlanning;
+        let mut cpu = CpuExecutionProvider::new();
+        cpu.initialize(&onnx_runtime_ep_api::EpConfig::default())
+            .unwrap();
+        for (domain, op_type, expected) in [
+            ("", "Gemm", WorkspacePlanning::Metadata),
+            ("ai.onnx", "Gemm", WorkspacePlanning::Metadata),
+            (
+                onnx_runtime_ir::RUNTIME_DOMAIN,
+                "BlockQuantizedMatMul",
+                WorkspacePlanning::Metadata,
+            ),
+            ("", "Add", WorkspacePlanning::None),
+            ("", "If", WorkspacePlanning::None),
         ] {
-            assert!(
-                is_planned_workspace_node(&node(domain, op_type)),
-                "{domain}::{op_type} must be prepared before admission"
+            let mut graph = Graph::new();
+            graph.opset_imports.insert(domain.into(), 24);
+            let mut node = Node::new(NodeId(0), op_type, Vec::new(), Vec::new());
+            node.domain = domain.into();
+            if op_type == "Add" {
+                let a = graph.create_named_value(
+                    "a",
+                    DataType::Float32,
+                    onnx_runtime_ir::static_shape([2, 2]),
+                );
+                let b = graph.create_named_value(
+                    "b",
+                    DataType::Float32,
+                    onnx_runtime_ir::static_shape([2, 2]),
+                );
+                node.inputs = vec![Some(a), Some(b)];
+            }
+            // Test registry declarations directly: capability may additionally
+            // reject deliberately absent operand shapes/attributes.
+            let registry = onnx_runtime_ep_cpu::kernels::build_cpu_registry();
+            assert_eq!(
+                registry
+                    .workspace_planning(op_type, domain, 24)
+                    .unwrap_or(WorkspacePlanning::None),
+                expected
             );
+            if expected == WorkspacePlanning::None {
+                assert_eq!(
+                    workspace_planning_for_node(&cpu, &graph, &node, false, &graph),
+                    expected
+                );
+            }
         }
-        assert!(!is_planned_workspace_node(&node("", "Add")));
     }
 
     #[test]

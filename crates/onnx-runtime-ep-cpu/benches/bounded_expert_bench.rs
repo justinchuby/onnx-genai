@@ -144,6 +144,7 @@ fn main() {
         fc2.view(),
     ];
     let mut output = Tensor::zeros(FloatDType::F32, &[rows, hidden]);
+    let mut kernel = common::PreparedKernel::new(kernel, &inputs);
     let inputs_peak = usage().1;
     kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
     let before = BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed);

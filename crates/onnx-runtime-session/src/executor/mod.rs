@@ -767,6 +767,7 @@ pub(crate) struct NodePlan {
     pub node_id: NodeId,
     /// Accepted whole-graph claim; compile and dispatch through the provider.
     pub graph_kernel: bool,
+    pub workspace_planning: onnx_runtime_ep_api::WorkspacePlanning,
     /// Positional input value ids in ONNX signature order. An omitted optional
     /// input (ONNX empty-string input name → `None` slot) is preserved as
     /// `None` so a later present input is never misread as the omitted one

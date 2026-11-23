@@ -7,7 +7,7 @@ use onnx_runtime_ir::{DataType, Node, Shape, TensorLayout};
 
 use crate::abi::LegacyOrtEp;
 use crate::error::Result;
-use crate::kernel::{Kernel, KernelMatch};
+use crate::kernel::{Kernel, KernelMatch, WorkspacePlanning};
 use crate::provider::{EpConfig, EpId, ExecutionProvider};
 
 /// Registry key: an operator identity plus the opset version it was introduced.
@@ -43,7 +43,7 @@ pub trait KernelFactory: Send + Sync {
 /// Maps `(op_type, domain, opset)` → kernel factory (§4.3).
 #[derive(Default)]
 pub struct OpRegistry {
-    entries: HashMap<OpKey, Box<dyn KernelFactory>>,
+    entries: HashMap<OpKey, (WorkspacePlanning, Box<dyn KernelFactory>)>,
     /// Normalized domain → op type → sorted registered `since_version`s.
     by_op: HashMap<String, HashMap<String, Vec<u64>>>,
 }
@@ -54,7 +54,12 @@ impl OpRegistry {
     }
 
     /// Register a factory under `key`.
-    pub fn register(&mut self, mut key: OpKey, factory: Box<dyn KernelFactory>) {
+    pub fn register(
+        &mut self,
+        mut key: OpKey,
+        planning: WorkspacePlanning,
+        factory: Box<dyn KernelFactory>,
+    ) {
         key.domain = norm_domain(&key.domain).to_owned();
         let versions = self
             .by_op
@@ -65,19 +70,39 @@ impl OpRegistry {
         if let Err(index) = versions.binary_search(&key.since_version) {
             versions.insert(index, key.since_version);
         }
-        self.entries.insert(key, factory);
+        self.entries.insert(key, (planning, factory));
     }
 
     /// Look up the best matching factory: the highest `since_version` that is
     /// `<= opset` for the given `(op_type, domain)`.
     pub fn lookup(&self, op_type: &str, domain: &str, opset: u64) -> Option<&dyn KernelFactory> {
+        self.lookup_entry(op_type, domain, opset)
+            .map(|(_, factory)| factory.as_ref())
+    }
+
+    /// Capability of the exact versioned registration selected for compilation.
+    pub fn workspace_planning(
+        &self,
+        op_type: &str,
+        domain: &str,
+        opset: u64,
+    ) -> Option<WorkspacePlanning> {
+        self.lookup_entry(op_type, domain, opset)
+            .map(|(planning, _)| *planning)
+    }
+
+    fn lookup_entry(
+        &self,
+        op_type: &str,
+        domain: &str,
+        opset: u64,
+    ) -> Option<&(WorkspacePlanning, Box<dyn KernelFactory>)> {
         let domain = norm_domain(domain);
         let versions = self.by_op.get(domain)?.get(op_type)?;
         let index = versions.partition_point(|&version| version <= opset);
         let since_version = *versions.get(index.checked_sub(1)?)?;
         self.entries
             .get(&OpKey::new(op_type, domain, since_version))
-            .map(Box::as_ref)
     }
 
     /// Whether a factory is registered for `(op_type, domain)` at or before
@@ -154,6 +179,7 @@ mod tests {
             let since_version = state % 25;
             registry.register(
                 OpKey::new(op_type, domain, since_version),
+                WorkspacePlanning::None,
                 Box::new(DummyFactory(factory_id)),
             );
         }
@@ -180,7 +206,7 @@ mod tests {
                     key.op_type == op_type && key.domain == domain && key.since_version <= opset
                 })
                 .max_by_key(|(key, _)| key.since_version)
-                .map(|(_, factory)| factory.as_ref());
+                .map(|(_, (_, factory))| factory.as_ref());
             match (registry.lookup(op_type, domain, opset), linear_lookup) {
                 (Some(indexed), Some(linear)) => assert!(std::ptr::eq(indexed, linear)),
                 (None, None) => {}
@@ -210,10 +236,12 @@ mod tests {
         let mut registry = OpRegistry::new();
         registry.register(
             OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+            WorkspacePlanning::None,
             Box::new(DummyFactory(1)),
         );
         registry.register(
             OpKey::new("DsaIndexSelect", "pkg.nxrt", 3),
+            WorkspacePlanning::Metadata,
             Box::new(DummyFactory(3)),
         );
 
@@ -234,6 +262,18 @@ mod tests {
         assert!(!std::ptr::eq(resolved_v1, resolved_v3));
         assert!(std::ptr::eq(resolved_v3, resolved_v4));
         assert!(registry.lookup("DsaIndexSelect", "pkg.nxrt", 0).is_none());
+        assert_eq!(
+            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt", 0),
+            None
+        );
+        assert_eq!(
+            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt", 2),
+            Some(WorkspacePlanning::None)
+        );
+        assert_eq!(
+            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt", 3),
+            Some(WorkspacePlanning::Metadata)
+        );
     }
 }
 

@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
 use std::ptr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use memmap2::Mmap;
 use onnx_genai_ort_sys as ort;
@@ -152,11 +155,197 @@ impl HostOrtValue {
     }
 }
 
+/// The foreign Compute ABI discovers scratch requests at callback time. Use
+/// the configured Host provider's existing lane pool, retaining all loans until
+/// Compute returns. The observed high-water mark coalesces warm calls into one
+/// loan; cold growth keeps old pointers live and funds every spill separately.
+struct HostScratch {
+    provider: Arc<dyn crate::ExecutionProvider>,
+    peak: Arc<AtomicUsize>,
+    borrowed: Option<crate::WorkspaceView>,
+    primary: Option<crate::WorkspaceAllocation>,
+    spills: Vec<crate::WorkspaceAllocation>,
+    cursor: usize,
+    total: usize,
+}
+impl HostScratch {
+    const ALIGNMENT: usize = 16;
+    fn new(
+        provider: Arc<dyn crate::ExecutionProvider>,
+        peak: Arc<AtomicUsize>,
+        borrowed: Option<crate::WorkspaceView>,
+    ) -> Self {
+        Self {
+            provider,
+            peak,
+            borrowed,
+            primary: None,
+            spills: Vec::new(),
+            cursor: 0,
+            total: 0,
+        }
+    }
+    fn capacity_refusal(error: &EpError) -> bool {
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(error) = cause {
+            // Transparent error wrappers expose their inner source rather
+            // than the wrapped value itself; unwrap those typed values before
+            // classifying, without parsing strings or retrying hard failures.
+            let memory = error
+                .downcast_ref::<onnx_runtime_memory_api::MemoryError>()
+                .or_else(|| match error.downcast_ref::<EpError>() {
+                    Some(EpError::Memory(memory)) => Some(memory),
+                    _ => None,
+                })
+                .or_else(|| {
+                    match error
+                        .downcast_ref::<onnx_runtime_memory_governor::AllocationTransactionError>()
+                    {
+                        Some(onnx_runtime_memory_governor::AllocationTransactionError::Memory(
+                            memory,
+                        )) => Some(memory),
+                        _ => None,
+                    }
+                });
+            if let Some(memory) = memory {
+                return matches!(
+                    memory,
+                    onnx_runtime_memory_api::MemoryError::TierExhausted { .. }
+                        | onnx_runtime_memory_api::MemoryError::CapacityUnavailable { .. }
+                );
+            }
+            cause = error.source();
+        }
+        false
+    }
+    fn allocate(&mut self, bytes: usize) -> Result<*mut c_void> {
+        if bytes == 0 {
+            return Ok(std::ptr::NonNull::<u128>::dangling().as_ptr().cast());
+        }
+        let layout = std::alloc::Layout::from_size_align(bytes, Self::ALIGNMENT)
+            .map_err(|_| EpError::KernelFailed(format!("plugin Host scratch request of {bytes} bytes exceeds addressable capacity; reduce the request or batch dimensions")))?.pad_to_align();
+        let bytes = layout.size();
+        let total = self.total.checked_add(bytes).filter(|&total| total <= isize::MAX as usize)
+            .ok_or_else(|| EpError::KernelFailed("plugin Host scratch requests exceed addressable aggregate capacity; reduce simultaneous scratch demand".into()))?;
+        if let Some(view) = self.borrowed {
+            let end = self.cursor.checked_add(bytes).ok_or_else(|| {
+                EpError::KernelFailed(
+                    "plugin borrowed scratch offset overflows; reduce scratch demand".into(),
+                )
+            })?;
+            let address = view.ptr().0 as usize;
+            if end > view.bytes()
+                || address == 0
+                || !address.is_multiple_of(Self::ALIGNMENT)
+                || address.checked_add(end).is_none()
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "plugin needs {end} bytes of aligned Host scratch but the enclosing workspace has {} bytes at {address:#x}; prepare sufficient {}-byte-aligned backing before Compute",
+                    view.bytes(),
+                    Self::ALIGNMENT
+                )));
+            }
+            self.cursor = end;
+            self.total = total;
+            return Ok(view.ptr().0.cast::<u8>().wrapping_add(end - bytes).cast());
+        }
+        if self.primary.is_none() {
+            // The hint is optional, never an admission requirement. Borrow only
+            // on the first nonempty callback, so a scratch-free branch stays
+            // free even after a larger previous Compute.
+            let hint = self.peak.load(Ordering::Relaxed);
+            let capacity = hint.max(bytes);
+            let role = onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: true };
+            self.primary = Some(
+                match self
+                    .provider
+                    .allocate_workspace(capacity, Self::ALIGNMENT, role)
+                {
+                    Ok(loan) => loan,
+                    Err(error) if capacity > bytes && Self::capacity_refusal(&error) => {
+                        // Explicit capacity refusal can discard an old large hint;
+                        // ownership/context/reclaim failures must propagate intact.
+                        let _ = self.peak.compare_exchange(
+                            hint,
+                            bytes,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+                        self.provider
+                            .allocate_workspace(bytes, Self::ALIGNMENT, role)?
+                    }
+                    Err(error) => return Err(error),
+                },
+            );
+        }
+        let primary = self
+            .primary
+            .as_mut()
+            .expect("primary scratch loan initialized");
+        let end = self.cursor.checked_add(bytes).ok_or_else(|| {
+            EpError::KernelFailed("plugin scratch offset overflows; reduce scratch demand".into())
+        })?;
+        let ptr = if end <= primary.len() {
+            let ptr = primary
+                .as_mut_ptr()
+                .cast::<u8>()
+                .wrapping_add(self.cursor)
+                .cast();
+            self.cursor = end;
+            ptr
+        } else {
+            // Never resize a live loan: earlier callbacks may still use its
+            // address. The next Compute borrows one larger lane instead.
+            self.spills.try_reserve(1).map_err(|error| EpError::KernelFailed(format!("plugin scratch spill bookkeeping allocation failed: {error}; reduce concurrent scratch requests")))?;
+            let mut spill = self.provider.allocate_workspace(
+                bytes,
+                Self::ALIGNMENT,
+                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: true },
+            )?;
+            let ptr = spill.as_mut_ptr();
+            self.spills.push(spill);
+            ptr
+        };
+        self.total = total;
+        Ok(ptr)
+    }
+}
+impl HostScratch {
+    fn finish(&mut self, successful_compute: bool) -> Result<()> {
+        if successful_compute {
+            self.peak.fetch_max(self.total, Ordering::Relaxed);
+        }
+        let mut failure = None;
+        for loan in self.primary.take().into_iter().chain(self.spills.drain(..)) {
+            if let Err(error) = self.provider.deallocate_workspace(loan) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Some(error) = failure {
+            return Err(EpError::Backend {
+                operation: "returning plugin Host scratch to its configured workspace provider",
+                source: Box::new(error),
+            });
+        }
+        Ok(())
+    }
+}
+impl Drop for HostScratch {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish(false) {
+            eprintln!(
+                "plugin Host scratch cleanup failed: {error}; inspect the workspace ownership contract before reusing this provider"
+            );
+        }
+    }
+}
+
 #[repr(C)]
 pub(super) struct HostKernelContext {
     inputs: Vec<Option<HostOrtValue>>,
     outputs: Vec<HostOrtValue>,
     requested_outputs: Option<Vec<bool>>,
+    scratch: Option<Mutex<HostScratch>>,
 }
 
 impl HostKernelContext {
@@ -215,6 +404,7 @@ impl HostKernelContext {
             inputs,
             outputs,
             requested_outputs: None,
+            scratch: None,
         })
     }
 
@@ -258,6 +448,30 @@ impl HostKernelContext {
             let HostOrtValueStorage::Owned(bytes) = value.storage else { return Err(EpError::KernelFailed(format!("plugin dynamic output {index} does not own its payload"))); };
             Ok(Some(crate::KernelSizedOutput { shape, dtype, bytes }))
         }).collect()
+    }
+
+    pub(super) fn prepare_scratch(
+        &mut self,
+        provider: Arc<dyn crate::ExecutionProvider>,
+        peak: Arc<AtomicUsize>,
+        borrowed: Option<crate::WorkspaceView>,
+    ) {
+        self.scratch = Some(Mutex::new(HostScratch::new(provider, peak, borrowed)));
+    }
+
+    pub(super) fn finish_scratch(&mut self, successful_compute: bool) -> Result<()> {
+        let Some(scratch) = self.scratch.take() else {
+            return Ok(());
+        };
+        let poisoned = scratch.is_poisoned();
+        let mut scratch = scratch
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        scratch.finish(successful_compute && !poisoned)?;
+        if poisoned {
+            return Err(EpError::KernelFailed("plugin Host scratch lock was poisoned; loans were retired, but this execution plan must be recreated".into()));
+        }
+        Ok(())
     }
 
     pub(super) fn byte_size(&self) -> usize {
@@ -780,6 +994,7 @@ pub(super) fn ort_api() -> *const ort::OrtApi {
         ReleaseTensorTypeAndShapeInfo: Some(host_release_tensor_type_and_shape_info),
         GetTensorData: Some(host_get_tensor_data),
         GetTensorMemoryInfo: Some(host_get_tensor_memory_info),
+        CompareMemoryInfo: Some(host_compare_memory_info),
         MemoryInfoGetDeviceType: Some(host_memory_info_device_type),
         MemoryInfoGetName: Some(host_memory_info_name),
         MemoryInfoGetId: Some(host_memory_info_id),
@@ -825,6 +1040,7 @@ pub(super) fn ort_api() -> *const ort::OrtApi {
         Node_GetNumSubgraphs: Some(host_node_get_num_subgraphs),
         Node_GetSubgraphs: Some(host_node_get_subgraphs),
         KernelContext_GetInput: Some(host_kernel_context_get_input),
+        KernelContext_GetScratchBuffer: Some(host_kernel_context_get_scratch_buffer),
         KernelContext_GetOutput: Some(host_kernel_context_get_output),
         KernelContext_GetInputCount: Some(host_kernel_context_input_count),
         KernelContext_GetOutputCount: Some(host_kernel_context_output_count),
@@ -1143,6 +1359,68 @@ unsafe extern "C" fn host_get_tensor_memory_info(
     }
     ptr::null_mut()
 }
+unsafe extern "C" fn host_compare_memory_info(
+    left: *const ort::OrtMemoryInfo,
+    right: *const ort::OrtMemoryInfo,
+    out: *mut i32,
+) -> ort::OrtStatusPtr {
+    let cpu = (&HOST_CPU_MEMORY_INFO as *const u8).cast();
+    if left != cpu || right != cpu || out.is_null() {
+        return status_error(
+            "CompareMemoryInfo: this native Host bridge only accepts memory-info handles returned by its GetTensorMemoryInfo callback; use Host tensor boundaries and a valid comparison output",
+        );
+    }
+    unsafe {
+        *out = 0;
+    }
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn host_kernel_context_get_scratch_buffer(
+    context: *const ort::OrtKernelContext,
+    info: *const ort::OrtMemoryInfo,
+    bytes: usize,
+    out: *mut *mut c_void,
+) -> ort::OrtStatusPtr {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !out.is_null() {
+            unsafe {
+                *out = ptr::null_mut();
+            }
+        }
+        if context.is_null() || out.is_null() || info != (&HOST_CPU_MEMORY_INFO as *const u8).cast()
+        {
+            return status_error(
+                "KernelContext_GetScratchBuffer: invalid context/output or foreign memory device; supply this Host bridge's CPU memory-info handle and live callback pointers",
+            );
+        }
+        let context = unsafe { &*context.cast::<HostKernelContext>() };
+        let Some(scratch) = &context.scratch else {
+            return status_error(
+                "KernelContext_GetScratchBuffer: no configured Host workspace source; compile the plugin with this session's Host execution provider",
+            );
+        };
+        let mut scratch = match scratch.lock() {
+            Ok(scratch) => scratch,
+            Err(_) => {
+                return status_error(
+                    "KernelContext_GetScratchBuffer: scratch ownership lock was poisoned; recreate this plugin execution plan",
+                );
+            }
+        };
+        match scratch.allocate(bytes) {
+            Ok(ptr) => {
+                unsafe {
+                    *out = ptr;
+                }
+                ptr::null_mut()
+            }
+            Err(error) => status_error(&format!("KernelContext_GetScratchBuffer: {error}")),
+        }
+    }));
+    result.unwrap_or_else(|_| status_error("KernelContext_GetScratchBuffer: Host scratch callback panicked; recreate the plugin execution plan and inspect its workspace provider"))
+}
+
 unsafe extern "C" fn host_memory_info_name(
     info: *const ort::OrtMemoryInfo,
     out: *mut *const c_char,
@@ -2507,5 +2785,358 @@ mod tests {
         assert_eq!(claims[0].node_ids, vec![n0, n1]);
         assert_eq!(claims[0].input_values, vec![x]);
         assert_eq!(claims[0].output_values, vec![z]);
+    }
+    struct ScratchProvider {
+        pool: onnx_runtime_memory_governor::HostWorkspacePool,
+        loans: AtomicUsize,
+        returns: AtomicUsize,
+        reject_return: std::sync::atomic::AtomicBool,
+        quarantined: Mutex<Vec<crate::WorkspaceAllocation>>,
+    }
+    impl crate::ExecutionProvider for ScratchProvider {
+        fn name(&self) -> &str {
+            "host_scratch_test"
+        }
+        fn device_type(&self) -> onnx_runtime_ir::DeviceType {
+            onnx_runtime_ir::DeviceType::Cpu
+        }
+        fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+            onnx_runtime_ir::DeviceId::cpu()
+        }
+        fn initialize(&mut self, _: &crate::EpConfig) -> Result<()> {
+            Ok(())
+        }
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn supports_op(
+            &self,
+            _: &Node,
+            _: u64,
+            _: &[onnx_runtime_ir::Shape],
+            _: &[DataType],
+            _: &[onnx_runtime_ir::TensorLayout],
+        ) -> crate::KernelMatch {
+            crate::KernelMatch::unsupported("scratch-only test provider has no kernels")
+        }
+        fn get_kernel(&self, _: &Node, _: &[Vec<usize>], _: u64) -> Result<Box<dyn crate::Kernel>> {
+            unreachable!("scratch-only provider")
+        }
+        fn allocate(&self, _: usize, _: usize) -> Result<crate::DeviceBuffer> {
+            unreachable!("use configured workspace lane")
+        }
+        fn deallocate(&self, _: crate::DeviceBuffer) -> Result<()> {
+            unreachable!("return configured workspace lane")
+        }
+        fn copy(
+            &self,
+            _: &crate::DeviceBuffer,
+            _: &mut crate::DeviceBuffer,
+            _: usize,
+        ) -> Result<()> {
+            unreachable!("scratch-only provider")
+        }
+        fn copy_async(
+            &self,
+            _: &crate::DeviceBuffer,
+            _: &mut crate::DeviceBuffer,
+            _: usize,
+        ) -> Result<crate::Fence> {
+            unreachable!("scratch-only provider")
+        }
+        fn sync(&self) -> Result<()> {
+            Ok(())
+        }
+        fn allocate_workspace(
+            &self,
+            bytes: usize,
+            alignment: usize,
+            role: onnx_runtime_memory_api::MemoryRole,
+        ) -> Result<crate::WorkspaceAllocation> {
+            self.loans.fetch_add(1, Ordering::Relaxed);
+            let owner = self
+                .pool
+                .checkout(bytes, alignment, role)
+                .map_err(|source| EpError::Backend {
+                    operation: "test Host workspace admission",
+                    source: Box::new(source),
+                })?;
+            Ok(crate::WorkspaceAllocation::new(
+                crate::DeviceBuffer::from_managed_allocation(
+                    owner,
+                    onnx_runtime_ir::DeviceId::cpu(),
+                ),
+                None,
+            ))
+        }
+        fn deallocate_workspace(&self, allocation: crate::WorkspaceAllocation) -> Result<()> {
+            self.returns.fetch_add(1, Ordering::Relaxed);
+            if self.reject_return.load(Ordering::Relaxed) {
+                self.quarantined.lock().unwrap().push(allocation);
+                return Err(EpError::KernelFailed(
+                    "test Host workspace return refused; owner quarantined with funding intact"
+                        .into(),
+                ));
+            }
+            let (buffer, lease) = allocation.into_parts();
+            assert!(lease.is_none());
+            let crate::BoundBufferOwnership::Managed(owner) =
+                buffer.into_bound_ownership().unwrap()
+            else {
+                panic!("managed test owner")
+            };
+            self.pool.recycle_completed(owner).map_err(|error| {
+                EpError::KernelFailed(format!("test Host workspace return: {error}"))
+            })
+        }
+    }
+    fn scratch_provider(
+        budget: u64,
+    ) -> (
+        Arc<ScratchProvider>,
+        Arc<onnx_runtime_memory_governor::LedgerGovernor>,
+    ) {
+        use onnx_runtime_memory_governor::{
+            HostWorkspacePool, LeaseLedger, LedgerGovernor, ProcessMemoryManager,
+        };
+        let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+            onnx_runtime_memory_api::DeviceKey::HOST,
+            0,
+            budget,
+            0,
+        )));
+        let manager = ProcessMemoryManager::new().unwrap();
+        let provider = Arc::new(ScratchProvider {
+            pool: HostWorkspacePool::governed(&manager, books.clone()).unwrap(),
+            loans: AtomicUsize::new(0),
+            returns: AtomicUsize::new(0),
+            reject_return: std::sync::atomic::AtomicBool::new(false),
+            quarantined: Mutex::new(Vec::new()),
+        });
+        (provider, books)
+    }
+
+    #[test]
+    fn host_scratch_cold_spills_keep_addresses_live_and_warm_uses_one_loan() {
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let (provider, books) = scratch_provider(256);
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut cold = HostScratch::new(provider.clone(), peak.clone(), None);
+        let first = cold.allocate(8).unwrap().cast::<u64>();
+        unsafe {
+            first.write(0x0123456789abcdef);
+        }
+        let second = cold.allocate(24).unwrap();
+        unsafe {
+            second.cast::<u8>().write_bytes(0xcd, 24);
+        }
+        assert_ne!(first as usize, second as usize);
+        assert_eq!(
+            unsafe { first.read() },
+            0x0123456789abcdef,
+            "growth must not replace or free a previously returned pointer"
+        );
+        assert_eq!(provider.loans.load(Ordering::Relaxed), 2);
+        cold.finish(true).unwrap();
+        assert_eq!(
+            peak.load(Ordering::Relaxed),
+            48,
+            "high water includes each callback's alignment padding"
+        );
+        assert_eq!(books.used(onnx_runtime_memory_api::Tier::Host), 48);
+        let mut warm = HostScratch::new(provider.clone(), peak.clone(), None);
+        let before = provider.loans.load(Ordering::Relaxed);
+        let first = warm.allocate(8).unwrap();
+        let second = warm.allocate(24).unwrap();
+        assert_eq!(second as usize - first as usize, 16);
+        assert_eq!(
+            provider.loans.load(Ordering::Relaxed),
+            before + 1,
+            "warm callbacks must carve one coarse lane"
+        );
+        assert_eq!(
+            before, 2,
+            "exactly one primary loan for the complete warm Compute"
+        );
+        warm.finish(true).unwrap();
+        provider.pool.trim_idle(u64::MAX).unwrap();
+        assert_eq!(books.used(onnx_runtime_memory_api::Tier::Host), 0);
+    }
+
+    #[test]
+    fn host_scratch_zero_requests_and_external_backing_do_not_borrow_from_provider() {
+        let (provider, _) = scratch_provider(256);
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut empty = HostScratch::new(provider.clone(), peak.clone(), None);
+        assert!(!empty.allocate(0).unwrap().is_null());
+        empty.finish(true).unwrap();
+        assert_eq!(peak.load(Ordering::Relaxed), 0);
+        assert_eq!(provider.loans.load(Ordering::Relaxed), 0);
+        assert_eq!(provider.returns.load(Ordering::Relaxed), 0);
+        let mut backing = [0u128; 4];
+        let view = crate::WorkspaceView::new(crate::DevicePtrMut(backing.as_mut_ptr().cast()), 64);
+        let mut borrowed = HostScratch::new(provider.clone(), peak.clone(), Some(view));
+        let a = borrowed.allocate(17).unwrap();
+        let b = borrowed.allocate(17).unwrap();
+        assert_eq!(b as usize - a as usize, 32);
+        assert!(
+            borrowed
+                .allocate(1)
+                .unwrap_err()
+                .to_string()
+                .contains("prepare sufficient")
+        );
+        borrowed.finish(false).unwrap();
+        assert_eq!(provider.loans.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            peak.load(Ordering::Relaxed),
+            0,
+            "failed Compute must not publish a capacity hint"
+        );
+    }
+
+    #[test]
+    fn host_scratch_refusal_and_return_failure_preserve_funding_and_report_errors() {
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let (provider, books) = scratch_provider(64);
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut scratch = HostScratch::new(provider.clone(), peak.clone(), None);
+        scratch.allocate(8).unwrap();
+        assert!(scratch.allocate(1024).is_err());
+        assert_eq!(books.used(onnx_runtime_memory_api::Tier::Host), 16);
+        scratch.finish(false).unwrap();
+        assert_eq!(peak.load(Ordering::Relaxed), 0);
+        let mut scratch = HostScratch::new(provider.clone(), peak.clone(), None);
+        scratch.allocate(8).unwrap();
+        provider.reject_return.store(true, Ordering::Relaxed);
+        assert!(
+            scratch
+                .finish(true)
+                .unwrap_err()
+                .to_string()
+                .contains("returning plugin Host scratch")
+        );
+        assert_eq!(provider.quarantined.lock().unwrap().len(), 1);
+        assert_eq!(
+            books.used(onnx_runtime_memory_api::Tier::Host),
+            16,
+            "failed return must not refund live backing"
+        );
+        provider.reject_return.store(false, Ordering::Relaxed);
+        let loan = provider.quarantined.lock().unwrap().pop().unwrap();
+        crate::ExecutionProvider::deallocate_workspace(provider.as_ref(), loan).unwrap();
+        provider.pool.trim_idle(u64::MAX).unwrap();
+        assert_eq!(books.used(onnx_runtime_memory_api::Tier::Host), 0);
+    }
+
+    #[test]
+    fn concurrent_host_scratch_computes_have_disjoint_primary_loans() {
+        let (provider, _) = scratch_provider(256);
+        let peak = Arc::new(AtomicUsize::new(32));
+        let barrier = std::sync::Barrier::new(2);
+        let addresses = std::thread::scope(|scope| {
+            let tasks = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut scratch = HostScratch::new(provider.clone(), peak.clone(), None);
+                        let address = scratch.allocate(16).unwrap() as usize;
+                        barrier.wait();
+                        scratch.finish(true).unwrap();
+                        address
+                    })
+                })
+                .collect::<Vec<_>>();
+            tasks
+                .into_iter()
+                .map(|task| task.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_ne!(addresses[0], addresses[1]);
+    }
+
+    #[test]
+    fn host_scratch_callbacks_validate_memory_info_and_keep_zero_requests_free() {
+        let (provider, _) = scratch_provider(256);
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut context = HostKernelContext::new(&[], &mut []).unwrap();
+        context.prepare_scratch(provider.clone(), peak, None);
+        let cpu = (&HOST_CPU_MEMORY_INFO as *const u8).cast();
+        let foreign = (&9u8 as *const u8).cast();
+        let api = unsafe { &*ort_api() };
+        let mut equal = -1;
+        assert!(unsafe { api.CompareMemoryInfo.unwrap()(cpu, cpu, &mut equal) }.is_null());
+        assert_eq!(equal, 0);
+        let status = unsafe { api.CompareMemoryInfo.unwrap()(cpu, foreign, &mut equal) };
+        assert!(!status.is_null());
+        release_status(status);
+        let mut pointer = ptr::null_mut();
+        let ctx = (&context as *const HostKernelContext).cast();
+        let status =
+            unsafe { api.KernelContext_GetScratchBuffer.unwrap()(ctx, foreign, 16, &mut pointer) };
+        assert!(!status.is_null() && pointer.is_null());
+        release_status(status);
+        assert!(
+            unsafe { api.KernelContext_GetScratchBuffer.unwrap()(ctx, cpu, 0, &mut pointer) }
+                .is_null()
+        );
+        assert!(!pointer.is_null());
+        assert_eq!(provider.loans.load(Ordering::Relaxed), 0);
+        context.finish_scratch(true).unwrap();
+    }
+    #[test]
+    fn host_scratch_capacity_hint_is_optional_and_zero_branches_ignore_it() {
+        use onnx_runtime_memory_governor::MemoryGovernor;
+        let (provider, books) = scratch_provider(64);
+        let peak = Arc::new(AtomicUsize::new(1024));
+        let mut zero = HostScratch::new(provider.clone(), peak.clone(), None);
+        zero.allocate(0).unwrap();
+        zero.finish(true).unwrap();
+        assert_eq!(provider.loans.load(Ordering::Relaxed), 0);
+        let mut small = HostScratch::new(provider.clone(), peak.clone(), None);
+        small.allocate(8).unwrap();
+        small.finish(true).unwrap();
+        assert_eq!(
+            provider.loans.load(Ordering::Relaxed),
+            2,
+            "one refused old hint, then actual 16-byte demand"
+        );
+        assert_eq!(peak.load(Ordering::Relaxed), 16);
+        assert_eq!(books.used(onnx_runtime_memory_api::Tier::Host), 16);
+        let mut warm = HostScratch::new(provider.clone(), peak, None);
+        warm.allocate(8).unwrap();
+        warm.finish(true).unwrap();
+        assert_eq!(
+            provider.loans.load(Ordering::Relaxed),
+            3,
+            "old large hint must not be retried on every small Compute"
+        );
+    }
+    #[test]
+    fn host_scratch_capacity_classification_never_hides_a_reclaim_or_context_failure() {
+        use onnx_runtime_memory_api::{MemoryError, MemoryRole};
+        let refusal = || MemoryError::TierExhausted {
+            tier: "host",
+            requested: 1024,
+            used: 0,
+            limit: 64,
+            available: 64,
+            role: MemoryRole::Workspace { step_scoped: true },
+        };
+        assert!(HostScratch::capacity_refusal(&EpError::Memory(refusal())));
+        let reclaim = EpError::Memory(MemoryError::ReclaimFailed {
+            tier: "host",
+            requested: 1024,
+            source: Box::new(refusal()),
+        });
+        assert!(
+            !HostScratch::capacity_refusal(&reclaim),
+            "a failed reclaimer is not an ordinary capacity decline, even if its own cause mentions capacity"
+        );
+        let allocator = EpError::Memory(MemoryError::AllocationFailed {
+            tier: "host",
+            requested: 1024,
+            reason: "provider context became unavailable".into(),
+        });
+        assert!(!HostScratch::capacity_refusal(&allocator));
     }
 }

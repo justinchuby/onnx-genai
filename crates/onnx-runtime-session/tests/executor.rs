@@ -537,8 +537,21 @@ impl ExecutionProvider for HostDownloadCountingEp {
         input_dtypes: &[DataType],
         layouts: &[TensorLayout],
     ) -> KernelMatch {
-        self.cpu
-            .supports_op(op, opset, shapes, input_dtypes, layouts)
+        let mut support = self
+            .cpu
+            .supports_op(op, opset, shapes, input_dtypes, layouts);
+        // These lifecycle fixtures deliberately exercise specialization during
+        // metadata preparation, even when the wrapped CPU kernel needs zero
+        // scratch. Do not inherit CPU's stronger skip-planning promise: doing
+        // so would stop constructing the cache misses this fixture tests.
+        if self.assert_finalized_before_execute
+            && let KernelMatch::Supported {
+                workspace_planning, ..
+            } = &mut support
+        {
+            *workspace_planning = onnx_runtime_ep_api::WorkspacePlanning::Metadata;
+        }
+        support
     }
 
     fn get_kernel(

@@ -27,13 +27,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node, Shape};
 
 use super::block_quantized_matmul::{
     BlockFormat, DenseWeightCacheKey, DenseWeightIdentity, DenseWeightLayout,
-    decode_dense_weight_into,
+    decode_dense_weight_into, linear_packed_prepared, projection_plan,
 };
+use super::decoded_projection::ProjectionScratch;
 use super::moe::{
     ExpertProjection, MoeAttributes, routing_weights, run_expert_grouped, run_expert_projections,
 };
@@ -177,6 +181,7 @@ pub struct BlockQuantizedMoEKernel {
     constant_inputs: [bool; 9],
     weight_identities: [DenseWeightIdentity; 3],
     weight_cache: WeightCache<DenseWeightCacheKey>,
+    projection_plan: super::decoded_projection::DecodedProjectionPlan,
 }
 
 #[derive(Debug)]
@@ -196,6 +201,7 @@ impl KernelFactory for BlockQuantizedMoEFactory {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::new(self.memory.clone(), self.cache_bytes),
         }))
     }
@@ -218,30 +224,53 @@ impl Kernel for BlockQuantizedMoEKernel {
         }
     }
 
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        let dims = validate_runtime_shapes(inputs, None, &self.attributes, self.formats)?;
+        self.projection_workspace(dims)
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.execute_prepared_experts(inputs, outputs, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.execute_prepared_experts(inputs, outputs, workspace)
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
+    }
+}
+
+impl BlockQuantizedMoEKernel {
+    fn projection_workspace(&self, dims: Dimensions) -> Result<WorkspaceRequirement> {
+        // Experts and their projections execute serially. An expert receives a
+        // row at most once, so total rows bound every group, independent of k.
+        // Cover streamed fallback even when a dense resident set is available.
+        let mut requirement = WorkspaceRequirement::NONE;
+        for (k, n) in [(dims.hidden, dims.fc1_size), (dims.inter, dims.hidden)]
+            .into_iter()
+            .chain(self.formats.fc3.map(|_| (dims.hidden, dims.inter)))
+        {
+            let layout = self.projection_plan.layout(dims.rows, k, n)?;
+            requirement.bytes = requirement.bytes.max(layout.bytes() as u64);
+            requirement.alignment = requirement.alignment.max(layout.alignment());
+        }
+        Ok(requirement)
+    }
+
+    fn execute_prepared_experts(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         check_arity(OP, inputs, outputs, 5, 9, 1)?;
-        for &index in &[0, 1, 2, 4] {
-            if inputs[index].is_absent() {
-                return Err(error(format!(
-                    "required input {index} ('{}') is absent",
-                    INPUT_NAMES[index]
-                )));
-            }
-        }
-        for &index in &[0, 1] {
-            require_dtype(index, &inputs[index], DataType::Float32)?;
-        }
-        for &index in &[2, 4] {
-            require_dtype(index, &inputs[index], DataType::Uint8)?;
-        }
-        for &index in &[3, 5, 7, 8] {
-            if let Some(input) = optional_input(inputs, index) {
-                require_dtype(index, input, DataType::Float32)?;
-            }
-        }
-        if let Some(input) = optional_input(inputs, 6) {
-            require_dtype(6, input, DataType::Uint8)?;
-        }
         if outputs[0].dtype != DataType::Float32 {
             return Err(error(format!(
                 "output dtype {:?} unsupported; expected Float32",
@@ -249,8 +278,29 @@ impl Kernel for BlockQuantizedMoEKernel {
             )));
         }
 
-        let dimensions =
-            validate_runtime_shapes(inputs, &outputs[0], &self.attributes, self.formats)?;
+        let metadata: [_; 9] = std::array::from_fn(|index| {
+            inputs.get(index).map_or(
+                TensorMetadata::new(DataType::Float32, &[], false),
+                |input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()),
+            )
+        });
+        let dimensions = validate_runtime_shapes(
+            &metadata,
+            Some(outputs[0].shape),
+            &self.attributes,
+            self.formats,
+        )?;
+        let requirement = self.projection_workspace(dimensions)?;
+        // SAFETY: the executor exclusively lends valid Host storage for this
+        // dispatch. Sequential applies return owned outputs, so no scratch view
+        // escapes. Initialization is deferred until the first streamed apply.
+        let mut scratch = unsafe {
+            ProjectionScratch::bind(
+                "BlockQuantizedMoE streamed workspace binding",
+                requirement.bytes as usize,
+                workspace,
+            )
+        }?;
         let Dimensions {
             rows,
             hidden,
@@ -424,6 +474,19 @@ impl Kernel for BlockQuantizedMoEKernel {
                         .as_deref()
                         .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
                     &self.attributes,
+                    |projection, input, rows, bias| {
+                        linear_packed_prepared(
+                            projection.format,
+                            &projection.bytes,
+                            input,
+                            rows,
+                            projection.in_features,
+                            projection.out_features,
+                            bias,
+                            self.projection_plan,
+                            scratch.initialized(),
+                        )
+                    },
                 )?
             };
             for (grouped_row, (row, route_weight)) in expert_tasks.into_iter().enumerate() {
@@ -449,12 +512,6 @@ impl Kernel for BlockQuantizedMoEKernel {
         write_dense_f32(&mut outputs[0], &output)
     }
 
-    fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        true
-    }
-}
-
-impl BlockQuantizedMoEKernel {
     fn dequantize_expert_group(
         &self,
         inputs: &[TensorView],
@@ -556,21 +613,47 @@ struct Dimensions {
 }
 
 fn validate_runtime_shapes(
-    inputs: &[TensorView],
-    output: &TensorMut,
+    inputs: &[TensorMetadata<'_>],
+    output_shape: Option<&[usize]>,
     attributes: &MoeAttributes,
     formats: ProjectionFormats,
 ) -> Result<Dimensions> {
+    if !(5..=9).contains(&inputs.len()) {
+        return Err(error(format!(
+            "workspace metadata needs 5..=9 positional inputs, got {}; preserve absent optional slots",
+            inputs.len()
+        )));
+    }
+    for &index in &[0, 1, 2, 4] {
+        if !inputs[index].present {
+            return Err(error(format!(
+                "required input {index} ('{}') is absent",
+                INPUT_NAMES[index]
+            )));
+        }
+    }
+    for (index, input) in inputs.iter().enumerate().filter(|(_, input)| input.present) {
+        require_dtype(
+            index,
+            input,
+            if matches!(index, 2 | 4 | 6) {
+                DataType::Uint8
+            } else {
+                DataType::Float32
+            },
+        )?;
+    }
     let input_shape = inputs[0].shape;
     if !matches!(input_shape.len(), 2 | 3) {
         return Err(error(format!(
             "input must be [rows,H] or [B,S,H], got {input_shape:?}"
         )));
     }
-    if output.shape != input_shape {
+    if let Some(output_shape) = output_shape
+        && output_shape != input_shape
+    {
         return Err(error(format!(
-            "output shape {:?} must equal input shape {input_shape:?}",
-            output.shape
+            "output shape {output_shape:?} must equal input shape {input_shape:?}"
         )));
     }
     let hidden = *input_shape.last().expect("validated non-empty input rank");
@@ -635,14 +718,14 @@ fn validate_runtime_shapes(
     validate_bias(inputs, 3, experts, fc1_size)?;
     validate_bias(inputs, 5, experts, hidden)?;
 
-    let has_fc3 = optional_input(inputs, 6).is_some();
+    let has_fc3 = optional_metadata(inputs, 6).is_some();
     if has_fc3 != formats.fc3.is_some() {
         return Err(error(
             "fc3_format must be present exactly when fc3_experts_weights is wired",
         ));
     }
     if attributes.uses_separate_gate(has_fc3) {
-        let fc3 = optional_input(inputs, 6)
+        let fc3 = optional_metadata(inputs, 6)
             .ok_or_else(|| error("unfused swiglu requires input 6 fc3_experts_weights"))?;
         let fc3_format = formats
             .fc3
@@ -659,11 +742,11 @@ fn validate_runtime_shapes(
                 "fc3_experts_weights is only valid for unfused swiglu or silu gated-GLU",
             ));
         }
-        if optional_input(inputs, 7).is_some() {
+        if optional_metadata(inputs, 7).is_some() {
             return Err(error("fc3_experts_bias requires fc3_experts_weights"));
         }
     }
-    if let Some(weights) = optional_input(inputs, 8)
+    if let Some(weights) = optional_metadata(inputs, 8)
         && weights.shape != [rows, experts]
     {
         return Err(error(format!(
@@ -714,18 +797,8 @@ impl ExpertProjection for PackedExpertProjection<'_> {
     fn in_features(&self) -> usize {
         self.in_features
     }
-    fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
-        super::block_quantized_matmul::linear_packed_grouped(
-            self.format,
-            &self.bytes,
-            input,
-            rows,
-            self.in_features,
-            self.out_features,
-            bias,
-        )
-    }
 }
+
 fn packed_projection<'a>(
     packed: &'a TensorView<'_>,
     format: BlockFormat,
@@ -1216,8 +1289,13 @@ fn require_same_static_axis(
     Ok(())
 }
 
-fn validate_bias(inputs: &[TensorView], index: usize, experts: usize, width: usize) -> Result<()> {
-    if let Some(input) = optional_input(inputs, index)
+fn validate_bias(
+    inputs: &[TensorMetadata<'_>],
+    index: usize,
+    experts: usize,
+    width: usize,
+) -> Result<()> {
+    if let Some(input) = optional_metadata(inputs, index)
         && input.shape != [experts, width]
     {
         return Err(error(format!(
@@ -1238,7 +1316,7 @@ fn require_exact_rank(index: usize, shape: &[usize], expected: usize) -> Result<
     Ok(())
 }
 
-fn require_dtype(index: usize, input: &TensorView, expected: DataType) -> Result<()> {
+fn require_dtype(index: usize, input: &TensorMetadata<'_>, expected: DataType) -> Result<()> {
     if input.dtype != expected {
         return Err(error(format!(
             "input {index} ('{}') dtype {:?} unsupported; expected {expected:?}",
@@ -1246,6 +1324,13 @@ fn require_dtype(index: usize, input: &TensorView, expected: DataType) -> Result
         )));
     }
     Ok(())
+}
+
+fn optional_metadata<'a>(
+    inputs: &'a [TensorMetadata<'a>],
+    index: usize,
+) -> Option<&'a TensorMetadata<'a>> {
+    inputs.get(index).filter(|input| input.present)
 }
 
 fn optional_input<'a>(inputs: &'a [TensorView<'a>], index: usize) -> Option<&'a TensorView<'a>> {
@@ -1282,9 +1367,9 @@ mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
     use crate::kernels::block_quantized_matmul::packed_for_format;
-    use crate::kernels::testutil::Owned;
+    use crate::kernels::testutil::{Owned, PreparedTestKernel};
     use crate::kernels::weight_cache::DEFAULT_DENSE_WEIGHT_CACHE_BYTES;
-    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ep_api::{DevicePtrMut, ExecutionProvider};
     use onnx_runtime_ir::{Attribute, Dim, Graph, NodeId, SymbolId, static_shape};
 
     const H: usize = 32;
@@ -1485,7 +1570,7 @@ mod tests {
         }
         let mut output = Owned::f32(&[1, H], &[0.0; H]);
         kernel
-            .execute(&views, &mut [output.view_mut()])
+            .execute_prepared(&views, &mut [output.view_mut()])
             .expect("execute BlockQuantizedMoE");
         output.to_f32()
     }
@@ -1498,6 +1583,257 @@ mod tests {
                 "index {index}: got {actual}, expected {expected}"
             );
         }
+    }
+
+    #[test]
+    fn dense_resident_experts_do_not_initialize_projection_scratch() {
+        let shapes = vec![
+            Some((DataType::Float32, vec![1, H])),
+            Some((DataType::Float32, vec![1, E])),
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+        ];
+        let (graph, node) = model_node(&shapes, &attrs("identity", 1, true, 0));
+        let ValidatedMetadata {
+            attributes,
+            formats,
+        } = validate_metadata(graph.node(node), None).unwrap();
+        let kernel = BlockQuantizedMoEKernel {
+            attributes,
+            formats,
+            constant_inputs: [false, false, true, false, true, false, false, false, false],
+            weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            projection_plan: projection_plan(),
+            weight_cache: WeightCache::with_limit(2 * H * H * 4),
+        };
+        let input = Owned::f32(&[1, H], &[0.125; H]);
+        let router = Owned::f32(&[1, E], &[4., -4.]);
+        let fc1 = Owned::u8(&[E, H, 1, 17], &identity_projection([2, 4]));
+        let fc2 = Owned::u8(&[E, H, 1, 17], &identity_projection([2, 2]));
+        let views = [
+            input.view(),
+            router.view(),
+            fc1.view(),
+            TensorView::absent(DataType::Float32),
+            fc2.view(),
+        ];
+        let metadata: Vec<_> = views
+            .iter()
+            .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+            .collect();
+        let req = kernel.workspace_requirement(&metadata).unwrap();
+        let mut scratch = vec![29.0f32; req.bytes as usize / 4];
+        assert!(!scratch.is_empty());
+        let mut output = Owned::zeros_f32(&[1, H]);
+        for _ in 0..2 {
+            let workspace = WorkspaceView::new(
+                DevicePtrMut(scratch.as_mut_ptr().cast()),
+                req.bytes as usize,
+            );
+            kernel
+                .execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace))
+                .unwrap();
+            assert!(
+                scratch.iter().all(|&value| value == 29.0),
+                "cold dense expansion and warm resident hits must leave streamed scratch untouched"
+            );
+            assert_eq!(output.to_f32(), vec![0.125; H]);
+        }
+        assert_eq!(
+            kernel.weight_cache.activity().1,
+            2,
+            "only the first call expands both dense projections"
+        );
+    }
+
+    #[test]
+    fn streamed_workspace_is_one_projection_max_with_no_warm_issuer_callbacks() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_governor::{HolderId, HostWorkspacePool, ProcessMemoryManager};
+        use std::num::NonZeroUsize;
+        // Construct with one logical shard, then execute in a larger pool. A
+        // scheduling change must never increase the admitted scratch bound.
+        let pool_threads = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool_threads.install(|| {
+        for (activation, fusion, separate) in [
+            ("identity", 0, false),
+            ("swiglu", 2, false),
+            ("swiglu", 0, true),
+        ] {
+            let (rows, hidden, inter, experts) = (3, 32, 64, 4);
+            let fc1_size = if fusion == 0 { inter } else { 2 * inter };
+            let mut spec = attrs(activation, 2, true, fusion);
+            if separate {
+                spec = with_fc3_format(spec, "mxfp4");
+            }
+            let shapes = vec![
+                Some((DataType::Float32, vec![rows, hidden])),
+                Some((DataType::Float32, vec![rows, experts])),
+                Some((DataType::Uint8, vec![experts, fc1_size, 1, 17])),
+                None,
+                Some((DataType::Uint8, vec![experts, hidden, 2, 17])),
+                None,
+                separate.then(|| (DataType::Uint8, vec![experts, inter, 1, 17])),
+                None,
+            ];
+            let (graph, node) = model_node(&shapes, &spec);
+            let ValidatedMetadata {
+                attributes,
+                formats,
+            } = validate_metadata(graph.node(node), None).unwrap();
+            let books = RecordingGovernor::new_host(1 << 20);
+            let manager = ProcessMemoryManager::new().unwrap();
+            let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
+            let memory = books.weight_memory(HolderId::new(13));
+            let resources = crate::CpuMemoryResources::new(memory.clone(), Default::default())
+                .unwrap()
+                .with_workspace_pool(pool.clone())
+                .unwrap();
+            let cpu = CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+            let kernel = BlockQuantizedMoEKernel {
+                attributes,
+                formats,
+                constant_inputs: [false; 9],
+                weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+                weight_cache: WeightCache::new(memory, 0),
+                projection_plan: super::super::decoded_projection::DecodedProjectionPlan::new(
+                    NonZeroUsize::new(1).unwrap(),
+                    NonZeroUsize::new(if super::super::matmul::serial_projection_is_portable() {
+                        4
+                    } else {
+                        1
+                    })
+                    .unwrap(),
+                ),
+            };
+            let input = Owned::f32(&[rows, hidden], &vec![0.001; rows * hidden]);
+            // Every row selects experts 0 and 1: each receives all rows, while
+            // experts 2 and 3 receive none. The bound must cover this skew.
+            let router = Owned::f32(&[rows, experts], &[4., 3., -4., -5.].repeat(rows));
+            let w1 = Owned::u8(
+                &[experts, fc1_size, 1, 17],
+                &packed_for_format(BlockFormat::Mxfp4, experts, fc1_size, hidden),
+            );
+            let w2 = Owned::u8(
+                &[experts, hidden, 2, 17],
+                &packed_for_format(BlockFormat::Mxfp4, experts, hidden, inter),
+            );
+            let w3 = separate.then(|| {
+                Owned::u8(
+                    &[experts, inter, 1, 17],
+                    &packed_for_format(BlockFormat::Mxfp4, experts, inter, hidden),
+                )
+            });
+            let views = [
+                input.view(),
+                router.view(),
+                w1.view(),
+                TensorView::absent(DataType::Float32),
+                w2.view(),
+                TensorView::absent(DataType::Float32),
+                w3.as_ref()
+                    .map_or_else(|| TensorView::absent(DataType::Uint8), Owned::view),
+                TensorView::absent(DataType::Float32),
+            ];
+            let metadata: Vec<_> = views
+                .iter()
+                .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+                .collect();
+            let req = kernel.workspace_requirement(&metadata).unwrap();
+            let l1 = kernel
+                .projection_plan
+                .layout(rows, hidden, fc1_size)
+                .unwrap();
+            let l2 = kernel.projection_plan.layout(rows, inter, hidden).unwrap();
+            let l3 = kernel.projection_plan.layout(rows, hidden, inter).unwrap();
+            let max = l1
+                .bytes()
+                .max(l2.bytes())
+                .max(if separate { l3.bytes() } else { 0 });
+            assert_eq!(
+                req.bytes, max as u64,
+                "serial experts/projections share max, not sum or k*E"
+            );
+            assert!(max < l1.bytes() + l2.bytes());
+            let mut output = Owned::zeros_f32(&[rows, hidden]);
+            let err = kernel
+                .execute(&views, &mut [output.view_mut()])
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("BlockQuantizedMoE streamed workspace binding"),
+                "{err}"
+            );
+            let mut expected = None;
+            let mut counts = None;
+            for _ in 0..17 {
+                let mut backing = cpu
+                    .allocate_workspace(req.bytes as usize, req.alignment, req.role())
+                    .unwrap();
+                let workspace =
+                    WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr()), backing.len());
+                kernel.execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace)).unwrap();
+                cpu.deallocate_workspace(backing).unwrap();
+                let current = (books.claims(), books.releases());
+                assert_eq!(
+                    *counts.get_or_insert(current),
+                    current,
+                    "warm checkout/compute/return must never call the issuer, including zero bytes"
+                );
+                assert_eq!(
+                    *expected.get_or_insert_with(|| output.bytes.clone()),
+                    output.bytes
+                );
+            }
+            assert_eq!(kernel.weight_cache.activity(), (0, 0));
+            drop(cpu);
+            pool.trim_idle(u64::MAX).unwrap();
+            assert!(books.releases() > counts.unwrap().1);
+        }
+        });
+    }
+
+    #[test]
+    fn workspace_metadata_validates_optional_slots_and_empty_rows() {
+        let shapes = vec![
+            Some((DataType::Float32, vec![0, H])),
+            Some((DataType::Float32, vec![0, E])),
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+        ];
+        let (graph, node) = model_node(&shapes, &attrs("identity", 1, false, 0));
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(graph.node(node), &[], 1)
+            .unwrap();
+        let mut metadata: Vec<_> = shapes
+            .iter()
+            .map(|input| match input {
+                Some((dtype, shape)) => TensorMetadata::new(*dtype, shape, true),
+                None => TensorMetadata::new(DataType::Float32, &[], false),
+            })
+            .collect();
+        assert_eq!(kernel.workspace_requirement(&metadata).unwrap().bytes, 0);
+        metadata[3].present = true;
+        let err = kernel.workspace_requirement(&metadata).unwrap_err();
+        assert!(
+            err.to_string().contains("fc1_experts_bias must have shape"),
+            "{err}"
+        );
+        metadata[3].present = false;
+        metadata[4].present = false;
+        let err = kernel.workspace_requirement(&metadata).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("required input 4 ('fc2_experts_weights') is absent"),
+            "{err}"
+        );
+        let err = kernel.workspace_requirement(&metadata[..2]).unwrap_err();
+        assert!(err.to_string().contains("5..=9 positional inputs"), "{err}");
     }
 
     #[test]
@@ -1528,6 +1864,7 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         kernel.set_constant_inputs(&[false, false, true, false, true, false, false, false]);
@@ -1550,7 +1887,7 @@ mod tests {
 
         let hits_before = BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed);
         kernel
-            .execute(&views, &mut [output.view_mut()])
+            .execute_prepared(&views, &mut [output.view_mut()])
             .expect("first MoE execution");
         let identity_after_first = [
             kernel.weight_identities[0].stats(),
@@ -1558,7 +1895,7 @@ mod tests {
         ];
         let activity_after_first = kernel.weight_cache.activity();
         kernel
-            .execute(&views, &mut [output.view_mut()])
+            .execute_prepared(&views, &mut [output.view_mut()])
             .expect("second MoE execution");
         assert_eq!(
             kernel.weight_cache.stats().0,
@@ -1638,6 +1975,7 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            projection_plan: projection_plan(),
             // The default ceiling, pinned rather than inherited: `new()` reads
             // `ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES` through a process-wide
             // `OnceLock`, so an ambient `=0` turns every resolve into
@@ -1666,7 +2004,7 @@ mod tests {
         let mut output = Owned::f32(&[ROWS, H], &vec![0.0; ROWS * H]);
 
         kernel
-            .execute(&views, &mut [output.view_mut()])
+            .execute_prepared(&views, &mut [output.view_mut()])
             .expect("48-row MoE execution");
 
         assert_eq!(
@@ -1768,6 +2106,7 @@ mod tests {
                 formats,
                 constant_inputs: [false; 9],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+                projection_plan: projection_plan(),
                 weight_cache: WeightCache::default(),
             };
             kernel.set_constant_inputs(&[false, false, true, false, true, false, false, false]);
@@ -1793,7 +2132,7 @@ mod tests {
             ];
             let mut output = Owned::f32(&[1, H], &[0.0; H]);
             kernel
-                .execute(&views, &mut [output.view_mut()])
+                .execute_prepared(&views, &mut [output.view_mut()])
                 .expect("execute gated BlockQuantizedMoE with runtime fc3");
 
             let expert_bytes = H * 17;
@@ -1846,6 +2185,7 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::with_limit(0),
         };
         kernel.set_constant_inputs(&[false, false, true, false, true]);
@@ -1871,7 +2211,9 @@ mod tests {
                 fc2.view(),
             ];
             let mut output = Owned::f32(&[1, H], &[0.; H]);
-            kernel.execute(&views, &mut [output.view_mut()]).unwrap();
+            kernel
+                .execute_prepared(&views, &mut [output.view_mut()])
+                .unwrap();
             let mut expected = values.clone();
             if changed {
                 expected[0] *= 2.;
@@ -1900,7 +2242,9 @@ mod tests {
             fc2.view(),
         ];
         let mut output = Owned::f32(&[1, H], &[0.; H]);
-        kernel.execute(&views, &mut [output.view_mut()]).unwrap();
+        kernel
+            .execute_prepared(&views, &mut [output.view_mut()])
+            .unwrap();
         let mut expected = values.clone();
         expected[0] *= 2.;
         assert_close(&output.to_f32(), &expected);
@@ -1955,7 +2299,9 @@ mod tests {
         ];
         let mut expected = Owned::zeros_f32(&[1, H]);
         let mut actual = Owned::zeros_f32(&[1, H]);
-        first.execute(&views, &mut [expected.view_mut()]).unwrap();
+        first
+            .execute_prepared(&views, &mut [expected.view_mut()])
+            .unwrap();
         assert_eq!(
             governor.used(Tier::Host),
             bytes,
@@ -1981,7 +2327,9 @@ mod tests {
                 .unwrap();
             active.push(concrete.weight_cache.test_get(&resolved.key).unwrap());
         }
-        second.execute(&views, &mut [actual.view_mut()]).unwrap();
+        second
+            .execute_prepared(&views, &mut [actual.view_mut()])
+            .unwrap();
         assert_eq!(actual.bytes, expected.bytes);
         assert_eq!(
             governor.used(Tier::Host),
@@ -2006,7 +2354,9 @@ mod tests {
         );
         drop(active);
         assert_eq!(governor.used(Tier::Host), 0);
-        second.execute(&views, &mut [actual.view_mut()]).unwrap();
+        second
+            .execute_prepared(&views, &mut [actual.view_mut()])
+            .unwrap();
         assert_eq!(actual.bytes, expected.bytes);
         assert_eq!(governor.used(Tier::Host), bytes);
         drop(provider);
@@ -2073,6 +2423,7 @@ mod tests {
                     formats,
                     constant_inputs: [false; 9],
                     weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+                    projection_plan: projection_plan(),
                     weight_cache: WeightCache::with_limit(budget),
                 };
                 kernel.set_constant_inputs(&[false, false, true, false, true, false, has_fc3]);
@@ -2142,12 +2493,14 @@ mod tests {
                 let mut expected = Owned::f32(&[rows, hidden], &vec![0.; rows * hidden]);
                 let mut actual = Owned::f32(&[rows, hidden], &vec![0.; rows * hidden]);
                 reference
-                    .execute(&views, &mut [expected.view_mut()])
+                    .execute_prepared(&views, &mut [expected.view_mut()])
                     .unwrap();
-                streamed.execute(&views, &mut [actual.view_mut()]).unwrap();
+                streamed
+                    .execute_prepared(&views, &mut [actual.view_mut()])
+                    .unwrap();
                 let mut denied_output = Owned::zeros_f32(&[rows, hidden]);
                 denied
-                    .execute(&views, &mut [denied_output.view_mut()])
+                    .execute_prepared(&views, &mut [denied_output.view_mut()])
                     .unwrap();
                 assert_eq!(
                     denied_output.bytes, actual.bytes,
@@ -2271,11 +2624,12 @@ mod tests {
                 formats,
                 constant_inputs: [false; 9],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+                projection_plan: projection_plan(),
                 weight_cache: WeightCache::default(),
             };
             let mut expected = Owned::f32(&[1, hidden], &vec![0.0; hidden]);
             uncached
-                .execute(&views, &mut [expected.view_mut()])
+                .execute_prepared(&views, &mut [expected.view_mut()])
                 .expect("uncached MoE reference");
 
             let mut cached = BlockQuantizedMoEKernel {
@@ -2283,15 +2637,16 @@ mod tests {
                 formats,
                 constant_inputs: [false; 9],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+                projection_plan: projection_plan(),
                 weight_cache: WeightCache::default(),
             };
             cached.set_constant_inputs(&[false, false, true, false, true]);
             let mut actual = Owned::f32(&[1, hidden], &vec![0.0; hidden]);
             cached
-                .execute(&views, &mut [actual.view_mut()])
+                .execute_prepared(&views, &mut [actual.view_mut()])
                 .expect("cold cached MoE");
             cached
-                .execute(&views, &mut [actual.view_mut()])
+                .execute_prepared(&views, &mut [actual.view_mut()])
                 .expect("warm cached MoE");
             assert_close(&actual.to_f32(), &expected.to_f32());
         }
@@ -2782,6 +3137,7 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
 
@@ -2804,7 +3160,7 @@ mod tests {
         ];
         let mut output = Owned::f32(&[1, HID], &vec![0.0; HID]);
         kernel
-            .execute(&views, &mut [output.view_mut()])
+            .execute_prepared(&views, &mut [output.view_mut()])
             .expect("execute mixed-format MoE");
 
         // Reference: expert 0 is the top-1 routed expert; decode each projection
@@ -2895,6 +3251,7 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            projection_plan: projection_plan(),
             weight_cache: WeightCache::default(),
         };
         let input_values: Vec<f32> = (0..HID).map(|index| (index as f32) / 256.0 + 0.1).collect();
@@ -2915,7 +3272,7 @@ mod tests {
         ];
         let mut output = Owned::f32(&[1, HID], &vec![0.0; HID]);
         kernel
-            .execute(&views, &mut [output.view_mut()])
+            .execute_prepared(&views, &mut [output.view_mut()])
             .expect("execute mixed gated MoE");
 
         let fc1_layout = ProjectionLayout::new(fc1_format, HID, HID, experts);

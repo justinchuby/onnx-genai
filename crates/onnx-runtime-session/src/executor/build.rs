@@ -1094,20 +1094,21 @@ impl Executor {
         let all_value_ids = value_shapes.keys().copied().collect();
 
         // 3) Build the structural per-node plan.
-        let capabilities = ep.capabilities();
         let plan = Self::build_node_plan(
             &graph,
             &order,
             &value_dtypes,
             has_symbols,
             &weight_handles,
-            &capabilities,
             &graph_claims,
+            ep.as_ref(),
         )?;
 
         // 4) name → value id and the set of caller-required inputs.
         let (input_index, required_inputs, name_index) = Self::build_name_indexes(&graph);
 
+        let workspace_node_locations =
+            super::bindings::collect_workspace_node_locations(ep.as_ref(), &graph, &plan)?;
         let plan_len = plan.len();
         let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
         let mut exec = Self {
@@ -1195,6 +1196,7 @@ impl Executor {
             inherited_workspace: InheritedWorkspaces::default(),
             workspace_preparation_required: false,
             workspace_preparation_memo: None,
+            workspace_node_locations,
         };
 
         // Constant preparation depends only on immutable operand metadata.
@@ -1701,9 +1703,10 @@ impl Executor {
         value_dtypes: &HashMap<ValueId, DataType>,
         has_symbols: bool,
         weight_handles: &HashMap<ValueId, WeightHandle>,
-        capabilities: &onnx_runtime_ep_api::ExecutionProviderCapabilities,
         graph_claims: &onnx_runtime_ep_api::GraphKernelClaims,
+        ep: &dyn ExecutionProvider,
     ) -> Result<Vec<NodePlan>> {
+        let capabilities = ep.capabilities();
         let mut plan_span = trace_span("session.execution_plan", "session");
         let mut plan = Vec::with_capacity(order.len());
         let mut skipped_epcontext = 0_u64;
@@ -1774,7 +1777,7 @@ impl Executor {
                 for vid in inputs.iter().flatten() {
                     if weight_handles
                         .get(vid)
-                        .is_some_and(|handle| handle.is_lazy_for(capabilities))
+                        .is_some_and(|handle| handle.is_lazy_for(&capabilities))
                         && !lazy_weight_inputs.contains(vid)
                     {
                         lazy_weight_inputs.push(*vid);
@@ -1784,6 +1787,13 @@ impl Executor {
             plan.push(NodePlan {
                 node_id: nid,
                 graph_kernel,
+                workspace_planning: super::bindings::workspace_planning_for_node(
+                    ep,
+                    graph,
+                    node,
+                    graph_kernel,
+                    graph,
+                ),
                 inputs,
                 outputs,
                 input_dtypes,

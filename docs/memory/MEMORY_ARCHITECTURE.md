@@ -79,6 +79,36 @@ and host tests do not validate CUDA mapping, stream ordering, capture/replay or
 throughput. Adoption, pooling, lending and release behavior remain unchanged in
 this cleanup.
 
+### CPU compressed-projection scratch
+
+CPU `BlockQuantizedMatMul` and `BlockQuantizedMoE` declare metadata-planned,
+step-scoped Host scratch through the existing kernel workspace contract. The
+executor admits and retains the physical backing; kernels bind local regions
+without requesting or refunding quota per decoded row, tile, or expert. A warm
+pool checkout/return stays within the admitted grant. Physical growth and trim
+remain accounting events.
+
+For a streamed MoE node, experts execute serially and each row selects distinct
+expert IDs. Each expert therefore receives at most the total input row count.
+The node declares the maximum **complete** projection layout across FC1, FC2,
+and optional FC3 at that row count, rather than their sum or a multiple of
+expert count/top-k. Each projection layout includes column staging plus decoded
+tiles. The logical shard count is fixed when the kernel is created and is used
+by both planning and execution, even when a different Rayon pool runs it.
+Dense-cache admission may decline, so the bound always covers streamed fallback.
+
+One exclusive scratch lane is borrowed by sequential projection calls, which
+return owned results. A private dispatch-local owner lazily initializes the
+required f32 prefix at the first streamed apply; later applies receive short,
+exclusive initialized slices and partition their own prefixes safely. Dense
+resident hits leave scratch untouched, and unused capacity in a larger pool
+slot is not initialized. The initialization proof ends with the dispatch and
+is never cached across pool borrowers. FC1/FC3 results survive subsequent
+scratch overwrites for gating. Routing, activation buffers, grouped inputs,
+output staging, and their owned intermediate results remain separate allocations; this contract does not
+claim a complete process-memory bound. Dense resident-set admission remains a
+separate existing weight-cache operation. No new public EP API is required.
+
 ## Implementation status
 
 This document describes the target architecture. Most of it is not built yet,

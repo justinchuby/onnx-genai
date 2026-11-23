@@ -1,0 +1,34 @@
+{
+  "head": "56542d7d03fa07bffa5e883d16daad4e42cd5172",
+  "base": "46f1321d7e7524703eaba5f8898ec29f5c741417",
+  "source_path": "/tmp/nxrt-compact-wire-grants",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/benches/bounded_expert_bench.rs": "e9e8d4d6ac77d57df0227ae9989bf9d95e038d0f86a1e081862b1b922c0a33ed",
+    "crates/onnx-runtime-ep-cpu/benches/common/mod.rs": "baededb158d160a8e4cdce0c03e115792617801fa9073e4316d8b48d554d1aa8",
+    "crates/onnx-runtime-ep-cpu/benches/kernels.rs": "0ad8279215463e81fb78b4995e4c3d59381684f2f76af17c2fdba88e505cc081",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs": "009bc9b64adb4792142eaaa135c45aee293027a1edd16c2ab75ff6f1a2018154",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "e7c7f86cfed9756e4039375531ea166c3887bf37939a5179a0623c9f6d6f9c38",
+    "crates/onnx-runtime-ep-cpu/src/kernels/mod.rs": "1f505109335ecbcd24112e40ea50e55b99022ca312438e4e28e9dfd7cd40228e",
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "75068323f5f7f4645eacd496f823f0b91d54a0884d1dd7b1c2510494abb17e26",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "8d45c904ea2d5e6a54ceedaf9de14b9c3e00a983e6484dcaf18e6c7a738cb64a",
+    "crates/onnx-runtime-ep-cuda/tests/block_quantized_moe_gpu.rs": "13fea48de709f7d572c77371c5464ec6e9318bf9b020b2ecbb715caaec12f5d9",
+    "crates/onnx-runtime-session/src/executor/tests.rs": "c77abbb5ea9c13440323acf21244db58a3c74f06f2a7ddecc9e6e4ffa2336854",
+    "docs/memory/MEMORY_ARCHITECTURE.md": "34201e55350dd93318619e91d6d4597c52cc98cb366d5dc85ec614d644f76be5"
+  },
+  "probe_sha256": "84a3c9fe3a989d979bb3232511eef0f442519de742bb0d868a945ce050c795e2",
+  "temporary_dev_dependency": "libc=0.2, identical in both arms, manifest/lock restored",
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "binaries": {
+    "baseline": {
+      "sha256": "59cb55464567fa24063db18b10640b45257954e43a33c0e3eaef1beca75e071f",
+      "symbols": 21566,
+      "mlas_symbols": 0
+    },
+    "after": {
+      "sha256": "19cfce049b9494864b7df78aa7621757ce84bc6278619afae13b1bdc5cd57a9a",
+      "symbols": 21570,
+      "mlas_symbols": 0
+    }
+  }
+}

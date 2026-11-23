@@ -514,6 +514,7 @@ impl Executor {
         // dispatch never goes through a `&mut self` method while they are held).
         let node_id = self.plan[pi].node_id;
         let graph_kernel = self.plan[pi].graph_kernel;
+        let workspace_planning = self.plan[pi].workspace_planning;
         // Refill the reusable per-executor input-shape scratch first (before the
         // shared borrows below), so a steady-state decode step allocates no
         // fresh `Vec<Vec<usize>>` for shape lookup -- see `refill_input_shapes`.
@@ -758,7 +759,9 @@ impl Executor {
                     .unwrap_or(DataType::Undefined)
                 })
                 .collect::<Vec<_>>();
-            let result = kernel.execute_kernel_sized(&views, &requested)?;
+            let (_, workspace) =
+                ctx.prepare_kernel_workspace(kernel, &views, node, workspace_planning)?;
+            let result = kernel.execute_kernel_sized(&views, &requested, workspace)?;
             validate_kernel_sized_outputs(
                 &result,
                 &requested,
@@ -913,6 +916,7 @@ impl Executor {
         )?;
 
         ctx.execute_kernel(
+            workspace_planning,
             kernel,
             inputs,
             outputs,
@@ -1958,6 +1962,140 @@ impl KernelDispatchContext<'_> {
         Ok((out_bufs, outs))
     }
 
+    /// Resolve and bind scratch once, regardless of whether outputs are sized
+    /// before execution or discovered by the kernel. Returned views borrow the
+    /// existing lifetime slot; no owner is returned to a pool during the call.
+    fn prepare_kernel_workspace(
+        &mut self,
+        kernel: &dyn Kernel,
+        views: &[TensorView],
+        node: &Node,
+        workspace_planning: onnx_runtime_ep_api::WorkspacePlanning,
+    ) -> Result<(WorkspaceRequirement, Option<WorkspaceView>)> {
+        let metadata: SmallVec<[TensorMetadata<'_>; 16]> = views
+            .iter()
+            .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
+            .collect();
+        let requirement = kernel.workspace_requirement_for_execution(views, &metadata)?;
+        if requirement.bytes != 0
+            && workspace_planning == onnx_runtime_ep_api::WorkspacePlanning::None
+        {
+            return Err(EpError::KernelFailed(format!(
+            "provider '{}' declared no executor workspace for node #{} ('{}::{}') but execution requires {} bytes; declare Metadata workspace planning for this selected implementation before preparing the session",
+            self.ep.name(), node.id.0, node.domain, node.op_type, requirement.bytes,
+        )).into());
+        }
+        if requirement.bytes != 0
+            && (requirement.alignment == 0 || !requirement.alignment.is_power_of_two())
+        {
+            return Err(EpError::KernelFailed(format!(
+            "node #{} ('{}::{}') requested invalid workspace alignment {}; declare a nonzero power-of-two alignment",
+            node.id.0, node.domain, node.op_type, requirement.alignment,
+        )).into());
+        }
+        let prepared = match requirement.lifetime {
+            WorkspaceLifetime::SessionPersistent => &mut *self.persistent_workspace,
+            WorkspaceLifetime::StepScoped => &mut *self.step_workspace,
+        };
+        let workspace = if requirement.bytes == 0 {
+            None
+        } else if let Some(inherited) = self.inherited_workspace.view(requirement.lifetime) {
+            let required = usize::try_from(requirement.bytes).map_err(|_| {
+                EpError::KernelFailed(format!(
+                    "kernel workspace requirement {} does not fit usize",
+                    requirement.bytes
+                ))
+            })?;
+            let address = inherited.ptr().0 as usize;
+            if address == 0
+                || !address.is_multiple_of(requirement.alignment)
+                || address.checked_add(required).is_none()
+            {
+                return Err(EpError::KernelFailed(format!(
+                "node #{} ('{}::{}') inherited workspace at {address:#x} cannot cover {} bytes aligned to {}; prepare and lend a live, aligned enclosing workspace",
+                node.id.0, node.domain, node.op_type, required, requirement.alignment,
+            )).into());
+            }
+            if required > inherited.bytes() {
+                Err(EpError::KernelFailed(format!(
+                    "node {} (op '{}::{}') workspace invariant mismatch: execute requires {} bytes, enclosing preparation supplied {} bytes",
+                    node.id.0,
+                    node.domain,
+                    node.op_type,
+                    required,
+                    inherited.bytes()
+                )))?;
+            }
+            Some(inherited)
+        } else {
+            let required = usize::try_from(requirement.bytes).map_err(|_| {
+                EpError::KernelFailed(format!(
+                    "kernel workspace requirement {} does not fit usize",
+                    requirement.bytes
+                ))
+            })?;
+            let needs_replacement = prepared.as_ref().is_none_or(|workspace| {
+                required > workspace.bytes || requirement.alignment > workspace.alignment
+            });
+            // A prepared session normally refuses to allocate at execution
+            // time — its governed workspace must be reserved up front so a
+            // captured device graph can bake a stable pointer. That invariant
+            // only holds *within* one shape bucket, though: when execution
+            // rebuckets to a larger bucket than preparation reserved for, the
+            // reserved slot may be absent or undersized for the new geometry
+            // (#1223). Re-run preparation in place on the eager (non-capture)
+            // dispatch that a rebucket forces before any re-capture — growing
+            // the slot there is safe because no captured graph references it
+            // yet. This generalizes the in-bucket reservation fix from #1221
+            // to the cross-bucket case, for every governed-workspace operator
+            // rather than any one op-type.
+            if needs_replacement
+                && (!self.workspace_preparation_required || self.eager_workspace_growth)
+            {
+                // Sequential dispatch is the scratch hand-off boundary. An
+                // EP may enqueue asynchronous device work, so synchronize
+                // before retiring the old disposable workspace. Release it
+                // before acquiring the replacement to avoid charging both.
+                self.ep.sync()?;
+                let old = prepared.take().map(|workspace| workspace.buffer);
+                let buffer = self.ep.replace_workspace(
+                    old,
+                    required,
+                    requirement.alignment,
+                    requirement.role(),
+                )?;
+                *prepared = Some(PreparedWorkspace {
+                    bytes: buffer.len(),
+                    alignment: buffer.alignment(),
+                    buffer,
+                });
+            }
+            let prepared = prepared.as_mut().ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "node {} (op '{}::{}') reached execution without prepared {:?} workspace",
+                    node.id.0, node.domain, node.op_type, requirement.lifetime
+                ))
+            })?;
+            if required > prepared.bytes || requirement.alignment > prepared.alignment {
+                Err(EpError::KernelFailed(format!(
+                    "node {} (op '{}::{}') workspace invariant mismatch: execute requires {} bytes aligned to {}, prepared {} bytes aligned to {}",
+                    node.id.0,
+                    node.domain,
+                    node.op_type,
+                    required,
+                    requirement.alignment,
+                    prepared.bytes,
+                    prepared.alignment
+                )))?;
+            }
+            Some(WorkspaceView::new(
+                DevicePtrMut(prepared.buffer.as_mut_ptr()),
+                prepared.bytes,
+            ))
+        };
+        Ok((requirement, workspace))
+    }
+
     /// Run the kernel over the bound input/output views (routing lazy-weight
     /// inputs through [`KernelInput`] when present), map any failure to a
     /// diagnostic naming the node and its input/output types and shapes, then
@@ -1965,6 +2103,7 @@ impl KernelDispatchContext<'_> {
     #[allow(clippy::too_many_arguments)]
     fn execute_kernel(
         &mut self,
+        workspace_planning: onnx_runtime_ep_api::WorkspacePlanning,
         kernel: &dyn Kernel,
         inputs: &[Option<ValueId>],
         outputs: &[ValueId],
@@ -2037,101 +2176,8 @@ impl KernelDispatchContext<'_> {
 
         let execution = {
             let _s = phase_span!("exec_kernel.compute");
-            let metadata: SmallVec<[TensorMetadata<'_>; 16]> = views
-                .iter()
-                .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
-                .collect();
-            let requirement = kernel.workspace_requirement_for_execution(views, &metadata)?;
-            let prepared = match requirement.lifetime {
-                WorkspaceLifetime::SessionPersistent => &mut *self.persistent_workspace,
-                WorkspaceLifetime::StepScoped => &mut *self.step_workspace,
-            };
-            let workspace = if requirement.bytes == 0 {
-                None
-            } else if let Some(inherited) = self.inherited_workspace.view(requirement.lifetime) {
-                let required = usize::try_from(requirement.bytes).map_err(|_| {
-                    EpError::KernelFailed(format!(
-                        "kernel workspace requirement {} does not fit usize",
-                        requirement.bytes
-                    ))
-                })?;
-                if required > inherited.bytes() {
-                    Err(EpError::KernelFailed(format!(
-                        "node {} (op '{}::{}') workspace invariant mismatch: execute requires {} bytes, enclosing preparation supplied {} bytes",
-                        node.id.0,
-                        node.domain,
-                        node.op_type,
-                        required,
-                        inherited.bytes()
-                    )))?;
-                }
-                Some(inherited)
-            } else {
-                let required = usize::try_from(requirement.bytes).map_err(|_| {
-                    EpError::KernelFailed(format!(
-                        "kernel workspace requirement {} does not fit usize",
-                        requirement.bytes
-                    ))
-                })?;
-                let needs_replacement = prepared.as_ref().is_none_or(|workspace| {
-                    required > workspace.bytes || requirement.alignment > workspace.alignment
-                });
-                // A prepared session normally refuses to allocate at execution
-                // time — its governed workspace must be reserved up front so a
-                // captured device graph can bake a stable pointer. That invariant
-                // only holds *within* one shape bucket, though: when execution
-                // rebuckets to a larger bucket than preparation reserved for, the
-                // reserved slot may be absent or undersized for the new geometry
-                // (#1223). Re-run preparation in place on the eager (non-capture)
-                // dispatch that a rebucket forces before any re-capture — growing
-                // the slot there is safe because no captured graph references it
-                // yet. This generalizes the in-bucket reservation fix from #1221
-                // to the cross-bucket case, for every governed-workspace operator
-                // rather than any one op-type.
-                if needs_replacement
-                    && (!self.workspace_preparation_required || self.eager_workspace_growth)
-                {
-                    // Sequential dispatch is the scratch hand-off boundary. An
-                    // EP may enqueue asynchronous device work, so synchronize
-                    // before retiring the old disposable workspace. Release it
-                    // before acquiring the replacement to avoid charging both.
-                    self.ep.sync()?;
-                    let old = prepared.take().map(|workspace| workspace.buffer);
-                    let buffer = self.ep.replace_workspace(
-                        old,
-                        required,
-                        requirement.alignment,
-                        requirement.role(),
-                    )?;
-                    *prepared = Some(PreparedWorkspace {
-                        bytes: buffer.len(),
-                        alignment: buffer.alignment(),
-                        buffer,
-                    });
-                }
-                let prepared = prepared.as_mut().ok_or_else(|| {
-                    EpError::KernelFailed(format!(
-                        "node {} (op '{}::{}') reached execution without prepared {:?} workspace",
-                        node.id.0, node.domain, node.op_type, requirement.lifetime
-                    ))
-                })?;
-                if required > prepared.bytes || requirement.alignment > prepared.alignment {
-                    Err(EpError::KernelFailed(format!(
-                        "node {} (op '{}::{}') workspace invariant mismatch: execute requires {} bytes aligned to {}, prepared {} bytes aligned to {}",
-                        node.id.0,
-                        node.domain,
-                        node.op_type,
-                        required,
-                        requirement.alignment,
-                        prepared.bytes,
-                        prepared.alignment
-                    )))?;
-                }
-                Some(WorkspaceView::new(
-                    DevicePtrMut(prepared.buffer.as_mut_ptr()),
-                    prepared.bytes,
-                ))
-            };
+            let (requirement, workspace) =
+                self.prepare_kernel_workspace(kernel, views, node, workspace_planning)?;
             match &kernel_inputs {
                 Some(inputs) if requirement.bytes == 0 => kernel.execute_with_inputs(inputs, outs),
                 Some(_) => Err(EpError::KernelFailed(

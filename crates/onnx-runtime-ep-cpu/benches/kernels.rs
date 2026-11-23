@@ -413,7 +413,15 @@ fn bench_block_quantized_moe_cache(c: &mut Criterion) {
 
     // Every measured iteration re-expands the routed expert projections.
     let mut uncached_output = Tensor::zeros(FloatDType::F32, &[rows, hidden]);
-    let uncached_kernel = block_quantized_moe_kernel(top_k);
+    let views = [
+        input.view(),
+        logits.view(),
+        fc1.view(),
+        onnx_runtime_ep_api::TensorView::absent(DataType::Float32),
+        fc2.view(),
+    ];
+    let mut uncached_kernel =
+        common::PreparedKernel::new(block_quantized_moe_kernel(top_k), &views);
     group.bench_function(
         BenchmarkId::new(
             "mxfp4_uncached_expert_dequant_each_call",
@@ -440,6 +448,7 @@ fn bench_block_quantized_moe_cache(c: &mut Criterion) {
     let mut cached_output = Tensor::zeros(FloatDType::F32, &[rows, hidden]);
     let mut cached_kernel = block_quantized_moe_kernel(top_k);
     cached_kernel.set_constant_inputs(&[false, false, true, false, true]);
+    let mut cached_kernel = common::PreparedKernel::new(cached_kernel, &views);
     // Prewarm the routed expert before Criterion; measured calls are cache hits.
     cached_kernel
         .execute(

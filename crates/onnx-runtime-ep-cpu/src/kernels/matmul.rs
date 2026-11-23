@@ -2576,6 +2576,7 @@ mod gemm_bt_avx2 {
     /// AVX2+FMA available. `a_row` is valid for `k` reads, `bt` for `n*k`
     /// reads, and `c_row` for `n` writes.
     #[target_feature(enable = "avx2,fma")]
+    #[cfg(not(feature = "mlas"))]
     pub unsafe fn dot_row_tail(
         a_row: *const f32,
         bt: *const f32,
