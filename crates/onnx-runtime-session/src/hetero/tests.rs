@@ -97,6 +97,7 @@ impl ExecutionProvider for AcceleratorEp {
             || self.device_sized.contains(&op.op_type.as_str())
         {
             return KernelMatch::Supported {
+                workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
                 cost: Cost::ZERO,
                 required_input_layouts: None,
                 output_layouts: vec![TensorLayout::contiguous(); op.outputs.len()],

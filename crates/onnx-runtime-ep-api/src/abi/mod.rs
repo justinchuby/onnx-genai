@@ -249,12 +249,21 @@ impl ExecutionProvider for LegacyOrtEp {
 impl PluginExecutionPlan {
     /// Load `library_path`, run capability discovery, compile the selected fused
     /// groups, and return the claims plus runnable kernels in the same order.
+    /// `host_provider` is the caller's configured CPU workspace source for
+    /// foreign Compute scratch callbacks; clones preserve its resource domain.
     pub fn compile(
         graph: &Graph,
         library_path: impl AsRef<Path>,
         registration_name: Option<&CStr>,
+        host_provider: Arc<dyn ExecutionProvider>,
     ) -> Result<(Vec<SubgraphClaim>, Self)> {
-        Self::compile_with_device_label(graph, library_path, registration_name, "plugin")
+        Self::compile_with_device_label(
+            graph,
+            library_path,
+            registration_name,
+            "plugin",
+            host_provider,
+        )
     }
 
     /// Like [`Self::compile`], but uses `device_label` in fused-dispatch trace spans.
@@ -263,7 +272,14 @@ impl PluginExecutionPlan {
         library_path: impl AsRef<Path>,
         registration_name: Option<&CStr>,
         device_label: impl Into<String>,
+        host_provider: Arc<dyn ExecutionProvider>,
     ) -> Result<(Vec<SubgraphClaim>, Self)> {
+        if host_provider.device_type() != onnx_runtime_ir::DeviceType::Cpu {
+            return Err(EpError::KernelFailed(format!(
+                "plugin Host scratch source must be a CPU execution provider, got {:?}; pass this session’s configured Host provider",
+                host_provider.device_id()
+            )));
+        }
         let library_path = library_path.as_ref();
         let device_label: Arc<str> = Arc::from(device_label.into());
         let mut support = HostSupportInfo::default();
@@ -369,6 +385,8 @@ impl PluginExecutionPlan {
             })?;
             kernels.push(Arc::new(PluginKernelShared {
                 runtime: Arc::clone(&inner),
+                host_provider: host_provider.clone(),
+                scratch_peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 info,
                 create_state,
                 compute,

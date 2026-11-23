@@ -117,6 +117,7 @@ impl ExecutionProvider for PluginExecutionProvider {
     ) -> KernelMatch {
         if is_plugin_fused(op) {
             return KernelMatch::Supported {
+                workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
                 cost: onnx_runtime_ep_api::Cost::ZERO,
                 required_input_layouts: None,
                 output_layouts: vec![TensorLayout::contiguous(); op.outputs.len()],
@@ -235,11 +236,13 @@ impl ExecutionProvider for PluginExecutionProvider {
             registration_name: self.registration_name.clone(),
             device_label: self.device_label.clone(),
             compiled: Arc::clone(&self.compiled),
+            cpu: self.cpu.clone(),
         })]
     }
 }
 
 struct PluginFusionPass {
+    cpu: Arc<dyn ExecutionProvider>,
     library: PathBuf,
     registration_name: Option<String>,
     device_label: String,
@@ -388,6 +391,7 @@ impl OptimizationPass for PluginFusionPass {
             &self.library,
             registration.as_deref(),
             self.device_label.clone(),
+            self.cpu.clone(),
         )
         .map_err(|err| OptimizerError::Fusion(format!("{err}")))?;
 

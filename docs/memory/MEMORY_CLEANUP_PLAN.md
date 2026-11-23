@@ -2079,3 +2079,87 @@ confound and too-short control samples were corrected before interpreting the
 final sweep; one remaining failed timing control is excluded, and a focused
 same-binary A/A check resolves the noisy unchanged dense path without claiming
 a speedup there.
+
+
+### Block projection scratch and implementation declarations
+
+`BlockQuantizedMatMul` now has a private fixed logical shard plan captured at
+kernel creation. Each task carries an exclusive pair of output-column and
+decoded-weight slices; a larger Rayon pool cannot increase the number of
+scratch slots. Work stealing changes task placement, not scratch ownership.
+The streamed branch binds two disjoint regions from the existing StepScoped
+`WorkspaceLayout`, without adding an EP execute or quota protocol.
+
+For `M` rows, `K` input features, `N` output features and stored maximum `W`
+logical shards, let `P=ceil(N/W)`, `S=ceil(N/P)` for a nonempty output, and `T`
+be the compute tile (four on the portable native route, one on the existing
+reference/AVX2 geometry). The f32 workspace upper bound is:
+
+- column-major output: `M*N` elements when both axes exceed one, otherwise zero;
+- decoded rows: `S*min(T,P)*K` elements, zero for an empty output.
+
+The last shard may have a shorter live tile. Uniform slot widths permit a
+checked, allocation-free zip of output shards with decoded slots; all layout,
+element and byte products are checked. The fixed decoder block stays on the
+stack. Single-token output uses the final staging buffer directly, avoiding a
+new transpose copy. Dense-cache hits do not reduce metadata requirements,
+because admission may decline and require the streamed fallback.
+
+Final output staging, dtype/strided input conversion, packed-input gathering,
+and MoE's owned FC1/FC3 results remain distinct ownership work. This migration
+is not proof of a complete process memory cap or a model throughput gain.
+
+Preparation now consumes the selected implementation's `WorkspacePlanning`
+declaration from the versioned kernel registry and `KernelMatch`, replacing the
+session's operator-name inventory. `None` promises zero executor scratch for
+all legal specializations; `Metadata` delegates the exact bound to the existing
+kernel requirement. A symbolic-shape decline is conservatively `Metadata`.
+A nonzero execution requirement contradicting an explicit `None` fails before
+late scratch allocation. Nested unclaimed control flow is planned recursively;
+claimed graph kernels are treated as opaque implementations. Diagnostic node
+locations are cached at construction and borrowed during decode, with no new
+capability scan or allocation per location query.
+
+The existing `execute_kernel_sized` entrypoint now accepts the same optional
+workspace view. Native ordinary and HostOwned dynamic-output dispatch share one
+requirement/refinement/binding helper, including lifetime selection, inherited
+capacity/alignment validation and existing growth/capture rules. The ORT
+single-node and routed multi-node HostOwned paths use `prepare_workspace` before
+calling the kernel. ORT still declines nonzero SessionPersistent requests with
+`None`; kernels requiring that lifetime must reject the decline or provide an
+explicit supported owned path. It is never served from short-lived ORT scratch.
+
+The native C graph-ABI bridge also exposes CPU memory-info comparison and the
+existing ORT scratch callback. `PluginExecutionPlan::compile` receives an
+explicit Host execution provider; the session passes its configured CPU source.
+No private allocator or quota source is created. Each foreign Compute retains
+all loans until it returns. On the first nonempty scratch callback it borrows
+one coarse lane using a successful prior Compute's aggregate high-water hint;
+requests within that lane only advance a checked offset. Cold overflow retains
+old addresses in separate funded spill loans. A capacity-refused large hint can
+shrink to the current request; reclaim/context/ownership failures propagate.
+The hint is not a grant and is published only after successful execution.
+Zero-byte callbacks borrow nothing. Concurrent Computes share only the atomic
+hint, with independent owners and mutex-protected offsets. Normal completion
+and Compute failure explicitly return loans; Drop provides cleanup on earlier
+failure. Return errors propagate without inventing a refund or idle owner.
+
+Foreign C plugins reveal scratch sizes through callbacks, so their first cold
+scratch growth is not a metadata-only admission guarantee. Warm backing reuse
+uses the same Host EP pool and funding as native workspace. Returned dynamic
+outputs own their payload independently of the retired scratch.
+
+Validation includes strict native preparation with nonzero graph scratch,
+changing branches, repeated backing reuse, retained-output independence,
+short/misaligned inherited rejection, actual nonzero scratch consumption across
+real ORT and both native plugin bridge paths, and Host callback tests for cold
+spill address stability, warm single-loan use, zero requests, concurrency,
+capacity refusal, optional hints, foreign memory-info rejection and failed
+return funding. Final local checks pass: native CPU 2,002/session 291; optional MLAS CPU
+2,044/session 293; plugin 384 and shared-mock 6 unit tests; API 106 unit tests,
+authority-privacy/integration/doctests; and all 12 required real-ORT shared-EP
+conformance tests on cached ORT 1.32. Strict all-target checks pass for the
+native API/CPU/session/engine/plugin stack and CUDA (`cuda,gpu-tests`, compile
+only). Before/after performance evidence remains required before publication.
+CUDA device execution and full-model throughput are not established on the
+current CPU-only host.

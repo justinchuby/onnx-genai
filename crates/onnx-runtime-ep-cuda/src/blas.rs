@@ -1551,7 +1551,7 @@ mod raw_workspace_allocation_guard {
             );
         }
 
-        let bindings = include_str!("../../onnx-runtime-session/src/executor/bindings.rs");
+        let registry = include_str!("kernels/mod.rs");
         for op in [
             "MatMul",
             "Gemm",
@@ -1559,9 +1559,15 @@ mod raw_workspace_allocation_guard {
             "FusedMatMulBias",
             "FusedGemm",
         ] {
+            let key = format!("OpKey::new(\"{op}\"");
+            let registration = registry
+                .split(&key)
+                .nth(1)
+                .expect("governed GEMM registration");
+            let declaration = registration.split("Box::new").next().unwrap();
             assert!(
-                bindings.contains(op),
-                "{op} must remain in the centralized is_planned_workspace_node predicate"
+                declaration.contains("WorkspacePlanning::Metadata"),
+                "{op} must declare metadata planning in its selected CUDA registration"
             );
         }
     }

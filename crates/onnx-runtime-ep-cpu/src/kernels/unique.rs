@@ -75,6 +75,8 @@ impl Kernel for UniqueKernel {
         &self,
         inputs: &[TensorView],
         requested_outputs: &[bool],
+
+        _workspace: Option<onnx_runtime_ep_api::WorkspaceView>,
     ) -> Result<Vec<Option<KernelSizedOutput>>> {
         self.compute_owned_outputs(inputs, requested_outputs)
     }
@@ -605,7 +607,7 @@ mod tests {
             axis: None,
             sorted: false,
         }
-        .execute_kernel_sized(&[input.view()], &[true, true, true, true])
+        .execute_kernel_sized(&[input.view()], &[true, true, true, true], None)
         .unwrap();
 
         assert_eq!(
@@ -634,7 +636,7 @@ mod tests {
             axis: None,
             sorted: true,
         }
-        .execute_kernel_sized(&[input.view()], &[true, false, true, false])
+        .execute_kernel_sized(&[input.view()], &[true, false, true, false], None)
         .unwrap();
 
         assert_eq!(output_f32(outputs[0].as_ref().unwrap()), [1., 2., 3.]);
@@ -655,7 +657,7 @@ mod tests {
                 axis: None,
                 sorted: true,
             }
-            .execute_kernel_sized(&[input.view()], &[true])
+            .execute_kernel_sized(&[input.view()], &[true], None)
             .unwrap();
             assert_eq!(output_f32(outputs[0].as_ref().unwrap()), expected);
         }
@@ -668,7 +670,7 @@ mod tests {
             axis: None,
             sorted: false,
         }
-        .execute_kernel_sized(&[input.view()], &[true])
+        .execute_kernel_sized(&[input.view()], &[true], None)
         .unwrap();
         assert_eq!(
             output_f32(outputs[0].as_ref().unwrap()),
@@ -694,7 +696,7 @@ mod tests {
             axis: None,
             sorted: true,
         }
-        .execute_kernel_sized(&[view], &[true])
+        .execute_kernel_sized(&[view], &[true], None)
         .unwrap_err();
         assert!(error.to_string().contains("host-only"));
         assert_eq!(UNIQUE_PLAN_RUNS.with(std::cell::Cell::get), 0);

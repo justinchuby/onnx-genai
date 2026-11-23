@@ -4317,6 +4317,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         let bytes_moved = structural_input_bytes(shapes, input_dtypes);
         let cost = Cost::ZERO.with_bytes_moved(bytes_moved);
         KernelMatch::Supported {
+            workspace_planning: self
+                .registry
+                .workspace_planning(&op.op_type, &op.domain, opset)
+                .expect("supported kernel has a versioned registration"),
             cost,
             required_input_layouts: None,
             output_layouts,

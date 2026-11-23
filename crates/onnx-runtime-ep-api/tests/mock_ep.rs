@@ -64,9 +64,17 @@ struct MockEp {
 impl MockEp {
     fn new() -> Self {
         let mut registry = OpRegistry::new();
-        registry.register(OpKey::new("Add", "", 7), Box::new(AddFactory));
+        registry.register(
+            OpKey::new("Add", "", 7),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(AddFactory),
+        );
         // A newer opset variant to exercise version resolution.
-        registry.register(OpKey::new("Add", "", 14), Box::new(AddFactory));
+        registry.register(
+            OpKey::new("Add", "", 14),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(AddFactory),
+        );
         Self {
             registry,
             initialized: false,
@@ -111,6 +119,7 @@ impl ExecutionProvider for MockEp {
             .is_some()
         {
             KernelMatch::Supported {
+                workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::None,
                 cost: Cost::new(1.0, 0.5, 0.0).with_bytes_moved(256),
                 required_input_layouts: None,
                 output_layouts: vec![TensorLayout::contiguous()],
@@ -177,8 +186,16 @@ fn lookup_tag(registry: &OpRegistry, op_type: &str, domain: &str, opset: u64) ->
 #[test]
 fn op_registry_resolves_highest_matching_opset() {
     let mut reg = OpRegistry::new();
-    reg.register(OpKey::new("Add", "", 14), Box::new(TaggedFactory(14)));
-    reg.register(OpKey::new("Add", "", 7), Box::new(TaggedFactory(7)));
+    reg.register(
+        OpKey::new("Add", "", 14),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(TaggedFactory(14)),
+    );
+    reg.register(
+        OpKey::new("Add", "", 7),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(TaggedFactory(7)),
+    );
     assert_eq!(reg.len(), 2);
 
     assert_eq!(lookup_tag(&reg, "Add", "", 7), Some(7));
@@ -190,7 +207,11 @@ fn op_registry_resolves_highest_matching_opset() {
 #[test]
 fn op_registry_reports_below_earliest_version() {
     let mut reg = OpRegistry::new();
-    reg.register(OpKey::new("Add", "", 7), Box::new(AddFactory));
+    reg.register(
+        OpKey::new("Add", "", 7),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(AddFactory),
+    );
 
     assert!(reg.lookup("Add", "", 6).is_none());
     assert!(!reg.supports("Add", "", 6));
@@ -201,8 +222,16 @@ fn op_registry_reports_below_earliest_version() {
 #[test]
 fn op_registry_aliases_default_onnx_domains() {
     let mut reg = OpRegistry::new();
-    reg.register(OpKey::new("Add", "ai.onnx", 7), Box::new(TaggedFactory(7)));
-    reg.register(OpKey::new("Mul", "", 9), Box::new(TaggedFactory(9)));
+    reg.register(
+        OpKey::new("Add", "ai.onnx", 7),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(TaggedFactory(7)),
+    );
+    reg.register(
+        OpKey::new("Mul", "", 9),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(TaggedFactory(9)),
+    );
 
     let empty_domain = reg.lookup("Add", "", 7).unwrap();
     let named_domain = reg.lookup("Add", "ai.onnx", 7).unwrap();
@@ -219,9 +248,14 @@ fn op_registry_aliases_default_onnx_domains() {
 #[test]
 fn op_registry_isolates_contrib_domain() {
     let mut reg = OpRegistry::new();
-    reg.register(OpKey::new("Add", "", 1), Box::new(TaggedFactory(1)));
+    reg.register(
+        OpKey::new("Add", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(TaggedFactory(1)),
+    );
     reg.register(
         OpKey::new("Add", "com.microsoft", 5),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(TaggedFactory(5)),
     );
 

@@ -132,6 +132,8 @@ pub fn structural_input_bytes(
 pub enum KernelMatch {
     Supported {
         cost: Cost,
+        /// Shape-independent scratch promise of this selected implementation.
+        workspace_planning: WorkspacePlanning,
         /// Layouts the kernel requires for each input, if constrained.
         required_input_layouts: Option<Vec<TensorLayout>>,
         /// Layouts the kernel produces for each output.
@@ -163,6 +165,16 @@ impl KernelMatch {
             Self::Unsupported { reason } => Some(reason),
         }
     }
+}
+
+/// Shape-independent promise carried by the selected kernel registration.
+/// Exact capacity remains solely a function of `Kernel::workspace_requirement`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspacePlanning {
+    /// Every legal specialization uses no executor-owned scratch.
+    None,
+    /// A specialization may need scratch; resolve metadata before admission.
+    Metadata,
 }
 
 /// Whether a compiled kernel can participate in device-graph capture.
@@ -891,14 +903,22 @@ pub trait Kernel: Send + KernelType {
     /// dtype, checked shape byte length, and buffer length before allocating
     /// final outputs, then performs one materialization copy per present slot.
     ///
-    /// The first implementation is intentionally host-only. Implementations
-    /// must reject non-host-accessible inputs before reading them.
+    /// `workspace` is borrowed executor/adapter scratch prepared from the same
+    /// metadata contract as ordinary execution. Retain no borrow after returning:
+    /// every returned output must independently own its bytes. An adapter may
+    /// decline an unsupported lifetime by passing `None`; a kernel requiring
+    /// scratch must reject that case with an actionable error.
+    ///
+    /// This output policy is host-only. Implementations must reject
+    /// non-host-accessible inputs before reading them.
     fn execute_kernel_sized(
         &self,
         inputs: &[TensorView],
         requested_outputs: &[bool],
+
+        workspace: Option<crate::WorkspaceView>,
     ) -> Result<Vec<Option<KernelSizedOutput>>> {
-        let _ = (inputs, requested_outputs);
+        let _ = (inputs, requested_outputs, workspace);
         Err(crate::EpError::KernelFailed(
             "kernel does not implement kernel-sized outputs".into(),
         ))
@@ -1112,6 +1132,7 @@ mod tests {
     #[test]
     fn kernel_match_reports_support() {
         let supported = KernelMatch::Supported {
+            workspace_planning: crate::WorkspacePlanning::Metadata,
             cost: Cost::new(1.0, 0.0, 0.0),
             required_input_layouts: None,
             output_layouts: vec![],
@@ -1127,6 +1148,7 @@ mod tests {
     fn require_positive(value: i32) -> KernelMatch {
         require!(value > 0, "value must be positive, got {value}");
         KernelMatch::Supported {
+            workspace_planning: crate::WorkspacePlanning::Metadata,
             cost: Cost::ZERO,
             required_input_layouts: None,
             output_layouts: vec![],

@@ -775,6 +775,7 @@ pub(crate) struct Executor {
     pub(super) inherited_workspace: InheritedWorkspaces,
     pub(super) workspace_preparation_required: bool,
     pub(super) workspace_preparation_memo: Option<WorkspacePreparationMemo>,
+    pub(super) workspace_node_locations: Vec<String>,
 }
 
 /// One successful metadata-only plan, scoped to this immutable executor graph.

@@ -1,7 +1,8 @@
 //! Structural control-flow conformance kernel. Production providers supply
 //! their own graph compiler; this test provider proves transport and dispatch.
 use onnx_runtime_ep_api::{
-    EpError, GraphKernelRequest, Kernel, KernelSizedOutput, Result, TensorMut, TensorView,
+    EpError, GraphKernelRequest, Kernel, KernelSizedOutput, Result, TensorMetadata, TensorMut,
+    TensorView, WorkspaceLayout, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{
     DataType, Graph, NodeId,
@@ -9,6 +10,9 @@ use onnx_runtime_ir::{
 };
 
 pub(super) static EXECUTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(super) static WORKSPACE_EXECUTIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 fn pattern(axis: i64) -> Pattern {
@@ -85,10 +89,25 @@ impl Kernel for IfKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        let Some(captured) = inputs.get(1).filter(|input| {
+            input.present && input.dtype == DataType::Float32 && input.shape.len() == 1
+        }) else {
+            return Err(EpError::KernelFailed("shared mock If workspace requires a present rank-one float32 capture in input slot 1; provide complete boundary metadata".into()));
+        };
+        let layout = std::alloc::Layout::array::<f32>(captured.shape[0]).map_err(|_| EpError::KernelFailed("shared mock If captured input exceeds addressable workspace capacity; reduce the input extent".into()))?;
+        Ok(WorkspaceRequirement {
+            bytes: layout.size() as u64,
+            alignment: layout.align(),
+            ..WorkspaceRequirement::NONE
+        })
+    }
     fn execute_kernel_sized(
         &self,
         inputs: &[TensorView],
         requested: &[bool],
+
+        workspace: Option<WorkspaceView>,
     ) -> Result<Vec<Option<KernelSizedOutput>>> {
         if inputs.len() != 2 || requested != [true] {
             return Err(EpError::KernelFailed(
@@ -117,6 +136,26 @@ impl Kernel for IfKernel {
             &[][..]
         } else {
             unsafe { std::slice::from_raw_parts(inputs[1].data_ptr::<u8>(), inputs[1].byte_size()) }
+        };
+        let [region] = WorkspaceLayout::new([std::alloc::Layout::array::<f32>(inputs[1].numel())
+            .map_err(|_| {
+                EpError::KernelFailed(
+                    "shared mock If capture scratch overflows; reduce the capture extent".into(),
+                )
+            })?])?
+        .bind(workspace)?;
+        let bytes = if bytes.is_empty() {
+            bytes
+        } else {
+            // SAFETY: the adapter lends checked exclusive Host backing through
+            // Compute. Initialize scratch before reading; returned Vec below
+            // independently owns its payload after the loan is reclaimed.
+            unsafe {
+                let ptr = region.ptr().as_ptr::<u8>();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+                WORKSPACE_EXECUTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::slice::from_raw_parts(ptr, bytes.len())
+            }
         };
         let mut result = bytes.to_vec();
         if !condition {

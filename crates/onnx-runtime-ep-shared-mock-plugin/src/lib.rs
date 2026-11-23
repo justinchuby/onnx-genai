@@ -236,6 +236,12 @@ pub extern "C" fn nxrt_mock_shared_ep_control_flow_executed() -> usize {
     control_flow::EXECUTIONS.load(Ordering::SeqCst)
 }
 
+/// Control-flow executions that consumed nonempty adapter-provided scratch.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_mock_shared_ep_control_flow_workspace_executed() -> usize {
+    control_flow::WORKSPACE_EXECUTIONS.load(Ordering::SeqCst)
+}
+
 /// Reset every counter. Tests call this before each scenario.
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_mock_shared_ep_reset_counters() {
@@ -333,6 +339,7 @@ impl ExecutionProvider for SharedMockEp {
             return KernelMatch::unsupported("shared mock EP is f32-only");
         }
         KernelMatch::Supported {
+            workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
             cost: Cost::ZERO,
             required_input_layouts: None,
             output_layouts: vec![TensorLayout::contiguous()],

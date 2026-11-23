@@ -679,7 +679,7 @@ pub struct DeviceId {
 ```rust
 /// Maps (op_type, domain, opset) → kernel factory.
 pub struct OpRegistry {
-    entries: HashMap<OpKey, Box<dyn KernelFactory>>,
+    entries: HashMap<OpKey, (WorkspacePlanning, Box<dyn KernelFactory>)>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -694,11 +694,21 @@ pub trait KernelFactory: Send + Sync {
 }
 
 impl OpRegistry {
-    pub fn register(&mut self, key: OpKey, factory: Box<dyn KernelFactory>);
+    pub fn register(&mut self, key: OpKey, planning: WorkspacePlanning, factory: Box<dyn KernelFactory>);
     /// Lookup best match (highest since_version ≤ graph's opset).
     pub fn lookup(&self, op_type: &str, domain: &str, opset: u64) -> Option<&dyn KernelFactory>;
 }
 ```
+
+Kernel registration explicitly declares `WorkspacePlanning::None` (no executor
+scratch for any legal specialization) or `WorkspacePlanning::Metadata` (resolve
+input metadata and ask the existing kernel requirement). The versioned registry
+returns that same declaration in `KernelMatch::Supported`; the session stores it
+in the selected node plan. A symbolic capability decline is conservatively
+planned as `Metadata`, never converted into a no-scratch promise. Executor-owned
+structural operations retain their standard recursive planning; an accepted
+graph kernel is planned as one implementation, without independently charging
+its internal nodes. Exact byte sizes remain in `Kernel::workspace_requirement`.
 
 ### 4.4 CPU EP Kernel Example (C++ FFI)
 

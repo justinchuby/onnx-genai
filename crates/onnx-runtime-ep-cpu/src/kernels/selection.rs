@@ -425,6 +425,8 @@ impl Kernel for NonMaxSuppressionKernel {
         &self,
         inputs: &[TensorView],
         requested_outputs: &[bool],
+
+        _workspace: Option<onnx_runtime_ep_api::WorkspaceView>,
     ) -> Result<Vec<Option<KernelSizedOutput>>> {
         if requested_outputs != [true] {
             return Err(EpError::KernelFailed(format!(
@@ -1336,6 +1338,7 @@ mod tests {
                 score.view(),
             ],
             &[true],
+            None,
         )
         .unwrap();
         assert_eq!(NMS_SELECTION_RUNS.with(std::cell::Cell::get), 1);
@@ -1466,7 +1469,7 @@ mod tests {
         let output = NonMaxSuppressionKernel {
             center_point_box: 0,
         }
-        .execute_kernel_sized(&[boxes.view(), scores.view()], &[true])
+        .execute_kernel_sized(&[boxes.view(), scores.view()], &[true], None)
         .unwrap();
         assert_eq!(output[0].as_ref().unwrap().shape, [0, 3]);
 
@@ -1483,6 +1486,7 @@ mod tests {
                 TensorView::absent(DataType::Float32),
             ],
             &[true],
+            None,
         )
         .unwrap();
         assert_eq!(output[0].as_ref().unwrap().shape, [2, 3]);
@@ -1507,7 +1511,7 @@ mod tests {
         let error = NonMaxSuppressionKernel {
             center_point_box: 0,
         }
-        .execute_kernel_sized(&[view, scores.view()], &[true])
+        .execute_kernel_sized(&[view, scores.view()], &[true], None)
         .unwrap_err();
         assert!(error.to_string().contains("host-only"));
         assert_eq!(NMS_SELECTION_RUNS.with(std::cell::Cell::get), 0);

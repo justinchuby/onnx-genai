@@ -3148,6 +3148,43 @@ unsafe extern "C" fn compute_execute(
                             continue;
                         }
 
+                        let plans = match exported.workspace_plan_cache(node_idx) {
+                            Some(plans) => plans,
+                            None => {
+                                return fail_status(&format!(
+                                    "Compute: node {node_idx}: missing workspace plan cache; compile all node workspace plans before execution"
+                                ));
+                            }
+                        };
+                        node_ort_operands.clear();
+                        node_ort_operands.extend(sources.iter().filter_map(
+                            |source| match source {
+                                NodeInputSource::Ort(index) => Some(*index),
+                                NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
+                            },
+                        ));
+                        let workspace = match unsafe {
+                            prepare_workspace(
+                                api_ref,
+                                kernel_context,
+                                PlacementSources {
+                                    ort_inputs: OrtOperands::Resolved(&node_ort_operands),
+                                    subgraph_fallback: SubgraphFallback {
+                                        staging: exported.device_staging.as_ref(),
+                                        memo: &subgraph_fallback_memo,
+                                    },
+                                },
+                                &*entry.kernel,
+                                plans,
+                                &kernel_inputs,
+                                format_args!(
+                                    "Compute: node {node_idx} host-owned dynamic-output workspace"
+                                ),
+                            )
+                        } {
+                            Ok(workspace) => workspace,
+                            Err(error) => return fail_status(&error),
+                        };
                         let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
                         let deferred = match run_kernel_sized(
                             exported,
@@ -3156,6 +3193,7 @@ unsafe extern "C" fn compute_execute(
                             &requested_outputs,
                             &entry.output_dtypes,
                             &format!("Compute: node {node_idx}"),
+                            workspace,
                         ) {
                             Ok(outputs) => outputs,
                             Err(error) => return fail_status(&error),
@@ -3773,6 +3811,35 @@ unsafe extern "C" fn compute_execute(
                         return ok_status();
                     }
 
+                    let plans = match exported.workspace_plan_cache(0) {
+                        Some(plans) => plans,
+                        None => {
+                            return fail_status(
+                                "Compute: node 0: missing workspace plan cache; compile the node workspace plan before execution",
+                            );
+                        }
+                    };
+                    let subgraph_fallback_memo = std::cell::Cell::new(None);
+                    let workspace = match unsafe {
+                        prepare_workspace(
+                            api_ref,
+                            kernel_context,
+                            PlacementSources {
+                                ort_inputs: OrtOperands::Slots(&entry.input_slots),
+                                subgraph_fallback: SubgraphFallback {
+                                    staging: exported.device_staging.as_ref(),
+                                    memo: &subgraph_fallback_memo,
+                                },
+                            },
+                            &*entry.kernel,
+                            plans,
+                            kernel_inputs,
+                            "Compute: node 0 host-owned dynamic-output workspace",
+                        )
+                    } {
+                        Ok(workspace) => workspace,
+                        Err(error) => return fail_status(&error),
+                    };
                     let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
                     let deferred = match run_kernel_sized(
                         exported,
@@ -3781,6 +3848,7 @@ unsafe extern "C" fn compute_execute(
                         &requested_outputs,
                         &entry.output_dtypes,
                         "Compute: node 0",
+                        workspace,
                     ) {
                         Ok(outputs) => outputs,
                         Err(error) => return fail_status(&error),
@@ -4045,6 +4113,7 @@ fn run_kernel_sized(
     requested_outputs: &[bool],
     declared_dtypes: &[DataType],
     context: &str,
+    workspace: Option<WorkspaceView>,
 ) -> Result<Vec<Option<KernelSizedOutput>>, String> {
     if kernel.kernel_sized_output_policy() != KernelSizedOutputPolicy::HostOwned {
         return Err(format!(
@@ -4083,7 +4152,7 @@ fn run_kernel_sized(
     }
 
     let outputs = kernel
-        .execute_kernel_sized(inputs, requested_outputs)
+        .execute_kernel_sized(inputs, requested_outputs, workspace)
         .map_err(|error| format!("{context}: kernel-sized execution failed: {error}"))?;
     validate_kernel_sized_outputs(&outputs, requested_outputs, declared_dtypes, context)?;
     Ok(outputs)
@@ -6242,6 +6311,8 @@ mod tests {
             &self,
             _inputs: &[TensorView],
             requested_outputs: &[bool],
+
+            _workspace: Option<onnx_runtime_ep_api::WorkspaceView>,
         ) -> onnx_runtime_ep_api::Result<Vec<Option<KernelSizedOutput>>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(requested_outputs
@@ -6286,6 +6357,7 @@ mod tests {
             &[true],
             &[DataType::Float32],
             "test",
+            None,
         )
         .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -6348,6 +6420,7 @@ mod tests {
             &[true],
             &[DataType::Float32],
             "test",
+            None,
         )
         .unwrap_err();
         assert!(error.contains("host-only"));
@@ -6368,6 +6441,7 @@ mod tests {
             &[true],
             &[DataType::Float32],
             "test",
+            None,
         )
         .unwrap_err();
         assert!(error.contains("this EP uses device-resident tensors"));

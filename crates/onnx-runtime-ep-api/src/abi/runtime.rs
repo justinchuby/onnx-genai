@@ -4,7 +4,7 @@ use std::path::Path;
 use std::ptr;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use onnx_genai_ort_sys as ort;
@@ -198,6 +198,8 @@ pub(super) struct PluginKernelShared {
     pub(super) calls: AtomicU64,
     pub(super) device_label: Arc<str>,
     pub(super) dynamic_output_dtypes: Option<Vec<onnx_runtime_ir::DataType>>,
+    pub(super) host_provider: Arc<dyn crate::ExecutionProvider>,
+    pub(super) scratch_peak: Arc<AtomicUsize>,
 }
 
 unsafe impl Send for PluginKernelShared {}
@@ -234,7 +236,16 @@ pub struct PluginCompiledKernel {
 }
 
 impl PluginCompiledKernel {
-    fn compute(&self, mut context: HostKernelContext) -> Result<HostKernelContext> {
+    fn compute(
+        &self,
+        mut context: HostKernelContext,
+        workspace: Option<crate::WorkspaceView>,
+    ) -> Result<HostKernelContext> {
+        context.prepare_scratch(
+            self.shared.host_provider.clone(),
+            self.shared.scratch_peak.clone(),
+            workspace,
+        );
         let mut states = self.shared.states.lock().map_err(|_| {
             EpError::KernelFailed(
                 "plugin fused-subgraph state mutex was poisoned; recreate the session".into(),
@@ -310,7 +321,17 @@ impl PluginCompiledKernel {
         // to check plugin compatibility and ORT_API_VERSION, which is exactly
         // wrong once the plugin has already loaded, compiled and run. A
         // failure here is about this call.
-        check_compute_status(&self.shared.runtime.path, self.shared.index, status)?;
+        let execution = check_compute_status(&self.shared.runtime.path, self.shared.index, status);
+        let cleanup = context.finish_scratch(execution.is_ok());
+        if let Err(error) = execution {
+            if let Err(cleanup) = cleanup {
+                return Err(EpError::KernelFailed(format!(
+                    "{error}; additionally, Host scratch cleanup failed: {cleanup}; recreate the plugin execution plan"
+                )));
+            }
+            return Err(error);
+        }
+        cleanup?;
         self.shared.calls.fetch_add(1, Ordering::Relaxed);
         Ok(context)
     }
@@ -318,7 +339,17 @@ impl PluginCompiledKernel {
 
 impl Kernel for PluginCompiledKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.compute(HostKernelContext::new(inputs, outputs)?)
+        self.compute(HostKernelContext::new(inputs, outputs)?, None)
+            .map(|_| ())
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<crate::WorkspaceView>,
+    ) -> Result<()> {
+        self.compute(HostKernelContext::new(inputs, outputs)?, workspace)
             .map(|_| ())
     }
 
@@ -330,12 +361,17 @@ impl Kernel for PluginCompiledKernel {
         &self,
         inputs: &[TensorView],
         requested: &[bool],
+
+        workspace: Option<crate::WorkspaceView>,
     ) -> Result<Vec<Option<crate::KernelSizedOutput>>> {
         let dtypes = self.shared.dynamic_output_dtypes.as_ref().ok_or_else(|| {
             EpError::KernelFailed("plugin kernel was compiled with static output allocation".into())
         })?;
-        self.compute(HostKernelContext::dynamic(inputs, dtypes, requested)?)?
-            .into_dynamic_outputs()
+        self.compute(
+            HostKernelContext::dynamic(inputs, dtypes, requested)?,
+            workspace,
+        )?
+        .into_dynamic_outputs()
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {

@@ -1234,6 +1234,7 @@ fn whole_graph_control_flow_crosses_the_plugin_bridge_and_executes() {
     let Some(f) = Fixture::acquire("whole graph control flow") else {
         return;
     };
+    let workspace_before = f.counter("nxrt_mock_shared_ep_control_flow_workspace_executed");
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 24);
     let x = graph.create_named_value("x", DataType::Float32, static_shape([2]));
@@ -1284,9 +1285,18 @@ fn whole_graph_control_flow_crosses_the_plugin_bridge_and_executes() {
             .insert(name.into(), Attribute::Graph(Box::new(body.clone())));
         graph.subgraphs.insert((owner, name.into()), body);
     }
-    let (claims, plan) =
-        PluginExecutionPlan::compile(&graph, &f.plugin_path, Some(c"nxrt_mock_compile_only"))
-            .unwrap();
+    let (claims, plan) = PluginExecutionPlan::compile(
+        &graph,
+        &f.plugin_path,
+        Some(c"nxrt_mock_compile_only"),
+        std::sync::Arc::new(
+            onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_resources(
+                Default::default(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
     assert_eq!(
         claims.len(),
         1,
@@ -1326,7 +1336,7 @@ fn whole_graph_control_flow_crosses_the_plugin_bridge_and_executes() {
                 }
             })
             .collect::<Vec<_>>();
-        let mut result = kernel.execute_kernel_sized(&views, &[true]).unwrap();
+        let mut result = kernel.execute_kernel_sized(&views, &[true], None).unwrap();
         let result = result.remove(0).unwrap();
         let expected = if condition != 0 {
             vec![9., 4.]
@@ -1342,6 +1352,11 @@ fn whole_graph_control_flow_crosses_the_plugin_bridge_and_executes() {
         assert_eq!(decoded, expected);
     }
     assert_eq!(plan.compute_calls(), 3);
+    assert_eq!(
+        f.counter("nxrt_mock_shared_ep_control_flow_workspace_executed") - workspace_before,
+        3,
+        "each claimed dynamic-output execution must consume nonempty prepared workspace"
+    );
 }
 
 #[test]
@@ -1350,6 +1365,7 @@ fn whole_graph_control_flow_executes_on_the_ep_in_real_ort() {
     let Some(f) = Fixture::acquire("real ORT control flow") else {
         return;
     };
+    let workspace_before = f.counter("nxrt_mock_shared_ep_control_flow_workspace_executed");
     let api = f.api;
     let model =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/control_flow.onnx.textproto");
@@ -1463,6 +1479,11 @@ fn whole_graph_control_flow_executes_on_the_ep_in_real_ort() {
             "unregister control flow EP",
         );
     }
+    assert_eq!(
+        f.counter("nxrt_mock_shared_ep_control_flow_workspace_executed") - workspace_before,
+        3,
+        "each claimed dynamic-output execution must consume nonempty prepared workspace"
+    );
 }
 
 #[test]
@@ -1474,6 +1495,7 @@ fn whole_graph_control_flow_executes_through_native_plugin_session() {
     let Some(f) = Fixture::acquire("native plugin control flow session") else {
         return;
     };
+    let workspace_before = f.counter("nxrt_mock_shared_ep_control_flow_workspace_executed");
     let provider = PluginExecutionProvider::new(
         f.plugin_path.clone(),
         Some("nxrt_mock_compile_only".into()),
@@ -1511,5 +1533,10 @@ fn whole_graph_control_flow_executes_through_native_plugin_session() {
     assert_eq!(
         f.counter("nxrt_mock_shared_ep_control_flow_executed") - before,
         3
+    );
+    assert_eq!(
+        f.counter("nxrt_mock_shared_ep_control_flow_workspace_executed") - workspace_before,
+        3,
+        "each claimed dynamic-output execution must consume nonempty prepared workspace"
     );
 }

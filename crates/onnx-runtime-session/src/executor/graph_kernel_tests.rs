@@ -11,6 +11,7 @@ struct PatternGraphEp {
     malformed: bool,
     claim_override: Option<Vec<NodeId>>,
     compile_failure: bool,
+    scratch_bytes: usize,
 }
 impl PatternGraphEp {
     fn new(malformed: bool) -> Self {
@@ -24,6 +25,7 @@ impl PatternGraphEp {
             malformed,
             claim_override: None,
             compile_failure: false,
+            scratch_bytes: 0,
         }
     }
 }
@@ -53,6 +55,7 @@ fn if_pattern() -> Pattern {
 
 struct IfPatternKernel {
     captured: usize,
+    scratch_bytes: usize,
     executions: Arc<AtomicUsize>,
     malformed: bool,
 }
@@ -69,10 +72,22 @@ impl Kernel for IfPatternKernel {
     fn has_kernel_sized_outputs(&self) -> bool {
         true
     }
+    fn workspace_requirement(
+        &self,
+        _inputs: &[TensorMetadata<'_>],
+    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        Ok(WorkspaceRequirement {
+            bytes: self.scratch_bytes as u64,
+            alignment: 16,
+            ..WorkspaceRequirement::NONE
+        })
+    }
     fn execute_kernel_sized(
         &self,
         inputs: &[TensorView],
         requested: &[bool],
+
+        workspace: Option<onnx_runtime_ep_api::WorkspaceView>,
     ) -> onnx_runtime_ep_api::Result<Vec<Option<KernelSizedOutput>>> {
         assert_eq!(requested, [true]);
         for input in inputs {
@@ -89,6 +104,29 @@ impl Kernel for IfPatternKernel {
         let input = &inputs[self.captured];
         let bytes =
             unsafe { std::slice::from_raw_parts(input.data_ptr::<u8>(), input.byte_size()) };
+        let bytes =
+            if self.scratch_bytes == 0 {
+                bytes
+            } else {
+                let layout = onnx_runtime_ep_api::WorkspaceLayout::new([
+                    std::alloc::Layout::from_size_align(self.scratch_bytes, 16).unwrap(),
+                ])?;
+                let [region] = layout.bind(workspace)?;
+                if bytes.len() > region.bytes() {
+                    return Err(EpError::KernelFailed(
+                    "test graph scratch is too short for captured input; increase scratch_bytes"
+                        .into(),
+                ));
+                }
+                // SAFETY: the binder checked live aligned Host backing, exclusively
+                // lent for this call. Copy initializes bytes before forming a slice;
+                // the returned output below copies again into its own independent Vec.
+                unsafe {
+                    let ptr = region.ptr().as_ptr::<u8>();
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+                    std::slice::from_raw_parts(ptr, bytes.len())
+                }
+            };
         let mut shape = input.shape.to_vec();
         if shape.is_empty() {
             return Err(EpError::KernelFailed(
@@ -245,11 +283,35 @@ impl ExecutionProvider for PatternGraphEp {
         }
         Ok(Box::new(IfPatternKernel {
             captured,
+            scratch_bytes: self.scratch_bytes,
             executions: self.executions.clone(),
             malformed: self.malformed,
         }))
     }
 
+    fn allocate_workspace(
+        &self,
+        bytes: usize,
+        alignment: usize,
+        role: onnx_runtime_memory_api::MemoryRole,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceAllocation> {
+        self.cpu.allocate_workspace(bytes, alignment, role)
+    }
+    fn replace_workspace(
+        &self,
+        old: Option<onnx_runtime_ep_api::WorkspaceAllocation>,
+        bytes: usize,
+        alignment: usize,
+        role: onnx_runtime_memory_api::MemoryRole,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceAllocation> {
+        self.cpu.replace_workspace(old, bytes, alignment, role)
+    }
+    fn deallocate_workspace(
+        &self,
+        allocation: onnx_runtime_ep_api::WorkspaceAllocation,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.deallocate_workspace(allocation)
+    }
     fn allocate(&self, size: usize, alignment: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
         self.cpu.allocate(size, alignment)
     }
@@ -462,6 +524,8 @@ impl Kernel for AccumulatingKernel {
         &self,
         inputs: &[TensorView],
         requested: &[bool],
+
+        _workspace: Option<onnx_runtime_ep_api::WorkspaceView>,
     ) -> onnx_runtime_ep_api::Result<Vec<Option<KernelSizedOutput>>> {
         assert_eq!(requested, [true, true]);
         for input in inputs.iter().filter(|input| !input.is_absent()) {
@@ -787,4 +851,95 @@ fn whole_graph_unknown_rank_inputs_follow_runtime_rank_changes() {
     }
     assert_eq!(ep.executions.load(Ordering::Relaxed), 3);
     assert_eq!(custom.control_flow_stats().subgraph_runs, 0);
+}
+
+#[test]
+fn claimed_dynamic_outputs_use_prepared_scratch_without_lending_it_to_outputs() {
+    let mut provider = PatternGraphEp::new(false);
+    provider.scratch_bytes = 64;
+    let ep = Arc::new(provider);
+    let mut executor =
+        Executor::build(if_graph(), Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    assert_eq!(
+        executor.workspace_node_locations().len(),
+        1,
+        "opaque claimed program must not independently plan its internal branches"
+    );
+    let mut first_address = None;
+    let mut retained = None;
+    for (condition, values) in [
+        (true, vec![1., 2.]),
+        (false, vec![3., 4.]),
+        (true, vec![8., 9., 10.]),
+        (false, vec![-1., 7.]),
+    ] {
+        let x = Tensor::from_f32(&[values.len()], &values).unwrap();
+        let cond = Tensor::from_raw(DataType::Bool, vec![], &[u8::from(condition)]).unwrap();
+        let requirement = executor
+            .prepare_with_device_bindings(&[("x", &x), ("condition", &cond)], &mut [])
+            .unwrap();
+        assert_eq!(requirement.bytes, 64);
+        assert_eq!(requirement.lifetime, WorkspaceLifetime::StepScoped);
+        let address = executor.step_workspace.as_ref().unwrap().buffer.as_ptr() as usize;
+        if let Some(first) = first_address {
+            assert_eq!(
+                address, first,
+                "warm slot must reuse backing across branch and input-shape changes"
+            );
+        } else {
+            first_address = Some(address);
+        }
+        let actual = executor.run(&[("x", &x), ("condition", &cond)]).unwrap();
+        let expected = if condition {
+            values.clone()
+        } else {
+            [values.clone(), values].concat()
+        };
+        assert_eq!(actual[0].to_vec_f32(), expected);
+        if let Some(first) = &retained {
+            let first: &Vec<Tensor> = first;
+            assert_eq!(
+                first[0].to_vec_f32(),
+                [1., 2.],
+                "retained output must not alias scratch reused by later runs"
+            );
+        } else {
+            retained = Some(actual);
+        }
+    }
+    assert_eq!(ep.executions.load(Ordering::Relaxed), 4);
+    assert_eq!(executor.control_flow_stats().subgraph_runs, 0);
+}
+
+#[test]
+fn claimed_dynamic_outputs_reject_short_or_misaligned_inherited_scratch_before_execution() {
+    let mut provider = PatternGraphEp::new(false);
+    provider.scratch_bytes = 64;
+    let ep = Arc::new(provider);
+    let mut executor =
+        Executor::build(if_graph(), Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    let x = Tensor::from_f32(&[2], &[1., 2.]).unwrap();
+    let cond = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
+    executor
+        .prepare_with_device_bindings(&[("x", &x), ("condition", &cond)], &mut [])
+        .unwrap();
+    let mut backing = [0u128; 8];
+    let address = backing.as_mut_ptr() as usize;
+    for (ptr, bytes, message) in [
+        (address, 63, "workspace invariant mismatch"),
+        (address + 1, 64, "live, aligned enclosing workspace"),
+    ] {
+        executor.inherited_workspace.step = Some((ptr, bytes));
+        let error = executor
+            .run(&[("x", &x), ("condition", &cond)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(message), "{error}");
+        assert_eq!(
+            ep.executions.load(Ordering::Relaxed),
+            0,
+            "rejected backing must fail before executing or publishing dynamic outputs"
+        );
+    }
+    executor.inherited_workspace.step = None;
 }

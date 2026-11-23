@@ -821,114 +821,144 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
     {
         registry.register(
             OpKey::new(nchwc::REORDER_TO_BLOCKED_OP, nchwc::NCHWC_DOMAIN, 1),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(nchwc::NchwcReorderToBlockedFactory),
         );
         registry.register(
             OpKey::new(nchwc::REORDER_TO_NCHW_OP, nchwc::NCHWC_DOMAIN, 1),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(nchwc::NchwcReorderToNchwFactory),
         );
         registry.register(
             OpKey::new(nchwc::NCHWC_CONV_OP, nchwc::NCHWC_DOMAIN, 1),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(nchwc::NchwcConvFactory),
         );
         registry.register(
             OpKey::new(nchwc::NCHWC_MAX_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(nchwc::NchwcPoolFactory::max()),
         );
         registry.register(
             OpKey::new(nchwc::NCHWC_AVERAGE_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(nchwc::NchwcPoolFactory::average()),
         );
         registry.register(
             OpKey::new(nchwc::NCHWC_GLOBAL_AVERAGE_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(nchwc::NchwcPoolFactory::global_average()),
         );
     }
     registry.register(
         OpKey::new("GridSample", "", 16),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(grid_sample::GridSampleFactory { since_version: 16 }),
     );
     registry.register(
         OpKey::new("GridSample", "", 20),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(grid_sample::GridSampleFactory { since_version: 20 }),
     );
     registry.register(
         OpKey::new("Resize", "", 10),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(resize::ResizeFactory { since_version: 10 }),
     );
     registry.register(
         OpKey::new("Resize", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(resize::ResizeFactory { since_version: 11 }),
     );
     registry.register(
         OpKey::new("AffineGrid", "", 20),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(affine_grid::AffineGridFactory),
     );
     registry.register(
         OpKey::new("Col2Im", "", 18),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(col2im::Col2ImFactory),
     );
     registry.register(
         OpKey::new("ConvTranspose", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(conv_transpose::ConvTransposeFactory),
     );
-    registry.register(OpKey::new("Conv", "", 1), Box::new(conv::ConvFactory));
+    registry.register(
+        OpKey::new("Conv", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(conv::ConvFactory),
+    );
     registry.register(
         OpKey::new("CenterCropPad", "", 18),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(center_crop_pad::CenterCropPadFactory),
     );
     for version in [1, 7, 10, 11, 19] {
         registry.register(
             OpKey::new("AveragePool", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(pooling::AveragePoolFactory),
         );
     }
     for version in [1, 8, 10, 11, 12] {
         registry.register(
             OpKey::new("MaxPool", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(pooling::MaxPoolFactory),
         );
     }
     registry.register(
         OpKey::new("GlobalAveragePool", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(pooling::GlobalAveragePoolFactory),
     );
     registry.register(
         OpKey::new("GlobalMaxPool", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(pooling::GlobalMaxPoolFactory),
     );
     registry.register(
         OpKey::new("LpPool", "", 18),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(pooling::LpPoolFactory),
     );
     registry.register(
         OpKey::new("GlobalLpPool", "", 2),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(pooling::GlobalLpPoolFactory),
     );
     registry.register(
         OpKey::new("SpaceToDepth", "", 13),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(space_to_depth::SpaceToDepthFactory),
     );
     // BatchNormalization inference semantics are stable since opset 7, when
     // the legacy `is_test` attribute was removed.
     registry.register(
         OpKey::new("BatchNormalization", "", 7),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(norm_ops::BatchNormFactory),
     );
     registry.register(
         OpKey::new("InstanceNormalization", "", 6),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(norm_ops::InstanceNormFactory),
     );
     registry.register(
         OpKey::new("GroupNormalization", "", 18),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(norm_ops::GroupNormFactory { since_version: 18 }),
     );
     registry.register(
         OpKey::new("GroupNormalization", "", 21),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(norm_ops::GroupNormFactory { since_version: 21 }),
     );
     registry.register(
         OpKey::new("PRelu", "", 16),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(norm_ops::PReluFactory),
     );
 });
@@ -999,18 +1029,22 @@ pub(crate) fn build_cpu_registry_with_resources(
     register_cnn_ops(&mut rec);
     rec.register(
         OpKey::new("MatMul", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(matmul::MatMulFactory::new(resources.clone())),
     );
     rec.register(
         OpKey::new("Einsum", "", 12),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(einsum::EinsumFactory::new(resources.clone())),
     );
     rec.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(matmul_nbits::MatMulNBitsFactory::new(resources.clone())),
     );
     rec.register(
         OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory::new(
             derived_weights.clone(),
             dense_weight_cache_bytes,
@@ -1018,6 +1052,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(block_quantized_moe::BlockQuantizedMoEFactory::new(
             derived_weights.clone(),
             dense_weight_cache_bytes,
@@ -1025,45 +1060,67 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("IndexShare", "pkg.nxrt", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(index_share::IndexShareFactory),
     );
     rec.register(
         OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(dsa_index_select::DsaIndexSelectFactory),
     );
     rec.register(
         OpKey::new("VarlenAttention", "pkg.nxrt", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(varlen_attention::VarlenAttentionFactory),
     );
     rec.register(
         OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(packed_varlen_attention::PackedVarlenAttentionFactory),
     );
     rec.register(
         OpKey::new("PackedMultiHeadAttention", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(packed_multi_head_attention::PackedMultiHeadAttentionFactory),
     );
     rec.register(
         OpKey::new("SparseKvGather", "pkg.nxrt", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sparse_kv_gather::SparseKvGatherFactory),
     );
     rec.register(
         OpKey::new("CompressedSparseAttention", "pkg.nxrt", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(compressed_sparse_attention::CompressedSparseAttentionFactory),
     );
-    rec.register(OpKey::new("Add", "", 1), Box::new(add::AddFactory));
-    rec.register(OpKey::new("Relu", "", 1), Box::new(relu::ReluFactory));
+    rec.register(
+        OpKey::new("Add", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(add::AddFactory),
+    );
+    rec.register(
+        OpKey::new("Relu", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(relu::ReluFactory),
+    );
     rec.register(
         OpKey::new("Reshape", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reshape::ReshapeFactory),
     );
     rec.register(
         OpKey::new("Transpose", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(transpose::TransposeFactory),
     );
-    rec.register(OpKey::new("Gather", "", 1), Box::new(gather::GatherFactory));
+    rec.register(
+        OpKey::new("Gather", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(gather::GatherFactory),
+    );
     rec.register(
         OpKey::new("LayerNormalization", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(layernorm::LayerNormFactory),
     );
     // The optimizer emits fused `LayerNormalization` in the private contrib
@@ -1072,6 +1129,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // still serves standard ONNX `LayerNormalization`.
     rec.register(
         OpKey::new("LayerNormalization", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(layernorm::LayerNormFactory),
     );
     // The optimizer's `MatMul + Add(bias)` fusion emits `FusedMatMulBias` in the
@@ -1079,6 +1137,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // (domain, op_type). It reuses the shared MatMul GEMM + broadcast-Add.
     rec.register(
         OpKey::new("FusedMatMulBias", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(fused_matmul_bias::FusedMatMulBiasFactory::new(
             resources.clone(),
         )),
@@ -1089,6 +1148,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // + elementwise Relu.
     rec.register(
         OpKey::new("FusedGemm", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(fused_gemm::FusedGemmFactory::new(resources.clone())),
     );
     // The optimizer's SDPA-core fusion (MatMul(QKᵀ) → scale → [+mask] → Softmax
@@ -1098,10 +1158,12 @@ pub(crate) fn build_cpu_registry_with_resources(
     // extracted last-axis softmax helper.
     rec.register(
         OpKey::new("FusedAttention", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(fused_attention::FusedAttentionFactory),
     );
     rec.register(
         OpKey::new("GroupQueryAttention", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(group_query_attention::GroupQueryAttentionFactory),
     );
     // `com.microsoft::MultiHeadAttention` (opset 1): scaled dot-product
@@ -1111,6 +1173,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // (`past_*` → `present_*`). f32 reference kernel matching ORT 1.26.0.
     rec.register(
         OpKey::new("MultiHeadAttention", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(multi_head_attention::MultiHeadAttentionFactory),
     );
     // `com.microsoft::Attention` (opset 1): the packed-QKV BERT/GPT attention
@@ -1122,6 +1185,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // kernel matching ORT 1.26.0; unblocks Whisper's packed-QKV encoder.
     rec.register(
         OpKey::new("Attention", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(msft_attention::MsftAttentionFactory),
     );
     // `com.microsoft::CausalConvWithState` and `com.microsoft::LinearAttention`:
@@ -1129,6 +1193,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // Qwen3-Next. Shape-driven and gate-configurable (no model-specific dims).
     rec.register(
         OpKey::new("CausalConvWithState", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
     // Standard ONNX-domain spelling, opset 27. Same contract as the contrib op
@@ -1137,16 +1202,19 @@ pub(crate) fn build_cpu_registry_with_resources(
     // than growing a second implementation to keep in step.
     rec.register(
         OpKey::new("CausalConvWithState", "", 27),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
     rec.register(
         OpKey::new("LinearAttention", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(linear_attention::LinearAttentionFactory),
     );
     // Standard ONNX-domain spelling (onnx/onnx#7689), semantically identical to
     // the com.microsoft op — served by the same fused kernel.
     rec.register(
         OpKey::new("LinearAttention", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(linear_attention::LinearAttentionFactory),
     );
     // `com.microsoft::GatherBlockQuantized`: block-quantized embedding gather
@@ -1154,6 +1222,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // dequantizes on the fly to the graph's activation dtype.
     rec.register(
         OpKey::new("GatherBlockQuantized", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(gather_block_quantized::GatherBlockQuantizedFactory),
     );
     // Standard `ai.onnx::Attention`: the richer SDPA op with 3D/4D inputs,
@@ -1167,10 +1236,12 @@ pub(crate) fn build_cpu_registry_with_resources(
     // swapped ordering and `nonpad_kv_seqlen` support.
     rec.register(
         OpKey::new("Attention", "", 23),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(attention::AttentionFactory { since_version: 23 }),
     );
     rec.register(
         OpKey::new("Attention", "", 24),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(attention::AttentionFactory { since_version: 24 }),
     );
     // The optimizer's exact-GELU fusion emits `com.microsoft::Gelu`; bind its
@@ -1178,46 +1249,57 @@ pub(crate) fn build_cpu_registry_with_resources(
     // op, so it is registered only under `com.microsoft`).
     rec.register(
         OpKey::new("Gelu", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(gelu::GeluFactory),
     );
     rec.register(
         OpKey::new("BiasGelu", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(contrib_fused::BiasGeluFactory),
     );
     rec.register(
         OpKey::new("FastGelu", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(contrib_fused::FastGeluFactory),
     );
     rec.register(
         OpKey::new("QuickGelu", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(contrib_fused::QuickGeluFactory),
     );
     rec.register(
         OpKey::new("Silu", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(activations::SiluFactory),
     );
     rec.register(
         OpKey::new("SkipLayerNormalization", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(contrib_fused::SkipLayerNormFactory),
     );
     rec.register(
         OpKey::new("SimplifiedLayerNormalization", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
     );
     rec.register(
         OpKey::new("SimplifiedLayerNormalization", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
     );
     rec.register(
         OpKey::new("SkipSimplifiedLayerNormalization", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(skip_simplified_layernorm::SkipSimplifiedLayerNormFactory),
     );
     rec.register(
         OpKey::new("MoE", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(moe::MoEFactory),
     );
     rec.register(
         OpKey::new("QMoE", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(qmoe::QMoEFactory::new(host_cache)),
     );
     // Standard-domain LLM/transformer primitives (ai.onnx). Registered at their
@@ -1227,129 +1309,228 @@ pub(crate) fn build_cpu_registry_with_resources(
     // `ai.onnx::Gelu` was added at opset 20 with the `approximate` attribute
     // ("none" = exact erf, "tanh" = tanh approximation). Distinct from the
     // com.microsoft::Gelu contrib op above.
-    rec.register(OpKey::new("Gelu", "", 20), Box::new(gelu::StdGeluFactory));
+    rec.register(
+        OpKey::new("Gelu", "", 20),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(gelu::StdGeluFactory),
+    );
     // `ai.onnx::RMSNormalization` added at opset 23.
     rec.register(
         OpKey::new("RMSNormalization", "", 23),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(rmsnorm::RmsNormFactory),
     );
     rec.register(
         OpKey::new("LpNormalization", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(lp_normalization::LpNormalizationFactory),
     );
     // `ai.onnx::RotaryEmbedding` added at opset 23.
     rec.register(
         OpKey::new("RotaryEmbedding", "", 23),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(rotary_embedding::RotaryEmbeddingFactory),
     );
     // `com.microsoft::RotaryEmbedding` contrib op: same rotation math, but the
     // inputs are ordered `(X, position_ids, cos_cache, sin_cache)`.
     rec.register(
         OpKey::new("RotaryEmbedding", "com.microsoft", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(rotary_embedding::RotaryEmbeddingContribFactory),
     );
     // `ai.onnx::Swish` added at opset 24: y = x·sigmoid(alpha·x).
     rec.register(
         OpKey::new("Swish", "", 24),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(activations::SwishFactory),
     );
     // Elementwise binary broadcasting ops.
-    rec.register(OpKey::new("Sub", "", 1), Box::new(elementwise::SubFactory));
-    rec.register(OpKey::new("Mul", "", 1), Box::new(elementwise::MulFactory));
-    rec.register(OpKey::new("Div", "", 1), Box::new(elementwise::DivFactory));
-    rec.register(OpKey::new("Mod", "", 10), Box::new(elementwise::ModFactory));
-    rec.register(OpKey::new("Pow", "", 1), Box::new(elementwise::PowFactory));
-    rec.register(OpKey::new("IsInf", "", 10), Box::new(is_inf::IsInfFactory));
-    rec.register(OpKey::new("IsNaN", "", 9), Box::new(is_nan::IsNaNFactory));
+    rec.register(
+        OpKey::new("Sub", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(elementwise::SubFactory),
+    );
+    rec.register(
+        OpKey::new("Mul", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(elementwise::MulFactory),
+    );
+    rec.register(
+        OpKey::new("Div", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(elementwise::DivFactory),
+    );
+    rec.register(
+        OpKey::new("Mod", "", 10),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(elementwise::ModFactory),
+    );
+    rec.register(
+        OpKey::new("Pow", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(elementwise::PowFactory),
+    );
+    rec.register(
+        OpKey::new("IsInf", "", 10),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(is_inf::IsInfFactory),
+    );
+    rec.register(
+        OpKey::new("IsNaN", "", 9),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(is_nan::IsNaNFactory),
+    );
     rec.register(
         OpKey::new("EyeLike", "", 9),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(eye_like::EyeLikeFactory),
     );
-    rec.register(OpKey::new("Min", "", 1), Box::new(elementwise::MinFactory));
-    rec.register(OpKey::new("Max", "", 1), Box::new(elementwise::MaxFactory));
-    rec.register(OpKey::new("Sum", "", 1), Box::new(elementwise::SumFactory));
+    rec.register(
+        OpKey::new("Min", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(elementwise::MinFactory),
+    );
+    rec.register(
+        OpKey::new("Max", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(elementwise::MaxFactory),
+    );
+    rec.register(
+        OpKey::new("Sum", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(elementwise::SumFactory),
+    );
     rec.register(
         OpKey::new("Mean", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(elementwise::MeanFactory),
     );
     // Elementwise unary ops.
     rec.register(
         OpKey::new("Sqrt", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(elementwise::SqrtFactory),
     );
-    rec.register(OpKey::new("Erf", "", 1), Box::new(elementwise::ErfFactory));
+    rec.register(
+        OpKey::new("Erf", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(elementwise::ErfFactory),
+    );
     rec.register(
         OpKey::new("Tanh", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(elementwise::TanhFactory),
     );
-    rec.register(OpKey::new("Cast", "", 1), Box::new(cast::CastFactory));
+    rec.register(
+        OpKey::new("Cast", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(cast::CastFactory),
+    );
     rec.register(
         OpKey::new("CastLike", "", 15),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(cast::CastLikeFactory),
     );
     // Identity: dtype-agnostic passthrough (raw byte copy).
     rec.register(
         OpKey::new("Identity", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(identity::IdentityFactory),
     );
     rec.register(
         OpKey::new("ReduceMean", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reduce::ReduceMeanFactory),
     );
     // Softmax: legacy coerce-to-2D at opset ≤ 12, per-axis at opset ≥ 13. The
     // provider's opset-aware lookup selects the version-correct kernel.
     rec.register(
         OpKey::new("Softmax", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(softmax::SoftmaxLegacyFactory),
     );
     rec.register(
         OpKey::new("Softmax", "", 13),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(softmax::SoftmaxFactory),
     );
     // LogSoftmax shares Softmax's opset split: legacy flattened trailing axes
     // through opset 12, then one-axis normalization from opset 13.
     rec.register(
         OpKey::new("LogSoftmax", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(log_softmax::LogSoftmaxLegacyFactory),
     );
     rec.register(
         OpKey::new("LogSoftmax", "", 13),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(log_softmax::LogSoftmaxFactory),
     );
     // Shape / data movement.
-    rec.register(OpKey::new("Shape", "", 1), Box::new(shape::ShapeFactory));
+    rec.register(
+        OpKey::new("Shape", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(shape::ShapeFactory),
+    );
     rec.register(
         OpKey::new("Unsqueeze", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unsqueeze::UnsqueezeFactory),
     );
-    rec.register(OpKey::new("Expand", "", 1), Box::new(expand::ExpandFactory));
-    rec.register(OpKey::new("Slice", "", 1), Box::new(slice::SliceFactory));
-    rec.register(OpKey::new("Split", "", 1), Box::new(split::SplitFactory));
-    rec.register(OpKey::new("Split", "", 18), Box::new(split::SplitFactory));
+    rec.register(
+        OpKey::new("Expand", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(expand::ExpandFactory),
+    );
+    rec.register(
+        OpKey::new("Slice", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(slice::SliceFactory),
+    );
+    rec.register(
+        OpKey::new("Split", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(split::SplitFactory),
+    );
+    rec.register(
+        OpKey::new("Split", "", 18),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(split::SplitFactory),
+    );
     rec.register(
         OpKey::new("Unique", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unique::UniqueFactory),
     );
     rec.register(
         OpKey::new("Dropout", "", 13),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(dropout::DropoutFactory),
     );
     rec.register(
         OpKey::new("Dropout", "", 22),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(dropout::DropoutFactory),
     );
-    rec.register(OpKey::new("Pad", "", 1), Box::new(pad::PadFactory));
+    rec.register(
+        OpKey::new("Pad", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(pad::PadFactory),
+    );
     rec.register(
         OpKey::new("ConstantOfShape", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(constant_of_shape::ConstantOfShapeFactory),
     );
     rec.register(
         OpKey::new("Constant", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(constant::ConstantFactory),
     );
     // GEMM.
     rec.register(
         OpKey::new("Gemm", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(gemm::GemmFactory::new(resources.clone())),
     );
     // Linear quantization evolved at opsets 10, 13, 19, 21, 23, and 25. The
@@ -1357,19 +1538,23 @@ pub(crate) fn build_cpu_registry_with_resources(
     for version in [10, 13, 19, 21, 23, 25] {
         rec.register(
             OpKey::new("QuantizeLinear", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(quantization::QuantizeLinearFactory),
         );
         rec.register(
             OpKey::new("DequantizeLinear", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(quantization::DequantizeLinearFactory),
         );
     }
     rec.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(quantization::DynamicQuantizeLinearFactory),
     );
     rec.register(
         OpKey::new("QLinearMatMul", "", 10),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(qlinear_matmul::QLinearMatMulFactory::new(
             retain_caches,
             derived_weights.clone(),
@@ -1377,272 +1562,441 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
     // Elementwise unary math (f32). Additive, default-domain-only registrations.
-    rec.register(OpKey::new("Abs", "", 1), Box::new(unary_math::AbsFactory));
-    rec.register(OpKey::new("Neg", "", 1), Box::new(unary_math::NegFactory));
+    rec.register(
+        OpKey::new("Abs", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::AbsFactory),
+    );
+    rec.register(
+        OpKey::new("Neg", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::NegFactory),
+    );
     rec.register(
         OpKey::new("Reciprocal", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unary_math::ReciprocalFactory),
     );
-    rec.register(OpKey::new("Exp", "", 1), Box::new(unary_math::ExpFactory));
-    rec.register(OpKey::new("Log", "", 1), Box::new(unary_math::LogFactory));
-    rec.register(OpKey::new("Sign", "", 1), Box::new(unary_math::SignFactory));
+    rec.register(
+        OpKey::new("Exp", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::ExpFactory),
+    );
+    rec.register(
+        OpKey::new("Log", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::LogFactory),
+    );
+    rec.register(
+        OpKey::new("Sign", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::SignFactory),
+    );
     rec.register(
         OpKey::new("Floor", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unary_math::FloorFactory),
     );
-    rec.register(OpKey::new("Ceil", "", 1), Box::new(unary_math::CeilFactory));
+    rec.register(
+        OpKey::new("Ceil", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::CeilFactory),
+    );
     rec.register(
         OpKey::new("Round", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unary_math::RoundFactory),
     );
-    rec.register(OpKey::new("Sin", "", 1), Box::new(unary_math::SinFactory));
-    rec.register(OpKey::new("Cos", "", 1), Box::new(unary_math::CosFactory));
+    rec.register(
+        OpKey::new("Sin", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::SinFactory),
+    );
+    rec.register(
+        OpKey::new("Cos", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::CosFactory),
+    );
     rec.register(
         OpKey::new("Sigmoid", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unary_math::SigmoidFactory),
     );
     rec.register(
         OpKey::new("Softplus", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unary_math::SoftplusFactory),
     );
     rec.register(
         OpKey::new("Softsign", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unary_math::SoftsignFactory),
     );
-    rec.register(OpKey::new("Acos", "", 1), Box::new(unary_math::AcosFactory));
+    rec.register(
+        OpKey::new("Acos", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::AcosFactory),
+    );
     rec.register(
         OpKey::new("Acosh", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unary_math::AcoshFactory),
     );
-    rec.register(OpKey::new("Asin", "", 1), Box::new(unary_math::AsinFactory));
+    rec.register(
+        OpKey::new("Asin", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::AsinFactory),
+    );
     rec.register(
         OpKey::new("Asinh", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unary_math::AsinhFactory),
     );
-    rec.register(OpKey::new("Atan", "", 1), Box::new(unary_math::AtanFactory));
+    rec.register(
+        OpKey::new("Atan", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::AtanFactory),
+    );
     rec.register(
         OpKey::new("Atanh", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unary_math::AtanhFactory),
     );
-    rec.register(OpKey::new("Cosh", "", 1), Box::new(unary_math::CoshFactory));
-    rec.register(OpKey::new("Sinh", "", 1), Box::new(unary_math::SinhFactory));
-    rec.register(OpKey::new("Tan", "", 1), Box::new(unary_math::TanFactory));
-    rec.register(OpKey::new("Elu", "", 1), Box::new(activations::EluFactory));
+    rec.register(
+        OpKey::new("Cosh", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::CoshFactory),
+    );
+    rec.register(
+        OpKey::new("Sinh", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::SinhFactory),
+    );
+    rec.register(
+        OpKey::new("Tan", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(unary_math::TanFactory),
+    );
+    rec.register(
+        OpKey::new("Elu", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(activations::EluFactory),
+    );
     // Celu is opset 12, Mish opset 18 -- registering at their introducing
     // opset keeps older models routing to whatever handled them before.
     rec.register(
         OpKey::new("Celu", "", 12),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(activations::CeluFactory),
     );
     rec.register(
         OpKey::new("Mish", "", 18),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(activations::MishFactory),
     );
     rec.register(
         OpKey::new("LeakyRelu", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(activations::LeakyReluFactory),
     );
     rec.register(
         OpKey::new("HardSigmoid", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(activations::HardSigmoidFactory),
     );
     rec.register(
         OpKey::new("Selu", "", 6),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(activations::SeluFactory),
     );
     rec.register(
         OpKey::new("ThresholdedRelu", "", 10),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(activations::ThresholdedReluFactory),
     );
     // Logical / selection.
-    rec.register(OpKey::new("And", "", 7), Box::new(logical::AndFactory));
-    rec.register(OpKey::new("Or", "", 7), Box::new(logical::OrFactory));
-    rec.register(OpKey::new("Xor", "", 7), Box::new(logical::XorFactory));
-    rec.register(OpKey::new("Not", "", 1), Box::new(logical::NotFactory));
-    rec.register(OpKey::new("Equal", "", 1), Box::new(logical::EqualFactory));
+    rec.register(
+        OpKey::new("And", "", 7),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(logical::AndFactory),
+    );
+    rec.register(
+        OpKey::new("Or", "", 7),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(logical::OrFactory),
+    );
+    rec.register(
+        OpKey::new("Xor", "", 7),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(logical::XorFactory),
+    );
+    rec.register(
+        OpKey::new("Not", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(logical::NotFactory),
+    );
+    rec.register(
+        OpKey::new("Equal", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(logical::EqualFactory),
+    );
     rec.register(
         OpKey::new("Greater", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(logical::GreaterFactory),
     );
     rec.register(
         OpKey::new("GreaterOrEqual", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(logical::GreaterOrEqualFactory),
     );
-    rec.register(OpKey::new("Less", "", 1), Box::new(logical::LessFactory));
+    rec.register(
+        OpKey::new("Less", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(logical::LessFactory),
+    );
     rec.register(
         OpKey::new("LessOrEqual", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(logical::LessOrEqualFactory),
     );
-    rec.register(OpKey::new("Where", "", 1), Box::new(where_op::WhereFactory));
+    rec.register(
+        OpKey::new("Where", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(where_op::WhereFactory),
+    );
     // Reductions (axes attribute or opset-13/18 axes input).
     rec.register(
         OpKey::new("ReduceSum", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reduce_ops::ReduceSumFactory),
     );
     rec.register(
         OpKey::new("ReduceMax", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reduce_ops::ReduceMaxFactory),
     );
     rec.register(
         OpKey::new("ReduceMin", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reduce_ops::ReduceMinFactory),
     );
     rec.register(
         OpKey::new("ReduceProd", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reduce_ops::ReduceProdFactory),
     );
     rec.register(
         OpKey::new("ReduceSumSquare", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reduce_ops::ReduceSumSquareFactory),
     );
     rec.register(
         OpKey::new("ReduceL1", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reduce_ops::ReduceL1Factory),
     );
     rec.register(
         OpKey::new("ReduceL2", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reduce_ops::ReduceL2Factory),
     );
     rec.register(
         OpKey::new("ReduceLogSum", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reduce_ops::ReduceLogSumFactory),
     );
     rec.register(
         OpKey::new("ReduceLogSumExp", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reduce_ops::ReduceLogSumExpFactory),
     );
     rec.register(
         OpKey::new("ReduceLogSumExp", "", 18),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reduce_ops::ReduceLogSumExpFactory),
     );
     // Shape / data movement (dtype-agnostic byte movers).
-    rec.register(OpKey::new("Concat", "", 1), Box::new(concat::ConcatFactory));
+    rec.register(
+        OpKey::new("Concat", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(concat::ConcatFactory),
+    );
     rec.register(
         OpKey::new("Flatten", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(movement_ops::FlattenFactory),
     );
     rec.register(
         OpKey::new("Squeeze", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(movement_ops::SqueezeFactory),
     );
     rec.register(
         OpKey::new("Size", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(movement_ops::SizeFactory),
     );
     rec.register(
         OpKey::new("Trilu", "", 14),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(movement_ops::TriluFactory),
     );
     // Indexed data movement and sequence construction.
     rec.register(
         OpKey::new("GatherElements", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(indexing::GatherElementsFactory),
     );
     rec.register(
         OpKey::new("GatherND", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(indexing::GatherNDFactory),
     );
     // ScatterElements gained its reduction attribute at opset 16.
     rec.register(
         OpKey::new("ScatterElements", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(indexing::ScatterElementsFactory),
     );
     rec.register(
         OpKey::new("ScatterElements", "", 16),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(indexing::ScatterElementsFactory),
     );
     // ScatterND gained reduction at opset 16 and max/min reductions at opset 18.
     for version in [11, 16, 18] {
         rec.register(
             OpKey::new("ScatterND", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(indexing::ScatterNDFactory),
         );
     }
     rec.register(
         OpKey::new("OneHot", "", 9),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(indexing::OneHotFactory),
     ); // TensorScatter (opset 24) standardizes the KV-cache update that GenAI
     // decoders previously expressed as ScatterND or a contrib op.
     rec.register(
         OpKey::new("TensorScatter", "", 24),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(tensor_scatter::TensorScatterFactory),
     );
     rec.register(
         OpKey::new("OneHot", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(onehot::OneHotFactory),
     );
     rec.register(
         OpKey::new("BitShift", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(bitshift::BitShiftFactory),
     );
     rec.register(
         OpKey::new("Compress", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(compress::CompressFactory),
     );
-    rec.register(OpKey::new("Tile", "", 6), Box::new(sequence::TileFactory));
+    rec.register(
+        OpKey::new("Tile", "", 6),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(sequence::TileFactory),
+    );
     rec.register(
         OpKey::new("Range", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sequence::RangeFactory),
     );
     rec.register(
         OpKey::new("CumSum", "", 14),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sequence::CumSumFactory),
     );
     rec.register(
         OpKey::new("CumProd", "", 26),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sequence::CumProdFactory),
     );
     rec.register(
         OpKey::new("HannWindow", "", 17),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(window::HannWindowFactory),
     );
     rec.register(
         OpKey::new("HammingWindow", "", 17),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(window::HammingWindowFactory),
     );
     rec.register(
         OpKey::new("BlackmanWindow", "", 17),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(window::BlackmanWindowFactory),
     );
-    rec.register(OpKey::new("DFT", "", 17), Box::new(dft::DftFactory));
-    rec.register(OpKey::new("STFT", "", 17), Box::new(stft::StftFactory));
+    rec.register(
+        OpKey::new("DFT", "", 17),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(dft::DftFactory),
+    );
+    rec.register(
+        OpKey::new("STFT", "", 17),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(stft::StftFactory),
+    );
     rec.register(
         OpKey::new("BitwiseAnd", "", 18),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(bitwise::BitwiseAndFactory),
     );
     rec.register(
         OpKey::new("BitwiseOr", "", 18),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(bitwise::BitwiseOrFactory),
     );
     rec.register(
         OpKey::new("BitwiseXor", "", 18),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(bitwise::BitwiseXorFactory),
     );
     rec.register(
         OpKey::new("BitwiseNot", "", 18),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(bitwise::BitwiseNotFactory),
     );
     // Value selection.
-    rec.register(OpKey::new("Clip", "", 1), Box::new(selection::ClipFactory));
+    rec.register(
+        OpKey::new("Clip", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(selection::ClipFactory),
+    );
     rec.register(
         OpKey::new("ArgMax", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(selection::ArgMaxFactory),
     );
     rec.register(
         OpKey::new("ArgMin", "", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(selection::ArgMinFactory),
     );
-    rec.register(OpKey::new("TopK", "", 10), Box::new(selection::TopKFactory));
+    rec.register(
+        OpKey::new("TopK", "", 10),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(selection::TopKFactory),
+    );
     rec.register(
         OpKey::new("NonMaxSuppression", "", 10),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(selection::NonMaxSuppressionFactory),
     );
     rec.register(
         OpKey::new("NonZero", "", 9),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(selection::NonZeroFactory),
     );
     rec.register(
         OpKey::new("Hardmax", "", 13),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(hardmax::HardmaxFactory),
     );
     rec
