@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{
-    DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceLayout, WorkspaceRequirement, WorkspaceView,
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node, Shape};
 
@@ -37,6 +37,7 @@ use super::block_quantized_matmul::{
     BlockFormat, DenseWeightCacheKey, DenseWeightIdentity, DenseWeightLayout,
     decode_dense_weight_into, linear_packed_prepared, projection_plan,
 };
+use super::decoded_projection::ProjectionScratch;
 use super::moe::{
     ExpertProjection, MoeAttributes, routing_weights, run_expert_grouped, run_expert_projections,
 };
@@ -290,20 +291,16 @@ impl BlockQuantizedMoEKernel {
             self.formats,
         )?;
         let requirement = self.projection_workspace(dimensions)?;
-        let layout = WorkspaceLayout::new([std::alloc::Layout::from_size_align(requirement.bytes as usize, requirement.alignment)
-            .map_err(|_| error("projection workspace exceeds addressable capacity; reduce batch or projection dimensions"))?])?;
-        let [region] = layout.bind(workspace).map_err(|source| EpError::Backend {
-            operation: "BlockQuantizedMoE streamed workspace binding",
-            source: Box::new(source),
-        })?;
-        let scratch: &mut [std::mem::MaybeUninit<u8>] = if region.bytes() == 0 {
-            &mut []
-        } else {
-            // SAFETY: the checked layout proves capacity and alignment. The
-            // executor exclusively lends this Host region for this dispatch.
-            // Only short-lived projection calls may borrow it; outputs are owned.
-            unsafe { std::slice::from_raw_parts_mut(region.ptr().0.cast(), region.bytes()) }
-        };
+        // SAFETY: the executor exclusively lends valid Host storage for this
+        // dispatch. Sequential applies return owned outputs, so no scratch view
+        // escapes. Initialization is deferred until the first streamed apply.
+        let mut scratch = unsafe {
+            ProjectionScratch::bind(
+                "BlockQuantizedMoE streamed workspace binding",
+                requirement.bytes as usize,
+                workspace,
+            )
+        }?;
         let Dimensions {
             rows,
             hidden,
@@ -487,10 +484,7 @@ impl BlockQuantizedMoEKernel {
                             projection.out_features,
                             bias,
                             self.projection_plan,
-                            Some(WorkspaceView::new(
-                                DevicePtrMut(scratch.as_mut_ptr().cast()),
-                                scratch.len(),
-                            )),
+                            scratch.initialized(),
                         )
                     },
                 )?
@@ -1375,7 +1369,7 @@ mod tests {
     use crate::kernels::block_quantized_matmul::packed_for_format;
     use crate::kernels::testutil::{Owned, PreparedTestKernel};
     use crate::kernels::weight_cache::DEFAULT_DENSE_WEIGHT_CACHE_BYTES;
-    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ep_api::{DevicePtrMut, ExecutionProvider};
     use onnx_runtime_ir::{Attribute, Dim, Graph, NodeId, SymbolId, static_shape};
 
     const H: usize = 32;
@@ -1589,6 +1583,68 @@ mod tests {
                 "index {index}: got {actual}, expected {expected}"
             );
         }
+    }
+
+    #[test]
+    fn dense_resident_experts_do_not_initialize_projection_scratch() {
+        let shapes = vec![
+            Some((DataType::Float32, vec![1, H])),
+            Some((DataType::Float32, vec![1, E])),
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+        ];
+        let (graph, node) = model_node(&shapes, &attrs("identity", 1, true, 0));
+        let ValidatedMetadata {
+            attributes,
+            formats,
+        } = validate_metadata(graph.node(node), None).unwrap();
+        let kernel = BlockQuantizedMoEKernel {
+            attributes,
+            formats,
+            constant_inputs: [false, false, true, false, true, false, false, false, false],
+            weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            projection_plan: projection_plan(),
+            weight_cache: WeightCache::with_limit(2 * H * H * 4),
+        };
+        let input = Owned::f32(&[1, H], &[0.125; H]);
+        let router = Owned::f32(&[1, E], &[4., -4.]);
+        let fc1 = Owned::u8(&[E, H, 1, 17], &identity_projection([2, 4]));
+        let fc2 = Owned::u8(&[E, H, 1, 17], &identity_projection([2, 2]));
+        let views = [
+            input.view(),
+            router.view(),
+            fc1.view(),
+            TensorView::absent(DataType::Float32),
+            fc2.view(),
+        ];
+        let metadata: Vec<_> = views
+            .iter()
+            .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+            .collect();
+        let req = kernel.workspace_requirement(&metadata).unwrap();
+        let mut scratch = vec![29.0f32; req.bytes as usize / 4];
+        assert!(!scratch.is_empty());
+        let mut output = Owned::zeros_f32(&[1, H]);
+        for _ in 0..2 {
+            let workspace = WorkspaceView::new(
+                DevicePtrMut(scratch.as_mut_ptr().cast()),
+                req.bytes as usize,
+            );
+            kernel
+                .execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace))
+                .unwrap();
+            assert!(
+                scratch.iter().all(|&value| value == 29.0),
+                "cold dense expansion and warm resident hits must leave streamed scratch untouched"
+            );
+            assert_eq!(output.to_f32(), vec![0.125; H]);
+        }
+        assert_eq!(
+            kernel.weight_cache.activity().1,
+            2,
+            "only the first call expands both dense projections"
+        );
     }
 
     #[test]

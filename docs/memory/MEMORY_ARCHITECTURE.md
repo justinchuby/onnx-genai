@@ -98,9 +98,14 @@ by both planning and execution, even when a different Rayon pool runs it.
 Dense-cache admission may decline, so the bound always covers streamed fallback.
 
 One exclusive scratch lane is borrowed by sequential projection calls, which
-return owned results. FC1/FC3 results survive subsequent scratch overwrites for
-gating. Routing, activation buffers, grouped inputs, output staging, and their
-owned intermediate results remain separate allocations; this contract does not
+return owned results. A private dispatch-local owner lazily initializes the
+required f32 prefix at the first streamed apply; later applies receive short,
+exclusive initialized slices and partition their own prefixes safely. Dense
+resident hits leave scratch untouched, and unused capacity in a larger pool
+slot is not initialized. The initialization proof ends with the dispatch and
+is never cached across pool borrowers. FC1/FC3 results survive subsequent
+scratch overwrites for gating. Routing, activation buffers, grouped inputs,
+output staging, and their owned intermediate results remain separate allocations; this contract does not
 claim a complete process-memory bound. Dense resident-set admission remains a
 separate existing weight-cache operation. No new public EP API is required.
 

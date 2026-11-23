@@ -26,6 +26,7 @@ use onnx_runtime_quantization::{
 use rayon::prelude::*;
 
 use super::block_dequant::{decode_e2m1, decode_e8m0_scale};
+use super::decoded_projection::ProjectionScratch;
 use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
@@ -441,6 +442,16 @@ impl BlockQuantizedMatMulKernel {
         };
         let Some(dense) = dense else {
             let packed = packed_tensor_bytes(&inputs[1])?;
+            let bytes = self.projection_plan.layout(m, self.k, self.n)?.bytes();
+            // SAFETY: the executor lends valid exclusive Host storage for this
+            // dispatch. The scratch owner and all views stay within this call.
+            let mut scratch = unsafe {
+                ProjectionScratch::bind(
+                    "block-quantized streamed workspace binding",
+                    bytes,
+                    workspace,
+                )
+            }?;
             let result = linear_packed_prepared(
                 self.format,
                 &packed,
@@ -450,7 +461,7 @@ impl BlockQuantizedMatMulKernel {
                 self.n,
                 bias.as_deref(),
                 self.projection_plan,
-                workspace,
+                scratch.initialized(),
             )?;
             return write_dense_f32_narrow(OP, &mut outputs[0], &result);
         };
@@ -874,7 +885,7 @@ pub(super) fn linear_packed_prepared(
     out_features: usize,
     bias: Option<&[f32]>,
     plan: super::decoded_projection::DecodedProjectionPlan,
-    workspace: Option<WorkspaceView>,
+    scratch: &mut [f32],
 ) -> Result<Vec<f32>> {
     if super::matmul::serial_projection_is_portable() {
         linear_packed_tiled::<4>(
@@ -885,7 +896,7 @@ pub(super) fn linear_packed_prepared(
             in_features,
             out_features,
             bias,
-            Some((plan, workspace)),
+            Some((plan, scratch)),
         )
     } else {
         linear_packed_tiled::<1>(
@@ -896,7 +907,7 @@ pub(super) fn linear_packed_prepared(
             in_features,
             out_features,
             bias,
-            Some((plan, workspace)),
+            Some((plan, scratch)),
         )
     }
 }
@@ -948,10 +959,7 @@ fn linear_packed_tiled<const FEATURE_TILE: usize>(
     in_features: usize,
     out_features: usize,
     bias: Option<&[f32]>,
-    prepared: Option<(
-        super::decoded_projection::DecodedProjectionPlan,
-        Option<WorkspaceView>,
-    )>,
+    prepared: Option<(super::decoded_projection::DecodedProjectionPlan, &mut [f32])>,
 ) -> Result<Vec<f32>> {
     let blocks = in_features.div_ceil(format.qk());
     let packed_stride = blocks
@@ -995,26 +1003,8 @@ fn linear_packed_tiled<const FEATURE_TILE: usize>(
                 super::matmul::gemm_bt_serial(decoded, input, output, features, k, rows)
             }
         };
-    if let Some((plan, workspace)) = prepared {
-        let layout = plan.layout(rows, in_features, out_features)?;
-        let regions = layout.bind(workspace).map_err(|source| EpError::Backend {
-            operation: "block-quantized streamed workspace binding",
-            source: Box::new(source),
-        })?;
-        let [columns, decoded] = regions.map(|region| -> &mut [f32] {
-            if region.bytes() == 0 {
-                return &mut [];
-            }
-            // SAFETY: the layout proves f32 alignment/capacity and disjointness;
-            // execution exclusively borrows Host storage until this call returns.
-            // Initialize before creating references to fresh workspace backing.
-            unsafe {
-                let ptr = region.ptr().as_ptr::<f32>();
-                let len = region.bytes() / std::mem::size_of::<f32>();
-                ptr.write_bytes(0, len);
-                std::slice::from_raw_parts_mut(ptr, len)
-            }
-        });
+    if let Some((plan, scratch)) = prepared {
+        let (columns, decoded) = plan.split_scratch(rows, in_features, out_features, scratch)?;
         let elements = rows.checked_mul(out_features).ok_or_else(|| {
             error("streamed output element count overflows; reduce projection dimensions")
         })?;
@@ -1760,6 +1750,63 @@ mod tests {
         CpuExecutionProvider::new()
             .get_kernel(model.graph.node(node), &[], 1)
             .expect("CPU EP must register BlockQuantizedMatMul")
+    }
+
+    #[test]
+    fn prepared_projection_overwrites_poisoned_reused_scratch_and_keeps_outputs_owned() {
+        for format in [BlockFormat::Mxfp4, BlockFormat::Q8_0] {
+            for (rows, k, n) in [
+                (0, 32, 13),
+                (1, 32, 13),
+                (3, 35, 13),
+                (3, 32, 1),
+                (3, 0, 13),
+                (3, 32, 0),
+            ] {
+                let packed = packed_for_format(format, 1, n, k);
+                let input: Vec<_> = (0..rows * k).map(|i| (i % 19) as f32 / 100.).collect();
+                let bias: Vec<_> = (0..n).map(|i| i as f32 / 10.).collect();
+                let expected =
+                    linear_packed_grouped(format, &packed, &input, rows, k, n, Some(&bias))
+                        .unwrap();
+                let plan = projection_plan();
+                let mut scratch = vec![f32::NAN; plan.layout(rows, k, n).unwrap().bytes() / 4];
+                let actual = linear_packed_prepared(
+                    format,
+                    &packed,
+                    &input,
+                    rows,
+                    k,
+                    n,
+                    Some(&bias),
+                    plan,
+                    &mut scratch,
+                )
+                .unwrap();
+                assert_eq!(
+                    actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "{format:?} rows={rows} K={k} N={n}"
+                );
+                scratch.fill(f32::NEG_INFINITY);
+                let next = linear_packed_prepared(
+                    format,
+                    &packed,
+                    &input,
+                    rows,
+                    k,
+                    n,
+                    Some(&bias),
+                    plan,
+                    &mut scratch,
+                )
+                .unwrap();
+                assert_eq!(
+                    actual, next,
+                    "later projection overwrites scratch without modifying previous owned output"
+                );
+            }
+        }
     }
 
     #[test]

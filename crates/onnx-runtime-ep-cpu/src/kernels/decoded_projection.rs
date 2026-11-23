@@ -1,7 +1,70 @@
 //! Row-decoded f32 projections shared by compressed weight representations.
 
-use onnx_runtime_ep_api::{EpError, Result};
+use onnx_runtime_ep_api::{EpError, Result, WorkspaceLayout, WorkspaceView};
 use rayon::prelude::*;
+use std::mem::MaybeUninit;
+
+/// One dispatch's exclusive f32 scratch lane. Binding does not initialize or
+/// touch backing: dense-cache hits pay no streamed-scratch clearing cost.
+/// Only the first streamed projection initializes the entire admitted lane;
+/// subsequent projections borrow initialized values without re-clearing them.
+pub(super) struct ProjectionScratch<'a> {
+    storage: &'a mut [MaybeUninit<f32>],
+    initialized: bool,
+}
+
+impl<'a> ProjectionScratch<'a> {
+    /// # Safety
+    /// Nonempty workspace must be valid, Host-accessible, writable storage,
+    /// exclusively lent for `'a`. It must outlive this dispatch and every
+    /// short-lived initialized slice. No references may escape the dispatch.
+    pub(super) unsafe fn bind(
+        operation: &'static str,
+        bytes: usize,
+        workspace: Option<WorkspaceView>,
+    ) -> Result<Self> {
+        if !bytes.is_multiple_of(std::mem::size_of::<f32>()) {
+            return Err(EpError::KernelFailed(format!(
+                "{operation}: {bytes} scratch bytes do not form complete f32 values; use the projection's prepared layout"
+            )));
+        }
+        let elements = bytes / std::mem::size_of::<f32>();
+        let region = std::alloc::Layout::array::<f32>(elements).map_err(|_| {
+            EpError::KernelFailed(format!("{operation}: {bytes} scratch bytes exceed addressable capacity; reduce batch or projection dimensions"))
+        })?;
+        let [region] = WorkspaceLayout::new([region])?
+            .bind(workspace)
+            .map_err(|source| EpError::Backend {
+                operation,
+                source: Box::new(source),
+            })?;
+        let storage = if elements == 0 {
+            &mut []
+        } else {
+            // SAFETY: the checked layout proves non-null/aligned capacity;
+            // the caller guarantees Host accessibility, exclusivity and lifetime.
+            unsafe { std::slice::from_raw_parts_mut(region.ptr().0.cast(), elements) }
+        };
+        Ok(Self {
+            storage,
+            initialized: false,
+        })
+    }
+
+    pub(super) fn initialized(&mut self) -> &mut [f32] {
+        if !self.initialized {
+            // SAFETY: binding exclusively lends every element. All-zero bytes
+            // initialize valid f32 values before any f32 references are made.
+            unsafe { self.storage.as_mut_ptr().write_bytes(0, self.storage.len()) };
+            self.initialized = true;
+        }
+        // SAFETY: first use initialized the entire lane; the only mutable views
+        // subsequently exposed are initialized f32 values with this short borrow.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast(), self.storage.len())
+        }
+    }
+}
 
 /// Decode a bounded tile of weight rows once and reuse it across routed tokens.
 /// FEATURE_TILE is a compute tile, not a model dimension. Each worker owns at
@@ -201,12 +264,7 @@ impl DecodedProjectionPlan {
         Ok((per_shard, shards, tile_elements))
     }
 
-    pub(super) fn layout(
-        self,
-        rows: usize,
-        k: usize,
-        n: usize,
-    ) -> Result<onnx_runtime_ep_api::WorkspaceLayout<2>> {
+    fn workspace_elements(self, rows: usize, k: usize, n: usize) -> Result<[usize; 2]> {
         let (_, shards, tile_elements) = self.geometry(rows, k, n)?;
         let invalid = || {
             EpError::KernelFailed(format!(
@@ -221,10 +279,40 @@ impl DecodedProjectionPlan {
         // Last shard may be shorter; uniform slots permit allocation-free zip
         // scheduling and remain bounded by the stored logical shard plan.
         let decoded = shards.checked_mul(tile_elements).ok_or_else(invalid)?;
-        onnx_runtime_ep_api::WorkspaceLayout::new([
+        Ok([columns, decoded])
+    }
+
+    pub(super) fn layout(self, rows: usize, k: usize, n: usize) -> Result<WorkspaceLayout<2>> {
+        let [columns, decoded] = self.workspace_elements(rows, k, n)?;
+        let invalid = || {
+            EpError::KernelFailed(format!(
+                "decoded projection workspace overflows for rows={rows}, K={k}, N={n}; reduce batch or projection dimensions"
+            ))
+        };
+        WorkspaceLayout::new([
             std::alloc::Layout::array::<f32>(columns).map_err(|_| invalid())?,
             std::alloc::Layout::array::<f32>(decoded).map_err(|_| invalid())?,
         ])
+    }
+
+    /// Partition only this projection's prefix, leaving the rest of a larger
+    /// shared lane untouched. Safe slice borrowing enforces non-overlap.
+    pub(super) fn split_scratch(
+        self,
+        rows: usize,
+        k: usize,
+        n: usize,
+        scratch: &mut [f32],
+    ) -> Result<(&mut [f32], &mut [f32])> {
+        let [columns, decoded] = self.workspace_elements(rows, k, n)?;
+        let elements = columns.checked_add(decoded).ok_or_else(|| EpError::KernelFailed(format!(
+            "decoded projection workspace element count overflows for rows={rows}, K={k}, N={n}; reduce projection dimensions"
+        )))?;
+        let available = scratch.len();
+        let scratch = scratch.get_mut(..elements).ok_or_else(|| EpError::KernelFailed(format!(
+            "decoded projection needs {elements} initialized scratch f32 values for rows={rows}, K={k}, N={n}, received {available}; prepare and pass the matching projection workspace"
+        )))?;
+        Ok(scratch.split_at_mut(columns))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -315,5 +403,145 @@ impl DecodedProjectionPlan {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onnx_runtime_ep_api::DevicePtrMut;
+    use std::num::NonZeroUsize;
+
+    #[test]
+    fn projection_scratch_is_lazy_once_per_dispatch_and_only_borrows_the_needed_prefix() {
+        let mut backing = [MaybeUninit::new(37.0f32); 32];
+        let view = WorkspaceView::new(
+            DevicePtrMut(backing.as_mut_ptr().cast()),
+            std::mem::size_of_val(&backing),
+        );
+        {
+            // SAFETY: backing is exclusive Host storage, aligned and live until
+            // the owner and all short projection borrows below are dropped.
+            let mut scratch =
+                unsafe { ProjectionScratch::bind("test projection binding", 16 * 4, Some(view)) }
+                    .unwrap();
+            assert!(!scratch.initialized);
+            assert_eq!(scratch.storage.len(), 16);
+            // SAFETY: the test populated every MaybeUninit with 37.0.
+            assert!(
+                scratch
+                    .storage
+                    .iter()
+                    .all(|value| unsafe { value.assume_init() } == 37.0),
+                "binding must not clear dense-hit scratch"
+            );
+            assert!(
+                scratch
+                    .initialized()
+                    .iter()
+                    .all(|&value| value.to_bits() == 0)
+            );
+            scratch.initialized().fill(19.0);
+            assert!(
+                scratch.initialized().iter().all(|&value| value == 19.0),
+                "a later FC must reuse initialized storage without resetting it"
+            );
+        }
+        // SAFETY: all backing values were initialized by the test or owner.
+        assert!(
+            backing[16..]
+                .iter()
+                .all(|value| unsafe { value.assume_init() } == 37.0),
+            "a larger pool slot's unused suffix must remain untouched"
+        );
+        {
+            // A new dispatch must not inherit an initialization proof from an
+            // unrelated kernel that may have used the pooled bytes in between.
+            let mut scratch =
+                unsafe { ProjectionScratch::bind("test projection binding", 16 * 4, Some(view)) }
+                    .unwrap();
+            assert!(
+                scratch
+                    .initialized()
+                    .iter()
+                    .all(|&value| value.to_bits() == 0)
+            );
+        }
+    }
+
+    #[test]
+    fn projection_scratch_rejects_invalid_layouts_and_accepts_empty_without_backing() {
+        let mut backing = [0u64; 4];
+        let ptr = backing.as_mut_ptr().cast();
+        for (bytes, workspace) in [
+            (3, None),
+            (16, None),
+            (16, Some(WorkspaceView::new(DevicePtrMut(ptr), 8))),
+            (
+                16,
+                Some(WorkspaceView::new(
+                    DevicePtrMut(ptr.cast::<u8>().wrapping_add(1).cast()),
+                    16,
+                )),
+            ),
+            (
+                16,
+                Some(WorkspaceView::new(
+                    DevicePtrMut((usize::MAX - 7) as *mut _),
+                    16,
+                )),
+            ),
+        ] {
+            // SAFETY: invalid views are rejected before dereferencing them.
+            let error =
+                unsafe { ProjectionScratch::bind("test projection binding", bytes, workspace) }
+                    .err()
+                    .expect("invalid workspace must be rejected");
+            assert!(
+                error.to_string().contains("test projection binding"),
+                "{error}"
+            );
+        }
+        // SAFETY: an empty owner dereferences no backing.
+        let mut scratch = unsafe { ProjectionScratch::bind("empty", 0, None) }.unwrap();
+        assert!(scratch.initialized().is_empty());
+    }
+
+    #[test]
+    fn projection_scratch_partitions_each_projection_prefix_without_aliasing() {
+        for shards in [1, 4] {
+            for tile in [1, 4] {
+                let plan = DecodedProjectionPlan::new(
+                    NonZeroUsize::new(shards).unwrap(),
+                    NonZeroUsize::new(tile).unwrap(),
+                );
+                for rows in [0, 1, 3] {
+                    for k in [0, 32] {
+                        for n in [0, 1, 17] {
+                            let layout = plan.layout(rows, k, n).unwrap();
+                            let elements = layout.bytes() / 4;
+                            let mut storage = vec![13.0f32; elements + 7];
+                            let (columns, decoded) =
+                                plan.split_scratch(rows, k, n, &mut storage).unwrap();
+                            assert_eq!(columns.len(), if rows > 1 && n > 1 { rows * n } else { 0 });
+                            assert_eq!(columns.len() + decoded.len(), elements);
+                            columns.fill(2.0);
+                            decoded.fill(3.0);
+                            assert!(columns.iter().all(|&value| value == 2.0));
+                            assert!(storage[elements..].iter().all(|&value| value == 13.0));
+                            if elements > 0 {
+                                let error = plan
+                                    .split_scratch(rows, k, n, &mut storage[..elements - 1])
+                                    .unwrap_err();
+                                assert!(
+                                    error.to_string().contains("initialized scratch f32 values"),
+                                    "{error}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
