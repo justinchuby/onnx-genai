@@ -1,0 +1,5 @@
+{"status": "queued", "pid": 21498, "action": "Wait for the peer batch on the shared stable flock; no heavy process has started."}
+{"status": "acquired", "pid": 21498, "command": ["python", "/tmp/nxrt-block-moe-accumulator/validate-mlas.py"]}
+mlas-list ok
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 2076 filtered out; finished in 0.24s
+mlas-tests ok

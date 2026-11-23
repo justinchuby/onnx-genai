@@ -2379,3 +2379,33 @@ study proves universally zero overhead, an RSS saving or a model speedup.
 source/binary hashes, raw batches, conservative capacity costs and host limits.
 Consumed probes and the private Miri target were removed under the stable lock,
 with receipts; sources, results, shared dependencies and lock inode remain.
+
+
+### BlockQuantizedMoE final accumulator shares its admitted lane
+
+The final rows*hidden f32 accumulator now joins the existing projection maximum
+and gather regions in one checked StepScoped layout. Its lifetime spans all
+experts, so it has a disjoint input-sized region rather than aliasing scratch
+that an expert still needs. The whole lane is admitted once; serial experts
+reuse their regions without per-expert quota calls. Empty output needs no lane.
+
+The accumulator initializes only its actual prefix, preserves accumulation
+order, and publishes to the output only after successful expert execution.
+Dense hits leave projection scratch untouched. Routing, input conversions, FC
+intermediates, compressed strided copies and GEMM internals remain separate;
+this is not full process-memory accounting. Retained capacity stays charged
+until actual reclamation.
+
+Native and MLAS-reference module tests pass (29 each), as does native strict
+all-target Clippy. The resource test pins exact full-lane charges, zero warm
+issuer callbacks including zero bytes, and trim-to-zero. The
+[102-process report](../benchmarks/block-moe-accumulator-workspace/README.md)
+retains the original failed controls and one fixed diagnostic. Qualified ranges
+do not establish a distinguishable regression or a general speedup; small costs
+are not excluded. No CUDA runtime or model throughput claim is made.
+
+The initial public-session pilot also exposed a generic NodePlan bug: trimming
+legal trailing optional inputs leaves the source node and EP metadata with
+different positional cardinalities. The performance probe uses the equivalent
+omitted-tail form; this unrelated runtime inconsistency requires a separate
+plan fix and public-session regression without relaxing EP validation.
