@@ -11599,12 +11599,12 @@ mod tests {
             ])
             .unwrap();
         let allocation = providers[0]
-            .allocate_workspace(request.bytes as usize, request.alignment, request.role)
+            .allocate_workspace(request.bytes as usize, request.alignment, request.role())
             .unwrap();
         let identity = allocation.managed_owner().unwrap().identity();
         assert!(
             providers[1]
-                .allocate_workspace(64, 4, request.role)
+                .allocate_workspace(64, 4, request.role())
                 .is_err(),
             "a second active lane must not borrow the first lane's conversion storage"
         );
@@ -11613,7 +11613,7 @@ mod tests {
         for iteration in 0..4096 {
             let index = iteration % 2;
             let mut allocation = providers[index]
-                .allocate_workspace(64, 4, request.role)
+                .allocate_workspace(64, 4, request.role())
                 .unwrap();
             assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
             let workspace = WorkspaceView::new(
@@ -11639,7 +11639,7 @@ mod tests {
         assert_eq!(manager.process_used(Tier::Host), 0);
         drop(pressure);
         let allocation = providers[0]
-            .allocate_workspace(64, 4, request.role)
+            .allocate_workspace(64, 4, request.role())
             .unwrap();
         assert!(
             books.claims() > calls.0,

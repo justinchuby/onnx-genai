@@ -648,12 +648,22 @@ pub enum WorkspaceLifetime {
 }
 
 /// A kernel's owned-scratch bound for one concrete input geometry.
+///
+/// Kernels choose the lifetime; the corresponding ledger role is derived.
+///
+/// ```
+/// use onnx_runtime_ep_api::{WorkspaceLifetime, WorkspaceRequirement};
+/// use onnx_runtime_memory_api::MemoryRole;
+/// let step = WorkspaceRequirement { bytes: 4096, alignment: 64, ..WorkspaceRequirement::NONE };
+/// assert_eq!(step.role(), MemoryRole::Workspace { step_scoped: true });
+/// let persistent = WorkspaceRequirement { lifetime: WorkspaceLifetime::SessionPersistent, ..step };
+/// assert_eq!(persistent.role(), MemoryRole::Workspace { step_scoped: false });
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkspaceRequirement {
     pub bytes: u64,
     pub alignment: usize,
     pub lifetime: WorkspaceLifetime,
-    pub role: MemoryRole,
 }
 
 impl WorkspaceRequirement {
@@ -661,8 +671,15 @@ impl WorkspaceRequirement {
         bytes: 0,
         alignment: 1,
         lifetime: WorkspaceLifetime::StepScoped,
-        role: MemoryRole::Workspace { step_scoped: true },
     };
+
+    /// Ledger classification follows the workspace lifetime. Kernels cannot
+    /// declare an unrelated role or disagree with the executor's slot choice.
+    pub const fn role(self) -> MemoryRole {
+        MemoryRole::Workspace {
+            step_scoped: matches!(self.lifetime, WorkspaceLifetime::StepScoped),
+        }
+    }
 }
 
 /// Executor-owned prepared workspace handed to a kernel for one dispatch.

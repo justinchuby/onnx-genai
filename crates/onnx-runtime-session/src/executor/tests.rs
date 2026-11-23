@@ -5231,7 +5231,6 @@ impl Kernel for WeightDeliveryKernel {
             bytes,
             alignment: if rows >= 4 { 512 } else { 256 },
             lifetime: WorkspaceLifetime::SessionPersistent,
-            role: onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
         })
     }
 
@@ -5283,7 +5282,6 @@ impl Kernel for WorkspaceOnlyKernel {
             bytes: self.bytes,
             alignment: 256,
             lifetime: WorkspaceLifetime::SessionPersistent,
-            role: MemoryRole::Workspace { step_scoped: false },
         })
     }
 
@@ -5820,7 +5818,7 @@ fn prepare_reserves_static_index_share_workspace() {
         .unwrap();
     assert_eq!(requirement.bytes, 768);
     assert_eq!(
-        requirement.role,
+        requirement.role(),
         MemoryRole::Workspace { step_scoped: false }
     );
     assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 768);

@@ -56,7 +56,6 @@ use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
     EpError, Result, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
-use onnx_runtime_memory_api::MemoryRole;
 
 use crate::error::cublas_err;
 
@@ -707,7 +706,6 @@ pub const fn governed_workspace_requirement(bytes: usize) -> WorkspaceRequiremen
             bytes: bytes as u64,
             alignment: WORKSPACE_ALIGNMENT,
             lifetime: WorkspaceLifetime::SessionPersistent,
-            role: MemoryRole::Workspace { step_scoped: false },
         }
     }
 }
@@ -1454,6 +1452,7 @@ mod raw_workspace_allocation_guard {
     use onnx_runtime_ep_api::DevicePtrMut;
 
     use super::*;
+    use onnx_runtime_memory_api::MemoryRole;
 
     #[test]
     fn exact_requirement_is_persistent_and_shortfall_is_deterministic() {
@@ -1462,7 +1461,7 @@ mod raw_workspace_allocation_guard {
         assert_eq!(requirement.alignment, WORKSPACE_ALIGNMENT);
         assert_eq!(requirement.lifetime, WorkspaceLifetime::SessionPersistent);
         assert!(matches!(
-            requirement.role,
+            requirement.role(),
             MemoryRole::Workspace { step_scoped: false }
         ));
 

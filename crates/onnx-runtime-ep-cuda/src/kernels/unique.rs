@@ -11,7 +11,6 @@ use onnx_runtime_ep_api::{
     WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{Attribute, DataType, Node, Shape, TensorLayout};
-use onnx_runtime_memory_api::MemoryRole;
 
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaDeviceCapabilities, CudaRuntime, cuptr};
@@ -553,7 +552,6 @@ impl Kernel for UniqueKernel {
             })?,
             alignment: std::mem::align_of::<u64>(),
             lifetime: WorkspaceLifetime::StepScoped,
-            role: MemoryRole::Workspace { step_scoped: true },
         })
     }
 

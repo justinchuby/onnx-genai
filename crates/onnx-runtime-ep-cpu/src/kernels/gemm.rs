@@ -615,13 +615,13 @@ mod tests {
             .workspace_requirement_for_execution(&[a.view(), b.view()], &metadata)
             .unwrap();
         let first = provider
-            .allocate_workspace(request.bytes as usize, request.alignment, request.role)
+            .allocate_workspace(request.bytes as usize, request.alignment, request.role())
             .unwrap();
         let identity = first.managed_owner().unwrap().identity();
         provider.deallocate_workspace(first).unwrap();
         let before_control = (books.claims(), books.releases());
         let zero = books
-            .reserve(Tier::Host, 0, request.role, HolderId::new(99))
+            .reserve(Tier::Host, 0, request.role(), HolderId::new(99))
             .unwrap();
         assert_eq!(
             books.claims(),
@@ -638,7 +638,7 @@ mod tests {
         let calls = (books.claims(), books.releases());
         for _ in 0..4096 {
             let mut allocation = provider
-                .allocate_workspace(request.bytes as usize, request.alignment, request.role)
+                .allocate_workspace(request.bytes as usize, request.alignment, request.role())
                 .unwrap();
             assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
             let workspace = WorkspaceView::new(

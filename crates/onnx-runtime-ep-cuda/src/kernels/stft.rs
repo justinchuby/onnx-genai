@@ -15,7 +15,6 @@ use onnx_runtime_ep_api::{
     WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node, Shape, TensorLayout};
-use onnx_runtime_memory_api::MemoryRole;
 
 use crate::cufft::{CufftPlan, CufftPlanCache, CufftPlanKey, DftDirection, DftInputKind};
 use crate::error::driver_err;
@@ -329,7 +328,6 @@ impl StftKernel {
             })?,
             alignment: WORKSPACE_ALIGNMENT,
             lifetime: WorkspaceLifetime::StepScoped,
-            role: MemoryRole::Workspace { step_scoped: true },
         })
     }
 

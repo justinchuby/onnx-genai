@@ -2711,7 +2711,7 @@ mod tests {
         let request = kernel.workspace_requirement(&metadata).unwrap();
         assert_eq!(request.bytes, 16);
         let mut allocation = provider
-            .allocate_workspace(16, request.alignment, request.role)
+            .allocate_workspace(16, request.alignment, request.role())
             .unwrap();
         let identity = allocation.managed_owner().unwrap().identity();
         let mut output = Owned::zeros(DataType::Uint8, &[2, 2, 2]);
@@ -2734,7 +2734,7 @@ mod tests {
         let calls = (books.claims(), books.releases());
         for _ in 0..4096 {
             let mut allocation = provider
-                .allocate_workspace(16, request.alignment, request.role)
+                .allocate_workspace(16, request.alignment, request.role())
                 .unwrap();
             assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
             let workspace = WorkspaceView::new(
@@ -2820,7 +2820,7 @@ mod tests {
                         alignment: 4,
                         ..WorkspaceRequirement::NONE
                     };
-                    let allocation = provider.allocate_workspace(16, 4, request.role);
+                    let allocation = provider.allocate_workspace(16, 4, request.role());
                     if allocation.is_err() {
                         refused.fetch_add(1, Ordering::Relaxed);
                     }
