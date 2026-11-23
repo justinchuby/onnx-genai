@@ -51,6 +51,47 @@ impl<'a> ProjectionScratch<'a> {
         })
     }
 
+    /// Gather only the requested rows, initializing every returned value by
+    /// copying it. Unused capacity is untouched; no whole-lane clear is needed.
+    pub(super) fn gather_rows(
+        &mut self,
+        input: &[f32],
+        width: usize,
+        rows: impl Iterator<Item = usize>,
+    ) -> Result<&mut [f32]> {
+        if width == 0 {
+            return Ok(&mut []);
+        }
+        let mut written = 0usize;
+        for row in rows {
+            let start = row.checked_mul(width).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "projection input row {row} times width {width} overflows addressable storage"
+                ))
+            })?;
+            let source = input.get(start..).and_then(|rest| rest.get(..width)).ok_or_else(|| EpError::KernelFailed(
+                format!("projection input row {row} of width {width} exceeds {} input values; validate routed row indices", input.len())
+            ))?;
+            let end = written.checked_add(width).ok_or_else(|| {
+                EpError::KernelFailed(
+                    "projection input gather size overflow; reduce routed batch dimensions".into(),
+                )
+            })?;
+            let capacity = self.storage.len();
+            let target = self.storage.get_mut(written..end).ok_or_else(|| EpError::KernelFailed(
+                format!("projection input gather needs {end} values, workspace has {capacity}; prepare the complete grouped-input bound")
+            ))?;
+            for (target, &value) in target.iter_mut().zip(source) {
+                target.write(value);
+            }
+            written = end;
+        }
+        // SAFETY: each complete target row was initialized above, and written
+        // counts actual copied values, without trusting an iterator size hint.
+        // The returned prefix is exclusive and cannot outlive this short borrow.
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast(), written) })
+    }
+
     pub(super) fn initialized(&mut self) -> &mut [f32] {
         if !self.initialized {
             // SAFETY: binding exclusively lends every element. All-zero bytes
@@ -411,6 +452,75 @@ mod tests {
     use super::*;
     use onnx_runtime_ep_api::DevicePtrMut;
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn gathered_projection_input_initializes_only_actual_rows_and_reuses_capacity() {
+        let mut backing = [MaybeUninit::new(29.0f32); 16];
+        let view = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 16 * 4);
+        // SAFETY: the test exclusively lends live aligned Host storage.
+        let mut scratch =
+            unsafe { ProjectionScratch::bind("gather test", 16 * 4, Some(view)) }.unwrap();
+        let input = [1., 2., 3., 4., 5., 6.];
+        assert_eq!(
+            scratch
+                .gather_rows(&input, 2, [2, 0, 2].into_iter())
+                .unwrap(),
+            &[5., 6., 1., 2., 5., 6.]
+        );
+        assert!(
+            !scratch.initialized,
+            "a valid prefix is not a whole-lane initialization proof"
+        );
+        assert_eq!(
+            scratch.gather_rows(&input, 2, [1].into_iter()).unwrap(),
+            &[3., 4.]
+        );
+        // SAFETY: the test initially filled every value; gathering only copies f32.
+        let values: Vec<_> = scratch
+            .storage
+            .iter()
+            .map(|x| unsafe { x.assume_init() })
+            .collect();
+        assert_eq!(&values[2..6], &[1., 2., 5., 6.]);
+        assert!(values[6..].iter().all(|&x| x == 29.));
+        assert!(
+            scratch
+                .gather_rows(&input, 2, [].into_iter())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            scratch
+                .gather_rows(&input, 0, [0].into_iter())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            scratch
+                .gather_rows(&input, 2, [3].into_iter())
+                .unwrap_err()
+                .to_string()
+                .contains("row 3")
+        );
+        assert!(
+            scratch
+                .gather_rows(&input, 2, [usize::MAX].into_iter())
+                .unwrap_err()
+                .to_string()
+                .contains("overflows")
+        );
+        assert!(
+            scratch
+                .gather_rows(&input, 2, [0; 9].into_iter())
+                .unwrap_err()
+                .to_string()
+                .contains("workspace has 16")
+        );
+        // A partially written failure never grants a whole-lane proof. The
+        // ordinary initialized path must still establish every remaining value.
+        assert!(!scratch.initialized);
+        assert!(scratch.initialized().iter().all(|&x| x == 0.));
+    }
 
     #[test]
     fn projection_scratch_is_lazy_once_per_dispatch_and_only_borrows_the_needed_prefix() {
