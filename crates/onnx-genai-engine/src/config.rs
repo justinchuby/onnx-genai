@@ -1708,6 +1708,9 @@ pub(crate) enum TextGrammar {
 /// leave them empty when response_projection owns the declared assistant prefill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateConstraint {
+    /// llama.cpp GBNF over the raw newly generated stream, including channel
+    /// markers and model-token references. Assistant prefill is not consumed.
+    Gbnf { grammar: String },
     /// Constrain the existing prefix plus new output to prefixes of one JSON value.
     /// EOS requires a complete value; explicit stops and length limits may truncate it.
     Json {
@@ -1744,6 +1747,10 @@ impl GenerateOptions {
         anyhow::ensure!(
             self.max_constraint_bytes > 0,
             "max_constraint_bytes must be greater than zero; configure a positive constraint text byte budget"
+        );
+        anyhow::ensure!(
+            !matches!(self.constraint, Some(GenerateConstraint::Gbnf { .. })) || self.stop_on_eos,
+            "GBNF grammar requires stop_on_eos=true; allow root completion to terminate the generation"
         );
         self.adaptive_p.validate()?;
         if !self.temperature.is_finite() || self.temperature < 0.0 {

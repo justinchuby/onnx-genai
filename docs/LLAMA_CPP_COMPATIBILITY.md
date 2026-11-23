@@ -255,8 +255,8 @@ Projected literal grammars preserve authored backslashes and Unicode spellings;
 only JSON Schema policy applies JSON escape normalization. Model-token references,
 token-count directives, per-rule temperatures and hidden stops cannot be treated
 as bytes and are rejected from projected byte grammars with an actionable error.
-Unprojected model-token Lark retains its existing token-aware behavior. This does
-not implement llama.cpp's HTTP GBNF grammar syntax.
+Unprojected model-token Lark retains its existing token-aware behavior. User
+GBNF uses the separate raw-output path described below.
 
 Tool observation preserves strict byte fragments for resolved byte decoders, so
 split Unicode channel markers are never replaced by provisional glyphs in tool
@@ -470,3 +470,37 @@ Temporary fixtures, proxy, Chrome and server processes are cleaned up, with
 bounded startup/observer waits. Append an optional screenshot path after the
 Playwright module path to save an image of the baseline chat. Coordinate this
 inference workload with other sessions using the shared host lock.
+
+
+## Raw GBNF constraints
+
+The chat, legacy completion and native completion endpoints accept the llama.cpp
+`grammar` field as GBNF over newly generated raw output. Existing assistant
+prefill is not consumed, and declared reasoning/content projection does not
+remove markers before this grammar sees them. This follows the pinned upstream
+[sampling contract](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/sampling.cpp).
+
+The supported syntax includes recursive rules, alternatives, groups, comments,
+Unicode literals and ranges, negated classes, dot, optional/repeated items and
+bounded repetition. Model token references use actual vocabulary IDs (`<[42]>`)
+or text that tokenizes to exactly one model token (`<think>`); `!` negates a token
+reference. Every legal token spelling remains available to the sampler, including
+compound tokens and partial UTF-8 byte pieces. Ending roles are eligible only
+when the root is complete, including endings covered by a negated token range.
+
+The parser requires `root`, rejects undefined rules and left recursion, and
+reports source line/column diagnostics. It bounds source bytes, rules, nesting,
+expanded items and repetitions. As in the pinned upstream parser, minimum
+repetitions above 2,000 are refused and larger upper bounds become unbounded.
+The model must declare a dense, resolved, token-local byte vocabulary. Actual
+raw pieces include special-token spellings; only explicitly declared ending IDs
+receive terminal semantics. Token names and angle brackets do not guess roles.
+Non-byte contextual decoders and stream-initial stripping currently return an
+actionable capability error before SSE.
+
+GBNF conflicts with JSON `response_format`, forced `tool_choice`, and
+`ignore_eos=true`. Neutral `grammar_lazy=false`, `grammar_triggers=[]` and
+`preserved_tokens=[]` are accepted. Active lazy grammars, triggers, preserved
+tokens and raw `%llguidance` input remain open compatibility work. Native
+`n_probs` and `completion_probabilities` also remain open; native GBNF acceptance
+does not imply support for those reporting fields.

@@ -2289,6 +2289,15 @@ fn build_generate_options(
     if let Some(constraint) = response_format_constraint(request) {
         options.constraint = Some(constraint);
     }
+    if let Some(grammar) = request
+        .grammar
+        .as_ref()
+        .filter(|grammar| !grammar.is_empty())
+    {
+        options.constraint = Some(GenerateConstraint::Gbnf {
+            grammar: grammar.clone(),
+        });
+    }
     options
 }
 
@@ -2392,6 +2401,7 @@ pub(super) fn build_generate_options_with_tokenizer(
     tokenizer: &Tokenizer,
     output_budget: usize,
 ) -> anyhow::Result<GenerateOptions> {
+    request.validate_grammar()?;
     let mut options = build_generate_options(request, output_budget);
     if let Some(biases) = request.extensions.get("logit_bias") {
         use onnx_genai_engine::logits::LogitBias;

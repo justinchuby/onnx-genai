@@ -213,6 +213,9 @@ pub(crate) async fn apply_template(
 /// Controls that do not change inference may be safely accepted. Every other
 /// unknown field is rejected, rather than reporting success with ignored settings.
 pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(), ApiError> {
+    request
+        .validate_grammar()
+        .map_err(|error| ApiError::invalid_request(format!("{error:#}")))?;
     if request.repeat_last_n != -1 && usize::try_from(request.repeat_last_n).is_err() {
         return Err(ApiError::invalid_request(
             "repeat_last_n must be -1 for full history, 0 to disable all penalties, or a non-negative token count supported by this host",

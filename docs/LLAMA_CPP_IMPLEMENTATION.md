@@ -1272,7 +1272,7 @@ Literal text grammars use the same transactional response projection as JSON
 without canonicalizing their escape spellings. Compiled grammar inspection
 rejects model-token references, token-based limits, rule temperatures and hidden
 stops rather than silently interpreting model token IDs as byte IDs. Unprojected
-model-token Lark remains token-aware. HTTP GBNF remains an independent open item.
+model-token Lark remains token-aware. The subsequent raw GBNF increment is described below.
 
 Tool observation consumes only the declared content channel, including tool
 prefill. Actual ONNX regression first demonstrated HTTP 500 from a reasoning
@@ -1299,3 +1299,44 @@ also passed with native-backend enabled. The final tool regression explicitly
 selects ORT or Native, covering forced/Auto tools, buffered/SSE/logprob delivery
 and reasoning exclusion. These are functional checks without performance claims.
 The broader unchecked delivery items remain required.
+
+
+## Raw GBNF generation constraints
+
+Add an explicit `GenerateConstraint::Gbnf` without a prefix field: user grammars
+operate on new raw model output, while internal forced-tool Lark remains scoped
+to projected content. This distinction follows the pinned upstream
+[grammar parser](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-grammar.cpp)
+and [sampling initialization](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/sampling.cpp).
+A bounded AST lowers Unicode classes, literals, recursion, groups, repetitions
+and model-token references into model-aware Lark. Numeric IDs must exist in the
+loaded vocabulary; named references use actual model tokenization. A resolved
+ByteStreamContract proves actual decoder bytes and dense IDs. Raw special-token
+pieces remain available to character literals, matching the pinned upstream
+[vocabulary cache](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-vocab.cpp).
+Only explicit ending roles get EOS frames; adapter name-based role guesses and
+decoded-token fallback are excluded. Contextual initial stripping remains an
+explicit unsupported capability on this raw model-token path.
+
+Adversarial mask tests exposed two real semantic differences: negated token
+ranges could allow EOS before the root completed, and llguidance canonical
+forcing could exclude a legal compound token. The GBNF path now proves root
+completion for all ending roles and disables canonical forcing. Literal `{0}`
+is lowered to epsilon because the target Lark parser rejects a zero upper bound.
+History rewind/recovery, nullable recursion, expanded repetition, Unicode scalar
+limits and incomplete UTF-8 pieces have executable coverage.
+
+HTTP preparation rejects conflicting JSON/forced-tool/ignore-EOS controls and
+validates syntax, model token references and decoder capability before SSE.
+Shared public request builders apply the same grammar validation. Neutral lazy,
+trigger and preserved-token fields are accepted; active forms are rejected.
+Native `n_probs` was confirmed as a separate missing protocol feature and remains
+required by the overall compatibility goal. Raw `%llguidance` syntax and active
+lazy grammars are also still required follow-ups.
+
+Final validation: engine libraries 948 passed / 1 inherited ignore; server
+libraries 449 passed / 2 inherited ignores; HTTP integration 37 passed. Strict
+engine/server all-target Clippy passed. Explicit Native CPU and ORT tests cover
+all three completion endpoints, buffered/logprob SSE, reasoning-budget interaction,
+neutral grammar controls, conflicting fields and malformed input before SSE.
+This increment does not close the goal.

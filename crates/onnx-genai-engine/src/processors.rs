@@ -52,7 +52,8 @@ pub(crate) fn build_processor_chain(
             GenerateConstraint::Json { prefix }
             | GenerateConstraint::JsonSchema { prefix, .. }
             | GenerateConstraint::Regex { prefix, .. }
-            | GenerateConstraint::Lark { prefix, .. } => prefix,
+            | GenerateConstraint::Lark { prefix, .. } => prefix.as_str(),
+            GenerateConstraint::Gbnf { .. } => "",
         };
         anyhow::ensure!(
             projection.is_none() || plain_prefix.is_empty(),
@@ -85,6 +86,26 @@ pub(crate) fn build_processor_chain(
             }
         };
         let grammar: Box<dyn crate::logits::Constraint> = match constraint {
+            GenerateConstraint::Gbnf { grammar } => {
+                let lark = crate::gbnf::compile(grammar, options.max_constraint_bytes, tokenizer)?;
+                let contract = crate::byte_stream::ByteStreamContract::resolve(
+                    tokenizer, crate::tokenization::SpecialTokenHandling::Preserve,
+                ).context("resolve tokenizer.decoder byte contract for GBNF grammar")?.context("GBNF grammar requires a resolved lossless tokenizer.decoder byte contract; use a tokenizer with supported byte decoding instead of contextual decoded-token guesses")?;
+                anyhow::ensure!(
+                    contract.new_state().is_identity(),
+                    "GBNF grammar cannot yet interpret tokenizer.decoder stream-initial stripping with model-token references; use a context-free byte decoder or a content-only response_format constraint"
+                );
+                // GBNF inspects raw pieces, including declared special tokens.
+                // Only explicitly resolved ending roles receive an EOS frame.
+                // The shared byte contract proves density and exact decoder
+                // transforms without adapter guesses based on token spelling.
+                let endings = terminal_token_ids(options);
+                Box::new(llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    LlguidanceConstraint::from_token_bytes(
+                        GrammarConstraintKind::Lark, &lark, contract.pieces, &endings, "",
+                    )
+                })).map(|constraint| constraint.with_completion_only_eos(endings)).context("compile grammar GBNF against the resolved model byte vocabulary; repair the grammar or tokenizer.decoder")?)
+            }
             GenerateConstraint::Json { prefix: plain } => {
                 Box::new(crate::response_constraint::ContentConstraint::json_schema(
                     tokenizer,
@@ -1578,6 +1599,221 @@ mod json_continuation_tests {
 #[cfg(test)]
 mod lark_prefill_tests {
     use super::*;
+
+    #[test]
+    fn gbnf_literal_unicode_classes_repetitions_and_recursion_match_actual_bytes() {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/tiny-llm/tokenizer.json"
+        )))
+        .unwrap();
+        let vocab = value["model"]["vocab"].as_object_mut().unwrap();
+        for (id, text) in [
+            (22, "é"),
+            (23, "😀"),
+            (24, "é😀"),
+            (25, r"\u00E9"),
+            (26, "<0xC3>"),
+            (27, "<0xA9>"),
+        ] {
+            let old = vocab
+                .iter()
+                .find(|(_, value)| value.as_u64() == Some(id))
+                .unwrap()
+                .0
+                .clone();
+            vocab.remove(&old);
+            vocab.insert(text.into(), serde_json::json!(id));
+        }
+        value["decoder"] = serde_json::json!({"type":"ByteFallback"});
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        for (grammar, history, expected) in [
+            ("root ::=", vec![], vec![3]),
+            (r"root ::= [é😀]{1,2}", vec![26], vec![27]),
+            (r"root ::= [é😀]{1,2}", vec![26, 27], vec![3, 22, 23, 26]),
+            ("root ::= \"é\" |", vec![], vec![3, 22, 26]),
+            ("root ::= \"é\"{0}", vec![], vec![3]),
+            (r"root ::= [é😀]{1,2}", vec![], vec![22, 23, 24, 26]),
+            (r"root ::= [é😀]{1,2}", vec![22], vec![3, 22, 23, 26]),
+            (r"root ::= [é😀]{1,2}", vec![24], vec![3]),
+            ("root ::= \"é\" root | \"\"", vec![], vec![3, 22, 26]),
+            ("root ::= \"é\" root | \"\"", vec![22], vec![3, 22, 26]),
+            ("root ::= .", vec![], vec![14, 15, 22, 23, 26]),
+            (r#"root ::= "\u00E9\U0001F600""#, vec![], vec![22, 24, 26]),
+            (r#"root ::= "\u00E9\U0001F600""#, vec![22], vec![23]),
+            (r#"root ::= "\\u00E9""#, vec![], vec![25]),
+        ] {
+            let options = GenerateOptions {
+                constraint: Some(GenerateConstraint::Gbnf {
+                    grammar: grammar.into(),
+                }),
+                eos_token_id: Some(3),
+                greedy: true,
+                ..Default::default()
+            };
+            let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+            let mut logits = vec![0.0; 32];
+            chain
+                .process(
+                    &mut logits,
+                    &ProcessorContext {
+                        generated_tokens: history.clone(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let allowed = logits
+                .iter()
+                .enumerate()
+                .filter_map(|(id, score)| score.is_finite().then_some(id))
+                .collect::<Vec<_>>();
+            assert_eq!(allowed, expected, "{grammar} after {history:?}");
+        }
+    }
+
+    #[test]
+    fn gbnf_masks_actual_model_tokens_negation_and_history_rewinds() {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/tiny-llm/tokenizer.json"
+        )))
+        .unwrap();
+        value["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tok31");
+        value["model"]["vocab"]["<think>"] = serde_json::json!(31);
+        value["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tok29");
+        value["model"]["vocab"]["<ordinary>"] = serde_json::json!(29);
+        value["added_tokens"] = serde_json::json!([{
+            "id":31,"content":"<think>","single_word":false,"lstrip":false,
+            "rstrip":false,"normalized":false,"special":true
+        }, {"id":29,"content":"<ordinary>","single_word":false,"lstrip":false,
+            "rstrip":false,"normalized":false,"special":false}]);
+        value["decoder"] = serde_json::json!({"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false});
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let options = GenerateOptions {
+            constraint: Some(GenerateConstraint::Gbnf {
+                grammar: "root ::= <think> !<[31]> <[31]>".into(),
+            }),
+            eos_token_id: Some(3),
+            eos_token_ids: vec![30],
+            greedy: true,
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        for (history, expected) in [
+            (vec![], Some(31)),
+            (vec![31], None),
+            (vec![31, 4], Some(31)),
+            (vec![31, 4, 31], Some(3)),
+            (vec![], Some(31)),
+            (vec![31, 5], Some(31)),
+        ] {
+            let mut logits = vec![0.0; 32];
+            chain
+                .process(
+                    &mut logits,
+                    &ProcessorContext {
+                        generated_tokens: history,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let allowed = logits
+                .iter()
+                .enumerate()
+                .filter_map(|(id, score)| score.is_finite().then_some(id))
+                .collect::<Vec<_>>();
+            if let Some(expected) = expected {
+                assert_eq!(
+                    allowed,
+                    if expected == 3 {
+                        vec![3, 30]
+                    } else {
+                        vec![expected]
+                    }
+                );
+            } else {
+                assert!(!allowed.contains(&31));
+                assert!(allowed.contains(&4));
+                assert!(!allowed.contains(&3));
+                assert!(!allowed.contains(&30));
+            }
+        }
+        for (literal, expected) in [("<think>", 31), ("<ordinary>", 29)] {
+            let mut literal_options = options.clone();
+            literal_options.constraint = Some(GenerateConstraint::Gbnf {
+                grammar: format!("root ::= {literal:?}"),
+            });
+            let literal_chain =
+                build_processor_chain(&literal_options, Some(&tokenizer), false).unwrap();
+            let mut logits = [0.0; 32];
+            literal_chain
+                .process(&mut logits, &ProcessorContext::default())
+                .unwrap();
+            let allowed = logits
+                .iter()
+                .enumerate()
+                .filter_map(|(id, score)| score.is_finite().then_some(id))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                allowed,
+                [expected],
+                "literal {literal} must follow actual token bytes and special flags"
+            );
+        }
+        for (case, expected) in [("initial-strip", "initial stripping"), ("sparse", "dense")] {
+            let mut invalid_vocab = value.clone();
+            if case == "initial-strip" {
+                invalid_vocab["decoder"] = serde_json::json!({"type":"Sequence","decoders":[
+                    {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
+                    {"type":"Strip","content":" ","start":1,"stop":0}
+                ]});
+            } else {
+                invalid_vocab["model"]["vocab"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("tok28");
+            }
+            let invalid_path = scratch.path().join(format!("{case}.json"));
+            std::fs::write(&invalid_path, serde_json::to_vec(&invalid_vocab).unwrap()).unwrap();
+            let invalid_tokenizer = Tokenizer::from_file(invalid_path).unwrap();
+            let error = build_processor_chain(&options, Some(&invalid_tokenizer), false)
+                .err()
+                .expect("unsupported byte contract must be explicit");
+            assert!(format!("{error:#}").contains(expected), "{case}: {error:#}");
+        }
+        let invalid_history = ProcessorContext {
+            generated_tokens: vec![31, 3],
+            ..Default::default()
+        };
+        assert!(chain.process(&mut [0.0; 32], &invalid_history).is_err());
+        let mut reset_logits = vec![0.0; 32];
+        chain
+            .process(&mut reset_logits, &ProcessorContext::default())
+            .unwrap();
+        assert!(reset_logits[31].is_finite() && !reset_logits[3].is_finite());
+        for grammar in ["root ::= <[32]>", "root ::= <not-in-vocabulary>"] {
+            let mut invalid = options.clone();
+            invalid.constraint = Some(GenerateConstraint::Gbnf {
+                grammar: grammar.into(),
+            });
+            let error = build_processor_chain(&invalid, Some(&tokenizer), false)
+                .err()
+                .expect("invalid token reference");
+            assert!(format!("{error:#}").contains("grammar token"), "{error:#}");
+        }
+    }
 
     #[test]
     fn lark_prefill_keeps_explicit_special_token_transitions() {
