@@ -1658,6 +1658,10 @@ async fn status_reports_each_configured_ort_worker() {
         &model_dir,
         Some("tiny-llm".to_string()),
         ServerConfig {
+            engine_config: EngineConfig {
+                decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+                ..Default::default()
+            },
             ort_session_workers: OrtSessionWorkerCount::new(2).unwrap(),
             ..ServerConfig::default()
         },
@@ -1689,6 +1693,10 @@ async fn resources_and_metrics_track_worker1_host_release_without_worker0_comman
         &model_dir,
         Some("tiny-llm".to_string()),
         ServerConfig {
+            engine_config: EngineConfig {
+                decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+                ..Default::default()
+            },
             ort_session_workers: OrtSessionWorkerCount::new(2).unwrap(),
             ..ServerConfig::default()
         },
@@ -1787,6 +1795,10 @@ async fn multiple_workers_still_refuse_a_second_turn_on_one_session() {
         &model_dir,
         Some("tiny-llm".to_string()),
         ServerConfig {
+            engine_config: EngineConfig {
+                decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+                ..Default::default()
+            },
             ort_session_workers: OrtSessionWorkerCount::new(2).unwrap(),
             ..ServerConfig::default()
         },
@@ -4108,8 +4120,7 @@ async fn the_trace_endpoint_points_at_the_aggregate_profile() {
 /// passes whether or not the bug is present.
 #[tokio::test]
 async fn resource_snapshots_are_answered_during_a_batch_not_deferred() {
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
 
     // The mirror is what the driver refreshes between steps; a batch in flight
@@ -4159,8 +4170,7 @@ async fn an_empty_snapshot_mirror_defers_rather_than_fabricating() {
 /// not "answer anything".
 #[tokio::test]
 async fn mutating_commands_are_still_deferred() {
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
 
     let mirror = std::sync::Mutex::new(Some(engine.resource_snapshot()));
@@ -5407,7 +5417,18 @@ async fn a_fim_completion_carrying_a_session_id_opens_no_session() {
 #[tokio::test]
 async fn an_ort_decode_core_session_is_charged_for_what_it_attends() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-    let state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
+    let state = AppState::load_with_config(
+        &model_dir,
+        Some("tiny-llm".to_string()),
+        ServerConfig {
+            engine_config: EngineConfig {
+                decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("load fixture");
     let router = app(state);
     let session = "sess-decode-core";
 
@@ -5442,7 +5463,18 @@ async fn an_ort_decode_core_session_is_charged_for_what_it_attends() {
 #[tokio::test]
 async fn a_decode_core_conversation_past_the_window_is_refused_not_answered_empty() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-    let state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
+    let state = AppState::load_with_config(
+        &model_dir,
+        Some("tiny-llm".to_string()),
+        ServerConfig {
+            engine_config: EngineConfig {
+                decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("load fixture");
     let router = app(state);
     let session = "sess-decode-core-window";
     let message = "the quick brown fox jumps over the lazy dog";

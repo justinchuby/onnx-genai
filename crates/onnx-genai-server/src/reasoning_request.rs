@@ -801,11 +801,16 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                let status = response.status();
                 let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
                     .await
                     .unwrap();
                 let text = std::str::from_utf8(&bytes).unwrap();
+                assert_eq!(
+                    status,
+                    axum::http::StatusCode::OK,
+                    "{path} stream={stream}: {text}"
+                );
                 let id = if stream {
                     let value: Value = serde_json::from_str(
                         text.lines()

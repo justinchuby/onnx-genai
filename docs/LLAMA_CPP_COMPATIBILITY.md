@@ -1,5 +1,11 @@
 # llama.cpp protocol compatibility
 
+Native execution is enabled and selected by default in the engine, facade, CLI
+and server. ORT is an explicitly selected reference backend for tests and
+comparisons: use `--backend ort` or `EngineDecodeBackend::Ort`. Native failures
+remain visible instead of automatically switching production requests to ORT.
+The opt-in auto selector is also a reference/testing mode.
+
 The server embeds the official Llama Chat frontend with a small capability adapter from
 [llama.cpp commit 8d60873dfb8619f2b5ed31adfbab07cccb40db5c](https://github.com/ggml-org/llama.cpp/tree/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/ui/apps/chat).
 The integration patch gates automatically attached browser tools using the

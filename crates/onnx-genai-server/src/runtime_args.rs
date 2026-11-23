@@ -31,13 +31,13 @@ use onnx_genai_engine::NativeDecodeDevice;
 /// Backend, device and memory-ceiling flags.
 #[derive(Debug, Args, Default, Clone)]
 pub struct EngineArgs {
-    /// Decoder backend for text generation.
+    /// Decoder backend: native by default; ort/auto are reference test modes.
     #[arg(
         long,
         value_name = "auto|ort|native",
         env = "ONNX_GENAI_BACKEND",
         value_parser = parse_decode_backend,
-        default_value = "auto"
+        default_value = "native"
     )]
     pub backend: EngineDecodeBackend,
 
@@ -325,7 +325,7 @@ mod tests {
     fn no_device_leaves_the_backend_alone() {
         assert_eq!(
             EngineArgs::default().resolved_backend(),
-            EngineDecodeBackend::Auto
+            EngineDecodeBackend::Native
         );
     }
 }

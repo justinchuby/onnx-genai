@@ -708,7 +708,14 @@ async fn session_ids_are_random_csprng_tokens() {
 
 #[tokio::test]
 async fn session_fork_endpoint_returns_an_independent_child() {
-    let app = test_app().await;
+    let app = test_app_with_config(ServerConfig {
+        engine_config: onnx_genai_engine::EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
     let source = create_http_session(app.clone()).await;
     let response = app
         .clone()
@@ -747,6 +754,10 @@ async fn session_fork_endpoint_returns_an_independent_child() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_fork_routes_worker_local_id_collisions_without_leaking_failed_children() {
     let app = test_app_with_config(ServerConfig {
+        engine_config: onnx_genai_engine::EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..Default::default()
+        },
         ort_session_workers: OrtSessionWorkerCount::new(2).unwrap(),
         ..ServerConfig::default()
     })
@@ -845,7 +856,14 @@ async fn session_fork_routes_worker_local_id_collisions_without_leaking_failed_c
 
 #[tokio::test]
 async fn session_fork_endpoint_reports_the_unsupported_participant_before_child() {
-    let app = test_app().await;
+    let app = test_app_with_config(ServerConfig {
+        engine_config: onnx_genai_engine::EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
     let source = create_http_session(app.clone()).await;
     let generated = app
         .clone()
@@ -1985,8 +2003,15 @@ async fn streaming_chat_completions_stop_sequence_finishes_before_max_tokens() {
 }
 
 #[tokio::test]
-async fn chat_completions_reuses_persistent_session() {
-    let app = test_app().await;
+async fn ort_chat_completions_reuses_persistent_session() {
+    let app = test_app_with_config(ServerConfig {
+        engine_config: onnx_genai_engine::EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
     let session_id = create_http_session(app.clone()).await;
 
     let first = app

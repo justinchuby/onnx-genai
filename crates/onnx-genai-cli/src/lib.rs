@@ -836,15 +836,15 @@ mod tests {
     }
 
     #[test]
-    fn backend_defaults_to_auto() {
+    fn backend_defaults_to_native() {
         let parsed = Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi"]).unwrap();
 
         match parsed.command {
             Commands::Generate(args) => {
-                assert_eq!(args.engine.backend, EngineDecodeBackend::Auto);
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Native);
                 assert_eq!(
                     args.engine.to_config().decode_backend,
-                    EngineDecodeBackend::Auto
+                    EngineDecodeBackend::Native
                 );
             }
             _ => panic!("expected generate command"),

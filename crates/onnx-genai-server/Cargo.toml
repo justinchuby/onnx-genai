@@ -9,7 +9,7 @@ keywords = ["onnx", "llm", "inference", "server"]
 categories = ["web-programming::http-server", "science"]
 
 [features]
-default = ["metrics", "cuda-13000"]
+default = ["metrics", "cuda-13000", "native-backend"]
 # Exposes the allocation-free atomic registry at GET /metrics in Prometheus format.
 metrics = []
 # Enables profiling integration hooks. Perfetto and OTLP exporters remain deferred.

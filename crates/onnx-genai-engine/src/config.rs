@@ -564,11 +564,11 @@ impl Default for KvConnectorConfig {
 pub enum EngineDecodeBackend {
     /// Use the native runtime for models containing native-only operators;
     /// otherwise use ONNX Runtime.
-    #[default]
     Auto,
-    /// Always use ONNX Runtime.
+    /// Explicit ONNX Runtime reference backend for tests and comparisons.
     Ort,
     /// Always use the native runtime.
+    #[default]
     Native,
 }
 
@@ -851,6 +851,8 @@ pub enum DecisionSource {
 /// Engine configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
+    /// Native is the production default; ORT and Auto are explicit reference
+    /// modes for tests and comparisons.
     /// Decoder execution backend. [`EngineDecodeBackend::Auto`] preserves ORT
     /// for existing models and selects native execution only when required.
     ///
@@ -928,7 +930,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            decode_backend: EngineDecodeBackend::Auto,
+            decode_backend: EngineDecodeBackend::Native,
             native_device: None,
             native_decode_batch: None,
             #[cfg(feature = "native-backend")]
@@ -1071,7 +1073,7 @@ mod resource_limit_tests {
     #[test]
     fn engine_config_defaults_to_scheduler_resource_defaults() {
         let config = EngineConfig::default();
-        assert_eq!(config.decode_backend, EngineDecodeBackend::Auto);
+        assert_eq!(config.decode_backend, EngineDecodeBackend::Native);
         assert_eq!(config.limits, ResourceLimits::default());
         assert!(!config.allow_runtime_override);
     }

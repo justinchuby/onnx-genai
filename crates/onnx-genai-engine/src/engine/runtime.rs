@@ -5422,7 +5422,13 @@ mod tests {
     #[test]
     fn prompt_only_prefill_publishes_real_ort_cache_without_output() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let prompt = [2, 4, 3];
         let result = engine.prefill(prefill_request(&prompt))?;
         assert_eq!(
@@ -5504,7 +5510,14 @@ mod tests {
         request.options.stop_on_eos = false;
         let generated = engine.generate(request.clone())?;
         assert!(generated.prefix_cache_hit_len > 0);
-        let oracle = Engine::from_dir(&fixture, EngineConfig::default())?.generate(request)?;
+        let oracle = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?
+        .generate(request)?;
         assert_eq!(generated.token_ids, oracle.token_ids);
         assert_eq!(generated.text, oracle.text);
         Ok(())
@@ -5570,6 +5583,7 @@ mod tests {
         let mut engine = Engine::from_dir(
             &fixture,
             EngineConfig {
+                decode_backend: EngineDecodeBackend::Ort,
                 kv_connector: KvConnectorConfig {
                     backend: KvConnectorBackend::LocalTiered(onnx_genai_kv::LocalTieredConfig {
                         chunk_size: 2,
@@ -5712,6 +5726,7 @@ mod tests {
             .canonicalize()?;
         let chunk_size = 2;
         let config = EngineConfig {
+            decode_backend: EngineDecodeBackend::Ort,
             kv_connector: KvConnectorConfig {
                 backend: KvConnectorBackend::LocalTiered(onnx_genai_kv::LocalTieredConfig {
                     chunk_size,
