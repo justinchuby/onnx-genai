@@ -736,8 +736,15 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 111);
-        assert_eq!(registry.iter().count(), 120);
+        assert_eq!(registry.schemas.len(), 110);
+        assert_eq!(registry.iter().count(), 123);
+        for op in ["LinearAttention", "CausalConvWithState"] {
+            assert!(registry.lookup(op, "", 26).is_none());
+            assert_eq!(registry.lookup(op, "", 28).unwrap().since_version, 27);
+            assert!(registry.lookup(op, "", 29).is_none());
+        }
+        assert_eq!(registry.lookup("Range", "", 26).unwrap().since_version, 11);
+        assert_eq!(registry.lookup("Range", "", 27).unwrap().since_version, 27);
 
         for (name, since_version) in [
             ("DequantizePacked", 29),
