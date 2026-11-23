@@ -1747,3 +1747,21 @@ capability increment, not family graduation or whole-model throughput evidence.
 Decoded tiles remain bounded call-owned scratch pending public-workspace
 migration; the per-worker bound increases to at most four rows on portable
 compute. Process RSS is reported as an absolute high-water mark, not savings.
+
+
+## ARM64 NT register tiles preserve output chains
+
+The native ARM64 NT dispatcher now uses register-only 4x4 output tiles with
+runtime NEON gating, separate multiply/add rounding and the original K order.
+It adds no packed payload, scratch allocation or resource API. Full/partial
+shape bit oracles, nonfinite checks and the two-ULP public-dispatch argmax
+regression pass. A measured column-tail regression was fixed before acceptance.
+
+[Controlled M1 Max evidence](../benchmarks/arm64-nt-register-tiles/README.md)
+shows roughly 18–19% less CPU time for two larger-row serial shapes and 16.8%
+less CPU for a warm resident MoE fixture. Streamed block MatMul shows no
+established endpoint gain. All default full outputs and argmaxes match; controls,
+null arms, corrected single-thread reference, source/executable hashes and
+rejected evidence are recorded. MLAS still wins several shapes, so the family
+remains ungraduated and the optional research reference remains. No model-wide,
+CUDA, x86 or universal memory/performance claim follows from these results.

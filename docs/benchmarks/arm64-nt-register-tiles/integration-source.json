@@ -1,0 +1,8 @@
+{
+  "integration_parent": "f667643f2",
+  "tested_head": "78eb1fc1edd59025aaaacb5402c038c4f99231ac",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs": "eeb4323d72e29ac5d16b083375cb9a9dc03a0ba4915c66e64cf818e50373198d",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_neon.rs": "394580501bedcd8c8a7b9889001bbe3bacf4a343fb6c696f521d873f4a9399e9"
+  }
+}

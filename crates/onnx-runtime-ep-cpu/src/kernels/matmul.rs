@@ -2196,8 +2196,19 @@ fn gemm_bt_block(a: &[f32], bt: &[f32], c: &mut [f32], rows: usize, k: usize, n:
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    if rows >= 4 && n >= 4 && std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: runtime NEON detection and the caller's exact matrix extents;
+        // each tile reads immutable inputs and exclusively overwrites its C tile.
+        unsafe { gemm_bt_neon::block(a, bt, c, rows, k, n) };
+        return;
+    }
     gemm_bt_block_portable(a, bt, c, rows, k, n);
 }
+
+#[cfg(target_arch = "aarch64")]
+#[path = "matmul_neon.rs"]
+mod gemm_bt_neon;
 
 /// Portable NT micro-tiles vectorize across independent outputs, not K.
 /// Each output retains the original left-to-right f32 accumulation order.
@@ -4485,8 +4496,7 @@ mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
 
-    #[test]
-    fn portable_projection_preserves_the_two_ulp_argmax_margin() {
+    fn two_ulp_projection_fixture() -> (Vec<f32>, Vec<f32>) {
         // Minimized from a rejected public BlockQuantizedMatMul run: changing
         // the K reduction to 16 lanes tied two logits and flipped the argmax.
         // The other two rows exercise the four-output native micro-tile.
@@ -4520,6 +4530,13 @@ mod tests {
         let input: Vec<f32> = (0..K)
             .map(|p| ((10 * K + p) % 31) as f32 / 1000. - 0.015)
             .collect();
+        (weights, input)
+    }
+
+    #[test]
+    fn portable_projection_preserves_the_two_ulp_argmax_margin() {
+        const K: usize = 1024;
+        let (weights, input) = two_ulp_projection_fixture();
         let mut output = [0.0f32; 4];
         gemm_bt_block_portable(&weights, &input, &mut output, 4, K, 1);
         assert_eq!(output.map(f32::to_bits), [0x3fd9_6455, 0x3fd9_6457, 0, 0]);
@@ -4527,6 +4544,51 @@ mod tests {
             output[1] > output[0],
             "preserve the baseline's strict winning logit"
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn native_neon_projection_dispatch_preserves_the_two_ulp_argmax_margin() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        const K: usize = 1024;
+        let (weights, input) = two_ulp_projection_fixture();
+        let inputs = input.repeat(4);
+        let mut output = [f32::NAN; 16];
+        let before = gemm_bt_neon::block_calls();
+        gemm_bt_serial_with_backend(&weights, &inputs, &mut output, 4, K, 4, CpuBackend::Generic)
+            .unwrap();
+        assert_eq!(
+            gemm_bt_neon::block_calls(),
+            before + 1,
+            "the public serial entry must actually enter the NEON tile"
+        );
+        for column in 0..4 {
+            assert_eq!(output[column].to_bits(), 0x3fd9_6455);
+            assert_eq!(output[4 + column].to_bits(), 0x3fd9_6457);
+            assert!(
+                output[4 + column] > output[column],
+                "keep the strict winning feature at every input row"
+            );
+        }
+        let mut decode = [f32::NAN; 4];
+        gemm_bt_serial_with_backend(
+            &weights[..K],
+            &inputs,
+            &mut decode,
+            1,
+            K,
+            4,
+            CpuBackend::Generic,
+        )
+        .unwrap();
+        assert_eq!(
+            gemm_bt_neon::block_calls(),
+            before + 1,
+            "unit-row calls retain the existing portable route"
+        );
+        assert_eq!(decode.map(f32::to_bits), [0x3fd9_6455; 4]);
     }
 
     #[test]
