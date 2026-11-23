@@ -21,6 +21,7 @@ impl Executor {
     pub(super) fn begin_device_validation_submission(
         &mut self,
     ) -> Result<DeviceValidationSubmission> {
+        self.workspace_completion = WorkspaceCompletion::Pending;
         let registration = self
             .validation_registration
             .as_ref()
@@ -35,6 +36,7 @@ impl Executor {
         &mut self,
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceValidationSubmission> {
+        self.workspace_completion = WorkspaceCompletion::Pending;
         let registration = self
             .validation_registration
             .as_ref()
@@ -74,6 +76,7 @@ impl Executor {
         validation_submission: Option<DeviceValidationSubmission>,
         artifact_requirement: Option<CapturedProviderArtifactRequirement>,
     ) -> Result<ScopedRunResult> {
+        self.workspace_completion = WorkspaceCompletion::Pending;
         // Distinguish the outermost (top-level graph) run from nested
         // control-flow subgraph runs so the phase profiler can attribute
         // overhead to the right layer.
@@ -198,6 +201,9 @@ impl Executor {
         if !decode_memo_eligible {
             self.scratch_resolved_shapes = resolved;
         }
+        if outcome.is_err() || validation.is_err() || unbound.is_err() {
+            self.workspace_completion = WorkspaceCompletion::Pending;
+        }
         match (outcome, validation, unbound) {
             (_, Err(e), _) => Err(e),
             (Err(e), _, _) => Err(e),
@@ -276,6 +282,7 @@ impl Executor {
                     self.ep
                         .consume_route_residency_at_boundary_for_executor(owner)?;
                 }
+                self.workspace_completion = WorkspaceCompletion::Completed;
                 Ok(())
             }
             flags => Err(EpError::KernelFailed(format!(
@@ -394,6 +401,7 @@ impl Executor {
     }
 
     fn reset_run_state(&mut self) -> Result<()> {
+        self.restore_completed_step_workspace();
         // A previous run must never leave a handle aliasing its caller's
         // tensors installed (it cannot, but re-establishing the invariant here
         // makes the guarantee independent of every early-return path above).

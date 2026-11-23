@@ -2045,3 +2045,55 @@ fn holder_ids_are_manager_issued_not_caller_selected() {
     assert_ne!(fixture.holder.id(), second.id());
     assert_ne!(fixture.holder.id(), HolderId::new(0));
 }
+
+#[test]
+fn authority_pressure_registry_is_the_existing_physical_admission_registry() {
+    let fixture = Fixture::new(DeviceKey::HOST, 256, unlimited());
+    let registry = fixture.authority.pressure_registry().unwrap().unwrap();
+    assert_eq!(
+        registry.authority_id(),
+        fixture.governor.authority_id(Tier::Host)
+    );
+    assert_eq!(registry.tier(), Tier::Host);
+    let idle = Arc::new(ReentrantReclaimer {
+        manager: fixture.manager.clone(),
+        allocation: Mutex::new(None),
+        calls: AtomicUsize::new(0),
+        want: AtomicU64::new(0),
+    });
+    let responder: Arc<dyn onnx_runtime_memory_governor::PressureResponder> = idle.clone();
+    let registration = registry.register(&responder).unwrap();
+    let binding = fixture.manager.bind_registered(&fixture.mechanism).unwrap();
+    let allocation = binding
+        .allocate(
+            AllocationRequest::managed(
+                200,
+                64,
+                Tier::Host,
+                MemoryRole::Workspace { step_scoped: true },
+                fixture.holder.clone(),
+                200,
+            ),
+            AllocationPublication::exclusive(200, 200, 200),
+        )
+        .unwrap();
+    let wait = allocation.settlement_wait();
+    assert_eq!(wait.charged_bytes(), 200);
+    *idle.allocation.lock().unwrap() = Some(allocation);
+    // Admission through the governor must see the callback enrolled via the
+    // registered authority, without constructing another holder or ledger.
+    let lease = fixture
+        .governor
+        .reserve(Tier::Host, 100, MemoryRole::KvCache, HolderId::new(91))
+        .unwrap();
+    assert_eq!(idle.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.governor.used(Tier::Host), 100);
+    assert_eq!(
+        wait.status(),
+        onnx_runtime_memory_governor::AllocationSettlementStatus::Released
+    );
+    assert_eq!(wait.charged_bytes(), 0);
+    drop(lease);
+    drop(registration);
+    assert_eq!(fixture.governor.used(Tier::Host), 0);
+}
