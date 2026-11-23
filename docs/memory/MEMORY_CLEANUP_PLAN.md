@@ -2302,6 +2302,30 @@ The old compatibility-lease failure test is replaced by real managed backing
 and ledger/process-manager checks. Existing incomplete-release, warm zero-issuer
 callback and CUDA host-side barrier tests remain applicable.
 
+### QMoE input groups reuse one execution lane
+
+Integer QMoE now declares metadata-planned StepScoped grouped-input scratch.
+The checked bound is rows*hidden*f32, reused across serial experts, without an
+expert-count/top-k multiplier. A singleton group borrows its already contiguous
+input row; zero- and one-row batches need no gather storage. Multirow groups
+reuse ProjectionScratch::gather_rows. Only the main compute thread borrows that
+lane; prefetch workers still own weights independently, retaining their ordering,
+reader, capacity-proof and join contracts. No extra allocator or quota API is
+introduced. Contributions, routing, FC intermediates, row decoder scratch and
+transient weight admission remain outside this migration.
+
+[Actual-session evidence](../benchmarks/qmoe-grouped-input-workspace/README.md)
+retains both 27-process studies. The first candidate's qualified single-row
++2.20% point estimate motivated the singleton refinement. Final point changes on
+M1 Max are -0.51%, +0.81% and +0.47%, with overlapping ranges and passing controls;
+no distinguishable regression or gain is established on these fixtures. All 54
+full outputs/argmaxes agree. Single-row gather storage is zero; eight-row H=256
+storage is exactly 8,192 bytes at one or four threads. Warm workspace borrow and
+return have zero recorded issuer callbacks; this is not a claim that existing
+transient weight admission makes no callbacks. The scoped cap is not a full
+process cap. The CUDA parity CPU oracle is also updated to prepare scratch,
+with a real GPU-free f64 regression that caught the missing caller.
+
 ### Float MoE gather uses the shared execution lane
 
 Float MoE now follows the same declared-workspace contract as the quantized

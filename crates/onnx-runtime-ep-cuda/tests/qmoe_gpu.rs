@@ -12,6 +12,8 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
+mod common;
+
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
@@ -335,9 +337,8 @@ fn run_cpu(case: Case, inputs: &[Option<HostTensor>]) -> Vec<f32> {
     let output_shape = [case.rows, case.hidden];
     let (graph, node) = model_node(inputs, DataType::Float32, &output_shape, case);
     let model = Model::new(&graph);
-    let kernel = CpuExecutionProvider::new()
-        .get_kernel(model.graph.node(node), &[], 1)
-        .unwrap();
+    let ep = CpuExecutionProvider::new();
+    let kernel = ep.get_kernel(model.graph.node(node), &[], 1).unwrap();
     let strides: Vec<_> = inputs
         .iter()
         .map(|input| {
@@ -363,18 +364,19 @@ fn run_cpu(case: Case, inputs: &[Option<HostTensor>]) -> Vec<f32> {
         .collect();
     let mut output = vec![0u8; case.rows * case.hidden * 4];
     let output_strides = compute_contiguous_strides(&output_shape);
-    kernel
-        .execute(
-            &views,
-            &mut [TensorMut::new(
-                DevicePtrMut(output.as_mut_ptr().cast()),
-                DataType::Float32,
-                &output_shape,
-                &output_strides,
-                DeviceId::cpu(),
-            )],
-        )
-        .unwrap();
+    common::execute_cpu_kernel(
+        &ep,
+        kernel.as_ref(),
+        &views,
+        &mut [TensorMut::new(
+            DevicePtrMut(output.as_mut_ptr().cast()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            DeviceId::cpu(),
+        )],
+    )
+    .unwrap();
     output
         .chunks_exact(4)
         .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))

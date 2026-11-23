@@ -1,0 +1,1 @@
+CUDA test source scan passed over 95 CUDA test targets: every test carries an ignore and is present with gpu-tests off; 4 resource-sensitive targets acquire their suite lock before test work and keep its guard live through function exit

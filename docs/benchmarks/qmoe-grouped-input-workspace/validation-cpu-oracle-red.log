@@ -1,0 +1,31 @@
+{"status": "queued", "pid": 61362, "action": "Wait for the peer batch on the shared stable flock; no heavy process has started."}
+{"status": "acquired", "pid": 61362, "command": ["env", "CARGO_TARGET_DIR=/tmp/nxrt-erf-nan-target", "CARGO_INCREMENTAL=0", "ORT_ROOT=/Users/justinc/Documents/GitHub/onnx-genai/target/debug/build/onnx-genai-ort-sys-14a8134a15d047e2/out/ort-prebuilt", "cargo", "test", "--offline", "-p", "onnx-runtime-ep-cuda", "--test", "qmoe_gpu", "cpu_qmoe_oracle_prepares_declared_workspace_without_cuda"]}
+   Compiling onnx-genai-ort-sys v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-genai-ort/ort-sys)
+   Compiling onnx-genai-cuda-version-guard v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-genai-cuda-version-guard)
+   Compiling onnx-runtime-cuda-memory v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-cuda-memory)
+   Compiling onnx-genai-paged-attention v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-genai-paged-attention)
+   Compiling onnx-runtime-einsum-conformance v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-einsum-conformance)
+   Compiling onnx-runtime-ep-cuda v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cuda)
+   Compiling onnx-runtime-ep-api v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-api)
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.03s
+     Running tests/qmoe_gpu.rs (/tmp/nxrt-erf-nan-target/debug/deps/qmoe_gpu-0185fe856bb28213)
+
+running 1 test
+test cpu_qmoe_oracle_prepares_declared_workspace_without_cuda ... FAILED
+
+failures:
+
+---- cpu_qmoe_oracle_prepares_declared_workspace_without_cuda stdout ----
+
+thread 'cpu_qmoe_oracle_prepares_declared_workspace_without_cuda' (8974238) panicked at crates/onnx-runtime-ep-cuda/tests/qmoe_gpu.rs:408:10:
+called `Result::unwrap()` on an `Err` value: Backend { operation: "QMoE grouped input", source: KernelFailed("workspace needs 64 bytes aligned to 4, received 0 bytes at 0x0; prepare and pass the kernel's workspace requirement before execution") }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cpu_qmoe_oracle_prepares_declared_workspace_without_cuda
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p onnx-runtime-ep-cuda --test qmoe_gpu`

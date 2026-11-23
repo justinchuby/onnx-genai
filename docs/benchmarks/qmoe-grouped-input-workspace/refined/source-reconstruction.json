@@ -1,0 +1,10 @@
+{
+  "base": "911fcbd78ee1eb0a82b471b164aa02cff2d33c32",
+  "head": "1cc886fb498f67f1035179c4cd89067a2f4a8fc3",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/mod.rs": "6b161640a6b30a456b7eb1f94b5a4dda77ef260da1c4a999176534cdce95e75f",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "2ed1b88bf45674e2c8e5245ce824a233b8953b2e2ff4b66c234e57deeb0fdc30",
+    "crates/onnx-runtime-ep-cuda/tests/qmoe_gpu.rs": "35a7271dd3254894de252ed334b3e4b636a7f7a5c74e2f2056120553fbf13db0"
+  },
+  "patch_sha256": "c55470e7dd8cc3e0dc9f47f06de8a57db71b7ecafa5b62a459bd3222effcfcb1"
+}

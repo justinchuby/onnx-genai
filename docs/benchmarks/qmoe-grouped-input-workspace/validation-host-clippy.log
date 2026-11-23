@@ -1,0 +1,9 @@
+    Checking onnx-runtime-tracer v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-tracer)
+    Checking onnx-runtime-cuda-memory v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-cuda-memory)
+   Compiling onnx-runtime-ep-cuda v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cuda)
+    Checking onnx-runtime-einsum-conformance v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-einsum-conformance)
+    Checking onnx-runtime-loader v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-loader)
+    Checking onnx-runtime-optimizer v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-optimizer)
+    Checking onnx-runtime-ep-api v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-api)
+    Checking onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cpu)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.10s

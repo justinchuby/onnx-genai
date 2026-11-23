@@ -1,0 +1,4 @@
+    Checking onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cpu)
+   Compiling onnx-runtime-ep-cuda v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cuda)
+    Checking onnx-runtime-session v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-session)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.70s

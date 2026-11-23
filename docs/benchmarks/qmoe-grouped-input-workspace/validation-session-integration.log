@@ -1,0 +1,180 @@
+
+running 295 tests
+....................................................................................... 87/295
+....................................................................................... 174/295
+....................................................................................... 261/295
+..................................
+test result: ok. 295 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+
+running 23 tests
+.......................
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 13 tests
+.............
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 48 tests
+................................................
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 1 test
+i
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+test: graph_partition_performance_audit, ignore_message: manual performance audit
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 1 test
+i
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+test: perch_model_runs, ignore_message: requires models/perch-onnx/perch_v2.onnx at repo root
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 6 tests
+projection_fusion_flag_off_is_noop --- FAILED
+projection_fusion_skips_projection_with_external_consumer --- FAILED
+projection_fusion_runs_after_silu_rewrite --- FAILED
+projection_fusion_materializes_int64_split_initializer --- FAILED
+projection_fusion_matches_unfused_and_concatenates_rows --- FAILED
+projection_fusion_skips_bias_zero_point_and_escaping_outputs --- FAILED
+
+failures:
+
+---- projection_fusion_flag_off_is_noop stdout ----
+
+thread 'projection_fusion_flag_off_is_noop' (8972830) panicked at crates/onnx-runtime-session/tests/projection_fusion.rs:59:5:
+model builder failed: Traceback (most recent call last):
+  File "/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-session/tests/projection_fusion_model.py", line 7, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'. Did you mean: 'runpy'?
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- projection_fusion_skips_projection_with_external_consumer stdout ----
+
+thread 'projection_fusion_skips_projection_with_external_consumer' (8972835) panicked at crates/onnx-runtime-session/tests/projection_fusion.rs:59:5:
+model builder failed: Traceback (most recent call last):
+  File "/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-session/tests/projection_fusion_model.py", line 7, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'. Did you mean: 'runpy'?
+
+
+---- projection_fusion_runs_after_silu_rewrite stdout ----
+
+thread 'projection_fusion_runs_after_silu_rewrite' (8972833) panicked at crates/onnx-runtime-session/tests/projection_fusion.rs:59:5:
+model builder failed: Traceback (most recent call last):
+  File "/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-session/tests/projection_fusion_model.py", line 7, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'. Did you mean: 'runpy'?
+
+
+---- projection_fusion_materializes_int64_split_initializer stdout ----
+
+thread 'projection_fusion_materializes_int64_split_initializer' (8972832) panicked at crates/onnx-runtime-session/tests/projection_fusion.rs:59:5:
+model builder failed: Traceback (most recent call last):
+  File "/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-session/tests/projection_fusion_model.py", line 7, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'. Did you mean: 'runpy'?
+
+
+---- projection_fusion_matches_unfused_and_concatenates_rows stdout ----
+
+thread 'projection_fusion_matches_unfused_and_concatenates_rows' (8972831) panicked at crates/onnx-runtime-session/tests/projection_fusion.rs:59:5:
+model builder failed: Traceback (most recent call last):
+  File "/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-session/tests/projection_fusion_model.py", line 7, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'. Did you mean: 'runpy'?
+
+
+---- projection_fusion_skips_bias_zero_point_and_escaping_outputs stdout ----
+
+thread 'projection_fusion_skips_bias_zero_point_and_escaping_outputs' (8972834) panicked at crates/onnx-runtime-session/tests/projection_fusion.rs:59:5:
+model builder failed: Traceback (most recent call last):
+  File "/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-session/tests/projection_fusion_model.py", line 7, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'. Did you mean: 'runpy'?
+
+
+
+failures:
+    projection_fusion_flag_off_is_noop
+    projection_fusion_matches_unfused_and_concatenates_rows
+    projection_fusion_materializes_int64_split_initializer
+    projection_fusion_runs_after_silu_rewrite
+    projection_fusion_skips_bias_zero_point_and_escaping_outputs
+    projection_fusion_skips_projection_with_external_consumer
+
+test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+error: test failed, to rerun pass `-p onnx-runtime-session --test projection_fusion`
