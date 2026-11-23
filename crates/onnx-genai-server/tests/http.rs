@@ -1081,10 +1081,15 @@ async fn completions_with_suffix_rejects_model_without_fim_tokens() {
     let json: Value = serde_json::from_slice(&body).unwrap();
     let message = json["error"]["message"].as_str().unwrap();
     assert!(
-        message.contains("FIM is not supported by this model"),
+        message.contains("suffix requires a model declaring FIM tokens"),
         "{json}"
     );
-    assert!(message.contains("recognized FIM tokens"), "{json}");
+    assert!(
+        message.contains("choose a FIM-capable package or omit suffix"),
+        "{json}"
+    );
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert_eq!(json["error"]["code"], 400);
 }
 
 #[test]

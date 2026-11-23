@@ -1073,3 +1073,7 @@ API test now derives a future version from the declared maximum instead of
 misclassifying the supported v1.9 as future; all four public-API cases and all
 24 metadata schema-version cases pass. These resolve the Linux Fast/coverage and
 ORT-backed CI failures without changing runtime ranking or version semantics.
+The complete HTTP integration suite also passes all 37 cases after updating
+the suffix-without-FIM refusal assertion to the shared, metadata-driven admission
+message. The test verifies HTTP 400, invalid_request_error, the rejected suffix
+field and the remedy; no runtime behavior or refusal is weakened.
