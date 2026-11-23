@@ -53,7 +53,7 @@ pub(crate) fn build_processor_chain(
             | GenerateConstraint::JsonSchema { prefix, .. }
             | GenerateConstraint::Regex { prefix, .. }
             | GenerateConstraint::Lark { prefix, .. } => prefix.as_str(),
-            GenerateConstraint::Gbnf { .. } => "",
+            GenerateConstraint::Gbnf { .. } | GenerateConstraint::RawLark { .. } => "",
         };
         anyhow::ensure!(
             projection.is_none() || plain_prefix.is_empty(),
@@ -86,14 +86,26 @@ pub(crate) fn build_processor_chain(
             }
         };
         let grammar: Box<dyn crate::logits::Constraint> = match constraint {
-            GenerateConstraint::Gbnf { grammar } => {
-                let lark = crate::gbnf::compile(grammar, options.max_constraint_bytes, tokenizer)?;
+            GenerateConstraint::Gbnf { grammar } | GenerateConstraint::RawLark { grammar } => {
+                let lark = match constraint {
+                    GenerateConstraint::RawLark { .. } => {
+                        anyhow::ensure!(
+                            options.max_constraint_bytes > 0
+                                && grammar.len() <= options.max_constraint_bytes,
+                            "raw Lark grammar is {} bytes with max_constraint_bytes={}; shorten grammar or configure a positive sufficient budget",
+                            grammar.len(),
+                            options.max_constraint_bytes
+                        );
+                        grammar.clone()
+                    }
+                    _ => crate::gbnf::compile(grammar, options.max_constraint_bytes, tokenizer)?,
+                };
                 let contract = crate::byte_stream::ByteStreamContract::resolve(
                     tokenizer, crate::tokenization::SpecialTokenHandling::Preserve,
-                ).context("resolve tokenizer.decoder byte contract for GBNF grammar")?.context("GBNF grammar requires a resolved lossless tokenizer.decoder byte contract; use a tokenizer with supported byte decoding instead of contextual decoded-token guesses")?;
+                ).context("resolve tokenizer.decoder byte contract for raw grammar")?.context("raw grammar requires a resolved lossless tokenizer.decoder byte contract; use a tokenizer with supported byte decoding instead of contextual decoded-token guesses")?;
                 anyhow::ensure!(
                     contract.new_state().is_identity(),
-                    "GBNF grammar cannot yet interpret tokenizer.decoder stream-initial stripping with model-token references; use a context-free byte decoder or a content-only response_format constraint"
+                    "raw grammar cannot yet interpret tokenizer.decoder stream-initial stripping with model-token references; use a context-free byte decoder or a content-only response_format constraint"
                 );
                 // GBNF inspects raw pieces, including declared special tokens.
                 // Only explicitly resolved ending roles receive an EOS frame.
@@ -104,7 +116,7 @@ pub(crate) fn build_processor_chain(
                     LlguidanceConstraint::from_token_bytes(
                         GrammarConstraintKind::Lark, &lark, contract.pieces, &endings, "",
                     )
-                })).map(|constraint| constraint.with_completion_only_eos(endings)).context("compile grammar GBNF against the resolved model byte vocabulary; repair the grammar or tokenizer.decoder")?)
+                })).map(|constraint| constraint.with_completion_only_eos(endings)).context("compile raw grammar against the resolved model byte vocabulary; repair the grammar or tokenizer.decoder")?)
             }
             GenerateConstraint::Json { prefix: plain } => {
                 Box::new(crate::response_constraint::ContentConstraint::json_schema(
@@ -1601,7 +1613,7 @@ mod lark_prefill_tests {
     use super::*;
 
     #[test]
-    fn gbnf_literal_unicode_classes_repetitions_and_recursion_match_actual_bytes() {
+    fn raw_grammars_match_actual_unicode_bytes_and_tokenizations() {
         let mut value: serde_json::Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/tiny-llm/tokenizer.json"
@@ -1631,6 +1643,21 @@ mod lark_prefill_tests {
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         let tokenizer = Tokenizer::from_file(path).unwrap();
         for (grammar, history, expected) in [
+            (
+                "%llguidance {\"no_forcing\":true}\nstart: \"é😀\"",
+                vec![],
+                vec![22, 24, 26],
+            ),
+            (
+                "%llguidance {\"no_forcing\":true}\nstart: \"é😀\"",
+                vec![26],
+                vec![27],
+            ),
+            (
+                "%llguidance {\"no_forcing\":true}\nstart: <[22]> <[23]>",
+                vec![22],
+                vec![23],
+            ),
             ("root ::=", vec![], vec![3]),
             (r"root ::= [é😀]{1,2}", vec![26], vec![27]),
             (r"root ::= [é😀]{1,2}", vec![26, 27], vec![3, 22, 23, 26]),
@@ -1647,8 +1674,14 @@ mod lark_prefill_tests {
             (r#"root ::= "\\u00E9""#, vec![], vec![25]),
         ] {
             let options = GenerateOptions {
-                constraint: Some(GenerateConstraint::Gbnf {
-                    grammar: grammar.into(),
+                constraint: Some(if grammar.starts_with("%llguidance") {
+                    GenerateConstraint::RawLark {
+                        grammar: grammar.into(),
+                    }
+                } else {
+                    GenerateConstraint::Gbnf {
+                        grammar: grammar.into(),
+                    }
                 }),
                 eos_token_id: Some(3),
                 greedy: true,
@@ -1672,6 +1705,18 @@ mod lark_prefill_tests {
                 .collect::<Vec<_>>();
             assert_eq!(allowed, expected, "{grammar} after {history:?}");
         }
+        let options = GenerateOptions {
+            constraint: Some(GenerateConstraint::RawLark {
+                grammar: "%llguidance {}\nstart: \"é\"".into(),
+            }),
+            max_constraint_bytes: 2,
+            ..Default::default()
+        };
+        let error = match build_processor_chain(&options, Some(&tokenizer), false) {
+            Ok(_) => panic!("oversized raw Lark must be rejected"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("max_constraint_bytes=2"));
     }
 
     #[test]

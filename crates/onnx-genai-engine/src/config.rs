@@ -1711,6 +1711,9 @@ pub enum GenerateConstraint {
     /// llama.cpp GBNF over the raw newly generated stream, including channel
     /// markers and model-token references. Assistant prefill is not consumed.
     Gbnf { grammar: String },
+    /// Raw llguidance Lark over new model output, without assistant-prefill
+    /// consumption or response-content projection. Keep the %llguidance header.
+    RawLark { grammar: String },
     /// Constrain the existing prefix plus new output to prefixes of one JSON value.
     /// EOS requires a complete value; explicit stops and length limits may truncate it.
     Json {
@@ -1749,8 +1752,11 @@ impl GenerateOptions {
             "max_constraint_bytes must be greater than zero; configure a positive constraint text byte budget"
         );
         anyhow::ensure!(
-            !matches!(self.constraint, Some(GenerateConstraint::Gbnf { .. })) || self.stop_on_eos,
-            "GBNF grammar requires stop_on_eos=true; allow root completion to terminate the generation"
+            !matches!(
+                self.constraint,
+                Some(GenerateConstraint::Gbnf { .. } | GenerateConstraint::RawLark { .. })
+            ) || self.stop_on_eos,
+            "raw grammar requires stop_on_eos=true; allow root completion to terminate the generation"
         );
         self.adaptive_p.validate()?;
         if !self.temperature.is_finite() || self.temperature < 0.0 {

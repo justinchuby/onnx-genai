@@ -472,10 +472,12 @@ Playwright module path to save an image of the baseline chat. Coordinate this
 inference workload with other sessions using the shared host lock.
 
 
-## Raw GBNF constraints
+## Raw GBNF and llguidance constraints
 
 The chat, legacy completion and native completion endpoints accept the llama.cpp
-`grammar` field as GBNF over newly generated raw output. Existing assistant
+`grammar` field as GBNF over newly generated raw output. A source beginning
+with `%llguidance` instead uses llguidance Lark, preserving its header and
+options. Existing assistant
 prefill is not consumed, and declared reasoning/content projection does not
 remove markers before this grammar sees them. This follows the pinned upstream
 [sampling contract](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/sampling.cpp).
@@ -498,9 +500,9 @@ receive terminal semantics. Token names and angle brackets do not guess roles.
 Non-byte contextual decoders and stream-initial stripping currently return an
 actionable capability error before SSE.
 
-GBNF conflicts with JSON `response_format`, forced `tool_choice`, and
+Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and
 `ignore_eos=true`. Neutral `grammar_lazy=false`, `grammar_triggers=[]` and
 `preserved_tokens=[]` are accepted. Active lazy grammars, triggers, preserved
-tokens and raw `%llguidance` input remain open compatibility work. Native
+tokens remain open compatibility work. Native
 `n_probs` and `completion_probabilities` also remain open; native GBNF acceptance
 does not imply support for those reporting fields.

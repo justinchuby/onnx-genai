@@ -113,74 +113,83 @@ mod gbnf_wire {
         .unwrap();
         let router = app(state);
         for path in ["/v1/chat/completions", "/v1/completions", "/completion"] {
-            for stream in [false, true] {
-                let chat = path == "/v1/chat/completions";
-                let mut body = if chat {
-                    json!({"messages":[{"role":"user","content":"hello"}], "grammar":"root ::= <[23]> <[4]>", "logprobs":true})
-                } else {
-                    json!({"prompt":"hello", "grammar":"root ::= <[4]>", "logprobs":1})
-                };
-                if path == "/completion" {
-                    body.as_object_mut().unwrap().remove("logprobs");
-                }
-                body["grammar_lazy"] = json!(false);
-                body["grammar_triggers"] = json!([]);
-                body["preserved_tokens"] = json!([]);
-                body["stream"] = json!(stream);
-                body["max_tokens"] = json!(4);
-                body["temperature"] = json!(0);
-                let response = router
-                    .clone()
-                    .oneshot(
-                        Request::post(path)
-                            .header(header::CONTENT_TYPE, "application/json")
-                            .body(Body::from(body.to_string()))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let status = response.status();
-                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-                let text = std::str::from_utf8(&bytes).unwrap();
-                assert_eq!(
-                    status,
-                    StatusCode::OK,
-                    "{backend:?} {path} stream={stream}: {text}"
-                );
-                if stream {
-                    let events = sse_json_events(&bytes);
-                    assert!(!events.is_empty(), "{text}");
-                    assert!(
-                        !events.iter().any(|event| event.get("error").is_some()),
-                        "{text}"
-                    );
-                    let content = events
-                        .iter()
-                        .filter_map(|event| {
-                            if path == "/completion" {
-                                event["content"].as_str()
-                            } else if chat {
-                                event["choices"][0]["delta"]["content"].as_str()
-                            } else {
-                                event["choices"][0]["text"].as_str()
-                            }
-                        })
-                        .collect::<String>();
-                    assert_eq!(content.trim(), "hello", "{path}: {text}");
-                } else {
-                    let result: Value = serde_json::from_slice(&bytes).unwrap();
-                    let content = if path == "/completion" {
-                        &result["content"]
-                    } else if chat {
-                        &result["choices"][0]["message"]["content"]
+            for raw_lark in [false, true] {
+                for stream in [false, true] {
+                    let chat = path == "/v1/chat/completions";
+                    let mut body = if chat {
+                        json!({"messages":[{"role":"user","content":"hello"}], "grammar":"root ::= <[23]> <[4]>", "logprobs":true})
                     } else {
-                        &result["choices"][0]["text"]
+                        json!({"prompt":"hello", "grammar":"root ::= <[4]>", "logprobs":1})
                     };
+                    if raw_lark {
+                        body["grammar"] = if chat {
+                            json!("%llguidance {\"no_forcing\":true}\nstart: <[23]> <[4]>")
+                        } else {
+                            json!("%llguidance {\"no_forcing\":true}\nstart: <[4]>")
+                        };
+                    }
+                    if path == "/completion" {
+                        body.as_object_mut().unwrap().remove("logprobs");
+                    }
+                    body["grammar_lazy"] = json!(false);
+                    body["grammar_triggers"] = json!([]);
+                    body["preserved_tokens"] = json!([]);
+                    body["stream"] = json!(stream);
+                    body["max_tokens"] = json!(4);
+                    body["temperature"] = json!(0);
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::post(path)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(body.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                    let text = std::str::from_utf8(&bytes).unwrap();
                     assert_eq!(
-                        content.as_str().unwrap().trim(),
-                        "hello",
-                        "{path}: {result}"
+                        status,
+                        StatusCode::OK,
+                        "{backend:?} {path} stream={stream}: {text}"
                     );
+                    if stream {
+                        let events = sse_json_events(&bytes);
+                        assert!(!events.is_empty(), "{text}");
+                        assert!(
+                            !events.iter().any(|event| event.get("error").is_some()),
+                            "{text}"
+                        );
+                        let content = events
+                            .iter()
+                            .filter_map(|event| {
+                                if path == "/completion" {
+                                    event["content"].as_str()
+                                } else if chat {
+                                    event["choices"][0]["delta"]["content"].as_str()
+                                } else {
+                                    event["choices"][0]["text"].as_str()
+                                }
+                            })
+                            .collect::<String>();
+                        assert_eq!(content.trim(), "hello", "{path}: {text}");
+                    } else {
+                        let result: Value = serde_json::from_slice(&bytes).unwrap();
+                        let content = if path == "/completion" {
+                            &result["content"]
+                        } else if chat {
+                            &result["choices"][0]["message"]["content"]
+                        } else {
+                            &result["choices"][0]["text"]
+                        };
+                        assert_eq!(
+                            content.as_str().unwrap().trim(),
+                            "hello",
+                            "{path}: {result}"
+                        );
+                    }
                 }
             }
         }
@@ -239,6 +248,9 @@ mod gbnf_wire {
             json!({"grammar":"root ::= \"hello\"", "grammar_triggers":[{"type":0,"value":"hello"}]}),
             json!({"grammar":"root ::= \"hello\"", "preserved_tokens":["hello"]}),
             json!({"grammar":"root ::= \"hello\"", "ignore_eos":true}),
+            json!({"grammar":"%llguidance {}\nstart: missing"}),
+            json!({"grammar":"%llguidance {}\nstart: <[9999]>"}),
+            json!({"grammar":"%llguidance {broken}\nstart: \"hello\""}),
             json!({"grammar":"root ::= missing"}),
             json!({"grammar":"root ::= [z-a]"}),
             json!({"grammar":"root ::= <[9999]>"}),
