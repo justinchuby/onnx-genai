@@ -731,6 +731,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Gemm", 1, gemm);
     reg.register("", "Det", 11, det);
     reg.register("pkg.nxrt", "BlockQuantizedMatMul", 1, quantized_matmul);
+    reg.register("pkg.nxrt", "Float6Projection", 1, matmul);
     reg.register("com.microsoft", "MatMulNBits", 1, quantized_matmul);
     // com.microsoft fused matmul honors transA/transB/transBatch attributes.
     reg.register("com.microsoft", "FusedMatMul", 1, fused_matmul);

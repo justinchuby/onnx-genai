@@ -176,6 +176,9 @@ fn cast_to(op: &str, input: &TensorView, output: &mut TensorMut, to: DataType) -
             output.dtype
         )));
     }
+    if input.dtype.is_float6() {
+        return widen_float6(input, output);
+    }
 
     // Fast path first: both views row-major contiguous and non-overlapping.
     // The generic path below costs an `elem_offset` dot product, a `next_index`
@@ -194,6 +197,194 @@ fn cast_to(op: &str, input: &TensorView, output: &mut TensorMut, to: DataType) -
         write_num(&mut bytes, n, to)?;
     }
     super::write_dense_bytes(output, &bytes)
+}
+
+fn widen_float6(input: &TensorView, output: &mut TensorMut) -> Result<()> {
+    input.validate()?;
+    output.validate()?;
+    if input.shape != output.shape {
+        return Err(EpError::KernelFailed(
+            "Cast from FLOAT6 requires matching input and output shapes".into(),
+        ));
+    }
+    if !matches!(
+        output.dtype,
+        DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
+    ) {
+        return Err(EpError::KernelFailed(format!(
+            "CPU Cast from {:?} to {:?} is unsupported; cast FLOAT6 to f16, bf16, f32, or f64 first",
+            input.dtype, output.dtype
+        )));
+    }
+    let values = float6_table(input.dtype);
+    let n = input.numel();
+    if n == 0 {
+        return Ok(());
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        let mut bytes = Vec::with_capacity(output.byte_size());
+        let mut index = vec![0; input.shape.len()];
+        let origin = input.data_ptr::<u8>();
+        loop {
+            let element = crate::strided::elem_offset(input.strides, &index);
+            let lane_bit = element.rem_euclid(4) * 6;
+            let offset = element.div_euclid(4) * 3 + lane_bit / 8;
+            let shift = lane_bit % 8;
+            // The executor owns the strided extent. Read a second byte only
+            // for codes that straddle a boundary, including the final group.
+            let word = unsafe {
+                u16::from(*origin.offset(offset))
+                    | if shift > 2 {
+                        u16::from(*origin.offset(offset + 1)) << 8
+                    } else {
+                        0
+                    }
+            };
+            let code = usize::from((word >> shift) & 63);
+            write_num(&mut bytes, Num::F(f64::from(values[code])), output.dtype)?;
+            if !crate::strided::next_index(input.shape, &mut index) {
+                break;
+            }
+        }
+        return super::write_dense_bytes(output, &bytes);
+    }
+    // SAFETY: the CPU kernel contract supplies live buffers for both validated
+    // dense views; use byte slices so mapped origins need not be aligned.
+    let len = output.byte_size();
+    let src_ptr = input.data_ptr::<u8>();
+    let dst_ptr = output.data_ptr_mut::<u8>();
+    let src_len = input.byte_size();
+    let src = unsafe { std::slice::from_raw_parts(src_ptr, src_len) };
+    let snapshot;
+    let src = if byte_ranges_overlap(src_ptr, src_len, dst_ptr, len) {
+        snapshot = src.to_vec();
+        snapshot.as_slice()
+    } else {
+        src
+    };
+    // The borrowed source is disjoint from the destination, or was copied.
+    let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+    match output.dtype {
+        DataType::Float32 => write_float6(src, dst, n, values.map(f32::to_le_bytes)),
+        DataType::Float64 => write_float6(src, dst, n, values.map(|x| (x as f64).to_le_bytes())),
+        DataType::Float16 => write_float6(
+            src,
+            dst,
+            n,
+            values.map(|x| half::f16::from_f32(x).to_le_bytes()),
+        ),
+        DataType::BFloat16 => write_float6(
+            src,
+            dst,
+            n,
+            values.map(|x| half::bf16::from_f32(x).to_le_bytes()),
+        ),
+        _ => unreachable!("FLOAT6 destination was validated"),
+    }
+    Ok(())
+}
+
+fn byte_ranges_overlap(src: *const u8, src_len: usize, dst: *const u8, dst_len: usize) -> bool {
+    let (src, dst) = (src.addr(), dst.addr());
+    src < dst.saturating_add(dst_len) && dst < src.saturating_add(src_len)
+}
+
+fn float6_table(dtype: DataType) -> [f32; 64] {
+    let (mantissa, bias) = if dtype == DataType::Float6E2M3 {
+        (3, 1)
+    } else {
+        (2, 3)
+    };
+    std::array::from_fn(|code| {
+        let exponent = (code as i32 & 31) >> mantissa;
+        let fraction = code as i32 & ((1 << mantissa) - 1);
+        let significand = if exponent == 0 {
+            fraction
+        } else {
+            (1 << mantissa) | fraction
+        };
+        let magnitude = significand as f32 * 2f32.powi(exponent.max(1) - bias - mantissa);
+        if code & 32 != 0 {
+            -magnitude
+        } else {
+            magnitude
+        }
+    })
+}
+
+pub struct Float6Projection;
+
+impl KernelFactory for Float6Projection {
+    fn create(&self, _: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(Self))
+    }
+}
+
+impl Kernel for Float6Projection {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        use rayon::prelude::*;
+        let (k, n) = onnx_runtime_ep_api::float6_projection::geometry(inputs, outputs)?;
+        let [x, w] = inputs else { unreachable!() };
+        let table = float6_table(w.dtype);
+        let y = &mut outputs[0];
+        let dst = y.data_ptr_mut::<u8>();
+        if [x, w]
+            .iter()
+            .any(|input| byte_ranges_overlap(input.data_ptr::<u8>(), input.byte_size(), dst, n * 4))
+        {
+            return Err(EpError::KernelFailed(
+                "Float6Projection output overlaps an input; bind a separate output buffer".into(),
+            ));
+        }
+        // SAFETY: validated dense buffer geometry and disjoint output above.
+        let x = unsafe { std::slice::from_raw_parts(x.data_ptr::<u8>(), x.byte_size()) };
+        let w = unsafe { std::slice::from_raw_parts(w.data_ptr::<u8>(), w.byte_size()) };
+        let y = unsafe { std::slice::from_raw_parts_mut(dst, n * 4) };
+        const TILE: usize = 128;
+        let row_bytes = n / 4 * 3;
+        let tile = |(i, out): (usize, &mut [u8])| {
+            let mut accum = [0f32; TILE];
+            let offset = i * (TILE / 4 * 3);
+            let cols = out.len() / 4;
+            for (row, a) in x.chunks_exact(4).enumerate() {
+                let a = f32::from_le_bytes(a.try_into().unwrap());
+                let start = row * row_bytes + offset;
+                let groups = w[start..start + cols / 4 * 3].chunks_exact(3);
+                for (g, sum) in groups.zip(accum.chunks_exact_mut(4)) {
+                    let word = u32::from_le_bytes([g[0], g[1], g[2], 0]);
+                    for (lane, dst) in sum.iter_mut().enumerate() {
+                        *dst += a * table[(word >> (lane * 6)) as usize & 63];
+                    }
+                }
+            }
+            for (out, v) in out.chunks_exact_mut(4).zip(accum) {
+                out.copy_from_slice(&v.to_le_bytes());
+            }
+        };
+        if k * n >= 128 * 1024 && n > TILE {
+            y.par_chunks_mut(TILE * 4).enumerate().for_each(tile);
+        } else {
+            y.chunks_mut(TILE * 4).enumerate().for_each(tile);
+        }
+        Ok(())
+    }
+}
+fn write_float6<const WIDTH: usize>(
+    src: &[u8],
+    dst: &mut [u8],
+    count: usize,
+    table: [[u8; WIDTH]; 64],
+) {
+    for (group, out) in src.chunks(3).zip(dst.chunks_mut(4 * WIDTH)) {
+        let mut bytes = [0; 4];
+        bytes[..group.len()].copy_from_slice(group);
+        let packed = u32::from_le_bytes(bytes);
+        for (lane, element) in out.chunks_exact_mut(WIDTH).enumerate() {
+            let code = (packed >> (6 * lane)) as usize & 63;
+            element.copy_from_slice(&table[code]);
+        }
+    }
+    debug_assert_eq!(dst.len(), count * WIDTH);
 }
 
 /// Number of elements converted per staging batch. Sized so the `Num` staging
@@ -681,6 +872,26 @@ mod tests {
         CastKernel { to: Some(to) }
             .execute(&[input.view()], &mut [out.view_mut()])
             .unwrap();
+    }
+
+    #[test]
+    fn float6_cast_reads_partial_groups_and_strided_codes() {
+        let packed = Owned {
+            bytes: vec![0x01, 0x0b, 0x02], // E2M3 codes [1, 44, 32].
+            shape: vec![3],
+            strides: vec![1],
+            dtype: DataType::Float6E2M3,
+        };
+        let mut out = Owned::zeros(DataType::Float32, &[3]);
+        cast(DataType::Float32, &packed, &mut out);
+        assert_eq!(
+            out.to_f32().iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            [0.125_f32, -1.5, -0.0].map(f32::to_bits)
+        );
+        let mut out = Owned::zeros(DataType::Float32, &[2]);
+        cast(DataType::Float32, &packed.with_view(&[2], &[2]), &mut out);
+        assert_eq!(out.to_f32()[1].to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(out.to_f32()[0], 0.125);
     }
 
     #[test]

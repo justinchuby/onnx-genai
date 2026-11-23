@@ -1677,9 +1677,22 @@ and use supported encodings.
   packing and must have a whole-byte payload: unlike ONNX, SafeTensors
   cannot store an odd number of `F4` values by padding the final nibble.
   Use the logical shape in the SafeTensors header, not the byte shape
-  exposed by PyTorch's `float4_e2m1fn_x2`. ONNX defines FLOAT6 types, but
-  nxrt does not yet represent them internally, so `F6_E2M3` and `F6_E3M2`
-  are rejected rather than being reinterpreted as bytes or another dtype.
+  exposed by PyTorch's `float4_e2m1fn_x2`. `F6_E2M3` and `F6_E3M2` map to
+  ONNX `FLOAT6E2M3` (27) and `FLOAT6E3M2` (28). For ONNX binding, the
+  exporter must store the codes in ONNX order: four consecutive six-bit
+  codes in three bytes, least-significant bits first. [SafeTensors' FLOAT6
+  support](https://github.com/safetensors/safetensors/pull/611) validates
+  the byte length but does not transform or describe producer-specific
+  blocking or swizzling; nxrt cannot infer a different order from the header.
+  The total logical element count, not each row, must be divisible by four.
+  ONNX inline and ordinary external data can use a
+  zero-padded final byte; ONNX `int32_data` uses one unsigned code per
+  element. On native CPU and CUDA, opset 28 `Cast` widens contiguous
+  FLOAT6 to FP16, BF16, FP32 or FP64. For single-row FP32 `MatMul` with an
+  immutable `[K,N]` FLOAT6 RHS, positive `K,N`, `N` divisible by four,
+  and no other user of the widened weight, both providers can consume the
+  packed bytes directly without allocating the widened matrix. This is not support for quantizing
+  to FLOAT6, `DequantizeLinear` on FLOAT6, or direct FLOAT6 arithmetic.
 * **GGUF:** accepts little-endian v2 and v3. Dense `F32`, `F16`, `BF16`,
   `F64`, and `I8`/`I16`/`I32`/`I64` map to their exact ONNX scalar dtype.
   GGML's first dimension is contiguous; the ONNX shape is the reversed

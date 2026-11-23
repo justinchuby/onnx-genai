@@ -403,6 +403,7 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/or.yaml"),
     include_str!("../../schemas/standard/not.yaml"),
     include_str!("../../schemas/standard/cast.yaml"),
+    include_str!("../../schemas/standard/cast_v28.yaml"),
     include_str!("../../schemas/standard/shape.yaml"),
     include_str!("../../schemas/standard/size.yaml"),
     include_str!("../../schemas/standard/non_zero.yaml"),
@@ -521,6 +522,8 @@ mod data_types {
             "uint4" => DataType::Uint4,
             "int4" => DataType::Int4,
             "float4e2m1" => DataType::Float4E2M1,
+            "float6e2m3" => DataType::Float6E2M3,
+            "float6e3m2" => DataType::Float6E3M2,
             "float8e8m0" => DataType::Float8E8M0,
             "uint2" => DataType::Uint2,
             "int2" => DataType::Int2,
@@ -554,6 +557,8 @@ mod data_types {
             DataType::Uint4 => "uint4",
             DataType::Int4 => "int4",
             DataType::Float4E2M1 => "float4e2m1",
+            DataType::Float6E2M3 => "float6e2m3",
+            DataType::Float6E3M2 => "float6e3m2",
             DataType::Float8E8M0 => "float8e8m0",
             DataType::Uint2 => "uint2",
             DataType::Int2 => "int2",
@@ -734,7 +739,16 @@ type_constraints:
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
         assert_eq!(registry.schemas.len(), 108);
-        assert_eq!(registry.iter().count(), 120);
+        assert_eq!(registry.iter().count(), 121);
+        assert_eq!(registry.lookup("Cast", "", 27).unwrap().since_version, 25);
+        let float6_cast = registry.lookup("Cast", "", 28).unwrap();
+        assert_eq!(float6_cast.since_version, 28);
+        assert!(
+            float6_cast
+                .type_constraints
+                .iter()
+                .all(|c| c.allowed.len() == 26)
+        );
 
         for (name, since_version) in [
             ("DequantizePacked", 29),

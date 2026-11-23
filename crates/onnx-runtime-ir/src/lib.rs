@@ -54,6 +54,7 @@ mod domain;
 mod dtype;
 mod einsum;
 mod error;
+pub mod float6_projection;
 mod graph;
 mod graph_view;
 mod layout;

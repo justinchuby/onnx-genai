@@ -137,6 +137,9 @@ pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
             gguf_layout: crate::kernels::block_quantized_matmul::packed_matmul_layout,
         },
     ));
+    passes.push(Box::new(
+        onnx_runtime_optimizer::float6_projection::Float6ProjectionFusion,
+    ));
     passes
 }
 

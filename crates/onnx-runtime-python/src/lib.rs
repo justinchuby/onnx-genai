@@ -272,6 +272,8 @@ fn onnx_type_string(dtype: DataType) -> String {
         DataType::Uint4 => "uint4",
         DataType::Int4 => "int4",
         DataType::Float4E2M1 => "float4e2m1",
+        DataType::Float6E2M3 => "float6e2m3",
+        DataType::Float6E3M2 => "float6e3m2",
         DataType::Float8E8M0 => "float8e8m0",
         DataType::Uint2 => "uint2",
         DataType::Int2 => "int2",

@@ -1492,6 +1492,11 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(cast::CastFactory),
     );
     rec.register(
+        OpKey::new("Float6Projection", "pkg.nxrt", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(cast::Float6Projection),
+    );
+    rec.register(
         OpKey::new("CastLike", "", 15),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(cast::CastLikeFactory),

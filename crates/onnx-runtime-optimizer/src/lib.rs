@@ -39,6 +39,7 @@ pub mod affine_gather;
 mod constant_folding;
 mod dead_node;
 mod error;
+pub mod float6_projection;
 mod fusion;
 mod pass;
 pub mod quantized_grouped;

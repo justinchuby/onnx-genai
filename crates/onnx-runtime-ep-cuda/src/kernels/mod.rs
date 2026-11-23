@@ -1646,6 +1646,13 @@ pub fn build_cuda_registry_with_metrics(
     );
 
     // Cast / CastLike (NVRTC element-wise dtype conversion).
+    reg.register(
+        OpKey::new("Float6Projection", "pkg.nxrt", 1),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(cast::Float6Projection {
+            runtime: runtime.clone(),
+        }),
+    );
     for op_type in ["Cast", "CastLike"] {
         reg.register(
             OpKey::new(op_type, "", 1),

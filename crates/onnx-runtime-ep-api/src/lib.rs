@@ -36,6 +36,7 @@
 pub mod abi;
 pub mod affine_gather;
 pub mod epcontext;
+pub mod float6_projection;
 pub mod host_parallel;
 pub mod kernel;
 pub mod packed_routed;
