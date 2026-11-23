@@ -141,6 +141,22 @@ referencing graph slots. This preserves the old owner on refusal. Host contracts
 cover the ownership, pressure and failure paths; CUDA execution and throughput
 still require a device runner.
 
+### CUDA GQA temporary storage
+
+GQA uses one prepared composite for packed staging, Q/output transposes,
+reference/general-half attention scratch, and omitted KV destinations. These
+large temporary regions have no private raw-allocation fallback. Hidden K/V
+share the physical capacity of any visible sibling; if neither is visible,
+the input-derived length bound funds both. Every region is checked against the
+complete admitted backing before metadata preparation starts. This introduces
+no additional authority, pool, or issuer callback in dispatch.
+
+The three small preparation metadata allocations still own actual graph
+resources. They remain explicit pending migration of that capture ownership;
+a workspace borrow alone cannot replace their pins or prove completion. The
+composite remains SessionPersistent, so this stage does not claim step-scoped
+reuse or CUDA performance validation.
+
 ### CPU compressed-projection scratch
 
 CPU `BlockQuantizedMatMul` and `BlockQuantizedMoE` declare metadata-planned,

@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    DeviceGraphResource, DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMetadata,
-    TensorMut, TensorView, WorkspaceLayout, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    DeviceGraphResource, DevicePtrMut, EpError, Kernel, KernelFactory, OutputMetadata, Result,
+    TensorMetadata, TensorMut, TensorView, WorkspaceLayout, WorkspaceLifetime,
+    WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -831,15 +832,7 @@ const BLOCK: u32 = 256;
 const WS_TOTALS: usize = 0;
 const WS_PAST_LENGTHS: usize = 1;
 const WS_QUERY_STARTS: usize = 2;
-const WS_PACKED_Q: usize = 3;
-const WS_PACKED_K: usize = 4;
-const WS_PACKED_V: usize = 5;
-const WS_Q_BNSH: usize = 6;
-const WS_OUT_BNSH: usize = 7;
-const WS_PRESENT_K: usize = 8;
-const WS_PRESENT_V: usize = 9;
-const WS_SCORES: usize = 10;
-const WS_COUNT: usize = 11;
+const WS_COUNT: usize = 3;
 
 /// Device-pointer alignment for the governed GQA session-persistent composite
 /// workspace and every sub-buffer carved from it (packed Q/K/V staging,
@@ -1041,9 +1034,9 @@ fn gqa_packed_staging_bytes(
 
 /// Byte layout of the governed GQA session-persistent composite workspace. The
 /// packed Q/K/V projection-staging buffers come first, followed by route-required
-/// Q/output BNSH scratch, then the route's complete attention scratch last.
-/// Capacity-dependent attention scratch can therefore extend into the reserved peak
-/// without perturbing shape-derived offsets. Packed `Sq==1` overlays its Q
+/// Q/output BNSH scratch and complete attention scratch, then hidden KV outputs.
+/// Attention uses the input-derived logical bound; hidden KV uses the actual
+/// visible sibling capacity, or that logical bound when both are omitted. Packed `Sq==1` overlays its Q
 /// staging and Q-BNSH roles because fused extraction and unfused splitting are
 /// mutually exclusive. Any region a route does not populate is zero-length.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1062,6 +1055,10 @@ struct GqaWorkspaceLayout {
     scores_bytes: usize,
     phase2a_offset: usize,
     phase2a_bytes: usize,
+    present_k_offset: usize,
+    present_k_bytes: usize,
+    present_v_offset: usize,
+    present_v_bytes: usize,
     total_bytes: usize,
 }
 
@@ -1200,6 +1197,116 @@ fn gqa_workspace_layout(
     }
     layout.total_bytes = offset;
     Ok(layout)
+}
+
+/// Both cache destinations share one physical stride, even when one output is
+/// omitted. Size the hidden sibling from the actual visible output capacity.
+#[derive(Debug)]
+struct GqaPresentScratch {
+    capacity: usize,
+    key_bytes: usize,
+    value_bytes: usize,
+}
+
+fn gqa_present_scratch(
+    outputs: &[OutputMetadata<'_>],
+    dtype: DataType,
+    batch: usize,
+    kv_heads: usize,
+    dim: usize,
+    logical_capacity: usize,
+) -> Result<GqaPresentScratch> {
+    let absent = |index| {
+        outputs
+            .get(index)
+            .is_none_or(|output| matches!(output, OutputMetadata::Absent))
+    };
+    let needs_hidden = absent(1) || absent(2);
+    let mut capacity = None;
+    for (index, name) in [(1, "present_key"), (2, "present_value")] {
+        match outputs.get(index) {
+            None | Some(OutputMetadata::Absent) => {}
+            Some(OutputMetadata::Unresolved { .. }) if needs_hidden => {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep GroupQueryAttention: {name} output capacity is unresolved; resolve its shape or bind an exact output extent before workspace preparation"
+                )));
+            }
+            Some(OutputMetadata::Unresolved { .. }) => {}
+            Some(OutputMetadata::Tensor {
+                dtype: output_dtype,
+                shape,
+            }) => {
+                if *output_dtype != dtype
+                    || shape.len() != 4
+                    || shape[0] != batch
+                    || shape[1] != kv_heads
+                    || shape[3] != dim
+                {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep GroupQueryAttention: {name} must be {dtype:?} BNSH [{batch}, {kv_heads}, capacity, {dim}], got {output_dtype:?} {shape:?}"
+                    )));
+                }
+                if capacity.is_some_and(|capacity| capacity != shape[2]) {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep GroupQueryAttention: present_key and present_value must share one cache capacity, got {capacity:?} and {}; bind matching physical output extents",
+                        shape[2]
+                    )));
+                }
+                capacity = Some(shape[2]);
+            }
+        }
+    }
+    let capacity = capacity.unwrap_or(logical_capacity);
+    let bytes = if needs_hidden {
+        gqa_packed_staging_bytes(
+            batch,
+            capacity,
+            kv_heads.checked_mul(dim).ok_or_else(|| {
+                EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: KV hidden width overflow; reduce the cache geometry"
+                    .into(),
+            )
+            })?,
+            dtype.byte_size(),
+        )?
+    } else {
+        0
+    };
+    Ok(GqaPresentScratch {
+        capacity,
+        key_bytes: if absent(1) { bytes } else { 0 },
+        value_bytes: if absent(2) { bytes } else { 0 },
+    })
+}
+
+impl GqaWorkspaceLayout {
+    fn with_present_scratch(mut self, scratch: &GqaPresentScratch) -> Result<Self> {
+        for (offset, bytes) in [
+            (&mut self.present_k_offset, scratch.key_bytes),
+            (&mut self.present_v_offset, scratch.value_bytes),
+        ] {
+            if bytes == 0 {
+                continue;
+            }
+            *offset = gqa_align_up(self.total_bytes, GQA_SCORES_ALIGN)?;
+            self.total_bytes = offset.checked_add(bytes).ok_or_else(|| EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: hidden KV workspace overflow; reduce the prepared cache geometry".into()
+            ))?;
+        }
+        self.present_k_bytes = scratch.key_bytes;
+        self.present_v_bytes = scratch.value_bytes;
+        Ok(self)
+    }
+
+    fn bind(self, prepared: Option<WorkspaceView>) -> Result<WorkspaceView> {
+        let range = Layout::from_size_align(self.total_bytes, GQA_SCORES_ALIGN).map_err(|_| EpError::KernelFailed(
+            "cuda_ep GroupQueryAttention: complete workspace exceeds addressable capacity; reduce the prepared geometry".into()
+        ))?;
+        let [view] = WorkspaceLayout::new([range])?.bind(prepared).map_err(|error| EpError::KernelFailed(format!(
+            "cuda_ep GroupQueryAttention: cannot bind complete prepared workspace: {error}; call workspace_requirement with the actual output geometry and execute_with_workspace"
+        )))?;
+        Ok(view)
+    }
 }
 
 /// Carve a `CUdeviceptr` for the `[offset, offset + bytes)` sub-range of an
@@ -1496,7 +1603,6 @@ struct WorkspaceSlot {
 struct GqaWorkspace {
     runtime: Arc<CudaRuntime>,
     slots: [WorkspaceSlot; WS_COUNT],
-    used: [bool; WS_COUNT],
 }
 
 impl GqaWorkspace {
@@ -1504,16 +1610,10 @@ impl GqaWorkspace {
         Self {
             runtime,
             slots: std::array::from_fn(|_| WorkspaceSlot::default()),
-            used: [false; WS_COUNT],
         }
     }
 
-    fn begin_call(&mut self) {
-        self.used.fill(false);
-    }
-
     fn reserve(&mut self, index: usize, bytes: usize) -> Result<CUdeviceptr> {
-        self.used[index] = true;
         let bytes = bytes.max(1);
         let slot = &self.slots[index];
         if slot.bytes >= bytes
@@ -1851,7 +1951,6 @@ impl GroupQueryAttentionKernel {
         })?;
         let warmed_signature = warm_state.capture_signature.clone();
         let mut workspace_candidate = warm_state.workspace.clone();
-        workspace_candidate.begin_call();
         let capturing = self.runtime.is_capturing()?;
         if !(7..=14).contains(&inputs.len()) || !(1..=3).contains(&outputs.len()) {
             return Err(EpError::KernelFailed(format!(
@@ -2082,9 +2181,23 @@ impl GroupQueryAttentionKernel {
         }
         let current_key_length = checked_i32(k_seq, "key sequence length")?;
         let query_length = checked_i32(q_seq, "query sequence length")?;
-        let requested_present_capacity = outputs
-            .get(1)
-            .map(|output| output.shape.get(2).copied().unwrap_or(past_capacity));
+        let output_metadata: [OutputMetadata<'_>; 3] = std::array::from_fn(|index| {
+            outputs
+                .get(index)
+                .map_or(OutputMetadata::Absent, OutputMetadata::from_view)
+        });
+        let present_scratch = gqa_present_scratch(
+            &output_metadata,
+            q.dtype,
+            batch,
+            self.kv_num_heads,
+            dim,
+            gqa_score_stride(past_capacity, k_seq)?,
+        )?;
+        let requested_present_capacity = output_metadata[1..]
+            .iter()
+            .any(|output| matches!(output, OutputMetadata::Tensor { .. }))
+            .then_some(present_scratch.capacity);
 
         let explicit_positions = inputs.get(9).filter(|view| !view.is_absent());
         let (
@@ -2197,6 +2310,8 @@ impl GroupQueryAttentionKernel {
         let structurally_valid_outputs = requested_present_capacity.is_some_and(|capacity| {
             let expected = [batch, self.kv_num_heads, capacity, dim];
             outputs.len() == 3
+                && !outputs[1].is_absent()
+                && !outputs[2].is_absent()
                 && outputs[1].dtype == q.dtype
                 && outputs[1].shape == expected
                 && outputs[1].is_contiguous()
@@ -2381,9 +2496,14 @@ impl GroupQueryAttentionKernel {
             }
         }
 
-        let minimum_present_capacity =
-            past_capacity.max(total_sequence_length.unwrap_or(past_capacity));
-        let present_capacity = requested_present_capacity.unwrap_or(minimum_present_capacity);
+        // The scalar describes external physical capacity. Fully internal KV
+        // needs only the input-derived valid-length bound, not that padded extent.
+        let minimum_present_capacity = if requested_present_capacity.is_some() {
+            past_capacity.max(total_sequence_length.unwrap_or(past_capacity))
+        } else {
+            past_capacity
+        };
+        let present_capacity = present_scratch.capacity;
         if present_capacity < minimum_present_capacity {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep GroupQueryAttention: present cache capacity {present_capacity} is smaller than required {minimum_present_capacity}"
@@ -2391,7 +2511,7 @@ impl GroupQueryAttentionKernel {
         }
         let expected_cache_shape = [batch, self.kv_num_heads, present_capacity, dim];
         for (index, name) in [(1, "present_key"), (2, "present_value")] {
-            if let Some(output) = outputs.get(index)
+            if let Some(output) = outputs.get(index).filter(|output| !output.is_absent())
                 && (output.dtype != q.dtype
                     || output.shape != expected_cache_shape
                     || !output.is_contiguous())
@@ -2489,7 +2609,9 @@ impl GroupQueryAttentionKernel {
             transpose_scratch.query,
             transpose_scratch.output,
             attention_scratch,
-        )?;
+        )?
+        .with_present_scratch(&present_scratch)?;
+        let prepared_view = composite_layout.bind(prepared)?;
         let attention_route = gqa_attention_route(selected_backend, q.dtype, q_seq, dim);
         let phase2a_scratch = if attention_route == GqaAttentionRoute::Phase2a {
             Some(bind_gqa_phase2a_scratch(
@@ -2514,51 +2636,34 @@ impl GroupQueryAttentionKernel {
         } else {
             0
         };
-        // Packed QKV projection staging (§736). When the executor prepared the
-        // composite workspace, carve the Q/K/V staging sub-buffers from it so the
-        // bytes are charged against the device authority; otherwise (the
-        // compatibility/opt-out `execute` path) keep them self-owned in the
-        // pooled slot. The staging is materialized only when a packed tensor is
-        // split on the unfused prep path (`packed_qkv && !fuse_prep`); every
-        // unpacked-input and fused-decode dispatch carves nothing.
+        // Every large temporary region belongs to the one admitted composite.
+        // Metadata retains its real graph-owned allocation until capture ownership
+        // can be supplied by the caller; no private large scratch pool remains.
         let stage_packed = packed_qkv && !fuse_prep;
         let (packed_q, packed_k, packed_v) = if stage_packed {
-            match prepared {
-                Some(view) => (
-                    Some(gqa_carve(
-                        view,
-                        composite_layout.packed_q_offset,
-                        composite_layout.packed_q_bytes,
-                        "packed query staging",
-                    )?),
-                    Some(gqa_carve(
-                        view,
-                        composite_layout.packed_k_offset,
-                        composite_layout.packed_k_bytes,
-                        "packed key staging",
-                    )?),
-                    Some(gqa_carve(
-                        view,
-                        composite_layout.packed_v_offset,
-                        composite_layout.packed_v_bytes,
-                        "packed value staging",
-                    )?),
-                ),
-                None => (
-                    Some(workspace.reserve(WS_PACKED_Q, batch * q_seq * q_hidden * element_size)?),
-                    Some(workspace.reserve(WS_PACKED_K, batch * k_seq * k_hidden * element_size)?),
-                    Some(workspace.reserve(WS_PACKED_V, batch * k_seq * k_hidden * element_size)?),
-                ),
-            }
+            (
+                Some(gqa_carve(
+                    prepared_view,
+                    composite_layout.packed_q_offset,
+                    composite_layout.packed_q_bytes,
+                    "packed query staging",
+                )?),
+                Some(gqa_carve(
+                    prepared_view,
+                    composite_layout.packed_k_offset,
+                    composite_layout.packed_k_bytes,
+                    "packed key staging",
+                )?),
+                Some(gqa_carve(
+                    prepared_view,
+                    composite_layout.packed_v_offset,
+                    composite_layout.packed_v_bytes,
+                    "packed value staging",
+                )?),
+            )
         } else {
             (None, None, None)
         };
-        // BSH↔BNSH transpose scratch (§736). Prepared execution carves both
-        // buffers from the governed composite. The compatibility/opt-out path
-        // retains the self-owned pooled slots. For Sq==1, unpacked non-RoPE Q is
-        // already in the layout attention consumes and uses the input directly.
-        // An unfused packed Sq==1 route similarly consumes/rotates its split Q
-        // staging in place; the layout overlays that mutually-exclusive role.
         let q_bnsh = if !transpose_scratch.query {
             input_q_ptr
         } else if single_token && stage_packed {
@@ -2568,52 +2673,47 @@ impl GroupQueryAttentionKernel {
                 )
             })?
         } else {
-            match prepared {
-                Some(view) => gqa_carve(
-                    view,
-                    composite_layout.q_bnsh_offset,
-                    composite_layout.q_bnsh_bytes,
-                    "query BNSH transpose scratch",
-                )?,
-                None => workspace.reserve(
-                    WS_Q_BNSH,
-                    gqa_packed_staging_bytes(batch, q_seq, q_hidden, element_size)?,
-                )?,
-            }
+            gqa_carve(
+                prepared_view,
+                composite_layout.q_bnsh_offset,
+                composite_layout.q_bnsh_bytes,
+                "query BNSH transpose scratch",
+            )?
         };
-        let out_bnsh = if transpose_scratch.output {
-            Some(match prepared {
-                Some(view) => gqa_carve(
-                    view,
+        let out_bnsh = transpose_scratch
+            .output
+            .then(|| {
+                gqa_carve(
+                    prepared_view,
                     composite_layout.out_bnsh_offset,
                     composite_layout.out_bnsh_bytes,
                     "output BNSH transpose scratch",
-                )?,
-                None => workspace.reserve(
-                    WS_OUT_BNSH,
-                    gqa_packed_staging_bytes(batch, q_seq, q_hidden, element_size)?,
-                )?,
-            })
-        } else {
-            None
-        };
-        let owned_present_k = (outputs.len() < 2)
-            .then(|| {
-                workspace.reserve(
-                    WS_PRESENT_K,
-                    expected_cache_shape.iter().product::<usize>() * element_size,
                 )
             })
             .transpose()?;
-        let owned_present_v = (outputs.len() < 3)
+        let owned_present_k = matches!(output_metadata[1], OutputMetadata::Absent)
             .then(|| {
-                workspace.reserve(
-                    WS_PRESENT_V,
-                    expected_cache_shape.iter().product::<usize>() * element_size,
+                gqa_carve(
+                    prepared_view,
+                    composite_layout.present_k_offset,
+                    composite_layout.present_k_bytes,
+                    "hidden present key",
                 )
             })
             .transpose()?;
-        let present_k_ptr = if let Some(output) = outputs.get_mut(1) {
+        let owned_present_v = matches!(output_metadata[2], OutputMetadata::Absent)
+            .then(|| {
+                gqa_carve(
+                    prepared_view,
+                    composite_layout.present_v_offset,
+                    composite_layout.present_v_bytes,
+                    "hidden present value",
+                )
+            })
+            .transpose()?;
+        let present_k_ptr = if let Some(output) =
+            outputs.get_mut(1).filter(|output| !output.is_absent())
+        {
             cuptr(output.data_ptr_mut::<u8>() as *const c_void)
         } else {
             *owned_present_k.as_ref().ok_or_else(|| {
@@ -2622,7 +2722,9 @@ impl GroupQueryAttentionKernel {
                 )
             })?
         };
-        let present_v_ptr = if let Some(output) = outputs.get_mut(2) {
+        let present_v_ptr = if let Some(output) =
+            outputs.get_mut(2).filter(|output| !output.is_absent())
+        {
             cuptr(output.data_ptr_mut::<u8>() as *const c_void)
         } else {
             *owned_present_v.as_ref().ok_or_else(|| {
@@ -3164,24 +3266,12 @@ impl GroupQueryAttentionKernel {
                     "cuda_ep GroupQueryAttention: score workspace stride exceeds uint64".into(),
                 )
             })?;
-            let score_scratch = match prepared {
-                // Governed slice (§736): the executor reserved this
-                // session-persistent composite buffer against the device
-                // authority during prepare-only planning, sized through the same
-                // `gqa_workspace_layout`/`gqa_reference_scores_bytes` helpers.
-                // Carve the score region deterministically, refusing on a
-                // shortfall rather than silently under-allocating or
-                // reintroducing a raw pooled allocation.
-                Some(view) => gqa_carve(
-                    view,
-                    composite_layout.scores_offset,
-                    scores_bytes,
-                    "reference score matrix",
-                )?,
-                // Compatibility/opt-out path: no executor-prepared workspace, so
-                // the score scratch stays self-owned in the pooled slot.
-                None => workspace.reserve(WS_SCORES, scores_bytes)?,
-            };
+            let score_scratch = gqa_carve(
+                prepared_view,
+                composite_layout.scores_offset,
+                scores_bytes,
+                "reference score matrix",
+            )?;
             let attention_rows_u32 = u32::try_from(attention_rows).map_err(|_| {
                 EpError::KernelFailed(
                     "cuda_ep GroupQueryAttention: attention row count exceeds u32".into(),
@@ -3299,8 +3389,8 @@ impl GroupQueryAttentionKernel {
 
     /// Prepare-only planning (#747, §736): report the governed session-persistent
     /// composite workspace — packed Q/K/V projection staging, BSH↔BNSH
-    /// transpose scratch, and complete reference/general-half attention scratch
-    /// — so the executor reserves it before request admission. Auto planning
+    /// transpose scratch, complete reference/general-half attention scratch, and
+    /// omitted KV destinations — so the executor reserves it before request admission. Auto planning
     /// covers every valid length allowed by the input geometry; a shorter
     /// invocation may select fused while the common bound funds its fallback:
     ///
@@ -3320,6 +3410,9 @@ impl GroupQueryAttentionKernel {
     ///   both transpose regions charge zero. Seq-major BSNH changes KV strides,
     ///   not the Q/output orientation, and therefore does not change this split.
     ///
+    /// - **Hidden KV outputs** share the physical stride of any visible sibling.
+    ///   When both are omitted, the input-derived logical bound funds both.
+    ///
     /// Runtime remains responsible for complete input validation. The composite
     /// keeps its existing SessionPersistent declaration; moving it to step reuse
     /// requires the remaining preparation/capture lifetime migration. The
@@ -3327,6 +3420,7 @@ impl GroupQueryAttentionKernel {
     /// growth against the same physical authority.
     fn composite_workspace_requirement(
         inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
         num_heads: usize,
         kv_num_heads: usize,
         do_rotary: bool,
@@ -3397,6 +3491,14 @@ impl GroupQueryAttentionKernel {
             gqa_score_stride(past_capacity, key_length)?,
             inputs.get(11).is_some_and(|sink| sink.present),
         )?;
+        let present_scratch = gqa_present_scratch(
+            outputs,
+            q.dtype,
+            batch,
+            kv_num_heads,
+            head_dim,
+            gqa_score_stride(past_capacity, key_length)?,
+        )?;
         let layout = gqa_workspace_layout(
             batch,
             num_heads,
@@ -3408,7 +3510,8 @@ impl GroupQueryAttentionKernel {
             transpose_scratch.query,
             transpose_scratch.output,
             attention_scratch,
-        )?;
+        )?
+        .with_present_scratch(&present_scratch)?;
         if layout.total_bytes == 0 {
             return Ok(WorkspaceRequirement::NONE);
         }
@@ -3426,18 +3529,17 @@ impl GroupQueryAttentionKernel {
 
 impl Kernel for GroupQueryAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        // Compatibility/opt-out path: no executor-prepared workspace, so the f32
-        // reference score scratch stays self-owned in the pooled slot.
         self.run(inputs, outputs, None)
     }
 
     fn workspace_requirement(
         &self,
         inputs: &[TensorMetadata<'_>],
-        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
         Self::composite_workspace_requirement(
             inputs,
+            outputs,
             self.num_heads,
             self.kv_num_heads,
             self.do_rotary,
@@ -3566,6 +3668,219 @@ mod tests {
         assert!(format!("{error}").contains("batch_size 2"));
     }
 
+    #[test]
+    fn composite_requirement_funds_hidden_kv_but_not_visible_outputs() {
+        let inputs = [
+            TensorMetadata::new(DataType::Float32, &[1, 1, 8], true),
+            TensorMetadata::new(DataType::Float32, &[1, 1, 4], true),
+            TensorMetadata::new(DataType::Float32, &[1, 1, 4], true),
+        ];
+        let y = OutputMetadata::tensor(DataType::Float32, &[1, 1, 8]);
+        let kv = OutputMetadata::tensor(DataType::Float32, &[1, 2, 11, 2]);
+        let requirement = |outputs: &[OutputMetadata<'_>]| {
+            GroupQueryAttentionKernel::composite_workspace_requirement(
+                &inputs,
+                outputs,
+                4,
+                2,
+                false,
+                GroupQueryAttentionBackend::Auto,
+                7,
+            )
+            .unwrap()
+        };
+        assert_eq!(requirement(&[y.clone(), kv.clone(), kv.clone()]).bytes, 0);
+        assert_eq!(requirement(&[y.clone(), kv.clone()]).bytes, 176);
+        assert_eq!(
+            requirement(&[y.clone(), OutputMetadata::Absent, kv]).bytes,
+            176
+        );
+        // Fully hidden caches need one element row per KV head, with disjoint
+        // 256-aligned destinations; external padding is not charged internally.
+        assert_eq!(requirement(&[y]).bytes, 272);
+    }
+
+    #[test]
+    fn hidden_present_scratch_uses_visible_sibling_capacity() {
+        for capacity in [3, 11] {
+            let shape = [2, 3, capacity, 5];
+            for (key_present, value_present) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let outputs = [
+                    OutputMetadata::Unresolved {
+                        dtype: DataType::Float16,
+                    },
+                    if key_present {
+                        OutputMetadata::tensor(DataType::Float16, &shape)
+                    } else {
+                        OutputMetadata::Absent
+                    },
+                    if value_present {
+                        OutputMetadata::tensor(DataType::Float16, &shape)
+                    } else {
+                        OutputMetadata::Absent
+                    },
+                ];
+                let scratch = gqa_present_scratch(&outputs, DataType::Float16, 2, 3, 5, 7).unwrap();
+                let expected_capacity = if key_present || value_present {
+                    capacity
+                } else {
+                    7
+                };
+                assert_eq!(scratch.capacity, expected_capacity);
+                let bytes = 2 * 3 * expected_capacity * 5 * 2;
+                assert_eq!(scratch.key_bytes, if key_present { 0 } else { bytes });
+                assert_eq!(scratch.value_bytes, if value_present { 0 } else { bytes });
+            }
+        }
+    }
+
+    #[test]
+    fn visible_unresolved_kv_requires_no_hidden_capacity_reservation() {
+        let outputs = std::array::from_fn::<_, 3, _>(|_| OutputMetadata::Unresolved {
+            dtype: DataType::Float32,
+        });
+        let scratch = gqa_present_scratch(&outputs, DataType::Float32, 1, 2, 4, 7).unwrap();
+        assert_eq!((scratch.key_bytes, scratch.value_bytes), (0, 0));
+    }
+
+    #[test]
+    fn hidden_present_scratch_preserves_omitted_trailing_slots() {
+        let shape = [1, 2, 11, 4];
+        let outputs = [
+            OutputMetadata::Unresolved {
+                dtype: DataType::Float32,
+            },
+            OutputMetadata::tensor(DataType::Float32, &shape),
+        ];
+        let scratch = gqa_present_scratch(&outputs, DataType::Float32, 1, 2, 4, 2).unwrap();
+        assert_eq!(
+            (scratch.capacity, scratch.key_bytes, scratch.value_bytes),
+            (11, 0, 352)
+        );
+        let scratch = gqa_present_scratch(&outputs[..1], DataType::Float32, 1, 2, 4, 2).unwrap();
+        assert_eq!(
+            (scratch.capacity, scratch.key_bytes, scratch.value_bytes),
+            (2, 64, 64)
+        );
+    }
+
+    #[test]
+    fn present_scratch_rejects_unresolved_mismatched_and_overflowing_geometry() {
+        let y = OutputMetadata::Unresolved {
+            dtype: DataType::Float32,
+        };
+        let a = [1, 2, 4, 3];
+        let b = [1, 2, 8, 3];
+        for (outputs, message) in [
+            (
+                vec![
+                    y.clone(),
+                    OutputMetadata::Unresolved {
+                        dtype: DataType::Float32,
+                    },
+                ],
+                "resolve its shape or bind an exact output extent",
+            ),
+            (
+                vec![
+                    y.clone(),
+                    OutputMetadata::tensor(DataType::Float32, &a),
+                    OutputMetadata::tensor(DataType::Float32, &b),
+                ],
+                "share one cache capacity",
+            ),
+            (
+                vec![y.clone(), OutputMetadata::tensor(DataType::Float16, &a)],
+                "must be Float32 BNSH",
+            ),
+            (
+                vec![y, OutputMetadata::tensor(DataType::Float32, &[1, 2, 4])],
+                "must be Float32 BNSH",
+            ),
+        ] {
+            let error = gqa_present_scratch(&outputs, DataType::Float32, 1, 2, 3, 2).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        assert!(gqa_present_scratch(&[], DataType::Float32, 2, 2, 3, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn hidden_kv_layout_is_disjoint_and_requires_complete_prepared_backing() {
+        let scratch = GqaPresentScratch {
+            capacity: 8,
+            key_bytes: 512,
+            value_bytes: 512,
+        };
+        let layout = GqaWorkspaceLayout {
+            total_bytes: 40,
+            ..Default::default()
+        }
+        .with_present_scratch(&scratch)
+        .unwrap();
+        assert_eq!(layout.present_k_offset, 256);
+        assert_eq!(layout.present_v_offset, 768);
+        assert_eq!(layout.total_bytes, 1280);
+        #[repr(align(256))]
+        struct Backing([u8; 1280]);
+        let mut backing = Backing([0; 1280]);
+        let ptr = backing.0.as_mut_ptr().cast();
+        assert!(
+            layout
+                .bind(None)
+                .unwrap_err()
+                .to_string()
+                .contains("execute_with_workspace")
+        );
+        assert!(
+            layout
+                .bind(Some(WorkspaceView::new(DevicePtrMut(ptr), 1279)))
+                .is_err()
+        );
+        assert!(
+            layout
+                .bind(Some(WorkspaceView::new(
+                    DevicePtrMut(ptr.wrapping_add(1)),
+                    1280
+                )))
+                .is_err()
+        );
+        let view = layout
+            .bind(Some(WorkspaceView::new(DevicePtrMut(ptr), 1280)))
+            .unwrap();
+        let key = gqa_carve(
+            view,
+            layout.present_k_offset,
+            layout.present_k_bytes,
+            "hidden key",
+        )
+        .unwrap();
+        let value = gqa_carve(
+            view,
+            layout.present_v_offset,
+            layout.present_v_bytes,
+            "hidden value",
+        )
+        .unwrap();
+        assert_eq!(value - key, 512);
+        let visible = GqaPresentScratch {
+            capacity: 8,
+            key_bytes: 0,
+            value_bytes: 0,
+        };
+        assert_eq!(
+            GqaWorkspaceLayout {
+                total_bytes: 40,
+                ..Default::default()
+            }
+            .with_present_scratch(&visible)
+            .unwrap()
+            .total_bytes,
+            40
+        );
+    }
+
     fn runtime() -> Option<Arc<CudaRuntime>> {
         crate::test_support::maybe_runtime()
     }
@@ -3579,13 +3894,13 @@ mod tests {
         let before = runtime.allocation_counts();
         let mut workspace = GqaWorkspace::new(runtime.clone());
 
-        let first = workspace.reserve(WS_Q_BNSH, 4096).unwrap();
+        let first = workspace.reserve(WS_TOTALS, 4096).unwrap();
         let allocated = runtime.allocation_counts();
         assert_eq!(allocated.allocations, before.allocations + 1);
         assert_eq!(allocated.frees, before.frees);
 
-        assert_eq!(workspace.reserve(WS_Q_BNSH, 4096).unwrap(), first);
-        assert_eq!(workspace.reserve(WS_Q_BNSH, 2048).unwrap(), first);
+        assert_eq!(workspace.reserve(WS_TOTALS, 4096).unwrap(), first);
+        assert_eq!(workspace.reserve(WS_TOTALS, 2048).unwrap(), first);
         assert_eq!(runtime.allocation_counts(), allocated);
 
         // Growing releases the old block and takes a larger one. `frees` counts
@@ -3595,7 +3910,7 @@ mod tests {
         // Asserting on the retained total keeps the property this test exists
         // for -- the old block is released, not leaked -- without pinning which
         // side of the pool it ends up on.
-        let grown = workspace.reserve(WS_Q_BNSH, 8192).unwrap();
+        let grown = workspace.reserve(WS_TOTALS, 8192).unwrap();
         assert_ne!(grown, first);
         let grown_counts = runtime.allocation_counts();
         assert_eq!(grown_counts.allocations, before.allocations + 2);
@@ -3896,8 +4211,17 @@ mod tests {
     fn workspace_requirement_governs_reference_scores_and_transposes_by_route() {
         let (num_heads, kv_heads, dim) = (4usize, 2usize, 64usize);
         let requirement = |inputs: &[TensorMetadata<'_>]| {
+            let cache_shape = [inputs[0].shape[0], kv_heads, 1024, dim];
+            let outputs = [
+                OutputMetadata::Unresolved {
+                    dtype: inputs[0].dtype,
+                },
+                OutputMetadata::tensor(inputs[0].dtype, &cache_shape),
+                OutputMetadata::tensor(inputs[0].dtype, &cache_shape),
+            ];
             GroupQueryAttentionKernel::composite_workspace_requirement(
                 inputs,
+                &outputs,
                 num_heads,
                 kv_heads,
                 false,
@@ -3984,6 +4308,13 @@ mod tests {
         // while the same Auto geometry above is provably fused on this tier.
         let forced_half = GroupQueryAttentionKernel::composite_workspace_requirement(
             &f16_inputs,
+            &[
+                OutputMetadata::Unresolved {
+                    dtype: DataType::Float16,
+                },
+                OutputMetadata::tensor(DataType::Float16, &past_shape),
+                OutputMetadata::tensor(DataType::Float16, &past_shape),
+            ],
             num_heads,
             kv_heads,
             false,
@@ -4029,8 +4360,7 @@ mod tests {
     #[test]
     fn packed_staging_bytes_matches_split_scratch_formula() {
         // Planning and execution size each packed QKV staging buffer through this
-        // helper (§736): `batch·seq·hidden·element_size`, matching the pooled
-        // `workspace.reserve(WS_PACKED_*, batch * seq * hidden * element_size)`.
+        // helper: `batch·seq·hidden·element_size`.
         let (batch, seq, hidden, elem) = (2usize, 7usize, 512usize, 2usize);
         assert_eq!(
             gqa_packed_staging_bytes(batch, seq, hidden, elem).unwrap(),
@@ -4235,8 +4565,17 @@ mod tests {
     fn workspace_requirement_charges_packed_staging_only_when_packed() {
         let (num_heads, kv_heads, dim) = (8usize, 2usize, 64usize);
         let requirement = |inputs: &[TensorMetadata<'_>]| {
+            let cache_shape = [inputs[0].shape[0], kv_heads, 1024, dim];
+            let outputs = [
+                OutputMetadata::Unresolved {
+                    dtype: inputs[0].dtype,
+                },
+                OutputMetadata::tensor(inputs[0].dtype, &cache_shape),
+                OutputMetadata::tensor(inputs[0].dtype, &cache_shape),
+            ];
             GroupQueryAttentionKernel::composite_workspace_requirement(
                 inputs,
+                &outputs,
                 num_heads,
                 kv_heads,
                 false,
@@ -4320,95 +4659,28 @@ mod tests {
     }
 }
 
-/// Regression guard for issue #736: the governed GQA score buffer (`WS_SCORES`)
-/// is routed through `Kernel::workspace_requirement` + an executor-prepared
-/// session-persistent workspace, consumed via `execute_with_workspace`. This
-/// CPU-only test fails if the f32 reference branch reintroduces an unconditional
-/// raw pooled allocation of the score slot, bypassing the device authority. It
-/// runs on CI without a GPU, matching the #751 bar (a source-scan unit test, not
-/// a `Select-String`-style external scan).
+/// Static migration guard; actual sizing and binding behavior is tested above.
 #[cfg(test)]
 mod raw_allocation_guard {
     #[test]
-    fn gqa_scores_slot_is_governed_not_raw_allocated() {
-        const SOURCE: &str = include_str!("group_query_attention.rs");
-        assert!(
-            SOURCE.contains("fn execute_with_workspace"),
-            "GroupQueryAttention must stay wired into governed workspace preparation (#736)."
-        );
-        assert!(
-            SOURCE.contains("gqa_reference_scores_bytes"),
-            "the f32 reference score buffer must be sized through the shared helper (#736)."
-        );
-        // The pre-#736 seam reserved the score slot from the self-owned pool
-        // unconditionally. The needle is assembled at runtime so this literal
-        // does not itself match when the file is scanned via `include_str!`.
-        let ungoverned = ["workspace.reserve(WS_SCORES, score_count", ".max(1) * 4)"].concat();
-        assert!(
-            !SOURCE.contains(ungoverned.as_str()),
-            "GroupQueryAttention must not reintroduce an unconditional raw pooled allocation of \
-             the governed score slot (#736); carve it from the executor-prepared workspace."
-        );
-    }
-
-    #[test]
-    fn gqa_packed_qkv_staging_is_governed_not_raw_allocated() {
-        const SOURCE: &str = include_str!("group_query_attention.rs");
-        // The packed QKV projection staging is sized through the shared composite
-        // layout helper and carved from the executor-prepared workspace on the
-        // governed path (§736 QKV slice).
-        assert!(
-            SOURCE.contains("gqa_workspace_layout"),
-            "packed QKV staging must be sized through the shared composite layout helper (#736)."
-        );
-        assert!(
-            SOURCE.contains("packed query staging")
-                && SOURCE.contains("packed key staging")
-                && SOURCE.contains("packed value staging"),
-            "packed QKV staging must be carved from the executor-prepared composite workspace \
-             via `gqa_carve` on the governed path (#736)."
-        );
-        // The pre-#736 seam reserved the packed slots straight from the pooled
-        // allocator with no executor-prepared branch. The needle is assembled at
-        // runtime so this literal does not match when scanned via `include_str!`.
-        let ungoverned = [
-            "(packed_qkv && !fuse_prep)\n",
-            "            .then(|| workspace.reserve(WS_PACKED_Q,",
-        ]
-        .concat();
-        assert!(
-            !SOURCE.contains(ungoverned.as_str()),
-            "GroupQueryAttention must not reintroduce an unconditional raw pooled allocation of \
-             the packed QKV staging slots (#736); carve them from the prepared workspace and keep \
-             the pooled reserve only on the compatibility/opt-out `None` arm."
-        );
-    }
-
-    #[test]
-    fn gqa_bnsh_transpose_slots_are_governed_not_raw_allocated() {
-        const SOURCE: &str = include_str!("group_query_attention.rs");
-        assert!(
-            SOURCE.contains("gqa_transpose_scratch")
-                && SOURCE.contains("query BNSH transpose scratch")
-                && SOURCE.contains("output BNSH transpose scratch"),
-            "GQA transpose scratch must be route-sized and carved from the prepared composite."
-        );
-        let unconditional_query = [
-            "let q_bnsh = workspace.reserve(WS_Q_BNSH,",
-            " batch * q_seq * q_hidden * element_size)?;",
-        ]
-        .concat();
-        let unconditional_output = [
-            "then(|| workspace.reserve(WS_OUT_BNSH,",
-            " outputs[0].numel() * element_size))",
-        ]
-        .concat();
-        assert!(
-            !SOURCE.contains(unconditional_query.as_str())
-                && !SOURCE.contains(unconditional_output.as_str()),
-            "GroupQueryAttention must not reintroduce unconditional raw pooled BNSH transpose \
-             reservations; prepared execution must use the governed composite and Sq==1 direct \
-             routes must remain allocation-free."
-        );
+    fn only_capture_metadata_retains_private_allocation_slots() {
+        let source = include_str!("group_query_attention.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        for removed in [
+            "PACKED_Q",
+            "PACKED_K",
+            "PACKED_V",
+            "Q_BNSH",
+            "OUT_BNSH",
+            "PRESENT_K",
+            "PRESENT_V",
+            "SCORES",
+        ] {
+            let slot = format!("WS_{removed}");
+            assert!(
+                !production.contains(&slot),
+                "large temporary slot {slot} must remain in prepared workspace"
+            );
+        }
     }
 }

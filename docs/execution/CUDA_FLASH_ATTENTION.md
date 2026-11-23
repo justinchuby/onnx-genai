@@ -174,8 +174,18 @@ planning can reserve fallback scratch even when a shorter individual invocation
 selects fused; guaranteed-fused and dedicated decode shapes reserve neither
 matrix nor BLAS scratch. Missing or invalid fallback backing is an error.
 
-GQA's remaining private preparation metadata and temporary KV/staging slots
-still need migration; its composite retains its existing lifetime for now.
+GQA now requires its composite for all large temporary buffers: packed staging,
+Q/output transposes, scores/BLAS, and hidden KV outputs. There is no private
+allocation fallback for these regions. A single visible K or V output fixes the
+physical capacity of its hidden sibling; when both are omitted, both temporary
+caches use the input-derived logical bound. Planning receives actual output facts
+and rejects unresolved visible cache geometry when a hidden sibling needs that
+capacity before admission. Complete backing
+is checked before metadata preparation or attention launches.
+
+Three small preparation metadata allocations still retain real graph-resource
+owners. Their capture lifetime is not replaced by a borrowed pointer; the
+composite retains its existing lifetime for now.
 The shared Phase-2a engine still retains temporary ownership for MHA pending
 that caller's complete composite migration.
 
