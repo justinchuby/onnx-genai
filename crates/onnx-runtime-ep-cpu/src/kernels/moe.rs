@@ -6,7 +6,7 @@
 //! `fc3_experts_bias?`. Weights use ORT's expert-major canonical layout.
 
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView, WorkspaceLayout,
     WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
@@ -243,7 +243,12 @@ impl MoeAttributes {
 }
 
 impl MoEKernel {
-    fn gather_workspace_bytes(&self, shape: &[usize], inter: usize) -> Result<usize> {
+    fn workspace_layout(
+        &self,
+        shape: &[usize],
+        inter: usize,
+        has_fc3: bool,
+    ) -> Result<WorkspaceLayout<2>> {
         if !matches!(shape.len(), 2 | 3) {
             return Err(error(format!(
                 "input must be 2-D [rows, hidden] or 3-D [batch, sequence, hidden], got {shape:?}"
@@ -251,7 +256,7 @@ impl MoEKernel {
         }
         let invalid = || {
             error(format!(
-                "grouped input workspace overflows for input {shape:?}, inter_size={inter}, k={}; reduce batch or projection dimensions",
+                "execution workspace overflows for input {shape:?}, inter_size={inter}, k={}; reduce batch or projection dimensions",
                 self.attributes.k
             ))
         };
@@ -260,25 +265,37 @@ impl MoEKernel {
             .try_fold(1usize, |n, &d| n.checked_mul(d))
             .ok_or_else(invalid)?;
         let hidden = shape[shape.len() - 1];
-        let elements = rows.checked_mul(hidden).ok_or_else(invalid)?;
-        // Check the original f32 span even when a singleton needs no gather.
-        std::alloc::Layout::array::<f32>(elements).map_err(|_| invalid())?;
+        let input_elements = rows.checked_mul(hidden).ok_or_else(invalid)?;
+        std::alloc::Layout::array::<f32>(input_elements).map_err(|_| invalid())?;
         let fc1 = self.attributes.checked_fc1_size(inter, "MoE")?;
-        // Actual expert groups contain at most rows entries. Do not use the
-        // current pool width: prepare and run may enter different Rayon pools.
         let grouped_possible =
             projection_work_units(rows, fc1, hidden, inter) >= self.grouped_min_work;
-        let elements = if grouped_possible {
-            elements
-                .checked_mul(self.attributes.k)
-                .ok_or_else(invalid)?
-        } else if rows <= 1 {
+        let bound = if hidden == 0 {
             0
+        } else if grouped_possible {
+            rows.checked_mul(self.attributes.k).ok_or_else(invalid)?
         } else {
-            elements
+            rows
         };
-        let layout = std::alloc::Layout::array::<f32>(elements).map_err(|_| invalid())?;
-        Ok(layout.size())
+        let separate_gate = self.attributes.uses_separate_gate(has_fc3);
+        let widths = if self.attributes.is_gated(has_fc3) {
+            // A: gather -> activated; B: FC1+FC3 -> expert output.
+            [
+                hidden.max(inter),
+                fc1.checked_add(if separate_gate { inter } else { 0 })
+                    .ok_or_else(invalid)?
+                    .max(hidden),
+            ]
+        } else {
+            // A: gather -> expert output; B: FC1 -> in-place activation.
+            [hidden, inter]
+        };
+        let regions = widths.map(|width| {
+            let elements = bound.checked_mul(width).ok_or_else(invalid)?;
+            std::alloc::Layout::array::<f32>(elements).map_err(|_| invalid())
+        });
+        let [a, b] = regions;
+        WorkspaceLayout::new([a?, b?])
     }
 }
 
@@ -307,7 +324,13 @@ impl Kernel for MoEKernel {
         let fc2 = required(4, "fc2_experts_weights")?;
         require_shape("fc2_experts_weights", fc2.shape, 3)?;
         Ok(WorkspaceRequirement {
-            bytes: self.gather_workspace_bytes(input.shape, fc2.shape[2])? as u64,
+            bytes: self
+                .workspace_layout(
+                    input.shape,
+                    fc2.shape[2],
+                    inputs.get(6).is_some_and(|v| v.present),
+                )?
+                .bytes() as u64,
             alignment: std::mem::align_of::<f32>(),
             ..WorkspaceRequirement::NONE
         })
@@ -466,11 +489,12 @@ impl Kernel for MoEKernel {
             (None, None)
         };
 
-        let scratch_bytes = self.gather_workspace_bytes(x_shape, inter)?;
-        // SAFETY: CPU dispatch lends exclusive Host-accessible backing through
-        // this synchronous execution. No gathered reference escapes the call.
-        let mut scratch =
-            unsafe { ProjectionScratch::bind("MoE grouped input", scratch_bytes, workspace)? };
+        let layout = self.workspace_layout(x_shape, inter, has_fc3)?;
+        // SAFETY: exclusive Host backing lives through this synchronous call.
+        let [input, projection] = unsafe {
+            ProjectionScratch::bind_layout("MoE execution workspace", layout, workspace)?
+        };
+        let mut scratch = MoeWorkspace { input, projection };
 
         // Borrow rather than `into_owned()`. Expert weights are the largest
         // tensors in the graph - a Mixtral-shaped `fc1` + `fc2` pair is 352 MiB
@@ -529,6 +553,20 @@ impl MoeAttributes {
             })
         } else {
             Ok(inter)
+        }
+    }
+
+    fn is_gated(&self, has_fc3: bool) -> bool {
+        self.activation == Activation::Swiglu || (self.activation == Activation::Silu && has_fc3)
+    }
+
+    fn gated_pair_indices(&self, index: usize, inter: usize, separate: bool) -> (usize, usize) {
+        if separate {
+            (index, index)
+        } else if self.swiglu_fusion == 1 {
+            (2 * index, 2 * index + 1)
+        } else {
+            (index, inter + index)
         }
     }
 
@@ -851,9 +889,9 @@ fn grouped_min_work() -> u64 {
 /// The per-expert driver: gather each expert's rows into the shared lane, run
 /// the pair of expert GEMMs, then accumulate the weighted result.
 ///
-/// Kept as the small-shape path. It leaves FC intermediates per expert and the
-/// gather, activation and scatter serial, which is exactly the trade that wins
-/// when each expert only has a handful of rows. Gather storage is reused.
+/// Kept as the small-shape path: compute one expert at a time, retaining the
+/// serial gather, activation and scatter policy. Both scratch banks are reused
+/// by every expert rather than allocating intermediate matrices per group.
 ///
 /// Iterating `plan.groups` reproduces the ascending-expert order, and slots
 /// inside a group are in ascending row order, so this is **bit-identical** to
@@ -872,7 +910,7 @@ fn run_moe_per_expert(
     hidden: usize,
     inter: usize,
     attributes: &MoeAttributes,
-    scratch: &mut ProjectionScratch<'_>,
+    scratch: &mut MoeWorkspace<'_>,
 ) -> Result<Vec<f32>> {
     let mut output = vec![0.0f32; plan.rows * hidden];
     if plan.slots() == 0 || hidden == 0 {
@@ -881,25 +919,18 @@ fn run_moe_per_expert(
     for group in &plan.groups {
         let expert = group.expert;
         let slots = group.start..group.start + group.len;
-        let grouped_input = if group.len == 1 {
-            let source = plan.slot_row[group.start] as usize * hidden;
-            &x[source..source + hidden]
-        } else {
-            scratch.gather_rows(
-                x,
-                hidden,
-                slots.clone().map(|slot| plan.slot_row[slot] as usize),
-            )?
-        };
-        let expert_out = run_expert_grouped(
-            grouped_input,
-            group.len,
-            &fc1_weights[expert * fc1_size * hidden..(expert + 1) * fc1_size * hidden],
-            fc1_bias.map(|b| &b[expert * fc1_size..(expert + 1) * fc1_size]),
-            &fc2_weights[expert * hidden * inter..(expert + 1) * hidden * inter],
-            fc2_bias.map(|b| &b[expert * hidden..(expert + 1) * hidden]),
-            fc3_weights.map(|w| &w[expert * inter * hidden..(expert + 1) * inter * hidden]),
-            fc3_bias.map(|b| &b[expert * inter..(expert + 1) * inter]),
+        let expert_out = scratch.run_dense_expert(
+            x,
+            &plan.slot_row[slots.clone()],
+            DenseExpertWeights {
+                fc1: &fc1_weights[expert * fc1_size * hidden..(expert + 1) * fc1_size * hidden],
+                fc1_bias: fc1_bias.map(|b| &b[expert * fc1_size..(expert + 1) * fc1_size]),
+                fc2: &fc2_weights[expert * hidden * inter..(expert + 1) * hidden * inter],
+                fc2_bias: fc2_bias.map(|b| &b[expert * hidden..(expert + 1) * hidden]),
+                fc3: fc3_weights
+                    .map(|w| &w[expert * inter * hidden..(expert + 1) * inter * hidden]),
+                fc3_bias: fc3_bias.map(|b| &b[expert * inter..(expert + 1) * inter]),
+            },
             fc1_size,
             hidden,
             inter,
@@ -939,7 +970,7 @@ fn run_moe_grouped(
     hidden: usize,
     inter: usize,
     attributes: &MoeAttributes,
-    scratch: &mut ProjectionScratch<'_>,
+    scratch: &mut MoeWorkspace<'_>,
 ) -> Result<Vec<f32>> {
     let slots = plan.slots();
     let mut output = vec![0.0f32; plan.rows * hidden];
@@ -953,55 +984,59 @@ fn run_moe_grouped(
     );
 
     let gathered = match parallel_rows_per_task(slots, hidden) {
-        Some(rows_per_task) => scratch.gather_rows_parallel(
+        Some(rows_per_task) => scratch.input.gather_rows_parallel(
             x,
             hidden,
             &plan.slot_row,
             std::num::NonZeroUsize::new(rows_per_task).expect("parallel row tasks are nonempty"),
         )?,
-        None => scratch.gather_rows(x, hidden, plan.slot_row.iter().map(|&row| row as usize))?,
+        None => {
+            scratch
+                .input
+                .gather_rows(x, hidden, plan.slot_row.iter().map(|&row| row as usize))?
+        }
     };
-
-    let mut fc1_out = vec![0.0f32; slots * fc1_size];
-    grouped_linear(gathered, plan, fc1_weights, fc1_size, hidden, &mut fc1_out)?;
-
-    let gate_source = if attributes.uses_separate_gate(fc3_weights.is_some()) {
-        let mut fc3_out = vec![0.0f32; slots * inter];
+    let separate = attributes.uses_separate_gate(fc3_weights.is_some());
+    let projections = scratch
+        .projection
+        .zeroed_prefix(slots * (fc1_size + if separate { inter } else { 0 }))?;
+    let (fc1_out, gate) = projections.split_at_mut(slots * fc1_size);
+    grouped_linear(gathered, plan, fc1_weights, fc1_size, hidden, fc1_out)?;
+    let gate = if separate {
         grouped_linear(
             gathered,
             plan,
             fc3_weights.expect("validated separate gate FC3"),
             inter,
             hidden,
-            &mut fc3_out,
+            gate,
         )?;
-        Some(fc3_out)
+        Some(&*gate)
     } else {
         None
     };
-
-    let activated = apply_activation(
-        fc1_out,
-        gate_source,
-        plan,
-        fc1_bias,
-        fc3_bias,
-        slots,
-        fc1_size,
-        inter,
-        attributes,
-    );
-
-    let mut expert_out = vec![0.0f32; slots * hidden];
-    grouped_linear(
-        &activated,
-        plan,
-        fc2_weights,
-        hidden,
-        inter,
-        &mut expert_out,
-    )?;
-    drop(activated);
+    let expert_out = if attributes.is_gated(fc3_weights.is_some()) {
+        let activated = scratch.input.zeroed_prefix(slots * inter)?;
+        apply_gated_activation(
+            fc1_out, gate, plan, fc1_bias, fc3_bias, fc1_size, inter, attributes, activated,
+        );
+        let expert_out = scratch.projection.zeroed_prefix(slots * hidden)?;
+        grouped_linear(activated, plan, fc2_weights, hidden, inter, expert_out)?;
+        expert_out
+    } else {
+        for_each_row(fc1_out, fc1_size, |slot, row| {
+            let bias = expert_bias(fc1_bias, &plan.slot_expert, slot, fc1_size);
+            for (index, value) in row.iter_mut().enumerate() {
+                *value = activate(
+                    attributes.activation,
+                    *value + bias.map_or(0.0, |bias| bias[index]),
+                );
+            }
+        });
+        let expert_out = scratch.input.zeroed_prefix(slots * hidden)?;
+        grouped_linear(fc1_out, plan, fc2_weights, hidden, inter, expert_out)?;
+        expert_out
+    };
 
     let (row_slots, slot_weight, slot_expert, k) = (
         &plan.row_slots,
@@ -1038,88 +1073,194 @@ fn run_moe_grouped(
     Ok(output)
 }
 
-/// Collapse FC1 (and the optional FC3 gate) into the `inter`-wide activated
-/// tensor the second expert GEMM consumes.
-///
-/// The gated variants used to build the gate and linear halves as two fresh
-/// `Vec`s element by element and then a third for the result. For a
-/// 512-token Mixtral-shaped forward that is ~56 MiB of allocation and three
-/// serial passes; here it is one parallel pass that writes each half directly
-/// into the buffer it will be consumed from.
+fn expert_bias<'a>(
+    bias: Option<&'a [f32]>,
+    slot_expert: &[u32],
+    slot: usize,
+    width: usize,
+) -> Option<&'a [f32]> {
+    bias.map(|bias| {
+        let expert = slot_expert[slot] as usize;
+        &bias[expert * width..(expert + 1) * width]
+    })
+}
+
+/// Per-expert projections have already added bias; grouped projections add it
+/// here, including their existing +0 operation when an optional bias is absent.
+#[derive(Clone, Copy)]
+enum ActivationBias<'a> {
+    Applied,
+    Pending {
+        fc1: Option<&'a [f32]>,
+        linear: Option<&'a [f32]>,
+    },
+}
+impl ActivationBias<'_> {
+    fn value(self, linear: bool, index: usize, value: f32) -> f32 {
+        match self {
+            Self::Applied => value,
+            Self::Pending {
+                fc1,
+                linear: linear_bias,
+            } => value + if linear { linear_bias } else { fc1 }.map_or(0.0, |bias| bias[index]),
+        }
+    }
+}
+
+fn gated_activation_row(
+    output: &mut [f32],
+    fc1: &[f32],
+    fc3: Option<&[f32]>,
+    inter: usize,
+    attributes: &MoeAttributes,
+    bias: ActivationBias<'_>,
+) {
+    let linear = fc3.unwrap_or(fc1);
+    for (index, value) in output.iter_mut().enumerate() {
+        let (g, l) = attributes.gated_pair_indices(index, inter, fc3.is_some());
+        *value = attributes.swiglu(bias.value(false, g, fc1[g]), bias.value(true, l, linear[l]));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn apply_activation(
-    mut fc1_out: Vec<f32>,
-    gate_source: Option<Vec<f32>>,
+fn apply_gated_activation(
+    fc1_out: &[f32],
+    gate_source: Option<&[f32]>,
     plan: &RoutingPlan,
     fc1_bias: Option<&[f32]>,
     fc3_bias: Option<&[f32]>,
-    slots: usize,
     fc1_size: usize,
     inter: usize,
     attributes: &MoeAttributes,
-) -> Vec<f32> {
-    let slot_expert = &plan.slot_expert;
-    fn expert_bias<'a>(
-        bias: Option<&'a [f32]>,
-        slot_expert: &[u32],
-        slot: usize,
-        width: usize,
-    ) -> Option<&'a [f32]> {
-        bias.map(|bias| {
-            let expert = slot_expert[slot] as usize;
-            &bias[expert * width..(expert + 1) * width]
-        })
-    }
-    let gated = attributes.activation == Activation::Swiglu
-        || (attributes.activation == Activation::Silu && gate_source.is_some());
-    if !gated {
-        for_each_row(&mut fc1_out, fc1_size, |slot, row| {
-            let bias = expert_bias(fc1_bias, slot_expert, slot, fc1_size);
-            for (index, value) in row.iter_mut().enumerate() {
-                let biased = *value + bias.map_or(0.0, |bias| bias[index]);
-                *value = activate(attributes.activation, biased);
+    activated: &mut [f32],
+) {
+    for_each_row(activated, inter, |slot, row| {
+        let fc1 = &fc1_out[slot * fc1_size..(slot + 1) * fc1_size];
+        let fc3 = gate_source.map(|gate| &gate[slot * inter..(slot + 1) * inter]);
+        let fc1_bias = expert_bias(fc1_bias, &plan.slot_expert, slot, fc1_size);
+        let linear_bias = if fc3.is_some() {
+            expert_bias(fc3_bias, &plan.slot_expert, slot, inter)
+        } else {
+            fc1_bias
+        };
+        gated_activation_row(
+            row,
+            fc1,
+            fc3,
+            inter,
+            attributes,
+            ActivationBias::Pending {
+                fc1: fc1_bias,
+                linear: linear_bias,
+            },
+        );
+    });
+}
+
+/// Two exclusive banks, reused only after the previous phase's final read.
+struct MoeWorkspace<'a> {
+    input: ProjectionScratch<'a>,
+    projection: ProjectionScratch<'a>,
+}
+struct DenseExpertWeights<'a> {
+    fc1: &'a [f32],
+    fc1_bias: Option<&'a [f32]>,
+    fc2: &'a [f32],
+    fc2_bias: Option<&'a [f32]>,
+    fc3: Option<&'a [f32]>,
+    fc3_bias: Option<&'a [f32]>,
+}
+impl MoeWorkspace<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn run_dense_expert(
+        &mut self,
+        x: &[f32],
+        row_indices: &[u32],
+        weights: DenseExpertWeights<'_>,
+        fc1_size: usize,
+        hidden: usize,
+        inter: usize,
+        attributes: &MoeAttributes,
+    ) -> Result<&[f32]> {
+        let rows = row_indices.len();
+        let input = if rows == 1 {
+            let start = row_indices[0] as usize * hidden;
+            &x[start..start + hidden]
+        } else {
+            self.input
+                .gather_rows(x, hidden, row_indices.iter().map(|&row| row as usize))?
+        };
+        let separate = attributes.uses_separate_gate(weights.fc3.is_some());
+        let projections = self
+            .projection
+            .zeroed_prefix(rows * (fc1_size + if separate { inter } else { 0 }))?;
+        let (fc1, fc3) = projections.split_at_mut(rows * fc1_size);
+        linear_grouped_into(
+            input,
+            rows,
+            weights.fc1,
+            weights.fc1_bias,
+            fc1_size,
+            hidden,
+            fc1,
+        )?;
+        let fc3 = if separate {
+            linear_grouped_into(
+                input,
+                rows,
+                weights.fc3.expect("validated separate FC3"),
+                weights.fc3_bias,
+                inter,
+                hidden,
+                fc3,
+            )?;
+            Some(&*fc3)
+        } else {
+            None
+        };
+        if attributes.is_gated(weights.fc3.is_some()) {
+            let activated = self.input.zeroed_prefix(rows * inter)?;
+            // Keep the per-expert activation serial, as before.
+            if inter != 0 {
+                for (row, target) in activated.chunks_mut(inter).enumerate() {
+                    gated_activation_row(
+                        target,
+                        &fc1[row * fc1_size..(row + 1) * fc1_size],
+                        fc3.map(|linear| &linear[row * inter..(row + 1) * inter]),
+                        inter,
+                        attributes,
+                        ActivationBias::Applied,
+                    );
+                }
             }
-        });
-        return fc1_out;
-    }
-    let mut activated = vec![0.0f32; slots * inter];
-    match gate_source {
-        // Unfused gate: FC1 is the gate, FC3 the linear half.
-        Some(linear_part) => {
-            for_each_row(&mut activated, inter, |slot, row| {
-                let gate = &fc1_out[slot * inter..(slot + 1) * inter];
-                let linear = &linear_part[slot * inter..(slot + 1) * inter];
-                let gate_bias = expert_bias(fc1_bias, slot_expert, slot, inter);
-                let linear_bias = expert_bias(fc3_bias, slot_expert, slot, inter);
-                for (index, value) in row.iter_mut().enumerate() {
-                    let g = gate[index] + gate_bias.map_or(0.0, |bias| bias[index]);
-                    let l = linear[index] + linear_bias.map_or(0.0, |bias| bias[index]);
-                    *value = attributes.swiglu(g, l);
-                }
-            });
-        }
-        // Fused gate: FC1 is `2 * inter` wide, interleaved when
-        // `swiglu_fusion == 1` and split in halves when it is 2. The bias has
-        // the same width and the same interleaving.
-        None => {
-            let interleaved = attributes.swiglu_fusion == 1;
-            for_each_row(&mut activated, inter, |slot, row| {
-                let source = &fc1_out[slot * fc1_size..(slot + 1) * fc1_size];
-                let bias = expert_bias(fc1_bias, slot_expert, slot, fc1_size);
-                for (index, value) in row.iter_mut().enumerate() {
-                    let (gate_index, linear_index) = if interleaved {
-                        (2 * index, 2 * index + 1)
-                    } else {
-                        (index, inter + index)
-                    };
-                    let g = source[gate_index] + bias.map_or(0.0, |bias| bias[gate_index]);
-                    let l = source[linear_index] + bias.map_or(0.0, |bias| bias[linear_index]);
-                    *value = attributes.swiglu(g, l);
-                }
-            });
+            let output = self.projection.zeroed_prefix(rows * hidden)?;
+            linear_grouped_into(
+                activated,
+                rows,
+                weights.fc2,
+                weights.fc2_bias,
+                hidden,
+                inter,
+                output,
+            )?;
+            Ok(output)
+        } else {
+            for value in fc1.iter_mut() {
+                *value = activate(attributes.activation, *value);
+            }
+            let output = self.input.zeroed_prefix(rows * hidden)?;
+            linear_grouped_into(
+                fc1,
+                rows,
+                weights.fc2,
+                weights.fc2_bias,
+                hidden,
+                inter,
+                output,
+            )?;
+            Ok(output)
         }
     }
-    activated
 }
 
 /// Portable single-token reference expert: plain scalar dot products, no GEMM,
@@ -1309,14 +1450,10 @@ pub(super) fn run_expert_projections<P: ExpertProjection>(
                 let mut gate = Vec::with_capacity(rows * inter);
                 let mut linear = Vec::with_capacity(rows * inter);
                 for row in fc1_out.chunks_exact(fc1_size) {
-                    if attributes.swiglu_fusion == 1 {
-                        for pair in row.as_chunks::<2>().0 {
-                            gate.push(pair[0]);
-                            linear.push(pair[1]);
-                        }
-                    } else {
-                        gate.extend_from_slice(&row[..inter]);
-                        linear.extend_from_slice(&row[inter..]);
+                    for index in 0..inter {
+                        let (g, l) = attributes.gated_pair_indices(index, inter, false);
+                        gate.push(row[g]);
+                        linear.push(row[l]);
                     }
                 }
                 (gate, linear)
@@ -1368,6 +1505,30 @@ fn linear_grouped(
     in_features: usize,
 ) -> Result<Vec<f32>> {
     let mut output = vec![0.0f32; rows * out_features];
+    linear_grouped_into(
+        input,
+        rows,
+        weights_nk,
+        bias,
+        out_features,
+        in_features,
+        &mut output,
+    )?;
+    Ok(output)
+}
+
+/// The destination is an initialized zeroed prefix, including for a zero-K
+/// projection. Both owned and workspace callers establish that invariant.
+#[allow(clippy::too_many_arguments)]
+fn linear_grouped_into(
+    input: &[f32],
+    rows: usize,
+    weights_nk: &[f32],
+    bias: Option<&[f32]>,
+    out_features: usize,
+    in_features: usize,
+    output: &mut [f32],
+) -> Result<()> {
     #[cfg(feature = "mlas")]
     {
         if rows > 0 && out_features > 0 && in_features > 0 {
@@ -1383,7 +1544,7 @@ fn linear_grouped(
                 weights_nk,
                 in_features,
                 0.0,
-                &mut output,
+                output,
                 out_features,
                 true,
             );
@@ -1391,23 +1552,16 @@ fn linear_grouped(
     }
     #[cfg(not(feature = "mlas"))]
     {
-        gemm_bt(
-            input,
-            weights_nk,
-            &mut output,
-            rows,
-            in_features,
-            out_features,
-        )?;
+        gemm_bt(input, weights_nk, output, rows, in_features, out_features)?;
     }
-    if let Some(bias) = bias {
+    if let Some(bias) = bias.filter(|_| out_features != 0) {
         for row in output.chunks_exact_mut(out_features) {
             for (value, bias) in row.iter_mut().zip(bias) {
                 *value += bias;
             }
         }
     }
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1657,20 +1811,28 @@ mod tests {
         (graph, node)
     }
 
-    fn test_scratch(backing: &mut [f32]) -> ProjectionScratch<'_> {
-        let bytes = std::mem::size_of_val(backing);
-        // SAFETY: exclusive initialized Host slice lives through the test call.
-        unsafe {
-            ProjectionScratch::bind(
-                "MoE test",
-                bytes,
-                Some(WorkspaceView::new(
-                    onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+    fn test_scratch(backing: &mut [f32]) -> MoeWorkspace<'_> {
+        let mid = backing.len() / 2;
+        let (a, b) = backing.split_at_mut(mid);
+        let bind = |slice: &mut [f32]| {
+            let bytes = std::mem::size_of_val(slice);
+            // SAFETY: each independent Host slice is exclusively lent.
+            unsafe {
+                ProjectionScratch::bind(
+                    "MoE test",
                     bytes,
-                )),
-            )
+                    Some(WorkspaceView::new(
+                        onnx_runtime_ep_api::DevicePtrMut(slice.as_mut_ptr().cast()),
+                        bytes,
+                    )),
+                )
+            }
+            .unwrap()
+        };
+        MoeWorkspace {
+            input: bind(a),
+            projection: bind(b),
         }
-        .unwrap()
     }
 
     fn kernel(graph: &Graph, node: NodeId) -> Box<dyn Kernel> {
@@ -1697,7 +1859,7 @@ mod tests {
     }
 
     #[test]
-    fn gather_workspace_bounds_cover_threshold_skew_and_pool_changes() {
+    fn execution_workspace_bounds_cover_threshold_skew_and_pool_changes() {
         use crate::kernels::testutil::RecordingGovernor;
         use onnx_runtime_ep_api::DevicePtrMut;
         use onnx_runtime_memory_api::Tier;
@@ -1727,7 +1889,7 @@ mod tests {
         // plus an explicit grouped override; policy lives in the kernel.
         for threshold in [97, 96, 0] {
             let kernel = workspace_kernel(threshold);
-            let bytes = ROWS * H * 4 * if threshold <= 96 { K } else { 1 };
+            let bytes = ROWS * (H + H) * 4 * if threshold <= 96 { K } else { 1 };
             let books = RecordingGovernor::new_host(bytes as u64);
             let manager = ProcessMemoryManager::new().unwrap();
             let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
@@ -1786,7 +1948,7 @@ mod tests {
                     let err = kernel
                         .execute_with_workspace(&inputs, &mut [output.view_mut()], workspace)
                         .unwrap_err();
-                    assert!(err.to_string().contains("MoE grouped input"), "{err}");
+                    assert!(err.to_string().contains("MoE execution workspace"), "{err}");
                     assert_eq!(output.to_f32(), [-123.; ROWS * H]);
                 }
                 for pool_threads in [&one, &four, &one, &four] {
@@ -1838,7 +2000,7 @@ mod tests {
     }
 
     #[test]
-    fn gather_workspace_metadata_checks_empty_singleton_dtype_and_overflow() {
+    fn execution_workspace_metadata_checks_empty_singleton_dtype_and_overflow() {
         let kernel = workspace_kernel(MOE_GROUPED_MIN_WORK);
         let requirement = |shape: &[usize], dtype, present| {
             kernel.workspace_requirement(&[
@@ -1851,8 +2013,8 @@ mod tests {
         };
         for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
             assert_eq!(requirement(&[0, 4], dtype, true).unwrap().bytes, 0);
-            assert_eq!(requirement(&[1, 4], dtype, true).unwrap().bytes, 0);
-            assert_eq!(requirement(&[2, 3, 4], dtype, true).unwrap().bytes, 96);
+            assert_eq!(requirement(&[1, 4], dtype, true).unwrap().bytes, 32);
+            assert_eq!(requirement(&[2, 3, 4], dtype, true).unwrap().bytes, 192);
         }
         for shape in [
             &[][..],
@@ -1883,12 +2045,192 @@ mod tests {
                 .contains("fc2_experts_weights")
         );
         let grouped = workspace_kernel(0);
-        assert_eq!(grouped.gather_workspace_bytes(&[1, 4], 4).unwrap(), 32);
+        assert_eq!(
+            grouped.workspace_layout(&[1, 4], 4, false).unwrap().bytes(),
+            64
+        );
         assert!(
             grouped
-                .gather_workspace_bytes(&[isize::MAX as usize / 8, 2], 4)
+                .workspace_layout(&[isize::MAX as usize / 8, 2], 4, false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn projection_banks_cover_gates_asymmetric_widths_and_zero_axes() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{
+            HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
+        };
+        use std::sync::Arc;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for (hidden, inter) in [(4, 7), (11, 3), (4, 0), (0, 3)] {
+            for rows in [0, 1, 3] {
+                for (activation, fusion, separate) in [
+                    (Activation::Identity, 0, false),
+                    (Activation::Silu, 0, true),
+                    (Activation::Swiglu, 0, true),
+                    (Activation::Swiglu, 1, false),
+                    (Activation::Swiglu, 2, false),
+                ] {
+                    for threshold in [0, u64::MAX] {
+                        let attributes = MoeAttributes {
+                            k: 2,
+                            activation,
+                            normalize_routing_weights: true,
+                            swiglu_fusion: fusion,
+                            activation_alpha: 1.7,
+                            activation_beta: 0.2,
+                            swiglu_limit: 3.0,
+                        };
+                        let kernel = MoEKernel {
+                            attributes,
+                            grouped_min_work: threshold,
+                        };
+                        let experts = 4;
+                        let fc1_size = if fusion == 0 { inter } else { 2 * inter };
+                        let x_values = ramp(rows * hidden, 11, 0.2, 0.02);
+                        let router_values = [4., 4., 0., 0.].repeat(rows);
+                        let w1 = ramp(experts * fc1_size * hidden, 17, 0.1, 0.01);
+                        let w2 = ramp(experts * hidden * inter, 19, 0.1, 0.01);
+                        let w3 = ramp(experts * inter * hidden, 23, 0.1, 0.01);
+                        let b1 = ramp(experts * fc1_size, 5, 0.1, 0.01);
+                        let b2 = ramp(experts * hidden, 7, 0.1, 0.01);
+                        let b3 = ramp(experts * inter, 3, 0.1, 0.01);
+                        let expected = reference_moe(
+                            rows,
+                            hidden,
+                            inter,
+                            experts,
+                            2,
+                            fc1_size,
+                            &x_values,
+                            &router_values,
+                            &w1,
+                            &w2,
+                            separate.then_some(&w3),
+                            Some(&b1),
+                            Some(&b2),
+                            separate.then_some(&b3),
+                            &attributes,
+                        );
+                        let x = Owned::f32(&[rows, hidden], &x_values);
+                        let router = Owned::f32(&[rows, experts], &router_values);
+                        let w1 = Owned::f32(&[experts, fc1_size, hidden], &w1);
+                        let w2 = Owned::f32(&[experts, hidden, inter], &w2);
+                        let w3 = Owned::f32(&[experts, inter, hidden], &w3);
+                        let b1 = Owned::f32(&[experts, fc1_size], &b1);
+                        let b2 = Owned::f32(&[experts, hidden], &b2);
+                        let b3 = Owned::f32(&[experts, inter], &b3);
+                        let inputs = [
+                            x.view(),
+                            router.view(),
+                            w1.view(),
+                            b1.view(),
+                            w2.view(),
+                            b2.view(),
+                            if separate {
+                                w3.view()
+                            } else {
+                                TensorView::absent(DataType::Float32)
+                            },
+                            if separate {
+                                b3.view()
+                            } else {
+                                TensorView::absent(DataType::Float32)
+                            },
+                        ];
+                        let metadata: Vec<_> = inputs
+                            .iter()
+                            .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+                            .collect();
+                        let req = kernel.workspace_requirement(&metadata).unwrap();
+                        let bound = if hidden == 0 {
+                            0
+                        } else {
+                            rows * if threshold == 0 { 2 } else { 1 }
+                        };
+                        let gated = activation == Activation::Swiglu || separate;
+                        let widths = if gated {
+                            hidden.max(inter)
+                                + (fc1_size + if separate { inter } else { 0 }).max(hidden)
+                        } else {
+                            hidden + inter
+                        };
+                        assert_eq!(req.bytes, (bound * widths * 4) as u64);
+                        let books = RecordingGovernor::new_host(req.bytes);
+                        let manager = ProcessMemoryManager::new().unwrap();
+                        let backing_pool =
+                            HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
+                        let cpu = CpuExecutionProvider::with_resources(
+                            crate::CpuMemoryResources::default()
+                                .with_workspace_pool(backing_pool.clone())
+                                .unwrap(),
+                        );
+                        let mut output = Owned::zeros_f32(&[rows, hidden]);
+                        let mut callbacks = None;
+                        for _ in 0..3 {
+                            if req.bytes == 0 {
+                                kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
+                            } else {
+                                let mut backing = cpu
+                                    .allocate_workspace(
+                                        req.bytes as usize,
+                                        req.alignment,
+                                        req.role(),
+                                    )
+                                    .unwrap();
+                                pool.install(|| {
+                                    let inputs = [
+                                        x.view(),
+                                        router.view(),
+                                        w1.view(),
+                                        b1.view(),
+                                        w2.view(),
+                                        b2.view(),
+                                        if separate {
+                                            w3.view()
+                                        } else {
+                                            TensorView::absent(DataType::Float32)
+                                        },
+                                        if separate {
+                                            b3.view()
+                                        } else {
+                                            TensorView::absent(DataType::Float32)
+                                        },
+                                    ];
+                                    let workspace = WorkspaceView::new(
+                                        DevicePtrMut(backing.as_mut_ptr()),
+                                        backing.len(),
+                                    );
+                                    kernel.execute_with_workspace(
+                                        &inputs,
+                                        &mut [output.view_mut()],
+                                        Some(workspace),
+                                    )
+                                })
+                                .unwrap();
+                                cpu.deallocate_workspace(backing).unwrap();
+                            }
+                            assert_close(&output.to_f32(), &expected);
+                            assert_eq!(
+                                *callbacks.get_or_insert((books.claims(), books.releases())),
+                                (books.claims(), books.releases())
+                            );
+                            assert_eq!(books.used(Tier::Host), req.bytes);
+                        }
+                        backing_pool.trim_idle(u64::MAX).unwrap();
+                        assert_eq!(books.used(Tier::Host), 0);
+                        assert_eq!(manager.process_used(Tier::Host), 0);
+                    }
+                }
+            }
+        }
     }
 
     fn assert_close(got: &[f32], want: &[f32]) {
@@ -2486,7 +2828,7 @@ mod tests {
                         fc3_bias.as_deref(),
                     );
                     plan.build_row_slots();
-                    let mut backing = vec![0f32; plan.slots() * HIDDEN];
+                    let mut backing = vec![0f32; plan.slots() * (HIDDEN + 3 * INTER) * 2];
                     let mut scratch = test_scratch(&mut backing);
                     let grouped = run_moe_grouped(
                         &plan,
@@ -2742,7 +3084,7 @@ mod tests {
                     );
                     let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true);
                     plan.build_row_slots();
-                    let mut backing = vec![0f32; plan.slots() * HIDDEN];
+                    let mut backing = vec![0f32; plan.slots() * (HIDDEN + 3 * INTER) * 2];
                     let mut scratch = test_scratch(&mut backing);
                     let got = run_moe_grouped(
                         &plan,
