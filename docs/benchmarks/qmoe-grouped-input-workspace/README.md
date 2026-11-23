@@ -157,3 +157,20 @@ feature and !cancelled(), independently of earlier compile-step success. It uses
 scripts/test_step.sh to reject an empty/all-ignored run. Running that exact step
 locally without CUDA reports the named oracle passed and TEST_STEP_EXECUTED=1.
 Workflow integrity, required-tier and package/lint coverage checks pass.
+
+### Windows CLI closure: physical external-file identity
+
+The Windows CLI ORT job exposed a separate linked-model cache bug: equal-size
+replacement weights could retain the same modification timestamp, so the
+non-Unix key reused the old linked directory. The key now combines a physical
+file handle's identity with its modification time, queried through the same
+open file, using the already locked `same-file` crate. It does not read/copy the
+weight bank and runs at model materialization, outside warm inference.
+The existing regression now constructs equal size and equal modification time
+before replacement; unchanged handles still share a directory and replacements
+must obtain a new directory containing the new bytes.
+
+Local validation: 12 island tests and 895 native-backend engine tests pass
+(1 ignored), plus strict native-backend engine all-target Clippy. This is Host
+validation; the corrected Windows execution remains a CI responsibility. QMoE
+and projection production files and historical timing sources are unchanged.
