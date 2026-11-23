@@ -58,6 +58,7 @@ pub mod csa_state_group;
 pub mod cumprod;
 pub mod cumsum;
 pub mod data_transform;
+pub(crate) mod deform_conv;
 mod dequantize_packed;
 pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
@@ -384,6 +385,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "QLinearMatMul",
     "Resize",
     "ConvTranspose",
+    "DeformConv",
     "GridSample",
     "GatherBlockQuantized",
     "CausalConvWithState",
@@ -553,6 +555,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
+        ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
         ("Pack", "") => &[DataType::Uint8],
         ("Unpack", "") => onnx_runtime_ir::packed_routed::WORD_DTYPES,
@@ -1054,6 +1057,16 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    for version in [19, 22] {
+        reg.register(
+            OpKey::new("DeformConv", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(deform_conv::Factory {
+                runtime: runtime.clone(),
+                version,
+            }),
+        );
+    }
     for since_version in [16_u32, 20] {
         reg.register(
             OpKey::new("GridSample", "", u64::from(since_version)),

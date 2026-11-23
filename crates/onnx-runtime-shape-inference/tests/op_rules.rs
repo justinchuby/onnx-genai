@@ -4984,6 +4984,41 @@ fn ints(values: &[i64]) -> Attribute {
 }
 
 #[test]
+fn deform_conv_shapes_follow_geometry_and_versioned_types() {
+    let n = with_attr(node("DeformConv", 3, 1), "strides", ints(&[2]));
+    let inputs = |dtype, offset_channels| {
+        [
+            vec![c(2), c(3), c(9)],
+            vec![c(4), c(3), c(3)],
+            vec![c(2), c(offset_channels), c(4)],
+        ]
+        .into_iter()
+        .map(|s| tin(dtype, s))
+        .collect()
+    };
+    assert_eq!(
+        out_shape(&run(&n, inputs(DataType::Float64, 3), 19)),
+        vec![c(2), c(4), c(4)]
+    );
+    assert!(
+        try_run(&n, inputs(DataType::BFloat16, 3), 21)
+            .unwrap_err()
+            .to_string()
+            .contains("requires opset 22")
+    );
+    assert_eq!(
+        out_shape(&run(&n, inputs(DataType::BFloat16, 3), 22)),
+        vec![c(2), c(4), c(4)]
+    );
+    assert!(
+        try_run(&n, inputs(DataType::Float32, 4), 22)
+            .unwrap_err()
+            .to_string()
+            .contains("offset shape")
+    );
+}
+
+#[test]
 fn conv_transpose_deconvolution_formula_and_channels() {
     // stride*(input-1) + output_padding + effective_kernel - pads.
     let mut n = with_attr(node("ConvTranspose", 2, 1), "strides", ints(&[2, 2]));
@@ -7025,6 +7060,8 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Constant", 1),
     ("", "ConstantOfShape", 1),
     ("", "Conv", 1),
+    ("", "DeformConv", 19),
+    ("", "DeformConv", 22),
     ("", "ConvTranspose", 1),
     ("", "Cos", 1),
     ("", "Cosh", 9),

@@ -551,6 +551,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "DeformConv"
+            && domain.is_empty()
+            && let Err(reason) =
+                onnx_runtime_ir::deform_conv::validate_claim(op, opset, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(format!("DeformConv: {reason}"));
+        }
         // Attribute-level capability limits for the attention and MoE family.
         //
         // Every one of these mirrors a rejection its kernel factory raises, and

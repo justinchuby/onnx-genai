@@ -2365,6 +2365,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("Resize", resize_cases()));
     p.push(sweep("ConvTranspose", conv_transpose_cases()));
     p.push(sweep("GridSample", grid_sample_cases()));
+    p.push(dedicated(
+        "DeformConv",
+        "deform_conv_gpu.rs",
+        "Upstream ONNX and independently calculated N-D fixtures on both native EPs",
+    ));
     p.push(sweep("Dropout", dropout_cases()));
     p.push(sweep("NonZero", nonzero_cases()));
     p.push(sweep(
