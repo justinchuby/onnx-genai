@@ -4434,11 +4434,11 @@ impl ExecutionProvider for CudaExecutionProvider {
         if let Some(grant) = self.prepare_mapped_growth(target_mapped, role)? {
             return self
                 .allocate_with_mapped_growth_for_role(size, alignment, grant, role)
-                .map(|buffer| WorkspaceAllocation::new(buffer, None));
+                .map(WorkspaceAllocation::new);
         }
         let full = 0..size;
         self.allocate_transaction(size, alignment, std::slice::from_ref(&full), role, true)
-            .map(|buffer| WorkspaceAllocation::new(buffer, None))
+            .map(WorkspaceAllocation::new)
     }
 
     fn replace_workspace(
@@ -4460,12 +4460,7 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn deallocate_workspace(&self, workspace: WorkspaceAllocation) -> Result<()> {
         let captured = self.workspace_release_barrier.capture(&workspace);
-        let (buffer, lease) = workspace.into_parts();
-        assert!(
-            lease.is_none(),
-            "CUDA manager-backed workspace must keep accounting in ManagedAllocation, not an outer \
-             compatibility lease"
-        );
+        let buffer = workspace.into_buffer();
         assert!(
             captured,
             "CUDA workspace must carry allocation-specific manager settlement"
@@ -5491,28 +5486,6 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.runtime.raw_allocation_site_stats()
     }
 
-    fn reserve_workspace(
-        &self,
-        bytes: u64,
-        role: onnx_runtime_memory_api::MemoryRole,
-    ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
-        if self.memory().commits_on_demand() {
-            return Ok(None);
-        }
-        self.governor
-            .as_deref()
-            .map(|governor| {
-                governor.reserve(
-                    onnx_runtime_memory_api::Tier::Device,
-                    bytes,
-                    role,
-                    onnx_runtime_memory_governor::HolderId::new(64),
-                )
-            })
-            .transpose()
-            .map_err(Into::into)
-    }
-
     fn prepare_mapped_growth(
         &self,
         bytes: u64,
@@ -6145,15 +6118,14 @@ extern "C" __global__ void spin_delay(long long spin) {
                 AllocationPublication::exclusive(bytes as u64, bytes as u64, bytes as u64),
             )
             .unwrap();
-        WorkspaceAllocation::new(
-            DeviceBuffer::from_managed_allocation(Box::new(owner), DeviceId::cpu()),
-            None,
-        )
+        WorkspaceAllocation::new(DeviceBuffer::from_managed_allocation(
+            Box::new(owner),
+            DeviceId::cpu(),
+        ))
     }
 
     fn release_managed_workspace(workspace: WorkspaceAllocation) {
-        let (buffer, lease) = workspace.into_parts();
-        assert!(lease.is_none());
+        let buffer = workspace.into_buffer();
         let BoundBufferOwnership::Managed(owner) = buffer.into_bound_ownership().unwrap() else {
             panic!("test workspace lost manager ownership");
         };
@@ -6214,8 +6186,7 @@ extern "C" __global__ void spin_delay(long long spin) {
         queue: &CudaDeferredReleaseQueue,
         workspace: WorkspaceAllocation,
     ) {
-        let (buffer, lease) = workspace.into_parts();
-        assert!(lease.is_none());
+        let buffer = workspace.into_buffer();
         let BoundBufferOwnership::Managed(owner) = buffer.into_bound_ownership().unwrap() else {
             panic!("test workspace lost manager ownership");
         };
