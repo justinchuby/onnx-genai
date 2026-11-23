@@ -12401,6 +12401,9 @@ mod weight_cache_accounting {
             "DequantizePacked" => {
                 NoWeightCache("decodes each block into stack scratch and writes the caller output")
             }
+            "DeformConv" => NoWeightCache(
+                "samples into execution-local panels and consumes weights without retaining them",
+            ),
             "GroupedMatMul" => NoWeightCache(
                 "indexes weight layouts directly using execution-local dense views or copies",
             ),
