@@ -16,8 +16,8 @@ rounding; there is no K reduction or FMA. Column tails reuse each weight across
 four rows; bottom rows use the portable kernel. Runtime NEON detection and
 rows/columns >=4 gate dispatch. Small shapes retain the existing fallback.
 There is no heap scratch, packed-weight copy, new resource request, worker pool,
-or public API. The optional x86 dot-row helper now shares its caller's non-MLAS
-feature gate, fixing strict feature-build dead code without changing its math.
+or public API. The measured checkpoint also fixed an optional x86 dot-row
+feature gate; that same fix is now inherited from main.
 
 Finite oracle tests compare output bits across full/partial tiles and K tails,
 including empty shapes. FMA- and reassociation-sensitive fixtures and an actual
@@ -148,3 +148,21 @@ CPU/session Clippy passes in both modes. Exact validation commands are in
 No CUDA device, x86 execution, Linux/Windows ARM64 execution or whole-model
 throughput was validated here. Further native capability work must close the
 measured reference gap while retaining the scalar-chain/argmax contract.
+
+## Integration after upstream merges
+
+After measurement, #2438 and #2427 merged. This branch was rebased onto main
+`f667643f2`; the NT implementation and all ARM64 math are unchanged. The only
+MatMul-file difference versus the measured source is an upstream duplicate
+non-MLAS cfg annotation on an x86-only helper. Original hashes and measured
+revisions above remain authoritative for timing. In particular the historical
+operator probe uses the pre-migration direct-execute contract; use the recorded
+source checkpoint to reproduce it, rather than running it against today's
+workspace-required operator API. No performance numbers are asserted for the
+rebased endpoint or reinterpreted as a new baseline comparison.
+
+Rebased local unit validation passes: native CPU 2,013 / 20 ignored and session
+292; optional MLAS CPU 2,055 / 35 ignored and session 294. Integration source
+identities and the separate validation driver are recorded alongside the original
+measurement artifacts. Logs use `/tmp/nxrt-neon-nt-integrated-*.log`.
+Strict all-target CPU/session Clippy passes in both configurations.
