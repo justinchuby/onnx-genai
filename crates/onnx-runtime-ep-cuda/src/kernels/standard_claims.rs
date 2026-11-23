@@ -37,6 +37,9 @@ pub(crate) fn unsupported_reason(
         "Mod" => mod_op(node, input_dtypes),
         "QuantizeLinear" => quantize_linear(node, input_dtypes),
         "DequantizeLinear" => dequantize_linear(node, input_dtypes),
+        "DequantizePacked" => {
+            onnx_runtime_ir::dequantize_packed::validate_claim(node, input_shapes, input_dtypes)
+        }
         "Dropout" => dropout(node, input_dtypes),
         "NonZero" => nonzero(node, input_dtypes),
         "AffineGrid" => affine_grid(node, input_dtypes),
@@ -340,13 +343,32 @@ fn quantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String>
 }
 
 fn dequantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
-    required_arity(node, input_dtypes, node.inputs.len(), 1, 1)?;
-    if !(2..=3).contains(&node.inputs.len()) {
-        return Err("requires 2 or 3 inputs".into());
+    if !(2..=3).contains(&node.inputs.len())
+        || node.inputs[..2].iter().any(Option::is_none)
+        || !matches!(node.outputs.as_slice(), [Some(_)])
+    {
+        return Err(format!(
+            "requires x, scale, optional zero_point, and one present output; got input slots {:?} and output slots {:?}",
+            node.inputs, node.outputs
+        ));
     }
-    require_one_of(input_dtypes, 0, &[DataType::Int8, DataType::Uint8], "x")?;
+    // Some placement callers compact missing trailing inputs out of metadata.
+    if node.inputs.get(2) != Some(&None) || input_dtypes.len() != 2 {
+        metadata_arity(node, input_dtypes)?;
+    }
+    require_one_of(
+        input_dtypes,
+        0,
+        &[
+            DataType::Int8,
+            DataType::Uint8,
+            DataType::Int4,
+            DataType::Uint4,
+        ],
+        "x",
+    )?;
     require_dtype(input_dtypes, 1, DataType::Float32, "scale")?;
-    if input_dtypes.len() == 3 && input_dtypes[2] != input_dtypes[0] {
+    if node.inputs.get(2).is_some_and(Option::is_some) && input_dtypes[2] != input_dtypes[0] {
         return Err("zero_point dtype must match x".into());
     }
     Ok(())

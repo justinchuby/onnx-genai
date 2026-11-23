@@ -8,5 +8,14 @@ repository.workspace = true
 keywords = ["onnx", "quantization", "inference"]
 categories = ["science"]
 
+[features]
+# Shared independent oracle for the native EP integration tests.
+test-conformance = ["dep:half", "dep:onnx-runtime-ir", "dep:sha2"]
+
+[dependencies]
+half = { workspace = true, optional = true }
+onnx-runtime-ir = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
 [lints]
 workspace = true

@@ -235,6 +235,7 @@ pub(crate) fn cuda_optimization_passes(
     device: Option<CudaDeviceCapabilities>,
 ) -> Vec<Box<dyn OptimizationPass>> {
     vec![
+        Box::new(onnx_runtime_optimizer::affine_gather::AffineGatherFusion),
         Box::new(CudaSiluFusion),
         // Collapse the SSM/linear-attention `Reciprocal(Sqrt(x))` normalize-scale
         // glue into a single byte-identical `rsqrt` kernel (drops the standalone
@@ -281,6 +282,17 @@ pub(crate) fn cuda_optimization_passes(
         // fusions above (and the ~90 fp32→fp32 export casts per forward), rewiring
         // consumers onto the pre-cast value. Byte-identical, shape/dtype-driven.
         Box::new(CudaDropIdentityCast),
+        Box::new(
+            onnx_runtime_optimizer::quantized_matmul::AffineMatMulFusion {
+                single_row_only: true,
+                max_columns: device
+                    .filter(|caps| {
+                        caps.max_threads_per_block() >= crate::kernels::matmul_nbits::BLOCK_THREADS
+                    })
+                    .map_or(0, |caps| caps.max_grid_dim_x() as usize),
+                gguf_layout: crate::kernels::block_quantized_matmul::packed_matmul_layout,
+            },
+        ),
     ]
 }
 

@@ -14,15 +14,8 @@ use crate::runtime::{CudaRuntime, cuptr};
 const BLOCK: u32 = 256;
 pub const GATHER_CAPTURE_ERROR_INDEX: u32 = 64;
 const GATHER_SOURCE: &str = r#"
-extern "C" __global__ void gather_bytes(
-    const unsigned char* data, const void* indices, unsigned char* output,
-    int output_bytes, int elem_bytes, int axis_dim, int num_indices, int inner,
-    int index_is_i64, unsigned int* capture_error) {
-  for (int byte = blockIdx.x * blockDim.x + threadIdx.x; byte < output_bytes;
-       byte += gridDim.x * blockDim.x) {
-    int element = byte / elem_bytes;
-    int within = byte - element * elem_bytes;
-    int inner_index = element % inner;
+__device__ long long gather_offset(int element, const void* indices, int axis_dim,
+    int num_indices, int inner, int index_is_i64, unsigned int* capture_error) {
     int selected = (element / inner) % num_indices;
     int outer = element / (inner * num_indices);
     long long index = index_is_i64
@@ -31,9 +24,40 @@ extern "C" __global__ void gather_bytes(
     if (index < 0) index += axis_dim;
     if (index < 0 || index >= axis_dim) {
       if (capture_error) atomicOr(capture_error, 64u);
-      continue;
+      return -1;
     }
-    output[byte] = data[((outer * axis_dim + index) * inner + inner_index) * elem_bytes + within];
+    return (outer * (long long)axis_dim + index) * inner + element % inner;
+}
+
+extern "C" __global__ void gather_bytes(
+    const unsigned char* data, const void* indices, unsigned char* output,
+    int output_bytes, int elem_bytes, int axis_dim, int num_indices, int inner,
+    int index_is_i64, unsigned int* capture_error) {
+  for (int byte = blockIdx.x * blockDim.x + threadIdx.x; byte < output_bytes;
+       byte += gridDim.x * blockDim.x) {
+    int element = byte / elem_bytes;
+    int within = byte - element * elem_bytes;
+    long long offset = gather_offset(element, indices, axis_dim, num_indices, inner,
+                                     index_is_i64, capture_error);
+    if (offset >= 0) output[byte] = data[offset * elem_bytes + within];
+  }
+}
+
+extern "C" __global__ void gather_affine(
+    const unsigned char* data, const void* indices, float* output,
+    int lanes, int elem_bytes, int axis_dim, int num_indices, int inner,
+    int index_is_i64, unsigned int* capture_error, const float* scale,
+    const unsigned char* zero, int is_signed) {
+  // Match CUDA's standalone DequantizeLinear, which does not reject scale values.
+  int z = zero ? (is_signed ? (int)*(const signed char*)zero : (int)*zero) : 0;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < lanes;
+       i += gridDim.x * blockDim.x) {
+    long long offset = gather_offset(i, indices, axis_dim, num_indices, inner,
+                                     index_is_i64, capture_error);
+    if (offset >= 0) {
+      int q = is_signed ? (int)((const signed char*)data)[offset] : (int)data[offset];
+      output[i] = (q - z) * *scale;
+    }
   }
 }
 "#;
@@ -48,6 +72,8 @@ impl KernelFactory for GatherFactory {
             runtime: self.runtime.clone(),
             axis: node.attr("axis").and_then(|a| a.as_int()).unwrap_or(0),
             last_call_capture_safe: AtomicBool::new(false),
+            affine: node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+                && node.op_type == onnx_runtime_ir::affine_gather::OP,
         }))
     }
 }
@@ -57,6 +83,7 @@ pub struct GatherKernel {
     runtime: Arc<CudaRuntime>,
     axis: i64,
     last_call_capture_safe: AtomicBool,
+    affine: bool,
 }
 
 fn checked_product(dims: &[usize], what: &str) -> Result<usize> {
@@ -68,7 +95,9 @@ fn checked_product(dims: &[usize], what: &str) -> Result<usize> {
 
 impl Kernel for GatherKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        if inputs.len() != 2 || outputs.len() != 1 {
+        if self.affine {
+            onnx_runtime_ep_api::affine_gather::layout(self.axis, inputs, outputs)?;
+        } else if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Gather: expected 2 inputs and 1 output, got {} and {}",
                 inputs.len(),
@@ -78,10 +107,10 @@ impl Kernel for GatherKernel {
         let data = &inputs[0];
         let indices = &inputs[1];
         let output = &mut outputs[0];
-        if !data.is_contiguous() || !indices.is_contiguous() || !output.is_contiguous() {
+        if inputs.iter().any(|t| !t.is_contiguous()) || !output.is_contiguous() {
             return Err(not_implemented("Gather with non-contiguous input/output"));
         }
-        if output.dtype != data.dtype {
+        if !self.affine && output.dtype != data.dtype {
             return Err(EpError::KernelFailed(
                 "cuda_ep Gather: output dtype must match data dtype".into(),
             ));
@@ -191,10 +220,19 @@ impl Kernel for GatherKernel {
                 EpError::KernelFailed(format!("cuda_ep Gather: {name} exceeds i32"))
             })?;
         }
+        let entry = if self.affine {
+            "gather_affine"
+        } else {
+            "gather_bytes"
+        };
         let func = self
             .runtime
-            .nvrtc_function("gather_bytes", GATHER_SOURCE, "gather_bytes")?;
-        let output_bytes = output_bytes as i32;
+            .nvrtc_function("gather_bytes", GATHER_SOURCE, entry)?;
+        let lanes = if self.affine {
+            expected_elements
+        } else {
+            output_bytes
+        } as i32;
         let elem_bytes = elem_bytes as i32;
         let axis_dim = axis_dim as i32;
         let num_indices = num_indices as i32;
@@ -208,20 +246,33 @@ impl Kernel for GatherKernel {
         let data_ptr = cuptr(data.data_ptr::<u8>() as *const c_void);
         let indices_ptr = cuptr(indices.data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-        let grid = (output_bytes as u32).div_ceil(BLOCK).clamp(1, 65_535);
+        let grid = (lanes as u32).div_ceil(BLOCK).clamp(1, 65_535);
+        let ptr = |t: &TensorView| cuptr(t.data_ptr::<u8>() as *const c_void);
+        let (scale, zero, signed) = if self.affine {
+            (
+                ptr(&inputs[2]),
+                inputs.get(3).map_or(0, ptr),
+                i32::from(data.dtype == DataType::Int8),
+            )
+        } else {
+            (0, 0, 0)
+        };
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         builder
             .arg(&data_ptr)
             .arg(&indices_ptr)
             .arg(&output_ptr)
-            .arg(&output_bytes)
+            .arg(&lanes)
             .arg(&elem_bytes)
             .arg(&axis_dim)
             .arg(&num_indices)
             .arg(&inner)
             .arg(&index_is_i64)
             .arg(&capture_error);
+        if self.affine {
+            builder.arg(&scale).arg(&zero).arg(&signed);
+        }
         // SAFETY: argument types and order match `gather_bytes`; all pointers refer
         // to live contiguous device allocations validated above.
         unsafe {

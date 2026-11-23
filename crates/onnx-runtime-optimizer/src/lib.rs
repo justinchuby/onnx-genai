@@ -35,11 +35,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod affine_gather;
 mod constant_folding;
 mod dead_node;
 mod error;
 mod fusion;
 mod pass;
+pub mod quantized_matmul;
 pub mod recognition;
 
 pub use constant_folding::ConstantFolding;

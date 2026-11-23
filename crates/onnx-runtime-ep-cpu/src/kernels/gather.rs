@@ -3,7 +3,7 @@
 //! `data.shape[:axis] ++ indices.shape ++ data.shape[axis+1:]`.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Node, is_contiguous};
+use onnx_runtime_ir::{DataType, Node, is_contiguous};
 
 use super::{check_arity, elem_size, to_dense_bytes, to_dense_i64, write_dense_bytes};
 use crate::strided::numel;
@@ -38,6 +38,82 @@ pub struct GatherKernel {
 
 /// Factory reading the `axis` attribute (default 0) from the node.
 pub struct GatherFactory;
+
+pub struct AffineGatherFactory;
+
+impl KernelFactory for AffineGatherFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(AffineGather {
+            axis: node.attr("axis").and_then(|a| a.as_int()).unwrap_or(0),
+        }))
+    }
+}
+
+struct AffineGather {
+    axis: i64,
+}
+
+impl Kernel for AffineGather {
+    fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
+        let l = onnx_runtime_ep_api::affine_gather::layout(self.axis, x, y)?;
+        let scale = super::to_dense_f32(&x[2])?[0];
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(EpError::KernelFailed(
+                "DequantizeLinear: scale values must be finite and positive".into(),
+            ));
+        }
+        let signed = x[0].dtype == DataType::Int8;
+        let code = |v: u8| {
+            if signed {
+                i32::from(v as i8)
+            } else {
+                i32::from(v)
+            }
+        };
+        let zero = x
+            .get(3)
+            .map(to_dense_bytes)
+            .transpose()?
+            .map_or(0, |v| code(v[0]));
+        // Standard CPU Gather does not consume any indices if the prefix
+        // preceding the gather axis contains no elements.
+        if l.outer == 0 {
+            return Ok(());
+        }
+        let indices = to_dense_i64(&x[1])?
+            .into_iter()
+            .map(|raw| normalize_index(raw, l.axis))
+            .collect::<Result<Vec<_>>>()?;
+        if l.lanes == 0 {
+            return Ok(());
+        }
+        let owned;
+        let data = if x[0].is_contiguous() {
+            x[0].validate()?;
+            // SAFETY: the validated view has one byte per element and is contiguous.
+            unsafe { std::slice::from_raw_parts(x[0].data_ptr::<u8>(), x[0].numel()) }
+        } else {
+            owned = to_dense_bytes(&x[0])?;
+            &owned
+        };
+        let mut out = Vec::with_capacity(l.lanes);
+        for outer in 0..l.outer {
+            for &i in &indices {
+                let start = (outer * l.axis + i) * l.inner;
+                out.extend(
+                    data[start..start + l.inner]
+                        .iter()
+                        .map(|&v| (code(v) - zero) as f32 * scale),
+                );
+            }
+        }
+        super::write_dense_f32(&mut y[0], &out)
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        true
+    }
+}
 
 impl KernelFactory for GatherFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {

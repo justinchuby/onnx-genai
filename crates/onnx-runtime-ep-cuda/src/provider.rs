@@ -4271,7 +4271,8 @@ impl ExecutionProvider for CudaExecutionProvider {
         }
         if matches!(op.op_type.as_str(), "QuantizeLinear" | "DequantizeLinear")
             && (op.domain.is_empty() || op.domain == "ai.onnx")
-            && let Some(reason) = crate::kernels::quantization::unsupported_reason(op, shapes)
+            && let Some(reason) =
+                crate::kernels::quantization::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }

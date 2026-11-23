@@ -158,7 +158,7 @@ impl BlockFormat {
         }
     }
 
-    fn scalar_decoder(self) -> fn(&[u8], &mut [f32]) {
+    pub(super) fn scalar_decoder(self) -> fn(&[u8], &mut [f32]) {
         match self {
             Self::Mxfp4 => decode_mxfp4_block,
             Self::Iq4Nl => decode_iq4_nl_block,
@@ -207,6 +207,11 @@ pub struct BlockQuantizedMatMulFactory {
     cache_bytes: usize,
 }
 
+pub(crate) fn packed_matmul_layout(name: &str) -> Option<(usize, usize)> {
+    let format = BlockFormat::parse(name).ok()?;
+    Some((format.qk(), format.block_bytes()))
+}
+
 impl BlockQuantizedMatMulFactory {
     pub(super) fn new(memory: crate::DerivedWeightMemory, cache_bytes: usize) -> Self {
         Self {
@@ -241,7 +246,18 @@ impl KernelFactory for BlockQuantizedMatMulFactory {
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             projection_plan: projection_plan(),
-            weight_cache: WeightCache::new(self.memory.clone(), self.cache_bytes),
+            weight_cache: WeightCache::new(
+                self.memory.clone(),
+                if node
+                    .attr(onnx_runtime_optimizer::quantized_matmul::STREAM_DECODED_ROWS)
+                    .and_then(|a| a.as_int())
+                    == Some(1)
+                {
+                    0
+                } else {
+                    self.cache_bytes
+                },
+            ),
         }))
     }
 }

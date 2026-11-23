@@ -108,7 +108,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Gemm` | `` | ✅ | **cuBLASLt** + NVRTC bias | `Y=α·A'·B'+β·C`, transA/transB, α/β; fused NVRTC `β·C` broadcast-bias epilogue (`gemm.rs`). f32. |
 | `FusedMatMulBias` | `com.microsoft` | ✅ | **cuBLASLt** `CUBLASLT_EPILOGUE_BIAS` | Dense rank-2 f32/f16/bf16 with an exact per-N bias vector; bias add is fused into GEMM with no elementwise pass. |
 | `FusedGemm` | `com.microsoft` | ✅ | **cuBLASLt** `CUBLASLT_EPILOGUE_{BIAS,RELU_BIAS,GELU_BIAS}` | Dense rank-2 f32/f16/bf16; transA/transB and α. CUDA 13's `GELU_BIAS` is the tanh/0.044715 GELU approximation (H200 output differs from exact-erf at the expected ~2.2e-4 for x=1.5); cuBLASLt exposes no exact-erf selector, so this deliberately follows the vendor epilogue rather than adding a separate pass. Bias must be per-N and `beta=1` because `BIAS_POINTER` is unscaled; other β values fail explicitly. Missing `activation` defaults to Relu for the repository optimizer's existing `FusedGemm` contract; empty/Identity selects plain BIAS. |
-| `MatMulNBits` | `com.microsoft` | ✅ | **NVRTC-custom + cuBLASLt** | Standard packed INT4 `[N, ceil(K/block_size), block_size/2]` weights are block-wise dequantized to f32 on-device, then multiplied by f32 activations with full-f32 accumulation. Supports optional packed zero points, group indices, and fused per-N bias. |
+| `MatMulNBits` | `com.microsoft` | ✅ | **NVRTC-custom + cuBLASLt** | Supports optional packed zero points, group indices, and fused per-N bias. The native optimizer also lowers eligible standard FP32 `DequantizeLinear` → `MatMul` RHS patterns to a single packed GEMV that rounds each decoded weight before accumulation. |
 | `QMoE` | `com.microsoft` | ✅ | **NVRTC grouped block-dequant expert GEMV/GEMM** | Single-GPU resident: exact ORT expert-major affine INT1/INT2/INT4/INT8 layouts, optional packed zero points and expert biases, top-k routing/normalization, Relu/Gelu/Silu/Identity and fused or separate-gate SwiGLU. Decode uses per-route GEMV; prefill counts and prefix-groups routes by expert, gathers contiguous rows, runs a tiled dequant-GEMM for experts with at least two tokens, then deterministically combines weighted route outputs. f32/f16/bf16 activations use f32 accumulation; the other T-typed float operands (router_probs, fc1/fc2/fc3 scales, expert biases, and the optional aggregation weights) may independently be f32 or the same half type as the input — matching ORT's single type parameter `T` — and any half operand is losslessly widened to f32 before the unchanged f32 routing/dequant kernels run, so an all-fp16 fused QMoE export runs natively and the pure-f32 path stays byte-identical. tile width, shared-memory fallback, launch width, and saturation grid derive from detected device limits. Native IQ/MXFP4 blocks remain explicitly unsupported because the ORT QMoE affine inputs cannot encode those layouts; they require a block-quantized MoE operator. Weight paging/prefetch and expert-parallel sharding are deferred. |
 
 ### Convolution
@@ -223,6 +223,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Reshape`, `Squeeze`, `Unsqueeze` | `` | ✅ | **memcpy** | Dtype-agnostic D2D copy into the executor's pre-shaped output; modern axes inputs and legacy attributes are accepted. |
 | `Transpose` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed byte copy; explicit permutation or default axis reversal. |
 | `Gather` | `` | ✅ | **NVRTC-custom** | Axis-parametric contiguous indexed copy; Int32/Int64 indices, negative index wrap, arbitrary index rank. |
+| `AffineQuantizedGather` | `pkg.nxrt` | ✅ | **NVRTC-custom** | EP fusion for single-use per-tensor FLOAT `DequantizeLinear` on INT8/UINT8 data feeding `Gather`; decodes only selected elements. |
 | `GatherElements` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic contiguous element gather with Int64 indices, negative axes/indices, and CPU-matched rank/dimension validation. |
 | `ScatterElements` (v11 & v16) | `` | ✅ | **NVRTC-custom** | Deterministic f32/Int64 updates in row-major input order. Opset 16 supports `none`, `add`, `mul`, `min`, and `max`; duplicate indices therefore preserve CPU last-write/sequential-reduction semantics. |
 | `TopK` (v10) | `` | ✅ | **NVRTC-custom** | Deterministic f32 per-slice selection with input `K`, arbitrary/negative axis, largest/smallest modes, and CPU tie-breaking by lower source index. |
@@ -264,6 +265,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`, `BitShift` | `` | ✅ | **NVRTC-custom** | Integer bitwise family, including broadcasting and CPU-matched over-shift behavior. |
 | `ConstantOfShape`, `OneHot`, `TensorScatter` | `` | ✅ | **NVRTC / device materialization** | Shape-driven construction and fixed-capacity scatter paths with explicit dtype, bounds, and capture checks. |
 | `QuantizeLinear`, `DequantizeLinear`, `QLinearMatMul`, `DynamicQuantizeLinear` | `` | ✅ | **NVRTC quantization** | Per-tensor/per-axis constraints and supported integer storage are enforced by each kernel's claim gate. |
+| `DequantizePacked` | `` | ✅ | **NVRTC block decode** | All 27 opset-29 GGUF profiles decode directly from device-resident UINT8 payloads into FLOAT, FLOAT16, BFLOAT16, or DOUBLE. |
 | `Dropout`, `NonZero` | `` | ✅ | **NVRTC-custom** | Inference Dropout and bounded dynamic-output coordinate extraction; dynamic metadata paths decline capture where host materialization is required. |
 | `Resize`, `GridSample`, `ConvTranspose` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling and transposed-convolution subsets; unsupported coordinate modes, cubic/volumetric cases, and output-shape policies fail closed. |
 
@@ -560,7 +562,8 @@ periodic modes. This raises `CUDA_COVERED_OPS` from **136** to **140** and CPU
 standard-domain parity from **107 / 141** to **111 / 141**.
 
 The issue #67 operator-coverage batch 9 adds per-tensor `QuantizeLinear` and
-`DequantizeLinear` (f32 with scalar scale and optional scalar i8/u8 zero point),
+`DequantizeLinear` (f32 with scalar or blocked scale, with optional matching
+INT4/UINT4 or INT8/UINT8 zero points),
 deterministic inference-mode `Dropout` (identity data plus optional all-true
 mask), and `NonZero` coordinate extraction for f32/f16/bf16. Inline GPU parity
 covers signed and unsigned quantization, saturation and ties-to-even rounding,
@@ -745,3 +748,28 @@ There is intentionally **no new GPU GitHub Actions workflow**: hosted CI runners
 have no GPU, so the sweep would only ever skip there. The no-GPU audits provide
 the enforcement in CI; the on-device parity sweep is run on a GPU host (e.g. an
 H100/H200 box) as documented above.
+### Standard quantized MatMul patterns
+
+The native CPU and CUDA optimizers fuse FP32 MatMul with a private RHS
+decoded by opset-21+ `DequantizeLinear`. The initializer can be native INT4
+or UINT4, or opset-29 `Unpack` of UINT8 words into UINT8 4-bit codes. Use
+rank-2 weights in `[K,N]` order or `[N,K]` followed by a swap transpose.
+Quantization is blocked along K (including negative axis notation), with
+a power-of-two block size of at least 16, FP32 scales, and an optional
+matching zero-point initializer. An omitted zero point means zero. `Unpack`
+must specify an immutable scalar count equal to K.
+
+For GGUF, emit a flat UINT8 initializer, opset-29 `DequantizePacked` with
+logical shape `[N,K]`, and a swap transpose. Blocks must fit within each
+row without padding. A redundant FLOAT-to-FLOAT Cast before the transpose
+is allowed. The fused formats are `iq1_s`, `iq1_m`, `iq2_xxs`, `iq2_xs`,
+`iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_nl`, `iq4_xs`, `q2_k`, `q3_k`, `q5_k`,
+`q6_k`, and `q8_0`. The other profiles, including `q4_k` and `mxfp4`,
+retain standalone decoding. Precision-changing casts, shared decoded
+values, shared inline GGUF bytes, or other layouts also retain the original
+graph.
+
+CUDA uses these fusions only when the activation is statically known to
+contain one row and launch geometry permits it. CPU can stream decoded
+rows for multiple activation rows. Neither fused path materializes the
+full decoded weight matrix.

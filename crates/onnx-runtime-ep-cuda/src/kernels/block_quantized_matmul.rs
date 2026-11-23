@@ -36,6 +36,10 @@ const Q5_K_BLOCK_BYTES: usize = 176;
 const Q6_K_BLOCK_BYTES: usize = 210;
 const Q8_0_BLOCK_BYTES: usize = 34;
 const BLOCK_THREADS: u32 = 256;
+pub(crate) fn packed_matmul_layout(name: &str) -> Option<(usize, usize)> {
+    let format = BlockFormat::parse(name).ok()?;
+    Some((format.qk(), format.block_bytes()))
+}
 const GEMM_TILE_M: u32 = 8;
 const CUDA_MAX_GRID_DIM_Y: u32 = 65_535;
 // 4K row tiles saturate the device while keeping the grid-stride path testable.
@@ -168,20 +172,12 @@ __device__ __forceinline__ void q4_k_scale_min(
     }
 }
 
-__device__ __forceinline__ float decode_weight(
-    const unsigned char* packed,
+template<bool strict>
+__device__ __forceinline__ float decode_block_weight(
+    const unsigned char* data,
     int format,
-    int qk,
-    int blocks,
-    int block_bytes,
-    int column,
-    int depth)
+    int within)
 {
-    const int block = depth / qk;
-    const int within = depth - block * qk;
-    const unsigned char* data =
-        packed + ((long long)column * blocks + block) * block_bytes;
-
     if (format == 0) {
         const int quant_index = within & 15;
         const unsigned char quant = data[1 + quant_index];
@@ -293,6 +289,11 @@ __device__ __forceinline__ float decode_weight(
         const unsigned char quant = data[16 + 32 * half + lane];
         const float d = fp16_to_fp32(load_u16_le(data + 80));
         const float dmin = fp16_to_fp32(load_u16_le(data + 82));
+        if (strict) {
+            return __fsub_rn(__fmul_rn(d * (float)(packed_scale & 15u),
+                                      (float)((quant >> (2 * quarter)) & 3u)),
+                             __fmul_rn(dmin, (float)(packed_scale >> 4)));
+        }
         return d * (float)(packed_scale & 15u)
                 * (float)((quant >> (2 * quarter)) & 3u)
             - dmin * (float)(packed_scale >> 4);
@@ -322,6 +323,10 @@ __device__ __forceinline__ float decode_weight(
         q4_k_scale_min(data + 4, 2 * quarter + upper, &scale_factor, &minimum);
         const float d = fp16_to_fp32(load_u16_le(data));
         const float dmin = fp16_to_fp32(load_u16_le(data + 2));
+        if (strict) {
+            return __fsub_rn(__fmul_rn(d * (float)scale_factor, (float)quant),
+                             __fmul_rn(dmin, (float)minimum));
+        }
         return d * (float)scale_factor * (float)quant - dmin * (float)minimum;
     }
     if (format == 13) {
@@ -365,6 +370,16 @@ __device__ __forceinline__ float decode_weight(
         | ((unsigned int)((qh >> high_shift) & 7u) << 8);
     const float delta = qh & (0x08u << high_shift) ? -0.125f : 0.125f;
     return subscale * (iq1_grid_value(iq1s_grid[index], element) + delta);
+}
+
+__device__ __forceinline__ float decode_weight(
+    const unsigned char* packed, int format, int qk, int blocks,
+    int block_bytes, int column, int depth)
+{
+    const int block = depth / qk;
+    const unsigned char* data =
+        packed + ((long long)column * blocks + block) * block_bytes;
+    return decode_block_weight<false>(data, format, depth - block * qk);
 }
 
 __device__ __forceinline__ float warp_sum(float value)

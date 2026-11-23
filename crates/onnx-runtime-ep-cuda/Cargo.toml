@@ -76,6 +76,7 @@ default-features = false
 features = ["std", "driver", "cublaslt", "cudnn", "nvrtc", "f16", "dynamic-loading"]
 
 [dev-dependencies]
+onnx-runtime-quantization = { workspace = true, features = ["test-conformance"] }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-einsum-conformance = { workspace = true }
 onnx-runtime-shape-inference = { workspace = true }

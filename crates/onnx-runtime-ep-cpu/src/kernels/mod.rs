@@ -280,6 +280,7 @@ pub fn input_dtype_constraints_for_op(
         (3, F32_ONLY),
     ];
     match (op_type, domain) {
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::INPUT_DTYPES,
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
         ("RotaryEmbedding", "com.microsoft") => MSFT_ROTARY_SLOTS,
@@ -306,6 +307,7 @@ pub fn output_dtype_constraints_for_op(
 ) -> &'static [(usize, &'static [DataType])] {
     static DSA_INDEX_SELECT_OUTPUTS: &[(usize, &[DataType])] = &[(0, I64_ONLY)];
     match (op_type, domain) {
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::OUTPUT_DTYPES,
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
         _ => &[],
     }
@@ -479,10 +481,20 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("IsInf", "") | ("IsNaN", "") | ("EyeLike", "") => FLOAT_DTYPES,
 
         // Quantization: specific types but advertise broad.
-        ("QuantizeLinear", "")
-        | ("DequantizeLinear", "")
-        | ("DynamicQuantizeLinear", "")
-        | ("QLinearMatMul", "") => ARITH_DTYPES,
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
+        ("DequantizeLinear", "") => &[
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Int4,
+            DataType::Uint4,
+            DataType::Int8,
+            DataType::Uint8,
+            DataType::Int32,
+        ],
+        ("QuantizeLinear", "") | ("DynamicQuantizeLinear", "") | ("QLinearMatMul", "") => {
+            ARITH_DTYPES
+        }
 
         // Sequence/range ops.
         ("Range", "") | ("CumSum", "") | ("CumProd", "") => ARITH_DTYPES,
@@ -601,6 +613,7 @@ mod half_gemm;
 // The GEMV is an F16C/AVX2 kernel with no portable body: off x86 the decode
 // path is unchanged, so the module is not compiled at all rather than left as
 // dead code.
+mod dequantize_packed;
 pub mod governed_weight_cache;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod half_gemv;
@@ -1046,6 +1059,15 @@ pub(crate) fn build_cpu_registry_with_resources(
     let dense_weight_cache_bytes = resources.weight_cache_limits().dense_bytes;
     let retain_caches = resources.cache_retention().is_admitted();
     let mut rec = OpRegistry::new();
+    rec.register(
+        OpKey::new(
+            onnx_runtime_ir::affine_gather::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(gather::AffineGatherFactory),
+    );
     for name in onnx_runtime_ir::packed_routed::OPS {
         rec.register(
             OpKey::new(name, "", 29),
@@ -1581,6 +1603,11 @@ pub(crate) fn build_cpu_registry_with_resources(
             Box::new(quantization::DequantizeLinearFactory),
         );
     }
+    rec.register(
+        OpKey::new("DequantizePacked", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(dequantize_packed::Factory),
+    );
     rec.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3368,11 +3395,19 @@ mod tests {
         // `TensorScatter` (opset-24 KV-cache update) adds one more, and the
         // standard-domain `CausalConvWithState` (opset 27) adds one alongside
         // its `com.microsoft` spelling.
-        // `STFT` adds its opset-17 standard-domain registration.
+        // `STFT` and `DequantizePacked` each add a standard-domain registration.
+        // The EP-owned affine Gather fusion adds one runtime-domain registration.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 106 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 108 + mlas_registrations);
         for op in PHASE1_OPS {
-            assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
+            let since = reg
+                .earliest_since_version(op, "")
+                .unwrap_or_else(|| panic!("no standard-domain registration for {op}"));
+            let opset = 21.max(since);
+            assert!(
+                reg.lookup(op, "", opset).is_some(),
+                "missing factory for {op} at opset {opset}"
+            );
         }
         // Softmax selects legacy at opset ≤ 12 and per-axis at opset ≥ 13.
         assert!(reg.lookup("Softmax", "", 12).is_some());

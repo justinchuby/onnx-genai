@@ -663,6 +663,21 @@ pub(crate) fn node_passes_dtype_filter(
     let Some(entry) = entry else {
         return false;
     };
+    // The slot sets describe which types the op can use; the attribute selects
+    // the one dtype this particular node produces.
+    if node.is_default_domain() && node.op_type == "DequantizePacked" {
+        let Ok(metadata) = onnx_runtime_ir::dequantize_packed::Metadata::from_node(node) else {
+            return false;
+        };
+        let output = node.outputs.first().copied().flatten();
+        if output
+            .and_then(|id| ir_graph.values.get(id))
+            .map(|value| value.dtype)
+            != Some(metadata.dtype())
+        {
+            return false;
+        }
+    }
     for (slot, input) in node.inputs.iter().enumerate() {
         let Some(vid) = input else { continue };
         let Some(value) = ir_graph.values.get(*vid) else {
@@ -2242,6 +2257,41 @@ mod tests {
             ),
             "a uint8 activation must not be claimed"
         );
+    }
+
+    #[test]
+    fn dtype_filter_honors_dequantize_packed_output_attribute() {
+        use onnx_runtime_ir::{Attribute, dequantize_packed};
+
+        let entries = [KernelRegistryEntry {
+            op_type: "DequantizePacked",
+            domain: "",
+            since_version: 29,
+            end_version: i32::MAX,
+            supported_dtypes: dequantize_packed::DTYPES,
+            input_dtype_constraints: dequantize_packed::INPUT_DTYPES,
+            output_dtype_constraints: dequantize_packed::OUTPUT_DTYPES,
+        }];
+        for (input, output, accepted) in [
+            (DataType::Uint8, DataType::Float64, true),
+            (DataType::Uint8, DataType::Float32, false),
+            (DataType::Uint8, DataType::Uint8, false),
+            (DataType::Float32, DataType::Float64, false),
+        ] {
+            let (mut graph, id) = graph_with_node("DequantizePacked", "", &[input], &[output]);
+            let node = graph.nodes.get_mut(id).unwrap();
+            node.attributes
+                .insert("format".into(), Attribute::String(b"gguf:q4_0".to_vec()));
+            node.attributes
+                .insert("shape".into(), Attribute::Ints(vec![32]));
+            node.attributes
+                .insert("output_dtype".into(), Attribute::Int(11));
+            assert_eq!(
+                super::node_passes_dtype_filter(graph.node(id), &graph, &entries),
+                accepted,
+                "{input:?} → {output:?}"
+            );
+        }
     }
 
     #[test]
