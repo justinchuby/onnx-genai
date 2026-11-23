@@ -40,3 +40,15 @@ The next independent experiment should keep this same QMoE computation and compa
 - New tests cover 3→1→3 warm reuse and retained charging, top-k product/composite layout overflow, strided output canaries and real input/output aliases. Existing exact route accumulation, all gates, affine and prefetch/cache-policy tests remain passing.
 - The default qmoe_gpu run compiled but executed zero tests (57 ignored), as required for CUDA-named targets without gpu-tests. I initially misread this as missing coverage and duplicated an older host test into that target. That duplicate was reverted: the existing host test already lives in the separate qmoe_cpu_oracle target. The correct target is explicitly selected with --exact and its named cpu_qmoe_oracle_prepares_declared_workspace_without_cuda test passes (rows 1 and 6, exact unit-weight f64 reference). The CUDA source scan passes over 95 targets. Initial zero-execution and mistaken-duplicate logs remain labelled in the archive; they are not the evidence for the correct host target. The duplicate file was never linked into the CPU timing probe, and its removal changes no timed CPU/runtime source. CUDA device tests remain unexecuted.
 - No new whole-kernel Miri claim is made here. The shared partition helper has its existing layout tests; threaded Miri limitations recorded in earlier source-scoped reports remain limitations.
+
+## Active-lane attribution follow-up
+
+The [isolated five-arm experiment](https://github.com/justinchuby/onnx-genai/blob/ed5bd92a828de562568fe1bda90483b2dc8417db/docs/benchmarks/active-execution-lane/README.md) retained 75 formal processes and
+included setup/finish in total costs. Same-binary scoped/unscoped differences are
+about -0.021% at H32 and -0.448% at H64, with overlapping ranges and +1.323%
+original/null drift for H64. H256 failed its control gate. These results do not
+cleanly attribute or erase the earlier cost. The functional scope prototype
+passes its tests but is not adopted or integrated into the real engine. Keep
+this QMoE PR draft; investigate the existing warm-fit mechanism before adding
+public lifecycle surface. The prototype is preserved only on the experiment
+branch, with hash-verified binary copies cleaned after the study.

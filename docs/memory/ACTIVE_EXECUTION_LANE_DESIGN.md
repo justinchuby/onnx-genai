@@ -1,6 +1,6 @@
 # Active execution lane: attribution and ownership proposal
 
-Status: proposed; no implementation or performance result is claimed here.
+Status: production proposal not adopted. A prototype and its attribution are preserved on an experimental branch; the real engine integration is not implemented.
 
 ## Problem and evidence
 
@@ -79,3 +79,13 @@ measurable single-row regression rather than merely repeat the zero-issuer
 assertion. Test ordinary reuse, growth/failure, phase/yield return and independent
 capture/asynchronous ownership behavior. Host doubles can validate contracts;
 they do not establish CUDA-device performance or driver correctness.
+
+## Attribution prerequisite remains unresolved
+
+The [fixed five-arm prototype study](https://github.com/justinchuby/onnx-genai/blob/ed5bd92a828de562568fe1bda90483b2dc8417db/docs/benchmarks/active-execution-lane/README.md) demonstrates fewer checkouts, but not
+a convincing latency benefit. H32 is effectively unchanged scoped/unscoped;
+H64 is about -0.448% with overlapping ranges and +1.323% original/null drift;
+H256 fails its control gate. Do not introduce the public scope API or refactor
+the engine adapter on this evidence. The experiment branch preserves the
+prototype, error/lifetime tests and full raw data without adding it to this
+candidate or default code. Continue attribution of the existing warm-fit path.

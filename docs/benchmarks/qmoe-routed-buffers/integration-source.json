@@ -8,5 +8,14 @@
   "tree_sha256_note": "Git tree OIDs below, not SHA-256",
   "baseline_tree_oid": "e87323369b96df244976a4762e5d54593218b091",
   "candidate_report_tree_oid": "ce959f5b778967e9f97d8490f3084738b8b5f0c8",
-  "reason": "#2450 merged; move onto main plus pending #2449 shared safety changes. No source/test/measurement file contents changed. This receipt is documentation-only."
+  "reason": "#2450 merged; move onto main plus pending #2449 shared safety changes. No source/test/measurement file contents changed. This receipt is documentation-only.",
+  "parent_merge_followup": {
+    "main": "c0d4fabd9c96070d06deb5624a93555d30bae6b2",
+    "previous_base": "94af06264",
+    "base_tree_equal": true,
+    "previous_head": "eaf9bf17a1338e4af9312582b03008fa29584f24",
+    "rebased_head": "161f5f6a5f104f252557eeac2e7d06d25ca5d11d",
+    "head_tree_equal_before_documentation_followup": true,
+    "additional_changes": "Documentation and this receipt only; scope implementation remains solely on experimental branch."
+  }
 }
