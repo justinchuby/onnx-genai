@@ -1,0 +1,6 @@
+
+STDERR:
+
+thread '<unnamed>' (9588278) panicked at src/main.rs:158:10:
+called `Result::unwrap()` on an `Err` value: UnsupportedOp { op_type: "BlockQuantizedMoE", domain: "pkg.nxrt", node: "<unnamed node #0>", opset: Known(1), reason: "kernel execution failed: BlockQuantizedMoE: claim metadata must cover all 7 positional inputs (got 5 shapes and 5 dtypes)", execution_providers: "cpu_ep" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
