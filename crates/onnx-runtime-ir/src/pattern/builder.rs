@@ -18,10 +18,18 @@ pub struct PatternAttribute {
     index: usize,
 }
 
+/// An ordered sequence of positional slots, including absent slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PatternSequence {
+    owner: usize,
+    index: usize,
+}
+
 /// Explicit positional slots. `None::<PatternValue>` also denotes absence.
 #[derive(Clone, Copy, Debug)]
 pub enum Input {
     Value(PatternValue),
+    Sequence(PatternSequence),
     Absent,
     /// A fresh present wildcard at each occurrence, as in text `_`.
     Any,
@@ -30,6 +38,12 @@ pub enum Input {
 impl From<PatternValue> for Input {
     fn from(value: PatternValue) -> Self {
         Self::Value(value)
+    }
+}
+
+impl From<PatternSequence> for Input {
+    fn from(value: PatternSequence) -> Self {
+        Self::Sequence(value)
     }
 }
 
@@ -116,9 +130,24 @@ struct Binding {
 
 #[derive(Debug)]
 enum BindingKind {
-    Input(bool),
+    Input(ValueInput),
+    Sequence { min: usize, max: Option<usize> },
     Output,
     Attribute(AttributeType, bool),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ValueInput {
+    Required,
+    OptionalTensor,
+    OptionalValue,
+}
+
+#[derive(Clone, Copy)]
+enum BindingClass {
+    Value,
+    Attribute,
+    Sequence,
 }
 
 /// Compact, checked pattern construction. Methods record construction errors;
@@ -197,7 +226,7 @@ impl PatternBuilder {
 
     /// Declare and capture a required input once.
     pub fn input(&mut self, name: &str) -> PatternValue {
-        let index = self.binding(Some(name), BindingKind::Input(false));
+        let index = self.binding(Some(name), BindingKind::Input(ValueInput::Required));
         PatternValue {
             owner: self.owner,
             index,
@@ -210,8 +239,33 @@ impl PatternBuilder {
 
     /// A tensor-or-absent input, including a truncated trailing slot.
     pub fn optional_input(&mut self, name: &str) -> PatternValue {
-        let index = self.binding(Some(name), BindingKind::Input(true));
+        let index = self.binding(Some(name), BindingKind::Input(ValueInput::OptionalTensor));
         PatternValue {
+            owner: self.owner,
+            index,
+        }
+    }
+
+    /// An arbitrary value-or-absent slot, without requiring tensor metadata.
+    pub fn optional_value(&mut self, name: &str) -> PatternValue {
+        let index = self.binding(Some(name), BindingKind::Input(ValueInput::OptionalValue));
+        PatternValue {
+            owner: self.owner,
+            index,
+        }
+    }
+
+    /// Capture an ordered slot sequence with explicit inclusive length bounds.
+    pub fn slot_sequence(&mut self, name: &str, min: usize, max: Option<usize>) -> PatternSequence {
+        if let Some(max) = max
+            && max < min
+        {
+            self.errors.push(format!(
+                "slot sequence {name:?} has maximum {max} below minimum {min}; use min <= max"
+            ));
+        }
+        let index = self.binding(Some(name), BindingKind::Sequence { min, max });
+        PatternSequence {
             owner: self.owner,
             index,
         }
@@ -241,7 +295,7 @@ impl PatternBuilder {
     /// Name an intermediate for normal `Match::value`/`instance` access.
     /// Inputs already have names; each binding may be named only once.
     pub fn capture(&mut self, name: &str, value: PatternValue) {
-        if self.check(value.owner, value.index, false, "capture") {
+        if self.check(value.owner, value.index, BindingClass::Value, "capture") {
             let binding = &mut self.bindings[value.index];
             if binding.explicit {
                 self.errors.push(format!(
@@ -252,6 +306,17 @@ impl PatternBuilder {
                 binding.name = name.into();
                 binding.explicit = true;
             }
+        }
+    }
+
+    /// Start with an existing value; alternatives can add operator branches.
+    pub fn alias(&mut self, value: PatternValue) -> NodeBuilder<'_> {
+        let expr = self.value_expr(value, "alias");
+        NodeBuilder {
+            builder: self,
+            current: PendingExpression::Value(expr),
+            alternatives: Vec::new(),
+            completed: false,
         }
     }
 
@@ -271,6 +336,20 @@ impl PatternBuilder {
         op: &str,
         inputs: impl IntoIterator<Item = I>,
     ) -> NodeBuilder<'_> {
+        let current = self.operation(op, inputs);
+        NodeBuilder {
+            builder: self,
+            current,
+            alternatives: Vec::new(),
+            completed: false,
+        }
+    }
+
+    fn operation<I: Into<Input>>(
+        &mut self,
+        op: &str,
+        inputs: impl IntoIterator<Item = I>,
+    ) -> PendingExpression {
         let inputs = inputs
             .into_iter()
             .enumerate()
@@ -278,28 +357,45 @@ impl PatternBuilder {
                 Input::Value(value) => {
                     self.value_expr(value, &format!("operator {op:?} input {index}"))
                 }
+                Input::Sequence(sequence) => {
+                    self.check(
+                        sequence.owner,
+                        sequence.index,
+                        BindingClass::Sequence,
+                        &format!("operator {op:?} input {index}"),
+                    );
+                    expression(ExprKind::Spread(internal_name(sequence.index)))
+                }
                 Input::Absent => expression(ExprKind::Name("None".into())),
                 Input::Any => expression(ExprKind::Name("_".into())),
             })
             .collect();
-        NodeBuilder {
-            builder: self,
+        PendingExpression::Operator {
             op: op.into(),
             domain: None,
             inputs,
             attributes: Vec::new(),
-            completed: false,
         }
     }
 
-    fn check(&mut self, owner: usize, index: usize, attribute: bool, context: &str) -> bool {
+    fn check(&mut self, owner: usize, index: usize, expected: BindingClass, context: &str) -> bool {
         let error = if owner != self.owner {
             Some(
                 "handle belongs to another builder/scope; declare a local input or pass a finished body",
             )
         } else if let Some(binding) = self.bindings.get(index) {
-            if matches!(binding.kind, BindingKind::Attribute(..)) != attribute {
-                Some("handle has the wrong binding kind; use separate value and attribute handles")
+            let correct = matches!(
+                (expected, &binding.kind),
+                (
+                    BindingClass::Value,
+                    BindingKind::Input(_) | BindingKind::Output
+                ) | (BindingClass::Attribute, BindingKind::Attribute(..))
+                    | (BindingClass::Sequence, BindingKind::Sequence { .. })
+            );
+            if !correct {
+                Some(
+                    "handle has the wrong binding kind; use separate value, attribute and sequence handles",
+                )
             } else {
                 None
             }
@@ -313,7 +409,7 @@ impl PatternBuilder {
     }
 
     fn value_expr(&mut self, value: PatternValue, context: &str) -> Expr {
-        self.check(value.owner, value.index, false, context);
+        self.check(value.owner, value.index, BindingClass::Value, context);
         expression(ExprKind::Name(internal_name(value.index)))
     }
 
@@ -382,17 +478,29 @@ impl PatternBuilder {
         let mut parameters = Vec::new();
         for (index, binding) in self.bindings.iter().enumerate() {
             let annotation = match binding.kind {
-                BindingKind::Input(optional) => optional.then(|| {
+                BindingKind::Input(ValueInput::Required) => None,
+                BindingKind::Input(ValueInput::OptionalTensor) => {
                     let mut annotation = optional_annotation("tensor");
                     annotation[0].dimensions = None;
-                    annotation
-                }),
+                    Some(annotation)
+                }
+                BindingKind::Input(ValueInput::OptionalValue) => {
+                    let mut annotation = optional_annotation("value");
+                    annotation[0].dimensions = None;
+                    Some(annotation)
+                }
+                BindingKind::Sequence { min, max } => {
+                    let mut annotation = raw("slots");
+                    annotation.dimensions = None;
+                    annotation.sequence = Some((min, max, true));
+                    Some(vec![annotation])
+                }
                 BindingKind::Attribute(kind, optional) => {
                     let name = internal_name(index);
-                    let used = self.statements.iter().any(|(_, expr)| {
-                        matches!(&expr.kind, ExprKind::Call(_, _, attrs)
-                            if attrs.iter().any(|(_, expr)| matches!(&expr.kind, ExprKind::Name(n) if n == &name)))
-                    });
+                    let used = self
+                        .statements
+                        .iter()
+                        .any(|(_, expr)| uses_attribute(expr, &name));
                     if !used {
                         return Err(PatternError::new(
                             PatternErrorKind::InvalidPattern,
@@ -462,29 +570,109 @@ impl PatternBuilder {
 #[must_use = "call output() or outputs() to add the operator"]
 pub struct NodeBuilder<'a> {
     builder: &'a mut PatternBuilder,
-    op: String,
-    domain: Option<String>,
-    inputs: Vec<Expr>,
-    attributes: Vec<(String, Expr)>,
+    current: PendingExpression,
+    alternatives: Vec<Expr>,
     completed: bool,
 }
 
+#[derive(Clone)]
+enum PendingExpression {
+    Operator {
+        op: String,
+        domain: Option<String>,
+        inputs: Vec<Expr>,
+        attributes: Vec<(String, Expr)>,
+    },
+    Value(Expr),
+}
+
+impl PendingExpression {
+    fn context(&self) -> String {
+        match self {
+            Self::Operator { op, .. } => format!("operator {op:?}"),
+            Self::Value(_) => "value alternative".into(),
+        }
+    }
+
+    fn compile(self, builder: &mut PatternBuilder) -> Expr {
+        match self {
+            Self::Value(expr) => expr,
+            Self::Operator {
+                op,
+                domain,
+                inputs,
+                attributes,
+            } => {
+                let domain = domain.as_deref().unwrap_or("");
+                if !identifier(&op) || (!domain.is_empty() && !domain.split('.').all(identifier)) {
+                    builder.errors.push(format!(
+                        "operator {op:?} or domain {domain:?} is invalid; pass an operator identifier and use .domain(\"vendor.name\") separately"
+                    ));
+                }
+                let name = if domain.is_empty() {
+                    op
+                } else {
+                    format!("{domain}::{op}")
+                };
+                expression(ExprKind::Call(name, inputs, attributes))
+            }
+        }
+    }
+}
+
 impl NodeBuilder<'_> {
+    /// Append an ordered operator alternative. Subsequent domain/attribute
+    /// configuration applies only to this new branch.
+    pub fn or_node<I: Into<Input>>(
+        mut self,
+        op: &str,
+        inputs: impl IntoIterator<Item = I>,
+    ) -> Self {
+        let next = self.builder.operation(op, inputs);
+        let previous = std::mem::replace(&mut self.current, next);
+        self.alternatives.push(previous.compile(self.builder));
+        self
+    }
+
+    /// Append a passthrough alternative, preserving the original value identity.
+    pub fn or_value(mut self, value: PatternValue) -> Self {
+        let next = self.builder.value_expr(value, "alternative");
+        let previous = std::mem::replace(&mut self.current, PendingExpression::Value(next));
+        self.alternatives.push(previous.compile(self.builder));
+        self
+    }
+
     pub fn domain(mut self, domain: &str) -> Self {
-        if self.domain.replace(domain.into()).is_some() {
+        let PendingExpression::Operator {
+            op,
+            domain: current,
+            ..
+        } = &mut self.current
+        else {
+            self.builder.errors.push(
+                "value alternative has no operator domain; apply domain() after node() or or_node()".into(),
+            );
+            return self;
+        };
+        if current.replace(domain.into()).is_some() {
             self.builder.errors.push(format!(
-                "operator {:?} domain is specified twice; set its domain once",
-                self.op
+                "operator {op:?} domain is specified twice; set its domain once"
             ));
         }
         self
     }
 
     pub fn attr(mut self, name: &str, value: impl Into<AttributeValue>) -> Self {
-        if !identifier(name) || self.attributes.iter().any(|(key, _)| key == name) {
+        let PendingExpression::Operator { op, attributes, .. } = &mut self.current else {
+            self.builder.errors.push(
+                "value alternative has no attributes; apply attr() after node() or or_node()"
+                    .into(),
+            );
+            return self;
+        };
+        if !identifier(name) || attributes.iter().any(|(key, _)| key == name) {
             self.builder.errors.push(format!(
-                "operator {:?} attribute {name:?} is invalid or duplicated; use each attribute identifier once",
-                self.op
+                "operator {op:?} attribute {name:?} is invalid or duplicated; use each attribute identifier once"
             ));
         }
         let kind = match value.into() {
@@ -497,8 +685,8 @@ impl NodeBuilder<'_> {
                 self.builder.check(
                     v.owner,
                     v.index,
-                    true,
-                    &format!("operator {:?} attribute {name:?}", self.op),
+                    BindingClass::Attribute,
+                    &format!("operator {op:?} attribute {name:?}"),
                 );
                 ExprKind::Name(internal_name(v.index))
             }
@@ -507,7 +695,7 @@ impl NodeBuilder<'_> {
                 ExprKind::Graph(body.pattern)
             }
         };
-        self.attributes.push((name.into(), expression(kind)));
+        attributes.push((name.into(), expression(kind)));
         self
     }
 
@@ -519,15 +707,8 @@ impl NodeBuilder<'_> {
     pub fn outputs<const N: usize>(mut self) -> [PatternValue; N] {
         if N == 0 {
             self.builder.errors.push(format!(
-                "operator {:?} declares zero outputs; request at least one positional output",
-                self.op
-            ));
-        }
-        let domain = self.domain.as_deref().unwrap_or("");
-        if !identifier(&self.op) || (!domain.is_empty() && !domain.split('.').all(identifier)) {
-            self.builder.errors.push(format!(
-                "operator {:?} or domain {:?} is invalid; pass an operator identifier and use .domain(\"vendor.name\") separately",
-                self.op, self.domain
+                "{} declares zero outputs; request at least one positional output",
+                self.current.context()
             ));
         }
         let outputs = std::array::from_fn(|_| {
@@ -544,19 +725,16 @@ impl NodeBuilder<'_> {
                 annotation: None,
             })
             .collect();
-        let name = if domain.is_empty() {
-            std::mem::take(&mut self.op)
+        let current = self.current.clone().compile(self.builder);
+        let expr = if self.alternatives.is_empty() {
+            current
         } else {
-            format!("{domain}::{}", self.op)
+            self.alternatives.push(current);
+            expression(ExprKind::Alternatives(std::mem::take(
+                &mut self.alternatives,
+            )))
         };
-        self.builder.statements.push((
-            targets,
-            expression(ExprKind::Call(
-                name,
-                std::mem::take(&mut self.inputs),
-                std::mem::take(&mut self.attributes),
-            )),
-        ));
+        self.builder.statements.push((targets, expr));
         self.completed = true;
         outputs
     }
@@ -566,8 +744,8 @@ impl Drop for NodeBuilder<'_> {
     fn drop(&mut self) {
         if !self.completed {
             self.builder.errors.push(format!(
-                "operator {:?} was not completed; call output() or outputs() before finishing the pattern",
-                self.op
+                "{} was not completed; call output() or outputs() before finishing the pattern",
+                self.current.context()
             ));
         }
     }
@@ -611,7 +789,7 @@ fn optional_annotation(name: &str) -> Vec<RawConstraint> {
 
 fn rename_expr(expr: &mut Expr, rename: &impl Fn(&mut String)) {
     match &mut expr.kind {
-        ExprKind::Name(name) => rename(name),
+        ExprKind::Name(name) | ExprKind::Spread(name) => rename(name),
         ExprKind::Call(_, inputs, attributes) => {
             for input in inputs {
                 rename_expr(input, rename);
@@ -620,7 +798,24 @@ fn rename_expr(expr: &mut Expr, rename: &impl Fn(&mut String)) {
                 rename_expr(attribute, rename);
             }
         }
+        ExprKind::Alternatives(branches) => {
+            for branch in branches {
+                rename_expr(branch, rename);
+            }
+        }
         _ => {}
+    }
+}
+
+fn uses_attribute(expr: &Expr, name: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Call(_, _, attributes) => attributes
+            .iter()
+            .any(|(_, expr)| matches!(&expr.kind, ExprKind::Name(n) if n == name)),
+        ExprKind::Alternatives(branches) => {
+            branches.iter().any(|branch| uses_attribute(branch, name))
+        }
+        _ => false,
     }
 }
 
