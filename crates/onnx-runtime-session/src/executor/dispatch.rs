@@ -610,6 +610,7 @@ impl Executor {
             inherited_workspace: self.inherited_workspace,
             workspace_preparation_required: self.workspace_preparation_required,
             eager_workspace_growth: matches!(capture, OpCaptureTrace::Eager),
+            workspace_captures: &self.slot_capture,
         };
 
         // Build the (possibly strided) input views once; they feed both the
@@ -1712,14 +1713,15 @@ struct KernelDispatchContext<'a> {
     inherited_workspace: InheritedWorkspaces,
     workspace_preparation_required: bool,
     /// True when this node is dispatched on a plain eager run (no device-graph
-    /// capture in progress), so growing a prepared workspace slot in place is
-    /// safe: nothing has baked its device pointer into a captured graph. This is
+    /// capture in progress). Growth also checks `workspace_captures` to
+    /// exclude installed graphs from every slot. This is
     /// what lets a prepared session re-prepare (grow) its governed workspace when
     /// execution rebuckets to a larger shape bucket than preparation reserved
     /// for, instead of failing the prepared-workspace invariant (#1223). It is
     /// false while recording a captured segment ([`OpCaptureTrace::Captured`]),
     /// where the workspace pointer must stay fixed for replay.
     eager_workspace_growth: bool,
+    workspace_captures: &'a [SlotCaptureState],
 }
 
 impl KernelDispatchContext<'_> {
@@ -2057,6 +2059,10 @@ impl KernelDispatchContext<'_> {
             let needs_replacement = prepared.as_ref().is_none_or(|workspace| {
                 required > workspace.bytes || requirement.alignment > workspace.alignment
             });
+            if needs_replacement {
+                WorkspaceReplacement::for_captures(self.workspace_captures)
+                    .check(prepared.as_ref(), requirement)?;
+            }
             // A prepared session normally refuses to allocate at execution
             // time — its governed workspace must be reserved up front so a
             // captured device graph can bake a stable pointer. That invariant
