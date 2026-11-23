@@ -365,12 +365,22 @@ fn prepare(
         &handle.tokenizer,
         output_budget,
     )
-    .map_err(|err| ApiError::invalid_request(err.to_string()))?;
+    .map_err(|err| ApiError::invalid_request(format!("{err:#}")))?;
+    options.max_json_bytes = state.config.replay_buffer_bytes;
     options.resolve_sampling_defaults(
         handle.generation_defaults.as_ref(),
         &super::completions::chat_sampling_overrides(&request.sampling),
     );
     options.max_context = handle.model_max_context;
+    if options.constraint.is_some() {
+        options
+            .validate_processors(&handle.tokenizer)
+            .map_err(|error| {
+                ApiError::invalid_request(format!(
+                    "invalid native completion constraint: {error:#}"
+                ))
+            })?;
+    }
     Ok(PreparedNative {
         request,
         handle,

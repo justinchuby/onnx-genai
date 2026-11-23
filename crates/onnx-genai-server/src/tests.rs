@@ -6720,7 +6720,7 @@ mod llama_compat {
     }
 
     #[tokio::test]
-    async fn projected_json_unicode_prefill_selects_schema_valid_suffix_in_buffered_and_sse() {
+    async fn json_unicode_prefill_selects_schema_valid_suffix_in_buffered_and_sse() {
         let scratch = tempfile::tempdir().unwrap();
         let source =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
@@ -6751,60 +6751,69 @@ mod llama_compat {
             vocab.insert(text.into(), json!(id));
         }
         std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
-        std::fs::write(scratch.path().join("tokenizer_config.json"), json!({
-            "chat_template":"{% for m in messages %}[assistant]{{ m.content }}[end]{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
-            "response_template":{"start_anchor":"[assistant]","fields":{"content":{}}}
-        }).to_string()).unwrap();
-        let router = app(AppState::load(scratch.path(), Some("unicode-prefill".into())).unwrap());
-        for (prefix, schema, valid, invalid, suffix) in [
-            (r#""\u004"#, json!({"const":"A"}), 22, 23, "1\""),
-            (
-                r#"{"\u004"#,
-                json!({"type":"object","properties":{"A":{"const":0}},"required":["A"],"additionalProperties":false}),
-                24,
-                25,
-                "1\":0}",
-            ),
-            (r#""\ud83d\ud"#, json!({"const":"😀"}), 26, 27, "e00\""),
-        ] {
-            let mut bias = serde_json::Map::new();
-            bias.insert(valid.to_string(), json!(1000));
-            bias.insert(invalid.to_string(), json!(2000));
-            bias.insert("3".into(), json!(3000));
-            let mut body = json!({"messages":[{"role":"assistant","content":prefix}],"continue_final_message":true,
+        for declared in [false, true] {
+            let mut config = json!({"chat_template":"{% for m in messages %}[assistant]{{ m.content }}[end]{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}"});
+            if declared {
+                config["response_template"] =
+                    json!({"start_anchor":"[assistant]","fields":{"content":{}}});
+            }
+            std::fs::write(
+                scratch.path().join("tokenizer_config.json"),
+                config.to_string(),
+            )
+            .unwrap();
+            let router =
+                app(AppState::load(scratch.path(), Some("unicode-prefill".into())).unwrap());
+            for (prefix, schema, valid, invalid, suffix) in [
+                (r#""\u004"#, json!({"const":"A"}), 22, 23, "1\""),
+                (
+                    r#"{"\u004"#,
+                    json!({"type":"object","properties":{"A":{"const":0}},"required":["A"],"additionalProperties":false}),
+                    24,
+                    25,
+                    "1\":0}",
+                ),
+                (r#""\ud83d\ud"#, json!({"const":"😀"}), 26, 27, "e00\""),
+            ] {
+                let mut bias = serde_json::Map::new();
+                bias.insert(valid.to_string(), json!(1000));
+                bias.insert(invalid.to_string(), json!(2000));
+                bias.insert("3".into(), json!(3000));
+                let mut body = json!({"messages":[{"role":"assistant","content":prefix}],"continue_final_message":true,
                 "response_format":{"type":"json_schema","json_schema":{"name":"escaped","schema":schema}},
                 "max_tokens":1,"temperature":0,"logprobs":true,"logit_bias":bias});
-            let (status, result) =
-                call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
-            assert_eq!(status, StatusCode::OK, "{result}");
-            assert_eq!(result["choices"][0]["message"]["content"], suffix);
-            assert_eq!(result["usage"]["completion_tokens"], 1);
-            body["stream"] = json!(true);
-            let response = router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/v1/chat/completions")
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(body.to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let events = sse_json_events(&bytes);
-            assert!(
-                events.iter().all(|event| event.get("error").is_none()),
-                "{events:?}"
-            );
-            let content = events
-                .iter()
-                .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
-                .collect::<String>();
-            assert_eq!(content, suffix);
-            assert!(serde_json::from_str::<Value>(&format!("{prefix}{content}")).is_ok());
+                let (status, result) =
+                    call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{result}");
+                assert_eq!(result["choices"][0]["message"]["content"], suffix);
+                assert_eq!(result["usage"]["completion_tokens"], 1);
+                body["stream"] = json!(true);
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let events = sse_json_events(&bytes);
+                assert!(
+                    events.iter().all(|event| event.get("error").is_none()),
+                    "{events:?}"
+                );
+                let content = events
+                    .iter()
+                    .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                    .collect::<String>();
+                assert_eq!(content, suffix);
+                assert!(serde_json::from_str::<Value>(&format!("{prefix}{content}")).is_ok());
+            }
         }
     }
 

@@ -8,6 +8,7 @@
 //! - Speculative decoding (acceleration)
 
 pub(crate) mod batched;
+mod byte_stream;
 pub mod config;
 pub(crate) mod connector_bridge;
 pub(crate) mod decode;
@@ -17,6 +18,7 @@ pub mod engine;
 pub mod fim;
 pub mod json_cursor;
 mod json_prefix;
+mod json_projection;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
 pub mod logits;
@@ -69,9 +71,9 @@ pub use engine::{
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
-    Constraint, ConstraintPrefixError, ConstraintProcessor, JsonConstraint, LogitProcessor,
-    ProcessorChain, ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence,
-    TokenId,
+    Constraint, ConstraintPrefixError, ConstraintProcessor, LogitProcessor, ProcessorChain,
+    ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
+    validate_json_prefix,
 };
 pub use memory_authority::{
     DeviceCompatibilityDomain, DeviceMemoryAuthority, EngineMemoryAccounting,

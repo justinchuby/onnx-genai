@@ -190,21 +190,42 @@ token candidates constrain only projected content while reasoning remains free.
 This applies to implicit prefill and explicit reasoning continuation, with the
 same projection for buffered, SSE and logprob output. Capabilities are checked
 before generation/SSE admission. Supported combinations currently use literal
-boundaries or regex boundaries with a resolved byte DFA, plus root
-ByteLevel/ByteFallback or canonical non-byte decoders. Pending Unicode bytes,
+boundaries or regex boundaries with a resolved byte DFA, plus
+ByteLevel/ByteFallback or canonical non-byte decoders. Byte decoder sequences
+also support token-local Replace/Strip before one byte stage, Fuse, and initial
+Strip after fusion. These capabilities follow decoder metadata and preserve
+generated-stream boundaries, including split Unicode and special-token policy. Pending Unicode bytes,
 regex priority, greedy/lazy continuations and EOF assertions share the publication
 parser's boundary rules. Regexes requiring unsupported DFA look assertions
-and contextual byte-decoder sequences remain open compatibility work.
+and other contextual byte-decoder stages (including trailing stripping) remain
+open compatibility work; errors identify the unsupported decoder path.
 Projected JSON accepts split Unicode escapes and surrogate pairs, including
 string constants, known property names, string patterns and scalar length limits.
 An unfinished escape must have a schema-valid scalar completion and never permits
 EOF. Original prompt and output spelling is retained. Escaped DEL in a schema-declared
 property name still has a backend lexical mismatch; its previously supported raw
 key spelling is preserved. Ordinary string values and free property names accept
-escaped DEL. Plain token-trie JSON Schema
-generation still requires equivalent escape support.
+escaped DEL. Ordinary JSON output without a response template uses the same
+byte-oriented schema recognition, including split escapes and surrogate pairs.
 Forced tool/Lark output policies during
 reasoning continuation and thinking-budget controls also remain unsupported.
+
+Ordinary JSON decoding follows the tokenizer's normal special-token policy;
+protocol-channel projection preserves markers for its declared parser. An EOS
+role does not make an ordinary token special: its actual decoded bytes must also
+finish the JSON value. Canonical byte-concatenating vocabularies use a trie mask
+against the same compiled schema. Escape candidates, contextual non-byte decoding
+and pending UTF-16 spelling use semantic candidate inspection. Model-token masks
+and recognizer-byte masks have separate identities and cannot share cached bits.
+
+`GenerateOptions.max_json_bytes` bounds both raw response text and its canonical
+JSON prefix, with a 4 MiB Rust default. HTTP preparation uses the configured
+`--replay-buffer-bytes` limit for all JSON output modes. Exceeding the candidate
+budget rejects that candidate; backend errors preserve their cause. Constraints
+are validated during chat/native/legacy completion admission before SSE headers.
+The old public character-based `JsonConstraint` was removed; pure request syntax
+preflight uses `validate_json_prefix`, while generation uses the shared schema
+recognizer.
 
 Without explicit continuation, declared content/reasoning text in the template
 prefill is included in the response, matching upstream session projection.

@@ -244,7 +244,7 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
     }
     request
         .validate_continuation()
-        .map_err(|error| ApiError::invalid_request(error.to_string()))?;
+        .map_err(|error| ApiError::invalid_request(format!("{error:#}")))?;
     Ok(())
 }
 
