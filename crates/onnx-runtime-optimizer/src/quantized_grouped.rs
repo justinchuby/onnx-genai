@@ -136,8 +136,7 @@ pub fn explain_at(graph: &Graph, ctx: &PassContext, anchor: NodeId) -> Result<St
     let Some(node) = graph.try_node(anchor) else {
         return Err(crate::OptimizerError::Fusion(format!(
             "affine GroupedMatMul anchor {anchor:?} is not live; select a node from this graph"
-        ))
-        .into());
+        )));
     };
     let outcome = if !is_anchor(node) {
         Err(Rejection::Structure {
