@@ -1,10 +1,11 @@
-//! Count complete QLinearMatMul execute calls on ARM64's borrowed native GEMM.
+//! Count prepared QLinearMatMul execute calls on ARM64's borrowed native GEMM.
 //! Per-row A quantization cannot route to MLAS, even in reference builds. The
-//! small work stays serial; inputs, outputs and factory setup are unobserved.
+//! small work stays serial; input/output, factory and workspace setup are unobserved.
 #![cfg(all(target_arch = "aarch64", feature = "ops-quantized"))]
 
 use onnx_runtime_ep_api::{
-    DeviceId, DevicePtr, DevicePtrMut, KernelFactory, TensorMut, TensorView,
+    DeviceId, DevicePtr, DevicePtrMut, KernelFactory, TensorMetadata, TensorMut, TensorView,
+    WorkspaceView,
 };
 use onnx_runtime_ep_cpu::{DerivedWeightMemory, kernels::qlinear_matmul::QLinearMatMulFactory};
 use onnx_runtime_ir::{DataType, Node, NodeId, compute_contiguous_strides};
@@ -120,9 +121,28 @@ fn native_qgemm_compensation_allocations_do_not_scale_with_batches() {
             let kernel = QLinearMatMulFactory::new(false, DerivedWeightMemory::default())
                 .create(&Node::new(NodeId(0), "QLinearMatMul", vec![], vec![]), &[])
                 .unwrap();
+            let metadata = inputs
+                .iter()
+                .map(|input| TensorMetadata::new(input.dtype, input.shape, true))
+                .collect::<Vec<_>>();
+            let requirement = kernel.workspace_requirement(&metadata).unwrap();
+            assert_eq!(
+                requirement.bytes,
+                3 * 9 * 4,
+                "one accumulator tile is reused across all batches"
+            );
+            assert_eq!(requirement.alignment, std::mem::align_of::<i32>());
+            let mut backing = vec![
+                std::mem::MaybeUninit::<i32>::uninit();
+                requirement.bytes as usize / std::mem::size_of::<i32>()
+            ];
+            let workspace = Some(WorkspaceView::new(
+                DevicePtrMut(backing.as_mut_ptr().cast()),
+                requirement.bytes as usize,
+            ));
             let mut run = || {
                 kernel
-                    .execute(
+                    .execute_with_workspace(
                         &inputs,
                         &mut [TensorMut::new(
                             DevicePtrMut(y.as_mut_ptr().cast()),
@@ -131,6 +151,7 @@ fn native_qgemm_compensation_allocations_do_not_scale_with_batches() {
                             &y_strides,
                             DeviceId::cpu(),
                         )],
+                        workspace,
                     )
                     .unwrap()
             };
@@ -138,7 +159,7 @@ fn native_qgemm_compensation_allocations_do_not_scale_with_batches() {
             let calls = observed(&mut run);
             assert!(
                 calls > 0,
-                "the complete execute still allocates parameter/geometry storage"
+                "prepared execution still allocates parameter/geometry storage"
             );
             for (index, &value) in y.iter().enumerate() {
                 let row = (index / 9) % 3;

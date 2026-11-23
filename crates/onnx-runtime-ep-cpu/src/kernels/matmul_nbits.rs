@@ -27,7 +27,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, Weak};
 
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, LazyWeightBoundary, Result, TensorMut, TensorView,
+    EpError, Kernel, KernelFactory, LazyWeightBoundary, Result, TensorMetadata, TensorMut,
+    TensorView, WorkspaceLayout, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node};
 use rayon::prelude::*;
@@ -36,7 +37,7 @@ use super::int4_nibble;
 use super::matmul::gemm;
 use super::weight_cache::{GrantedWeight, WeightCache, WeightCacheKey, WeightLoad, WeightSpec};
 use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_f32};
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{to_dense_f32_widen, to_dense_f32_widen_into, write_dense_f32_narrow};
 use crate::resources::{DerivedWeightGrant, IdleWeightCache, WeightAdmission};
 use crate::strided::numel;
 use crate::{CpuMemoryResources, DerivedWeightMemory};
@@ -1868,7 +1869,78 @@ impl Kernel for MatMulNBitsKernel {
         Ok(true)
     }
 
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        if !(3..=6).contains(&inputs.len()) || !inputs[0].present {
+            return Err(error(
+                "activation workspace needs 3..=6 input slots with present A (0); provide complete MatMulNBits metadata",
+            ));
+        }
+        let layout = self.activation_layout(inputs[0].dtype, inputs[0].shape)?;
+        if layout.bytes() == 0 {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        Ok(WorkspaceRequirement {
+            bytes: layout.bytes() as u64,
+            alignment: layout.alignment(),
+            ..WorkspaceRequirement::NONE
+        })
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.execute_with_activation_workspace(inputs, outputs, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.execute_with_activation_workspace(inputs, outputs, workspace)
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
+    }
+
+    fn estimated_flops(&self) -> Option<u64> {
+        self.flops
+    }
+}
+
+impl MatMulNBitsKernel {
+    fn activation_layout(&self, dtype: DataType, shape: &[usize]) -> Result<WorkspaceLayout<1>> {
+        require_float_compute_dtype("A", dtype)?;
+        if shape.last() != Some(&self.k) {
+            return Err(error(format!(
+                "activation workspace A must have rank >= 1 and last dimension K={}, got {shape:?}; provide matching activation metadata",
+                self.k
+            )));
+        }
+        let elements = if shape.contains(&0) {
+            0
+        } else {
+            shape.iter().try_fold(1usize, |count, &extent| count.checked_mul(extent))
+                .ok_or_else(|| error(format!("activation shape {shape:?} element count overflows usize; reduce the activation dimensions")))?
+        };
+        let full = std::alloc::Layout::array::<f32>(elements).map_err(|_| error(format!("activation shape {shape:?} exceeds addressable f32 conversion storage; reduce the activation dimensions")))?;
+        // Contiguous f32 is borrowed. Metadata cannot prove strides, so f32
+        // strided gathers remain a separate scratch migration; do not reserve
+        // a matrix-sized conversion buffer for every ordinary f32 invocation.
+        let region = if dtype == DataType::Float32 {
+            std::alloc::Layout::new::<[f32; 0]>()
+        } else {
+            full
+        };
+        WorkspaceLayout::new([region])
+    }
+
+    fn execute_with_activation_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         check_arity("MatMulNBits", inputs, outputs, 3, 6, 1)?;
         require_float_compute_dtype("A", inputs[0].dtype)?;
         require_dtype("B", inputs[1].dtype, DataType::Uint8)?;
@@ -1889,6 +1961,32 @@ impl Kernel for MatMulNBitsKernel {
                 outputs[0].shape
             )));
         }
+
+        let [activation_region] = self
+            .activation_layout(inputs[0].dtype, a_shape)?
+            .bind(workspace)
+            .map_err(|source| EpError::Backend {
+                operation: "MatMulNBits activation workspace binding",
+                source: Box::new(source),
+            })?;
+        let activation_scratch: &mut [std::mem::MaybeUninit<f32>] =
+            if activation_region.bytes() == 0 {
+                &mut []
+            } else {
+                let elements = activation_region.bytes() / std::mem::size_of::<f32>();
+                // SAFETY: WorkspaceLayout checked complete capacity/alignment. The
+                // executor lends exclusive Host backing until this call returns.
+                // Fresh storage need not be initialized; widening initializes it
+                // inside the existing phase timer before forming f32 references.
+                unsafe {
+                    std::slice::from_raw_parts_mut(
+                        activation_region
+                            .ptr()
+                            .as_ptr::<std::mem::MaybeUninit<f32>>(),
+                        elements,
+                    )
+                }
+            };
 
         let k_blocks = self.k.div_ceil(self.block_size);
         let blob_size = self.block_size * self.bits / 8;
@@ -1964,8 +2062,13 @@ impl Kernel for MatMulNBitsKernel {
             && self.constant_inputs[2]
             && zero_points.is_none_or(|_| self.constant_inputs[3])
             && group_indices.is_none_or(|_| self.constant_inputs[4]);
-        let activations = mm_profile::time_widen(|| compute_activations_cow(&inputs[0]))?;
-        let m = numel(&a_shape[..a_shape.len() - 1]);
+        let activations =
+            mm_profile::time_widen(|| compute_activations_cow(&inputs[0], activation_scratch))?;
+        let m = if a_shape.contains(&0) {
+            0
+        } else {
+            numel(&a_shape[..a_shape.len() - 1])
+        };
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let mut flops = (m as u64)
                 .saturating_mul(self.n as u64)
@@ -1976,7 +2079,18 @@ impl Kernel for MatMulNBitsKernel {
             }
             flops
         });
-        let result_len = m * self.n;
+        let result_len = m.checked_mul(self.n).ok_or_else(|| {
+            error(format!(
+                "output [{m}, {}] element count overflows usize; reduce the activation rows or N",
+                self.n
+            ))
+        })?;
+        std::alloc::Layout::array::<f32>(result_len).map_err(|_| error(format!("output [{m}, {}] exceeds addressable f32 compute storage; reduce the activation rows or N", self.n)))?;
+        // Empty byte buffers need not provide a non-null, f32-aligned address.
+        // Return before constructing a typed output slice or invoking packing.
+        if result_len == 0 {
+            return Ok(());
+        }
         let direct_result = outputs[0].dtype == DataType::Float32
             && outputs[0].is_contiguous()
             && outputs[0].device.is_host_accessible();
@@ -2607,14 +2721,6 @@ impl Kernel for MatMulNBitsKernel {
         } else {
             write_compute_f32(&mut outputs[0], result)
         }
-    }
-
-    fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        true
-    }
-
-    fn estimated_flops(&self) -> Option<u64> {
-        self.flops
     }
 }
 
@@ -11152,9 +11258,25 @@ fn to_dense_compute_f32(view: &TensorView) -> Result<Vec<f32>> {
 /// graphs carry `float32` activations). All downstream kernels only *read* the
 /// activations, so borrowing skips a redundant per-call `m*k` copy that
 /// `to_dense_compute_f32` would otherwise allocate on every `MatMulNBits`
-/// invocation. Strided or lower-precision (`f16`/`bf16`) inputs still widen into
-/// an owned buffer, preserving the previous behaviour bit-for-bit.
-fn compute_activations_cow<'a>(view: &'a TensorView<'_>) -> Result<Cow<'a, [f32]>> {
+/// invocation. Lower-precision (`f16`/`bf16`) inputs widen into executor-owned
+/// scratch. Strided f32 keeps its existing call-owned gather buffer.
+fn compute_activations_cow<'a>(
+    view: &'a TensorView<'_>,
+    scratch: &'a mut [std::mem::MaybeUninit<f32>],
+) -> Result<Cow<'a, [f32]>> {
+    if matches!(view.dtype, DataType::Float16 | DataType::BFloat16) {
+        for value in scratch.iter_mut() {
+            value.write(0.0);
+        }
+        // SAFETY: every element is initialized above; the exclusive scratch
+        // borrow covers the entire returned activation reader. Keep this fill
+        // within time_widen, matching the previous Vec initialization scope.
+        let initialized = unsafe {
+            std::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<f32>(), scratch.len())
+        };
+        to_dense_f32_widen_into("MatMulNBits activation", view, initialized)?;
+        return Ok(Cow::Borrowed(initialized));
+    }
     if view.dtype == DataType::Float32 && view.is_contiguous() && view.device.is_host_accessible() {
         view.validate()?;
         let n = numel(view.shape);
@@ -11215,6 +11337,7 @@ fn error(message: impl Into<String>) -> EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernels::testutil::PreparedTestKernel;
     use crate::test_support::{
         STATUS_ACCESS_VIOLATION, child_status_detail, is_environmental_access_violation_crash,
     };
@@ -11250,6 +11373,286 @@ mod tests {
     /// byte holds two blocks, so an off-by-one in the shift or the index swaps
     /// even and odd blocks -- which a run of equal zero points would hide, hence
     /// the distinct per-nibble values.
+    #[test]
+    fn activation_workspace_preserves_quantized_backend_routes() {
+        let _probe = lock_dispatch_probe();
+        for (m, k, n) in [(1usize, 64usize, 8usize), (1, 2048, 256), (32, 1024, 256)] {
+            for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+                let mut kernel = MatMulNBitsFactory::default()
+                    .create(&governed_dense_node(k, n, 4, 32), &[vec![m, k]])
+                    .unwrap();
+                kernel.set_constant_inputs(&[false, true, true]);
+                let values = vec![0.5; m * k];
+                let a = match dtype {
+                    DataType::Float16 => Owned::f16(&[m, k], &values),
+                    DataType::BFloat16 => Owned::bf16(&[m, k], &values),
+                    _ => Owned::f32(&[m, k], &values),
+                };
+                let b = Owned::u8(&[n, k / 32, 16], &vec![0x99; n * k / 2]);
+                let scales = Owned::f32(&[n, k / 32], &vec![1.; n * k / 32]);
+                let mut output = Owned::zeros_f32(&[m, n]);
+                #[cfg(feature = "mlas")]
+                let before = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
+                kernel
+                    .execute_prepared(
+                        &[a.view(), b.view(), scales.view()],
+                        &mut [output.view_mut()],
+                    )
+                    .unwrap();
+                assert_eq!(output.to_f32(), vec![k as f32 * 0.5; m * n]);
+                #[cfg(feature = "mlas")]
+                {
+                    let reached = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > before;
+                    let available = mlas_sys::sqnbit_packed_b_size(
+                        n,
+                        k,
+                        4,
+                        32,
+                        false,
+                        mlas_sys::SQNBitComputeType::Fp32,
+                    )
+                    .is_some();
+                    assert_eq!(
+                        reached,
+                        mlas_qnbit_enabled() && available,
+                        "dtype={dtype:?} M={m} K={k} N={n}"
+                    );
+                    eprintln!(
+                        "activation route proof dtype={dtype:?} M={m} K={k} N={n} reached_mlas_sqnbit={reached}"
+                    );
+                }
+                #[cfg(not(feature = "mlas"))]
+                eprintln!(
+                    "activation route proof dtype={dtype:?} M={m} K={k} N={n} native-only build"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn activation_workspace_tracks_dtype_shape_and_rejects_unaddressable_metadata() {
+        let kernel = test_kernel(16, 2, 16);
+        let requirement = |dtype, shape: &[usize]| {
+            kernel.workspace_requirement(&[
+                TensorMetadata::new(dtype, shape, true),
+                TensorMetadata::new(DataType::Uint8, &[2, 1, 8], true),
+                TensorMetadata::new(DataType::Float32, &[2, 1], true),
+            ])
+        };
+        assert_eq!(
+            requirement(DataType::Float32, &[2, 16]).unwrap(),
+            WorkspaceRequirement::NONE
+        );
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            let r = requirement(dtype, &[2, 3, 16]).unwrap();
+            assert_eq!(r.bytes, 384);
+            assert_eq!(r.alignment, 4);
+            assert_eq!(
+                r.lifetime,
+                onnx_runtime_ep_api::WorkspaceLifetime::StepScoped
+            );
+            assert_eq!(
+                requirement(dtype, &[2, 0, 16]).unwrap(),
+                WorkspaceRequirement::NONE
+            );
+        }
+        assert!(
+            kernel
+                .workspace_requirement(&[])
+                .unwrap_err()
+                .to_string()
+                .contains("input slots")
+        );
+        for (dtype, shape, message) in [
+            (DataType::Int8, vec![2, 16], "dtype"),
+            (DataType::Float16, vec![2, 15], "K=16"),
+            (DataType::Float16, vec![usize::MAX, 16], "overflow"),
+            (
+                DataType::Float32,
+                vec![(isize::MAX as usize / 4) / 16 + 1, 16],
+                "addressable",
+            ),
+        ] {
+            let e = requirement(dtype, &shape).unwrap_err().to_string();
+            assert!(e.contains("MatMulNBits") && e.contains(message), "{e}");
+        }
+        assert!(
+            kernel
+                .workspace_requirement(&[
+                    TensorMetadata::new(DataType::Float16, &[2, 16], false),
+                    TensorMetadata::new(DataType::Uint8, &[2, 1, 8], true),
+                    TensorMetadata::new(DataType::Float32, &[2, 1], true),
+                ])
+                .unwrap_err()
+                .to_string()
+                .contains("present A")
+        );
+    }
+
+    #[test]
+    fn activation_workspace_checks_before_writes_and_handles_reversed_half_views() {
+        let _probe = lock_dispatch_probe();
+        let kernel = test_kernel(16, 2, 16);
+        let b = Owned::u8(&[2, 1, 8], &[0x99; 16]);
+        let scales = Owned::f32(&[2, 1], &[1.; 2]);
+        let values: Vec<f32> = (0..32).map(|v| v as f32 / 16.).collect();
+        for a in [
+            Owned::f16(&[2, 16], &values),
+            Owned::bf16(&[2, 16], &values),
+        ] {
+            let mut output = Owned::f32(&[2, 2], &[73.; 4]);
+            let inputs = [a.view(), b.view(), scales.view()];
+            let mut backing = [0u128; 9];
+            for workspace in [
+                None,
+                Some(WorkspaceView::new(
+                    onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+                    124,
+                )),
+                Some(WorkspaceView::new(
+                    onnx_runtime_ep_api::DevicePtrMut(
+                        unsafe { backing.as_mut_ptr().cast::<u8>().add(1) }.cast(),
+                    ),
+                    128,
+                )),
+            ] {
+                let e = kernel
+                    .execute_with_workspace(&inputs, &mut [output.view_mut()], workspace)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    e.contains("MatMulNBits activation workspace") && e.contains("prepare"),
+                    "{e}"
+                );
+                assert_eq!(output.to_f32(), [73.; 4]);
+            }
+            let strides = [16, -1];
+            let reversed = TensorView::new(
+                a.view().data,
+                a.dtype,
+                &a.shape,
+                &strides,
+                onnx_runtime_ir::DeviceId::cpu(),
+            )
+            .with_byte_offset(30)
+            .with_backing(a.view().backing);
+            let workspace = WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+                128,
+            );
+            kernel
+                .execute_with_workspace(
+                    &[reversed, b.view(), scales.view()],
+                    &mut [output.view_mut()],
+                    Some(workspace),
+                )
+                .unwrap();
+            assert_eq!(output.to_f32(), [7.5, 7.5, 23.5, 23.5]);
+        }
+        for a in [Owned::f16(&[0, 16], &[]), Owned::bf16(&[0, 16], &[])] {
+            let mut output = Owned::zeros_f32(&[0, 2]);
+            Kernel::execute(
+                &kernel,
+                &[a.view(), b.view(), scales.view()],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn activation_workspace_reuses_real_host_lane_without_warm_issuer_callbacks() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{
+            HolderId, HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
+        };
+        let _probe = lock_dispatch_probe();
+        let books = Arc::new(RecordingGovernor::new_host(64));
+        let manager = ProcessMemoryManager::new().unwrap();
+        let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+        let providers = [true, false].map(|retention| {
+            let resources =
+                CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                    .unwrap()
+                    .with_cache_retention(crate::CpuCacheRetention::new(retention))
+                    .with_workspace_pool(pool.clone())
+                    .unwrap();
+            crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap()
+        });
+        let node = governed_dense_node(16, 2, 4, 16);
+        let kernels = providers
+            .each_ref()
+            .map(|p| p.get_kernel(&node, &[vec![1, 16]], 1).unwrap());
+        let a = [
+            Owned::f16(&[1, 16], &[0.5; 16]),
+            Owned::bf16(&[1, 16], &[1.; 16]),
+        ];
+        let b = Owned::u8(&[2, 1, 8], &[0x99; 16]);
+        let scales = Owned::f32(&[2, 1], &[1.; 2]);
+        let request = kernels[0]
+            .workspace_requirement(&[
+                TensorMetadata::new(a[0].dtype, &a[0].shape, true),
+                TensorMetadata::new(b.dtype, &b.shape, true),
+                TensorMetadata::new(scales.dtype, &scales.shape, true),
+            ])
+            .unwrap();
+        let allocation = providers[0]
+            .allocate_workspace(request.bytes as usize, request.alignment, request.role)
+            .unwrap();
+        let identity = allocation.managed_owner().unwrap().identity();
+        assert!(
+            providers[1]
+                .allocate_workspace(64, 4, request.role)
+                .is_err(),
+            "a second active lane must not borrow the first lane's conversion storage"
+        );
+        providers[0].deallocate_workspace(allocation).unwrap();
+        let calls = (books.claims(), books.releases());
+        for iteration in 0..4096 {
+            let index = iteration % 2;
+            let mut allocation = providers[index]
+                .allocate_workspace(64, 4, request.role)
+                .unwrap();
+            assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
+            let workspace = WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(allocation.as_mut_ptr()),
+                allocation.len(),
+            );
+            let mut output = Owned::zeros_f32(&[1, 2]);
+            kernels[index]
+                .execute_with_workspace(
+                    &[a[index].view(), b.view(), scales.view()],
+                    &mut [output.view_mut()],
+                    Some(workspace),
+                )
+                .unwrap();
+            assert_eq!(output.to_f32(), [if index == 0 { 8. } else { 16. }; 2]);
+            providers[index].deallocate_workspace(allocation).unwrap();
+        }
+        assert_eq!((books.claims(), books.releases()), calls);
+        assert_eq!(books.used(Tier::Host), 64);
+        let pressure = books
+            .reserve(Tier::Host, 64, MemoryRole::KvCache, HolderId::new(27))
+            .unwrap();
+        assert_eq!(manager.process_used(Tier::Host), 0);
+        drop(pressure);
+        let allocation = providers[0]
+            .allocate_workspace(64, 4, request.role)
+            .unwrap();
+        assert!(
+            books.claims() > calls.0,
+            "reclaimed storage must re-admit before reuse"
+        );
+        providers[0].deallocate_workspace(allocation).unwrap();
+        drop(kernels);
+        drop(providers);
+        pool.trim_idle(64).unwrap();
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(manager.process_used(Tier::Host), 0);
+    }
+
     #[test]
     fn int4_zero_point_matches_the_generic_layout() {
         let layout = NBitsLayout {
@@ -11377,8 +11780,9 @@ mod tests {
         // Entry points that reach a probe counter indirectly, through dispatch
         // rather than by incrementing one themselves. These cannot be derived
         // from a `fetch_add` and so are still named by hand.
-        const PERTURBS_INDIRECT: [&str; 3] = [
-            ".execute(",
+        const PERTURBS_INDIRECT: [&str; 4] = [
+            ".execute_prepared(",
+            ".execute_with_workspace(",
             "try_mlas_sqnbit(",
             "borrowed_int4_prefill_block_enabled(",
         ];
@@ -11459,7 +11863,7 @@ mod tests {
         // guarding the wrong name. If this list needs editing, a probe counter
         // moved -- check that whatever observes it still locks.
         let mut expected: Vec<String> = [
-            "execute(",
+            "execute_with_activation_workspace(",
             "try_int8_prefill_gebp(",
             "try_mlas_sqnbit(",
             "with_decode_pool_lazy(",
@@ -11527,7 +11931,7 @@ mod tests {
             functions.len()
         );
 
-        // Match on code only: a body that merely *mentions* `.execute(` in a
+        // Match on code only: a body that merely *mentions* `.execute_prepared(` in a
         // comment moves no counter, and forcing it to lock would make this
         // check obstruct unrelated work.
         let code_of = |body: &str| -> String {
@@ -11796,7 +12200,7 @@ mod tests {
         let run = |kernel: &dyn Kernel| {
             let mut y = Owned::zeros_f32(&[1, n]);
             kernel
-                .execute(
+                .execute_prepared(
                     &[
                         a.view(),
                         b.view(),
@@ -11899,7 +12303,7 @@ mod tests {
                         kernel.set_constant_inputs(&[false, true, true, true, true]);
                         let mut y = Owned::zeros_f32(&[m, n]);
                         kernel
-                            .execute(
+                            .execute_prepared(
                                 &[
                                     a.view(),
                                     b.view(),
@@ -11996,7 +12400,7 @@ mod tests {
                     kernel.set_constant_inputs(&[false, true, true, true, true]);
                     let mut y = make(dtype, &[m, n], &vec![0.0; m * n]);
                     kernel
-                        .execute(
+                        .execute_prepared(
                             &[
                                 a.view(),
                                 b.view(),
@@ -12040,7 +12444,7 @@ mod tests {
                 let groups = Owned::i32(&[k], &indices);
                 let mut y = Owned::zeros_f32(&[1, n]);
                 let failure = kernel
-                    .execute(
+                    .execute_prepared(
                         &[
                             a.view(),
                             b.view(),
@@ -12096,7 +12500,7 @@ mod tests {
         let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
         let mut y = Owned::zeros_f32(&[m, n]);
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
         assert!(
             INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed) > before,
@@ -12784,7 +13188,7 @@ mod tests {
             .unwrap();
         let mut fallback = Owned::zeros_f32(&[1, n]);
         kernel
-            .execute(
+            .execute_prepared(
                 &[a.view(), b.view(), scales.view()],
                 &mut [fallback.view_mut()],
             )
@@ -12805,7 +13209,7 @@ mod tests {
         for _ in 0..3 {
             let mut out = Owned::zeros_f32(&[1, n]);
             kernel
-                .execute(&[a.view(), b.view(), scales.view()], &mut [out.view_mut()])
+                .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [out.view_mut()])
                 .unwrap();
             assert_eq!(out.to_f32(), vec![-8.0; n]);
             assert_eq!(books.used(Tier::Host), bytes as u64);
@@ -12935,7 +13339,7 @@ mod tests {
                     sv.shape = &scale_shape;
                     sv.strides = &scale_strides;
                 }
-                kernel.execute(&[a.view(), b.view(), sv], &mut [output.view_mut()])?;
+                kernel.execute_prepared(&[a.view(), b.view(), sv], &mut [output.view_mut()])?;
                 assert_eq!(output.to_f32(), vec![-8.; rows * n]);
                 Ok::<_, EpError>(())
             };
@@ -13008,7 +13412,7 @@ mod tests {
                     sv.strides = &scale_strides;
                 }
                 builder
-                    .execute(
+                    .execute_prepared(
                         &[decode_a.view(), b.view(), sv],
                         &mut [decode_out.view_mut()],
                     )
@@ -13353,7 +13757,7 @@ mod tests {
                             native.as_ref()
                         };
                         black_box(kernel)
-                            .execute(
+                            .execute_prepared(
                                 black_box(&[
                                     a.view(),
                                     b.view(),
@@ -13369,7 +13773,7 @@ mod tests {
                         let wall = Instant::now();
                         for _ in 0..iterations {
                             black_box(kernel)
-                                .execute(
+                                .execute_prepared(
                                     black_box(&[
                                         a.view(),
                                         b.view(),
@@ -13453,7 +13857,7 @@ mod tests {
             for _ in 0..3 {
                 let mut output = Owned::zeros_f32(&[3, 3]);
                 kernel
-                    .execute(
+                    .execute_prepared(
                         &[
                             a.view(),
                             b.view(),
@@ -13502,7 +13906,7 @@ mod tests {
             let a = Owned::f32(&[3, 33], &[0.25; 99]);
             let mut y = Owned::zeros_f32(&[3, 3]);
             kernel
-                .execute(
+                .execute_prepared(
                     &[
                         a.view(),
                         b.view(),
@@ -13715,7 +14119,7 @@ mod tests {
                     let groups = Owned::i32(&[33], &[group; 33]);
                     let mut output = Owned::zeros_f32(&[1, 1]);
                     kernel
-                        .execute(
+                        .execute_prepared(
                             &[
                                 a.view(),
                                 b.view(),
@@ -14012,7 +14416,7 @@ mod tests {
                 let zp = Owned::u8(&[1, 1], &[point]);
                 let mut output = Owned::zeros_f32(&[1, 1]);
                 kernel
-                    .execute(
+                    .execute_prepared(
                         &[a.view(), b.view(), scales.view(), zp.view()],
                         &mut [output.view_mut()],
                     )
@@ -14318,7 +14722,7 @@ mod tests {
                 let mut blocker = None;
                 for _ in 0..3 {
                     let mut output = Owned::zeros_f32(&[1, n]);
-                    let result = kernel.execute(
+                    let result = kernel.execute_prepared(
                         &[a.view(), b.view(), scales.view(), points.view()],
                         &mut [output.view_mut()],
                     );
@@ -14649,8 +15053,10 @@ mod tests {
                 for m in [1, 4] {
                     let a = Owned::f32(&[m, k], &vec![0.25; m * k]);
                     let mut y = Owned::zeros_f32(&[m, n]);
-                    let outcome =
-                        kernel.execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()]);
+                    let outcome = kernel.execute_prepared(
+                        &[a.view(), b.view(), scales.view()],
+                        &mut [y.view_mut()],
+                    );
                     if capacity < peak {
                         assert!(matches!(
                             outcome,
@@ -14855,7 +15261,9 @@ mod tests {
                     let mut y = Owned::zeros_f32(&[m, n]);
                     let inputs = [a.view(), b.view(), scales.view(), z.view()];
                     for _ in 0..2 {
-                        active.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                        active
+                            .execute_prepared(&inputs, &mut [y.view_mut()])
+                            .unwrap();
                         let dequantized = dequantize_2bit_reference(
                             &bytes,
                             &scale_values,
@@ -15067,7 +15475,7 @@ mod tests {
             let mut y = Owned::zeros_f32(&[1, n]);
             let kai_before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
             kernel
-                .execute(
+                .execute_prepared(
                     &[a.view(), b.view(), scales_t.view(), zp.view()],
                     &mut [y.view_mut()],
                 )
@@ -15194,7 +15602,9 @@ mod tests {
                         inputs.push(g_idx.view());
                     }
                     let mut y = Owned::zeros_f32(&[1, n]);
-                    kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                    kernel
+                        .execute_prepared(&inputs, &mut [y.view_mut()])
+                        .unwrap();
 
                     let predicted = nbits_decode_f32_retention_candidate(
                         4,
@@ -15256,7 +15666,7 @@ mod tests {
             kernel.set_constant_inputs(&[true; 5]);
             let mut y = Owned::zeros_f32(&[1, n]);
             kernel
-                .execute(
+                .execute_prepared(
                     &[
                         a_t.view(),
                         b.view(),
@@ -15350,7 +15760,7 @@ mod tests {
             ] {
                 let mut y = Owned::zeros_f32(&[1, n]);
                 kernel
-                    .execute(
+                    .execute_prepared(
                         &[
                             a.view(),
                             b.view(),
@@ -15645,7 +16055,7 @@ mod tests {
         let mut y = Owned::zeros_f32(&[1, n]);
         let before = BORROWED_INT4_NBLOCK_TEST_CALLS.load(Ordering::Relaxed);
         kernel
-            .execute(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
             .unwrap();
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
@@ -16511,7 +16921,7 @@ mod tests {
         let mut output = Owned::zeros_f32(&[m, n]);
         if let Some(zero_points) = &zero_points {
             kernel
-                .execute(
+                .execute_prepared(
                     &[
                         activation.view(),
                         packed.view(),
@@ -16523,7 +16933,7 @@ mod tests {
                 .unwrap();
         } else {
             kernel
-                .execute(
+                .execute_prepared(
                     &[activation.view(), packed.view(), scales.view()],
                     &mut [output.view_mut()],
                 )
@@ -16609,7 +17019,7 @@ mod tests {
         let scales = Owned::f32(&[n, blocks], scales);
         let mut y = Owned::zeros_f32(&[1, n]);
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
         y.to_f32()
     }
@@ -16658,7 +17068,7 @@ mod tests {
         let points = Owned::u8(&zero_point_shape, zero_points);
         let mut y = Owned::zeros_f32(&[1, n]);
         kernel
-            .execute(
+            .execute_prepared(
                 &[a.view(), b.view(), scales.view(), points.view()],
                 &mut [y.view_mut()],
             )
@@ -16756,7 +17166,7 @@ mod tests {
         let mut y = Owned::zeros_f32(&[m, n]);
         reset_int4_routes();
         kernel
-            .execute(
+            .execute_prepared(
                 &[a.view(), b.view(), s.view(), z.view()],
                 &mut [y.view_mut()],
             )
@@ -16836,7 +17246,7 @@ mod tests {
         let scales = Owned::f32(&[n, k.div_ceil(block_size)], &scales);
         let mut y = Owned::zeros_f32(&[m, n]);
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
         assert_int8_close(&y.to_f32(), &expected);
     }
@@ -16885,7 +17295,7 @@ mod tests {
                 .unwrap();
             let mut y_borrow = Owned::zeros_f32(&[m, n]);
             kernel
-                .execute(
+                .execute_prepared(
                     &[a_contig.view(), b.view(), scales_t.view()],
                     &mut [y_borrow.view_mut()],
                 )
@@ -16910,7 +17320,7 @@ mod tests {
                 .unwrap();
             let mut y_copy = Owned::zeros_f32(&[m, n]);
             kernel
-                .execute(
+                .execute_prepared(
                     &[a_strided.view(), b.view(), scales_t.view()],
                     &mut [y_copy.view_mut()],
                 )
@@ -16972,7 +17382,7 @@ mod tests {
             let zero_points = Owned::u8(&[n, blocks.div_ceil(2)], &zps);
             let mut y = Owned::zeros_f32(&[m, n]);
             kernel
-                .execute(
+                .execute_prepared(
                     &[a.view(), b.view(), scales_owned.view(), zero_points.view()],
                     &mut [y.view_mut()],
                 )
@@ -17164,7 +17574,7 @@ mod tests {
         reference.set_constant_inputs(&[false, true, true]);
         let mut y = Owned::zeros_f32(&[1, n]);
         reference
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
         let expected = y.to_f32();
 
@@ -17182,7 +17592,7 @@ mod tests {
                             for _ in 0..RUNS {
                                 let mut y = Owned::zeros_f32(&[1, n]);
                                 kernel
-                                    .execute(
+                                    .execute_prepared(
                                         &[a.view(), b.view(), scales.view()],
                                         &mut [y.view_mut()],
                                     )
@@ -17306,13 +17716,13 @@ mod tests {
         let scales = Owned::f16(&[n, 2], &scales);
         let mut y = Owned::zeros_f32(&[1, n]);
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
         let direct_int4 = selected_dot_kernel().supports_int4_direct(block_size, false);
         let cached =
             prepack_cache_ptr(&kernel).expect("selected accuracy-4 weight cache must be populated");
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
         let reused =
             prepack_cache_ptr(&kernel).expect("selected accuracy-4 weight cache must be reused");
@@ -17429,7 +17839,7 @@ mod tests {
 
                 let before = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
                 kernel
-                    .execute(
+                    .execute_prepared(
                         &[a.view(), b.view(), scales.view(), zero_points.view()],
                         &mut [y.view_mut()],
                     )
@@ -17966,7 +18376,7 @@ mod tests {
             let scales = Owned::f32(&[n, blocks], &scales);
             let mut y = Owned::zeros_f32(&[1, n]);
             kernel
-                .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+                .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
                 .unwrap();
             let used_kai = kernel.native_packs.packed_kai_qsi4_weight.get().is_some();
             #[cfg(feature = "mlas")]
@@ -18234,7 +18644,7 @@ mod tests {
         let before_plain = INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed);
         let before_n16 = N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
         let reached_plain = INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_plain;
         let reached_n16 = N16_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before_n16;
@@ -18320,7 +18730,7 @@ mod tests {
         #[cfg(feature = "mlas")]
         let before_mlas = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
         kernel
-            .execute(
+            .execute_prepared(
                 &[a.view(), b.view(), scales.view(), zps.view()],
                 &mut [y.view_mut()],
             )
@@ -19253,7 +19663,7 @@ mod tests {
             let mut y = Owned::zeros_f32(&[1, n]);
             let before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
             kernel
-                .execute(
+                .execute_prepared(
                     &[a.view(), b.view(), scales.view(), zps.view()],
                     &mut [y.view_mut()],
                 )
@@ -19362,7 +19772,7 @@ mod tests {
         }
         let mut y = Owned::zeros_f32(&[m, n]);
         kernel
-            .execute(&inputs, &mut [y.view_mut()])
+            .execute_prepared(&inputs, &mut [y.view_mut()])
             .expect("8-bit block-128 execute must succeed");
 
         let oracle = reference(activations, &dequantized, m, k, n);
@@ -19429,7 +19839,7 @@ mod tests {
         let scales_tensor = Owned::f32(&[n, blocks], &scales);
         let mut y = Owned::zeros_f32(&[1, n]);
         kernel
-            .execute(
+            .execute_prepared(
                 &[a.view(), b.view(), scales_tensor.view()],
                 &mut [y.view_mut()],
             )
@@ -21350,7 +21760,7 @@ mod tests {
         let scales = Owned::f32(&[n, 2], &scales);
         let mut y = Owned::zeros_f32(&[m, n]);
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
         assert_close(&y.to_f32(), &reference(&a.to_f32(), &dequantized, m, k, n));
     }
@@ -21399,7 +21809,7 @@ mod tests {
 
                 let mut low_y = Owned::zeros(dtype, &[m, n]);
                 accuracy4_kernel(k, n, block_size)
-                    .execute(
+                    .execute_prepared(
                         &[
                             low_a.view(),
                             b.view(),
@@ -21414,7 +21824,7 @@ mod tests {
 
                 let mut f32_y = Owned::zeros_f32(&[m, n]);
                 accuracy4_kernel(k, n, block_size)
-                    .execute(
+                    .execute_prepared(
                         &[
                             f32_a.view(),
                             b.view(),
@@ -21494,7 +21904,7 @@ mod tests {
         let scales = Owned::f32(&[1], &[1.0]);
         let mut y = Owned::zeros_f32(&[1, 1]);
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
         assert_eq!(y.to_f32(), vec![988.0]); // -2*1 + -1*10 + 0*100 + 1*1000
     }
@@ -21518,7 +21928,7 @@ mod tests {
         let zero_points = Owned::u8(&[n, 2], &zero_points);
         let mut y = Owned::zeros_f32(&[2, 3, n]);
         kernel
-            .execute(
+            .execute_prepared(
                 &[a.view(), b.view(), scales.view(), zero_points.view()],
                 &mut [y.view_mut()],
             )
@@ -21592,7 +22002,9 @@ mod tests {
                     }
                     let mut y = Owned::zeros_f32(&[m, n]);
                     let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
-                    kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                    kernel
+                        .execute_prepared(&inputs, &mut [y.view_mut()])
+                        .unwrap();
                     assert_eq!(
                         INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
                         before + 1,
@@ -21663,7 +22075,7 @@ mod tests {
 
         let _env = crate::test_support::EnvVarGuard::set("ONNX_GENAI_CPU_MM_INT8_GEBP", "0");
         let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
-        let executed = kernel.execute(
+        let executed = kernel.execute_prepared(
             &[a.view(), b.view(), scales_tensor.view()],
             &mut [y.view_mut()],
         );
@@ -21723,7 +22135,7 @@ mod tests {
         let mut y = Owned::zeros_f32(&[m, n]);
         let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
         kernel
-            .execute(
+            .execute_prepared(
                 &[a.view(), b.view(), scales_tensor.view()],
                 &mut [y.view_mut()],
             )
@@ -21850,7 +22262,9 @@ mod tests {
 
                     let mut fused = Owned::zeros_f32(&[m, n]);
                     let before = INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
-                    kernel.execute(&inputs, &mut [fused.view_mut()]).unwrap();
+                    kernel
+                        .execute_prepared(&inputs, &mut [fused.view_mut()])
+                        .unwrap();
                     assert_eq!(
                         INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
                         before + 1,
@@ -21861,7 +22275,7 @@ mod tests {
                     let _env =
                         crate::test_support::EnvVarGuard::set("ONNX_GENAI_CPU_MM_INT8_GEBP", "0");
                     let mut dequant = Owned::zeros_f32(&[m, n]);
-                    let executed = kernel.execute(&inputs, &mut [dequant.view_mut()]);
+                    let executed = kernel.execute_prepared(&inputs, &mut [dequant.view_mut()]);
                     executed.unwrap();
                     assert_eq!(
                         INT8_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed),
@@ -21922,7 +22336,9 @@ mod tests {
                 // the numeric one below runs everywhere.
                 #[cfg(target_arch = "x86_64")]
                 let before = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
-                kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                kernel
+                    .execute_prepared(&inputs, &mut [y.view_mut()])
+                    .unwrap();
                 #[cfg(target_arch = "x86_64")]
                 let took_gebp = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed) > before;
                 // Scaled tolerance, not `assert_close`'s fixed 1e-5: the GEBP
@@ -21997,7 +22413,9 @@ mod tests {
                 }
                 let mut y = Owned::zeros_f32(&[m, n]);
                 let before = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed);
-                kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                kernel
+                    .execute_prepared(&inputs, &mut [y.view_mut()])
+                    .unwrap();
                 let took_gebp = INT4_PREFILL_GEBP_TEST_CALLS.load(Ordering::Relaxed) > before;
 
                 // Same scaled tolerance as the 32-element case, and for the
@@ -22060,7 +22478,7 @@ mod tests {
         let zero_points = Owned::u8(&[n, 1], &zero_points);
         let mut y = Owned::zeros(DataType::BFloat16, &[m, n]);
         kernel
-            .execute(
+            .execute_prepared(
                 &[a.view(), b.view(), scales.view(), zero_points.view()],
                 &mut [y.view_mut()],
             )
@@ -22118,7 +22536,7 @@ mod tests {
         let mut y1 = Owned::zeros_f32(&[1, n]);
         let probe = Int4Acc0RouteProbe::start();
         kernel
-            .execute(&[a1.view(), b.view(), scales.view()], &mut [y1.view_mut()])
+            .execute_prepared(&[a1.view(), b.view(), scales.view()], &mut [y1.view_mut()])
             .unwrap();
         assert_close(&y1.to_f32(), &reference(&a1_values, &dequantized, 1, k, n));
         probe.assert_fast_route(&kernel, true);
@@ -22127,7 +22545,7 @@ mod tests {
         let a2 = Owned::f32(&[1, k], &a2_values);
         let mut y2 = Owned::zeros_f32(&[1, n]);
         kernel
-            .execute(&[a2.view(), b.view(), scales.view()], &mut [y2.view_mut()])
+            .execute_prepared(&[a2.view(), b.view(), scales.view()], &mut [y2.view_mut()])
             .unwrap();
         assert_eq!(
             prepack_cache_ptr(&kernel),
@@ -22169,7 +22587,7 @@ mod tests {
         let mut y = Owned::zeros_f32(&[1, n]);
         let probe = Int4Acc0RouteProbe::start();
         kernel
-            .execute(
+            .execute_prepared(
                 &[a.view(), b.view(), scales.view(), zero_points.view()],
                 &mut [y.view_mut()],
             )
@@ -22254,7 +22672,7 @@ mod tests {
         let mut y = Owned::zeros_f32(&[1, n]);
         let probe = Int4Acc0RouteProbe::start();
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
@@ -22282,7 +22700,7 @@ mod tests {
         let scales = Owned::f32(&[n, 2], &scales);
         let mut y = Owned::zeros_f32(&[1, n]);
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
@@ -22320,7 +22738,7 @@ mod tests {
         let mut y = Owned::zeros_f32(&[1, n]);
         let sym_before = BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed);
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
@@ -22370,7 +22788,7 @@ mod tests {
 
             let deferred_before = DEFERRED_DECODE_TEST_CALLS.load(Ordering::Relaxed);
             kernel
-                .execute(
+                .execute_prepared(
                     &[a.view(), b.view(), scale_view.view()],
                     &mut [y.view_mut()],
                 )
@@ -22439,7 +22857,7 @@ mod tests {
             let a = Owned::f32(&[1, k], &activations);
             let mut y = Owned::zeros_f32(&[1, n]);
             kernel
-                .execute(
+                .execute_prepared(
                     &[a.view(), b.view(), scale_tensor.view()],
                     &mut [y.view_mut()],
                 )
@@ -22534,7 +22952,7 @@ mod tests {
         let scales_tensor = Owned::f32(&[n, 8], &scales);
         let mut y = Owned::zeros_f32(&[1, n]);
         kernel
-            .execute(
+            .execute_prepared(
                 &[a.view(), b.view(), scales_tensor.view()],
                 &mut [y.view_mut()],
             )
@@ -22680,7 +23098,7 @@ mod tests {
             let a = Owned::f32(&[m, k], &a_values);
             let mut y = Owned::zeros_f32(&[m, n]);
             kernel
-                .execute(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
+                .execute_prepared(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
                 .unwrap();
             kernel
         };
@@ -22816,7 +23234,7 @@ mod tests {
             let scales_t = Owned::f32(&[n, 8], &scales);
             let mut y = Owned::zeros_f32(&[1, n]);
             kernel
-                .execute(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
+                .execute_prepared(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
                 .unwrap();
             (kernel, y.to_f32())
         };
@@ -22878,7 +23296,7 @@ mod tests {
         let scales = Owned::f32(&[1], &[1.0]);
         let mut y = Owned::zeros_f32(&[1, 1]);
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
         assert_eq!(y.to_f32(), vec![53.0]); // (1-8)*1 + (14-8)*10
     }
@@ -22933,7 +23351,7 @@ mod tests {
         let absent_zp = TensorView::absent(DataType::Uint8);
         let mut y = Owned::zeros_f32(&[1, 1]);
         kernel
-            .execute(
+            .execute_prepared(
                 &[a.view(), b.view(), scales.view(), absent_zp, groups.view()],
                 &mut [y.view_mut()],
             )
@@ -22992,7 +23410,7 @@ mod tests {
         let scales = Owned::f32(&[1], &[1.0]);
         let mut y = Owned::zeros_f32(&[1, 1]);
         kernel
-            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
         assert_eq!(y.to_f32(), vec![53.0]);
     }
@@ -23091,7 +23509,7 @@ mod tests {
             let mut standard_kernel = test_kernel(k, n, block_size);
             standard_kernel.set_constant_inputs(&[false, true, true]);
             standard_kernel
-                .execute(
+                .execute_prepared(
                     &[activations.view(), standard_b.view(), scales.view()],
                     &mut [standard_output.view_mut()],
                 )
@@ -23103,7 +23521,7 @@ mod tests {
             };
             prepacked_kernel.set_constant_inputs(&[false, true, true]);
             prepacked_kernel
-                .execute(
+                .execute_prepared(
                     &[activations.view(), prepacked_b.view(), scales.view()],
                     &mut [prepacked_output.view_mut()],
                 )
@@ -23114,7 +23532,7 @@ mod tests {
                 .expect("constant MLAS prepacked weight must be cached");
             let mut reused_output = Owned::zeros_f32(&[m, n]);
             prepacked_kernel
-                .execute(
+                .execute_prepared(
                     &[activations.view(), prepacked_b.view(), scales.view()],
                     &mut [reused_output.view_mut()],
                 )
@@ -23432,7 +23850,7 @@ mod tests {
             let before = SPMD_TEST_DISPATCHES.load(Ordering::Relaxed);
             let persistent = spmd_decode_active().is_some();
             kernel
-                .execute(
+                .execute_prepared(
                     &[a.view(), b.view(), scales.view()],
                     &mut [output.view_mut()],
                 )
@@ -23471,7 +23889,7 @@ mod tests {
             let persistent = spmd_decode_active().is_some();
             let before = SPMD_TEST_DISPATCHES.load(Ordering::Relaxed);
             concrete
-                .execute(
+                .execute_prepared(
                     &[
                         a.view(),
                         b.view(),

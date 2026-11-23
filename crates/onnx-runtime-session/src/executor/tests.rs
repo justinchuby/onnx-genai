@@ -14085,6 +14085,121 @@ fn sequential_gemm_layouts_share_managed_peak_and_reuse_on_next_run() {
     assert_eq!(books.used(Tier::Host), 0);
 }
 
+#[test]
+fn sequential_nbits_half_activations_share_one_funded_peak() {
+    use onnx_runtime_memory_api::{DeviceKey, Tier};
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
+    let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+        DeviceKey::HOST,
+        0,
+        128,
+        0,
+    )));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13))
+            .unwrap(),
+        Default::default(),
+    )
+    .unwrap()
+    .with_workspace_pool(pool.clone())
+    .unwrap();
+    let provider = Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let a = graph.create_named_value("a", DataType::Float16, static_shape([2, 16]));
+    let b = graph.create_named_value("b", DataType::Uint8, static_shape([8, 1, 8]));
+    let c = graph.create_named_value("c", DataType::Uint8, static_shape([2, 1, 8]));
+    let s = graph.create_named_value("s", DataType::Float32, static_shape([8, 1]));
+    let t = graph.create_named_value("t", DataType::Float32, static_shape([2, 1]));
+    for value in [a, b, c, s, t] {
+        graph.add_input(value);
+    }
+    let middle = graph.create_named_value("middle", DataType::Float16, static_shape([2, 8]));
+    let y = graph.create_named_value("y", DataType::Float16, static_shape([2, 2]));
+    graph.add_output(y);
+    for (id, lhs, rhs, scales, out, k, n) in
+        [(0, a, b, s, middle, 16, 8), (1, middle, c, t, y, 8, 2)]
+    {
+        let mut node = Node::new(
+            NodeId(id),
+            "MatMulNBits",
+            vec![Some(lhs), Some(rhs), Some(scales)],
+            vec![out],
+        );
+        node.domain = "com.microsoft".into();
+        for (name, value) in [("K", k), ("N", n), ("bits", 4), ("block_size", 16)] {
+            node.attributes
+                .insert(name.into(), onnx_runtime_ir::Attribute::Int(value));
+        }
+        graph.insert_node(node);
+    }
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), provider, None).unwrap();
+    let a = Tensor::from_raw(
+        DataType::Float16,
+        vec![2, 16],
+        &[half::f16::from_f32(0.5).to_bits().to_le_bytes(); 32].concat(),
+    )
+    .unwrap();
+    let b = Tensor::from_raw(DataType::Uint8, vec![8, 1, 8], &[0x99; 64]).unwrap();
+    let c = Tensor::from_raw(DataType::Uint8, vec![2, 1, 8], &[0x99; 16]).unwrap();
+    let s = Tensor::from_raw(
+        DataType::Float32,
+        vec![8, 1],
+        &[1f32.to_le_bytes(); 8].concat(),
+    )
+    .unwrap();
+    let t = Tensor::from_raw(
+        DataType::Float32,
+        vec![2, 1],
+        &[1f32.to_le_bytes(); 2].concat(),
+    )
+    .unwrap();
+    let inputs = [("a", &a), ("b", &b), ("c", &c), ("s", &s), ("t", &t)];
+    let mut identity = None;
+    for _ in 0..8 {
+        let requirement = executor
+            .prepare_with_device_bindings(&inputs, &mut [])
+            .unwrap();
+        assert_eq!(
+            requirement.bytes, 128,
+            "max(128,64), not the sum of per-node conversions"
+        );
+        let output = executor.run(&inputs).unwrap();
+        assert_eq!(
+            output[0].as_bytes(),
+            &[half::f16::from_f32(64.).to_bits().to_le_bytes(); 4].concat()
+        );
+        let allocations = manager.snapshot().unwrap().allocations;
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(
+            *identity.get_or_insert(allocations[0].identity),
+            allocations[0].identity
+        );
+        assert_eq!(books.used(Tier::Host), 128);
+        assert_eq!(manager.process_used(Tier::Host), 128);
+    }
+    pool.trim_idle(128).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+    assert_eq!(
+        executor
+            .prepare_with_device_bindings(&inputs, &mut [])
+            .unwrap()
+            .bytes,
+        128
+    );
+    assert_eq!(books.used(Tier::Host), 128);
+    executor.run(&inputs).unwrap();
+    drop(executor);
+    pool.trim_idle(128).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
 fn minimal_workspace_executor() -> Executor {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 17);
