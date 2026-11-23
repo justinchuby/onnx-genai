@@ -1,0 +1,108 @@
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs b/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs
+index b128d4b28..125d78809 100644
+--- a/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs
+@@ -253,10 +253,10 @@ impl Kernel for BlockQuantizedMoEKernel {
+ }
+ 
+ impl BlockQuantizedMoEKernel {
+-    fn execution_workspace_layout(&self, dims: Dimensions) -> Result<WorkspaceLayout<2>> {
++    fn execution_workspace_layout(&self, dims: Dimensions) -> Result<WorkspaceLayout<3>> {
+         // A validated empty final output cannot consume projections or gathers.
+         if dims.rows == 0 || dims.hidden == 0 {
+-            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 2]);
++            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 3]);
+         }
+         // Experts and their projections execute serially. An expert receives a
+         // row at most once, so total rows bound every group, independent of k.
+@@ -280,7 +280,10 @@ impl BlockQuantizedMoEKernel {
+         let gathered = std::alloc::Layout::array::<f32>(gathered_elements).map_err(|_| {
+             error("grouped input workspace exceeds addressable capacity; reduce batch dimensions")
+         })?;
+-        WorkspaceLayout::new([projection, gathered])
++        // The accumulator is live across all experts, so it cannot alias the
++        // projection or gather region. One input-sized region covers the full
++        // output without any expert-count or top-k multiplier.
++        WorkspaceLayout::new([projection, gathered, gathered])
+     }
+ 
+     fn execute_prepared_experts(
+@@ -315,7 +318,7 @@ impl BlockQuantizedMoEKernel {
+         let layout = self.execution_workspace_layout(dimensions)?;
+         // SAFETY: one checked layout lends disjoint Host regions for this
+         // dispatch. Neither short borrow nor a projection output escapes.
+-        let [mut scratch, mut grouped_scratch] = unsafe {
++        let [mut scratch, mut grouped_scratch, mut accumulator] = unsafe {
+             ProjectionScratch::bind_layout(
+                 "BlockQuantizedMoE execution workspace binding",
+                 layout,
+@@ -354,7 +357,7 @@ impl BlockQuantizedMoEKernel {
+             }
+         }
+ 
+-        let mut output = vec![0.0f32; rows * hidden];
++        let output = accumulator.zeroed_prefix(rows * hidden)?;
+         // A dense resident set must fit as a whole: separately admitting
+         // projections can evict an Arc still held by this expert call and
+         // hide its live expansion outside the cache's resident-byte count.
+@@ -531,7 +534,7 @@ impl BlockQuantizedMoEKernel {
+                 "{streamed_experts} row-streamed and {dense_experts} dense expert sets; {dense_bytes} dense bytes per set, cache budget {cache_budget} bytes; last Host grant refusal: {grant_refusal:?}"
+             );
+         }
+-        write_dense_f32(&mut outputs[0], &output)
++        write_dense_f32(&mut outputs[0], output)
+     }
+ 
+     fn dequantize_expert_group(
+@@ -1698,12 +1701,12 @@ mod tests {
+                 .execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace))
+                 .unwrap();
+             assert!(
+-                scratch[..scratch.len() - H]
++                scratch[..scratch.len() - 2 * H]
+                     .iter()
+                     .all(|&value| value == 29.0),
+                 "cold dense expansion and warm resident hits must leave streamed scratch untouched"
+             );
+-            assert_eq!(&scratch[scratch.len() - H..], &[0.125; H]);
++            assert_eq!(&scratch[scratch.len() - 2 * H..], &[0.125; 2 * H]);
+             assert_eq!(output.to_f32(), vec![0.125; H]);
+         }
+         assert_eq!(
+@@ -1714,7 +1717,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn streamed_workspace_is_projection_max_plus_one_gather_with_no_warm_issuer_callbacks() {
++    fn streamed_workspace_covers_projection_gather_and_accumulator_without_warm_issuer_calls() {
+         use crate::kernels::testutil::RecordingGovernor;
+         use onnx_runtime_memory_governor::{HolderId, HostWorkspacePool, ProcessMemoryManager};
+         use std::num::NonZeroUsize;
+@@ -1821,8 +1824,8 @@ mod tests {
+                 .max(l2.bytes())
+                 .max(if separate { l3.bytes() } else { 0 });
+             assert_eq!(
+-                req.bytes, (max + rows * hidden * std::mem::size_of::<f32>()) as u64,
+-                "serial experts/projections share max plus one gathered input, not k*E buffers"
++                req.bytes, (max + 2 * rows * hidden * std::mem::size_of::<f32>()) as u64,
++                "serial experts/projections share max plus gather and accumulator, not k*E buffers"
+             );
+             assert!(max < l1.bytes() + l2.bytes());
+             let mut output = Owned::zeros_f32(&[rows, hidden]);
+@@ -1844,6 +1847,8 @@ mod tests {
+                     WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr()), backing.len());
+                 kernel.execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace)).unwrap();
+                 cpu.deallocate_workspace(backing).unwrap();
++                assert_eq!(manager.process_used(onnx_runtime_memory_api::Tier::Host), req.bytes,
++                    "idle backing stays charged at the complete physical lane capacity");
+                 let current = (books.claims(), books.releases());
+                 assert_eq!(
+                     *counts.get_or_insert(current),
+@@ -1858,6 +1863,7 @@ mod tests {
+             assert_eq!(kernel.weight_cache.activity(), (0, 0));
+             drop(cpu);
+             pool.trim_idle(u64::MAX).unwrap();
++            assert_eq!(manager.process_used(onnx_runtime_memory_api::Tier::Host), 0);
+             assert!(books.releases() > counts.unwrap().1);
+         }
+         });

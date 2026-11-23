@@ -1,0 +1,39 @@
+{
+  "removed_rebuildable_binaries": [
+    {
+      "path": "/tmp/nxrt-block-moe-accumulator/baseline-probe",
+      "bytes": 13879760
+    },
+    {
+      "path": "/tmp/nxrt-block-moe-accumulator/after-probe",
+      "bytes": 13887440
+    },
+    {
+      "path": "/tmp/nxrt-block-moe-accumulator/null-probe",
+      "bytes": 13879760
+    },
+    {
+      "path": "/tmp/nxrt-block-moe-accumulator/tiny-diagnostic/baseline-probe",
+      "bytes": 13879760
+    },
+    {
+      "path": "/tmp/nxrt-block-moe-accumulator/tiny-diagnostic/after-probe",
+      "bytes": 13887440
+    },
+    {
+      "path": "/tmp/nxrt-block-moe-accumulator/tiny-diagnostic/null-probe",
+      "bytes": 13879760
+    },
+    {
+      "path": "/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a",
+      "bytes": 94401672
+    },
+    {
+      "path": "/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-53b93bd9d65a9d6e",
+      "bytes": 99886136
+    }
+  ],
+  "logical_bytes": 277581728,
+  "package_clean": "     Removed 8 files, 26.5MiB total\n",
+  "retained": "source, raw results, previous probes and shared dependencies; stable flock inode untouched"
+}

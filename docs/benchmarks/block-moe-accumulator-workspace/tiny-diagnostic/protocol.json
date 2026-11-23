@@ -1,0 +1,55 @@
+{
+  "shapes": [
+    [
+      1,
+      32,
+      64,
+      1,
+      0,
+      0
+    ],
+    [
+      1,
+      64,
+      128,
+      1,
+      1,
+      0
+    ]
+  ],
+  "orders": [
+    [
+      "baseline",
+      "after",
+      "null"
+    ],
+    [
+      "after",
+      "null",
+      "baseline"
+    ],
+    [
+      "null",
+      "baseline",
+      "after"
+    ],
+    [
+      "baseline",
+      "after",
+      "null"
+    ],
+    [
+      "after",
+      "null",
+      "baseline"
+    ]
+  ],
+  "processes_per_arm_shape": 5,
+  "batches": 9,
+  "target_cpu_ms": 500,
+  "minimum_cpu_ms": 20,
+  "minimum_cpu_wall_ratio": 0.9,
+  "control_gate_percent": 5,
+  "attempts": 1,
+  "reason": "one predeclared diagnostic of the original two unqualified tiny cells, longer CPU batches and more independent processes; identical previously built executables"
+}
