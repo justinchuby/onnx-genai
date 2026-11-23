@@ -4250,7 +4250,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         if op.op_type == "Attention"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =
-                crate::kernels::standard_attention::unsupported_reason(opset, input_dtypes)
+                crate::kernels::standard_attention::unsupported_reason(op, opset, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }

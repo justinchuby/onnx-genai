@@ -45,12 +45,16 @@
 //! * `qk_matmul_output_mode`: modes **0, 1, 2, 3** implemented per spec; any
 //!   other value errors.
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    attention_window::AttentionWindow,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
 use super::sdpa::{
     AttnBias, NoMask, QkCapture, QkCaptureStage, ScaleMode, SdpaConfig, SdpaTensors, sdpa_f32,
+    sdpa_f32_windowed,
 };
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
@@ -59,18 +63,19 @@ pub struct AttentionKernel {
     /// Explicit score scale; `None` → default `1/sqrt(head_size)`.
     scale: Option<f32>,
     is_causal: bool,
+    window: AttentionWindow,
     q_num_heads: Option<usize>,
     kv_num_heads: Option<usize>,
     qk_matmul_output_mode: i64,
     /// Softcap value; `0.0` disables it.
     softcap: f32,
-    /// The registered opset version this kernel serves (23, or 24 for 24–26).
+    /// The registered schema revision this kernel serves (23, 24 or 25).
     /// Controls `nonpad_kv_seqlen` acceptance (opset 24+ only).
     since_version: u32,
 }
 
 /// Factory for [`AttentionKernel`], reading the standard-`Attention` attributes.
-/// `since_version` selects the opset semantics (23 vs 24–26).
+/// `since_version` selects the opset semantics.
 pub struct AttentionFactory {
     pub since_version: u32,
 }
@@ -80,11 +85,11 @@ pub struct AttentionFactory {
 /// Answered at *claim* time: a rejection raised in the factory instead arrives
 /// after ORT has compiled the node onto this EP and is a hard session failure
 /// that no fallback recovers from. Implemented by running the factory's own
-/// attribute parse, so the two cannot disagree. `since_version` selects opset
-/// semantics inside `execute` and cannot change which nodes are rejected, so
-/// the claim-time call passes the newest.
-pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
-    attributes_from_node(node, 26).err().map(|e| e.to_string())
+/// attribute parse, so the two cannot disagree.
+pub(crate) fn unsupported_reason(node: &Node, opset: u64) -> Option<String> {
+    attributes_from_node(node, opset as u32)
+        .err()
+        .map(|e| e.to_string())
 }
 
 fn attributes_from_node(node: &Node, since_version: u32) -> Result<AttentionKernel> {
@@ -124,6 +129,7 @@ fn attributes_from_node(node: &Node, since_version: u32) -> Result<AttentionKern
     Ok(AttentionKernel {
         scale,
         is_causal,
+        window: AttentionWindow::from_node(node, u64::from(since_version))?,
         q_num_heads,
         kv_num_heads,
         qk_matmul_output_mode,
@@ -390,6 +396,25 @@ impl AttnBias for AttnMaskBias<'_> {
     }
 }
 
+struct WindowMaskBias<'a> {
+    mask: &'a Mask,
+    total_seq: usize,
+    q_seq: usize,
+    bounds: &'a [(usize, usize)],
+}
+
+impl AttnBias for WindowMaskBias<'_> {
+    #[inline]
+    fn at(&self, b: usize, head: usize, i: usize, j: usize) -> f32 {
+        let (start, end) = self.bounds[b * self.q_seq + i];
+        if j >= start && j < end {
+            self.mask.bias(b, head, i, j, self.total_seq)
+        } else {
+            f32::NEG_INFINITY
+        }
+    }
+}
+
 impl Kernel for AttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Attention", inputs, outputs, 3, 7, 1)?;
@@ -575,6 +600,28 @@ impl Kernel for AttentionKernel {
             offsets: &offsets,
             pad_limits: &pad_limits,
         };
+        let mut bounds = Vec::new();
+        if self.window.is_active() {
+            bounds.reserve(batch * q_seq);
+            for b in 0..batch {
+                let valid = pad_limits[b].map_or(total_seq, |limit| {
+                    (limit.max(0) as u64).min(total_seq as u64) as usize
+                });
+                for i in 0..q_seq {
+                    bounds.push(self.window.key_range(
+                        offsets[b].saturating_add(i as i64),
+                        valid,
+                        self.is_causal,
+                    ));
+                }
+            }
+        }
+        let window_bias = WindowMaskBias {
+            mask: &mask,
+            total_seq,
+            q_seq,
+            bounds: &bounds,
+        };
 
         let cfg = SdpaConfig {
             // √scale folded into each operand (overflow-safe), matching the
@@ -624,7 +671,11 @@ impl Kernel for AttentionKernel {
             }
         });
 
-        sdpa_f32(&tensors, &cfg, &bias, &NoMask, &mut y, qk_cap);
+        if self.window.is_active() {
+            sdpa_f32_windowed(&tensors, &cfg, &window_bias, &mut y, qk_cap, &bounds);
+        } else {
+            sdpa_f32(&tensors, &cfg, &bias, &NoMask, &mut y, qk_cap);
+        }
 
         // Write Y, reshaping back to the rank of Q.
         if q_rank == 3 {
@@ -970,6 +1021,7 @@ mod tests {
         softcap: f32,
     ) -> AttentionKernel {
         AttentionKernel {
+            window: AttentionWindow::default(),
             scale,
             is_causal,
             q_num_heads,

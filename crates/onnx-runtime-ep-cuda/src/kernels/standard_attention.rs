@@ -84,6 +84,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
     DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
     TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    attention_window::AttentionWindow,
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -463,7 +464,8 @@ extern "C" __global__ void attention_row(
     int mask_kind, int mask_rank,
     unsigned long long md0, unsigned long long md1,
     unsigned long long md2, unsigned long long md3,
-    int qk_mode, int want_qk, const int* dev_len) {
+    int qk_mode, int want_qk, const int* dev_len,
+    long long window_left, long long window_right) {
   const unsigned long long row = blockIdx.x;
   const unsigned long long total_rows = batch * q_heads * q_seq;
   if (row >= total_rows) {
@@ -490,8 +492,30 @@ extern "C" __global__ void attention_row(
       ? (b * q_seq + i) * (q_heads * head_size) + qh * head_size
       : ((b * q_heads + qh) * q_seq + i) * head_size;
 
+  const long long offset =
+      (dev_len != nullptr) ? (long long)total_seq - (long long)q_seq : offsets[b];
+  const long long pad_limit = pad_limits[b];
+  const long long position = (long long)i + offset;
+  unsigned long long begin = 0, end = total_seq;
+  if (window_left >= 0 || window_right >= 0) {
+    if (pad_limit >= 0) end = min(end, (unsigned long long)pad_limit);
+    if (window_left >= 0 && position > window_left) {
+      begin = min(end, (unsigned long long)(position - window_left));
+    }
+    const long long right = is_causal ? 0 : window_right;
+    // Clip before adding: right_window_size can be as large as INT64_MAX.
+    if (right >= 0 && end > 0 && position < (long long)(end - 1) - right) {
+      end = (unsigned long long)max(0LL, position + right + 1);
+      begin = min(begin, end);
+    }
+  }
+  // Pre-mask diagnostics still expose every QK score.
+  const bool dense_qk = want_qk && qk_mode < 2;
+  const unsigned long long score_begin = dense_qk ? 0 : begin;
+  const unsigned long long score_end = dense_qk ? total_seq : end;
+
   // Stage 1: scaled Q·Kᵀ scores (sqrt(scale) folded into each operand).
-  for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+  for (unsigned long long j = score_begin + tid; j < score_end; j += nthreads) {
     const unsigned long long koff = ((b * kv_heads + kvh) * cap + j) * head_size;
     float acc = 0.0f;
     for (unsigned long long p = 0; p < head_size; ++p) {
@@ -507,7 +531,7 @@ extern "C" __global__ void attention_row(
 
   // Stage 2: softcap (before mask), applied when nonzero.
   if (softcap != 0.0f) {
-    for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+    for (unsigned long long j = score_begin + tid; j < score_end; j += nthreads) {
       const float s = scores[srow + j];
       scores[srow + j] = softcap * tanhf(s / softcap);
     }
@@ -526,17 +550,13 @@ extern "C" __global__ void attention_row(
   // length) rather than the host `offsets[b]`, which under a frozen fixed-
   // capacity binding reports the padded capacity. Query row `i` (absolute
   // position `past + i`) attends keys `[0, past + i]`.
-  const long long offset =
-      (dev_len != nullptr) ? (long long)total_seq - (long long)q_seq : offsets[b];
-  const long long pad_limit = pad_limits[b];
-  const long long causal_limit = (long long)i + offset;
-  for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+  for (unsigned long long j = begin + tid; j < end; j += nthreads) {
     const long long jj = (long long)j;
     if (pad_limit >= 0 && jj >= pad_limit) {
       scores[srow + j] = NEG_INF;
       continue;
     }
-    if (is_causal && jj > causal_limit) {
+    if (is_causal && jj > position) {
       scores[srow + j] = NEG_INF;
       continue;
     }
@@ -546,7 +566,7 @@ extern "C" __global__ void attention_row(
   __syncthreads();
   if (want_qk && qk_mode == 2) {
     for (unsigned long long j = tid; j < total_seq; j += nthreads) {
-      store_float(qk_out, srow + j, scores[srow + j], dtype);
+      store_float(qk_out, srow + j, j >= begin && j < end ? scores[srow + j] : NEG_INF, dtype);
     }
     __syncthreads();
   }
@@ -558,7 +578,7 @@ extern "C" __global__ void attention_row(
   __shared__ int all_masked_sh;
   if (tid == 0) {
     float m = NEG_INF;
-    for (unsigned long long j = 0; j < total_seq; ++j) {
+    for (unsigned long long j = begin; j < end; ++j) {
       m = fmaxf(m, scores[srow + j]);
     }
     if (m == NEG_INF) {
@@ -567,7 +587,7 @@ extern "C" __global__ void attention_row(
     } else {
       all_masked_sh = 0;
       float sum = 0.0f;
-      for (unsigned long long j = 0; j < total_seq; ++j) {
+      for (unsigned long long j = begin; j < end; ++j) {
         const float e = expf(scores[srow + j] - m);
         scores[srow + j] = e;
         sum += e;
@@ -577,19 +597,19 @@ extern "C" __global__ void attention_row(
   }
   __syncthreads();
   if (all_masked_sh) {
-    for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+    for (unsigned long long j = begin + tid; j < end; j += nthreads) {
       scores[srow + j] = 0.0f;
     }
   } else {
     const float inv = inv_sum_sh;
-    for (unsigned long long j = tid; j < total_seq; j += nthreads) {
+    for (unsigned long long j = begin + tid; j < end; j += nthreads) {
       scores[srow + j] *= inv;
     }
   }
   __syncthreads();
   if (want_qk && qk_mode == 3) {
     for (unsigned long long j = tid; j < total_seq; j += nthreads) {
-      store_float(qk_out, srow + j, scores[srow + j], dtype);
+      store_float(qk_out, srow + j, j >= begin && j < end ? scores[srow + j] : 0.0f, dtype);
     }
     __syncthreads();
   }
@@ -601,7 +621,7 @@ extern "C" __global__ void attention_row(
       : ((b * q_heads + qh) * q_seq + i) * v_head_size;
   for (unsigned long long c = tid; c < v_head_size; c += nthreads) {
     float acc = 0.0f;
-    for (unsigned long long j = 0; j < total_seq; ++j) {
+    for (unsigned long long j = begin; j < end; ++j) {
       const unsigned long long voff = ((b * kv_heads + kvh) * cap + j) * v_head_size;
       acc += scores[srow + j] * load_float(value, voff + c, dtype);
     }
@@ -882,9 +902,13 @@ extern "C" __global__ void attention_combine(
 /// that distinct from a supplied tensor so absent mask/cache/length slots are
 /// accepted without weakening dtype checks for tensors that are present.
 pub(crate) fn unsupported_reason(
+    node: &Node,
     opset: u64,
     input_dtypes: &[DataType],
 ) -> Option<Cow<'static, str>> {
+    if let Err(error) = AttentionWindow::from_node(node, opset) {
+        return Some(Cow::Owned(error.to_string()));
+    }
     let dtype_at = |index: usize| {
         input_dtypes
             .get(index)
@@ -982,6 +1006,7 @@ pub struct StandardAttentionKernel {
     /// Explicit score scale; `None` → default `1/sqrt(head_size)`.
     scale: Option<f32>,
     is_causal: bool,
+    window: AttentionWindow,
     q_num_heads: Option<usize>,
     kv_num_heads: Option<usize>,
     qk_matmul_output_mode: i64,
@@ -1282,10 +1307,9 @@ fn std_attention_carve(
 /// conservative dense-route reservation.
 fn std_attention_staging_route(
     inputs: &[TensorMetadata<'_>],
-    is_causal: bool,
+    mask_can_supply_length: bool,
     output_count: usize,
 ) -> (bool, bool) {
-    let _ = is_causal;
     let has_past_key = inputs.get(4).is_some_and(|input| input.present);
     let has_past_value = inputs.get(5).is_some_and(|input| input.present);
     if !has_past_key || !has_past_value {
@@ -1307,7 +1331,8 @@ fn std_attention_staging_route(
     // the mask width (valid length + current) differ, so this stays false there
     // regardless of causality; it only holds once the KV+mask are frozen to a
     // common capacity, where execution appends in place without staging.
-    let fixed_capacity_append = past_key_capacity.is_some()
+    let fixed_capacity_append = mask_can_supply_length
+        && past_key_capacity.is_some()
         && past_key_capacity == past_value_capacity
         && past_key_capacity == mask_key_capacity;
     if fixed_capacity_append {
@@ -1334,7 +1359,7 @@ fn std_attention_workspace_requirement(
     inputs: &[TensorMetadata<'_>],
     q_num_heads: Option<usize>,
     kv_num_heads: Option<usize>,
-    is_causal: bool,
+    mask_can_supply_length: bool,
     output_count: usize,
 ) -> Result<WorkspaceRequirement> {
     let (Some(q), Some(k), Some(v)) = (inputs.first(), inputs.get(1), inputs.get(2)) else {
@@ -1398,7 +1423,8 @@ fn std_attention_workspace_requirement(
     if total_seq != value_total_seq {
         return Ok(WorkspaceRequirement::NONE);
     }
-    let (stage_key, stage_value) = std_attention_staging_route(inputs, is_causal, output_count);
+    let (stage_key, stage_value) =
+        std_attention_staging_route(inputs, mask_can_supply_length, output_count);
     // Present-K/V scratch is served whenever the corresponding present output
     // slot is unbound — `run` derives this from `present_*_out.is_none()`, which
     // is exactly `output_count < 2` / `< 3`, so plan and execution agree.
@@ -1551,6 +1577,7 @@ impl KernelFactory for StandardAttentionFactory {
             runtime: self.runtime.clone(),
             scale,
             is_causal,
+            window: AttentionWindow::from_node(node, u64::from(self.since_version))?,
             q_num_heads,
             kv_num_heads,
             qk_matmul_output_mode,
@@ -2116,7 +2143,8 @@ impl StandardAttentionKernel {
         // whole-step CUDA-graph capture stays shape-static. The eager-growing
         // path (past extent < present capacity, exercised by the unit tests with
         // explicit shapes) keeps host-derived lengths and is left untouched.
-        let kv_frozen = has_past_key
+        let kv_frozen = !self.window.is_active()
+            && has_past_key
             && has_past_value
             && present_key_phys > 0
             && present_value_phys > 0
@@ -2271,7 +2299,8 @@ impl StandardAttentionKernel {
             // `attention_row`), so no host length leaks into a captured causal
             // decode. Every other path passes a null pointer and keeps the
             // host-derived length, so eager/dense/GQA are bit-for-bit unchanged.
-            let dev_length_eligible = has_past_key
+            let dev_length_eligible = !self.window.is_active()
+                && has_past_key
                 && has_past_value
                 && mask.kind != 0
                 && capacity_key
@@ -2676,6 +2705,8 @@ impl StandardAttentionKernel {
                 let q_is_3d = i32::from(q.is_3d);
                 let out_is_3d = i32::from(q_rank == 3);
                 let is_causal = i32::from(self.is_causal);
+                let window_left = self.window.left.unwrap_or(-1);
+                let window_right = self.window.right.unwrap_or(-1);
                 let mask_kind = mask.kind;
                 let mask_rank = mask.rank;
                 let (md0, md1, md2, md3) = (mask.dims[0], mask.dims[1], mask.dims[2], mask.dims[3]);
@@ -2809,7 +2840,9 @@ impl StandardAttentionKernel {
                         .arg(&md3)
                         .arg(&qk_mode)
                         .arg(&want_qk_i)
-                        .arg(&dev_len_ptr);
+                        .arg(&dev_len_ptr)
+                        .arg(&window_left)
+                        .arg(&window_right);
                     unsafe {
                         builder.launch(LaunchConfig {
                             grid_dim: (grid_x, 1, 1),
@@ -2860,7 +2893,7 @@ impl StandardAttentionKernel {
             inputs,
             self.q_num_heads,
             self.kv_num_heads,
-            self.is_causal,
+            !self.window.is_active(),
             self.output_count,
         )
     }
@@ -3013,6 +3046,7 @@ mod alias_tests {
         let past_v = fill(heads * past * vdim, 5);
 
         let kernel = StandardAttentionKernel {
+            window: AttentionWindow::default(),
             runtime: rt.clone(),
             scale: None,
             is_causal: true,
@@ -3219,6 +3253,7 @@ mod alias_tests {
         let past_v = fill(heads * past * vdim, 5);
 
         let kernel = StandardAttentionKernel {
+            window: AttentionWindow::default(),
             runtime: rt.clone(),
             scale: None,
             is_causal: true,
@@ -3391,6 +3426,7 @@ mod alias_tests {
             return;
         };
         let kernel = StandardAttentionKernel {
+            window: AttentionWindow::default(),
             runtime: rt.clone(),
             scale: None,
             is_causal: false,
@@ -3492,6 +3528,7 @@ mod alias_tests {
             return;
         };
         let kernel = StandardAttentionKernel {
+            window: AttentionWindow::default(),
             runtime: rt.clone(),
             scale: None,
             is_causal: false,
@@ -3666,12 +3703,17 @@ mod workspace_governance_tests {
         let mut fixed = dense_inputs(DataType::Float16, 1, 1, 2048);
         fixed[3] = meta(DataType::Float32, Box::leak(Box::new([1, 1, 1, 2048])));
         assert_eq!(
-            std_attention_staging_route(&fixed, false, 3),
+            std_attention_staging_route(&fixed, true, 3),
             (false, false),
             "mask-driven non-causal fixed-capacity append must report no staging"
         );
         let fixed_req =
-            std_attention_workspace_requirement(&fixed, Some(32), Some(8), false, 3).unwrap();
+            std_attention_workspace_requirement(&fixed, Some(32), Some(8), true, 3).unwrap();
+        assert_eq!(
+            std_attention_staging_route(&fixed, false, 3),
+            (true, true),
+            "windowed Attention must reserve for logical cache growth, not infer length from mask width"
+        );
         // Bound present outputs charge zero staged-K/V bytes; the composite keeps
         // its always-live scores plus the per-batch control arrays.
         let fixed_layout = std_attention_workspace_layout(
@@ -3840,10 +3882,28 @@ mod claim_tests {
     use super::*;
 
     #[test]
+    fn attention25_window_claim_is_opset_and_value_aware() {
+        use onnx_runtime_ir::{Attribute, NodeId};
+
+        let mut node = Node::new(NodeId(0), "Attention", vec![], vec![]);
+        let types = [DataType::Float32; 3];
+        node.attributes
+            .insert("left_window_size".into(), Attribute::Int(0));
+        let reason = unsupported_reason(&node, 24, &types).unwrap();
+        assert!(reason.contains("requires opset 25"));
+        assert!(unsupported_reason(&node, 25, &types).is_none());
+        node.attributes
+            .insert("right_window_size".into(), Attribute::Int(-2));
+        let reason = unsupported_reason(&node, 25, &types).unwrap();
+        assert!(reason.contains("invalid right_window_size"));
+    }
+
+    #[test]
     fn accepts_float32_additive_mask_for_half_attention() {
         for activation_dtype in [DataType::Float16, DataType::BFloat16] {
             assert!(
                 unsupported_reason(
+                    &Node::new(onnx_runtime_ir::NodeId(0), "Attention", vec![], vec![]),
                     24,
                     &[
                         activation_dtype,

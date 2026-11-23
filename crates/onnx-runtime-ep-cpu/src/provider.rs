@@ -578,7 +578,7 @@ impl ExecutionProvider for CpuExecutionProvider {
             ("Attention", "com.microsoft") => {
                 crate::kernels::msft_attention::unsupported_reason(op)
             }
-            ("Attention", "ai.onnx") => crate::kernels::attention::unsupported_reason(op),
+            ("Attention", "ai.onnx") => crate::kernels::attention::unsupported_reason(op, opset),
             _ => None,
         };
         if let Some(reason) = attribute_reason {
@@ -1518,6 +1518,20 @@ mod tests {
                 "ai.onnx",
                 23,
                 ("qk_matmul_output_mode", Attribute::Int(7)),
+                &[],
+            ),
+            (
+                "Attention",
+                "ai.onnx",
+                24,
+                ("left_window_size", Attribute::Int(0)),
+                &[],
+            ),
+            (
+                "Attention",
+                "ai.onnx",
+                25,
+                ("right_window_size", Attribute::Int(-2)),
                 &[],
             ),
             (
