@@ -278,7 +278,13 @@ impl MoEKernel {
         } else {
             rows
         };
-        let widths = expert_bank_widths(&self.attributes, hidden, inter, fc1, has_fc3)?;
+        let mut widths = expert_bank_widths(&self.attributes, hidden, inter, fc1, has_fc3)?;
+        if grouped_possible && self.attributes.is_gated(has_fc3) {
+            // Parallel grouped activation still needs a separate destination;
+            // serial experts compact FC1 and need only the base bank widths.
+            widths[0] = widths[0].max(inter);
+            widths[1] = widths[1].max(hidden);
+        }
         let regions = widths.map(|width| {
             let elements = bound.checked_mul(width).ok_or_else(invalid)?;
             std::alloc::Layout::array::<f32>(elements).map_err(|_| invalid())
@@ -1077,29 +1083,15 @@ fn expert_bias<'a>(
     })
 }
 
-/// Per-expert projections have already added bias; grouped projections add it
-/// here, including their existing +0 operation when an optional bias is absent.
-/// Distinct static states keep that decision out of the element loop.
-trait ActivationBias: Copy {
-    fn value(self, linear: bool, index: usize, value: f32) -> f32;
-}
-
+/// Grouped projections add bias here, including their existing +0 operation
+/// when an optional bias is absent. Per-expert activation consumes biased FCs.
 #[derive(Clone, Copy)]
-struct AppliedActivationBias;
-
-impl ActivationBias for AppliedActivationBias {
-    fn value(self, _linear: bool, _index: usize, value: f32) -> f32 {
-        value
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PendingActivationBias<'a> {
+struct ActivationBias<'a> {
     fc1: Option<&'a [f32]>,
     linear: Option<&'a [f32]>,
 }
 
-impl ActivationBias for PendingActivationBias<'_> {
+impl ActivationBias<'_> {
     fn value(self, linear: bool, index: usize, value: f32) -> f32 {
         value + if linear { self.linear } else { self.fc1 }.map_or(0.0, |bias| bias[index])
     }
@@ -1111,13 +1103,40 @@ fn gated_activation_row(
     fc3: Option<&[f32]>,
     inter: usize,
     attributes: &MoeAttributes,
-    bias: impl ActivationBias,
+    bias: ActivationBias<'_>,
 ) {
     let linear = fc3.unwrap_or(fc1);
     for (index, value) in output.iter_mut().enumerate() {
         let (g, l) = attributes.gated_pair_indices(index, inter, fc3.is_some());
         *value = attributes.swiglu(bias.value(false, g, fc1[g]), bias.value(true, l, linear[l]));
     }
+}
+
+/// Compact already-biased gates into FC1's initialized prefix. Each gate and
+/// linear value is copied before its destination is overwritten. For separate
+/// FC3, destination equals gate; for fused layouts it never follows either
+/// source. Forward row order therefore cannot overwrite a future source row.
+/// The parallel grouped driver retains its separate activation destination.
+fn compact_gated_activation<'a>(
+    fc1: &'a mut [f32],
+    fc3: Option<&[f32]>,
+    rows: usize,
+    fc1_size: usize,
+    inter: usize,
+    attributes: &MoeAttributes,
+) -> &'a [f32] {
+    for row in 0..rows {
+        for index in 0..inter {
+            let (g, l) = attributes.gated_pair_indices(index, inter, fc3.is_some());
+            let gate = fc1[row * fc1_size + g];
+            let linear = match fc3 {
+                Some(linear) => linear[row * inter + l],
+                None => fc1[row * fc1_size + l],
+            };
+            fc1[row * inter + index] = attributes.swiglu(gate, linear);
+        }
+    }
+    &fc1[..rows * inter]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1147,7 +1166,7 @@ fn apply_gated_activation(
             fc3,
             inter,
             attributes,
-            PendingActivationBias {
+            ActivationBias {
                 fc1: fc1_bias,
                 linear: linear_bias,
             },
@@ -1177,7 +1196,8 @@ pub(super) struct ExpertProjections<'a, P> {
     pub(super) fc3_bias: Option<&'a [f32]>,
 }
 
-/// Bank widths follow live ranges, independently of the projection encoding.
+/// Serial expert banks: A holds gather/output, B holds projections/activation.
+/// Grouped drivers add their parallel staging requirements at their caller.
 pub(super) fn expert_bank_widths(
     attributes: &MoeAttributes,
     hidden: usize,
@@ -1185,12 +1205,8 @@ pub(super) fn expert_bank_widths(
     fc1: usize,
     has_fc3: bool,
 ) -> Result<[usize; 2]> {
-    if attributes.is_gated(has_fc3) {
-        let projections = fc1.checked_add(if attributes.uses_separate_gate(has_fc3) { inter } else { 0 }).ok_or_else(|| error(format!("expert bank width overflows for hidden={hidden}, intermediate={inter}, FC1={fc1}; reduce projection dimensions")))?;
-        Ok([hidden.max(inter), projections.max(hidden)])
-    } else {
-        Ok([hidden, inter])
-    }
+    let projections = fc1.checked_add(if attributes.uses_separate_gate(has_fc3) { inter } else { 0 }).ok_or_else(|| error(format!("expert bank width overflows for hidden={hidden}, intermediate={inter}, FC1={fc1}; reduce projection dimensions")))?;
+    Ok([hidden, projections])
 }
 
 impl<'a> MoeWorkspace<'a> {
@@ -1286,32 +1302,19 @@ impl<'a> MoeWorkspace<'a> {
         } else {
             None
         };
-        if attributes.is_gated(weights.fc3.is_some()) {
-            let activated = self.input.zeroed_prefix(rows * inter)?;
-            // Preserve serial per-expert activation and already-applied bias.
-            if inter != 0 {
-                for (row, target) in activated.chunks_mut(inter).enumerate() {
-                    gated_activation_row(
-                        target,
-                        &fc1[row * fc1_size..(row + 1) * fc1_size],
-                        fc3.map(|linear| &linear[row * inter..(row + 1) * inter]),
-                        inter,
-                        attributes,
-                        AppliedActivationBias,
-                    );
-                }
-            }
-            let output = self.projection.zeroed_prefix(rows * hidden)?;
-            apply(weights.fc2, activated, rows, weights.fc2_bias, output)?;
-            Ok(output)
+        // Every per-expert variant now uses A for gather/output and B for
+        // projection/activation. No activation clear or extra bank is needed.
+        let activated = if attributes.is_gated(weights.fc3.is_some()) {
+            compact_gated_activation(fc1, fc3, rows, fc1_size, inter, attributes)
         } else {
             for value in fc1.iter_mut() {
                 *value = activate(attributes.activation, *value);
             }
-            let output = self.input.zeroed_prefix(rows * hidden)?;
-            apply(weights.fc2, fc1, rows, weights.fc2_bias, output)?;
-            Ok(output)
-        }
+            &*fc1
+        };
+        let output = self.input.zeroed_prefix(rows * hidden)?;
+        apply(weights.fc2, activated, rows, weights.fc2_bias, output)?;
+        Ok(output)
     }
 }
 
@@ -1830,6 +1833,68 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn compact_gated_activation_preserves_future_rows_and_unused_capacity() {
+        for rows in [0, 1, 3] {
+            for inter in [0, 1, 5] {
+                let gate = ramp(rows * inter, 7, 0.25, -0.5);
+                let linear = ramp(rows * inter, 11, -0.125, 0.75);
+                for fusion in 0..=2 {
+                    let attributes = MoeAttributes {
+                        k: 1,
+                        activation: Activation::Swiglu,
+                        normalize_routing_weights: false,
+                        swiglu_fusion: fusion,
+                        activation_alpha: 1.25,
+                        activation_beta: 0.5,
+                        swiglu_limit: 2.0,
+                    };
+                    let fc1_size = if fusion == 0 { inter } else { 2 * inter };
+                    let mut storage = Vec::new();
+                    for row in 0..rows {
+                        let gate = &gate[row * inter..(row + 1) * inter];
+                        let linear = &linear[row * inter..(row + 1) * inter];
+                        match fusion {
+                            0 => storage.extend_from_slice(gate),
+                            1 => {
+                                storage.extend(gate.iter().zip(linear).flat_map(|(&g, &l)| [g, l]))
+                            }
+                            _ => {
+                                storage.extend_from_slice(gate);
+                                storage.extend_from_slice(linear);
+                            }
+                        }
+                    }
+                    storage.extend_from_slice(&[29.0; 7]);
+                    let original = storage.clone();
+                    let expected = gate
+                        .iter()
+                        .zip(&linear)
+                        .map(|(&gate, &linear)| attributes.swiglu(gate, linear).to_bits())
+                        .collect::<Vec<_>>();
+                    let output = compact_gated_activation(
+                        &mut storage,
+                        (fusion == 0).then_some(linear.as_slice()),
+                        rows,
+                        fc1_size,
+                        inter,
+                        &attributes,
+                    );
+                    assert_eq!(
+                        output.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        expected,
+                        "rows={rows}, inter={inter}, fusion={fusion}"
+                    );
+                    assert_eq!(
+                        &storage[rows * inter..],
+                        &original[rows * inter..],
+                        "compaction writes only the active prefix"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn gated_row_bias_states_preserve_layouts_and_signed_zero() {
         let gate = [-0.0, -2.0, 3.0];
         let linear = [1.0, 2.0, -3.0];
@@ -1852,15 +1917,9 @@ mod tests {
             };
             let fc1 = arrange(&gate, &linear);
             let fc3 = (fusion == 0).then_some(&linear[..]);
-            let mut applied = [29.0; 3];
-            gated_activation_row(
-                &mut applied,
-                &fc1,
-                fc3,
-                3,
-                &attributes,
-                AppliedActivationBias,
-            );
+            let mut storage = fc1.clone();
+            let applied = compact_gated_activation(&mut storage, fc3, 1, fc1.len(), 3, &attributes);
+            let applied: [f32; 3] = applied.try_into().unwrap();
             let expected =
                 std::array::from_fn::<_, 3, _>(|i| attributes.swiglu(gate[i], linear[i]));
             assert_eq!(applied.map(f32::to_bits), expected.map(f32::to_bits));
@@ -1874,7 +1933,7 @@ mod tests {
                     fc3,
                     3,
                     &attributes,
-                    PendingActivationBias {
+                    ActivationBias {
                         fc1: biased.then_some(fc1_bias.as_slice()),
                         linear: biased.then_some(if fusion == 0 {
                             &linear_bias[..]
@@ -2293,11 +2352,11 @@ mod tests {
                             rows * if threshold == 0 { 2 } else { 1 }
                         };
                         let gated = activation == Activation::Swiglu || separate;
-                        let widths = if gated {
+                        let widths = if gated && threshold == 0 {
                             hidden.max(inter)
                                 + (fc1_size + if separate { inter } else { 0 }).max(hidden)
                         } else {
-                            hidden + inter
+                            hidden + fc1_size + if separate { inter } else { 0 }
                         };
                         assert_eq!(req.bytes, ((bound * widths + rows * hidden) * 4) as u64);
                         let books = RecordingGovernor::new_host(req.bytes);

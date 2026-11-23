@@ -2456,3 +2456,24 @@ not a performance conclusion. Preserve all failed gates and keep the candidate
 in draft while improving attribution. Fixed bank capacity increases retention
 even for a singleton that borrows its input; no RSS or full-process cap claim
 follows from removing FC result Vecs.
+
+The next candidate compacts already-biased serial expert activation in FC1's
+initialized prefix. Every source pair is read before writing its earlier or
+equal destination; forward row order preserves unread fused rows. Serial
+variants now uniformly use A for gather/output and B for projections/activation,
+without a separate activation clear. Their widths are hidden and FC1 plus
+optional FC3. Float metadata adds the old staging maxima only when the parallel
+grouped driver is possible; that driver keeps its separate destination and
+threading policy. This reduces actual admitted serial capacity without a new
+resource operation or changes to concurrent ownership and physical settlement.
+
+The no-longer-used applied-bias marker and private bias trait are removed.
+Grouped activation retains one pending-bias value carrying optional payloads,
+including its existing +0 operation. Serial compaction consumes already-biased
+FC results directly. Signed-zero, three gate layouts, multiple rows, asymmetric
+widths, empty axes, future-source preservation and untouched capacity are covered.
+Native and MLAS-reference Float MoE 26 (plus one existing ignored), Block MoE 29,
+and Block MatMul 38 (plus one existing ignored) pass, with strict CPU all-target
+Clippy in both configurations. The exact-capacity warm-callback and failure
+publication guards remain. Performance acceptance of the whole candidate is
+still required; this storage simplification is not adoption or a speed claim.

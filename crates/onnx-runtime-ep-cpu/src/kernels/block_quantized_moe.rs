@@ -1832,11 +1832,7 @@ mod tests {
                 .bytes()
                 .max(l2.bytes())
                 .max(if separate { l3.bytes() } else { 0 });
-            let bank_widths = if activation == "identity" {
-                hidden + inter
-            } else {
-                hidden.max(inter) + (fc1_size + if separate { inter } else { 0 }).max(hidden)
-            };
+            let bank_widths = hidden + fc1_size + if separate { inter } else { 0 };
             assert_eq!(
                 req.bytes, (max + rows * (bank_widths + hidden) * std::mem::size_of::<f32>()) as u64,
                 "serial experts share decoding, two phase banks and one accumulator, without k*E multiplication"
