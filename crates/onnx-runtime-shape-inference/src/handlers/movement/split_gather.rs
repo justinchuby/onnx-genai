@@ -189,10 +189,22 @@ pub fn split(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 
 /// `Gather`: `data[:axis] + indices.shape + data[axis+1:]`.
 pub fn gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    gather_impl(ctx, false)
+}
+
+pub fn affine_gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    gather_impl(ctx, true)
+}
+
+fn gather_impl(ctx: &mut InferenceContext, dequantize: bool) -> Result<(), ShapeInferError> {
     let Some(data) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
         return Ok(());
     };
-    let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
+    let dtype = if dequantize {
+        DataType::Float32
+    } else {
+        ctx.input_dtype(0).unwrap_or(DataType::Float32)
+    };
     let rank = data.len();
     if rank == 0 {
         return Err(ShapeInferError::InvalidRank {
@@ -223,7 +235,8 @@ pub fn gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     ctx.set_output(0, dtype, out);
 
     // Shape-data: gathering elements of a 1-D shape vector on axis 0.
-    if axis == 0
+    if !dequantize
+        && axis == 0
         && let Some(sd) = gather_shape_data(ctx)
     {
         ctx.set_output_shape_data(0, sd);
