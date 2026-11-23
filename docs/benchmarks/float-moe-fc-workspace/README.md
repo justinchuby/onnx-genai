@@ -42,8 +42,9 @@ Both GEMM paths retain their zero-initialized destination convention. Per-expert
 activation stays serial; grouped activation/gather retain the old threshold and
 worker budget. Applied/Pending bias modes preserve the old bias and absent-bias
 `+0` order, including their distinction from already biased projections. The
-existing `activate`/`swiglu` math and fused-pair classification are shared.
-QMoE/BlockQuantizedMoE continue to use their active owned-result projection seam.
+existing `activate`/`swiglu` math is shared; both Float workspace routes share
+fused-pair classification. QMoE/BlockQuantizedMoE keep their active owned-result
+seam and its original bulk-copy split-half path.
 
 ## Correctness and ownership evidence
 
@@ -70,9 +71,12 @@ Baseline is `4ccc0ce2d36f2d87197e4ef41e9e0b669789a9d1`: the previous gather-only
 workspace with the linked-file identity fix. `candidate.patch` reconstructs the
 measured candidate. After rebasing onto main #2447 (`28fad980b`), the same three
 source files are preserved at `e165460c0c6d4f1367f536810e6b8b23fd02254d`.
-The subsequent report change corrects only the scalar-oracle Rustdoc;
-`source-after-measurement.patch` and `published-source.json` record it. Runtime
-expressions, layouts and guards are unchanged. These timings must not be
+Subsequent review corrects the scalar-oracle Rustdoc and restores the original
+bulk-copy split-half path in the owned projection helper, outside the timed
+Float workspace path. `source-after-measurement.patch` and
+`published-source.json` record these differences and byte-identical hashes for
+the entire timed Float prefix and shared GEMM primitive. Float expressions,
+layouts and guards are unchanged. These timings must not be
 relabeled as a comparison against a later main commit.
 
 Apple M1 Max / ARM64 / macOS 27.0.1, Rust 1.98 release, native CPU backend.
@@ -158,3 +162,11 @@ After verification, five probe copies/aliases and the private Miri target were
 removed under the shared lock: 902,526,372 logical bytes, without a measured
 physical-disk saving. `cleanup.json` records verified executable hashes.
 Sources, raw results, shared dependencies and the stable lock inode remain.
+
+Final review restored the pre-existing bulk-copy split-half loop in the owned
+projection helper; the timed Float prefix and shared GEMM primitive remain
+byte-identical to the measured checkpoint. Complete native CPU 2,019, MLAS CPU
+2,061, session 296, layout 11 and strict native/MLAS all-target Clippy passed
+again. `post-review-validation.json` records counts and final raw-log hashes;
+those logs remain in `/tmp/nxrt-float-moe-fc-validation`. No timings were rerun
+or substituted for this owned-path preservation.

@@ -1449,10 +1449,14 @@ pub(super) fn run_expert_projections<P: ExpertProjection>(
                 let mut gate = Vec::with_capacity(rows * inter);
                 let mut linear = Vec::with_capacity(rows * inter);
                 for row in fc1_out.chunks_exact(fc1_size) {
-                    for index in 0..inter {
-                        let (g, l) = attributes.gated_pair_indices(index, inter, false);
-                        gate.push(row[g]);
-                        linear.push(row[l]);
+                    if attributes.swiglu_fusion == 1 {
+                        for pair in row.as_chunks::<2>().0 {
+                            gate.push(pair[0]);
+                            linear.push(pair[1]);
+                        }
+                    } else {
+                        gate.extend_from_slice(&row[..inter]);
+                        linear.extend_from_slice(&row[inter..]);
                     }
                 }
                 (gate, linear)
