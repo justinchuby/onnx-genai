@@ -819,6 +819,12 @@ impl Executor {
         peak_persistent: WorkspaceRequirement,
         peak_step: WorkspaceRequirement,
     ) -> Result<WorkspaceRequirement> {
+        if peak_step.bytes != 0 {
+            self.restore_completed_step_workspace();
+        }
+        let replacement = WorkspaceReplacement::for_captures(&self.slot_capture);
+        replacement.check(self.persistent_workspace.as_ref(), peak_persistent)?;
+        replacement.check(self.step_workspace.as_ref(), peak_step)?;
         Self::reserve_prepared_workspace(
             self.ep.as_ref(),
             &mut self.persistent_workspace,
@@ -989,11 +995,20 @@ impl Executor {
         // address), keep the StepScoped scratch alive so a later replay reads a
         // valid pointer. `reserve_prepared_workspace` reuses it whenever the next
         // requirement fits, so the pointer stays stable across replays.
-        if self.pin_step_workspace {
+        if self.pin_step_workspace
+            || matches!(
+                WorkspaceReplacement::for_captures(&self.slot_capture),
+                WorkspaceReplacement::CapturePinned
+            )
+        {
             return Ok(());
         }
         if let Some(workspace) = self.step_workspace.take() {
-            self.ep.deallocate_workspace(workspace.buffer)?;
+            if self.workspace_completion == WorkspaceCompletion::Completed {
+                self.workspace_reuse.recycle(&self.ep, workspace)?;
+            } else {
+                self.ep.deallocate_workspace(workspace.buffer)?;
+            }
         }
         Ok(())
     }
