@@ -89,6 +89,12 @@ plugin EPs (via C ABI bridge) handle them.
 | Trilu | 14 | CPU implemented; causal mask generation, optional int64 `k` input. |
 | RotaryEmbedding | 22 | Added in opset 22 (ONNX standard). |
 
+The opset-27 recurrent kernels also cover opset 28; the revised opset-29
+schemas are distinct. Native `Range-27` evaluates the documented indexed
+progression in the selected precision. The upstream function expansion instead
+adds `delta` repeatedly, so an expanded graph can produce different floating-point
+rounding. The CUDA plugin declines runtime-valued shape reads for `Range`.
+
 > **Note:** RotaryEmbedding exists in both standard ONNX (opset 22+) and com.microsoft contrib domain. Prefer standard domain when target opset ≥ 22. Contrib variant retained for backward compatibility with older models.
 | Attention | — | Not standard yet; we use contrib version. |
 
