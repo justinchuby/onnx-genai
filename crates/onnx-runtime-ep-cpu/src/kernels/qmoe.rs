@@ -2105,7 +2105,7 @@ fn error(message: impl Into<String>) -> EpError {
 mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
-    use crate::kernels::testutil::Owned;
+    use crate::kernels::testutil::{Owned, PreparedTestKernel};
     use crate::weight_offload::{WeightOffloadMode, WeightOffloadStats, metrics};
     use onnx_runtime_ep_api::{DevicePtr, ExecutionProvider};
     use onnx_runtime_ir::{Attribute, DeviceId, Graph, NodeId, WeightRef, static_shape};
@@ -3443,7 +3443,7 @@ mod tests {
         let mut float_output = Owned::zeros_f32(&[rows, hidden]);
         kernel(&float_graph, float_node)
             .unwrap()
-            .execute(
+            .execute_prepared(
                 &[
                     x.view(),
                     router_tensor.view(),

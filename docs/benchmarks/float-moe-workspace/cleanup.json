@@ -1,0 +1,32 @@
+{
+  "removed_verified_probe_copies": [
+    {
+      "path": "/tmp/nxrt-float-moe-perf/baseline-probe",
+      "logical_bytes": 13756208,
+      "sha256": "49e0241aec483435f3f18ea49a82d6cde91d6c85ff3e2470cba8f2319696667c"
+    },
+    {
+      "path": "/tmp/nxrt-float-moe-perf/after-probe",
+      "logical_bytes": 13910992,
+      "sha256": "03fbce5a82eca30151e3dd09afb3a4034f135566b1f4e808ecb18352da0ed770"
+    },
+    {
+      "path": "/tmp/nxrt-float-moe-perf/null-probe",
+      "logical_bytes": 13756208,
+      "sha256": "49e0241aec483435f3f18ea49a82d6cde91d6c85ff3e2470cba8f2319696667c"
+    },
+    {
+      "path": "/tmp/nxrt-erf-nan-target/release/nxrt-float-moe-probe",
+      "logical_bytes": 13910992,
+      "sha256": "03fbce5a82eca30151e3dd09afb3a4034f135566b1f4e808ecb18352da0ed770"
+    },
+    {
+      "path": "/tmp/nxrt-erf-nan-target/release/deps/nxrt_float_moe_probe-8b20355f64c6321e",
+      "logical_bytes": 13910992,
+      "sha256": "03fbce5a82eca30151e3dd09afb3a4034f135566b1f4e808ecb18352da0ed770"
+    }
+  ],
+  "logical_bytes": 69245392,
+  "stable_lock_preserved": true,
+  "sources_logs_raw_outputs_preserved": true
+}

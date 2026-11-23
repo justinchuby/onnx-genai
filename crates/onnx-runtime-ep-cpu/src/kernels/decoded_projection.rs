@@ -127,6 +127,46 @@ impl<'a> ProjectionScratch<'a> {
         Ok(unsafe { std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast(), written) })
     }
 
+    /// Gather in caller-selected whole-row tasks, preserving its threading
+    /// policy. Each returned element is written once; unused capacity is untouched.
+    pub(super) fn gather_rows_parallel(
+        &mut self,
+        input: &[f32],
+        width: usize,
+        rows: &[u32],
+        rows_per_task: std::num::NonZeroUsize,
+    ) -> Result<&mut [f32]> {
+        if width == 0 || rows.is_empty() {
+            return Ok(&mut []);
+        }
+        let count = rows.len().checked_mul(width).ok_or_else(|| {
+            EpError::KernelFailed(
+                "projection parallel gather size overflow; reduce routed batch dimensions".into(),
+            )
+        })?;
+        let capacity = self.storage.len();
+        let target = self.storage.get_mut(..count).ok_or_else(|| EpError::KernelFailed(
+            format!("projection parallel gather needs {count} values, workspace has {capacity}; prepare the complete grouped-input bound")
+        ))?;
+        // count above proves this clamped chunk multiplication addressable.
+        let chunk_rows = rows_per_task.get().min(rows.len());
+        target.par_chunks_mut(chunk_rows * width).zip(rows.par_chunks(chunk_rows)).try_for_each(|(target, rows)| -> Result<()> {
+            for (target, &row) in target.chunks_mut(width).zip(rows) {
+                let start = (row as usize).checked_mul(width).ok_or_else(|| EpError::KernelFailed(
+                    format!("projection input row {row} times width {width} overflows addressable storage")
+                ))?;
+                let source = input.get(start..).and_then(|rest| rest.get(..width)).ok_or_else(|| EpError::KernelFailed(
+                    format!("projection input row {row} of width {width} exceeds {} input values; validate routed row indices", input.len())
+                ))?;
+                for (target, &value) in target.iter_mut().zip(source) { target.write(value); }
+            }
+            Ok(())
+        })?;
+        // SAFETY: disjoint complete rows were initialized above. A failed
+        // gather never creates an f32 slice over partially initialized backing.
+        Ok(unsafe { std::slice::from_raw_parts_mut(target.as_mut_ptr().cast(), count) })
+    }
+
     pub(super) fn initialized(&mut self) -> &mut [f32] {
         if !self.initialized {
             // SAFETY: binding exclusively lends every element. All-zero bytes

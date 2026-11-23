@@ -1,0 +1,29 @@
+{
+  "main_base": "e127e6ceb8962d6037e01e8840fe0363a45f236b",
+  "files": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs": {
+      "sha256": "355acc330de7007c40bea5e33fba7846f9f405e8afec4b19acdcd949b297090c",
+      "matches_measured_candidate": true
+    },
+    "crates/onnx-runtime-ep-cpu/src/kernels/mod.rs": {
+      "sha256": "a5fb52f3885990fd3e82188c57ec05519da8498ac6c8ee6a41341f558b86907a",
+      "matches_measured_candidate": false
+    },
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": {
+      "sha256": "99755fd567ff19169c73e816cb113798bf50867864634949c62d7a6a20289c39",
+      "matches_measured_candidate": false,
+      "production_prefix_before_test_module_sha256": "ca1f1f5359b500afd71403baa06662daa4f0e50ea47ba08c2fba2f36f0055b3f",
+      "production_matches_measured_candidate": true
+    },
+    "crates/onnx-runtime-ep-cpu/tests/decoded_projection_layout.rs": {
+      "sha256": "47750e0e08e0573c161b1a7138554cca41509aa9448b3f3a03a06d84b4f3ad95",
+      "matches_measured_candidate": true
+    },
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": {
+      "sha256": "311224ea3d57a9fc2e5d88b2f87865032cde24701100a7da47739343ba245077",
+      "production_unchanged_from_main": true,
+      "note": "Float reference test call uses existing PreparedTestKernel; no QMoE runtime migration included."
+    }
+  },
+  "note": "Rebase excludes pending #2446. Float MoE production code and shared projection helper match measured candidate; MoE test now honors an MLAS budget below Rayon width and checks callback counts across routing changes. QMoE float-reference test prepares workspace. Historical timings retain d216 baseline."
+}

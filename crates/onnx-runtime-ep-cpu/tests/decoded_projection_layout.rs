@@ -247,3 +247,68 @@ fn fixed_plan_rejects_overflow_and_mismatched_storage_before_decoding() {
         .unwrap_err();
     assert!(error.to_string().contains("bind the matching plan"));
 }
+
+#[test]
+fn parallel_gather_initializes_complete_rows_and_recovers_after_refusal() {
+    use decoded_projection::ProjectionScratch;
+    use onnx_runtime_ep_api::{DevicePtrMut, WorkspaceView};
+    use std::{mem::MaybeUninit, num::NonZeroUsize};
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    for chunk_rows in [1, 2, 8] {
+        pool.install(|| {
+            let mut backing = [MaybeUninit::<f32>::uninit(); 8];
+            let bytes = std::mem::size_of_val(&backing);
+            // SAFETY: private Host storage is exclusively lent within this call.
+            let mut scratch = unsafe {
+                ProjectionScratch::bind(
+                    "parallel gather fixture",
+                    bytes,
+                    Some(WorkspaceView::new(
+                        DevicePtrMut(backing.as_mut_ptr().cast()),
+                        bytes,
+                    )),
+                )
+            }
+            .unwrap();
+            let chunk = NonZeroUsize::new(chunk_rows).unwrap();
+            let input = [0., 1., 2., 3., 4., 5., 6., 7.];
+            assert!(
+                scratch
+                    .gather_rows_parallel(&input, 2, &[0, 1, 2, 3, 0], chunk)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("workspace has 8")
+            );
+            assert!(
+                scratch
+                    .gather_rows_parallel(&input, 2, &[0, 8, 1], chunk)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exceeds 8 input values")
+            );
+            for _ in 0..3 {
+                assert_eq!(
+                    scratch
+                        .gather_rows_parallel(&input, 2, &[3, 1, 3], chunk)
+                        .unwrap(),
+                    [6., 7., 2., 3., 6., 7.]
+                );
+            }
+            assert!(
+                scratch
+                    .gather_rows_parallel(&[], 0, &[9], chunk)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                scratch
+                    .gather_rows_parallel(&input, 2, &[], chunk)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+}
