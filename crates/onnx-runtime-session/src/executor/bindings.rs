@@ -622,6 +622,7 @@ impl Executor {
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
     ) -> Result<WorkspaceRequirement> {
+        self.ensure_execution_scope_ready()?;
         if self.heterogeneous.is_some() {
             return Err(heterogeneous_api_error(
                 "workspace preparation with persistent device bindings",
@@ -984,7 +985,67 @@ impl Executor {
         Ok(())
     }
 
+    pub(crate) fn ensure_execution_scope_ready(&self) -> Result<()> {
+        if let ExecutionScopeState::Failed(source) = &self.execution_scope {
+            return Err(SessionError::ExecutionScopeBoundary {
+                source: source.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_execution_scope(&mut self) -> Result<()> {
+        self.ensure_execution_scope_ready()?;
+        if self.heterogeneous.is_some() {
+            return Err(heterogeneous_api_error("active execution workspace scope"));
+        }
+        if matches!(self.execution_scope, ExecutionScopeState::Active) {
+            return Err(SessionError::Internal("execution scope already active; finish the existing exclusive runner before borrowing another".into()));
+        }
+        if self.pending_device_validation.is_some() {
+            self.settle_execution_scope_boundary()?;
+        }
+        self.execution_scope = ExecutionScopeState::Active;
+        Ok(())
+    }
+
+    fn settle_execution_scope_boundary(&mut self) -> Result<()> {
+        // A completed run may already have consumed its receipt. Do not
+        // require a second receipt for the same submission. Preparation can
+        // still enqueue provider work, so even that case synchronizes before return.
+        let completion = if self.pending_device_validation.is_some() {
+            self.finish_device_validation_boundary()
+        } else {
+            self.ep.sync().map_err(SessionError::from)
+        };
+        if let Err(error) = completion {
+            let source = std::sync::Arc::new(error);
+            self.execution_scope = ExecutionScopeState::Failed(source.clone());
+            return Err(SessionError::ExecutionScopeBoundary { source });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_execution_scope(&mut self) -> Result<()> {
+        self.ensure_execution_scope_ready()?;
+        if !matches!(self.execution_scope, ExecutionScopeState::Active) {
+            return Err(SessionError::Internal(
+                "execution scope is not active; finish only the runner that owns this borrow"
+                    .into(),
+            ));
+        }
+        // Any error can precede synchronization. Never recycle on failed validation.
+        self.settle_execution_scope_boundary()?;
+        self.execution_scope = ExecutionScopeState::PerRun;
+        // Deallocation consumes the owner even on failure. Do not retry it.
+        self.release_step_workspace()
+    }
+
     pub(super) fn release_step_workspace(&mut self) -> Result<()> {
+        self.ensure_execution_scope_ready()?;
+        if matches!(self.execution_scope, ExecutionScopeState::Active) {
+            return Ok(());
+        }
         // When pinned (an installed fixed-shape verify graph baked this buffer's
         // address), keep the StepScoped scratch alive so a later replay reads a
         // valid pointer. `reserve_prepared_workspace` reuses it whenever the next

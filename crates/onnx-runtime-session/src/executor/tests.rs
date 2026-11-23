@@ -16430,3 +16430,447 @@ fn a_false_no_workspace_declaration_is_rejected_before_late_allocation() {
     );
     assert!(executor.step_workspace.is_none());
 }
+struct ExecutionScopeEp {
+    cpu: CpuExecutionProvider,
+    checkouts: AtomicUsize,
+    returns: AtomicUsize,
+    syncs: AtomicUsize,
+    fail_sync: AtomicBool,
+    fail_return: AtomicBool,
+}
+struct ScopeReturnFailure(onnx_runtime_ep_api::WorkspaceAllocation);
+impl std::fmt::Debug for ScopeReturnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ScopeReturnFailure retaining {} bytes", self.0.len())
+    }
+}
+impl std::fmt::Display for ScopeReturnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "forced workspace return failure; error retains the completed owner"
+        )
+    }
+}
+impl std::error::Error for ScopeReturnFailure {}
+impl ExecutionProvider for ExecutionScopeEp {
+    fn name(&self) -> &str {
+        "execution_scope_test"
+    }
+    fn device_type(&self) -> onnx_runtime_ir::DeviceType {
+        self.cpu.device_type()
+    }
+    fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+        self.cpu.device_id()
+    }
+    fn initialize(&mut self, config: &EpConfig) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.initialize(config)
+    }
+    fn shutdown(&mut self) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.shutdown()
+    }
+    fn supports_op(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        dtypes: &[DataType],
+        layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        self.cpu.supports_op(op, opset, shapes, dtypes, layouts)
+    }
+    fn get_kernel(
+        &self,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        self.cpu.get_kernel(op, shapes, opset)
+    }
+    fn copy(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        bytes: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.copy(src, dst, bytes)
+    }
+    fn copy_async(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        bytes: usize,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::Fence> {
+        self.cpu.copy_async(src, dst, bytes)
+    }
+    fn allocate(&self, bytes: usize, align: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+        self.cpu.allocate(bytes, align)
+    }
+    fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.deallocate(buffer)
+    }
+    fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.syncs.fetch_add(1, Ordering::Relaxed);
+        if self.fail_sync.load(Ordering::Relaxed) {
+            return Err(EpError::KernelFailed(
+                "forced scope synchronization failure".into(),
+            ));
+        }
+        self.cpu.sync()
+    }
+    fn allocate_workspace(
+        &self,
+        bytes: usize,
+        align: usize,
+        role: MemoryRole,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceAllocation> {
+        self.checkouts.fetch_add(1, Ordering::Relaxed);
+        self.cpu.allocate_workspace(bytes, align, role)
+    }
+    fn deallocate_workspace(
+        &self,
+        owner: onnx_runtime_ep_api::WorkspaceAllocation,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.returns.fetch_add(1, Ordering::Relaxed);
+        if self.fail_return.swap(false, Ordering::Relaxed) {
+            return Err(EpError::Backend {
+                operation: "return test scope owner",
+                source: Box::new(ScopeReturnFailure(owner)),
+            });
+        }
+        self.cpu.deallocate_workspace(owner)
+    }
+}
+fn execution_scope_fixture() -> (
+    crate::InferenceSession,
+    Arc<ExecutionScopeEp>,
+    Arc<onnx_runtime_memory_governor::LedgerGovernor>,
+    onnx_runtime_memory_governor::HostWorkspacePool,
+) {
+    use onnx_runtime_memory_api::DeviceKey;
+    use onnx_runtime_memory_governor::{
+        HostWorkspacePool, LeaseLedger, LedgerGovernor, ProcessMemoryManager,
+    };
+    let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+        DeviceKey::HOST,
+        0,
+        1 << 24,
+        0,
+    )));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+        Default::default(),
+        onnx_runtime_ep_cpu::CpuWeightCacheLimits {
+            dense_bytes: 0,
+            expert_bytes: 0,
+        },
+    )
+    .unwrap()
+    .with_workspace_pool(pool.clone())
+    .unwrap();
+    let ep = Arc::new(ExecutionScopeEp {
+        cpu: CpuExecutionProvider::initialized_with_resources(resources).unwrap(),
+        checkouts: AtomicUsize::new(0),
+        returns: AtomicUsize::new(0),
+        syncs: AtomicUsize::new(0),
+        fail_sync: AtomicBool::new(false),
+        fail_return: AtomicBool::new(false),
+    });
+    let graph = streamed_workspace_graph();
+    let bytes =
+        onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph)).unwrap();
+    let session = crate::InferenceSession::builder()
+        .model_bytes(&bytes)
+        .option("optimization", "none")
+        .execution_provider(ep.clone())
+        .build()
+        .unwrap();
+    (session, ep, books, pool)
+}
+
+#[test]
+fn execution_scope_reuses_one_lane_and_returns_at_finish() {
+    use onnx_runtime_memory_api::Tier;
+    use onnx_runtime_memory_governor::MemoryGovernor;
+    let (mut session, ep, books, pool) = execution_scope_fixture();
+    let input = Tensor::from_f32(&[1, 35], &[1.; 35]).unwrap();
+    session
+        .prepare_with_device_bindings(&[("a", &input)], &mut [])
+        .unwrap();
+    let expected = session.run(&[("a", &input)]).unwrap()[0].to_vec_f32();
+    ep.checkouts.store(0, Ordering::Relaxed);
+    ep.returns.store(0, Ordering::Relaxed);
+    let syncs = ep.syncs.load(Ordering::Relaxed);
+    let mut scope = session.execution_scope().unwrap();
+    assert_eq!(
+        ep.syncs.load(Ordering::Relaxed),
+        syncs,
+        "beginning retention enqueues/frees nothing"
+    );
+    for _ in 0..11 {
+        scope
+            .prepare_with_device_bindings(&[("a", &input)], &mut [])
+            .unwrap();
+        assert_eq!(
+            scope.run(&[("a", &input)]).unwrap()[0].to_vec_f32(),
+            expected
+        );
+    }
+    assert_eq!(ep.checkouts.load(Ordering::Relaxed), 1);
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 0);
+    let charged = books.used(Tier::Host);
+    assert!(charged > 0);
+    scope.finish().unwrap();
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 1);
+    assert!(session.exec.step_workspace.is_none());
+    assert_eq!(
+        books.used(Tier::Host),
+        charged,
+        "idle retained capacity stays charged"
+    );
+    session
+        .prepare_with_device_bindings(&[("a", &input)], &mut [])
+        .unwrap();
+    session.run(&[("a", &input)]).unwrap();
+    assert_eq!(ep.checkouts.load(Ordering::Relaxed), 2);
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 2);
+    pool.trim_idle(u64::MAX).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn execution_scope_growth_and_capture_pin_have_independent_ownership() {
+    let (mut session, ep, _, pool) = execution_scope_fixture();
+    let small = Tensor::from_f32(&[1, 35], &[1.; 35]).unwrap();
+    let large = Tensor::from_f32(&[8, 35], &[1.; 8 * 35]).unwrap();
+    let mut scope = session.execution_scope().unwrap();
+    let a = scope
+        .prepare_with_device_bindings(&[("a", &small)], &mut [])
+        .unwrap();
+    scope.run(&[("a", &small)]).unwrap();
+    let b = scope
+        .prepare_with_device_bindings(&[("a", &large)], &mut [])
+        .unwrap();
+    scope.run(&[("a", &large)]).unwrap();
+    assert!(b.bytes > a.bytes);
+    scope
+        .prepare_with_device_bindings(&[("a", &small)], &mut [])
+        .unwrap();
+    scope.run(&[("a", &small)]).unwrap();
+    assert_eq!(ep.checkouts.load(Ordering::Relaxed), 2);
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 1);
+    scope.finish().unwrap();
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 2);
+    session.exec.set_pin_step_workspace(true);
+    let mut scope = session.execution_scope().unwrap();
+    scope
+        .prepare_with_device_bindings(&[("a", &small)], &mut [])
+        .unwrap();
+    scope.run(&[("a", &small)]).unwrap();
+    scope.finish().unwrap();
+    assert!(session.exec.step_workspace_pinned());
+    assert!(session.exec.step_workspace.is_some());
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 2);
+    session.exec.set_pin_step_workspace(false);
+    session.exec.release_step_workspace().unwrap();
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 3);
+    pool.trim_idle(u64::MAX).unwrap();
+}
+
+#[test]
+fn execution_scope_boundary_failure_retains_owner_and_disables_reuse() {
+    use onnx_runtime_memory_api::Tier;
+    use onnx_runtime_memory_governor::MemoryGovernor;
+    let (mut session, ep, books, pool) = execution_scope_fixture();
+    let input = Tensor::from_f32(&[1, 35], &[1.; 35]).unwrap();
+    let mut scope = session.execution_scope().unwrap();
+    scope
+        .prepare_with_device_bindings(&[("a", &input)], &mut [])
+        .unwrap();
+    scope.run(&[("a", &input)]).unwrap();
+    let charged = books.used(Tier::Host);
+    assert!(charged > 0);
+    ep.fail_sync.store(true, Ordering::Relaxed);
+    let error = scope.finish().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("forced scope synchronization failure")
+    );
+    assert!(std::error::Error::source(&error).is_some());
+    assert!(session.exec.step_workspace.is_some());
+    assert_eq!(books.used(Tier::Host), charged);
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 0);
+    ep.fail_sync.store(false, Ordering::Relaxed);
+    let syncs = ep.syncs.load(Ordering::Relaxed);
+    assert!(
+        session
+            .prepare_with_device_bindings(&[("a", &input)], &mut [])
+            .unwrap_err()
+            .to_string()
+            .contains("discard and rebuild")
+    );
+    assert!(
+        session
+            .run(&[("a", &input)])
+            .unwrap_err()
+            .to_string()
+            .contains("discard and rebuild")
+    );
+    assert_eq!(ep.syncs.load(Ordering::Relaxed), syncs);
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 0);
+    drop(session);
+    pool.trim_idle(u64::MAX).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn execution_scope_consumed_return_error_is_not_retried() {
+    use onnx_runtime_memory_api::Tier;
+    use onnx_runtime_memory_governor::MemoryGovernor;
+    let (mut session, ep, books, pool) = execution_scope_fixture();
+    let input = Tensor::from_f32(&[1, 35], &[1.; 35]).unwrap();
+    let mut scope = session.execution_scope().unwrap();
+    scope
+        .prepare_with_device_bindings(&[("a", &input)], &mut [])
+        .unwrap();
+    scope.run(&[("a", &input)]).unwrap();
+    ep.fail_return.store(true, Ordering::Relaxed);
+    let error = scope.finish().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("forced workspace return failure")
+    );
+    assert!(session.exec.step_workspace.is_none());
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 1);
+    assert!(
+        books.used(Tier::Host) > 0,
+        "the consuming error retains the owner"
+    );
+    // Recover this test's synthetic owning error for teardown. The executor
+    // cannot retry the consumed owner; simply dropping it would quarantine it.
+    let crate::SessionError::Ep(EpError::Backend { source, .. }) = error else {
+        panic!("expected the test's consuming return error");
+    };
+    let owner = source.downcast::<ScopeReturnFailure>().unwrap().0;
+    ep.cpu.deallocate_workspace(owner).unwrap();
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 1);
+    pool.trim_idle(u64::MAX).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn execution_scope_drop_returns_the_lane_on_unwind() {
+    let (mut session, ep, _, pool) = execution_scope_fixture();
+    let input = Tensor::from_f32(&[1, 35], &[1.; 35]).unwrap();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut scope = session.execution_scope().unwrap();
+        scope
+            .prepare_with_device_bindings(&[("a", &input)], &mut [])
+            .unwrap();
+        scope.run(&[("a", &input)]).unwrap();
+        panic!("test unwind after scoped execution");
+    }));
+    assert!(panic.is_err());
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 1);
+    assert!(session.exec.step_workspace.is_none());
+    pool.trim_idle(u64::MAX).unwrap();
+}
+
+#[test]
+fn execution_scope_failed_boundary_blocks_main_and_sibling_public_entries() {
+    let (mut session, ep, _, pool) = execution_scope_fixture();
+    let input = Tensor::from_f32(&[1, 35], &[1.; 35]).unwrap();
+    let mut scope = session.execution_scope().unwrap();
+    scope
+        .prepare_with_device_bindings(&[("a", &input)], &mut [])
+        .unwrap();
+    scope.run(&[("a", &input)]).unwrap();
+    ep.fail_sync.store(true, Ordering::Relaxed);
+    assert!(scope.finish().is_err());
+    ep.fail_sync.store(false, Ordering::Relaxed);
+    macro_rules! blocked {
+        ($call:expr) => {
+            match $call {
+                Err(crate::SessionError::ExecutionScopeBoundary { .. }) => {}
+                Err(error) => panic!("{} bypassed the boundary error: {error}", stringify!($call)),
+                Ok(_) => panic!("{} accepted a failed session", stringify!($call)),
+            }
+        };
+    }
+    blocked!(session.enable_decode_inline());
+    blocked!(session.run_decode_inline_with_device_bindings(&[], &mut []));
+    blocked!(session.try_capture_decode_inline_with_device_bindings(&[], &mut []));
+    blocked!(session.replay_decode_inline_device_graph(&mut []));
+    blocked!(session.enable_verify_sibling());
+    blocked!(session.run_verify_sibling_with_device_bindings(&[], &mut []));
+    blocked!(session.try_capture_verify_sibling_with_device_bindings(&[], &mut []));
+    blocked!(session.replay_verify_sibling_device_graph(&mut []));
+    blocked!(session.try_capture_with_device_bindings(&[], &mut []));
+    blocked!(session.replay_device_graph(&mut []));
+    blocked!(session.warmup(&[]));
+    assert_eq!(ep.returns.load(Ordering::Relaxed), 0);
+    drop(session);
+    pool.trim_idle(u64::MAX).unwrap();
+}
+
+#[test]
+fn execution_scope_finish_consumes_pending_receipt_once_before_return() {
+    let (mut exec, ep, mut bindings) = deferred_validation_bound_fixture();
+    ep.fail_next.store(false, Ordering::Relaxed);
+    exec.begin_execution_scope().unwrap();
+    let buffer = ep
+        .allocate_workspace(256, 64, MemoryRole::Workspace { step_scoped: true })
+        .unwrap();
+    exec.step_workspace = Some(PreparedWorkspace {
+        bytes: buffer.len(),
+        alignment: buffer.alignment(),
+        buffer,
+    });
+    exec.run_with_device_bindings(&[], &mut bindings).unwrap();
+    assert!(exec.pending_device_validation.is_some());
+    assert!(exec.step_workspace.is_some());
+    let attempts = ep.validation_consume_attempts.load(Ordering::Relaxed);
+    exec.finish_execution_scope().unwrap();
+    assert_eq!(
+        ep.validation_consume_attempts.load(Ordering::Relaxed),
+        attempts + 1
+    );
+    assert!(exec.pending_device_validation.is_none());
+    assert!(exec.step_workspace.is_none());
+}
+
+#[test]
+fn execution_scope_pending_validation_error_keeps_backing_after_sync() {
+    let (mut exec, ep, mut bindings) = deferred_validation_bound_fixture();
+    exec.begin_execution_scope().unwrap();
+    let buffer = ep
+        .allocate_workspace(256, 64, MemoryRole::Workspace { step_scoped: true })
+        .unwrap();
+    exec.step_workspace = Some(PreparedWorkspace {
+        bytes: buffer.len(),
+        alignment: buffer.alignment(),
+        buffer,
+    });
+    exec.run_with_device_bindings(&[], &mut bindings).unwrap();
+    assert!(exec.pending_device_validation.is_some());
+    let error = exec.finish_execution_scope().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("device validation failed (flags=0x40)")
+    );
+    assert!(exec.step_workspace.is_some());
+    assert_eq!(
+        ep.synchronized_executions.load(Ordering::Relaxed),
+        ep.executions.load(Ordering::Relaxed)
+    );
+    assert!(
+        exec.run_with_device_bindings(&[], &mut bindings)
+            .unwrap_err()
+            .to_string()
+            .contains("discard and rebuild")
+    );
+}

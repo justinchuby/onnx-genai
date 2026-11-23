@@ -21,6 +21,7 @@ impl Executor {
     pub(super) fn begin_device_validation_submission(
         &mut self,
     ) -> Result<DeviceValidationSubmission> {
+        self.ensure_execution_scope_ready()?;
         let registration = self
             .validation_registration
             .as_ref()
@@ -35,6 +36,7 @@ impl Executor {
         &mut self,
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceValidationSubmission> {
+        self.ensure_execution_scope_ready()?;
         let registration = self
             .validation_registration
             .as_ref()
@@ -74,6 +76,7 @@ impl Executor {
         validation_submission: Option<DeviceValidationSubmission>,
         artifact_requirement: Option<CapturedProviderArtifactRequirement>,
     ) -> Result<ScopedRunResult> {
+        self.ensure_execution_scope_ready()?;
         // Distinguish the outermost (top-level graph) run from nested
         // control-flow subgraph runs so the phase profiler can attribute
         // overhead to the right layer.

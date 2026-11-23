@@ -1192,6 +1192,7 @@ impl Executor {
             provider_artifact_readiness: ProviderArtifactReadiness::default(),
             persistent_workspace: None,
             step_workspace: None,
+            execution_scope: ExecutionScopeState::PerRun,
             pin_step_workspace: false,
             inherited_workspace: InheritedWorkspaces::default(),
             workspace_preparation_required: false,

@@ -155,6 +155,13 @@ mod error {
     #[derive(Debug, thiserror::Error)]
     pub enum SessionError {
         #[error(
+            "active execution scope could not settle its completion boundary: {source}; workspace ownership is retained and this session cannot execute again; discard and rebuild the session"
+        )]
+        ExecutionScopeBoundary {
+            #[source]
+            source: std::sync::Arc<SessionError>,
+        },
+        #[error(
             "fallback_execution_provider '{provider}' is bound to {device:?}; pass a CPU provider initialized with this session's memory resources"
         )]
         InvalidFallbackProvider {
@@ -1130,6 +1137,9 @@ impl Drop for BlockQuantizedMoeTrafficObserver<'_> {
     }
 }
 
+mod execution_scope;
+pub use execution_scope::ExecutionScope;
+
 /// A loaded model ready to run inference (§20.2).
 /// Loaded, executable inference session.
 ///
@@ -1332,8 +1342,20 @@ impl InferenceSession {
         SessionBuilder::new()
     }
 
+    /// Borrow this session for a bounded sequence of executions sharing one
+    /// StepScoped workspace owner. Finish before a phase change or scheduling
+    /// yield so retained backing becomes reclaimable. Capture pins remain independent.
+    ///
+    /// Call [`ExecutionScope::finish`] on normal exits to observe completion and
+    /// return failures. A failed completion boundary disables subsequent execution.
+    pub fn execution_scope(&mut self) -> Result<ExecutionScope<'_>> {
+        self.exec.begin_execution_scope()?;
+        Ok(ExecutionScope::new(self))
+    }
+
     /// Run inference with named inputs, returning the graph outputs in order.
     pub fn run(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>> {
+        self.exec.ensure_execution_scope_ready()?;
         self.exec.run(inputs)
     }
 
@@ -1347,6 +1369,7 @@ impl InferenceSession {
 
     /// Run inference and preserve tensor or sequence graph-output types.
     pub fn run_outputs(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<SessionOutput>> {
+        self.exec.ensure_execution_scope_ready()?;
         self.exec.run_outputs(inputs)
     }
 
@@ -1397,6 +1420,7 @@ impl InferenceSession {
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceBindingOutputs> {
+        self.exec.ensure_execution_scope_ready()?;
         self.exec.run_with_device_bindings(inputs, bindings)
     }
 
@@ -1460,6 +1484,7 @@ impl InferenceSession {
     /// session itself reads no env and takes no user knob — the graph property
     /// (an inlineable single-trip recurrent `Scan`) is the only gate.
     pub fn enable_decode_inline(&mut self) -> Result<bool> {
+        self.exec.ensure_execution_scope_ready()?;
         if self.decode_inline_exec.is_none() {
             self.decode_inline_exec = self.exec.build_decode_inline_sibling()?;
         }
@@ -1486,6 +1511,7 @@ impl InferenceSession {
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceBindingOutputs> {
+        self.exec.ensure_execution_scope_ready()?;
         let exec = self.decode_inline_exec.as_mut().ok_or_else(|| {
             SessionError::Internal(
                 "decode-inline executor requested but not built; call enable_decode_inline first"
@@ -1511,6 +1537,7 @@ impl InferenceSession {
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceGraphCaptureResult> {
+        self.exec.ensure_execution_scope_ready()?;
         let exec = self.decode_inline_exec.as_mut().ok_or_else(|| {
             SessionError::Internal(
                 "decode-inline capture requested but no sibling built; call enable_decode_inline first"
@@ -1530,6 +1557,7 @@ impl InferenceSession {
         &mut self,
         bindings: &mut [DeviceIoBinding],
     ) -> Result<bool> {
+        self.exec.ensure_execution_scope_ready()?;
         let exec = self.decode_inline_exec.as_mut().ok_or_else(|| {
             SessionError::Internal(
                 "decode-inline replay requested but no sibling built; call enable_decode_inline first"
@@ -1586,6 +1614,7 @@ impl InferenceSession {
     /// admits the attention nodes, mirroring the main executor. The main/prefill
     /// executor is left byte-identical.
     pub fn enable_verify_sibling(&mut self) -> Result<bool> {
+        self.exec.ensure_execution_scope_ready()?;
         if self.verify_exec.is_none() {
             let mut sibling = self.exec.build_verify_sibling()?;
             sibling.pin_fixed_capacity_kv_capture_symbols();
@@ -1609,6 +1638,7 @@ impl InferenceSession {
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceBindingOutputs> {
+        self.exec.ensure_execution_scope_ready()?;
         let exec = self.verify_exec.as_mut().ok_or_else(|| {
             SessionError::Internal(
                 "verify sibling requested but not built; call enable_verify_sibling first".into(),
@@ -1628,6 +1658,7 @@ impl InferenceSession {
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceGraphCaptureResult> {
+        self.exec.ensure_execution_scope_ready()?;
         let exec = self.verify_exec.as_mut().ok_or_else(|| {
             SessionError::Internal(
                 "verify sibling capture requested but no sibling built; call enable_verify_sibling first".into(),
@@ -1644,6 +1675,7 @@ impl InferenceSession {
         &mut self,
         bindings: &mut [DeviceIoBinding],
     ) -> Result<bool> {
+        self.exec.ensure_execution_scope_ready()?;
         let exec = self.verify_exec.as_mut().ok_or_else(|| {
             SessionError::Internal(
                 "verify sibling replay requested but no sibling built; call enable_verify_sibling first".into(),
@@ -1791,6 +1823,7 @@ impl InferenceSession {
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceGraphCaptureResult> {
+        self.exec.ensure_execution_scope_ready()?;
         self.exec.try_capture_with_device_bindings(inputs, bindings)
     }
 
@@ -1800,6 +1833,7 @@ impl InferenceSession {
     /// step (the token was produced correctly via eager fallback) and the caller
     /// should re-warm and re-capture.
     pub fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<bool> {
+        self.exec.ensure_execution_scope_ready()?;
         self.exec.replay_device_graph(bindings)
     }
 
@@ -1993,6 +2027,7 @@ impl InferenceSession {
     /// cache, so this repopulates it for the plan; `shapes` are validated to
     /// name real inputs.
     pub fn warmup(&mut self, shapes: &[WarmupShape]) -> Result<()> {
+        self.exec.ensure_execution_scope_ready()?;
         for ws in shapes {
             if !self.inputs.iter().any(|m| m.name == ws.input_name) {
                 return Err(SessionError::InputNotFound {

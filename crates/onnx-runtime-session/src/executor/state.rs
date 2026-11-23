@@ -758,6 +758,7 @@ pub(crate) struct Executor {
     pub(super) provider_artifact_readiness: ProviderArtifactReadiness,
     pub(super) persistent_workspace: Option<PreparedWorkspace>,
     pub(super) step_workspace: Option<PreparedWorkspace>,
+    pub(super) execution_scope: ExecutionScopeState,
     /// When set, [`Executor::release_step_workspace`] is a no-op: the StepScoped
     /// `step_workspace` buffer is kept alive between runs instead of being freed
     /// after each one. A captured device graph bakes the physical address of the
@@ -1360,4 +1361,14 @@ pub(super) struct PreparedSubgraph {
     pub(super) key: (NodeId, onnx_runtime_ir::GraphAttribute),
     /// Direct captures plus transitive captures needed only by nested bodies.
     pub(super) captures: HashMap<String, Tensor>,
+}
+
+/// Retention is distinct from capture pinning. A failed boundary keeps the
+/// original owner charged and makes reuse fail closed until session disposal.
+#[derive(Default)]
+pub(super) enum ExecutionScopeState {
+    #[default]
+    PerRun,
+    Active,
+    Failed(std::sync::Arc<SessionError>),
 }
