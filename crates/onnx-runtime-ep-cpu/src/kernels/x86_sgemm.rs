@@ -155,6 +155,25 @@ pub(crate) fn sgemm_simd_variant(
 /// the correctness baseline for every `m` and the sole path for `m >= 2`.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn sgemm_simd_packed(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    sgemm_simd_packed_impl(a, b, c, m, k, n, true);
+}
+
+/// Run a caller-tiled matrix product without fanning out each small panel.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) fn sgemm_simd_panel(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    sgemm_simd_packed_impl(a, b, c, m, k, n, false);
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn sgemm_simd_packed_impl(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    parallel: bool,
+) {
     // Pack A once: one contiguous [k][MR] panel per MR-row block, zero-padded.
     let m_panels = m.div_ceil(MR);
     let mut apack = vec![0.0f32; m_panels * k * MR];
@@ -163,8 +182,11 @@ fn sgemm_simd_packed(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n:
     // Choose an NR-aligned column strip width: enough strips for load balance
     // across the Rayon pool while keeping each packed B panel cache-friendly.
     let n_panels = n.div_ceil(NR);
-    let threads = rayon::current_num_threads().max(1);
-    let target_tasks = threads.saturating_mul(8).max(1);
+    let target_tasks = if parallel {
+        rayon::current_num_threads().saturating_mul(8).max(1)
+    } else {
+        1
+    };
     let panels_per_strip = n_panels.div_ceil(target_tasks).clamp(1, 16);
     let strip_cols = panels_per_strip * NR;
     let strip_count = n.div_ceil(strip_cols);
@@ -172,7 +194,7 @@ fn sgemm_simd_packed(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n:
     let cptr = CPtr(c.as_mut_ptr());
     let apack = &apack;
 
-    (0..strip_count).into_par_iter().for_each(|s| {
+    let run_strip = |s| {
         let j0 = s * strip_cols;
         let nc = strip_cols.min(n - j0);
         // Scratch for this strip's packed B panels: [KC][NR] per NR sub-panel.
@@ -218,7 +240,12 @@ fn sgemm_simd_packed(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n:
             }
             pc += KC;
         }
-    });
+    };
+    if parallel {
+        (0..strip_count).into_par_iter().for_each(run_strip);
+    } else {
+        (0..strip_count).for_each(run_strip);
+    }
 }
 
 /// Transposed-B ("NT") entry point: `c[m,n] = a[m,k] @ b_nk[n,k]^T`, where
@@ -1747,6 +1774,21 @@ mod tests {
     #[test]
     fn exact_tile_multiple() {
         check(12, 64, 32);
+    }
+
+    #[test]
+    fn caller_tiled_sgemm_matches_parallel_packing() {
+        if !require_simd_x86("caller_tiled_sgemm_matches_parallel_packing") {
+            return;
+        }
+        let (m, k, n) = (7, KC + 1, 49);
+        let a = fill(m * k, 1);
+        let b = fill(k * n, 7);
+        let mut serial = vec![f32::NAN; m * n];
+        let mut parallel = vec![f32::NAN; m * n];
+        sgemm_simd_panel(&a, &b, &mut serial, m, k, n);
+        sgemm_simd_packed(&a, &b, &mut parallel, m, k, n);
+        assert_eq!(serial, parallel);
     }
 
     #[test]

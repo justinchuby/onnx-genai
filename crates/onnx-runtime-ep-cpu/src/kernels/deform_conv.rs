@@ -103,15 +103,13 @@ impl Number for f32 {
         n: usize,
     ) -> Result<()> {
         if m > 1 {
-            return super::matmul::gemm_with_backend(
-                CpuBackend::auto_detect(),
-                w,
-                panel,
-                y,
-                m,
-                k,
-                n,
-            );
+            let backend = CpuBackend::auto_detect();
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if backend == CpuBackend::SimdX86 {
+                super::matmul::x86_sgemm::sgemm_simd_panel(w, panel, y, m, k, n);
+                return Ok(());
+            }
+            return super::matmul::gemm_with_backend(backend, w, panel, y, m, k, n);
         }
         direct_dot(w, panel, y, k, n);
         Ok(())
