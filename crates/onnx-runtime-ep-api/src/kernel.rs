@@ -975,7 +975,10 @@ pub trait Kernel: Send + KernelType {
     /// [`Kernel::workspace_requirement`] remains the planning hook. Execution
     /// dispatch, though, may already hold device views whose *values* determine
     /// the exact scratch size (for example a reduction whose axes come from an
-    /// input tensor). The default preserves the metadata-only contract.
+    /// input tensor). Metadata presence is logical: a lazy initializer can be
+    /// present in metadata while its TensorView is absent. Check the view before
+    /// reading bytes; metadata alone never grants readable storage. The default
+    /// preserves the metadata-only contract.
     fn workspace_requirement_for_execution(
         &self,
         inputs: &[TensorView],
@@ -998,27 +1001,30 @@ pub trait Kernel: Send + KernelType {
 
     /// Execute through the general weight-delivery seam.
     ///
-    /// The default adapter accepts only resident tensor inputs and forwards to
-    /// [`Kernel::execute`], so existing EPs compile and behave identically.
-    /// Paging-aware kernels override this method to consume lazy handles.
+    /// Paging-aware kernels receive the same executor-prepared workspace as
+    /// resident kernels. Scratch ownership, admission and completion remain with
+    /// the executor; this hook only borrows the regions during execution.
+    /// The default accepts resident inputs and forwards both views and workspace
+    /// to [`Kernel::execute_with_workspace`]. A kernel consuming lazy handles
+    /// overrides this hook without needing a separate scratch protocol.
     fn execute_with_inputs(
         &self,
         inputs: &[KernelInput<'_>],
         outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
     ) -> Result<()> {
         let views = inputs
             .iter()
-            .map(|input| {
+            .enumerate()
+            .map(|(index, input)| {
                 input.tensor().copied().ok_or_else(|| {
-                    crate::EpError::KernelFailed(
-                        "kernel received a lazy WeightHandle without implementing \
-                         execute_with_inputs"
-                            .into(),
-                    )
+                    crate::EpError::KernelFailed(format!(
+                        "kernel input {index} is an unresolved weight handle; implement execute_with_inputs to consume it with the prepared workspace"
+                    ))
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        self.execute(&views, outputs)
+        self.execute_with_workspace(&views, outputs, workspace)
     }
 
     /// Estimated FLOPs, if known (for the cost model).
@@ -1281,6 +1287,70 @@ mod tests {
         }
     }
 
+    struct WorkspaceAdapterKernel;
+
+    impl Kernel for WorkspaceAdapterKernel {
+        fn execute(&self, _inputs: &[TensorView], _outputs: &mut [TensorMut]) -> Result<()> {
+            panic!("the general input adapter must retain the workspace")
+        }
+
+        fn execute_with_workspace(
+            &self,
+            inputs: &[TensorView],
+            _outputs: &mut [TensorMut],
+            workspace: Option<WorkspaceView>,
+        ) -> Result<()> {
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(inputs[0].shape, &[4]);
+            let workspace = workspace.ok_or_else(|| {
+                crate::EpError::KernelFailed(
+                    "workspace adapter fixture requires a borrowed region".into(),
+                )
+            })?;
+            assert_eq!(workspace.bytes(), 4);
+            // SAFETY: this test lends an exclusive four-byte Host array.
+            unsafe { workspace.ptr().0.cast::<u8>().write(37) };
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn general_input_adapter_forwards_workspace_and_rejects_unresolved_weights() {
+        let bytes = [1u8, 2, 3, 4];
+        let shape = [4usize];
+        let strides = [1i64];
+        let inputs = [KernelInput::Tensor(TensorView::new(
+            DevicePtr(bytes.as_ptr().cast()),
+            DataType::Uint8,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        ))];
+        let mut scratch = [0u8; 4];
+        let workspace = WorkspaceView::new(DevicePtrMut(scratch.as_mut_ptr().cast()), 4);
+        WorkspaceAdapterKernel
+            .execute_with_inputs(&inputs, &mut [], Some(workspace))
+            .unwrap();
+        assert_eq!(scratch[0], 37);
+        let error = WorkspaceAdapterKernel
+            .execute_with_inputs(&inputs, &mut [], None)
+            .unwrap_err();
+        assert!(error.to_string().contains("requires a borrowed region"));
+        scratch[0] = 0;
+        let handle = WeightHandle::Resident(
+            crate::ResidentWeight::new(DataType::Uint8, vec![4], bytes.to_vec()).unwrap(),
+        );
+        let error = WorkspaceAdapterKernel
+            .execute_with_inputs(&[KernelInput::Weight(&handle)], &mut [], Some(workspace))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("input 0") && error.contains("implement execute_with_inputs"),
+            "{error}"
+        );
+        assert_eq!(scratch[0], 0, "rejection must happen before compute");
+    }
+
     #[test]
     fn legacy_kernel_adapter_receives_the_resident_tensor_path() {
         let called = Arc::new(AtomicBool::new(false));
@@ -1298,7 +1368,7 @@ mod tests {
             DeviceId::cpu(),
         ))];
 
-        kernel.execute_with_inputs(&inputs, &mut []).unwrap();
+        kernel.execute_with_inputs(&inputs, &mut [], None).unwrap();
         assert!(called.load(Ordering::Relaxed));
     }
 }

@@ -5245,6 +5245,7 @@ impl Kernel for WeightDeliveryKernel {
         &self,
         inputs: &[KernelInput<'_>],
         outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
     ) -> onnx_runtime_ep_api::Result<()> {
         match &inputs[0] {
             KernelInput::Tensor(view) => self.execute(std::slice::from_ref(view), outputs),
@@ -5258,6 +5259,33 @@ impl Kernel for WeightDeliveryKernel {
                     ));
                 };
                 let resident = lazy.materialize()?;
+                let rows = resident.shape.first().copied().unwrap_or(1) as u64;
+                let required = if self.workspace_bytes_per_row == 0 {
+                    self.workspace_bytes
+                } else {
+                    rows.checked_mul(self.workspace_bytes_per_row).unwrap()
+                } as usize;
+                if required != 0 {
+                    let workspace = workspace.ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "lazy test kernel requires its prepared workspace".into(),
+                        )
+                    })?;
+                    if workspace.bytes() < required || resident.bytes().len() > required {
+                        return Err(EpError::KernelFailed(format!(
+                            "lazy test kernel needs {required} workspace bytes, received {}",
+                            workspace.bytes()
+                        )));
+                    }
+                    // SAFETY: the enclosing executor exclusively lends this Host
+                    // workspace; both the source and output extents are checked.
+                    let scratch = unsafe {
+                        std::slice::from_raw_parts_mut(workspace.ptr().0.cast::<u8>(), required)
+                    };
+                    scratch[..resident.bytes().len()].copy_from_slice(resident.bytes());
+                    return Self::copy_bytes(&scratch[..resident.bytes().len()], &mut outputs[0]);
+                }
+                assert!(workspace.is_none());
                 Self::copy_bytes(resident.bytes(), &mut outputs[0])
             }
         }
@@ -8290,6 +8318,88 @@ fn executor_selects_lazy_or_resident_weight_delivery_from_ep_capability() {
         drop(executor);
         std::fs::remove_file(path).unwrap();
     }
+}
+
+#[test]
+fn lazy_weight_execution_borrows_prepared_workspace_with_logical_geometry() {
+    for prepare in [false, true] {
+        let (graph, weights, path) = weight_delivery_fixture();
+        let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut ep = WeightDeliveryEp::new(true, Arc::clone(&deliveries));
+        // Four logical weight rows require 64 bytes. The absent device view
+        // would incorrectly produce the one-row 16-byte bound.
+        ep.workspace_bytes_per_row = 16;
+        let mut executor = Executor::build(graph, weights, Arc::new(ep), None).unwrap();
+        if prepare {
+            executor.prepare_with_device_bindings(&[], &mut []).unwrap();
+            assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 64);
+        }
+        let mut address = None;
+        for _ in 0..3 {
+            let outputs = executor.run(&[]).unwrap();
+            assert_eq!(outputs[0].as_bytes(), &[1, 2, 3, 4]);
+            let workspace = executor.persistent_workspace.as_ref().unwrap();
+            assert_eq!(workspace.bytes, 64);
+            let current = workspace.buffer.as_ptr() as usize;
+            assert_eq!(*address.get_or_insert(current), current);
+        }
+        assert_eq!(
+            &*deliveries.lock().unwrap(),
+            &["reserve_workspace", "lazy", "lazy", "lazy"]
+        );
+        drop(executor);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn lazy_weight_workspace_metadata_follows_execution_slots() {
+    let (graph, weights, path) = weight_delivery_fixture();
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ep = WeightDeliveryEp::new(true, Arc::clone(&deliveries));
+    ep.workspace_bytes_per_row = 16;
+    let mut executor = Executor::build(graph, weights, Arc::new(ep), None).unwrap();
+    // Pin the dispatch boundary directly: captured values can extend the
+    // execution slots beyond the descriptor's explicit inputs. This fixture
+    // retains the built input plan while removing the explicit descriptor slot;
+    // it does not claim graph-kernel lazy capture support.
+    let node = executor.plan[0].node_id;
+    executor.graph.node_mut(node).inputs.clear();
+    assert_eq!(executor.plan[0].inputs.len(), 1);
+    let output = executor.run(&[]).unwrap();
+    assert_eq!(output[0].as_bytes(), &[1, 2, 3, 4]);
+    assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 64);
+    assert_eq!(&*deliveries.lock().unwrap(), &["reserve_workspace", "lazy"]);
+    drop(executor);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn lazy_weight_workspace_refusal_precedes_materialization_and_can_retry() {
+    let (graph, weights, path) = weight_delivery_fixture();
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ep = WeightDeliveryEp::new(true, Arc::clone(&deliveries));
+    ep.workspace_bytes = 64;
+    // Only refuse the workspace; output allocation has a different extent.
+    ep.fail_allocation_size.store(64, Ordering::Relaxed);
+    let mut executor = Executor::build(graph, weights, Arc::new(ep), None).unwrap();
+    let error = executor.run(&[]).unwrap_err().to_string();
+    assert!(error.contains("64"), "{error}");
+    assert!(!deliveries.lock().unwrap().contains(&"lazy"));
+    assert!(executor.persistent_workspace.is_none());
+    let outputs = executor.run(&[]).unwrap();
+    assert_eq!(outputs[0].as_bytes(), &[1, 2, 3, 4]);
+    assert_eq!(
+        deliveries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&x| x == "lazy")
+            .count(),
+        1
+    );
+    drop(executor);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
