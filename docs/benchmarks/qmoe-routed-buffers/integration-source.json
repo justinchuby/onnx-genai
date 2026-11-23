@@ -1,0 +1,12 @@
+{
+  "previous_base": "08634f19a81ee9150951f66254c03fc1b221c52f",
+  "new_base": "94af06264db8793d2a4342c44d659acea3dd910e",
+  "baseline_tree_equal": true,
+  "previous_candidate_report_commit": "21c141ac45ee7376bcae22537c2aa7a906a74945",
+  "rebased_candidate_report_commit": "4ba848704fbea82e6ba9832a2e65f40243da5dec",
+  "whole_tree_equal": true,
+  "tree_sha256_note": "Git tree OIDs below, not SHA-256",
+  "baseline_tree_oid": "e87323369b96df244976a4762e5d54593218b091",
+  "candidate_report_tree_oid": "ce959f5b778967e9f97d8490f3084738b8b5f0c8",
+  "reason": "#2450 merged; move onto main plus pending #2449 shared safety changes. No source/test/measurement file contents changed. This receipt is documentation-only."
+}
