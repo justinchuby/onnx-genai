@@ -20,8 +20,9 @@ pub fn unary(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 fn standard_math(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     use onnx_runtime_ir::standard_math::{DTYPES, Math};
 
+    let name = ctx.op().to_owned();
     let invalid = |detail| ShapeInferError::Invalid {
-        op: ctx.op().to_owned(),
+        op: name.clone(),
         detail,
     };
     let op = Math::from_node(ctx.node).map_err(invalid)?;
@@ -56,6 +57,7 @@ fn standard_math(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
             "A and B must have the same dtype, got {a:?} and {b:?}"
         )));
     }
+    let derived_floor = ctx.interner_mut().initial_floor();
     if let (Some(a), Some(b)) = (ctx.input_shape(0), ctx.input_shape(1)) {
         if a.len() != b.len()
             || a.iter()
@@ -70,7 +72,10 @@ fn standard_math(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
             .iter()
             .zip(b)
             .map(|(x, y)| {
-                if y.as_const().is_some() {
+                if y.as_const().is_some()
+                    || (x.as_symbol().is_some_and(|s| s.0 >= derived_floor)
+                        && y.as_symbol().is_some_and(|s| s.0 < derived_floor))
+                {
                     y.clone()
                 } else {
                     x.clone()

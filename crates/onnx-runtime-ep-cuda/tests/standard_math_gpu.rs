@@ -130,6 +130,9 @@ fn check(ep: Option<&CudaExecutionProvider>) {
             &[("alpha", Attribute::Float(0.))],
         );
         assert_eq!(y, [-1., -1.5]);
+        let y = run("SwiGLU", 28, &[2], &[&a, &b], &[]);
+        close(y[0], -0.53788286);
+        close(y[1], -2.1931758);
         for (approximate, expected) in [(b"none", -0.3173105), (b"tanh", -0.317616)] {
             let y = run(
                 "GeGLU",
@@ -141,6 +144,8 @@ fn check(ep: Option<&CudaExecutionProvider>) {
             close(y[0], expected);
             close(y[1], -3. * (1. + expected / 2.));
         }
+        let y = run("GeGLU", 29, &[1], &[&[-4.], &[2.]], &[]);
+        close(y[0], -0.00025337);
         let axis = [("axis", Attribute::Int(-2))];
         // Non-last axis: lanes are interleaved. NaN must override a previous +inf.
         let x = [
@@ -160,6 +165,15 @@ fn check(ep: Option<&CudaExecutionProvider>) {
         close(y[2], -99.30685);
         close(y[4], -98.90139);
         assert!(run("LogCumSumExp", 29, &[0, 2], &[&[]], &axis).is_empty());
+        let y = run(
+            "LogCumSumExp",
+            29,
+            &[1, 128, 1],
+            &[&[0.; 128]],
+            &[("axis", Attribute::Int(1))],
+        );
+        assert_eq!(y[0], 0.);
+        close(y[127], 4.8520303);
     }
 
     // Must stay in f64, not underflow by conversion to f32.
@@ -175,6 +189,16 @@ fn check(ep: Option<&CudaExecutionProvider>) {
             1e-200
         );
     }
+    let inputs = [input(DataType::Float64, &[2], &[1e12f64, 1e12])];
+    let outputs = [(DataType::Float64, vec![2])];
+    let result = match ep {
+        Some(ep) => run_cuda(ep, "LogCumSumExp", "", 29, &inputs, &outputs, &[]),
+        None => run_cpu("LogCumSumExp", "", 29, &inputs, &outputs, &[]),
+    };
+    assert_eq!(
+        f64::from_ne_bytes(result[0][8..].try_into().unwrap()),
+        1e12 + std::f64::consts::LN_2,
+    );
 }
 
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA; enable gpu-tests")]

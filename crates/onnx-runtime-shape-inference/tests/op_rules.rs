@@ -289,6 +289,17 @@ fn standard_math_opset_gate_and_shape_contracts() {
         assert_eq!(out_shape(&y), vec![c(2), c(3)]);
     }
     let geglu = node("GeGLU", 2, 1);
+    let named = DimExpr::symbol(SymbolId(7));
+    let anonymous = DimExpr::symbol(SymbolId(0x8000_0000));
+    let y = run(
+        &geglu,
+        vec![
+            f32in(vec![anonymous, c(3)]),
+            f32in(vec![named.clone(), c(3)]),
+        ],
+        29,
+    );
+    assert_eq!(out_shape(&y), vec![named, c(3)]);
     assert_invalid(
         try_run(
             &geglu,
