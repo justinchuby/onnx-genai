@@ -2592,6 +2592,11 @@ dependencies = [
 [[package]]
 name = "onnx-runtime-quantization"
 version = "0.1.0-dev.6"
+dependencies = [
+ "half",
+ "onnx-runtime-ir",
+ "sha2",
+]
 
 [[package]]
 name = "onnx-runtime-session"

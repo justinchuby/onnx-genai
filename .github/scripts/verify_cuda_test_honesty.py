@@ -74,6 +74,7 @@ EXPECTED_CUDA_TARGETS_BY_DIR = {
             "cuda_conformance_gpu",
             "cuda_parity_batch10_gpu",
             "deferred_release_gpu",
+            "dequantize_packed_gpu",
             "device_allocator_gpu",
             "dft_gpu",
             "dsa_index_select_gpu",

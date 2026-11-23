@@ -420,6 +420,7 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/resize.yaml"),
     include_str!("../../schemas/standard/quantize_linear.yaml"),
     include_str!("../../schemas/standard/dequantize_linear.yaml"),
+    include_str!("../../schemas/standard/dequantize_packed.yaml"),
     include_str!("../../schemas/standard/dynamic_quantize_linear.yaml"),
     include_str!("../../schemas/standard/attention.yaml"),
     include_str!("../../schemas/standard/cast_like.yaml"),
@@ -732,10 +733,11 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 107);
-        assert_eq!(registry.iter().count(), 119);
+        assert_eq!(registry.schemas.len(), 108);
+        assert_eq!(registry.iter().count(), 120);
 
         for (name, since_version) in [
+            ("DequantizePacked", 29),
             ("BitShift", 11),
             ("BitwiseAnd", 18),
             ("BitwiseOr", 18),
