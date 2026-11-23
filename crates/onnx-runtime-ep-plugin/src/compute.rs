@@ -29,7 +29,10 @@ use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView
 use onnx_runtime_ir::{DataType, DeviceId, Node};
 
 use crate::kernel_ctx::{allocate_output, read_inputs_into};
-use crate::shared_shapes::{SharedNativeShapeRule, SharedShapeResult, infer_shared_node};
+use crate::shared_shapes::{
+    SharedNativeShapeRule, SharedShapeResult, infer_native_node, infer_shared_node,
+    native_shape_operands,
+};
 use crate::status::{fail_status, ok_status};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -64,6 +67,11 @@ pub enum ShapeInference {
     SharedNative {
         node: Box<Node>,
         fallback: Box<ShapeInference>,
+    },
+    /// Resolve through the native registry without a second shape rule.
+    NativeRegistry {
+        node: Box<Node>,
+        shape_operands: &'static [usize],
     },
     /// numpy-style broadcast of all inputs → one output.
     ElementwiseBroadcast,
@@ -347,6 +355,13 @@ impl ShapeInference {
                         "DequantizePacked requires a valid format, logical shape, and output_dtype",
                     ),
                 },
+            };
+        }
+
+        if let Some(shape_operands) = native_shape_operands(node) {
+            return Self::NativeRegistry {
+                node: Box::new(node.clone()),
+                shape_operands,
             };
         }
 
@@ -2157,6 +2172,7 @@ unsafe fn mem_info_is_device(api: &ort::OrtApi, mem_info: *const ort::OrtMemoryI
 /// operand that crossed a CPU→device boundary and must be staged (#982).
 fn host_operand_indices(strategy: &ShapeInference) -> &'static [usize] {
     match strategy {
+        ShapeInference::NativeRegistry { shape_operands, .. } => shape_operands,
         ShapeInference::SharedNative { fallback, .. } => host_operand_indices(fallback),
         ShapeInference::ReshapeData { .. } | ShapeInference::SqueezeFromInput => &[1],
         ShapeInference::SliceData => &[1, 2, 3, 4],
@@ -5011,6 +5027,17 @@ fn infer_shapes(
             "kernel-sized outputs must execute before allocation; infer_shapes is not applicable"
                 .into(),
         ),
+        ShapeInference::NativeRegistry {
+            node,
+            shape_operands,
+        } => match infer_native_node(node, inputs, |i| shape_operands.contains(&i)) {
+            SharedShapeResult::Resolved(shapes) => Ok(shapes),
+            SharedShapeResult::Rejected(reason) => Err(reason),
+            SharedShapeResult::SymbolicOrUnknown => Err(format!(
+                "{}: output shape is unresolved; provide concrete input shapes and host-accessible shape operands",
+                node.op_type
+            )),
+        },
         ShapeInference::SharedNative { node, fallback } => match infer_shared_node(node, inputs) {
             SharedShapeResult::Resolved(shapes) => Ok(shapes),
             // Preserve the plugin's established permissiveness. In particular,

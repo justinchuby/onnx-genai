@@ -290,6 +290,103 @@ fn migrated_shared_rules_agree() {
 }
 
 #[test]
+fn opset_28_29_and_affine_rules_resolve_through_the_plugin() {
+    let f = [0.0f32; 24];
+    let codes = [0u8; 24];
+    let routes = [0i64; 4];
+    let count = 5i64;
+    let a = view(DataType::Float32, &[2, 4], &[4, 1], f.as_ptr().cast());
+    let route = view(DataType::Int64, &[2, 2], &[2, 1], routes.as_ptr().cast());
+    let shape_only = |n: &Node, inputs: &[TensorView<'_>], expected: &[usize]| {
+        let selected = ShapeInference::for_node(n, &[], 1);
+        assert!(matches!(selected, ShapeInference::NativeRegistry { .. }));
+        let shapes = onnx_runtime_ep_plugin::compute::infer_shapes_for_test(&selected, inputs)
+            .unwrap_or_else(|err| panic!("{}: {err}", n.op_type));
+        assert_eq!(shapes, [expected.to_vec()], "{}", n.op_type);
+        let mut wrong_domain = n.clone();
+        wrong_domain.domain = "example".into();
+        assert!(matches!(
+            ShapeInference::for_node(&wrong_domain, &[], 1),
+            ShapeInference::Declined { .. }
+        ));
+        if n.domain.is_empty() {
+            let mut older = n.clone();
+            older.version = n.version.map(|v| v - 1);
+            assert!(matches!(
+                ShapeInference::for_node(&older, &[], 1),
+                ShapeInference::Declined { .. }
+            ));
+        }
+    };
+    for (name, opset, arity) in [
+        ("SwiGLU", 28, 2),
+        ("GeGLU", 29, 2),
+        ("Expm1", 29, 1),
+        ("Log1p", 29, 1),
+        ("LogCumSumExp", 29, 1),
+    ] {
+        let inputs = [a.clone(), a.clone()];
+        shape_only(&node(name, arity, &[], opset), &inputs[..arity], &[2, 4]);
+    }
+
+    shape_only(
+        &node("Pack", 1, &[("bits", 3)], 29),
+        &[view(DataType::Uint8, &[2, 5], &[5, 1], codes.as_ptr())],
+        &[2, 2],
+    );
+    shape_only(
+        &node("Unpack", 2, &[("bits", 3)], 29),
+        &[
+            view(DataType::Uint8, &[2, 2], &[2, 1], codes.as_ptr()),
+            view(DataType::Int64, &[], &[], (&count as *const i64).cast()),
+        ],
+        &[2, 5],
+    );
+    shape_only(
+        &node("GroupedMatMul", 3, &[("transB", 1)], 29),
+        &[
+            a.clone(),
+            view(
+                DataType::Float32,
+                &[2, 3, 4],
+                &[12, 4, 1],
+                f.as_ptr().cast(),
+            ),
+            route.clone(),
+        ],
+        &[2, 2, 3],
+    );
+    let mut gather = node("AffineQuantizedGather", 3, &[("axis", -1)], 1);
+    gather.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    shape_only(
+        &gather,
+        &[
+            view(DataType::Uint8, &[3, 4], &[4, 1], codes.as_ptr()),
+            route.clone(),
+            view(DataType::Float32, &[], &[], f.as_ptr().cast()),
+        ],
+        &[3, 2, 2],
+    );
+    let mut grouped = node(
+        "AffineQuantizedGroupedMatMul",
+        4,
+        &[("depth", 4), ("block_size", 2), ("zero", 0)],
+        1,
+    );
+    grouped.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    shape_only(
+        &grouped,
+        &[
+            a,
+            view(DataType::Uint8, &[2, 3, 2], &[6, 2, 1], codes.as_ptr()),
+            route,
+            view(DataType::Float32, &[2, 3, 2], &[6, 2, 1], f.as_ptr().cast()),
+        ],
+        &[2, 2, 3],
+    );
+}
+
+#[test]
 fn migrated_shared_rules_agree_on_edge_extents() {
     let empty: [i64; 0] = [];
     let empty_shape = view(DataType::Int64, &[0], &[1], empty.as_ptr().cast());

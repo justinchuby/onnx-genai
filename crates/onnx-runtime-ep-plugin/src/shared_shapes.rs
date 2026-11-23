@@ -86,7 +86,46 @@ pub(crate) enum SharedShapeResult {
 /// uses opset 1 rather than guessing the latest version. Future migrations with
 /// version-dependent semantics must account for this contract explicitly.
 pub(crate) fn infer_shared_node(node: &Node, inputs: &[TensorView<'_>]) -> SharedShapeResult {
-    let input_ios = match inputs.iter().map(node_io).collect::<Result<Vec<_>, _>>() {
+    infer_native_node(node, inputs, |_| true)
+}
+
+/// Native rules with no plugin fallback. Only the listed operands are read
+/// for shape data; all other operands contribute metadata only.
+pub(crate) fn native_shape_operands(node: &Node) -> Option<&'static [usize]> {
+    let opset = node.local_opset()?;
+    let op = node.op_type.as_str();
+    if node.is_default_domain() {
+        if onnx_runtime_ir::standard_math::OPS
+            .iter()
+            .any(|&(name, since)| name == op && opset >= since)
+        {
+            return Some(&[]);
+        }
+        if opset >= 29 && onnx_runtime_ir::packed_routed::OPS.contains(&op) {
+            return Some(if op == "Unpack" { &[1] } else { &[] });
+        }
+    } else if node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+        && matches!(
+            op,
+            onnx_runtime_ir::affine_gather::OP | onnx_runtime_ir::quantized_grouped::OP
+        )
+    {
+        return Some(&[]);
+    }
+    None
+}
+
+pub(crate) fn infer_native_node(
+    node: &Node,
+    inputs: &[TensorView<'_>],
+    read_operand: impl Fn(usize) -> bool,
+) -> SharedShapeResult {
+    let input_ios = match inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| node_io(input, read_operand(i)))
+        .collect::<Result<Vec<_>, _>>()
+    {
         Ok(inputs) => inputs,
         Err(reason) => return SharedShapeResult::Rejected(reason),
     };
@@ -132,7 +171,7 @@ pub(crate) fn infer_shared_node(node: &Node, inputs: &[TensorView<'_>]) -> Share
     }
 }
 
-fn node_io(input: &TensorView<'_>) -> Result<NodeIo, String> {
+fn node_io(input: &TensorView<'_>, read_operand: bool) -> Result<NodeIo, String> {
     if input.is_absent() {
         return Ok(NodeIo::default());
     }
@@ -148,7 +187,7 @@ fn node_io(input: &TensorView<'_>) -> Result<NodeIo, String> {
     let type_info = TypeInfo::new(input.dtype, shape);
     Ok(NodeIo {
         type_info: Some(type_info),
-        shape_data: tensor_shape_data(input),
+        shape_data: read_operand.then(|| tensor_shape_data(input)).flatten(),
         value_type: None,
     })
 }
