@@ -366,7 +366,7 @@ fn prepare(
         output_budget,
     )
     .map_err(|err| ApiError::invalid_request(format!("{err:#}")))?;
-    options.max_json_bytes = state.config.replay_buffer_bytes;
+    options.max_constraint_bytes = state.config.replay_buffer_bytes;
     options.resolve_sampling_defaults(
         handle.generation_defaults.as_ref(),
         &super::completions::chat_sampling_overrides(&request.sampling),

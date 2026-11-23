@@ -47,98 +47,125 @@ pub(crate) fn build_processor_chain(
     if let Some(constraint) = &options.constraint {
         let tokenizer = tokenizer.context("constrained decoding requires a tokenizer")?;
         let token_texts = tokenizer_token_texts(tokenizer)?;
-        match constraint {
-            GenerateConstraint::Json { prefix } => {
-                chain.add(Box::new(ConstraintProcessor::new(
-                    Box::new(crate::response_constraint::JsonContentConstraint::new(
-                        tokenizer,
-                        &serde_json::Value::Bool(true),
-                        crate::json_projection::ProjectionKind::Plain,
-                        prefix,
-                        options.max_json_bytes,
-                        if options.stop_on_eos {
-                            terminal_token_ids(options)
-                        } else {
-                            Vec::new()
-                        },
-                    )?),
-                    token_texts,
-                    terminal_token_ids(options),
-                )));
+        let projection = &options.response_projection;
+        let plain_prefix = match constraint {
+            GenerateConstraint::Json { prefix }
+            | GenerateConstraint::JsonSchema { prefix, .. }
+            | GenerateConstraint::Regex { prefix, .. }
+            | GenerateConstraint::Lark { prefix, .. } => prefix,
+        };
+        anyhow::ensure!(
+            projection.is_none() || plain_prefix.is_empty(),
+            "constraint prefix conflicts with response_projection ownership; leave the constraint prefix empty and put the complete assistant prefill in response_projection"
+        );
+        let max_bytes = projection
+            .as_ref()
+            .map_or(options.max_constraint_bytes, |projection| {
+                projection.max_bytes().min(options.max_constraint_bytes)
+            });
+        let prefix = |plain: &str| {
+            projection.as_ref().map_or_else(
+                || plain.to_owned(),
+                |projection| projection.prefix().to_owned(),
+            )
+        };
+        let kind = || {
+            projection.as_ref().map_or(
+                crate::text_projection::ProjectionKind::Plain,
+                |projection| {
+                    crate::text_projection::ProjectionKind::Declared(projection.template().clone())
+                },
+            )
+        };
+        let endings = || {
+            if options.stop_on_eos {
+                terminal_token_ids(options)
+            } else {
+                Vec::new()
             }
-            GenerateConstraint::JsonSchema { schema, prefix } => {
+        };
+        let grammar: Box<dyn crate::logits::Constraint> = match constraint {
+            GenerateConstraint::Json { prefix: plain } => {
+                Box::new(crate::response_constraint::ContentConstraint::json_schema(
+                    tokenizer,
+                    &serde_json::Value::Bool(true),
+                    kind(),
+                    &prefix(plain),
+                    max_bytes,
+                    endings(),
+                )?)
+            }
+            GenerateConstraint::JsonSchema {
+                schema,
+                prefix: plain,
+            } => {
                 let schema = serde_json::from_str(schema)
                     .context("parse JSON Schema constraint; supply a valid JSON schema value")?;
-                chain.add(Box::new(ConstraintProcessor::new(
-                    Box::new(crate::response_constraint::JsonContentConstraint::new(
-                        tokenizer,
-                        &schema,
-                        crate::json_projection::ProjectionKind::Plain,
-                        prefix,
-                        options.max_json_bytes,
-                        if options.stop_on_eos {
-                            terminal_token_ids(options)
-                        } else {
-                            Vec::new()
-                        },
-                    )?),
-                    token_texts,
-                    terminal_token_ids(options),
-                )));
+                Box::new(crate::response_constraint::ContentConstraint::json_schema(
+                    tokenizer,
+                    &schema,
+                    kind(),
+                    &prefix(plain),
+                    max_bytes,
+                    endings(),
+                )?)
             }
-            GenerateConstraint::ResponseJson {
-                schema,
-                template,
-                prefix,
+            GenerateConstraint::Regex {
+                pattern,
+                prefix: plain,
             } => {
-                chain.add(Box::new(ConstraintProcessor::new(
-                    Box::new(crate::response_constraint::JsonContentConstraint::new(
+                if let Some(projection) = projection {
+                    Box::new(crate::response_constraint::ContentConstraint::text(
                         tokenizer,
-                        schema,
-                        crate::json_projection::ProjectionKind::Declared(template.clone()),
-                        prefix,
-                        options.max_json_bytes,
-                        if options.stop_on_eos {
-                            terminal_token_ids(options)
-                        } else {
-                            Vec::new()
-                        },
-                    )?),
-                    token_texts,
-                    terminal_token_ids(options),
-                )));
-            }
-            GenerateConstraint::Regex { pattern, prefix } => {
-                chain.add(Box::new(ConstraintProcessor::new(
+                        &crate::config::TextGrammar::Regex(pattern.clone()),
+                        projection.template().clone(),
+                        projection.prefix(),
+                        max_bytes,
+                        endings(),
+                    )?)
+                } else {
                     build_llguidance_constraint(
                         GrammarConstraintKind::Regex,
                         pattern,
-                        prefix,
+                        plain,
                         tokenizer,
                         &token_texts,
                         options.eos_token_id,
                         &terminal_token_ids(options),
-                    )?,
-                    token_texts,
-                    terminal_token_ids(options),
-                )));
+                    )?
+                }
             }
-            GenerateConstraint::Lark { grammar, prefix } => {
-                chain.add(Box::new(ConstraintProcessor::new(
+            GenerateConstraint::Lark {
+                grammar,
+                prefix: plain,
+            } => {
+                if let Some(projection) = projection {
+                    Box::new(crate::response_constraint::ContentConstraint::text(
+                        tokenizer,
+                        &crate::config::TextGrammar::Lark(grammar.clone()),
+                        projection.template().clone(),
+                        projection.prefix(),
+                        max_bytes,
+                        endings(),
+                    )?)
+                } else {
                     build_llguidance_constraint(
                         GrammarConstraintKind::Lark,
                         grammar,
-                        prefix,
+                        plain,
                         tokenizer,
                         &token_texts,
                         options.eos_token_id,
                         &terminal_token_ids(options),
-                    )?,
-                    token_texts,
-                    terminal_token_ids(options),
-                )));
+                    )?
+                }
             }
-        }
+        };
+        chain.add(Box::new(ConstraintProcessor::new(
+            grammar,
+            token_texts,
+            terminal_token_ids(options),
+        )));
     }
 
     if let Some(budget) = &options.reasoning_budget {
