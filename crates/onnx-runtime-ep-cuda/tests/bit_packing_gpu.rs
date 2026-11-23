@@ -1,10 +1,7 @@
 mod common;
 
-use DataType::{BFloat16, Float16, Float32, Float64, Int32, Int64, Uint8, Uint32};
-use common::{
-    Tensor, absent_input, decode_floats, float_input, input, require_cuda, try_run_cpu,
-    try_run_cuda_with_origin_offset,
-};
+use DataType::{Int32, Int64, Uint8, Uint32};
+use common::{Tensor, input, require_cuda, try_run_cpu, try_run_cuda_with_origin_offset};
 use onnx_runtime_ep_api::ExecutionProvider;
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
@@ -37,15 +34,6 @@ fn test_provider(ep: Option<&CudaExecutionProvider>, origin_offset: usize) {
             vec![Uint32, Int64],
             vec![static_shape([2]), static_shape([])],
         ),
-        (
-            "GroupedMatMul",
-            vec![BFloat16, BFloat16, Int32],
-            vec![
-                static_shape([4, 3]),
-                static_shape([2, 3, 2]),
-                static_shape([4, 1]),
-            ],
-        ),
     ] {
         let mut node = Node::new(
             NodeId(0),
@@ -53,9 +41,7 @@ fn test_provider(ep: Option<&CudaExecutionProvider>, origin_offset: usize) {
             (0..dtypes.len()).map(|i| Some(ValueId(i as u32))).collect(),
             vec![ValueId(4)],
         );
-        if name != "GroupedMatMul" {
-            node.attributes.insert("bits".into(), Attribute::Int(3));
-        }
+        node.attributes.insert("bits".into(), Attribute::Int(3));
         assert!(
             provider
                 .supports_op(&node, 29, &shapes, &dtypes, &[])
@@ -174,88 +160,6 @@ fn test_provider(ep: Option<&CudaExecutionProvider>, origin_offset: usize) {
         codes
     );
 
-    for dtype in [Float16, BFloat16, Float32, Float64] {
-        let f = |shape: &[usize], v: &[f32]| {
-            if dtype == Float64 {
-                input(
-                    dtype,
-                    shape,
-                    &v.iter().map(|&x| f64::from(x)).collect::<Vec<_>>(),
-                )
-            } else {
-                float_input(dtype, shape, v)
-            }
-        };
-        let expected = [24., 30., 0., 6., 24., 30., 50., 71., 92., 113., 8., 29.];
-        let x = f(&[2, 3], &[1., 2., -1., 3., 0., 4.]);
-        let w = f(&[3, 2, 3], &(0..18).map(|i| i as f32).collect::<Vec<_>>());
-        for trans_b in [-1, 2] {
-            let attrs = [("transB", Attribute::Int(trans_b))];
-            let ids = input(Int64, &[2, 3], &[2i64, 0, 2, 1, 2, 0]);
-            let inputs = [x.clone(), w.clone(), ids, absent_input(dtype)];
-            let result = run("GroupedMatMul", &inputs, &[(dtype, vec![2, 3, 2])], &attrs).unwrap();
-            assert_eq!(decode_floats(&result, dtype), expected);
-        }
-        let x = f(&[2, 2], &[1., 2., 3., 4.]);
-        let w = f(&[2, 2, 2], &[1., 0., 0., 1., 0., 1., 1., 0.]);
-        let ids = input(Int32, &[2, 2], &[0i32, 1, 1, 0]);
-        let b = f(&[2, 2], &[0.5, 1., 1.5, 2.]);
-        let result = run(
-            "GroupedMatMul",
-            &[x, w, ids, b],
-            &[(dtype, vec![2, 2, 2])],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            decode_floats(&result, dtype),
-            [1.5, 3., 3.5, 3., 5.5, 5., 3.5, 5.]
-        );
-        if matches!(dtype, Float16 | BFloat16) {
-            let half_ulp = if dtype == Float16 {
-                1. / 2048.
-            } else {
-                1. / 256.
-            };
-            let out = run(
-                "GroupedMatMul",
-                &[
-                    f(&[1, 2], &[1., half_ulp]),
-                    f(&[1, 2, 1], &[1., 1.]),
-                    input(Int32, &[1, 1], &[0i32]),
-                    f(&[1, 1], &[-1.]),
-                ],
-                &[(dtype, vec![1, 1, 1])],
-                &[],
-            )
-            .unwrap();
-            assert_eq!(decode_floats(&out, dtype), [0.]);
-        }
-        let x = f(&[2, 0], &[]);
-        let w = f(&[2, 0, 1], &[]);
-        let ids = input(Int32, &[2, 1], &[1i32, 0]);
-        let b = f(&[2, 1], &[0.5, -2.0]);
-        let result = run(
-            "GroupedMatMul",
-            &[x.clone(), w.clone(), ids, b],
-            &[(dtype, vec![2, 1, 1])],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(decode_floats(&result, dtype), [-2., 0.5]);
-        let ids = input::<i64>(Int64, &[2, 0], &[]);
-        assert!(
-            run(
-                "GroupedMatMul",
-                &[x, w, ids],
-                &[(dtype, vec![2, 0, 1])],
-                &[]
-            )
-            .unwrap()
-            .is_empty()
-        );
-    }
-
     for (op, inputs, out, attrs, reason) in [
         (
             "Pack",
@@ -288,17 +192,6 @@ fn test_provider(ep: Option<&CudaExecutionProvider>, origin_offset: usize) {
             vec![("bits", Attribute::Int(3))],
             "exactly 1 words",
         ),
-        (
-            "GroupedMatMul",
-            vec![
-                float_input(Float32, &[1, 1], &[1.]),
-                float_input(Float32, &[1, 1, 1], &[2.]),
-                input(Int32, &[1, 1], &[-1i32]),
-            ],
-            (Float32, vec![1, 1, 1]),
-            vec![],
-            "group_indices",
-        ),
     ] {
         let error = run(op, &inputs, &[out], &attrs).unwrap_err().to_string();
         assert!(error.contains(op) && error.contains(reason), "{error}");
@@ -307,7 +200,7 @@ fn test_provider(ep: Option<&CudaExecutionProvider>, origin_offset: usize) {
 
 #[test]
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA; enable gpu-tests")]
-fn packed_routed_native_cpu_and_cuda() {
+fn bit_packing_native_cpu_and_cuda() {
     let ep = require_cuda();
     test_provider(None, 0);
     test_provider(Some(&ep), 0);

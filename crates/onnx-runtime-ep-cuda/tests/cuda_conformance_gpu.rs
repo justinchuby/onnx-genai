@@ -2488,13 +2488,18 @@ fn conformance_profile() -> Vec<ProfileEntry> {
             "independent CPU and native CUDA math expectations",
         ));
     }
-    for op in ["Pack", "Unpack", "GroupedMatMul"] {
+    for op in ["Pack", "Unpack"] {
         p.push(dedicated(
             op,
-            "packed_routed_gpu.rs",
+            "bit_packing_gpu.rs",
             "pinned opset-29 vectors and input validation on native CPU and CUDA",
         ));
     }
+    p.push(dedicated(
+        "GroupedMatMul",
+        "grouped_matmul_gpu.rs",
+        "native CPU and CUDA routing, dtype, bias and input validation vectors",
+    ));
     p.push(dedicated(
         "MatMulNBits",
         "matmul_nbits_gpu.rs",

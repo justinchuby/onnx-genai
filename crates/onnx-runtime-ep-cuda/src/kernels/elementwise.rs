@@ -22,9 +22,12 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 
+use onnx_runtime_ep_api::standard_math::{Scan, validate};
 use onnx_runtime_ep_api::{
-    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    CaptureSupport, DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut,
+    TensorView,
 };
+use onnx_runtime_ir::standard_math::Math;
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
@@ -1836,4 +1839,136 @@ extern "C" __global__ void read_after_delay(
             runtime.free_raw(out_ptr).unwrap();
         }
     }
+}
+
+const STABLE_UNARY_MATH_SOURCE: &str = concat!(
+    include_str!("float_math_prelude.cuh"),
+    include_str!("stable_unary_math.cu")
+);
+
+pub(super) struct StableUnaryFactory(pub Arc<CudaRuntime>);
+
+impl KernelFactory for StableUnaryFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(StableUnaryKernel {
+            op: Math::from_node(node).map_err(EpError::KernelFailed)?,
+            runtime: Arc::clone(&self.0),
+        }))
+    }
+}
+
+struct StableUnaryKernel {
+    op: Math,
+    runtime: Arc<CudaRuntime>,
+}
+
+impl Kernel for StableUnaryKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let (stem, alpha) = match self.op {
+            Math::Expm1 => ("expm1", 0.),
+            Math::Log1p => ("log1p", 0.),
+            _ => unreachable!("operator registered to its family"),
+        };
+        launch_float_math(
+            &self.runtime,
+            self.op,
+            FloatMathSource {
+                module: "stable_unary_math",
+                source: STABLE_UNARY_MATH_SOURCE,
+                stem,
+                alpha,
+            },
+            inputs,
+            outputs,
+        )
+    }
+
+    fn capture_support(&self) -> CaptureSupport {
+        CaptureSupport::Supported
+    }
+}
+
+pub(super) struct FloatMathSource {
+    pub module: &'static str,
+    pub source: &'static str,
+    pub stem: &'static str,
+    pub alpha: f32,
+}
+
+pub(super) fn launch_float_math(
+    runtime: &CudaRuntime,
+    math: Math,
+    source: FloatMathSource,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+) -> Result<()> {
+    let FloatMathSource {
+        module,
+        source,
+        stem,
+        alpha,
+    } = source;
+    let scan = validate(math, inputs, outputs)?;
+    let op = math.name();
+    let x = &inputs[0];
+    let Scan {
+        lanes,
+        length,
+        inner,
+    } = scan.unwrap_or(Scan {
+        lanes: x.numel(),
+        length: 0,
+        inner: 0,
+    });
+    if lanes == 0 {
+        return Ok(());
+    }
+    if !inputs.iter().all(TensorView::is_contiguous) || !outputs[0].is_contiguous() {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: CUDA requires contiguous inputs and output; materialize strided tensors first"
+        )));
+    }
+    let suffix = match x.dtype {
+        DataType::Float16 | DataType::BFloat16 => {
+            runtime.require_nvrtc_half_headers(op)?;
+            if x.dtype == DataType::Float16 {
+                "f16"
+            } else {
+                "bf16"
+            }
+        }
+        DataType::Float32 => "f32",
+        DataType::Float64 => "f64",
+        _ => unreachable!("validated math dtype"),
+    };
+    let entry = format!("{stem}_{suffix}");
+    let func = runtime.nvrtc_function(module, source, &entry)?;
+    let x = cuptr(x.data_ptr::<u8>() as *const c_void);
+    let b = inputs
+        .get(1)
+        .map_or(x, |b| cuptr(b.data_ptr::<u8>() as *const c_void));
+    let y = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+    const BLOCK: u32 = 256;
+    let cfg = LaunchConfig {
+        grid_dim: (lanes.div_ceil(BLOCK as usize).min(65_535) as u32, 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (lanes, length, inner) = (lanes as u64, length as u64, inner as u64);
+    let stream = runtime.stream();
+    let mut builder = stream.launch_builder(&func);
+    builder
+        .arg(&x)
+        .arg(&b)
+        .arg(&y)
+        .arg(&lanes)
+        .arg(&length)
+        .arg(&inner)
+        .arg(&alpha);
+    // SAFETY: the pointers cover the validated tensor shapes and the arguments match ENTRY.
+    unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {op}"), e))?;
+    if !runtime.is_capturing()? {
+        runtime.synchronize()?;
+    }
+    Ok(())
 }

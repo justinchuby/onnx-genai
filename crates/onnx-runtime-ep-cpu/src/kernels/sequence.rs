@@ -1,6 +1,8 @@
 //! Sequence construction and scans: `Tile`, `Range`, `CumSum`, and `CumProd`.
 
+use onnx_runtime_ep_api::standard_math::{Scan, validate};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::standard_math::Math;
 use onnx_runtime_ir::{DataType, Node};
 
 use super::{
@@ -834,5 +836,95 @@ mod tests {
                 x.to_u16_bits()[1]
             ]
         );
+    }
+}
+
+pub(super) struct LogCumSumExpFactory;
+
+impl KernelFactory for LogCumSumExpFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(LogCumSumExpKernel(
+            Math::from_node(node).map_err(EpError::KernelFailed)?,
+        )))
+    }
+}
+
+struct LogCumSumExpKernel(Math);
+
+impl Kernel for LogCumSumExpKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let scan = validate(self.0, inputs, outputs)?.expect("validated scan axis");
+        super::unary_math::run_dense_unary(
+            self.0.name(),
+            &inputs[0],
+            &mut outputs[0],
+            |x| scan_f32(x, scan),
+            |x| scan_f64(x, scan),
+        )
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        true
+    }
+}
+
+macro_rules! log_cum_sum_exp {
+    ($name:ident, $float:ty) => {
+        fn $name(data: &mut [$float], scan: Scan) {
+            let Scan {
+                lanes,
+                length,
+                inner,
+            } = scan;
+            for lane in 0..lanes {
+                let start = (lane / inner) * length * inner + lane % inner;
+                let mut max = <$float>::NEG_INFINITY;
+                // Keep the leading 1 separate so log1p retains small prefixes.
+                let mut rest = 0.;
+                for k in 0..length {
+                    let x = &mut data[start + k * inner];
+                    if x.is_nan() {
+                        max = *x;
+                    } else if !max.is_nan() {
+                        if *x == <$float>::INFINITY {
+                            max = *x;
+                        } else if x.is_finite() && max != <$float>::INFINITY {
+                            if *x > max {
+                                rest = (1. + rest) * (max - *x).exp();
+                                max = *x;
+                            } else {
+                                rest += (*x - max).exp();
+                            }
+                        }
+                    }
+                    *x = if max.is_finite() {
+                        max + rest.ln_1p()
+                    } else {
+                        max
+                    };
+                }
+            }
+        }
+    };
+}
+log_cum_sum_exp!(scan_f32, f32);
+log_cum_sum_exp!(scan_f64, f64);
+
+#[cfg(test)]
+mod log_cum_sum_exp_tests {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+
+    #[test]
+    fn scan_preserves_small_prefix_and_handles_interleaved_lanes() {
+        let x = Owned::f32(&[2, 2], &[0., 1000., -30., 1000.]);
+        let mut y = Owned::zeros_f32(&[2, 2]);
+        LogCumSumExpKernel(Math::LogCumSumExp { axis: -2 })
+            .execute(&[x.view()], &mut [y.view_mut()])
+            .unwrap();
+        let y = y.to_f32();
+        assert_eq!(&y[..2], &[0., 1000.]);
+        assert!((y[2] - 9.357_623e-14).abs() < 1e-19);
+        assert!((y[3] - 1_000.693_2).abs() < 1e-4);
     }
 }

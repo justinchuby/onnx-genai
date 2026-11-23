@@ -584,6 +584,7 @@ pub mod activations;
 pub mod add;
 pub mod attention;
 pub mod bit_cast;
+mod bit_packing;
 pub mod bitshift;
 pub mod bitwise;
 pub mod block_dequant;
@@ -620,6 +621,7 @@ mod half_gemm;
 // dead code.
 mod dequantize_packed;
 pub mod governed_weight_cache;
+mod grouped_matmul;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod half_gemv;
 pub mod hardmax;
@@ -642,7 +644,6 @@ pub mod msft_attention;
 pub mod multi_head_attention;
 pub mod onehot;
 pub mod packed_multi_head_attention;
-mod packed_routed;
 pub mod packed_varlen_attention;
 pub mod pad;
 pub mod planar_block_quant;
@@ -669,7 +670,6 @@ pub mod slice;
 pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod split;
-mod standard_math;
 pub mod stft;
 pub mod tensor_scatter;
 pub mod transpose;
@@ -1071,7 +1071,7 @@ pub(crate) fn build_cpu_registry_with_resources(
             1,
         ),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(packed_routed::AffineFactory),
+        Box::new(grouped_matmul::AffineFactory),
     );
     rec.register(
         OpKey::new(
@@ -1082,18 +1082,29 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(gather::AffineGatherFactory),
     );
-    for name in onnx_runtime_ir::packed_routed::OPS {
+    for name in ["Pack", "Unpack"] {
         rec.register(
             OpKey::new(name, "", 29),
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(packed_routed::Factory),
+            Box::new(bit_packing::Factory),
         );
     }
+    rec.register(
+        OpKey::new("GroupedMatMul", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(grouped_matmul::Factory),
+    );
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
+        let factory: Box<dyn onnx_runtime_ep_api::KernelFactory> = match name {
+            "Expm1" | "Log1p" => Box::new(unary_math::StableUnaryFactory),
+            "SwiGLU" | "GeGLU" => Box::new(activations::GatedActivationFactory),
+            "LogCumSumExp" => Box::new(sequence::LogCumSumExpFactory),
+            _ => unreachable!("unregistered standard math family for {name}"),
+        };
         rec.register(
             OpKey::new(name, "", since),
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(standard_math::Factory),
+            factory,
         );
     }
     register_cnn_ops(&mut rec);
