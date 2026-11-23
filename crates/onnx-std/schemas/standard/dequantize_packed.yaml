@@ -1,0 +1,15 @@
+domain: ""
+name: DequantizePacked
+since_version: 29
+doc: Decode a rank-one UINT8 packed weight payload using an ONNX-defined GGUF profile.
+attributes:
+  - { name: format, type: string, required: true }
+  - { name: shape, type: ints, required: true }
+  - { name: output_dtype, type: int, default: 1 }
+inputs:
+  - { name: x, type_str: T1 }
+outputs:
+  - { name: y, type_str: T2 }
+type_constraints:
+  - { type_param: T1, allowed: [uint8] }
+  - { type_param: T2, allowed: [float32, float16, bfloat16, float64] }

@@ -11,6 +11,7 @@ use crate::registry::InferenceRegistry;
 mod container;
 mod custom_ops;
 mod data_ops;
+mod dequantize_packed;
 mod einsum;
 mod elementwise;
 mod generator;
@@ -59,6 +60,7 @@ pub fn register_all(registry: &mut InferenceRegistry) {
     packed_routed::register(registry);
     movement::register(registry);
     data_ops::register(registry);
+    registry.register("", "DequantizePacked", 29, dequantize_packed::infer);
     pooling::register(registry);
     recurrent::register(registry);
     selection::register(registry);

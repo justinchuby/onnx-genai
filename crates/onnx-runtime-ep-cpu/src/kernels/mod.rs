@@ -280,6 +280,7 @@ pub fn input_dtype_constraints_for_op(
         (3, F32_ONLY),
     ];
     match (op_type, domain) {
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::INPUT_DTYPES,
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
         ("RotaryEmbedding", "com.microsoft") => MSFT_ROTARY_SLOTS,
@@ -306,6 +307,7 @@ pub fn output_dtype_constraints_for_op(
 ) -> &'static [(usize, &'static [DataType])] {
     static DSA_INDEX_SELECT_OUTPUTS: &[(usize, &[DataType])] = &[(0, I64_ONLY)];
     match (op_type, domain) {
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::OUTPUT_DTYPES,
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
         _ => &[],
     }
@@ -479,6 +481,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("IsInf", "") | ("IsNaN", "") | ("EyeLike", "") => FLOAT_DTYPES,
 
         // Quantization: specific types but advertise broad.
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
         ("QuantizeLinear", "")
         | ("DequantizeLinear", "")
         | ("DynamicQuantizeLinear", "")
@@ -601,6 +604,7 @@ mod half_gemm;
 // The GEMV is an F16C/AVX2 kernel with no portable body: off x86 the decode
 // path is unchanged, so the module is not compiled at all rather than left as
 // dead code.
+mod dequantize_packed;
 pub mod governed_weight_cache;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod half_gemv;
@@ -1590,6 +1594,11 @@ pub(crate) fn build_cpu_registry_with_resources(
             Box::new(quantization::DequantizeLinearFactory),
         );
     }
+    rec.register(
+        OpKey::new("DequantizePacked", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(dequantize_packed::Factory),
+    );
     rec.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3377,7 +3386,7 @@ mod tests {
         // `TensorScatter` (opset-24 KV-cache update) adds one more, and the
         // standard-domain `CausalConvWithState` (opset 27) adds one alongside
         // its `com.microsoft` spelling.
-        // `STFT` adds its opset-17 standard-domain registration.
+        // `STFT` and `DequantizePacked` each add a standard-domain registration.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
         assert_eq!(reg.len(), PHASE1_OPS.len() + 107 + mlas_registrations);
         for op in PHASE1_OPS {
