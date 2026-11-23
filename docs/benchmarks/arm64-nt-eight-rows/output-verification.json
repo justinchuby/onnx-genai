@@ -1,0 +1,1244 @@
+[
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "baseline",
+    "native_sha256": "cdb11df57199c132852e9911510b32028e279bf9864b94d0a94aab09a0fcff61",
+    "native_bytes": 4
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "after",
+    "native_sha256": "cdb11df57199c132852e9911510b32028e279bf9864b94d0a94aab09a0fcff61",
+    "native_bytes": 4
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "null",
+    "native_sha256": "cdb11df57199c132852e9911510b32028e279bf9864b94d0a94aab09a0fcff61",
+    "native_bytes": 4
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "baseline",
+    "native_sha256": "19b608fd89a0cf883acf71fd30862db1c66621689a7cfe14b55a69a0d85d4bf6",
+    "native_bytes": 256
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "after",
+    "native_sha256": "19b608fd89a0cf883acf71fd30862db1c66621689a7cfe14b55a69a0d85d4bf6",
+    "native_bytes": 256
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "null",
+    "native_sha256": "19b608fd89a0cf883acf71fd30862db1c66621689a7cfe14b55a69a0d85d4bf6",
+    "native_bytes": 256
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "baseline",
+    "native_sha256": "449ea49cd4a5d0ff6986acefdc760689fb4c6b98b8d59ba6a06c943fca6b0ac5",
+    "native_bytes": 1024
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "after",
+    "native_sha256": "449ea49cd4a5d0ff6986acefdc760689fb4c6b98b8d59ba6a06c943fca6b0ac5",
+    "native_bytes": 1024
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "null",
+    "native_sha256": "449ea49cd4a5d0ff6986acefdc760689fb4c6b98b8d59ba6a06c943fca6b0ac5",
+    "native_bytes": 1024
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "baseline",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "after",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "null",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "baseline",
+    "native_sha256": "6b095866533c97e38517a331140963c10398ba0336ba1b4162a15e37d9f95507",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "after",
+    "native_sha256": "6b095866533c97e38517a331140963c10398ba0336ba1b4162a15e37d9f95507",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "null",
+    "native_sha256": "6b095866533c97e38517a331140963c10398ba0336ba1b4162a15e37d9f95507",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "baseline",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "after",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "null",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "baseline",
+    "native_sha256": "f9032ce480e839033e86ad56b2aa935f79f8b6d0b0e20468f51e3533139f7fd2",
+    "native_bytes": 252
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "after",
+    "native_sha256": "f9032ce480e839033e86ad56b2aa935f79f8b6d0b0e20468f51e3533139f7fd2",
+    "native_bytes": 252
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "null",
+    "native_sha256": "f9032ce480e839033e86ad56b2aa935f79f8b6d0b0e20468f51e3533139f7fd2",
+    "native_bytes": 252
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "baseline",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "after",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "null",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "baseline",
+    "native_sha256": "f29b22b37a6e4c2787d4f1586fee1c731cedb1d240ab9f69f1d9bd08ecab73c0",
+    "native_bytes": 128
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "after",
+    "native_sha256": "f29b22b37a6e4c2787d4f1586fee1c731cedb1d240ab9f69f1d9bd08ecab73c0",
+    "native_bytes": 128
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "null",
+    "native_sha256": "f29b22b37a6e4c2787d4f1586fee1c731cedb1d240ab9f69f1d9bd08ecab73c0",
+    "native_bytes": 128
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "baseline",
+    "native_sha256": "b2243ac4416cd7fbbe07adef235c4e1cac79ecc74bf21c6fea0ffe8086120c37",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "after",
+    "native_sha256": "b2243ac4416cd7fbbe07adef235c4e1cac79ecc74bf21c6fea0ffe8086120c37",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "null",
+    "native_sha256": "b2243ac4416cd7fbbe07adef235c4e1cac79ecc74bf21c6fea0ffe8086120c37",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "after",
+    "native_sha256": "cdb11df57199c132852e9911510b32028e279bf9864b94d0a94aab09a0fcff61",
+    "native_bytes": 4
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "null",
+    "native_sha256": "cdb11df57199c132852e9911510b32028e279bf9864b94d0a94aab09a0fcff61",
+    "native_bytes": 4
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "baseline",
+    "native_sha256": "cdb11df57199c132852e9911510b32028e279bf9864b94d0a94aab09a0fcff61",
+    "native_bytes": 4
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "after",
+    "native_sha256": "19b608fd89a0cf883acf71fd30862db1c66621689a7cfe14b55a69a0d85d4bf6",
+    "native_bytes": 256
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "null",
+    "native_sha256": "19b608fd89a0cf883acf71fd30862db1c66621689a7cfe14b55a69a0d85d4bf6",
+    "native_bytes": 256
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "baseline",
+    "native_sha256": "19b608fd89a0cf883acf71fd30862db1c66621689a7cfe14b55a69a0d85d4bf6",
+    "native_bytes": 256
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "after",
+    "native_sha256": "449ea49cd4a5d0ff6986acefdc760689fb4c6b98b8d59ba6a06c943fca6b0ac5",
+    "native_bytes": 1024
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "null",
+    "native_sha256": "449ea49cd4a5d0ff6986acefdc760689fb4c6b98b8d59ba6a06c943fca6b0ac5",
+    "native_bytes": 1024
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "baseline",
+    "native_sha256": "449ea49cd4a5d0ff6986acefdc760689fb4c6b98b8d59ba6a06c943fca6b0ac5",
+    "native_bytes": 1024
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "after",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "null",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "baseline",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "after",
+    "native_sha256": "6b095866533c97e38517a331140963c10398ba0336ba1b4162a15e37d9f95507",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "null",
+    "native_sha256": "6b095866533c97e38517a331140963c10398ba0336ba1b4162a15e37d9f95507",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "baseline",
+    "native_sha256": "6b095866533c97e38517a331140963c10398ba0336ba1b4162a15e37d9f95507",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "after",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "null",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "baseline",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "after",
+    "native_sha256": "f9032ce480e839033e86ad56b2aa935f79f8b6d0b0e20468f51e3533139f7fd2",
+    "native_bytes": 252
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "null",
+    "native_sha256": "f9032ce480e839033e86ad56b2aa935f79f8b6d0b0e20468f51e3533139f7fd2",
+    "native_bytes": 252
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "baseline",
+    "native_sha256": "f9032ce480e839033e86ad56b2aa935f79f8b6d0b0e20468f51e3533139f7fd2",
+    "native_bytes": 252
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "after",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "null",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "baseline",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "after",
+    "native_sha256": "f29b22b37a6e4c2787d4f1586fee1c731cedb1d240ab9f69f1d9bd08ecab73c0",
+    "native_bytes": 128
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "null",
+    "native_sha256": "f29b22b37a6e4c2787d4f1586fee1c731cedb1d240ab9f69f1d9bd08ecab73c0",
+    "native_bytes": 128
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "baseline",
+    "native_sha256": "f29b22b37a6e4c2787d4f1586fee1c731cedb1d240ab9f69f1d9bd08ecab73c0",
+    "native_bytes": 128
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "after",
+    "native_sha256": "b2243ac4416cd7fbbe07adef235c4e1cac79ecc74bf21c6fea0ffe8086120c37",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "null",
+    "native_sha256": "b2243ac4416cd7fbbe07adef235c4e1cac79ecc74bf21c6fea0ffe8086120c37",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "baseline",
+    "native_sha256": "b2243ac4416cd7fbbe07adef235c4e1cac79ecc74bf21c6fea0ffe8086120c37",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "null",
+    "native_sha256": "cdb11df57199c132852e9911510b32028e279bf9864b94d0a94aab09a0fcff61",
+    "native_bytes": 4
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "baseline",
+    "native_sha256": "cdb11df57199c132852e9911510b32028e279bf9864b94d0a94aab09a0fcff61",
+    "native_bytes": 4
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "after",
+    "native_sha256": "cdb11df57199c132852e9911510b32028e279bf9864b94d0a94aab09a0fcff61",
+    "native_bytes": 4
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "null",
+    "native_sha256": "19b608fd89a0cf883acf71fd30862db1c66621689a7cfe14b55a69a0d85d4bf6",
+    "native_bytes": 256
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "baseline",
+    "native_sha256": "19b608fd89a0cf883acf71fd30862db1c66621689a7cfe14b55a69a0d85d4bf6",
+    "native_bytes": 256
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "after",
+    "native_sha256": "19b608fd89a0cf883acf71fd30862db1c66621689a7cfe14b55a69a0d85d4bf6",
+    "native_bytes": 256
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "null",
+    "native_sha256": "449ea49cd4a5d0ff6986acefdc760689fb4c6b98b8d59ba6a06c943fca6b0ac5",
+    "native_bytes": 1024
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "baseline",
+    "native_sha256": "449ea49cd4a5d0ff6986acefdc760689fb4c6b98b8d59ba6a06c943fca6b0ac5",
+    "native_bytes": 1024
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "after",
+    "native_sha256": "449ea49cd4a5d0ff6986acefdc760689fb4c6b98b8d59ba6a06c943fca6b0ac5",
+    "native_bytes": 1024
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "null",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "baseline",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "after",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "null",
+    "native_sha256": "6b095866533c97e38517a331140963c10398ba0336ba1b4162a15e37d9f95507",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "baseline",
+    "native_sha256": "6b095866533c97e38517a331140963c10398ba0336ba1b4162a15e37d9f95507",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "after",
+    "native_sha256": "6b095866533c97e38517a331140963c10398ba0336ba1b4162a15e37d9f95507",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "null",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "baseline",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "after",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "null",
+    "native_sha256": "f9032ce480e839033e86ad56b2aa935f79f8b6d0b0e20468f51e3533139f7fd2",
+    "native_bytes": 252
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "baseline",
+    "native_sha256": "f9032ce480e839033e86ad56b2aa935f79f8b6d0b0e20468f51e3533139f7fd2",
+    "native_bytes": 252
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "after",
+    "native_sha256": "f9032ce480e839033e86ad56b2aa935f79f8b6d0b0e20468f51e3533139f7fd2",
+    "native_bytes": 252
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "null",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "baseline",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "after",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "null",
+    "native_sha256": "f29b22b37a6e4c2787d4f1586fee1c731cedb1d240ab9f69f1d9bd08ecab73c0",
+    "native_bytes": 128
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "baseline",
+    "native_sha256": "f29b22b37a6e4c2787d4f1586fee1c731cedb1d240ab9f69f1d9bd08ecab73c0",
+    "native_bytes": 128
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "after",
+    "native_sha256": "f29b22b37a6e4c2787d4f1586fee1c731cedb1d240ab9f69f1d9bd08ecab73c0",
+    "native_bytes": 128
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "null",
+    "native_sha256": "b2243ac4416cd7fbbe07adef235c4e1cac79ecc74bf21c6fea0ffe8086120c37",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "baseline",
+    "native_sha256": "b2243ac4416cd7fbbe07adef235c4e1cac79ecc74bf21c6fea0ffe8086120c37",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "after",
+    "native_sha256": "b2243ac4416cd7fbbe07adef235c4e1cac79ecc74bf21c6fea0ffe8086120c37",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused0",
+    "label": "baseline",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused0",
+    "label": "after",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused0",
+    "label": "null",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused0",
+    "label": "baseline",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused0",
+    "label": "after",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused0",
+    "label": "null",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused0",
+    "label": "baseline",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused0",
+    "label": "after",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused0",
+    "label": "null",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused1",
+    "label": "after",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused1",
+    "label": "null",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused1",
+    "label": "baseline",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused1",
+    "label": "after",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused1",
+    "label": "null",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused1",
+    "label": "baseline",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused1",
+    "label": "after",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused1",
+    "label": "null",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused1",
+    "label": "baseline",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused2",
+    "label": "null",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused2",
+    "label": "baseline",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused2",
+    "label": "after",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused2",
+    "label": "null",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused2",
+    "label": "baseline",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused2",
+    "label": "after",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused2",
+    "label": "null",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused2",
+    "label": "baseline",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "focused-runs.json",
+    "tag": "focused2",
+    "label": "after",
+    "native_sha256": "18b943026e6a65c06aef4a9b207ba1ba23017eb74a17545e5a75cd65a402a05e",
+    "native_bytes": 64
+  },
+  {
+    "protocol": "serial",
+    "record_file": "reference-runs.json",
+    "tag": "reference0",
+    "label": "research",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048,
+    "reference_sha256": "e8ef6b655c1486aceda56d03b48790cb15e2af2bc3e6c89e912d097637c4a4a3",
+    "reference_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "reference-runs.json",
+    "tag": "reference1",
+    "label": "research",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048,
+    "reference_sha256": "e8ef6b655c1486aceda56d03b48790cb15e2af2bc3e6c89e912d097637c4a4a3",
+    "reference_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "reference-runs.json",
+    "tag": "reference2",
+    "label": "research",
+    "native_sha256": "a5090f3b60665d7f51e7ed94c480c82ba7f8fdcf98890cb0859181d31d52818f",
+    "native_bytes": 2048,
+    "reference_sha256": "e8ef6b655c1486aceda56d03b48790cb15e2af2bc3e6c89e912d097637c4a4a3",
+    "reference_bytes": 2048
+  },
+  {
+    "protocol": "serial",
+    "record_file": "reference-runs.json",
+    "tag": "reference0",
+    "label": "research",
+    "native_sha256": "6b095866533c97e38517a331140963c10398ba0336ba1b4162a15e37d9f95507",
+    "native_bytes": 4096,
+    "reference_sha256": "910bcfe187906a9f2cf5f8c0d9b6ce226d12c6fe4a99ef589f8f8299850326f2",
+    "reference_bytes": 4096
+  },
+  {
+    "protocol": "serial",
+    "record_file": "reference-runs.json",
+    "tag": "reference1",
+    "label": "research",
+    "native_sha256": "6b095866533c97e38517a331140963c10398ba0336ba1b4162a15e37d9f95507",
+    "native_bytes": 4096,
+    "reference_sha256": "910bcfe187906a9f2cf5f8c0d9b6ce226d12c6fe4a99ef589f8f8299850326f2",
+    "reference_bytes": 4096
+  },
+  {
+    "protocol": "serial",
+    "record_file": "reference-runs.json",
+    "tag": "reference2",
+    "label": "research",
+    "native_sha256": "6b095866533c97e38517a331140963c10398ba0336ba1b4162a15e37d9f95507",
+    "native_bytes": 4096,
+    "reference_sha256": "910bcfe187906a9f2cf5f8c0d9b6ce226d12c6fe4a99ef589f8f8299850326f2",
+    "reference_bytes": 4096
+  },
+  {
+    "protocol": "serial",
+    "record_file": "reference-runs.json",
+    "tag": "reference0",
+    "label": "research",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192,
+    "reference_sha256": "743656395516dd141cb27ae8434f596a8ac5bdf3b0d1c6905ff061aff1077cc7",
+    "reference_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "reference-runs.json",
+    "tag": "reference1",
+    "label": "research",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192,
+    "reference_sha256": "743656395516dd141cb27ae8434f596a8ac5bdf3b0d1c6905ff061aff1077cc7",
+    "reference_bytes": 8192
+  },
+  {
+    "protocol": "serial",
+    "record_file": "reference-runs.json",
+    "tag": "reference2",
+    "label": "research",
+    "native_sha256": "5f54931f42ef1403c8bd77b32a1475305e554998fc5cbb4d6b656a48c6327f38",
+    "native_bytes": 8192,
+    "reference_sha256": "743656395516dd141cb27ae8434f596a8ac5bdf3b0d1c6905ff061aff1077cc7",
+    "reference_bytes": 8192
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "baseline",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "after",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "null",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "baseline",
+    "native_sha256": "867dcda3fa9ebb4517b3b516aad5054c5e4d6f045d0223b8ac27dc7be3673636",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "after",
+    "native_sha256": "867dcda3fa9ebb4517b3b516aad5054c5e4d6f045d0223b8ac27dc7be3673636",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process0",
+    "label": "null",
+    "native_sha256": "867dcda3fa9ebb4517b3b516aad5054c5e4d6f045d0223b8ac27dc7be3673636",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "after",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "null",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "baseline",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "after",
+    "native_sha256": "867dcda3fa9ebb4517b3b516aad5054c5e4d6f045d0223b8ac27dc7be3673636",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "null",
+    "native_sha256": "867dcda3fa9ebb4517b3b516aad5054c5e4d6f045d0223b8ac27dc7be3673636",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process1",
+    "label": "baseline",
+    "native_sha256": "867dcda3fa9ebb4517b3b516aad5054c5e4d6f045d0223b8ac27dc7be3673636",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "null",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "baseline",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "after",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "null",
+    "native_sha256": "867dcda3fa9ebb4517b3b516aad5054c5e4d6f045d0223b8ac27dc7be3673636",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "baseline",
+    "native_sha256": "867dcda3fa9ebb4517b3b516aad5054c5e4d6f045d0223b8ac27dc7be3673636",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "session",
+    "record_file": "runs.json",
+    "tag": "process2",
+    "label": "after",
+    "native_sha256": "867dcda3fa9ebb4517b3b516aad5054c5e4d6f045d0223b8ac27dc7be3673636",
+    "native_bytes": 4096
+  },
+  {
+    "protocol": "session",
+    "record_file": "focused-runs.json",
+    "tag": "focused0",
+    "label": "baseline",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "focused-runs.json",
+    "tag": "focused0",
+    "label": "after",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "focused-runs.json",
+    "tag": "focused0",
+    "label": "null",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "focused-runs.json",
+    "tag": "focused1",
+    "label": "after",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "focused-runs.json",
+    "tag": "focused1",
+    "label": "null",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "focused-runs.json",
+    "tag": "focused1",
+    "label": "baseline",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "focused-runs.json",
+    "tag": "focused2",
+    "label": "null",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "focused-runs.json",
+    "tag": "focused2",
+    "label": "baseline",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  },
+  {
+    "protocol": "session",
+    "record_file": "focused-runs.json",
+    "tag": "focused2",
+    "label": "after",
+    "native_sha256": "8f1162ab6d390c680405a4ef220a5bdc1fec4b875d0a0981fc1b9f0e2da96a1e",
+    "native_bytes": 32768
+  }
+]

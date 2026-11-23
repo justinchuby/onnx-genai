@@ -17,7 +17,7 @@ use onnx_runtime_ir::{
 use onnx_runtime_memory_api::{
     AllocationIdentity, MemoryRole, OwningAllocation, ProviderContextIdentity,
 };
-use onnx_runtime_memory_governor::{ManagedAllocation, MemoryLease};
+use onnx_runtime_memory_governor::ManagedAllocation;
 
 /// Index of an EP within an [`crate::registry::EpRegistry`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -961,46 +961,19 @@ impl BoundBufferOwnership {
     }
 }
 
-/// Executor workspace allocation with any compatibility lease it still needs.
+/// Executor workspace retaining the provider's physical backing owner.
 ///
-/// Manager-aware providers retain charges inside the buffer's managed owner and
-/// leave `lease` empty. The default adapter preserves the older
-/// reserve-then-allocate contract for providers not yet migrated.
+/// Managed providers carry charges and release settlement inside `DeviceBuffer`.
+/// There is no separate workspace lease or second accounting authority. A raw
+/// allocator remains explicitly ungoverned unless its provider supplies ownership.
 #[derive(Debug)]
 pub struct WorkspaceAllocation {
     buffer: DeviceBuffer,
-    lease: Option<MemoryLease>,
-}
-
-static QUARANTINED_WORKSPACE_LEASES: std::sync::OnceLock<std::sync::Mutex<Vec<MemoryLease>>> =
-    std::sync::OnceLock::new();
-
-fn quarantine_failed_workspace_lease(lease: MemoryLease) {
-    eprintln!(
-        "execution provider workspace deallocation failed before physical release was proven; \
-         retaining its {} byte {:?} lease in compatibility quarantine",
-        lease.bytes(),
-        lease.tier()
-    );
-    QUARANTINED_WORKSPACE_LEASES
-        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(lease);
-}
-
-#[cfg(test)]
-fn quarantined_workspace_lease_count() -> usize {
-    QUARANTINED_WORKSPACE_LEASES
-        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .len()
 }
 
 impl WorkspaceAllocation {
-    pub fn new(buffer: DeviceBuffer, lease: Option<MemoryLease>) -> Self {
-        Self { buffer, lease }
+    pub fn new(buffer: DeviceBuffer) -> Self {
+        Self { buffer }
     }
 
     pub fn buffer(&self) -> &DeviceBuffer {
@@ -1011,8 +984,8 @@ impl WorkspaceAllocation {
         &mut self.buffer
     }
 
-    pub fn into_parts(self) -> (DeviceBuffer, Option<MemoryLease>) {
-        (self.buffer, self.lease)
+    pub fn into_buffer(self) -> DeviceBuffer {
+        self.buffer
     }
 }
 
@@ -1542,11 +1515,11 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(allocation)
     }
 
-    /// Allocate executor workspace as one reserve/allocate/commit transaction.
+    /// Allocate executor workspace with provider-owned funding and release.
     ///
-    /// Providers with a process manager override this so the charge travels with
-    /// physical ownership through deferred release. The default is the existing
-    /// compatibility sequence for synchronous providers.
+    /// Managed providers override this to borrow a funded lane or construct one
+    /// allocation transaction. The default uses the raw allocator and optional
+    /// mapped-growth capability; it does not add an independent quota charge.
     fn allocate_workspace(
         &self,
         size: usize,
@@ -1554,19 +1527,11 @@ pub trait ExecutionProvider: Send + Sync {
         role: MemoryRole,
     ) -> Result<WorkspaceAllocation> {
         let target_mapped = self.mapped_bytes_for_allocation(size, alignment)?;
-        let mut grant = self.prepare_mapped_growth(target_mapped, role)?;
-        let lease = match self.reserve_workspace(size as u64, role) {
-            Ok(lease) => lease,
-            Err(error) => {
-                drop(grant);
-                return Err(error);
-            }
-        };
-        let buffer = match grant.take() {
+        let buffer = match self.prepare_mapped_growth(target_mapped, role)? {
             Some(grant) => self.allocate_with_mapped_growth(size, alignment, grant)?,
             None => self.allocate(size, alignment)?,
         };
-        Ok(WorkspaceAllocation::new(buffer, lease))
+        Ok(WorkspaceAllocation::new(buffer))
     }
 
     /// Replace executor workspace without granting the replacement until the
@@ -1682,25 +1647,12 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(())
     }
 
-    /// Release an executor workspace and then its compatibility lease.
+    /// Release workspace through the provider that owns its physical backing.
     ///
-    /// The default is only for providers whose `deallocate` settles synchronously.
-    /// An asynchronous provider must override this method and keep accounting
-    /// attached to its own structured settlement.
+    /// An asynchronous provider must retain that owner and its charge until its
+    /// structured settlement completes. Returning `Ok` alone does not refund it.
     fn deallocate_workspace(&self, workspace: WorkspaceAllocation) -> Result<()> {
-        let (buffer, lease) = workspace.into_parts();
-        match self.deallocate(buffer) {
-            Ok(()) => {
-                drop(lease);
-                Ok(())
-            }
-            Err(error) => {
-                if let Some(lease) = lease {
-                    quarantine_failed_workspace_lease(lease);
-                }
-                Err(error)
-            }
-        }
+        self.deallocate(workspace.into_buffer())
     }
 
     /// Free device memory and report mapped-zone bytes actually unmapped.
@@ -2213,20 +2165,6 @@ pub trait ExecutionProvider: Send + Sync {
     /// Opt-in attribution for allocations made outside [`Self::allocate`].
     fn raw_device_allocation_site_stats(&self) -> Vec<RawDeviceAllocationSiteStats> {
         Vec::new()
-    }
-
-    /// Reserve governed bytes for executor-owned kernel workspace.
-    ///
-    /// Providers whose allocator already charges committed bytes may return
-    /// `None`; providers backed by an eager allocator retain the returned lease
-    /// alongside the allocation. The default preserves compatibility for
-    /// providers without a device-memory governor.
-    fn reserve_workspace(
-        &self,
-        _bytes: u64,
-        _role: onnx_runtime_memory_api::MemoryRole,
-    ) -> Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
-        Ok(None)
     }
 
     fn prepare_mapped_growth(
@@ -2796,13 +2734,25 @@ mod tests {
     }
 
     #[test]
-    fn failed_workspace_deallocation_quarantine_keeps_compatibility_charge() {
-        use onnx_runtime_memory_api::{DeviceKey, MemoryRole, Tier};
-        use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+    fn workspace_release_keeps_funding_until_physical_completion() {
+        use onnx_runtime_memory_api::{
+            DeviceAllocator, DeviceKey, HostAllocator, MemoryRole, Tier,
+        };
+        use onnx_runtime_memory_governor::{
+            AllocationPublication, AllocationRequest, LeaseLedger, LedgerGovernor,
+            ManagedAllocationState, MemoryGovernor, ProcessMemoryManager,
+        };
+
+        #[derive(Clone, Copy, Debug)]
+        enum Release {
+            Complete,
+            Fail,
+            Abandon,
+        }
 
         #[derive(Debug)]
         struct WorkspaceDeallocationEp {
-            fail: bool,
+            release: Release,
         }
 
         impl ExecutionProvider for WorkspaceDeallocationEp {
@@ -2850,14 +2800,21 @@ mod tests {
                 Err(EpError::KernelFailed("unused test allocation".into()))
             }
 
-            fn deallocate(&self, _buffer: DeviceBuffer) -> Result<()> {
-                if self.fail {
-                    Err(EpError::KernelFailed(
+            fn deallocate(&self, buffer: DeviceBuffer) -> Result<()> {
+                if matches!(self.release, Release::Fail) {
+                    return Err(EpError::KernelFailed(
                         "injected workspace deallocation failure".into(),
-                    ))
-                } else {
-                    Ok(())
+                    ));
                 }
+                if matches!(self.release, Release::Complete) {
+                    let BoundBufferOwnership::Managed(owner) =
+                        buffer.into_bound_ownership().unwrap()
+                    else {
+                        panic!("test workspace must retain its managed owner");
+                    };
+                    assert!(owner.release_now().unwrap().is_complete());
+                }
+                Ok(())
             }
 
             fn copy(
@@ -2883,67 +2840,104 @@ mod tests {
             }
         }
 
-        fn borrowed_workspace(lease: MemoryLease, backing: &mut [u8]) -> WorkspaceAllocation {
-            // SAFETY: `backing` outlives the synchronous deallocation call, and
-            // the test EP never reads, writes, or frees the borrowed pointer.
-            let buffer = unsafe {
-                DeviceBuffer::from_borrowed_parts(
-                    backing.as_mut_ptr().cast(),
-                    DeviceId::cpu(),
-                    backing.len(),
-                    1,
+        for release in [Release::Fail, Release::Abandon, Release::Complete] {
+            let books = std::sync::Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+                DeviceKey::HOST,
+                0,
+                1024,
+                0,
+            )));
+            let manager = ProcessMemoryManager::new().unwrap();
+            let context = manager
+                .register_provider_context(
+                    DeviceKey::HOST,
+                    "test Host context",
+                    std::sync::Arc::new(()),
                 )
-            };
-            WorkspaceAllocation::new(buffer, Some(lease))
+                .unwrap();
+            let authority = manager
+                .register_authority(
+                    DeviceKey::HOST,
+                    "test Host authority",
+                    std::sync::Arc::new(()),
+                    books.clone(),
+                )
+                .unwrap();
+            let holder = manager
+                .register_holder(&authority, "test workspace", None)
+                .unwrap();
+            let mechanism = manager
+                .register_allocator(
+                    &context,
+                    &authority,
+                    "test Host backing",
+                    std::sync::Arc::new(HostAllocator),
+                )
+                .unwrap();
+            let owner = manager
+                .bind_registered(&mechanism)
+                .unwrap()
+                .allocate(
+                    AllocationRequest::managed(
+                        64,
+                        16,
+                        Tier::Host,
+                        MemoryRole::Workspace { step_scoped: true },
+                        holder,
+                        64,
+                    ),
+                    AllocationPublication::exclusive(64, 64, 64),
+                )
+                .unwrap();
+            let raw = owner.as_ptr();
+            let identity = owner.identity();
+            let workspace = WorkspaceAllocation::new(DeviceBuffer::from_managed_allocation(
+                Box::new(owner),
+                DeviceId::cpu(),
+            ));
+            assert_eq!(books.used(Tier::Host), 64);
+            assert_eq!(manager.process_used(Tier::Host), 64);
+            let result = WorkspaceDeallocationEp { release }.deallocate_workspace(workspace);
+            if matches!(release, Release::Fail) {
+                assert!(result.unwrap_err().to_string().contains("injected"));
+            } else {
+                result.unwrap();
+            }
+            if !matches!(release, Release::Complete) {
+                assert_eq!(
+                    books.used(Tier::Host),
+                    64,
+                    "dropping an unsettled owner must not refund backing, even if the EP returns Ok"
+                );
+                assert_eq!(manager.process_used(Tier::Host), 64);
+                let allocations = manager.snapshot().unwrap().allocations;
+                let entry = allocations.iter().find(|a| a.identity == identity).unwrap();
+                assert_eq!(entry.state, ManagedAllocationState::Quarantined);
+                assert_eq!(entry.charged_bytes, 64);
+                // Test-only teardown: the dropped owner quarantined rather than
+                // freeing this exact Host allocation. Prove physical release
+                // before confirming termination of this isolated test context.
+                // No synthetic release outcome or early quota refund is used.
+                // SAFETY: raw preserves the original allocation's provenance;
+                // neither the consumed owner nor any view can access it again.
+                unsafe { HostAllocator.deallocate(raw, 64, 16) };
+                assert_eq!(books.used(Tier::Host), 64);
+                manager
+                    .invalidate_device(DeviceKey::HOST, "test backing physically released")
+                    .unwrap();
+                manager.confirm_context_terminated(&context).unwrap();
+                assert_eq!(books.used(Tier::Host), 0);
+                assert_eq!(manager.process_used(Tier::Host), 0);
+                assert!(manager.snapshot().unwrap().allocations.is_empty());
+            } else {
+                assert_eq!(
+                    books.used(Tier::Host),
+                    0,
+                    "only proven physical release refunds its owner"
+                );
+                assert_eq!(manager.process_used(Tier::Host), 0);
+            }
         }
-
-        let failed_governor =
-            LedgerGovernor::new(LeaseLedger::new_for_device(DeviceKey::HOST, 0, 1024, 0));
-        let failed_lease = failed_governor
-            .reserve(
-                Tier::Host,
-                64,
-                MemoryRole::Workspace { step_scoped: true },
-                HolderId::new(9),
-            )
-            .unwrap();
-        let before = quarantined_workspace_lease_count();
-        let mut failed_backing = vec![0_u8; 64];
-        let error = WorkspaceDeallocationEp { fail: true }
-            .deallocate_workspace(borrowed_workspace(failed_lease, &mut failed_backing))
-            .unwrap_err();
-        assert!(error.to_string().contains("injected"));
-        assert_eq!(quarantined_workspace_lease_count(), before + 1);
-        assert_eq!(
-            failed_governor.used(Tier::Host),
-            64,
-            "failed deallocation must not advertise unsettled bytes as free"
-        );
-
-        let success_governor =
-            LedgerGovernor::new(LeaseLedger::new_for_device(DeviceKey::HOST, 0, 1024, 0));
-        let success_lease = success_governor
-            .reserve(
-                Tier::Host,
-                64,
-                MemoryRole::Workspace { step_scoped: true },
-                HolderId::new(10),
-            )
-            .unwrap();
-        let mut success_backing = vec![0_u8; 64];
-        WorkspaceDeallocationEp { fail: false }
-            .deallocate_workspace(borrowed_workspace(success_lease, &mut success_backing))
-            .unwrap();
-        assert_eq!(
-            success_governor.used(Tier::Host),
-            0,
-            "successful synchronous deallocation must refund its outer lease"
-        );
-        assert_eq!(
-            quarantined_workspace_lease_count(),
-            before + 1,
-            "success and failure paths must not be swapped"
-        );
     }
 
     #[test]

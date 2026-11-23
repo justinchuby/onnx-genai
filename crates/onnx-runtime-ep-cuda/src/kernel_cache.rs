@@ -60,6 +60,8 @@ pub(crate) struct CacheKey<'a> {
     pub(crate) arch: &'a str,
     pub(crate) include_paths: &'a [String],
     pub(crate) kind: ArtifactKind,
+    // Resolved by the compilation boundary; hashing performs no library load.
+    pub(crate) nvrtc_version: &'a str,
 }
 
 impl CacheKey<'_> {
@@ -92,7 +94,7 @@ impl CacheKey<'_> {
         for path in self.include_paths {
             hash.field(path.as_bytes());
         }
-        hash.field(nvrtc_version_tag().as_bytes());
+        hash.field(self.nvrtc_version.as_bytes());
         // The module key is kept in the clear so a human looking at the cache
         // directory can tell which kernel an entry belongs to.
         let sanitized: String = self
@@ -136,7 +138,7 @@ impl Fnv128 {
 }
 
 /// NVRTC's own version, so a toolkit upgrade cannot serve last toolkit's PTX.
-fn nvrtc_version_tag() -> &'static str {
+pub(crate) fn nvrtc_version_tag() -> &'static str {
     static TAG: OnceLock<String> = OnceLock::new();
     TAG.get_or_init(|| {
         // Load NVRTC through our own resolver first. cudarc dlopens it lazily by
@@ -404,6 +406,7 @@ mod tests {
             arch: "compute_80",
             include_paths: includes,
             kind: ArtifactKind::Ptx,
+            nvrtc_version: "nvrtc13.0",
         }
     }
 
@@ -438,6 +441,10 @@ mod tests {
         let mut kind = key("gemv", "src", &includes);
         kind.kind = ArtifactKind::Cubin;
         assert_ne!(base, kind.file_name(), "artifact kind");
+
+        let mut version = key("gemv", "src", &includes);
+        version.nvrtc_version = "nvrtc13.1";
+        assert_ne!(base, version.file_name(), "NVRTC version");
     }
 
     #[test]
