@@ -105,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pool.broadcast(|_| {
         let kernel = ep.get_kernel(&Node::new(NodeId(0), "QLinearMatMul", vec![], vec![]), &[vec![m,k],vec![],vec![],vec![k,n]], 10)
             .expect("construct this execution lane's QLinearMatMul kernel");
-        let allocation=ep.allocate_workspace(request.bytes as usize,request.alignment,request.role);
+        let allocation=ep.allocate_workspace(request.bytes as usize,request.alignment,request.role());
         // Hold all successful lanes simultaneously to expose the concurrency peak.
         ready.wait();
         let mut allocation=match allocation { Ok(value)=>value,Err(error)=>{refused.fetch_add(1,Ordering::Relaxed);eprintln!("workspace admission: {error}; reduce concurrent threads or raise QLINEAR_HOST_BUDGET_MIB");return;} };

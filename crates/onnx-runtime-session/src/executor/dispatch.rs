@@ -2101,7 +2101,7 @@ impl KernelDispatchContext<'_> {
                         old,
                         required,
                         requirement.alignment,
-                        requirement.role,
+                        requirement.role(),
                     )?;
                     *prepared = Some(PreparedWorkspace {
                         bytes: buffer.len(),

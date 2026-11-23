@@ -86,6 +86,7 @@ use onnx_runtime_ep_api::{
     TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
+#[cfg(test)]
 use onnx_runtime_memory_api::MemoryRole;
 
 use crate::error::driver_err;
@@ -1434,7 +1435,6 @@ fn std_attention_workspace_requirement(
         })?,
         alignment: STD_SCORES_ALIGN,
         lifetime,
-        role: MemoryRole::Workspace { step_scoped },
     })
 }
 
@@ -3619,7 +3619,7 @@ mod workspace_governance_tests {
         assert!(layout.present_key_offset.is_none());
         assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
         assert!(matches!(
-            req.role,
+            req.role(),
             MemoryRole::Workspace { step_scoped: true }
         ));
         assert_eq!(req.alignment, STD_SCORES_ALIGN);
@@ -3639,7 +3639,7 @@ mod workspace_governance_tests {
         assert_eq!(layout.stage_value_bytes, 8 * 2049 * 128 * 2);
         assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
         assert!(matches!(
-            req.role,
+            req.role(),
             MemoryRole::Workspace { step_scoped: false }
         ));
     }
@@ -3657,7 +3657,7 @@ mod workspace_governance_tests {
         assert!(layout.stage_value_offset.is_some());
         assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
         assert!(matches!(
-            req.role,
+            req.role(),
             MemoryRole::Workspace { step_scoped: true }
         ));
     }

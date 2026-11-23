@@ -3241,11 +3241,11 @@ mod tests {
             .workspace_requirement(&[TensorMetadata::new(DataType::Float64, &[2, 3], true)])
             .unwrap();
         let mut allocation = providers[0]
-            .allocate_workspace(16, first.alignment, first.role)
+            .allocate_workspace(16, first.alignment, first.role())
             .unwrap();
         let identity = allocation.managed_owner().unwrap().identity();
         assert!(
-            providers[1].allocate_workspace(8, 4, first.role).is_err(),
+            providers[1].allocate_workspace(8, 4, first.role()).is_err(),
             "a second active lane must not execute without its own grant"
         );
         let input64 = Owned::f64(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
@@ -3272,7 +3272,7 @@ mod tests {
                 .workspace_requirement(&[TensorMetadata::new(input.dtype, &input.shape, true)])
                 .unwrap();
             let mut allocation = provider
-                .allocate_workspace(request.bytes as usize, request.alignment, request.role)
+                .allocate_workspace(request.bytes as usize, request.alignment, request.role())
                 .unwrap();
             assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
             let workspace = Some(WorkspaceView::new(

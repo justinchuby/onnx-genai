@@ -19,7 +19,6 @@ use onnx_runtime_ep_api::{
     EpError, Result, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::DataType;
-use onnx_runtime_memory_api::MemoryRole;
 
 use crate::dynamic_library::{CudaLibrary, is_available};
 use crate::error::{cudnn_err, cudnn_unavailable, driver_err};
@@ -34,7 +33,6 @@ pub const fn governed_workspace_requirement(bytes: usize) -> WorkspaceRequiremen
             bytes: bytes as u64,
             alignment: WORKSPACE_ALIGNMENT,
             lifetime: WorkspaceLifetime::SessionPersistent,
-            role: MemoryRole::Workspace { step_scoped: false },
         }
     }
 }

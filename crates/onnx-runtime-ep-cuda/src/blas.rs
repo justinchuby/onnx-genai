@@ -56,6 +56,7 @@ use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
     EpError, Result, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
+#[cfg(test)]
 use onnx_runtime_memory_api::MemoryRole;
 
 use crate::error::cublas_err;
@@ -707,7 +708,6 @@ pub const fn governed_workspace_requirement(bytes: usize) -> WorkspaceRequiremen
             bytes: bytes as u64,
             alignment: WORKSPACE_ALIGNMENT,
             lifetime: WorkspaceLifetime::SessionPersistent,
-            role: MemoryRole::Workspace { step_scoped: false },
         }
     }
 }
@@ -1462,7 +1462,7 @@ mod raw_workspace_allocation_guard {
         assert_eq!(requirement.alignment, WORKSPACE_ALIGNMENT);
         assert_eq!(requirement.lifetime, WorkspaceLifetime::SessionPersistent);
         assert!(matches!(
-            requirement.role,
+            requirement.role(),
             MemoryRole::Workspace { step_scoped: false }
         ));
 

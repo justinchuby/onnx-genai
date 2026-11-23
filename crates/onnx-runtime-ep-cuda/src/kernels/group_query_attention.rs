@@ -18,6 +18,7 @@ use onnx_runtime_ep_api::{
     TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
+#[cfg(test)]
 use onnx_runtime_memory_api::MemoryRole;
 
 use crate::error::driver_err;
@@ -3244,7 +3245,6 @@ impl GroupQueryAttentionKernel {
             })?,
             alignment: GQA_SCORES_ALIGN,
             lifetime: WorkspaceLifetime::SessionPersistent,
-            role: MemoryRole::Workspace { step_scoped: false },
         })
     }
 }
@@ -3511,7 +3511,7 @@ mod tests {
         assert_eq!(req.alignment, GQA_SCORES_ALIGN);
         assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
         assert!(matches!(
-            req.role,
+            req.role(),
             MemoryRole::Workspace { step_scoped: false }
         ));
 

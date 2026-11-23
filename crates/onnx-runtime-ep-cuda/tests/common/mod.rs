@@ -72,7 +72,7 @@ pub fn prepare_workspace(
     if needs_replacement {
         let old = workspace.take();
         *workspace =
-            Some(ep.replace_workspace(old, required, requirement.alignment, requirement.role)?);
+            Some(ep.replace_workspace(old, required, requirement.alignment, requirement.role())?);
     }
     let workspace = workspace
         .as_mut()

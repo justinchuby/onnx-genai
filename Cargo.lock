@@ -2577,7 +2577,6 @@ dependencies = [
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-plugin",
  "onnx-runtime-ir",
- "onnx-runtime-memory-api",
  "onnx-runtime-memory-governor",
  "onnx-runtime-ort-testkit",
  "onnx-runtime-session",

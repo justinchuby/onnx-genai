@@ -72,7 +72,6 @@ use onnx_runtime_ep_api::{
     WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
-use onnx_runtime_memory_api::MemoryRole;
 
 use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
@@ -718,7 +717,6 @@ impl Kernel for IndexShareKernel {
                 .map_err(|_| error("IndexShare workspace does not fit u64"))?,
             alignment: WORKSPACE_ALIGNMENT,
             lifetime: WorkspaceLifetime::SessionPersistent,
-            role: MemoryRole::Workspace { step_scoped: false },
         })
     }
 

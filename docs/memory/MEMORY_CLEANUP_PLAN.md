@@ -1980,3 +1980,64 @@ probe/binary hashes, raw rounds, allocation falsification and summaries remain
 under `/tmp/nxrt-workspace-boxes-*`. Consumed generators, benchmark executables
 and baseline checkout are removed after provenance; reproduction sources and
 drivers remain.
+
+
+### Coarse resource ownership and the EP implementation boundary
+
+The resource-design review keeps admission proportional to physical ownership
+changes, not to tensor or operator count. Scratch uses one exclusive execution
+lane per concurrently active invocation and lifetime. Sequential kernels borrow
+the enclosing peak; simultaneously live regions add their requirements. Control
+flow must account for parent/child overlap rather than assume all nested scratch
+can alias. Concurrent executions never share mutable backing.
+
+The current prepared dispatch already has this boundary: preparation reserves
+peak slots; a fitting kernel receives a WorkspaceView without pool checkout,
+context entry or a pool lock. Eager execution checks out only on the first use
+or capacity growth. Step completion returns the disposable slot once; persistent
+and capture-pinned slots remain owned. Pool microbenchmarks measure a lane
+checkout/return, not a cost incurred independently by every node in a graph.
+
+A returned slot remains physically allocated and funded. Warm checkout/return
+must perform no issuer callback, including zero-byte calls. Only confirmed
+physical release refunds backing; failed releases, pending device work, active
+views and pinned addresses retain ownership and charge. CPU completion rules do
+not establish CUDA event completion. Keep the existing context, binding, holder,
+role and outstanding-view guards at ownership boundaries.
+
+EP responsibilities stay small: declare the concrete workspace bound, borrow
+its disjoint regions, and forward provider workspace ownership through the
+shared resource domain. Kernels do not acquire leases or own pools. Immutable
+converted/packed weights retain independently reclaimable prepared payloads;
+KV admission follows actual capacity growth blocks. These resources have
+different lifetimes and should not be forced into one session-wide slab.
+
+WorkspaceRequirement now derives its ledger role from its lifetime through
+role(). Kernels provide only bytes, alignment and lifetime. The independently
+writable role field and both flat/nested planning mismatch checks are removed;
+non-Workspace or conflicting classifications are no longer representable. CPU,
+CUDA, shared mock, session, examples and test callers use the canonical API,
+without a compatibility alias. The underlying ledger classification remains. No second execution API, per-kernel quota
+protocol, additional allocator/cache, or speculative maximum-capacity credit is
+needed. Continue migrating private temporary buffers into the existing lane
+before considering size classes or more elaborate eviction policies.
+
+
+Validation of this cleanup: governor 77, EP API 99, plugin adapter 384;
+native CPU 1,997 unit + 63 integration and session 286; optional MLAS CPU
+2,038 unit + 64 integration and session 288. Strict all-target Clippy passes
+for the ownership consumers, CPU/session/engine, CUDA and shared mock, plus
+the MLAS configuration. The new EP API example and existing doctests pass.
+Seven CUDA metadata-only governance tests and three Host queue barrier tests
+pass; CUDA sources/test targets compile, with no real device execution claim.
+Real ORT 1.32.0 shared-plugin conformance runs with prerequisites required:
+all 12 tests pass, including workspace shapes/lifetimes and whole-graph control
+flow. Removing the mock's now-unused direct memory-api dependency is also
+validated by its strict all-target Clippy and a fresh 12-test ORT run.
+The first real-ORT attempt lacked the testkit-specific NXRT_ORT_LIB_DIR and
+failed before loading ORT; the corrected run explicitly names the cached
+library directory and does not accept skipped tests. Existing warm zero-issuer
+callback, allocation-counting, concurrent-lane, inherited-workspace and pressure
+regressions remain. All heavy validation holds the shared stable host flock.
+This is an API/state simplification; no new throughput or RSS claim is made.
+Raw logs and source/commit provenance remain under /tmp/nxrt-workspace-role-*.

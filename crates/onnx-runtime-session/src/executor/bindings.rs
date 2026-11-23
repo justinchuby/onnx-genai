@@ -708,17 +708,6 @@ impl Executor {
             if requirement.bytes == 0 {
                 continue;
             }
-            match requirement.role {
-                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped }
-                    if step_scoped
-                        == matches!(requirement.lifetime, WorkspaceLifetime::StepScoped) => {}
-                _ => {
-                    return Err(SessionError::Internal(format!(
-                        "node {} ('{}::{}') returned an inconsistent workspace role/lifetime",
-                        node_id.0, node.domain, node.op_type
-                    )));
-                }
-            }
             let peak = match requirement.lifetime {
                 WorkspaceLifetime::SessionPersistent => &mut peak_persistent,
                 WorkspaceLifetime::StepScoped => &mut peak_step,
@@ -796,7 +785,7 @@ impl Executor {
             return Ok(());
         };
         let old = slot.take().map(|workspace| workspace.buffer);
-        let fresh = ep.replace_workspace(old, bytes, peak.alignment, peak.role)?;
+        let fresh = ep.replace_workspace(old, bytes, peak.alignment, peak.role())?;
         *slot = Some(PreparedWorkspace {
             bytes: fresh.len(),
             alignment: fresh.alignment(),
@@ -871,17 +860,6 @@ impl Executor {
             let requirement = kernel.workspace_requirement(&metadata)?;
             if requirement.bytes == 0 {
                 continue;
-            }
-            match requirement.role {
-                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped }
-                    if step_scoped
-                        == matches!(requirement.lifetime, WorkspaceLifetime::StepScoped) => {}
-                _ => {
-                    return Err(SessionError::Internal(format!(
-                        "{scope}node#{} ('{}::{}') returned an inconsistent workspace role/lifetime",
-                        node_id.0, node.domain, node.op_type
-                    )));
-                }
             }
             let peak = match requirement.lifetime {
                 WorkspaceLifetime::SessionPersistent => &mut *peak_persistent,
@@ -1799,7 +1777,6 @@ mod planned_workspace_node_tests {
             bytes: 32 * 1024 * 1024,
             alignment: 256,
             lifetime: WorkspaceLifetime::SessionPersistent,
-            role: onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
         };
         let mut peak = WorkspaceRequirement::NONE;
         for _ in 0..4 {

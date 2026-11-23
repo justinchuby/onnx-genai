@@ -66,6 +66,7 @@ use onnx_runtime_ep_api::{
     WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
+#[cfg(test)]
 use onnx_runtime_memory_api::MemoryRole;
 
 use crate::blas::{GemmDtype, GemmEx, WORKSPACE_BYTES, gemm_ex};
@@ -1011,7 +1012,6 @@ impl Kernel for AttentionKernel {
             bytes,
             alignment: PHASE2A_SCRATCH_ALIGN,
             lifetime: WorkspaceLifetime::StepScoped,
-            role: MemoryRole::Workspace { step_scoped: true },
         })
     }
 
@@ -1117,7 +1117,7 @@ mod tests {
         assert_eq!(req.alignment, PHASE2A_SCRATCH_ALIGN);
         assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
         assert!(matches!(
-            req.role,
+            req.role(),
             MemoryRole::Workspace { step_scoped: true }
         ));
 
