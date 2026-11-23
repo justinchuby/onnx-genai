@@ -325,7 +325,7 @@ fn opset_28_29_and_affine_rules_resolve_through_the_plugin() {
         ("Log1p", 29, 1),
         ("LogCumSumExp", 29, 1),
     ] {
-        let inputs = [a.clone(), a.clone()];
+        let inputs = [a, a];
         shape_only(&node(name, arity, &[], opset), &inputs[..arity], &[2, 4]);
     }
 
@@ -345,14 +345,14 @@ fn opset_28_29_and_affine_rules_resolve_through_the_plugin() {
     shape_only(
         &node("GroupedMatMul", 3, &[("transB", 1)], 29),
         &[
-            a.clone(),
+            a,
             view(
                 DataType::Float32,
                 &[2, 3, 4],
                 &[12, 4, 1],
                 f.as_ptr().cast(),
             ),
-            route.clone(),
+            route,
         ],
         &[2, 2, 3],
     );
@@ -362,7 +362,7 @@ fn opset_28_29_and_affine_rules_resolve_through_the_plugin() {
         &gather,
         &[
             view(DataType::Uint8, &[3, 4], &[4, 1], codes.as_ptr()),
-            route.clone(),
+            route,
             view(DataType::Float32, &[], &[], f.as_ptr().cast()),
         ],
         &[3, 2, 2],
