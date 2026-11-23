@@ -196,9 +196,16 @@ before completion, so step retirement could reintroduce admission on every token
 Metadata contents remain temporary. This retention policy adds no per-token sync
 or issuer operation. Even an empty metadata group funds one backing byte for its
 legal empty windows rather than relying on every downstream launch being skipped.
-Dedicated split-K attention still uses the NVRTC module-global partial-state
-arrays in `gqa_decode`, `gqa_decode_fp16` and `gqa_decode_bf16`. Those buffers are
-separate from the removed preparation pool and remain to be migrated.
+Dedicated f32/f16/bf16 split-K decode now borrows partial states from the same
+composite. Its checked bound is `min(rows, row_cap) * max_splits * (head_dim + 2)`
+f32s. Only rows after the cap execute direct; earlier rows still use partials.
+All split columns remain funded even for a short/direct invocation, so changing
+the direct-output test/configuration or a device-resident valid length cannot
+invalidate preparation. Host and NVRTC row/split limits come from one definition.
+The three fixed module-global arrays are removed. Partial and merge launchers
+receive the same borrowed pointer; their reduction order and launch geometry are
+unchanged. Actual CUDA parity, NVRTC compilation and throughput require a device
+runner and are not established by Rust compilation.
 
 The separate MHA prepared-composite migration is tracked in
 [PR #2481](https://github.com/justinchuby/onnx-genai/pull/2481).

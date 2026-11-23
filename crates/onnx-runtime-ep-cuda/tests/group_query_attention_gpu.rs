@@ -419,20 +419,27 @@ fn prepare_in_place_workspace(
     kernel: &GroupQueryAttentionKernel,
 ) -> Option<WorkspaceAllocation> {
     use onnx_runtime_ep_api::{OutputMetadata, TensorMetadata};
-    let q = [1, 2, 16];
-    let cache = [1, 2, 5, 2];
-    let inputs = [
-        TensorMetadata::new(DataType::Float32, &q, true),
-        TensorMetadata::new(DataType::Float32, &[], false),
-        TensorMetadata::new(DataType::Float32, &[], false),
-        TensorMetadata::new(DataType::Float32, &cache, true),
-    ];
-    let outputs = [
-        OutputMetadata::tensor(DataType::Float32, &[1, 2, 8]),
-        OutputMetadata::tensor(DataType::Float32, &cache),
-        OutputMetadata::tensor(DataType::Float32, &cache),
-    ];
-    let requirement = kernel.workspace_requirement(&inputs, &outputs).unwrap();
+    let mut requirement = onnx_runtime_ep_api::WorkspaceRequirement::NONE;
+    for sequence in [1, 2] {
+        let q = [1, sequence, 16];
+        let y = [1, sequence, 8];
+        let cache = [1, 2, 5, 2];
+        let inputs = [
+            TensorMetadata::new(DataType::Float32, &q, true),
+            TensorMetadata::new(DataType::Float32, &[], false),
+            TensorMetadata::new(DataType::Float32, &[], false),
+            TensorMetadata::new(DataType::Float32, &cache, true),
+        ];
+        let outputs = [
+            OutputMetadata::tensor(DataType::Float32, &y),
+            OutputMetadata::tensor(DataType::Float32, &cache),
+            OutputMetadata::tensor(DataType::Float32, &cache),
+        ];
+        let candidate = kernel.workspace_requirement(&inputs, &outputs).unwrap();
+        if candidate.bytes > requirement.bytes {
+            requirement = candidate;
+        }
+    }
     let mut workspace = None;
     common::prepare_workspace(ep, requirement, &mut workspace).unwrap();
     workspace

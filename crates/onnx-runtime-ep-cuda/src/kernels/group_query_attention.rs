@@ -893,6 +893,7 @@ enum GqaAttentionScratch {
     None,
     Reference { stride: usize },
     Phase2a { layout: WorkspaceLayout<2> },
+    Decode { layout: WorkspaceLayout<1> },
 }
 
 /// Plan every route reachable with this input-derived length bound. For fixed
@@ -927,6 +928,11 @@ fn gqa_attention_scratch(
         match gqa_attention_route(selected, dtype, q_seq, head_dim) {
             GqaAttentionRoute::ReferenceF32 => GqaAttentionScratch::Reference {
                 stride: logical_capacity,
+            },
+            GqaAttentionRoute::DecodeF32
+            | GqaAttentionRoute::DecodeF16
+            | GqaAttentionRoute::DecodeBf16 => GqaAttentionScratch::Decode {
+                layout: gqa_decode::scratch_layout(batch, heads, q_seq, head_dim)?,
             },
             GqaAttentionRoute::Phase2a => {
                 let dtype = AttentionDtype::from_onnx(dtype).map_err(|_| {
@@ -1050,6 +1056,8 @@ struct GqaWorkspaceLayout {
     scores_bytes: usize,
     phase2a_offset: usize,
     phase2a_bytes: usize,
+    decode_offset: usize,
+    decode_bytes: usize,
     present_k_offset: usize,
     present_k_bytes: usize,
     present_v_offset: usize,
@@ -1189,6 +1197,14 @@ fn gqa_workspace_layout(
         offset = offset.checked_add(phase2a.bytes()).ok_or_else(|| {
             EpError::KernelFailed("cuda_ep GroupQueryAttention: Phase2a composite workspace size overflow; reduce the prepared geometry".into())
         })?;
+    }
+    if let GqaAttentionScratch::Decode { layout: decode } = attention_scratch {
+        offset = gqa_align_up(offset, GQA_SCORES_ALIGN)?;
+        layout.decode_offset = offset;
+        layout.decode_bytes = decode.bytes();
+        offset = offset.checked_add(decode.bytes()).ok_or_else(|| EpError::KernelFailed(
+            "cuda_ep GroupQueryAttention: split-K composite size overflow; reduce the decode geometry".into()
+        ))?;
     }
     layout.total_bytes = offset;
     Ok(layout)
@@ -2581,6 +2597,19 @@ impl GroupQueryAttentionKernel {
         } else {
             None
         };
+        let decode_workspace = if matches!(attention_scratch, GqaAttentionScratch::Decode { .. }) {
+            Some(WorkspaceView::new(
+                DevicePtrMut(gqa_carve(
+                    prepared_view,
+                    composite_layout.decode_offset,
+                    composite_layout.decode_bytes,
+                    "split-K partial states",
+                )? as *mut c_void),
+                composite_layout.decode_bytes,
+            ))
+        } else {
+            None
+        };
         let input_q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
         if capturing {
             self.runtime.require_registered_workspace_capture(
@@ -3105,7 +3134,7 @@ impl GroupQueryAttentionKernel {
                 selected_backend
             );
             // Capture-safe split-K single-token GQA decode. Reads the valid
-            // length on-device and uses fixed module-global scratch, so both
+            // length on-device and borrows prepared partial states, so both
             // partial and merge launches record/replay inside a CUDA graph.
             gqa_decode::run(
                 &self.runtime,
@@ -3125,6 +3154,7 @@ impl GroupQueryAttentionKernel {
                 local_window_i,
                 self.softcap,
                 head_sink_ptr,
+                decode_workspace,
             )?;
         } else if attention_route == GqaAttentionRoute::DecodeF16 {
             onnx_runtime_ep_api::record_kernel_variant!(
@@ -3134,7 +3164,7 @@ impl GroupQueryAttentionKernel {
                  and a host occupancy target that fills the multiprocessors",
                 q_seq,
                 dim,
-                gqa_decode_fp16::MAX_SPLITS
+                gqa_decode::MAX_SPLITS
             );
             // Capture-safe fp16 flash-decode sibling of the f32 `gqa_decode`
             // branch above. Same launcher signature/units; passes the fp16
@@ -3161,6 +3191,7 @@ impl GroupQueryAttentionKernel {
                 local_window_i,
                 self.softcap,
                 &self.kv_strides,
+                decode_workspace,
             )?;
         } else if attention_route == GqaAttentionRoute::DecodeBf16 {
             onnx_runtime_ep_api::record_kernel_variant!(
@@ -3170,7 +3201,7 @@ impl GroupQueryAttentionKernel {
                  and a host occupancy target that fills the multiprocessors",
                 q_seq,
                 dim,
-                gqa_decode_bf16::MAX_SPLITS
+                gqa_decode::MAX_SPLITS
             );
             // Capture-safe bf16 flash-decode sibling of the fp16 branch above.
             // Same launcher signature/units and capture-safety contract; passes
@@ -3200,6 +3231,7 @@ impl GroupQueryAttentionKernel {
                 local_window_i,
                 self.softcap,
                 &self.kv_strides,
+                decode_workspace,
             )?;
         } else if attention_route == GqaAttentionRoute::ReferenceF32 {
             onnx_runtime_ep_api::record_kernel_variant!(
@@ -3644,15 +3676,18 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(requirement(&[y.clone(), kv.clone(), kv.clone()]).bytes, 12);
-        assert_eq!(requirement(&[y.clone(), kv.clone()]).bytes, 256 + 12);
+        assert_eq!(
+            requirement(&[y.clone(), kv.clone(), kv.clone()]).bytes,
+            1024 + 12
+        );
+        assert_eq!(requirement(&[y.clone(), kv.clone()]).bytes, 1280 + 12);
         assert_eq!(
             requirement(&[y.clone(), OutputMetadata::Absent, kv]).bytes,
-            256 + 12
+            1280 + 12
         );
         // Fully hidden caches need one element row per KV head, with disjoint
         // 256-aligned destinations; external padding is not charged internally.
-        assert_eq!(requirement(&[y]).bytes, 512 + 12);
+        assert_eq!(requirement(&[y]).bytes, 1536 + 12);
     }
 
     #[test]
@@ -3985,6 +4020,14 @@ mod tests {
                                         .unwrap();
                                         assert!(layout.bytes() >= needed.bytes());
                                     }
+                                    GqaAttentionRoute::DecodeF32
+                                    | GqaAttentionRoute::DecodeF16
+                                    | GqaAttentionRoute::DecodeBf16 => {
+                                        assert!(matches!(
+                                            scratch,
+                                            GqaAttentionScratch::Decode { .. }
+                                        ));
+                                    }
                                     _ => {}
                                 }
                             }
@@ -4005,7 +4048,7 @@ mod tests {
             ] {
                 assert!(matches!(
                     gqa_attention_scratch(backend, 7, dtype, 1, 4, 1, 64, 8192, false).unwrap(),
-                    GqaAttentionScratch::None
+                    GqaAttentionScratch::None | GqaAttentionScratch::Decode { .. }
                 ));
             }
         }
@@ -4357,7 +4400,8 @@ mod tests {
         ];
         let decode_req = requirement(&decode_inputs).expect("decode requirement");
         assert_eq!(
-            decode_req.bytes, 12,
+            decode_req.bytes,
+            4 * 16 * (64 + 2) * 4 + 12,
             "unpacked non-RoPE single-token decode uses direct Q/output and gqa_decode scores"
         );
         for dtype in [DataType::Float16, DataType::BFloat16] {
@@ -4365,7 +4409,10 @@ mod tests {
             for input in &mut half_decode[..5] {
                 input.dtype = dtype;
             }
-            assert_eq!(requirement(&half_decode).unwrap().bytes, 12);
+            assert_eq!(
+                requirement(&half_decode).unwrap().bytes,
+                4 * 16 * (64 + 2) * 4 + 12
+            );
         }
     }
 

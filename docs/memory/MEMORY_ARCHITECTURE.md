@@ -191,11 +191,16 @@ call-local, but retaining physical capacity is a separate policy. This migration
 does not add per-token synchronization, issuer calls, or a new pool. CUDA capture,
 allocation and throughput validation still require a device runner.
 
-Dedicated split-K decode still has NVRTC module-global `gqa_split_scratch`
-arrays in `gqa_decode.rs`, `gqa_decode_fp16.rs` and `gqa_decode_bf16.rs`. They
-are separate from the removed preparation slot pool and are not covered by this
-migration. Moving their fixed worst-case storage into geometry-sized admitted
-workspace remains further work.
+Dedicated split-K f32/f16/bf16 partial states now occupy a route-selected region
+of this same composite, with the shared checked bound
+`min(batch * heads * query_seq, row_cap) * max_splits * (head_dim + 2) * 4` bytes.
+The old fixed module-global declarations are removed. Row-cap fallback remains
+per-row: early rows use partials and later rows write direct output. The budget
+therefore does not become zero merely because total rows exceed the cap. It
+reserves all split columns, including a one-split invocation when direct output
+is disabled. Host and NVRTC limits are emitted from one definition, and the
+partial/merge arguments share the same borrowed backing. No extra pool, quota
+transaction, or per-launch allocation is introduced.
 
 ### CPU compressed-projection scratch
 
