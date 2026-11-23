@@ -1,0 +1,44 @@
+[
+  {
+    "shape": [
+      8,
+      512,
+      64
+    ],
+    "native_cpu_ms": 0.012255760745219809,
+    "mlas_cpu_ms": 0.008319578362477528,
+    "paired_native_over_mlas": 1.480116248035344,
+    "paired_process_ratio_range": [
+      1.477591491962116,
+      1.495072342210111
+    ]
+  },
+  {
+    "shape": [
+      16,
+      512,
+      64
+    ],
+    "native_cpu_ms": 0.024563934863854765,
+    "mlas_cpu_ms": 0.01347383876134546,
+    "paired_native_over_mlas": 1.8340427657873712,
+    "paired_process_ratio_range": [
+      1.8049513185576593,
+      1.8348879757655752
+    ]
+  },
+  {
+    "shape": [
+      32,
+      512,
+      64
+    ],
+    "native_cpu_ms": 0.048897484575225435,
+    "mlas_cpu_ms": 0.02407973421926916,
+    "paired_native_over_mlas": 2.037169138351793,
+    "paired_process_ratio_range": [
+      2.0285821108454614,
+      2.0648810853330466
+    ]
+  }
+]

@@ -1,0 +1,5 @@
+   Compiling onnx-runtime-loader v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-loader)
+   Compiling onnx-runtime-optimizer v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-optimizer)
+   Compiling onnx-runtime-ep-api v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-ep-api)
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-compact-wire-grants/crates/onnx-runtime-ep-cpu)
+    Finished `release` profile [optimized] target(s) in 1m 01s
