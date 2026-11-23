@@ -1,14 +1,11 @@
 # onnx-genai — Python packaging via maturin.
 #
-# `onnx-genai` ships the importable `onnx_genai` package: the ONNX Runtime-backed
-# text generation Engine. It mirrors the `nxrt.genai` API but runs on ONNX
-# Runtime, so it is ONNX Runtime compatible. `nxrt` provides the same `genai`
-# surface backed by the native nxrt runtime.
+# onnx_genai exposes the same high-level Engine API as nxrt.genai. The shared
+# engine compiles and selects Native by default.
 #
-# The ONNX Runtime shared library is NOT bundled. It is loaded at import time
-# from the installed `onnxruntime` / `onnxruntime-gpu` wheel (see
-# python/onnx_genai/__init__.py), so the package automatically picks up whichever
-# execution providers the user installed.
+# The ONNX Runtime shared library remains linked for runtime infrastructure
+# and reference execution. It is loaded from the installed onnxruntime or
+# onnxruntime-gpu wheel rather than bundled in this wheel.
 #
 # Wheel: stable ABI `abi3`, tagged `cp310-abi3`. The ABI floor is 3.10, but the
 # supported minimum is Python 3.11 (enforced by requires-python and the
@@ -19,7 +16,7 @@ build-backend = "maturin"
 
 [project]
 name = "onnx-genai"
-description = "ONNX Runtime-backed text generation engine (same API as nxrt.genai)"
+description = "Native text generation engine (same API as nxrt.genai)"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Justin Chu" }]

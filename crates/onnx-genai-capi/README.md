@@ -38,7 +38,7 @@ filtered-out tokens are `-inf`); return the chosen token id.
 
 ```sh
 cargo build -p onnx-genai-capi --release          # CPU
-cargo build -p onnx-genai-capi --release --features ort-cuda   # + ORT CUDA wiring; there is no native backend here
+cargo build -p onnx-genai-capi --release --features ort-cuda   # + ORT CUDA reference support; Native remains the default
 ```
 
 This produces a `cdylib` and `staticlib` (plus a Rust `lib`) in `target/`. See

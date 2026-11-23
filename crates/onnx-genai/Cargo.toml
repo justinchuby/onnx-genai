@@ -9,7 +9,8 @@ keywords = ["onnx", "llm", "inference", "genai"]
 categories = ["science", "text-processing"]
 
 [features]
-default = ["cuda-13000"]
+native-backend = ["onnx-genai-engine/native-backend"]
+default = ["cuda-13000", "native-backend"]
 # Enable the ORT CUDA path. The CUDA API version is selected by exactly one
 # `cuda-*` feature; this crate defaults to CUDA 13.0.
 cuda = ["onnx-genai-ort/cuda", "onnx-genai-engine/ort-cuda"]
