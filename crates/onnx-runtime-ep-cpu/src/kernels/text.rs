@@ -178,7 +178,14 @@ impl Kernel for RegexFullMatchKernel {
         let bytes = inputs[0]
             .values
             .iter()
-            .map(|value| self.regex.full_match(value).map(u8::from))
+            .enumerate()
+            .map(|(index, value)| {
+                self.regex.full_match(value).map(u8::from).map_err(|cause| {
+                    error(format!(
+                        "RegexFullMatch: failed to match input 0 element {index}: {cause}"
+                    ))
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(vec![HostKernelOutput {
             shape: inputs[0].shape.to_vec(),
