@@ -2615,6 +2615,7 @@ impl CudaRuntime {
             arch: &self.ptx_arch,
             include_paths,
             kind: kernel_cache::ArtifactKind::Ptx,
+            nvrtc_version: kernel_cache::nvrtc_version_tag(),
         };
         if let Some(bytes) = kernel_cache::load(&key)
             && let Ok(text) = String::from_utf8(bytes)
@@ -2663,6 +2664,7 @@ impl CudaRuntime {
             arch: &self.cubin_arch,
             include_paths,
             kind: kernel_cache::ArtifactKind::Cubin,
+            nvrtc_version: kernel_cache::nvrtc_version_tag(),
         };
         let image = match kernel_cache::load(&key) {
             Some(image) => image,
