@@ -23,7 +23,14 @@ pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
     (node.domain.is_empty()
         && matches!(
             node.op_type.as_str(),
-            "MatMul" | "Gemm" | "QLinearMatMul" | "Attention" | "Conv" | "ReduceSum" | "ReduceMean"
+            "MatMul"
+                | "Gemm"
+                | "QLinearMatMul"
+                | "Einsum"
+                | "Attention"
+                | "Conv"
+                | "ReduceSum"
+                | "ReduceMean"
         ))
         || (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare"))
@@ -1767,6 +1774,7 @@ mod planned_workspace_node_tests {
             ("", "MatMul"),
             ("", "Gemm"),
             ("", "QLinearMatMul"),
+            ("", "Einsum"),
             ("", "Attention"),
             ("", "Conv"),
             ("", "ReduceSum"),

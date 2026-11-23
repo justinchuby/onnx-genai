@@ -4,20 +4,20 @@
 //! shape-specialized kernel is built. Execution consumes only the plan's
 //! structural classification and axis maps.
 
-use std::any::{Any, TypeId};
+use std::alloc::Layout as AllocationLayout;
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
 
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView, ViewOutput,
+    WorkspaceLayout, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{
     DataType, EinsumAxis, EinsumBinaryContractionPlan, EinsumContractionPlan,
-    EinsumContractionTreePlan, EinsumContractionTreeStep, EinsumGenericNativePlan, EinsumInput,
-    EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumPlannerQuality,
+    EinsumContractionTreePlan, EinsumContractionTreeStep, EinsumDimension, EinsumGenericNativePlan,
+    EinsumInput, EinsumOperandPlan, EinsumPermutationPlan, EinsumPlan, EinsumPlannerQuality,
     EinsumPlanningClassification, EinsumSchema, EinsumShapePlan,
     EinsumSupportedContractionTreeCandidate, EinsumUnaryReductionPlan, EinsumValueId, Node, Shape,
     compute_contiguous_strides,
@@ -25,12 +25,9 @@ use onnx_runtime_ir::{
 use rayon::prelude::*;
 
 use super::{check_arity, matmul::MatMulKernel, to_dense_bytes, write_dense_bytes};
+use crate::CpuCacheRetention;
 use crate::dtype::{
     ComputeDomain, NumericElem, to_dense_f32_widen, write_dense, write_dense_f32_narrow,
-};
-use crate::kernels::governed_accumulator_budget::{
-    DEFAULT_PER_THREAD_ACCUMULATOR_BYTES, DEFAULT_PROCESS_ACCUMULATOR_BYTES, GovernedAccumulator,
-    GovernedAccumulatorBudget,
 };
 use crate::strided::{elem_offset, next_index};
 
@@ -123,332 +120,9 @@ pub fn route_telemetry_count(route: usize) -> usize {
         .map_or(0, |count| count.load(Ordering::Relaxed))
 }
 
-/// Process-wide byte accounting for typed Einsum scratch retained between
-/// calls. Admission is deliberately absent here: each compiled session owns an
-/// immutable [`CpuCacheRetention`] verdict. The only process-global state
-/// is the aggregate byte ceiling shared by those independent sessions.
-static EINSUM_SCRATCH_BUDGET: GovernedAccumulatorBudget = GovernedAccumulatorBudget::new(
-    DEFAULT_PER_THREAD_ACCUMULATOR_BYTES,
-    DEFAULT_PROCESS_ACCUMULATOR_BYTES,
-);
-
-thread_local! {
-    /// One reusable slot per worker thread, never one map entry per session.
-    ///
-    /// The slot itself is owned by the session retention token; TLS keeps only
-    /// weak references. Dropping a session therefore frees inactive-worker
-    /// buffers immediately, while switching sessions on one worker unregisters
-    /// the previous slot before another owner can park there.
-    static EINSUM_SCRATCH: RefCell<Option<EinsumTlsScratch>> =
-        const { RefCell::new(None) };
-}
-
-struct EinsumScratchSlot {
-    accumulator: Mutex<Box<dyn ErasedGovernedAccumulator>>,
-}
-
-trait ErasedGovernedAccumulator: Send {
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-    fn capacity_bytes(&self) -> usize;
-}
-
-impl<T: Send + 'static> ErasedGovernedAccumulator for GovernedAccumulator<T> {
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn capacity_bytes(&self) -> usize {
-        GovernedAccumulator::capacity_bytes(self)
-    }
-}
-
-#[derive(Default)]
-struct EinsumScratchSlots {
-    next_registration: u64,
-    active: Vec<(u64, Arc<EinsumScratchSlot>)>,
-}
-
-struct CpuCacheRetentionInner {
-    admitted: bool,
-    budget: &'static GovernedAccumulatorBudget,
-    // Every entry owns a non-empty, byte-reserved buffer. TLS has exactly one
-    // weak entry and unregisters it on an owner switch or thread exit, so this
-    // list is bounded by concurrently parked workers and the process byte cap;
-    // it is not an ever-growing per-session thread map.
-    slots: Mutex<EinsumScratchSlots>,
-}
-
-impl CpuCacheRetentionInner {
-    fn register<T: Send + 'static>(self: &Arc<Self>, buffer: Vec<T>) -> Option<EinsumTlsScratch> {
-        let mut accumulator = GovernedAccumulator::new();
-        if !accumulator.try_park(buffer, self.budget) {
-            return None;
-        }
-        let slot = Arc::new(EinsumScratchSlot {
-            accumulator: Mutex::new(Box::new(accumulator)),
-        });
-        let registration = {
-            let mut slots = self
-                .slots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let registration = slots.next_registration;
-            slots.next_registration = slots.next_registration.checked_add(1)?;
-            slots.active.push((registration, Arc::clone(&slot)));
-            registration
-        };
-        Some(EinsumTlsScratch {
-            owner: Arc::downgrade(self),
-            slot: Arc::downgrade(&slot),
-            registration,
-            element_type: TypeId::of::<T>(),
-        })
-    }
-
-    fn unregister(&self, registration: u64) {
-        let mut slots = self
-            .slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(index) = slots
-            .active
-            .iter()
-            .position(|(candidate, _)| *candidate == registration)
-        {
-            slots.active.swap_remove(index);
-        }
-    }
-
-    #[cfg(test)]
-    fn active_slots(&self) -> usize {
-        self.slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active
-            .len()
-    }
-}
-
-struct EinsumTlsScratch {
-    owner: Weak<CpuCacheRetentionInner>,
-    slot: Weak<EinsumScratchSlot>,
-    registration: u64,
-    element_type: TypeId,
-}
-
-impl EinsumTlsScratch {
-    fn belongs_to(&self, owner: &Arc<CpuCacheRetentionInner>) -> bool {
-        self.owner.ptr_eq(&Arc::downgrade(owner))
-    }
-
-    fn stores<T: 'static>(&self) -> bool {
-        self.element_type == TypeId::of::<T>()
-    }
-}
-
-impl Drop for EinsumTlsScratch {
-    fn drop(&mut self) {
-        if let Some(owner) = self.owner.upgrade() {
-            owner.unregister(self.registration);
-        }
-    }
-}
-
-/// Immutable provider/session decision for the memory plan’s CPU caches.
-///
-/// Factories capture this verdict for planned dense/transpose/NBits/QLinear
-/// caches and Einsum scratch; it is eligibility, not a physical allocation grant.
-/// Different providers cannot overwrite one another’s memory strategy.
-/// For Einsum, the handle owns parked scratch slots strongly, while TLS keeps weak
-/// references; dropping the last provider/session/kernel handle immediately
-/// releases inactive-worker allocations and their process-budget reservations.
-#[derive(Clone)]
-pub struct CpuCacheRetention {
-    inner: Arc<CpuCacheRetentionInner>,
-}
-
-impl std::fmt::Debug for CpuCacheRetention {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CpuCacheRetention")
-            .field("admitted", &self.inner.admitted)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Default for CpuCacheRetention {
-    fn default() -> Self {
-        Self::new(true)
-    }
-}
-
-impl CpuCacheRetention {
-    /// Create one immutable retention verdict for one provider/session.
-    pub fn new(admitted: bool) -> Self {
-        Self::with_budget(admitted, &EINSUM_SCRATCH_BUDGET)
-    }
-
-    fn with_budget(admitted: bool, budget: &'static GovernedAccumulatorBudget) -> Self {
-        Self {
-            inner: Arc::new(CpuCacheRetentionInner {
-                admitted,
-                budget,
-                slots: Mutex::new(EinsumScratchSlots::default()),
-            }),
-        }
-    }
-
-    /// The memory plan verdict captured by this handle.
-    pub fn is_admitted(&self) -> bool {
-        self.inner.admitted
-    }
-
-    fn take<T: Send + 'static>(&self) -> Result<Vec<T>> {
-        EINSUM_SCRATCH
-            .try_with(|scratch| {
-                let mut scratch = scratch.try_borrow_mut().map_err(|_| {
-                    EpError::KernelFailed(
-                        "Einsum: the per-thread scratch pool is already being checked out. \
-                         HOW: do not hold the scratch-pool slot across kernel execution."
-                            .into(),
-                    )
-                })?;
-                if !self.inner.admitted {
-                    scratch.take();
-                    return Ok(Vec::new());
-                }
-                if !scratch
-                    .as_ref()
-                    .is_some_and(|entry| entry.belongs_to(&self.inner) && entry.stores::<T>())
-                {
-                    *scratch = None;
-                }
-                let Some(entry) = scratch.as_ref() else {
-                    return Ok(Vec::new());
-                };
-                let Some(slot) = entry.slot.upgrade() else {
-                    *scratch = None;
-                    return Ok(Vec::new());
-                };
-                let mut accumulator = slot
-                    .accumulator
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let accumulator = accumulator
-                    .as_any_mut()
-                    .downcast_mut::<GovernedAccumulator<T>>()
-                    .ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "Einsum: the typed scratch slot changed type while checked out".into(),
-                        )
-                    })?;
-                Ok(accumulator.take())
-            })
-            .map_err(|_| {
-                EpError::KernelFailed(
-                    "Einsum: the per-thread scratch pool is unavailable during thread teardown"
-                        .into(),
-                )
-            })?
-    }
-
-    fn park<T: Send + 'static>(&self, buffer: Vec<T>) {
-        if !self.inner.admitted {
-            let _ = EINSUM_SCRATCH.try_with(|scratch| {
-                if let Ok(mut scratch) = scratch.try_borrow_mut() {
-                    scratch.take();
-                }
-            });
-            return;
-        }
-        let mut buffer = Some(buffer);
-        let _ = EINSUM_SCRATCH.try_with(|scratch| {
-            let Ok(mut scratch) = scratch.try_borrow_mut() else {
-                return;
-            };
-            if !scratch
-                .as_ref()
-                .is_some_and(|entry| entry.belongs_to(&self.inner) && entry.stores::<T>())
-            {
-                *scratch = None;
-            }
-            if let Some(slot) = scratch.as_ref().and_then(|entry| entry.slot.upgrade()) {
-                let mut erased = slot
-                    .accumulator
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let parked = erased
-                    .as_any_mut()
-                    .downcast_mut::<GovernedAccumulator<T>>()
-                    .is_some_and(|accumulator| {
-                        accumulator.try_park(
-                            buffer
-                                .take()
-                                .expect("Einsum scratch buffer is parked at most once"),
-                            self.inner.budget,
-                        )
-                    });
-                if !parked {
-                    *scratch = None;
-                }
-                return;
-            }
-            *scratch = None;
-            if let Some(entry) = self.inner.register(
-                buffer
-                    .take()
-                    .expect("Einsum scratch buffer is registered at most once"),
-            ) {
-                *scratch = Some(entry);
-            }
-        });
-    }
-
-    fn with_scratch<T: Default + Send + 'static, R>(
-        &self,
-        len: usize,
-        execute: impl FnOnce(&mut Vec<T>) -> Result<R>,
-    ) -> Result<R> {
-        let mut buffer = self.take()?;
-        resize_scratch(&mut buffer, len)?;
-        let value = execute(&mut buffer)?;
-        self.park(buffer);
-        Ok(value)
-    }
-
-    fn with_f32_scratch<R>(
-        &self,
-        len: usize,
-        execute: impl FnOnce(&mut Vec<f32>) -> Result<R>,
-    ) -> Result<R> {
-        self.with_scratch(len, execute)
-    }
-
-    fn current_thread_capacity_bytes(&self) -> usize {
-        EINSUM_SCRATCH
-            .try_with(|scratch| {
-                let scratch = scratch.try_borrow().ok()?;
-                let entry = scratch.as_ref()?;
-                if !entry.belongs_to(&self.inner) {
-                    return None;
-                }
-                let slot = entry.slot.upgrade()?;
-                let bytes = slot
-                    .accumulator
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .capacity_bytes();
-                Some(bytes)
-            })
-            .ok()
-            .flatten()
-            .unwrap_or(0)
-    }
-
-    #[cfg(test)]
-    fn active_slots(&self) -> usize {
-        self.inner.active_slots()
-    }
-}
+// Algorithm-selection ceiling, not an allocation grant or a retention budget.
+// Larger trees use the lower-memory GenericNative route.
+const EINSUM_TREE_WORKSPACE_LIMIT: usize = 32 * 1024 * 1024;
 
 const CONCURRENCY_VIEW: usize = 0;
 const CONCURRENCY_REDUCTION: usize = 1;
@@ -788,40 +462,15 @@ impl ConcurrencyProbeGuard {
 #[doc(hidden)]
 pub use concurrency_probe::{begin as begin_concurrency_probe, finish as finish_concurrency_probe};
 
-/// Bytes currently parked between Einsum calls across all execution threads.
-pub fn einsum_scratch_live_bytes() -> u64 {
-    EINSUM_SCRATCH_BUDGET.live_bytes()
-}
-
-/// Current hard process-wide ceiling for retained Einsum scratch.
-pub fn einsum_scratch_process_cap_bytes() -> u64 {
-    EINSUM_SCRATCH_BUDGET.process_cap_bytes()
-}
-
-/// Predict the resident scratch budget to declare for a graph.
-///
-/// All Einsum kernels share one process-wide pool, so the prediction is one
-/// process cap when the graph contains any default-domain `Einsum`, not one cap
-/// per node. Reading the configured cap keeps admission aligned with the bytes
-/// the runtime may actually retain.
-pub fn einsum_scratch_budget_predicted_bytes(graph: &onnx_runtime_ir::Graph) -> u64 {
-    let has_einsum = graph
-        .nodes
-        .values()
-        .any(|node| node.is_default_domain() && node.op_type == "Einsum");
-    if has_einsum {
-        einsum_scratch_process_cap_bytes()
-    } else {
-        0
-    }
-}
-
 /// Shape-specialized CPU Einsum kernel.
 pub struct EinsumKernel {
     plan: EinsumShapePlan,
     matmul: MatMulKernel,
-    scratch_retention: CpuCacheRetention,
     mode: EinsumExecutionMode,
+    output_len: usize,
+    // Concrete IR choices are compiled facts, indexed by accumulator width
+    // (1/2/4/8 bytes). No mutable pool, dtype cache or per-run planning lock.
+    tree_choices: [std::result::Result<Option<TreeChoice>, String>; 4],
     flops: Option<u64>,
     last_workspace_bytes: AtomicUsize,
     #[cfg(test)]
@@ -830,14 +479,14 @@ pub struct EinsumKernel {
 
 /// Factory for [`EinsumKernel`].
 pub struct EinsumFactory {
-    scratch_retention: CpuCacheRetention,
+    cache_retention: CpuCacheRetention,
     mode: Option<EinsumExecutionMode>,
 }
 
 impl EinsumFactory {
-    pub fn new(scratch_retention: CpuCacheRetention) -> Self {
+    pub fn new(cache_retention: CpuCacheRetention) -> Self {
         Self {
-            scratch_retention,
+            cache_retention,
             mode: None,
         }
     }
@@ -848,11 +497,11 @@ impl EinsumFactory {
     /// benchmark adapters while keeping the ordinary provider configuration
     /// compatible with [`EINSUM_MODE_ENV`].
     pub fn with_execution_mode(
-        scratch_retention: CpuCacheRetention,
+        cache_retention: CpuCacheRetention,
         mode: EinsumExecutionMode,
     ) -> Self {
         Self {
-            scratch_retention,
+            cache_retention,
             mode: Some(mode),
         }
     }
@@ -882,16 +531,13 @@ impl KernelFactory for EinsumFactory {
             EinsumPlanningClassification::Gemm(gemm) => gemm_flops(gemm),
             _ => None,
         };
-        Ok(Box::new(EinsumKernel {
+        Ok(Box::new(EinsumKernel::new(
             plan,
-            matmul: MatMulKernel::with_cache_retention(self.scratch_retention.is_admitted()),
-            scratch_retention: self.scratch_retention.clone(),
+            MatMulKernel::with_cache_retention(self.cache_retention.is_admitted()),
             mode,
+            &input_shape_refs,
             flops,
-            last_workspace_bytes: AtomicUsize::new(0),
-            #[cfg(test)]
-            last_route: std::sync::atomic::AtomicU8::new(0),
-        }))
+        )?))
     }
 }
 
@@ -936,19 +582,6 @@ fn execution_mode() -> Result<EinsumExecutionMode> {
     }
 }
 
-/// Claim-time capability check using the original Einsum-12 contract.
-///
-/// This compatibility wrapper intentionally does not inspect node metadata or
-/// infer a schema from the operand dtypes. Model/provider paths that have an
-/// effective opset must call [`unsupported_reason_for_opset`] instead.
-pub fn unsupported_reason(
-    node: &Node,
-    shapes: &[Shape],
-    input_dtypes: &[DataType],
-) -> Option<String> {
-    unsupported_reason_for_opset(node, 12, shapes, input_dtypes)
-}
-
 /// Claim-time capability check shared with [`crate::CpuExecutionProvider`].
 ///
 /// Returning the planner's structured rejection before ORT compiles the node
@@ -991,7 +624,66 @@ impl Kernel for EinsumKernel {
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.execute_with_route(inputs, outputs).map(|_| ())
+        self.execute_with_route(inputs, outputs, None).map(|_| ())
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        let dtype = self.validate_workspace_metadata(inputs)?;
+        let bytes_per_element = match self.mode {
+            EinsumExecutionMode::GenericNative => accumulator_element_size(dtype),
+            EinsumExecutionMode::Oracle
+                if matches!(dtype, DataType::Float16 | DataType::Float32) =>
+            {
+                4
+            }
+            EinsumExecutionMode::Oracle => accumulator_element_size(dtype),
+            EinsumExecutionMode::Optimized => match self.plan.planning_classification() {
+                EinsumPlanningClassification::ViewOnlyPermutation(_)
+                | EinsumPlanningClassification::DiagonalView(_) => {
+                    return Ok(WorkspaceRequirement::NONE);
+                }
+                EinsumPlanningClassification::Gemm(_)
+                    if matches!(
+                        dtype,
+                        DataType::Float16 | DataType::BFloat16 | DataType::Float32
+                    ) =>
+                {
+                    4
+                }
+                EinsumPlanningClassification::Gemm(_) => return Ok(WorkspaceRequirement::NONE),
+                EinsumPlanningClassification::ContractionTree(_)
+                    if self.tree_choice(dtype)?.is_some() =>
+                {
+                    return Ok(WorkspaceRequirement::NONE);
+                }
+                _ => accumulator_element_size(dtype),
+            },
+        };
+        let bytes = self
+            .output_len
+            .checked_mul(bytes_per_element)
+            .ok_or_else(|| geometry_overflow(self.plan.equation(), "accumulator workspace"))?;
+        let layout = AllocationLayout::from_size_align(bytes, bytes_per_element).map_err(|_| {
+            geometry_overflow(self.plan.equation(), "addressable accumulator workspace")
+        })?;
+        if bytes == 0 {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        Ok(WorkspaceRequirement {
+            bytes: layout.size() as u64,
+            alignment: layout.align(),
+            ..WorkspaceRequirement::NONE
+        })
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.execute_with_route(inputs, outputs, workspace)
+            .map(|_| ())
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -1059,40 +751,100 @@ impl Kernel for EinsumKernel {
 }
 
 impl EinsumKernel {
-    fn with_scratch<T: Default + Send + 'static, R>(
-        &self,
-        len: usize,
-        execute: impl FnOnce(&mut Vec<T>) -> Result<R>,
-    ) -> Result<R> {
-        self.scratch_retention.with_scratch(len, execute)
+    fn new(
+        plan: EinsumShapePlan,
+        matmul: MatMulKernel,
+        mode: EinsumExecutionMode,
+        input_shapes: &[&[usize]],
+        flops: Option<u64>,
+    ) -> Result<Self> {
+        let output_shape = plan
+            .resolve_concrete_output_shape(input_shapes)
+            .map_err(|error| {
+                EpError::KernelFailed(format!("Einsum workspace output planning failed: {error}"))
+            })?;
+        let output_len = checked_numel("compiled output", &output_shape)?;
+        let tree_choices = std::array::from_fn(|width| {
+            if mode == EinsumExecutionMode::Optimized
+                && let EinsumPlanningClassification::ContractionTree(tree) =
+                    plan.planning_classification()
+            {
+                select_tree_choice(&plan, tree, input_shapes, &output_shape, 1 << width)
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(None)
+            }
+        });
+        Ok(Self {
+            plan,
+            matmul,
+            mode,
+            output_len,
+            tree_choices,
+            flops,
+            last_workspace_bytes: AtomicUsize::new(0),
+            #[cfg(test)]
+            last_route: std::sync::atomic::AtomicU8::new(0),
+        })
     }
 
-    fn with_f32_scratch<R>(
-        &self,
-        len: usize,
-        execute: impl FnOnce(&mut Vec<f32>) -> Result<R>,
-    ) -> Result<R> {
-        self.scratch_retention.with_f32_scratch(len, execute)
+    fn validate_workspace_metadata(&self, inputs: &[TensorMetadata<'_>]) -> Result<DataType> {
+        let dtype = inputs.first().map(|input| input.dtype).ok_or_else(|| EpError::KernelFailed("Einsum workspace needs at least one present numeric input; provide the compiled operand metadata".into()))?;
+        if inputs.len() != self.plan.operands().len() || !self.plan.schema().supports_dtype(dtype) {
+            return Err(EpError::KernelFailed(format!(
+                "Einsum `{}` workspace received {} operands with dtype {dtype:?}; supply {} homogeneous operands supported by {}",
+                self.plan.equation(),
+                inputs.len(),
+                self.plan.operands().len(),
+                self.plan.schema()
+            )));
+        }
+        for (index, (input, operand)) in inputs.iter().zip(self.plan.operands()).enumerate() {
+            if !input.present || input.dtype != dtype || input.shape.len() != operand.shape().len() || input.shape.iter().zip(operand.shape()).any(|(actual, planned)| !matches!(planned, EinsumDimension::Static(expected) if expected == actual)) {
+                return Err(EpError::KernelFailed(format!("Einsum `{}` workspace input {index} has present={}, dtype={:?}, shape={:?}; provide the compiled homogeneous {dtype:?} operand shape {:?}", self.plan.equation(), input.present, input.dtype, input.shape, operand.shape())));
+            }
+        }
+        Ok(dtype)
+    }
+
+    fn tree_choice(&self, dtype: DataType) -> Result<Option<TreeChoice>> {
+        let width = accumulator_element_size(dtype);
+        if !width.is_power_of_two() || width > 8 {
+            return Err(EpError::KernelFailed(format!(
+                "Einsum `{}` cannot select a contraction tree for accumulator width {width}; use a supported numeric dtype",
+                self.plan.equation()
+            )));
+        }
+        self.tree_choices[width.trailing_zeros() as usize]
+            .as_ref()
+            .copied()
+            .map_err(|error| {
+                EpError::KernelFailed(format!(
+                    "Einsum `{}` compiled tree selection failed for {dtype:?}: {error}",
+                    self.plan.equation()
+                ))
+            })
     }
 
     fn execute_with_route(
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
     ) -> Result<EinsumRoute> {
         self.last_workspace_bytes.store(0, Ordering::Relaxed);
         self.validate_execution(inputs, outputs)?;
         if self.mode == EinsumExecutionMode::GenericNative {
             let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_GENERIC);
-            self.execute_generic_native(inputs, outputs)?;
+            self.execute_generic_native(inputs, outputs, workspace)?;
             return Ok(self.finish_route(EinsumRoute::GenericNative));
         }
         if self.mode == EinsumExecutionMode::Oracle {
             let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_GENERIC);
             if matches!(inputs[0].dtype, DataType::Float32 | DataType::Float16) {
-                self.execute_oracle(inputs, outputs)?;
+                self.execute_oracle(inputs, outputs, workspace)?;
             } else {
-                self.execute_generic_native(inputs, outputs)?;
+                self.execute_generic_native(inputs, outputs, workspace)?;
             }
             return Ok(self.finish_route(EinsumRoute::Oracle));
         }
@@ -1106,7 +858,7 @@ impl EinsumKernel {
             }
             EinsumPlanningClassification::ReductionOrElementwise(_) => {
                 let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_REDUCTION);
-                self.execute_generic_native(inputs, outputs)?;
+                self.execute_generic_native(inputs, outputs, workspace)?;
                 Ok(self.finish_route(EinsumRoute::Reduction))
             }
             EinsumPlanningClassification::Gemm(gemm)
@@ -1115,7 +867,7 @@ impl EinsumKernel {
                     DataType::Float16 | DataType::BFloat16 | DataType::Float32
                 ) =>
             {
-                let route = self.execute_gemm(inputs, outputs, gemm)?;
+                let route = self.execute_gemm(inputs, outputs, workspace, gemm)?;
                 Ok(self.finish_route(route))
             }
             EinsumPlanningClassification::Gemm(gemm) => {
@@ -1127,12 +879,13 @@ impl EinsumKernel {
             }
             EinsumPlanningClassification::ContractionTree(tree) => {
                 let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_GENERIC);
-                let route = self.execute_contraction_tree_or_generic(inputs, outputs, tree)?;
+                let route =
+                    self.execute_contraction_tree_or_generic(inputs, outputs, workspace, tree)?;
                 Ok(self.finish_route(route))
             }
             _ => {
                 let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_GENERIC);
-                self.execute_generic_native(inputs, outputs)?;
+                self.execute_generic_native(inputs, outputs, workspace)?;
                 Ok(self.finish_route(EinsumRoute::GenericNative))
             }
         }
@@ -1251,7 +1004,12 @@ impl EinsumKernel {
         write_dense_bytes(&mut outputs[0], &dense)
     }
 
-    fn execute_oracle(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn execute_oracle(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         let mut iteration_axes = self.plan.output_axes().to_vec();
         iteration_axes.extend_from_slice(self.plan.reduction_axes());
         let output_rank = self.plan.output_axes().len();
@@ -1275,6 +1033,7 @@ impl EinsumKernel {
         self.execute_generic(
             inputs,
             outputs,
+            workspace,
             &iteration_axes,
             output_rank,
             &mappings,
@@ -1286,11 +1045,13 @@ impl EinsumKernel {
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
     ) -> Result<()> {
         crate::dispatch_arith!(inputs[0].dtype, "Einsum", T => {
             self.execute_generic_native_typed::<T>(
                 inputs,
                 outputs,
+                workspace,
                 self.plan.generic_native(),
             )
         })
@@ -1300,6 +1061,7 @@ impl EinsumKernel {
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
         generic: &EinsumGenericNativePlan,
     ) -> Result<()> {
         let program = generic.index_program();
@@ -1328,130 +1090,76 @@ impl EinsumKernel {
             })?;
         let tile = generic_output_tile(reduction_len, prepared.len(), output_len);
 
-        self.with_scratch::<<T as NumericElem>::Acc, _>(output_len, |accumulators| {
-            let evaluate = |first_tile: usize, output: &mut [<T as NumericElem>::Acc]| {
-                let first_output = first_tile * tile;
-                let mut coordinates = vec![0usize; iteration_shape.len()];
-                for (local, destination) in output.iter_mut().enumerate() {
-                    let output_linear = first_output + local;
-                    decode_row_major(output_linear, output_shape, &mut coordinates[..output_rank]);
-                    let mut sum = <T as NumericElem>::Acc::default();
-                    for reduction_linear in 0..reduction_len {
-                        decode_row_major(
-                            reduction_linear,
-                            reduction_shape,
-                            &mut coordinates[output_rank..],
-                        );
-                        let mut product = T::one();
-                        for input in &prepared {
-                            product = product.c_mul(input.read(&coordinates));
+        // SAFETY: CPU dispatch lends exclusive live workspace for this call;
+        // the closure writes every element before exposing initialized values.
+        unsafe {
+            with_accumulator::<<T as NumericElem>::Acc, _>(workspace, output_len, |accumulators| {
+                let evaluate =
+                    |first_tile: usize, output: &mut [MaybeUninit<<T as NumericElem>::Acc>]| {
+                        let first_output = first_tile * tile;
+                        let mut coordinates = vec![0usize; iteration_shape.len()];
+                        for (local, destination) in output.iter_mut().enumerate() {
+                            let output_linear = first_output + local;
+                            decode_row_major(
+                                output_linear,
+                                output_shape,
+                                &mut coordinates[..output_rank],
+                            );
+                            let mut sum = <T as NumericElem>::Acc::default();
+                            for reduction_linear in 0..reduction_len {
+                                decode_row_major(
+                                    reduction_linear,
+                                    reduction_shape,
+                                    &mut coordinates[output_rank..],
+                                );
+                                let mut product = T::one();
+                                for input in &prepared {
+                                    product = product.c_mul(input.read(&coordinates));
+                                }
+                                sum = if reduction_linear == 0 {
+                                    product
+                                } else {
+                                    sum.c_add(product)
+                                };
+                            }
+                            destination.write(sum);
                         }
-                        sum = if reduction_linear == 0 {
-                            product
-                        } else {
-                            sum.c_add(product)
-                        };
-                    }
-                    *destination = sum;
-                }
-            };
+                    };
 
-            const PARALLEL_GENERIC_WORK_ITEMS: u128 = 128 * 1024;
-            if output_len > 1 && work >= PARALLEL_GENERIC_WORK_ITEMS {
-                crate::task_runtime::chunk_runs_mut(accumulators, tile, 1, evaluate);
-            } else {
-                evaluate(0, accumulators);
-            }
-            self.last_workspace_bytes.store(
-                output_len.saturating_mul(std::mem::size_of::<T::Acc>()),
-                Ordering::Relaxed,
-            );
-            T::write_accumulators(&mut outputs[0], accumulators)
-        })
+                const PARALLEL_GENERIC_WORK_ITEMS: u128 = 128 * 1024;
+                if output_len > 1 && work >= PARALLEL_GENERIC_WORK_ITEMS {
+                    crate::task_runtime::chunk_runs_mut(accumulators, tile, 1, evaluate);
+                } else {
+                    evaluate(0, accumulators);
+                }
+                self.last_workspace_bytes.store(
+                    output_len.saturating_mul(std::mem::size_of::<T::Acc>()),
+                    Ordering::Relaxed,
+                );
+                // Every output position above writes a final sum, including zero reduction.
+                T::write_accumulators(&mut outputs[0], initialized(accumulators))
+            })
+        }
     }
 
     fn execute_contraction_tree_or_generic(
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
         tree: &EinsumContractionTreePlan,
     ) -> Result<EinsumRoute> {
-        if tree.quality() == EinsumPlannerQuality::GenericNativeFallback {
-            self.execute_generic_native(inputs, outputs)?;
-            return Ok(EinsumRoute::GenericNative);
-        }
-        let input_shapes = inputs.iter().map(|input| input.shape).collect::<Vec<_>>();
-        let accumulator_size = accumulator_element_size(inputs[0].dtype);
-        let output_shape = outputs[0].shape.to_vec();
-        let workspace_limit = usize::try_from(DEFAULT_PER_THREAD_ACCUMULATOR_BYTES)
-            .expect("the 32 MiB per-thread workspace ceiling fits usize");
-        let Some(concrete) = self
-            .plan
-            .resolve_concrete_contraction_tree(&input_shapes, accumulator_size)
-            .map_err(|error| {
-                EpError::KernelFailed(format!(
-                    "Einsum `{}` could not resolve its concrete contraction tree: {error}",
-                    self.plan.equation()
-                ))
-            })?
-        else {
-            self.execute_generic_native(inputs, outputs)?;
+        let Some(choice) = self.tree_choice(inputs[0].dtype)? else {
+            self.execute_generic_native(inputs, outputs, workspace)?;
             return Ok(EinsumRoute::GenericNative);
         };
-        let supported_candidates = tree
-            .candidates()
-            .iter()
-            .filter_map(|candidate| {
-                candidate
-                    .supported()
-                    .map(|supported| (candidate.id().clone(), supported))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let candidate_workspaces = concrete
-            .candidates()
-            .iter()
-            .filter(|candidate| candidate.cost().is_some())
-            .try_fold(BTreeMap::new(), |mut workspaces, candidate| {
-                let supported = supported_candidates.get(candidate.id()).ok_or_else(|| {
-                    EpError::KernelFailed(format!(
-                        "Einsum `{}` concrete contraction candidate `{}` has no matching \
-                         supported structural plan",
-                        self.plan.equation(),
-                        candidate.id()
-                    ))
-                })?;
-                workspaces.insert(
-                    candidate.id().clone(),
-                    contraction_tree_workspace_bytes(
-                        self.plan.equation(),
-                        &self.plan,
-                        supported,
-                        &output_shape,
-                        accumulator_size,
-                    )?,
-                );
-                Ok::<_, EpError>(workspaces)
-            })?;
-        let Some(selected) = concrete.preferred_candidate_matching(|candidate| {
-            candidate_workspaces
-                .get(candidate.id())
-                .is_some_and(|&bytes| bytes <= workspace_limit)
-        }) else {
-            self.execute_generic_native(inputs, outputs)?;
-            return Ok(EinsumRoute::GenericNative);
-        };
-        let admitted_workspace_bytes = *candidate_workspaces
-            .get(selected.id())
-            .expect("selected candidate passed workspace admission");
-        let candidate = supported_candidates
-            .get(selected.id())
-            .copied()
+        let candidate = tree.candidates()[choice.candidate]
+            .supported()
             .ok_or_else(|| {
                 EpError::KernelFailed(format!(
-                    "Einsum `{}` selected contraction candidate `{}` without a matching \
-                     supported structural plan",
+                    "Einsum `{}` compiled tree choice {} is unsupported; rebuild the kernel",
                     self.plan.equation(),
-                    selected.id()
+                    choice.candidate
                 ))
             })?;
         let actual_workspace_bytes = crate::dispatch_arith!(inputs[0].dtype, "Einsum", T => {
@@ -1459,8 +1167,8 @@ impl EinsumKernel {
                 inputs,
                 outputs,
                 candidate,
-                admitted_workspace_bytes,
-                workspace_limit,
+                choice.bytes,
+                EINSUM_TREE_WORKSPACE_LIMIT,
             )
         })?;
         self.last_workspace_bytes
@@ -1733,6 +1441,7 @@ impl EinsumKernel {
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
         iteration_axes: &[EinsumAxis],
         output_rank: usize,
         mappings: &[Vec<usize>],
@@ -1792,135 +1501,143 @@ impl EinsumKernel {
             })
             .collect::<Result<_>>()?;
 
-        self.with_f32_scratch(output_len, |f32_output| {
-            f32_output.fill(0.0);
-            let identity_mappings = mappings
-                .iter()
-                .all(|mapping| mapping.iter().copied().eq(0..iteration_axes.len()));
-            let aligned_dense = layouts
-                .iter()
-                .zip(&dense)
-                .all(|(layout, data)| layout.shape == iteration_shape && data.len() == output_len);
-            if !high_precision && reduction_len == 1 && identity_mappings && aligned_dense {
-                const PARALLEL_ELEMENTWISE_MIN_ELEMS: usize = 64 * 1024;
-                let evaluate = |index: usize| {
-                    dense
-                        .iter()
-                        .fold(1.0f32, |product, operand| product * operand[index])
-                };
-                if output_len >= PARALLEL_ELEMENTWISE_MIN_ELEMS {
-                    f32_output
-                        .par_iter_mut()
-                        .enumerate()
-                        .for_each(|(index, output)| *output = evaluate(index));
-                } else {
-                    f32_output
-                        .iter_mut()
-                        .enumerate()
-                        .for_each(|(index, output)| *output = evaluate(index));
-                }
-                return write_dense_f32_narrow("Einsum", &mut outputs[0], f32_output);
-            }
-            if !high_precision
-                && dense.len() == 1
-                && reduction_len != 0
-                && identity_mappings
-                && layouts[0].shape == iteration_shape
-                && dense[0].len() == output_len.saturating_mul(reduction_len)
-            {
-                const PARALLEL_REDUCTION_MIN_ELEMS: usize = 64 * 1024;
-                let data = dense[0].as_ref();
-                let reduce_one = |(output, values): (&mut f32, &[f32])| {
-                    *output = values.iter().copied().sum();
-                };
-                if data.len() >= PARALLEL_REDUCTION_MIN_ELEMS && output_len > 1 {
-                    f32_output
-                        .par_iter_mut()
-                        .zip(data.par_chunks(reduction_len))
-                        .for_each(reduce_one);
-                } else {
-                    f32_output
-                        .iter_mut()
-                        .zip(data.chunks(reduction_len))
-                        .for_each(reduce_one);
-                }
-                return write_dense_f32_narrow("Einsum", &mut outputs[0], f32_output);
-            }
-            if output_len != 0 && reduction_len != 0 {
-                let mut output_index = vec![0usize; output_rank];
-                for (output_offset, output) in f32_output.iter_mut().enumerate().take(output_len) {
-                    let mut reduction_index = vec![0usize; reduction_shape.len()];
-                    let mut first = true;
-                    let mut sum_f32 = 0.0f32;
-                    let mut sum_f64 = 0.0f64;
-                    while first || next_index(reduction_shape, &mut reduction_index) {
-                        first = false;
-                        let mut product_f32 = 1.0f32;
-                        let mut product_f64 = 1.0f64;
-                        for ((data, strides), _operand) in dense
+        // SAFETY: this call exclusively borrows live CPU workspace. Initialize
+        // before forming readable f32, as the original oracle also did.
+        unsafe {
+            with_zeroed_accumulator::<f32, _>(workspace, output_len, |f32_output| {
+                let identity_mappings = mappings
+                    .iter()
+                    .all(|mapping| mapping.iter().copied().eq(0..iteration_axes.len()));
+                let aligned_dense = layouts.iter().zip(&dense).all(|(layout, data)| {
+                    layout.shape == iteration_shape && data.len() == output_len
+                });
+                if !high_precision && reduction_len == 1 && identity_mappings && aligned_dense {
+                    const PARALLEL_ELEMENTWISE_MIN_ELEMS: usize = 64 * 1024;
+                    let evaluate = |index: usize| {
+                        dense
                             .iter()
-                            .zip(&operand_iteration_strides)
-                            .zip(self.plan.operands())
-                        {
-                            let mut offset = 0usize;
-                            for axis in 0..iteration_axes.len() {
-                                let index = if axis < output_rank {
-                                    output_index[axis]
-                                } else {
-                                    reduction_index[axis - output_rank]
-                                };
-                                offset = offset
-                                    .checked_add(index.checked_mul(strides[axis]).ok_or_else(
-                                        || {
+                            .fold(1.0f32, |product, operand| product * operand[index])
+                    };
+                    if output_len >= PARALLEL_ELEMENTWISE_MIN_ELEMS {
+                        f32_output
+                            .par_iter_mut()
+                            .enumerate()
+                            .for_each(|(index, output)| *output = evaluate(index));
+                    } else {
+                        f32_output
+                            .iter_mut()
+                            .enumerate()
+                            .for_each(|(index, output)| *output = evaluate(index));
+                    }
+                    return write_dense_f32_narrow("Einsum", &mut outputs[0], f32_output);
+                }
+                if !high_precision
+                    && dense.len() == 1
+                    && reduction_len != 0
+                    && identity_mappings
+                    && layouts[0].shape == iteration_shape
+                    && dense[0].len() == output_len.saturating_mul(reduction_len)
+                {
+                    const PARALLEL_REDUCTION_MIN_ELEMS: usize = 64 * 1024;
+                    let data = dense[0].as_ref();
+                    let reduce_one = |(output, values): (&mut f32, &[f32])| {
+                        *output = values.iter().copied().sum();
+                    };
+                    if data.len() >= PARALLEL_REDUCTION_MIN_ELEMS && output_len > 1 {
+                        f32_output
+                            .par_iter_mut()
+                            .zip(data.par_chunks(reduction_len))
+                            .for_each(reduce_one);
+                    } else {
+                        f32_output
+                            .iter_mut()
+                            .zip(data.chunks(reduction_len))
+                            .for_each(reduce_one);
+                    }
+                    return write_dense_f32_narrow("Einsum", &mut outputs[0], f32_output);
+                }
+                if output_len != 0 && reduction_len != 0 {
+                    let mut output_index = vec![0usize; output_rank];
+                    for (output_offset, output) in
+                        f32_output.iter_mut().enumerate().take(output_len)
+                    {
+                        let mut reduction_index = vec![0usize; reduction_shape.len()];
+                        let mut first = true;
+                        let mut sum_f32 = 0.0f32;
+                        let mut sum_f64 = 0.0f64;
+                        while first || next_index(reduction_shape, &mut reduction_index) {
+                            first = false;
+                            let mut product_f32 = 1.0f32;
+                            let mut product_f64 = 1.0f64;
+                            for ((data, strides), _operand) in dense
+                                .iter()
+                                .zip(&operand_iteration_strides)
+                                .zip(self.plan.operands())
+                            {
+                                let mut offset = 0usize;
+                                for axis in 0..iteration_axes.len() {
+                                    let index = if axis < output_rank {
+                                        output_index[axis]
+                                    } else {
+                                        reduction_index[axis - output_rank]
+                                    };
+                                    offset = offset
+                                        .checked_add(index.checked_mul(strides[axis]).ok_or_else(
+                                            || {
+                                                geometry_overflow(
+                                                    self.plan.equation(),
+                                                    "operand offset",
+                                                )
+                                            },
+                                        )?)
+                                        .ok_or_else(|| {
                                             geometry_overflow(
                                                 self.plan.equation(),
                                                 "operand offset",
                                             )
-                                        },
-                                    )?)
-                                    .ok_or_else(|| {
-                                        geometry_overflow(self.plan.equation(), "operand offset")
-                                    })?;
-                            }
-                            let value = *data.get(offset).ok_or_else(|| {
-                                EpError::KernelFailed(format!(
-                                    "Einsum `{}` canonical operand offset {offset} exceeded a \
+                                        })?;
+                                }
+                                let value = *data.get(offset).ok_or_else(|| {
+                                    EpError::KernelFailed(format!(
+                                        "Einsum `{}` canonical operand offset {offset} exceeded a \
                                      dense operand with {} element(s)",
-                                    self.plan.equation(),
-                                    data.len()
-                                ))
-                            })?;
-                            product_f32 *= value;
-                            product_f64 *= f64::from(value);
+                                        self.plan.equation(),
+                                        data.len()
+                                    ))
+                                })?;
+                                product_f32 *= value;
+                                product_f64 *= f64::from(value);
+                            }
+                            if high_precision {
+                                sum_f64 += product_f64;
+                            } else {
+                                sum_f32 += product_f32;
+                            }
+                            if reduction_shape.is_empty() {
+                                break;
+                            }
                         }
-                        if high_precision {
-                            sum_f64 += product_f64;
+                        *output = if high_precision {
+                            sum_f64 as f32
                         } else {
-                            sum_f32 += product_f32;
+                            sum_f32
+                        };
+                        if output_offset + 1 < output_len {
+                            let advanced = next_index(output_shape, &mut output_index);
+                            debug_assert!(advanced);
                         }
-                        if reduction_shape.is_empty() {
-                            break;
-                        }
-                    }
-                    *output = if high_precision {
-                        sum_f64 as f32
-                    } else {
-                        sum_f32
-                    };
-                    if output_offset + 1 < output_len {
-                        let advanced = next_index(output_shape, &mut output_index);
-                        debug_assert!(advanced);
                     }
                 }
-            }
-            write_dense_f32_narrow("Einsum", &mut outputs[0], f32_output)
-        })
+                write_dense_f32_narrow("Einsum", &mut outputs[0], f32_output)
+            })
+        }
     }
 
     fn execute_gemm(
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
         gemm: &EinsumContractionPlan,
     ) -> Result<EinsumRoute> {
         let geometry = self
@@ -2062,18 +1779,22 @@ impl EinsumKernel {
         self.last_workspace_bytes
             .store(workspace_bytes, Ordering::Relaxed);
         let _probe = ConcurrencyProbeGuard::enter(CONCURRENCY_MATERIALIZED_GEMM);
-        self.with_f32_scratch(canonical_len, |f32_output| {
-            let canonical_output = TensorMut::new(
-                onnx_runtime_ep_api::DevicePtrMut(f32_output.as_mut_ptr().cast()),
-                DataType::Float32,
-                &canonical_shape,
-                &canonical_strides,
-                onnx_runtime_ir::DeviceId::cpu(),
-            );
-            self.matmul
-                .execute(&[left_f32, right_f32], &mut [canonical_output])?;
-            write_canonical_output(&self.plan, gemm, f32_output, &mut outputs[0])
-        })?;
+        // SAFETY: exclusive CPU workspace; MatMul currently forms initialized
+        // f32 references, so its destination must be initialized before entry.
+        unsafe {
+            with_zeroed_accumulator::<f32, _>(workspace, canonical_len, |f32_output| {
+                let canonical_output = TensorMut::new(
+                    onnx_runtime_ep_api::DevicePtrMut(f32_output.as_mut_ptr().cast()),
+                    DataType::Float32,
+                    &canonical_shape,
+                    &canonical_strides,
+                    onnx_runtime_ir::DeviceId::cpu(),
+                );
+                self.matmul
+                    .execute(&[left_f32, right_f32], &mut [canonical_output])?;
+                write_canonical_output(&self.plan, gemm, f32_output, &mut outputs[0])
+            })
+        }?;
         Ok(EinsumRoute::MatMulMaterialized)
     }
 
@@ -3079,6 +2800,118 @@ fn gemm_flops(gemm: &EinsumContractionPlan) -> Option<u64> {
     })
 }
 
+#[derive(Clone, Copy)]
+struct TreeChoice {
+    candidate: usize,
+    bytes: usize,
+}
+
+fn select_tree_choice(
+    plan: &EinsumShapePlan,
+    tree: &EinsumContractionTreePlan,
+    input_shapes: &[&[usize]],
+    output_shape: &[usize],
+    accumulator_size: usize,
+) -> Result<Option<TreeChoice>> {
+    if tree.quality() == EinsumPlannerQuality::GenericNativeFallback {
+        return Ok(None);
+    }
+    let Some(concrete) = plan
+        .resolve_concrete_contraction_tree(input_shapes, accumulator_size)
+        .map_err(|error| {
+            EpError::KernelFailed(format!(
+                "Einsum `{}` could not resolve its concrete contraction tree: {error}",
+                plan.equation()
+            ))
+        })?
+    else {
+        return Ok(None);
+    };
+    let mut candidates = BTreeMap::new();
+    for candidate in concrete
+        .candidates()
+        .iter()
+        .filter(|candidate| candidate.cost().is_some())
+    {
+        let (index, supported) = tree.candidates().iter().enumerate()
+            .filter(|(_, structural)| structural.id() == candidate.id())
+            .find_map(|(index, structural)| structural.supported().map(|supported| (index, supported)))
+            .ok_or_else(|| EpError::KernelFailed(format!(
+                "Einsum `{}` concrete candidate `{}` has no supported structural plan; rebuild canonical planning",
+                plan.equation(), candidate.id()
+            )))?;
+        let bytes = contraction_tree_workspace_bytes(
+            plan.equation(),
+            plan,
+            supported,
+            output_shape,
+            accumulator_size,
+        )?;
+        candidates.insert(
+            candidate.id().clone(),
+            TreeChoice {
+                candidate: index,
+                bytes,
+            },
+        );
+    }
+    Ok(concrete
+        .preferred_candidate_matching(|candidate| {
+            candidates
+                .get(candidate.id())
+                .is_some_and(|choice| choice.bytes <= EINSUM_TREE_WORKSPACE_LIMIT)
+        })
+        .and_then(|selected| candidates.get(selected.id()).copied()))
+}
+
+/// Caller proves CPU accessibility, exclusive backing for the whole closure,
+/// and a lifetime covering all accesses. Layout validation alone is not proof.
+unsafe fn with_accumulator<T: Copy, R>(
+    workspace: Option<WorkspaceView>,
+    len: usize,
+    execute: impl FnOnce(&mut [MaybeUninit<T>]) -> Result<R>,
+) -> Result<R> {
+    let region = AllocationLayout::array::<T>(len).map_err(|_| {
+        EpError::KernelFailed(format!(
+            "Einsum cannot address {len} accumulator elements of {} bytes; reduce the output shape",
+            std::mem::size_of::<T>()
+        ))
+    })?;
+    let [view] = WorkspaceLayout::new([region])?.bind(workspace)?;
+    let pointer = if len == 0 {
+        std::ptr::NonNull::<MaybeUninit<T>>::dangling().as_ptr()
+    } else {
+        view.ptr().0.cast::<MaybeUninit<T>>()
+    };
+    // SAFETY: caller supplies exclusive live backing; checked layout covers len.
+    execute(unsafe { std::slice::from_raw_parts_mut(pointer, len) })
+}
+
+unsafe fn initialized<T>(storage: &[MaybeUninit<T>]) -> &[T] {
+    // SAFETY: caller proves every element has been initialized before reading.
+    unsafe { std::slice::from_raw_parts(storage.as_ptr().cast(), storage.len()) }
+}
+
+unsafe fn with_zeroed_accumulator<T: Default + Copy, R>(
+    workspace: Option<WorkspaceView>,
+    len: usize,
+    execute: impl FnOnce(&mut [T]) -> Result<R>,
+) -> Result<R> {
+    // SAFETY: forwards the caller's backing/exclusivity proof.
+    unsafe {
+        with_accumulator(workspace, len, |storage: &mut [MaybeUninit<T>]| {
+            for element in storage.iter_mut() {
+                element.write(T::default());
+            }
+            // Every element now contains a valid initialized T.
+            execute(std::slice::from_raw_parts_mut(
+                storage.as_mut_ptr().cast(),
+                storage.len(),
+            ))
+        })
+    }
+}
+
 fn resize_scratch<T: Default>(buffer: &mut Vec<T>, len: usize) -> Result<()> {
     if len > buffer.len() {
         buffer
@@ -3142,16 +2975,6 @@ fn views_may_overlap(input: &TensorView, output: &TensorMut) -> bool {
     input_range.0 < output_range.1 && output_range.0 < input_range.1
 }
 
-/// Current reusable typed scratch capacity held by an Einsum kernel.
-///
-/// Used by the benchmark to report steady-state workspace rather than infer it
-/// from tensor shapes.
-#[doc(hidden)]
-pub fn benchmark_scratch_capacity_bytes(kernel: &dyn Kernel) -> Option<usize> {
-    let kernel = kernel.as_any().downcast_ref::<EinsumKernel>()?;
-    Some(kernel.scratch_retention.current_thread_capacity_bytes())
-}
-
 /// Execution workspace attributed by the most recent successful dispatch.
 #[doc(hidden)]
 pub fn benchmark_last_workspace_bytes(kernel: &dyn Kernel) -> Option<usize> {
@@ -3161,7 +2984,7 @@ pub fn benchmark_last_workspace_bytes(kernel: &dyn Kernel) -> Option<usize> {
 
 /// Execute one validation dispatch and return the native branch that fired.
 ///
-/// The timed benchmark continues to call [`Kernel::execute`]. This probe uses
+/// The timed benchmark calls [`Kernel::execute_with_workspace`]. This probe uses
 /// the same dispatcher once before timing so route evidence is observed rather
 /// than inferred from the equation or expected layout.
 #[doc(hidden)]
@@ -3169,71 +2992,29 @@ pub fn benchmark_execute_route(
     kernel: &dyn Kernel,
     inputs: &[TensorView],
     outputs: &mut [TensorMut],
+    workspace: Option<WorkspaceView>,
 ) -> Result<Option<&'static str>> {
     let Some(kernel) = kernel.as_any().downcast_ref::<EinsumKernel>() else {
         return Ok(None);
     };
     kernel
-        .execute_with_route(inputs, outputs)
+        .execute_with_route(inputs, outputs, workspace)
         .map(|route| Some(route.label()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::testutil::Owned;
+    use crate::kernels::testutil::{Owned, PreparedTestKernel};
     use onnx_runtime_ep_api::abi::OrtGraphView;
     use onnx_runtime_ep_api::{DevicePtrMut, ExecutionProvider};
     use onnx_runtime_ir::{Attribute, DeviceId, Dim, FrozenGraph, Graph, NodeId, static_shape};
-    use std::sync::{Arc, Barrier, Mutex, MutexGuard};
-
-    static SCRATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
-    static TEST_SCRATCH_BUDGET: GovernedAccumulatorBudget =
-        GovernedAccumulatorBudget::new(128, 256);
-
-    struct ScratchTestGuard {
-        _guard: MutexGuard<'static, ()>,
-    }
-
-    impl Drop for ScratchTestGuard {
-        fn drop(&mut self) {
-            EINSUM_SCRATCH.with(|scratch| {
-                scratch.borrow_mut().take();
-            });
-            TEST_SCRATCH_BUDGET.set_caps_for_test(128, 256);
-            TEST_SCRATCH_BUDGET.reset_for_test();
-        }
-    }
-
-    fn begin_scratch_test(per_thread_cap_bytes: u64, process_cap_bytes: u64) -> ScratchTestGuard {
-        let guard = SCRATCH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        EINSUM_SCRATCH.with(|scratch| {
-            scratch.borrow_mut().take();
-        });
-        TEST_SCRATCH_BUDGET.reset_for_test();
-        TEST_SCRATCH_BUDGET.set_caps_for_test(per_thread_cap_bytes, process_cap_bytes);
-        ScratchTestGuard { _guard: guard }
-    }
-
-    fn test_retention(admitted: bool) -> CpuCacheRetention {
-        CpuCacheRetention::with_budget(admitted, &TEST_SCRATCH_BUDGET)
-    }
-
-    fn with_test_scratch<T>(
-        retention: &CpuCacheRetention,
-        len: usize,
-        execute: impl FnOnce(&mut Vec<f32>) -> Result<T>,
-    ) -> Result<T> {
-        retention.with_f32_scratch(len, execute)
-    }
 
     fn kernel_with_retention(
         equation: &str,
         shapes: &[Vec<usize>],
         mode: ExecutionMode,
-        scratch_retention: CpuCacheRetention,
+        cache_retention: CpuCacheRetention,
     ) -> Box<dyn Kernel> {
         let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
         node.attributes.insert(
@@ -3242,15 +3023,16 @@ mod tests {
         );
         let input_shape_refs: Vec<_> = shapes.iter().map(Vec::as_slice).collect();
         let plan = EinsumShapePlan::build(equation, &input_shape_refs).unwrap();
-        Box::new(EinsumKernel {
-            flops: None,
-            plan,
-            matmul: MatMulKernel::with_cache_retention(scratch_retention.is_admitted()),
-            scratch_retention,
-            mode,
-            last_workspace_bytes: AtomicUsize::new(0),
-            last_route: std::sync::atomic::AtomicU8::new(0),
-        })
+        Box::new(
+            EinsumKernel::new(
+                plan,
+                MatMulKernel::with_cache_retention(cache_retention.is_admitted()),
+                mode,
+                &input_shape_refs,
+                None,
+            )
+            .unwrap(),
+        )
     }
 
     fn kernel(equation: &str, shapes: &[Vec<usize>], mode: ExecutionMode) -> Box<dyn Kernel> {
@@ -3284,433 +3066,237 @@ mod tests {
     }
 
     #[test]
-    fn compiled_kernel_is_naturally_sync_without_an_unsafe_assertion() {
-        fn assert_sync<T: Sync>() {}
-        assert_sync::<EinsumKernel>();
-    }
-
-    #[test]
-    fn scratch_retention_is_bounded_by_the_process_aggregate_ceiling() {
-        let _guard = begin_scratch_test(64, 128);
-        const THREADS: usize = 4;
-        let parked = Arc::new(Barrier::new(THREADS + 1));
-        let release = Arc::new(Barrier::new(THREADS + 1));
-
-        let workers = (0..THREADS)
-            .map(|_| {
-                let parked = Arc::clone(&parked);
-                let release = Arc::clone(&release);
-                std::thread::spawn(move || {
-                    let retention = test_retention(true);
-                    with_test_scratch(&retention, 16, |buffer| {
-                        buffer.fill(1.0);
-                        Ok(())
-                    })
-                    .expect("scratch call succeeds");
-                    parked.wait();
-                    release.wait();
-                })
-            })
-            .collect::<Vec<_>>();
-
-        parked.wait();
-        assert_eq!(
-            TEST_SCRATCH_BUDGET.live_bytes(),
-            128,
-            "two 64-byte buffers fit and the other workers must be declined"
-        );
-        release.wait();
-        for worker in workers {
-            worker.join().expect("scratch worker exits cleanly");
-        }
-
-        assert_eq!(
-            TEST_SCRATCH_BUDGET.live_bytes(),
-            0,
-            "worker thread exit must release every parked reservation"
-        );
-    }
-
-    #[test]
-    fn scratch_reuses_an_admitted_allocation_on_the_same_thread() {
-        let _guard = begin_scratch_test(128, 128);
-        let retention = test_retention(true);
-        let first = with_test_scratch(&retention, 16, |buffer| {
-            Ok((buffer.as_ptr() as usize, buffer.capacity()))
-        })
-        .expect("first scratch call succeeds");
-        let retained = TEST_SCRATCH_BUDGET.live_bytes();
-        assert_eq!(retained, (first.1 * std::mem::size_of::<f32>()) as u64);
-        assert_eq!(retention.current_thread_capacity_bytes(), retained as usize);
-
-        let second = with_test_scratch(&retention, 16, |buffer| {
-            Ok((buffer.as_ptr() as usize, buffer.capacity()))
-        })
-        .expect("second scratch call succeeds");
-        assert_eq!(
-            second, first,
-            "the parked allocation must be checked out again"
-        );
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), retained);
-    }
-
-    #[test]
-    fn typed_scratch_switches_width_without_cross_type_reuse_or_accounting_leak() {
-        let _guard = begin_scratch_test(128, 128);
-        let retention = test_retention(true);
-        retention
-            .with_scratch::<f32, _>(16, |buffer| {
-                buffer.fill(3.0);
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 64);
-
-        retention
-            .with_scratch::<f64, _>(8, |buffer| {
-                assert!(buffer.iter().all(|&value| value == 0.0));
-                buffer.fill(5.0);
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(
-            TEST_SCRATCH_BUDGET.live_bytes(),
-            64,
-            "changing accumulator dtype must release the old reservation before parking the new one"
-        );
-        assert_eq!(retention.active_slots(), 1);
-    }
-
-    #[test]
-    fn oversized_and_declined_scratch_are_discarded_after_use() {
-        let _guard = begin_scratch_test(32, 128);
-        let admitted = test_retention(true);
-        with_test_scratch(&admitted, 9, |buffer| {
-            buffer.fill(2.0);
-            Ok(())
-        })
-        .expect("oversized temporary scratch still computes");
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
-        assert_eq!(
-            admitted.current_thread_capacity_bytes(),
-            0,
-            "a buffer over the per-thread cap must not remain in TLS"
-        );
-
-        with_test_scratch(&admitted, 8, |_| Ok(())).expect("prime an admitted buffer");
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 32);
-        let declined = test_retention(false);
-        with_test_scratch(&declined, 8, |buffer| {
-            buffer.fill(3.0);
-            Ok(())
-        })
-        .expect("declined retention still permits temporary scratch");
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
-        assert_eq!(
-            declined.current_thread_capacity_bytes(),
-            0,
-            "a declined buffer must be dropped rather than parked"
-        );
-        assert_eq!(
-            admitted.active_slots(),
-            0,
-            "switching owners on one worker must unregister the old session slot"
-        );
-    }
-
-    #[test]
-    fn scratch_error_unwind_and_checkout_failure_leave_exact_accounting() {
-        let _guard = begin_scratch_test(128, 128);
-        let retention = test_retention(true);
-        with_test_scratch(&retention, 16, |_| Ok(())).expect("prime retained scratch");
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 64);
-
-        let error = with_test_scratch(&retention, 16, |_buffer| -> Result<()> {
-            Err(EpError::KernelFailed("injected scratch error".into()))
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("injected scratch error"));
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
-        assert_eq!(retention.current_thread_capacity_bytes(), 0);
-
-        with_test_scratch(&retention, 16, |_| Ok(())).expect("prime scratch before unwind");
-        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = with_test_scratch(&retention, 16, |_buffer| -> Result<()> {
-                panic!("injected scratch unwind")
-            });
-        }));
-        assert!(unwind.is_err());
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
-        assert_eq!(retention.current_thread_capacity_bytes(), 0);
-
-        EINSUM_SCRATCH.with(|scratch| {
-            let _borrow = scratch.borrow_mut();
-            let error = with_test_scratch(&retention, 1, |_| Ok(())).unwrap_err();
-            assert!(error.to_string().contains("already being checked out"));
-        });
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
-    }
-
-    #[test]
-    fn scratch_thread_exit_releases_its_reservation() {
-        let _guard = begin_scratch_test(64, 64);
-        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
-        let release = Arc::new(Barrier::new(2));
-        let worker_release = Arc::clone(&release);
-        let worker = std::thread::spawn(move || {
-            let retention = test_retention(true);
-            with_test_scratch(&retention, 16, |_| Ok(())).expect("worker parks scratch");
-            parked_tx
-                .send(TEST_SCRATCH_BUDGET.live_bytes())
-                .expect("report parked bytes");
-            worker_release.wait();
-        });
-
-        assert_eq!(parked_rx.recv().expect("worker reported"), 64);
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 64);
-        release.wait();
-        worker.join().expect("scratch worker exits cleanly");
-        assert_eq!(
-            TEST_SCRATCH_BUDGET.live_bytes(),
-            0,
-            "TLS destruction must release the worker's reservation"
-        );
-    }
-
-    #[test]
-    fn zero_size_scratch_retains_and_accounts_nothing() {
-        let _guard = begin_scratch_test(0, 0);
-        let retention = test_retention(true);
-        let len = with_test_scratch(&retention, 0, |buffer| Ok(buffer.len()))
-            .expect("zero-sized scratch succeeds");
-        assert_eq!(len, 0);
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
-        assert_eq!(retention.current_thread_capacity_bytes(), 0);
-    }
-
-    #[test]
-    fn zero_output_generic_execution_allocates_no_typed_scratch() {
-        let _guard = begin_scratch_test(128, 128);
-        let retention = test_retention(true);
-        let kernel = kernel_with_retention(
-            "i->i",
-            &[vec![0]],
-            EinsumExecutionMode::GenericNative,
-            retention.clone(),
-        );
-        let input = Owned::f32(&[0], &[]);
-        let mut output = Owned::zeros_f32(&[0]);
-        kernel
-            .execute(&[input.view()], &mut [output.view_mut()])
-            .unwrap();
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
-        assert_eq!(retention.current_thread_capacity_bytes(), 0);
-    }
-
-    #[test]
-    fn opposite_session_verdicts_are_order_independent_on_one_worker() {
-        let _guard = begin_scratch_test(64, 128);
-
-        for admitted_created_first in [true, false] {
-            EINSUM_SCRATCH.with(|scratch| {
-                scratch.borrow_mut().take();
-            });
-            TEST_SCRATCH_BUDGET.reset_for_test();
-
-            let first = test_retention(admitted_created_first);
-            let second = test_retention(!admitted_created_first);
-            let (admitted, declined) = if admitted_created_first {
-                (&first, &second)
-            } else {
-                (&second, &first)
-            };
-
-            with_test_scratch(admitted, 16, |buffer| {
-                buffer.fill(2.0);
-                assert_eq!(buffer.iter().sum::<f32>(), 32.0);
-                Ok(())
-            })
-            .expect("admitted session executes");
-            assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 64);
-            assert_eq!(admitted.active_slots(), 1);
-
-            with_test_scratch(declined, 16, |buffer| {
-                buffer.fill(3.0);
-                assert_eq!(buffer.iter().sum::<f32>(), 48.0);
-                Ok(())
-            })
-            .expect("declined session executes without retaining");
-            assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
-            assert_eq!(admitted.active_slots(), 0);
-            assert_eq!(declined.active_slots(), 0);
-
-            with_test_scratch(admitted, 16, |buffer| {
-                buffer.fill(4.0);
-                assert_eq!(buffer.iter().sum::<f32>(), 64.0);
-                Ok(())
-            })
-            .expect("the admitted session keeps its own verdict");
-            assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 64);
-            assert_eq!(admitted.active_slots(), 1);
-        }
-    }
-
-    #[test]
-    fn admitted_sessions_do_not_cross_use_one_workers_slot() {
-        let _guard = begin_scratch_test(128, 128);
-        let first = test_retention(true);
-        let second = test_retention(true);
-
-        with_test_scratch(&first, 16, |buffer| {
-            buffer.fill(11.0);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(first.active_slots(), 1);
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 64);
-
-        with_test_scratch(&second, 8, |buffer| {
-            assert!(
-                buffer.iter().all(|&value| value == 0.0),
-                "a new session must not receive another session's parked values"
+    fn workspace_bounds_follow_accumulator_width_and_compiled_route() {
+        let reduction = kernel("ij->i", &[vec![2, 3]], ExecutionMode::Optimized);
+        for (dtype, width) in [
+            (DataType::Int8, 1),
+            (DataType::Int16, 2),
+            (DataType::Int32, 4),
+            (DataType::Int64, 8),
+            (DataType::Float16, 4),
+            (DataType::Float32, 4),
+            (DataType::Float64, 8),
+        ] {
+            let request = reduction
+                .workspace_requirement(&[TensorMetadata::new(dtype, &[2, 3], true)])
+                .unwrap();
+            assert_eq!(
+                (request.bytes, request.alignment),
+                (2 * width as u64, width)
             );
-            buffer.fill(13.0);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(first.active_slots(), 0);
-        assert_eq!(second.active_slots(), 1);
+        }
+        let view = kernel("ij->ji", &[vec![2, 3]], ExecutionMode::Optimized);
         assert_eq!(
-            TEST_SCRATCH_BUDGET.live_bytes(),
-            32,
-            "one worker retains at most its current session's buffer"
+            view.workspace_requirement(&[TensorMetadata::new(DataType::Float32, &[2, 3], true)])
+                .unwrap(),
+            WorkspaceRequirement::NONE
+        );
+        let gemm = kernel(
+            "ik,kj->ij",
+            &[vec![2, 3], vec![3, 4]],
+            ExecutionMode::Optimized,
+        );
+        for (dtype, bytes) in [
+            (DataType::Float32, 32),
+            (DataType::Float64, 0),
+            (DataType::Int64, 0),
+        ] {
+            let request = gemm
+                .workspace_requirement(&[
+                    TensorMetadata::new(dtype, &[2, 3], true),
+                    TensorMetadata::new(dtype, &[3, 4], true),
+                ])
+                .unwrap();
+            assert_eq!(request.bytes, bytes);
+        }
+        let tree = kernel(
+            "ab,bc,cd->ad",
+            &[vec![2, 3], vec![3, 4], vec![4, 5]],
+            ExecutionMode::Optimized,
+        );
+        for dtype in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            assert_eq!(
+                tree.workspace_requirement(&[
+                    TensorMetadata::new(dtype, &[2, 3], true),
+                    TensorMetadata::new(dtype, &[3, 4], true),
+                    TensorMetadata::new(dtype, &[4, 5], true)
+                ])
+                .unwrap(),
+                WorkspaceRequirement::NONE,
+                "a compiled tree must not reserve unused generic publication scratch"
+            );
+        }
+        for metadata in [
+            TensorMetadata::new(DataType::Float32, &[2, 3], false),
+            TensorMetadata::new(DataType::Float32, &[3, 3], true),
+        ] {
+            let error = reduction
+                .workspace_requirement(&[metadata])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("input 0") && error.contains("compiled"),
+                "{error}"
+            );
+        }
+        let large = kernel(
+            "i->i",
+            &[vec![isize::MAX as usize / 8 + 1]],
+            ExecutionMode::GenericNative,
+        );
+        let error = large
+            .workspace_requirement(&[TensorMetadata::new(
+                DataType::Float64,
+                &[isize::MAX as usize / 8 + 1],
+                true,
+            )])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("workspace") && error.contains("overflow"),
+            "{error}"
         );
     }
 
     #[test]
-    fn admitted_and_declined_sessions_run_concurrently_without_sharing_retention() {
-        let _guard = begin_scratch_test(64, 128);
-        let admitted = test_retention(true);
-        let declined = test_retention(false);
-        let entered = Arc::new(Barrier::new(3));
-        let release = Arc::new(Barrier::new(3));
-
-        let admitted_worker = {
-            let retention = admitted.clone();
-            let entered = Arc::clone(&entered);
-            let release = Arc::clone(&release);
-            std::thread::spawn(move || {
-                let sum = with_test_scratch(&retention, 16, |buffer| {
-                    buffer.fill(5.0);
-                    Ok(buffer.iter().sum::<f32>())
-                })
-                .expect("admitted session executes");
-                assert_eq!(sum, 80.0);
-                entered.wait();
-                release.wait();
-            })
-        };
-        let declined_worker = {
-            let retention = declined.clone();
-            let entered = Arc::clone(&entered);
-            let release = Arc::clone(&release);
-            std::thread::spawn(move || {
-                let sum = with_test_scratch(&retention, 16, |buffer| {
-                    buffer.fill(7.0);
-                    Ok(buffer.iter().sum::<f32>())
-                })
-                .expect("declined session executes");
-                assert_eq!(sum, 112.0);
-                entered.wait();
-                release.wait();
-            })
-        };
-
-        entered.wait();
-        assert_eq!(
-            TEST_SCRATCH_BUDGET.live_bytes(),
-            64,
-            "only the admitted session may contribute retained bytes"
+    fn fresh_workspace_initializes_zero_reductions_and_refuses_missing_backing() {
+        let reduction = kernel("ij->i", &[vec![2, 3]], ExecutionMode::GenericNative);
+        let input = Owned::f64(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let mut output = Owned::f64(&[2], &[73.; 2]);
+        let error = reduction
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("16 bytes") && error.contains("prepare and pass"),
+            "{error}"
         );
-        assert_eq!(admitted.active_slots(), 1);
-        assert_eq!(declined.active_slots(), 0);
-        release.wait();
-        admitted_worker.join().unwrap();
-        declined_worker.join().unwrap();
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
+        assert_eq!(output.to_f64(), [73.; 2]);
+        let mut scratch = [MaybeUninit::<u64>::uninit(); 2];
+        let workspace = WorkspaceView::new(DevicePtrMut(scratch.as_mut_ptr().cast()), 16);
+        reduction
+            .execute_with_workspace(&[input.view()], &mut [output.view_mut()], Some(workspace))
+            .unwrap();
+        assert_eq!(output.to_f64(), [6., 15.]);
+        for mode in [ExecutionMode::GenericNative, ExecutionMode::Oracle] {
+            let zero = kernel("ij->i", &[vec![2, 0]], mode);
+            let empty = Owned::f32(&[2, 0], &[]);
+            let mut output = Owned::f32(&[2], &[73.; 2]);
+            zero.execute_with_workspace(&[empty.view()], &mut [output.view_mut()], Some(workspace))
+                .unwrap();
+            assert_eq!(output.to_f32(), [0.; 2]);
+        }
+        let empty = kernel("ij->i", &[vec![0, 3]], ExecutionMode::GenericNative);
+        assert_eq!(
+            empty
+                .workspace_requirement(&[TensorMetadata::new(DataType::Float64, &[0, 3], true)])
+                .unwrap(),
+            WorkspaceRequirement::NONE
+        );
+        empty
+            .execute(
+                &[Owned::f64(&[0, 3], &[]).view()],
+                &mut [Owned::zeros(DataType::Float64, &[0]).view_mut()],
+            )
+            .unwrap();
     }
 
     #[test]
-    fn dropping_a_session_reclaims_inactive_worker_tls() {
-        let _guard = begin_scratch_test(64, 64);
-        let retention = test_retention(true);
+    fn workspace_reuse_is_funded_independent_of_weight_retention_and_has_no_warm_issuer_calls() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{
+            HolderId, HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
+        };
+        use std::sync::Arc;
+        let books = Arc::new(RecordingGovernor::new_host(16));
+        let manager = ProcessMemoryManager::new().unwrap();
+        let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+        let providers = [true, false].map(|admitted| {
+            let resources = crate::CpuMemoryResources::new(
+                books.weight_memory(HolderId::new(13)),
+                Default::default(),
+            )
+            .unwrap()
+            .with_cache_retention(CpuCacheRetention::new(admitted))
+            .with_workspace_pool(pool.clone())
+            .unwrap();
+            crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap()
+        });
         let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
         node.attributes
             .insert("equation".into(), Attribute::String(b"ij->i".to_vec()));
-        let provider = crate::CpuExecutionProvider::with_resources(
-            crate::CpuMemoryResources::default().with_cache_retention(retention),
+        let kernels = providers
+            .each_ref()
+            .map(|provider| provider.get_kernel(&node, &[vec![2, 3]], 12).unwrap());
+        let first = kernels[0]
+            .workspace_requirement(&[TensorMetadata::new(DataType::Float64, &[2, 3], true)])
+            .unwrap();
+        let mut allocation = providers[0]
+            .allocate_workspace(16, first.alignment, first.role)
+            .unwrap();
+        let identity = allocation.managed_owner().unwrap().identity();
+        assert!(
+            providers[1].allocate_workspace(8, 4, first.role).is_err(),
+            "a second active lane must not execute without its own grant"
         );
-        let kernel = provider
-            .get_kernel(&node, &[vec![2, 4]], 12)
-            .expect("session compiles Einsum");
-        drop(provider);
-
-        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
-        let drop_kernel = Arc::new(Barrier::new(2));
-        let keep_worker_alive = Arc::new(Barrier::new(2));
-        let worker_drop_kernel = Arc::clone(&drop_kernel);
-        let worker_keep_alive = Arc::clone(&keep_worker_alive);
-        let worker = std::thread::spawn(move || {
-            let input = Owned::f32(&[2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.]);
-            let mut output = Owned::zeros_f32(&[2]);
+        let input64 = Owned::f64(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let input32 = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let mut output64 = Owned::zeros(DataType::Float64, &[2]);
+        let mut output32 = Owned::zeros_f32(&[2]);
+        let workspace = Some(WorkspaceView::new(
+            DevicePtrMut(allocation.as_mut_ptr()),
+            allocation.len(),
+        ));
+        kernels[0]
+            .execute_with_workspace(&[input64.view()], &mut [output64.view_mut()], workspace)
+            .unwrap();
+        providers[0].deallocate_workspace(allocation).unwrap();
+        let calls = (books.claims(), books.releases());
+        for iteration in 0..4096 {
+            let (provider, kernel) = (&providers[iteration % 2], &kernels[iteration % 2]);
+            let (input, output) = if iteration % 2 == 0 {
+                (&input64, &mut output64)
+            } else {
+                (&input32, &mut output32)
+            };
+            let request = kernel
+                .workspace_requirement(&[TensorMetadata::new(input.dtype, &input.shape, true)])
+                .unwrap();
+            let mut allocation = provider
+                .allocate_workspace(request.bytes as usize, request.alignment, request.role)
+                .unwrap();
+            assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
+            let workspace = Some(WorkspaceView::new(
+                DevicePtrMut(allocation.as_mut_ptr()),
+                allocation.len(),
+            ));
             kernel
-                .execute(&[input.view()], &mut [output.view_mut()])
-                .expect("worker executes compiled session kernel");
-            assert_eq!(output.to_f32(), [10., 26.]);
-            parked_tx
-                .send(("parked", TEST_SCRATCH_BUDGET.live_bytes()))
-                .expect("report parked scratch");
-            worker_drop_kernel.wait();
-            drop(kernel);
-            parked_tx
-                .send(("dropped", TEST_SCRATCH_BUDGET.live_bytes()))
-                .expect("report dropped session");
-            worker_keep_alive.wait();
-        });
-
-        assert_eq!(parked_rx.recv().expect("worker reported"), ("parked", 8));
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 8);
-        drop_kernel.wait();
-        assert_eq!(parked_rx.recv().expect("worker reported"), ("dropped", 0));
-        assert_eq!(
-            TEST_SCRATCH_BUDGET.live_bytes(),
-            0,
-            "dropping the provider and its last compiled kernel must release \
-             scratch while the worker and its TLS entry remain alive"
-        );
-
-        keep_worker_alive.wait();
-        worker.join().expect("inactive worker exits cleanly");
-        assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
+                .execute_with_workspace(&[input.view()], &mut [output.view_mut()], workspace)
+                .unwrap();
+            provider.deallocate_workspace(allocation).unwrap();
+        }
+        assert_eq!(output64.to_f64(), [6., 15.]);
+        assert_eq!(output32.to_f32(), [6., 15.]);
+        assert_eq!((books.claims(), books.releases()), calls);
+        assert_eq!(books.used(Tier::Host), 16);
+        assert_eq!(manager.process_used(Tier::Host), 16);
+        assert_eq!(manager.snapshot().unwrap().allocations.len(), 1);
+        drop(kernels);
+        drop(providers);
+        pool.trim_idle(16).unwrap();
+        assert_eq!(books.used(Tier::Host), 0);
     }
 
     #[test]
-    fn scratch_prediction_is_one_configured_process_pool_per_graph() {
-        let empty = Graph::new();
-        assert_eq!(einsum_scratch_budget_predicted_bytes(&empty), 0);
-
-        let mut graph = Graph::new();
-        graph.insert_node(Node::new(NodeId(0), "Einsum", vec![], vec![]));
-        assert_eq!(
-            einsum_scratch_budget_predicted_bytes(&graph),
-            einsum_scratch_process_cap_bytes(),
-            "node count must not multiply the shared process pool"
-        );
-        graph.insert_node(Node::new(NodeId(1), "Einsum", vec![], vec![]));
-        assert_eq!(
-            einsum_scratch_budget_predicted_bytes(&graph),
-            einsum_scratch_process_cap_bytes()
-        );
+    fn compiled_kernel_is_naturally_sync_without_an_unsafe_assertion() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<EinsumKernel>();
     }
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
@@ -3733,9 +3319,13 @@ mod tests {
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let b = Owned::f32(&[3, 2], &[1., 0., 0., 1., 1., 1.]);
         let mut output = Owned::zeros_f32(&[2, 2]);
-        let route =
-            benchmark_execute_route(&*direct, &[a.view(), b.view()], &mut [output.view_mut()])
-                .unwrap();
+        let route = benchmark_execute_route(
+            &*direct,
+            &[a.view(), b.view()],
+            &mut [output.view_mut()],
+            None,
+        )
+        .unwrap();
         assert_eq!(route, Some("matmul-direct"));
         assert_eq!(output.to_f32(), [4., 5., 10., 11.]);
     }
@@ -3771,7 +3361,9 @@ mod tests {
         let reduce = kernel("ij->i", &[vec![2, 3]], ExecutionMode::Optimized);
         let x = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let mut out = Owned::zeros_f32(&[2]);
-        reduce.execute(&[x.view()], &mut [out.view_mut()]).unwrap();
+        reduce
+            .execute_prepared(&[x.view()], &mut [out.view_mut()])
+            .unwrap();
         assert_eq!(out.to_f32(), [6., 15.]);
         assert_eq!(route(&*reduce), 2);
 
@@ -3780,7 +3372,7 @@ mod tests {
         let right = Owned::f32(&[3], &[5., 7., 11.]);
         let mut out = Owned::zeros_f32(&[2, 3]);
         outer
-            .execute(&[left.view(), right.view()], &mut [out.view_mut()])
+            .execute_prepared(&[left.view(), right.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), [10., 14., 22., 15., 21., 33.]);
     }
@@ -3795,7 +3387,7 @@ mod tests {
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let b = Owned::f32(&[3, 2], &[1., 0., 0., 1., 1., 0.]);
         let mut out = Owned::zeros_f32(&[2, 2]);
-        gemm.execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        gemm.execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), [4., 2., 10., 5.]);
         assert_eq!(route(&*gemm), 6);
@@ -3817,7 +3409,7 @@ mod tests {
             ],
         );
         let mut out = Owned::zeros_f32(&[2, 2, 4]);
-        bmm.execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        bmm.execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(
             out.to_f32(),
@@ -3841,7 +3433,7 @@ mod tests {
             &[1., 0., 0., 1., 1., 0., 2., 1., 1., 0., 0., 2.],
         );
         let mut out = Owned::zeros_f32(&[2, 2, 2]);
-        bmm.execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        bmm.execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), [4., 2., 10., 5., 4., 7., 13., 16.]);
 
@@ -3849,7 +3441,7 @@ mod tests {
         let x = Owned::f32(&[3], &[1., 2., 3.]);
         let y = Owned::f32(&[3], &[4., 5., 6.]);
         let mut scalar = Owned::zeros_f32(&[]);
-        dot.execute(&[x.view(), y.view()], &mut [scalar.view_mut()])
+        dot.execute_prepared(&[x.view(), y.view()], &mut [scalar.view_mut()])
             .unwrap();
         assert_eq!(scalar.to_f32(), [32.]);
 
@@ -3861,7 +3453,7 @@ mod tests {
         let a = Owned::f32(&[0, 3], &[]);
         let b = Owned::f32(&[3, 4], &[1.; 12]);
         let mut out = Owned::zeros_f32(&[0, 4]);
-        zero.execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        zero.execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert!(out.to_f32().is_empty());
     }
@@ -3882,7 +3474,7 @@ mod tests {
         );
         let mut out = Owned::zeros_f32(&[2, 2, 2, 1]);
         multi
-            .execute(&[left.view(), right.view()], &mut [out.view_mut()])
+            .execute_prepared(&[left.view(), right.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(
             out.to_f32(),
@@ -3902,7 +3494,7 @@ mod tests {
         let right = Owned::f32(&[3, 2], &[1., 0., 0., 1., 1., 1.]);
         let mut out = Owned::zeros_f32(&[2, 2]);
         diagonal
-            .execute(&[left.view(), right.view()], &mut [out.view_mut()])
+            .execute_prepared(&[left.view(), right.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), [4., 5., 10., 11.]);
 
@@ -3922,10 +3514,10 @@ mod tests {
         let mut actual = Owned::zeros_f32(&[2, 3, 2, 2, 1]);
         let mut expected = Owned::zeros_f32(&[2, 3, 2, 2, 1]);
         broadcasted
-            .execute(&[left.view(), right.view()], &mut [actual.view_mut()])
+            .execute_prepared(&[left.view(), right.view()], &mut [actual.view_mut()])
             .unwrap();
         oracle
-            .execute(&[left.view(), right.view()], &mut [expected.view_mut()])
+            .execute_prepared(&[left.view(), right.view()], &mut [expected.view_mut()])
             .unwrap();
         assert_close(&actual.to_f32(), &expected.to_f32(), 1e-5);
         assert_eq!(route(&*broadcasted), 7);
@@ -3941,21 +3533,21 @@ mod tests {
         let a = Owned::f16(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let b = Owned::f16(&[3, 2], &[1., 0., 0., 1., 1., 0.]);
         let mut out = Owned::zeros(DataType::Float16, &[2, 2]);
-        gemm.execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        gemm.execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_close(&out.to_f16_as_f32(), &[4., 2., 10., 5.], 0.05);
 
         let reduce = kernel("ij->i", &[vec![2, 3]], ExecutionMode::Optimized);
         let mut reduced = Owned::zeros(DataType::Float16, &[2]);
         reduce
-            .execute(&[a.view()], &mut [reduced.view_mut()])
+            .execute_prepared(&[a.view()], &mut [reduced.view_mut()])
             .unwrap();
         assert_close(&reduced.to_f16_as_f32(), &[6., 15.], 0.05);
 
         let transpose = kernel("ij->ji", &[vec![2, 3]], ExecutionMode::Optimized);
         let mut transposed = Owned::zeros(DataType::Float16, &[3, 2]);
         transpose
-            .execute(&[a.view()], &mut [transposed.view_mut()])
+            .execute_prepared(&[a.view()], &mut [transposed.view_mut()])
             .unwrap();
         assert_eq!(
             transposed.to_u16_bits(),
@@ -3979,7 +3571,7 @@ mod tests {
         let b = Owned::f32(&[3, 2], &[1., 0., 0., 1., 1., 0.]);
         let mut out = Owned::zeros_f32(&[2, 2]);
         noncontiguous
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), [4., 2., 10., 5.]);
     }
@@ -4008,7 +3600,7 @@ mod tests {
             DeviceId::cpu(),
         );
         permutation_kernel
-            .execute(&[input], std::slice::from_mut(&mut output))
+            .execute_prepared(&[input], std::slice::from_mut(&mut output))
             .unwrap();
         tensor.shape = shape;
         tensor.strides = strides;
@@ -4038,7 +3630,7 @@ mod tests {
             &left_strides,
             DeviceId::cpu(),
         );
-        gemm.execute(
+        gemm.execute_prepared(
             &[left_input, right.view()],
             std::slice::from_mut(&mut aliased_output),
         )
@@ -4069,7 +3661,7 @@ mod tests {
             DeviceId::cpu(),
         );
         generic
-            .execute(&[input], std::slice::from_mut(&mut output))
+            .execute_prepared(&[input], std::slice::from_mut(&mut output))
             .unwrap();
         assert_eq!(tensor.to_f32(), [1., 3., 2., 4.]);
         assert_eq!(route(&*generic), 3);
@@ -4088,7 +3680,7 @@ mod tests {
         .with_byte_offset(2 * std::mem::size_of::<f32>());
         let mut output = Owned::zeros_f32(&[3]);
         reverse
-            .execute(&[reversed], &mut [output.view_mut()])
+            .execute_prepared(&[reversed], &mut [output.view_mut()])
             .unwrap();
         assert_eq!(output.to_f32(), [3., 2., 1.]);
     }
@@ -4099,7 +3691,7 @@ mod tests {
         let input = Owned::i32(&[0], &[]);
         let mut output = Owned::zeros(DataType::Int32, &[]);
         reduction
-            .execute(&[input.view()], &mut [output.view_mut()])
+            .execute_prepared(&[input.view()], &mut [output.view_mut()])
             .unwrap();
         assert_eq!(output.to_i32(), [0]);
 
@@ -4108,7 +3700,7 @@ mod tests {
         let mut output = Owned::f32(&[2], &[123.0, 456.0]);
         let before = output.bytes.clone();
         let error = identity
-            .execute(&[input.view()], &mut [output.view_mut()])
+            .execute_prepared(&[input.view()], &mut [output.view_mut()])
             .unwrap_err()
             .to_string();
         assert!(error.contains("output dtype"), "{error}");
@@ -4135,10 +3727,10 @@ mod tests {
         let mut fast = Owned::zeros_f32(&[2, 2]);
         let mut oracle = Owned::zeros_f32(&[2, 2]);
         optimized
-            .execute(&[a.view(), b.view()], &mut [fast.view_mut()])
+            .execute_prepared(&[a.view(), b.view()], &mut [fast.view_mut()])
             .unwrap();
         oracle_kernel
-            .execute(&[a.view(), b.view()], &mut [oracle.view_mut()])
+            .execute_prepared(&[a.view(), b.view()], &mut [oracle.view_mut()])
             .unwrap();
         assert_eq!(route(&*optimized), 6);
         assert_eq!(route(&*oracle_kernel), 9);
@@ -4215,7 +3807,7 @@ mod tests {
             };
             let mut output = Owned::zeros(dtype, &[2, 2]);
             kernel
-                .execute(&[left.view(), right.view()], &mut [output.view_mut()])
+                .execute_prepared(&[left.view(), right.view()], &mut [output.view_mut()])
                 .unwrap();
             let actual = match dtype {
                 DataType::Float32 => output.to_f32(),
@@ -4271,73 +3863,13 @@ mod tests {
         let right = Owned::f32(&[3, 2], &[1., 0., 0., 1., 1., 0.]);
         let mut output = Owned::zeros_f32(&[2, 2]);
         kernel
-            .execute(&[left.view(), right.view()], &mut [output.view_mut()])
+            .execute_prepared(&[left.view(), right.view()], &mut [output.view_mut()])
             .unwrap();
         assert_eq!(
             output.to_f32(),
             [4., 10., 2., 5.],
             "implicit ASCII output order is [B, Z], the transpose of [Z, B]"
         );
-    }
-
-    #[test]
-    fn two_session_opposite_verdicts_survive_both_load_orders_and_compute() {
-        let _guard = begin_scratch_test(128, 128);
-        let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
-        node.attributes
-            .insert("equation".into(), Attribute::String(b"ij->i".to_vec()));
-        let input = Owned::f32(&[2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.]);
-
-        for admitted_first in [true, false] {
-            EINSUM_SCRATCH.with(|scratch| {
-                scratch.borrow_mut().take();
-            });
-            TEST_SCRATCH_BUDGET.reset_for_test();
-
-            let first_retention = test_retention(admitted_first);
-            let second_retention = test_retention(!admitted_first);
-            let first = crate::CpuExecutionProvider::with_resources(
-                crate::CpuMemoryResources::default().with_cache_retention(first_retention.clone()),
-            );
-            let second = crate::CpuExecutionProvider::with_resources(
-                crate::CpuMemoryResources::default().with_cache_retention(second_retention.clone()),
-            );
-            let (admitted_provider, admitted_retention, declined_provider, declined_retention) =
-                if admitted_first {
-                    (&first, &first_retention, &second, &second_retention)
-                } else {
-                    (&second, &second_retention, &first, &first_retention)
-                };
-            let admitted_kernel = admitted_provider
-                .get_kernel(&node, &[vec![2, 4]], 12)
-                .expect("admitted provider compiles Einsum");
-            let declined_kernel = declined_provider
-                .get_kernel(&node, &[vec![2, 4]], 12)
-                .expect("declined provider compiles Einsum");
-
-            let mut admitted_output = Owned::zeros_f32(&[2]);
-            admitted_kernel
-                .execute(&[input.view()], &mut [admitted_output.view_mut()])
-                .expect("admitted kernel executes");
-            assert_eq!(admitted_output.to_f32(), [10., 26.]);
-            assert!(TEST_SCRATCH_BUDGET.live_bytes() > 0);
-            assert_eq!(admitted_retention.active_slots(), 1);
-
-            let mut declined_output = Owned::zeros_f32(&[2]);
-            declined_kernel
-                .execute(&[input.view()], &mut [declined_output.view_mut()])
-                .expect("declined kernel executes");
-            assert_eq!(declined_output.to_f32(), [10., 26.]);
-            assert_eq!(TEST_SCRATCH_BUDGET.live_bytes(), 0);
-            assert_eq!(admitted_retention.active_slots(), 0);
-            assert_eq!(declined_retention.active_slots(), 0);
-
-            admitted_kernel
-                .execute(&[input.view()], &mut [admitted_output.view_mut()])
-                .expect("admitted kernel keeps its original verdict");
-            assert_eq!(admitted_output.to_f32(), [10., 26.]);
-            assert!(TEST_SCRATCH_BUDGET.live_bytes() > 0);
-        }
     }
 
     #[test]
@@ -4376,7 +3908,7 @@ mod tests {
         let c = Owned::f32(&[2, 2], &[2., 0., 0., 3.]);
         let mut out = Owned::zeros_f32(&[2, 2]);
         contraction
-            .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
+            .execute_prepared(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
             .expect("general contraction executes");
         assert_eq!(out.to_f32(), [8., 15., 20., 33.]);
         assert_eq!(route(&*contraction), 4);
@@ -4418,7 +3950,7 @@ mod tests {
         let views = operands.iter().map(Owned::view).collect::<Vec<_>>();
         let mut output = Owned::zeros_f32(&[]);
         kernel
-            .execute(&views, &mut [output.view_mut()])
+            .execute_prepared(&views, &mut [output.view_mut()])
             .expect("128-input GenericNative fallback executes");
         assert_eq!(output.to_f32(), [1.0]);
         assert_eq!(route(&*kernel), 3);
@@ -4432,10 +3964,7 @@ mod tests {
         const RETAINED_SLOT_BYTES: usize = COLUMNS * std::mem::size_of::<f32>();
         const EXPECTED_WORKSPACE_BYTES: usize = OUTPUT_BYTES + RETAINED_SLOT_BYTES;
 
-        assert_eq!(
-            EXPECTED_WORKSPACE_BYTES,
-            usize::try_from(DEFAULT_PER_THREAD_ACCUMULATOR_BYTES).unwrap() - 8192
-        );
+        assert_eq!(EXPECTED_WORKSPACE_BYTES, EINSUM_TREE_WORKSPACE_LIMIT - 8192);
 
         let retention = CpuCacheRetention::default();
         let kernel = kernel_with_retention(
@@ -4449,7 +3978,7 @@ mod tests {
         let right = Owned::f32(&[1, COLUMNS], &vec![1.0; COLUMNS]);
         let mut output = Owned::zeros_f32(&[ROWS, COLUMNS]);
         kernel
-            .execute(
+            .execute_prepared(
                 &[left.view(), middle.view(), right.view()],
                 &mut [output.view_mut()],
             )
@@ -4462,9 +3991,17 @@ mod tests {
             "telemetry must count the final accumulator plus the retained temporary-slot capacity"
         );
         assert_eq!(
-            retention.current_thread_capacity_bytes(),
-            0,
-            "tree publication must not check out and park a second output-sized accumulator"
+            kernel
+                .workspace_requirement(
+                    &[left.view(), middle.view(), right.view()].map(|input| TensorMetadata::new(
+                        input.dtype,
+                        input.shape,
+                        true
+                    ))
+                )
+                .unwrap(),
+            WorkspaceRequirement::NONE,
+            "successful trees need no second publication accumulator"
         );
         assert_eq!(
             f32::from_ne_bytes(output.bytes[..4].try_into().unwrap()),
@@ -4526,7 +4063,9 @@ mod tests {
         let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
         node.attributes
             .insert("equation".into(), Attribute::String(b"i->i".to_vec()));
-        assert!(unsupported_reason(&node, &[int_shape], &[DataType::Int32]).is_none());
+        assert!(
+            unsupported_reason_for_opset(&node, 12, &[int_shape], &[DataType::Int32]).is_none()
+        );
 
         let direct = kernel("i->i", &[vec![2]], ExecutionMode::Optimized);
         let input = Owned::bf16(&[2], &[1.0, 2.0]);
@@ -4546,7 +4085,7 @@ mod tests {
 
         let bf16 = kernel_for_opset("i->i", &[vec![2]], 28, EinsumExecutionMode::GenericNative);
         let mut output = Owned::zeros(DataType::BFloat16, &[2]);
-        bf16.execute(&[input.view()], &mut [output.view_mut()])
+        bf16.execute_prepared(&[input.view()], &mut [output.view_mut()])
             .expect("Einsum-28 BFloat16 executes");
         assert_eq!(output.to_u16_bits(), input.to_u16_bits());
     }

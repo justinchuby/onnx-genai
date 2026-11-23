@@ -8,9 +8,10 @@ use onnx_runtime_einsum_conformance::{
     materialize_inputs, verify_observation,
 };
 use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, KernelFactory, TensorMut, TensorView};
+use onnx_runtime_ep_api::{TensorMetadata, WorkspaceView};
+use onnx_runtime_ep_cpu::CpuCacheRetention;
 use onnx_runtime_ep_cpu::kernels::einsum::{
-    CpuCacheRetention, EinsumExecutionMode, EinsumFactory, benchmark_execute_route,
-    benchmark_last_workspace_bytes,
+    EinsumExecutionMode, EinsumFactory, benchmark_execute_route, benchmark_last_workspace_bytes,
 };
 use onnx_runtime_ir::{Attribute, DataType, DeviceId, Node, NodeId, compute_contiguous_strides};
 
@@ -174,11 +175,26 @@ impl BackendAdapter for CpuAdapter {
         let output_shape = infer_output_shape(&request.case.equation, &request.case.input_shapes)
             .map_err(|error| AdapterError(error.to_string()))?;
         let mut output = AlignedTensor::zeros(request.case.dtype, output_shape);
-        let route = benchmark_execute_route(&*kernel, &input_views, &mut [output.view_mut()])
-            .map_err(|error| AdapterError(error.to_string()))?
-            .ok_or_else(|| {
-                AdapterError("Einsum route probe did not recognize its kernel".into())
-            })?;
+        let metadata = input_views
+            .iter()
+            .map(|input| TensorMetadata::new(input.dtype, input.shape, true))
+            .collect::<Vec<_>>();
+        let workspace_request = kernel
+            .workspace_requirement(&metadata)
+            .map_err(|error| AdapterError(error.to_string()))?;
+        assert!(workspace_request.alignment <= std::mem::align_of::<u64>());
+        let bytes = usize::try_from(workspace_request.bytes)
+            .map_err(|error| AdapterError(error.to_string()))?;
+        let mut scratch = vec![std::mem::MaybeUninit::<u64>::uninit(); bytes.div_ceil(8)];
+        let workspace = (bytes != 0).then(|| {
+            WorkspaceView::new(DevicePtrMut(scratch.as_mut_ptr().cast()), scratch.len() * 8)
+        });
+        let route =
+            benchmark_execute_route(&*kernel, &input_views, &mut [output.view_mut()], workspace)
+                .map_err(|error| AdapterError(error.to_string()))?
+                .ok_or_else(|| {
+                    AdapterError("Einsum route probe did not recognize its kernel".into())
+                })?;
         let (route, planner_quality) = match route {
             "generic-native" => (ForcedRoute::GenericNative, None),
             "optimized-dp" => (

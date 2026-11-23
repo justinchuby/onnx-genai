@@ -1495,8 +1495,8 @@ The RSS example now uses an actual Host governor and shared workspace pool.
 lanes and charged workspace bytes, not a fake per-thread retention total.
 Scales, zero-point vectors, sign-domain copies, output staging and native/backend
 packing scratch remain on their existing paths; accumulator migration is not a
-claim that all quantized-kernel allocations or RSS are governed. Einsum still
-uses the separate legacy accumulator-budget helper and remains to migrate.
+claim that all quantized-kernel allocations or RSS are governed. The subsequent Einsum migration below removes the final consumer of the
+legacy accumulator-budget helper.
 
 Preparation now reuses dispatch's existing compiled-kernel bindings, then keeps
 one successful metadata-only plan per executor. This memo holds the two
@@ -1549,3 +1549,98 @@ Raw initial, prebinding-only and final rounds, drivers, binary/source hashes
 and summaries remain under `/tmp/nxrt-qlinear-*`. Consumed baseline worktree,
 one-shot mutation scripts and probe binaries are removed after provenance is
 recorded; retained drivers can rebuild the documented base for reproduction.
+
+
+### Einsum accumulator workspace and a plain retention policy
+
+Einsum now borrows its typed GenericNative output accumulator, floating oracle
+output and materialized-GEMM canonical f32 output from the same StepScoped
+execution domain. Its requirement is a checked output-sized layout using the
+actual accumulator width; empty output is NONE. Successful contraction trees,
+optimized view routes and scalar-GEMM routes reserve no unused generic output
+buffer. Floating GEMM keeps a conservative f32 output bound because the direct
+route also depends on output layout and aliasing, which metadata-only planning
+does not observe.
+
+The factory compiles tree choices once for each supported accumulator width
+(1/2/4/8 bytes). Planning and execution consume the same immutable candidate
+index and byte fact, with exact compiled-shape/schema validation. This removes
+per-dispatch candidate-map construction instead of adding another mutable EP
+cache or resource protocol. The existing 32 MiB tree limit is now explicitly an
+algorithm-selection ceiling: larger candidates select lower-memory generic
+execution; it is not a physical grant, a process cap or a retention budget.
+
+Generic accumulation writes each final sum into MaybeUninit storage, including
+zero reductions, and reads only after all output elements have been written.
+Oracle preserves its existing initialization pass. Materialized GEMM explicitly
+initializes the destination before calling MatMul, whose current contract
+forms initialized f32 references. This adds a real pass on that route; removing
+it requires a properly proven overwrite seam in MatMul, not an unsafe cast in
+Einsum. Alias, negative-stride, precision and byte-result conformance controls
+remain in place.
+
+The TLS weak registry, typed slot owners and process accumulator ledger are
+removed, along with the final governed_accumulator_budget module. Removed
+scratch live/cap/prediction APIs and the obsolete default-opset compatibility
+helper have no aliases. CpuCacheRetention now lives with CpuMemoryResources as
+a plain immutable boolean verdict; it owns no scratch, mutex, thread registry
+or physical allocation. Engine resident-cache prediction no longer invents a
+128 MiB Einsum scratch resident. The benchmark owns an exclusive prepared lane
+outside timing, and conformance exercises fresh uninitialized backing instead
+of consulting TLS capacity.
+
+Real Host-budget regressions alternate f64/f32 execution and opposite weight
+retention policies over the same allocation, observe 4,096 warm
+checkout/execute/return cycles with zero issuer callbacks, reject a second
+active lane when the true cap is full and return charged bytes to zero on idle
+reclamation. A two-reduction graph uses max(24,8)=24 bytes; If branches borrow
+the enclosing 8-byte peak rather than reserving a second lane.
+
+This removes the retained accumulator pool, not every Einsum allocation.
+Contraction-tree/scalar-GEMM intermediates, operand materializations and layout /
+coordinate vectors still use their existing allocations. Their migration and
+resource propagation into lowered child MatMul remain separate work; no claim
+is made that all Einsum transient bytes are already governed.
+
+Validation: 1,986 native CPU and 284 native session tests, 2,027 optional-MLAS CPU
+and 286 optional-MLAS session tests pass. Each configuration also passes all
+three shared-corpus / parallel-tile / 128-operand fallback conformance tests and
+the two public numeric/schema contract tests. Strict all-target Clippy passes
+for CPU/session/engine in both configurations. The previous private-pool and
+budget-helper tests are replaced by real-owner admission/reuse/reclamation
+controls; existing arithmetic, precision, route and alias guards remain.
+
+CPU-only paired release controls compare `e4130c5a8` (the previous TLS Einsum)
+with this change on the same M1 Max / ARM64 macOS host. Each mode is a separate
+process with 1,000 warmups and 15 timed batches; the table uses the median of
+three process medians per arm in alternating before/after order. Both arms use
+the same thread-count environment settings and hold the stable shared host
+flock; those settings do not prove the backend worker count.
+Direct-kernel scratch and outputs are prepared outside timing; public-session
+rows include checkout/return, and prepare+run also includes preparation. Kernel controls verify nonzero output values and observe the actual execution
+route; public-session controls verify their output values through the session
+API;
+these are CPU controls, not whole-model or CUDA throughput measurements.
+
+| Mode | Native before → after | Optional MLAS before → after |
+| --- | --- | --- |
+| Tiny generic reduction (2×4 → 2) | 0.358 → 0.326 us | 0.348 → 0.317 us |
+| Generic reduction (16×64 → 16) | 3.561 → 3.540 us | 3.456 → 3.430 us |
+| Oracle reduction (16×64 → 16) | 4.966 → 4.923 us | 4.830 → 4.807 us |
+| Direct GEMM (16×64×16) | 1.683 → 1.643 us | 1.723 → 1.733 us |
+| Materialized/permuted GEMM (4,4,8,8 × 8,8,4,4) | 6.829 → 6.906 us | 6.997 → 6.970 us |
+| Larger materialized/permuted GEMM (8,8,16,16 × 16,16,8,8) | 65.422 → 65.329 us | 65.380 → 65.266 us |
+| Three-input contraction tree (8×16,16×16,16×8) | 36.712 → 19.956 us | 35.637 → 19.363 us |
+| Two-reduction session run | 3.499 → 3.633 us | 3.486 → 3.536 us |
+| Two-reduction session prepare + run | 3.654 → 3.791 us | 3.671 → 3.637 us |
+
+Removing the private pool helps the tiny kernel. Compiling tree decisions moves
+candidate planning out of execution, reducing this tree control by about 46%.
+Its sampled native factory median increases from roughly 175 to 259 us; that
+is a cold setup tradeoff, based on only three process samples, not a full model
+startup result. The mandatory materialized-output initialization does not show
+a material larger-case regression here. Tiny session run still costs roughly
+0.05–0.13 us more despite zero warm issuer callbacks. Raw rounds, complete
+sampling details, drivers, source/binary hashes and summaries remain under
+`/tmp/nxrt-einsum-*`. Consumed probe binaries, one-shot generators and baseline
+worktree are removed after provenance is recorded.

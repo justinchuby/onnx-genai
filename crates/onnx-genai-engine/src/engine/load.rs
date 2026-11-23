@@ -1066,9 +1066,6 @@ impl Engine {
                     .saturating_add(onnx_runtime_ep_cpu::matmul_dense_cache_predicted_bytes(
                         &graph,
                     ))
-                    .saturating_add(onnx_runtime_ep_cpu::einsum_scratch_budget_predicted_bytes(
-                        &graph,
-                    ))
                     .saturating_add(onnx_runtime_ep_cpu::qlinear_packed_b_predicted_bytes(
                         &graph,
                     )),

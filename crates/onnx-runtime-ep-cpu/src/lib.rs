@@ -78,7 +78,9 @@ pub use optimizer::{
     cpu_optimization_passes,
 };
 pub use provider::CpuExecutionProvider;
-pub use resources::{CpuMemoryResources, CpuWeightCacheLimits, DerivedWeightMemory};
+pub use resources::{
+    CpuCacheRetention, CpuMemoryResources, CpuWeightCacheLimits, DerivedWeightMemory,
+};
 pub use weight_offload::placement::{
     GpuLayersOverrideReport, HostFallbackReason, IqFormat, LayerPlacement, LayerWeightRegions,
     Placement, PlacementError, PlacementPlan, QuantTileFormat, RegionPlacement, SnappedTileSize,
@@ -92,14 +94,6 @@ pub use weight_offload::{
 pub use kernels::selection::non_max_suppression;
 pub use kernels::slice::{SliceAxisPlan, slice_axes_steps, slice_plan};
 
-// Einsum accumulator workspace is typed to its precision policy and parked per
-// execution thread, so a per-buffer cap alone would multiply by the pool width.
-// Each provider/session owns an immutable retention verdict; all admitted
-// sessions share only the governed process byte ceiling and live-byte accounting.
-pub use kernels::einsum::{
-    CpuCacheRetention, einsum_scratch_budget_predicted_bytes, einsum_scratch_live_bytes,
-    einsum_scratch_process_cap_bytes,
-};
 pub use kernels::group_query_attention::{present_inplace_count, present_inplace_half_count};
 pub use kernels::matmul_nbits::bound_process_to_decode_budget;
 pub use kernels::matmul_nbits::set_decode_thread_budget;

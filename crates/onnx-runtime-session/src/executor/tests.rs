@@ -13342,6 +13342,170 @@ fn executor_pin_fixed_capacity_kv_admits_gqa() {
 // resolution logic directly on synthetic graphs whose `::Attention` input has a
 // runtime-dependent context axis (the reported `v_model.Unsqueeze_16` shape).
 
+#[cfg(test)]
+mod einsum_workspace_tests {
+    use super::*;
+    use onnx_runtime_memory_api::{DeviceKey, Tier};
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
+    struct Fixture {
+        books: Arc<LedgerGovernor>,
+        manager: ProcessMemoryManager,
+        pool: HostWorkspacePool,
+        provider: Arc<dyn ExecutionProvider>,
+    }
+    impl Fixture {
+        fn new(capacity: u64) -> Self {
+            let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+                DeviceKey::HOST,
+                0,
+                capacity,
+                0,
+            )));
+            let manager = ProcessMemoryManager::new().unwrap();
+            let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+            let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+                onnx_runtime_ep_cpu::DerivedWeightMemory::governed(
+                    books.as_ref(),
+                    HolderId::new(13),
+                )
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap()
+            .with_cache_retention(onnx_runtime_ep_cpu::CpuCacheRetention::new(false))
+            .with_workspace_pool(pool.clone())
+            .unwrap();
+            let provider =
+                Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+            Self {
+                books,
+                manager,
+                pool,
+                provider,
+            }
+        }
+    }
+    fn einsum(id: u32, input: ValueId, output: ValueId, equation: &str) -> Node {
+        let mut node = Node::new(NodeId(id), "Einsum", vec![Some(input)], vec![output]);
+        node.attributes.insert(
+            "equation".into(),
+            Attribute::String(equation.as_bytes().to_vec()),
+        );
+        node
+    }
+    #[test]
+    fn sequential_reductions_use_one_prepared_peak_without_weight_retention() {
+        let fixture = Fixture::new(24);
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let input = graph.create_named_value("input", DataType::Float32, static_shape([2, 3, 4]));
+        let middle = graph.create_named_value("middle", DataType::Float32, static_shape([2, 3]));
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+        graph.add_input(input);
+        graph.add_output(output);
+        graph.insert_node(einsum(0, input, middle, "ijk->ij"));
+        graph.insert_node(einsum(1, middle, output, "ij->i"));
+        let mut executor = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            fixture.provider.clone(),
+            None,
+        )
+        .unwrap();
+        let input = Tensor::from_raw(
+            DataType::Float32,
+            vec![2, 3, 4],
+            &[1f32.to_le_bytes(); 24].concat(),
+        )
+        .unwrap();
+        let mut identity = None;
+        for _ in 0..8 {
+            let requirement = executor
+                .prepare_with_device_bindings(&[("input", &input)], &mut [])
+                .unwrap();
+            assert_eq!(
+                requirement.bytes, 24,
+                "max(24,8), never a sum or a fixed process budget"
+            );
+            let output = executor.run(&[("input", &input)]).unwrap();
+            assert_eq!(output[0].try_as_slice_f32().unwrap(), &[12.; 2]);
+            let allocations = fixture.manager.snapshot().unwrap().allocations;
+            assert_eq!(allocations.len(), 1);
+            let expected = identity.get_or_insert(allocations[0].identity);
+            assert_eq!(*expected, allocations[0].identity);
+            assert_eq!(fixture.books.used(Tier::Host), 24);
+        }
+        drop(executor);
+        fixture.pool.trim_idle(24).unwrap();
+        assert_eq!(fixture.books.used(Tier::Host), 0);
+    }
+    #[test]
+    fn if_reductions_borrow_the_enclosing_workspace() {
+        let fixture = Fixture::new(8);
+        let mut branch = Graph::new();
+        let input = branch.create_named_value("data", DataType::Float32, static_shape([3, 2]));
+        branch.set_initializer(
+            input,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Float32,
+                vec![3, 2],
+                [1f32.to_le_bytes(); 6].concat(),
+            )),
+        );
+        let output = branch.create_named_value("result", DataType::Float32, static_shape([2]));
+        branch.add_output(output);
+        branch.insert_node(einsum(0, input, output, "ij->j"));
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let cond = graph.create_named_value("cond", DataType::Bool, static_shape([]));
+        graph.add_input(cond);
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+        graph.add_output(output);
+        graph.insert_node(Node::new(NodeId(0), "If", vec![Some(cond)], vec![output]));
+        graph
+            .subgraphs
+            .insert((NodeId(0), "then_branch".into()), branch.clone());
+        graph
+            .subgraphs
+            .insert((NodeId(0), "else_branch".into()), branch);
+        let mut executor = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            fixture.provider.clone(),
+            None,
+        )
+        .unwrap();
+        for cond in [true, false, true] {
+            let cond = Tensor::from_raw(DataType::Bool, vec![], &[u8::from(cond)]).unwrap();
+            assert_eq!(
+                executor
+                    .prepare_with_device_bindings(&[("cond", &cond)], &mut [])
+                    .unwrap()
+                    .bytes,
+                8
+            );
+            assert_eq!(
+                executor.run(&[("cond", &cond)]).unwrap()[0]
+                    .try_as_slice_f32()
+                    .unwrap(),
+                &[3.; 2]
+            );
+            assert_eq!(
+                fixture.manager.snapshot().unwrap().allocations.len(),
+                1,
+                "child must borrow the parent's funded peak"
+            );
+            assert_eq!(fixture.books.used(Tier::Host), 8);
+        }
+        drop(executor);
+        fixture.pool.trim_idle(8).unwrap();
+        assert_eq!(fixture.books.used(Tier::Host), 0);
+    }
+}
+
 #[test]
 fn workspace_peak_preserves_alignment_of_smaller_nodes_in_either_order() {
     let small = WorkspaceRequirement {
