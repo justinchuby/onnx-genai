@@ -409,10 +409,6 @@ impl ChatCompletionRequest {
                         .is_some_and(|text| !text.trim().is_empty()),
                     "continue_final_message reasoning_content requires nonempty final assistant reasoning_content; provide the reasoning prefix to resume"
                 );
-                anyhow::ensure!(
-                    !self.wants_constrained_json(),
-                    "reasoning continuation with response_format needs a channel-aware generation grammar; omit response_format until that grammar capability is available"
-                );
             }
             _ => {
                 anyhow::ensure!(

@@ -70,6 +70,29 @@ pub(crate) fn build_processor_chain(
                     terminal_token_ids(options),
                 )));
             }
+            GenerateConstraint::ResponseJson {
+                schema,
+                template,
+                prefix,
+                max_bytes,
+            } => {
+                chain.add(Box::new(ConstraintProcessor::new(
+                    Box::new(crate::response_constraint::ResponseJsonConstraint::new(
+                        tokenizer,
+                        schema,
+                        template.clone(),
+                        prefix,
+                        *max_bytes,
+                        if options.stop_on_eos {
+                            terminal_token_ids(options)
+                        } else {
+                            Vec::new()
+                        },
+                    )?),
+                    token_texts,
+                    terminal_token_ids(options),
+                )));
+            }
             GenerateConstraint::Regex(regex) => {
                 chain.add(Box::new(ConstraintProcessor::new(
                     build_llguidance_constraint(

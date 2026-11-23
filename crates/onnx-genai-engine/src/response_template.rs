@@ -77,6 +77,54 @@ impl Boundary {
         self.minimum_bytes == Some(0)
     }
 
+    fn literal_hold(
+        &self,
+        input: &str,
+        pending: &[u8],
+        from: usize,
+        literals: &[String],
+    ) -> Option<usize> {
+        input[from..]
+            .char_indices()
+            .map(|(at, _)| from + at)
+            .chain(std::iter::once(input.len()))
+            .find(|&start| {
+                let part = &input.as_bytes()[start..];
+                literals.iter().any(|literal| {
+                    let bytes = literal.as_bytes();
+                    let length = part.len() + pending.len();
+                    length > 0
+                        && length < bytes.len()
+                        && bytes.starts_with(part)
+                        && bytes[part.len()..].starts_with(pending)
+                })
+            })
+    }
+
+    fn scan_pending(
+        &self,
+        input: &str,
+        pending: &[u8],
+        from: usize,
+        final_chunk: bool,
+    ) -> anyhow::Result<Scan> {
+        if pending.is_empty() || final_chunk || self.literals.is_none() {
+            return self.scan(input, from, final_chunk);
+        }
+        let literals = self
+            .literals
+            .as_ref()
+            .context("literal response boundary lost its declaration")?;
+        let found = self.regex.find_at(input, from).map(|m| m.range());
+        let hold = self
+            .literal_hold(input, pending, from, literals)
+            .unwrap_or(input.len());
+        Ok(Scan {
+            matched: found.filter(|range| range.start < hold),
+            hold_from: hold,
+        })
+    }
+
     pub fn scan(&self, input: &str, from: usize, final_chunk: bool) -> anyhow::Result<Scan> {
         ensure!(
             input.is_char_boundary(from),
@@ -90,16 +138,9 @@ impl Boundary {
             });
         }
         if let Some(literals) = &self.literals {
-            let mut hold = input.len();
-            for (offset, _) in input[from..].char_indices() {
-                let start = from + offset;
-                if literals.iter().any(|literal| {
-                    input[start..].len() < literal.len() && literal.starts_with(&input[start..])
-                }) {
-                    hold = start;
-                    break;
-                }
-            }
+            let hold = self
+                .literal_hold(input, &[], from, literals)
+                .unwrap_or(input.len());
             if let Some(found) = found {
                 // A longer literal at the same start can still win after the
                 // next chunk. Never commit a shorter complete alternative yet.
@@ -181,14 +222,45 @@ struct Field {
     optional: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "response ends with {bytes} incomplete UTF-8 bytes at raw offset {offset}; supply their continuation bytes before finishing the response"
+)]
+pub(crate) struct IncompleteResponseUtf8 {
+    bytes: usize,
+    offset: usize,
+}
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "response_template required field {name:?} was not generated; verify the prompt prefix and declared boundaries"
+)]
+pub(crate) struct MissingResponseField {
+    name: String,
+}
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "response parser buffer would exceed {limit} bytes, including incomplete UTF-8; shorten the assistant prefix or reduce max_tokens"
+)]
+pub(crate) struct ResponseBufferExceeded {
+    limit: usize,
+}
+
 /// Compiled response channels from a declared tokenizer response template.
 #[derive(Debug)]
 pub struct ResponseTemplate {
+    declaration: serde_json::Value,
     anchor: Boundary,
     fields: Vec<Field>,
     implicit: Option<usize>,
     defaults: serde_json::Map<String, serde_json::Value>,
 }
+
+impl PartialEq for ResponseTemplate {
+    fn eq(&self, other: &Self) -> bool {
+        self.declaration == other.declaration
+    }
+}
+impl Eq for ResponseTemplate {}
 
 fn object<'a>(
     value: &'a serde_json::Value,
@@ -251,6 +323,40 @@ fn boundary(
 }
 
 impl ResponseTemplate {
+    fn watched(&self, current: Option<usize>) -> Vec<(usize, bool, &Boundary)> {
+        let mut watch = Vec::new();
+        if let Some(field) = current.filter(|field| Some(*field) != self.implicit) {
+            if let Some(close) = &self.fields[field].close {
+                watch.push((field, false, close));
+            }
+        } else {
+            for (field, definition) in self.fields.iter().enumerate() {
+                if let Some(open) = &definition.open {
+                    watch.push((field, true, open));
+                }
+            }
+            if let Some(field) = self.implicit
+                && let Some(close) = &self.fields[field].close
+            {
+                watch.push((field, false, close));
+            }
+        }
+        watch
+    }
+
+    pub(crate) fn require_json_boundaries(&self) -> anyhow::Result<()> {
+        for field in &self.fields {
+            for boundary in [&field.open, &field.close].into_iter().flatten() {
+                ensure!(
+                    boundary.literals.is_some(),
+                    "response_template field {:?} uses a regex boundary that cannot yet be resolved for projected JSON sampling; this combination requires a byte-prefix boundary implementation",
+                    field.name
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn compile(value: &serde_json::Value) -> anyhow::Result<std::sync::Arc<Self>> {
         let root = object(value, "response_template")?;
         ensure!(
@@ -402,6 +508,7 @@ impl ResponseTemplate {
             });
         }
         Ok(std::sync::Arc::new(Self {
+            declaration: value.clone(),
             anchor,
             fields,
             implicit,
@@ -410,16 +517,30 @@ impl ResponseTemplate {
     }
 }
 
+fn response_whitespace(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
 #[derive(Debug, Clone)]
 struct Region {
     bytes: Range<usize>,
     visible: bool,
 }
 impl Region {
-    fn output<'a>(&self, field: &Field, buffer: &'a str, omitted_prefix_end: usize) -> &'a str {
+    fn output<'a>(
+        &self,
+        field: &Field,
+        buffer: &'a str,
+        omitted_prefix_end: usize,
+        preserve_end: bool,
+    ) -> &'a str {
         let raw = &buffer[self.bytes.clone()];
         let text = if field.strip {
-            raw.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+            if preserve_end {
+                raw.trim_start_matches(response_whitespace)
+            } else {
+                raw.trim_matches(response_whitespace)
+            }
         } else {
             raw
         };
@@ -459,6 +580,7 @@ struct FieldChunks<'a> {
     first: bool,
     default: Option<&'a str>,
     pending_body: Option<&'a str>,
+    preserve_end_for: Option<&'a Region>,
 }
 impl<'a> Iterator for FieldChunks<'a> {
     type Item = &'a str;
@@ -474,7 +596,13 @@ impl<'a> Iterator for FieldChunks<'a> {
             if !region.visible {
                 continue;
             }
-            let body = region.output(field, self.buffer, self.omitted_prefix_end);
+            let body = region.output(
+                field,
+                self.buffer,
+                self.omitted_prefix_end,
+                self.preserve_end_for
+                    .is_some_and(|active| std::ptr::eq(active, region)),
+            );
             if self.first {
                 self.first = false;
                 return Some(body);
@@ -547,6 +675,34 @@ pub struct ResponseParser {
     seen: Vec<bool>,
     sent: ChatText,
     max_bytes: usize,
+}
+
+/// A reopened field may reconstruct a published prefix while it remains open.
+/// Once finalized, every projection must extend the established prefix.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "response_template {field} replaced already streamed text; use buffered output or declare repeats with join for append-only fields"
+)]
+pub(crate) struct NonMonotonicProjection {
+    field: String,
+}
+
+pub(crate) fn projection_extension<'a>(
+    current: &'a str,
+    prior: &str,
+    final_chunk: bool,
+    field: &str,
+) -> anyhow::Result<Option<&'a str>> {
+    if let Some(tail) = current.strip_prefix(prior) {
+        return Ok(Some(tail));
+    }
+    if !final_chunk && prior.starts_with(current) {
+        return Ok(None);
+    }
+    Err(NonMonotonicProjection {
+        field: field.into(),
+    }
+    .into())
 }
 
 impl ResponseParser {
@@ -631,27 +787,16 @@ impl ResponseParser {
     fn process(&mut self, final_chunk: bool) -> anyhow::Result<()> {
         loop {
             let spec = self.spec.clone();
-            let mut watch = Vec::new();
-            if let Some(field) = self.current.filter(|field| Some(*field) != spec.implicit) {
-                if let Some(close) = &spec.fields[field].close {
-                    watch.push((field, false, close));
-                }
-            } else {
-                for (field, definition) in spec.fields.iter().enumerate() {
-                    if let Some(open) = &definition.open {
-                        watch.push((field, true, open));
-                    }
-                }
-                if let Some(field) = spec.implicit
-                    && let Some(close) = &spec.fields[field].close
-                {
-                    watch.push((field, false, close));
-                }
-            }
+            let watch = spec.watched(self.current);
             let mut hold = self.buffer.len();
             let mut best: Option<(usize, bool, Range<usize>)> = None;
             for (field, opening, boundary) in watch {
-                let scan = boundary.scan(&self.buffer, self.pos, final_chunk)?;
+                let scan = boundary.scan_pending(
+                    &self.buffer,
+                    self.utf8_tail.bytes(),
+                    self.pos,
+                    final_chunk,
+                )?;
                 hold = hold.min(scan.hold_from);
                 if let Some(range) = scan.matched {
                     let key = (range.start, std::cmp::Reverse(range.len()), !opening, field);
@@ -701,6 +846,14 @@ impl ResponseParser {
         Ok(())
     }
     fn field_chunks<'a>(&'a self, name: &str, final_chunk: bool) -> FieldChunks<'a> {
+        self.field_chunks_mode(name, final_chunk, false)
+    }
+    fn field_chunks_mode<'a>(
+        &'a self,
+        name: &str,
+        final_chunk: bool,
+        preserve_end: bool,
+    ) -> FieldChunks<'a> {
         let index = self.spec.fields.iter().position(|field| field.name == name);
         let default = if final_chunk && index.is_none_or(|index| !self.seen[index]) {
             self.spec
@@ -734,6 +887,11 @@ impl ResponseParser {
             first: true,
             default,
             pending_body: None,
+            preserve_end_for: if preserve_end && index == self.current {
+                self.region.as_ref()
+            } else {
+                None
+            },
         }
     }
 
@@ -747,25 +905,16 @@ impl ResponseParser {
     }
     fn delta(&mut self, final_chunk: bool) -> anyhow::Result<ChatText> {
         let now = self.snapshot(final_chunk);
-        let extension = |current: &str,
-                         sent: &str,
-                         field: &str|
-         -> anyhow::Result<Option<String>> {
-            if let Some(tail) = current.strip_prefix(sent) {
-                return Ok(Some(tail.to_owned()));
-            }
-            // A reopened region can rebuild the already-published prefix. Hold
-            // that incomplete reconstruction; never echo it or accept a shorter
-            // final value as a successful append-only response.
-            if !final_chunk && sent.starts_with(current) {
-                return Ok(None);
-            }
-            anyhow::bail!(
-                "response_template {field} replaced already streamed text; use buffered output or declare repeats with join for append-only fields"
-            )
-        };
-        let content = extension(&now.content, &self.sent.content, "content")?;
-        let reasoning = extension(&now.reasoning, &self.sent.reasoning, "reasoning_content")?;
+        let content =
+            projection_extension(&now.content, &self.sent.content, final_chunk, "content")?
+                .map(str::to_owned);
+        let reasoning = projection_extension(
+            &now.reasoning,
+            &self.sent.reasoning,
+            final_chunk,
+            "reasoning_content",
+        )?
+        .map(str::to_owned);
         if content.is_some() {
             self.sent.content = now.content;
         }
@@ -779,15 +928,18 @@ impl ResponseParser {
     }
     fn append_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         let pending = self.utf8_tail.bytes();
-        ensure!(
-            self.buffer
-                .len()
-                .checked_add(pending.len())
-                .and_then(|size| size.checked_add(bytes.len()))
-                .is_some_and(|size| size <= self.max_bytes),
-            "response parser buffer would exceed {} bytes, including incomplete UTF-8; shorten the assistant prefix or reduce max_tokens",
-            self.max_bytes
-        );
+        if !self
+            .buffer
+            .len()
+            .checked_add(pending.len())
+            .and_then(|size| size.checked_add(bytes.len()))
+            .is_some_and(|size| size <= self.max_bytes)
+        {
+            return Err(ResponseBufferExceeded {
+                limit: self.max_bytes,
+            }
+            .into());
+        }
         let input = if pending.is_empty() {
             std::borrow::Cow::Borrowed(bytes)
         } else {
@@ -815,12 +967,13 @@ impl ResponseParser {
     }
 
     fn require_complete_utf8(&self) -> anyhow::Result<()> {
-        ensure!(
-            self.utf8_tail.bytes().is_empty(),
-            "response ends with {} incomplete UTF-8 bytes at raw offset {}; supply their continuation bytes before finishing the response",
-            self.utf8_tail.bytes().len(),
-            self.buffer.len()
-        );
+        if !self.utf8_tail.bytes().is_empty() {
+            return Err(IncompleteResponseUtf8 {
+                bytes: self.utf8_tail.bytes().len(),
+                offset: self.buffer.len(),
+            }
+            .into());
+        }
         Ok(())
     }
 
@@ -842,7 +995,7 @@ impl ResponseParser {
         )
     }
 
-    fn with_preview<T>(
+    pub(crate) fn with_preview<T>(
         &mut self,
         bytes: &[u8],
         final_chunk: bool,
@@ -860,6 +1013,67 @@ impl ResponseParser {
         inspect(trial.parser)
     }
 
+    pub(crate) fn commit_unpublished(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.append_bytes(bytes)?;
+        self.process(false)
+    }
+
+    pub(crate) fn json_content(&self, final_chunk: bool) -> String {
+        self.field_chunks("content", final_chunk).collect()
+    }
+
+    pub(crate) fn grammar_json_content(&self) -> String {
+        self.field_chunks_mode("content", false, true).collect()
+    }
+
+    pub(crate) fn pending_can_be_trimmed(&self) -> bool {
+        let pending = self.utf8_tail.bytes();
+        if pending.is_empty()
+            || self.current.is_none_or(|field| {
+                self.spec.fields[field].name != "content" || !self.spec.fields[field].strip
+            })
+        {
+            return false;
+        }
+        static WHITESPACE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        WHITESPACE
+            .get_or_init(|| {
+                (0..=u32::from(char::MAX))
+                    .filter_map(char::from_u32)
+                    .filter(|c| response_whitespace(*c))
+                    .map(|c| c.to_string())
+                    .collect()
+            })
+            .iter()
+            .any(|c| c.as_bytes().starts_with(pending))
+    }
+
+    pub(crate) fn pending_json_bytes(&self) -> Option<&[u8]> {
+        let pending = self.utf8_tail.bytes();
+        if pending.is_empty()
+            || self
+                .current
+                .is_none_or(|field| self.spec.fields[field].name != "content")
+        {
+            return None;
+        }
+        if self
+            .spec
+            .watched(self.current)
+            .iter()
+            .any(|(_, _, boundary)| {
+                boundary.literals.as_ref().is_some_and(|literals| {
+                    boundary
+                        .literal_hold(&self.buffer, pending, self.pos, literals)
+                        .is_some()
+                })
+            })
+        {
+            return None;
+        }
+        Some(pending)
+    }
+
     pub fn feed(&mut self, text: &str) -> anyhow::Result<ChatText> {
         self.feed_bytes(text.as_bytes())
     }
@@ -874,13 +1088,15 @@ impl ResponseParser {
 
     fn validate_required(&self) -> anyhow::Result<()> {
         for (field, definition) in self.spec.fields.iter().enumerate() {
-            ensure!(
-                definition.optional
-                    || self.seen[field]
-                    || self.spec.defaults.contains_key(&definition.name),
-                "response_template required field {:?} was not generated; verify the prompt prefix and declared boundaries",
-                definition.name
-            );
+            if !(definition.optional
+                || self.seen[field]
+                || self.spec.defaults.contains_key(&definition.name))
+            {
+                return Err(MissingResponseField {
+                    name: definition.name.clone(),
+                }
+                .into());
+            }
         }
         Ok(())
     }

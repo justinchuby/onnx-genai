@@ -9,7 +9,7 @@ use tokenizers::decoders::DecoderWrapper;
 #[error(
     "incremental token decoding changed an already published prefix; use buffered output or repair the package tokenizer decoder"
 )]
-struct NonMonotonicText;
+pub(crate) struct NonMonotonicText;
 
 /// Whether protocol markers participate in incremental output text.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -109,7 +109,7 @@ pub fn token_texts(tokenizer: Option<&Tokenizer>, ids: &[u32]) -> anyhow::Result
     }
 }
 
-fn has_byte_decoder(decoder: &DecoderWrapper) -> bool {
+pub(crate) fn has_byte_decoder(decoder: &DecoderWrapper) -> bool {
     match decoder {
         DecoderWrapper::ByteFallback(_) | DecoderWrapper::ByteLevel(_) => true,
         DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(has_byte_decoder),

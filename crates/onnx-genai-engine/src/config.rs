@@ -1474,6 +1474,12 @@ pub struct SamplingOverrides {
 }
 
 impl GenerateOptions {
+    /// Resolve request-local processor capabilities before admitting generation.
+    /// The decoder builds its own mutable chain when execution starts.
+    pub fn validate_processors(&self, tokenizer: &onnx_genai_ort::Tokenizer) -> anyhow::Result<()> {
+        crate::processors::build_processor_chain(self, Some(tokenizer), false).map(drop)
+    }
+
     /// Validate explicit token biases against the admitted model vocabulary.
     pub fn validate_logit_bias(&self, tokenizer: &onnx_genai_ort::Tokenizer) -> anyhow::Result<()> {
         for id in self.logit_bias.keys() {
@@ -1694,6 +1700,14 @@ pub enum GenerateConstraint {
         schema: String,
         /// Existing assistant text, excluded from newly generated output.
         prefix: String,
+    },
+    /// Constrain declared response content while permitting separate reasoning.
+    ResponseJson {
+        schema: serde_json::Value,
+        template: std::sync::Arc<crate::response_template::ResponseTemplate>,
+        /// Actual rendered assistant prefill, including response framing.
+        prefix: String,
+        max_bytes: usize,
     },
     /// Constrain output to text matching the provided Rust regular expression.
     Regex(String),

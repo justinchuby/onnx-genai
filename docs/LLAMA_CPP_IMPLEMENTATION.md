@@ -997,3 +997,42 @@ cases and the request-local special-token policy case passed. Strict native-engi
 ORT and server all-target Clippy passed. No HTTP joint-constraint behavior was
 enabled by these ownership and contract changes; processor integration remains
 open, including partial-byte/framing viability and decoder context agreement.
+
+### Channel-aware JSON sampling through the production processor chain
+
+`ResponseJson` composes the model tokenizer, declared response projection and a
+compiled JSON Schema cursor in the mandatory generation processor chain. The
+actual rendered assistant prefix primes all three; JSON validates only the
+selected content field, so reasoning can continue before the content boundary.
+The server lowers JSON response formats through this processor and validates
+its capabilities before admitting generation or writing SSE headers. Explicit
+reasoning continuation no longer rejects these supported combinations.
+
+Candidates preserve request-local decoder state, strict split UTF-8 bytes,
+actual EOS spelling and the configured termination policy. Pending literal
+boundaries use the publication parser's classifier, including overlapping
+short/long delimiters. Active JSON string whitespace remains data even when
+publication trims field ends. Reopened fields and streaming share one typed
+append-only projection rule. Exact history replacement replays the original
+prefill; failed candidates restore parser and grammar state, and recovery errors
+retain both causes. Byte cursor representation replacement reuses the compiled
+schema and preserves the old prefix on failure.
+
+Scope remains explicit: root ByteLevel/ByteFallback and canonical non-byte
+decoders are supported; byte-decoder sequences and regex field boundaries still
+require further implementation. Incomplete Unicode escape spelling remains an
+open lexical compatibility item. These gaps do not close the delivery ledger
+or authorize merging this draft.
+
+Validation: seven production-processor cases cover model-token masks, history
+rewind/replacement, split Unicode data/framing, overlapping delimiters,
+provisional string whitespace and candidate budgets. Six byte-cursor cases
+include atomic representation replacement. All 21 response classifier cases
+pass. Full default engine: 712 passed / 1 inherited ignore. Full server:
+404 passed / 2 inherited ignores. The expanded real ONNX continuation matrix
+covers explicit/automatic reasoning resume, JSON/Schema/unconstrained output,
+buffered/SSE and logprobs; a higher-scoring invalid schema value is masked.
+Regex capability rejection is verified as HTTP 400 before SSE. Strict default
+engine/server all-target Clippy passes.
+Native-feature validation also passes all seven processor and six cursor cases,
+plus strict native-engine all-target Clippy.

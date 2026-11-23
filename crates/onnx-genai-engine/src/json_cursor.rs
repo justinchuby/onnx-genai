@@ -14,6 +14,15 @@ pub enum JsonCandidate {
     Rejected { byte_offset: usize },
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "JSON byte candidate would exceed the {limit}-byte response budget at committed offset {offset}; shorten the response or increase its explicit budget"
+)]
+pub(crate) struct JsonByteBudgetExceeded {
+    limit: usize,
+    offset: usize,
+}
+
 /// A request-local compiled schema recognizer independent of model token IDs.
 ///
 /// Bytes use the backend's JSON lexical language. Response-channel projection
@@ -100,15 +109,18 @@ impl JsonByteCursor {
         if let Some(failure) = &self.failure {
             return Err(failure.clone().into());
         }
-        ensure!(
-            self.committed
-                .len()
-                .checked_add(bytes.len())
-                .is_some_and(|size| size <= self.max_bytes.get()),
-            "JSON byte candidate would exceed the {}-byte response budget at committed offset {}; shorten the response or increase its explicit budget",
-            self.max_bytes,
-            self.committed.len()
-        );
+        if !self
+            .committed
+            .len()
+            .checked_add(bytes.len())
+            .is_some_and(|size| size <= self.max_bytes.get())
+        {
+            return Err(JsonByteBudgetExceeded {
+                limit: self.max_bytes.get(),
+                offset: self.committed.len(),
+            }
+            .into());
+        }
         Ok(())
     }
 
@@ -222,6 +234,32 @@ impl JsonByteCursor {
         self.failure = None;
     }
 
+    fn empty_fork(&self) -> anyhow::Result<Self> {
+        if let Some(failure) = &self.failure {
+            return Err(failure.clone().into());
+        }
+        Ok(Self {
+            matcher: self.initial.deep_clone(),
+            initial: self.initial.deep_clone(),
+            committed: Vec::new(),
+            max_bytes: self.max_bytes,
+            failure: None,
+        })
+    }
+
+    /// Check a replacement representation against the same compiled schema.
+    pub fn preview_root(&self, bytes: &[u8]) -> anyhow::Result<JsonCandidate> {
+        self.empty_fork()?.preview(bytes)
+    }
+
+    /// Atomically replace the logical prefix after a representation change.
+    pub fn replace_prefix(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        let mut fresh = self.empty_fork()?;
+        fresh.commit(bytes)?;
+        *self = fresh;
+        Ok(())
+    }
+
     /// Number of committed logical bytes, including any unfinished UTF-8 scalar.
     pub fn committed_bytes(&self) -> usize {
         self.committed.len()
@@ -242,6 +280,27 @@ mod tests {
             max_bytes,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn json_byte_cursor_replacement_probes_reuse_the_schema_and_preserve_the_old_prefix() {
+        let mut cursor = object_cursor(64);
+        cursor.commit(br#"{"n":1"#).unwrap();
+        assert_eq!(
+            cursor.preview_root(br#"{"n":2}"#).unwrap(),
+            JsonCandidate::Viable { complete: true }
+        );
+        assert_eq!(cursor.committed_bytes(), 6);
+        assert!(cursor.replace_prefix(br#"{"n":3}"#).is_err());
+        assert_eq!(
+            cursor.preview(b"}").unwrap(),
+            JsonCandidate::Viable { complete: true }
+        );
+        cursor.replace_prefix(br#"{"n":2}"#).unwrap();
+        assert_eq!(
+            cursor.preview(b"").unwrap(),
+            JsonCandidate::Viable { complete: true }
+        );
     }
 
     #[test]

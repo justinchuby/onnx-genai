@@ -617,6 +617,7 @@ async fn prepare_chat_input(
             default_reasoning_effort: config.default_reasoning_effort,
         },
         output_budget,
+        config.replay_buffer_bytes,
     )
     .map_err(|err| ApiError::invalid_request(format!("prompt preparation failed: {err}")))?;
     if !input_audio.is_empty() {
@@ -2050,6 +2051,7 @@ fn prepare_generate_request(
     session: bool,
     context: &PromptContext<'_>,
     output_budget: usize,
+    response_buffer_bytes: usize,
 ) -> anyhow::Result<PreparedGenerateRequest> {
     anyhow::ensure!(
         !session || !request.continue_final_message.is_enabled(),
@@ -2081,10 +2083,33 @@ fn prepare_generate_request(
         apply_tool_output_constraint(&mut options, protocol, request)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
+    if let Some(template) = context.response_template {
+        let schema = match options.constraint.as_ref() {
+            Some(GenerateConstraint::Json { .. }) => Some(serde_json::Value::Bool(true)),
+            Some(GenerateConstraint::JsonSchema { schema, .. }) => {
+                Some(serde_json::from_str(schema)?)
+            }
+            _ => None,
+        };
+        if let Some(schema) = schema {
+            options.constraint = Some(GenerateConstraint::ResponseJson {
+                schema,
+                template: template.clone(),
+                prefix: prompt.clone(),
+                max_bytes: response_buffer_bytes,
+            });
+            options.validate_processors(tokenizer)
+                .map_err(|error| anyhow::anyhow!("resolve response_format against the declared response_template and tokenizer: {error:#}"))?;
+        }
+    }
     anyhow::ensure!(
         request.continuation_mode() != crate::types::ChatContinuation::Reasoning
-            || options.constraint.is_none(),
-        "reasoning continuation with a constrained output policy needs a channel-aware generation grammar; omit the output constraint until that capability is available"
+            || options.constraint.is_none()
+            || matches!(
+                options.constraint,
+                Some(GenerateConstraint::ResponseJson { .. })
+            ),
+        "reasoning continuation with this constrained output policy requires a channel-aware generation grammar; use response_format with a compatible declared response_template"
     );
     Ok(PreparedGenerateRequest {
         response_prefix: Some(prompt),
@@ -3104,9 +3129,15 @@ mod prompt_rendering_tests {
         let request: ChatCompletionRequest =
             serde_json::from_value(json!({"messages":[{"role":"user","content":"hello"}]}))
                 .unwrap();
-        let prepared =
-            prepare_generate_request(&request, &tokenizer, false, &context(&template, None), 8)
-                .unwrap();
+        let prepared = prepare_generate_request(
+            &request,
+            &tokenizer,
+            false,
+            &context(&template, None),
+            8,
+            crate::state::ServerConfig::default().replay_buffer_bytes,
+        )
+        .unwrap();
         let expected = tokenizer
             .encode_with_options(
                 "hello",
@@ -3220,6 +3251,7 @@ mod prompt_rendering_tests {
                 default_reasoning_effort: None,
             },
             DEFAULT_MAX_OUTPUT_TOKENS,
+            crate::state::ServerConfig::default().replay_buffer_bytes,
         )
         .expect("production preparation");
 

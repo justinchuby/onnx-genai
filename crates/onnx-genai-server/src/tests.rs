@@ -6517,7 +6517,15 @@ mod llama_compat {
             .0
             .clone();
         vocab.remove(&old);
-        vocab.insert("new[/r]answer".into(), json!(22));
+        vocab.insert("new[/r]{\"n\":1}".into(), json!(22));
+        let old = vocab
+            .iter()
+            .find(|(_, id)| id.as_u64() == Some(23))
+            .unwrap()
+            .0
+            .clone();
+        vocab.remove(&old);
+        vocab.insert("new[/r]{\"n\":2}".into(), json!(23));
         std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
         std::fs::write(scratch.path().join("tokenizer_config.json"),json!({
             "chat_template":"{% for m in messages %}[assistant][r]{{ m.reasoning_content }}[/r]{{ m.content }}[end]{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
@@ -6526,102 +6534,129 @@ mod llama_compat {
             }}
         }).to_string()).unwrap();
         let router = app(AppState::load(scratch.path(), Some("reasoning-prefill".into())).unwrap());
-        for (mode, content) in [
-            (json!("reasoning_content"), Some("discarded")),
-            (json!(true), None),
+        for format in [
+            serde_json::Value::Null,
+            json!({"type":"json_object"}),
+            json!({"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"n":{"const":1}},"required":["n"],"additionalProperties":false}}}),
         ] {
-            let mut message = json!({"role":"assistant","reasoning_content":"old "});
-            if let Some(content) = content {
-                message["content"] = json!(content);
-            }
-            // An explicit continuation overrides even the default true generation-prompt flag.
-            let body = json!({"messages":[message],"continue_final_message":mode,"max_tokens":1,"temperature":0,"logit_bias":{"22":1000}});
-            let (status, prompt) =
-                call(router.clone(), "POST", "/apply-template", body.clone()).await;
-            assert_eq!(status, StatusCode::OK, "{prompt}");
-            assert_eq!(prompt["prompt"], "[assistant][r]old ");
-            let (status, count) = call(
-                router.clone(),
-                "POST",
-                "/v1/chat/completions/input_tokens",
-                body.clone(),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK, "{count}");
-            for logprobs in [false, true] {
-                let mut request = body.clone();
-                request["logprobs"] = json!(logprobs);
-                let (status, result) = call(
+            for (mode, content) in [
+                (json!("reasoning_content"), Some("discarded")),
+                (json!(true), None),
+            ] {
+                let mut message = json!({"role":"assistant","reasoning_content":"old "});
+                if let Some(content) = content {
+                    message["content"] = json!(content);
+                }
+                // An explicit continuation overrides even the default true generation-prompt flag.
+                let mut body = json!({"messages":[message],"continue_final_message":mode,"max_tokens":1,"temperature":0,"logit_bias":{"22":1000}});
+                if !format.is_null() {
+                    body["response_format"] = format.clone();
+                    if format["type"] == "json_schema" {
+                        // The invalid value has the highest score and must be masked.
+                        body["logit_bias"]["23"] = json!(2000);
+                    }
+                }
+                let (status, prompt) =
+                    call(router.clone(), "POST", "/apply-template", body.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{prompt}");
+                assert_eq!(prompt["prompt"], "[assistant][r]old ");
+                let (status, count) = call(
                     router.clone(),
                     "POST",
-                    "/v1/chat/completions",
-                    request.clone(),
+                    "/v1/chat/completions/input_tokens",
+                    body.clone(),
                 )
                 .await;
-                assert_eq!(status, StatusCode::OK, "{result}");
-                assert_eq!(
-                    result["choices"][0]["message"]["reasoning_content"], "new",
-                    "{result}"
-                );
-                assert_eq!(
-                    result["choices"][0]["message"]["content"], "answer",
-                    "{result}"
-                );
-                assert_eq!(result["usage"]["completion_tokens"], 1);
-                assert_eq!(result["usage"]["prompt_tokens"], count["input_tokens"]);
-                request["stream"] = json!(true);
-                let response = router
-                    .clone()
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/v1/chat/completions")
-                            .header(header::CONTENT_TYPE, "application/json")
-                            .body(Body::from(request.to_string()))
-                            .unwrap(),
+                assert_eq!(status, StatusCode::OK, "{count}");
+                for logprobs in [false, true] {
+                    let mut request = body.clone();
+                    request["logprobs"] = json!(logprobs);
+                    let (status, result) = call(
+                        router.clone(),
+                        "POST",
+                        "/v1/chat/completions",
+                        request.clone(),
                     )
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::OK);
-                let events =
-                    sse_json_events(&to_bytes(response.into_body(), usize::MAX).await.unwrap());
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "{result}");
+                    assert_eq!(
+                        result["choices"][0]["message"]["reasoning_content"], "new",
+                        "{result}"
+                    );
+                    assert_eq!(
+                        result["choices"][0]["message"]["content"], "{\"n\":1}",
+                        "{result}"
+                    );
+                    assert_eq!(result["usage"]["completion_tokens"], 1);
+                    assert_eq!(result["usage"]["prompt_tokens"], count["input_tokens"]);
+                    request["stream"] = json!(true);
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/v1/chat/completions")
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(request.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let events =
+                        sse_json_events(&to_bytes(response.into_body(), usize::MAX).await.unwrap());
+                    assert!(
+                        !events.iter().any(|event| event.get("error").is_some()),
+                        "{events:?}"
+                    );
+                    let reasoning = events
+                        .iter()
+                        .filter_map(|event| {
+                            event["choices"][0]["delta"]["reasoning_content"].as_str()
+                        })
+                        .collect::<String>();
+                    let content = events
+                        .iter()
+                        .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                        .collect::<String>();
+                    assert_eq!(reasoning, "new", "{events:?}");
+                    assert_eq!(content, "{\"n\":1}", "{events:?}");
+                }
+                let mut invalid = body.clone();
+                invalid["messages"][0]["reasoning_content"] = json!("old[/r]");
+                let (status, error) =
+                    call(router.clone(), "POST", "/v1/chat/completions", invalid).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
                 assert!(
-                    !events.iter().any(|event| event.get("error").is_some()),
-                    "{events:?}"
+                    error["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("leave response_template field"),
+                    "{error}"
                 );
-                let reasoning = events
-                    .iter()
-                    .filter_map(|event| event["choices"][0]["delta"]["reasoning_content"].as_str())
-                    .collect::<String>();
-                let content = events
-                    .iter()
-                    .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
-                    .collect::<String>();
-                assert_eq!(reasoning, "new", "{events:?}");
-                assert_eq!(content, "answer", "{events:?}");
             }
-            let mut invalid = body.clone();
-            invalid["messages"][0]["reasoning_content"] = json!("old[/r]");
-            let (status, error) =
-                call(router.clone(), "POST", "/v1/chat/completions", invalid).await;
+        }
+        // Capability rejection must precede SSE headers and model execution.
+        let config_path = scratch.path().join("tokenizer_config.json");
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["response_template"]["fields"]["reasoning_content"]
+            .as_object_mut()
+            .unwrap()
+            .remove("close");
+        config["response_template"]["fields"]["reasoning_content"]["close_pattern"] =
+            json!(r"\[/r\]");
+        std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("reasoning-prefill".into())).unwrap());
+        for stream in [false, true] {
+            let body = json!({"messages":[{"role":"assistant","reasoning_content":"old "}],"continue_final_message":"reasoning_content","response_format":{"type":"json_object"},"stream":stream,"max_tokens":1});
+            let (status, error) = call(router.clone(), "POST", "/v1/chat/completions", body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
             assert!(
                 error["error"]["message"]
                     .as_str()
                     .unwrap()
-                    .contains("leave response_template field"),
-                "{error}"
-            );
-            let mut constrained = body.clone();
-            constrained["response_format"] = json!({"type":"json_object"});
-            let (status, error) =
-                call(router.clone(), "POST", "/v1/chat/completions", constrained).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
-            assert!(
-                error["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("channel-aware generation grammar"),
+                    .contains("byte-prefix boundary"),
                 "{error}"
             );
         }
