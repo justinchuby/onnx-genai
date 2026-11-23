@@ -1,0 +1,209 @@
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs b/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs
+index b128d4b28..818e8a613 100644
+--- a/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs
+@@ -274,9 +274,15 @@ impl BlockQuantizedMoEKernel {
+         let projection =
+             std::alloc::Layout::from_size_align(projection_bytes, projection_alignment)
+                 .map_err(|_| error("decoded projection workspace exceeds addressable capacity"))?;
+-        let gathered_elements = dims.rows.checked_mul(dims.hidden).ok_or_else(|| {
+-            error("grouped input rows times hidden width overflow; reduce batch dimensions")
+-        })?;
++        // One row cannot need reordering: each expert sees it at most once.
++        // Larger batches retain one coarse worst-case gather lane.
++        let gathered_elements = if dims.rows == 1 {
++            0
++        } else {
++            dims.rows.checked_mul(dims.hidden).ok_or_else(|| {
++                error("grouped input rows times hidden width overflow; reduce batch dimensions")
++            })?
++        };
+         let gathered = std::alloc::Layout::array::<f32>(gathered_elements).map_err(|_| {
+             error("grouped input workspace exceeds addressable capacity; reduce batch dimensions")
+         })?;
+@@ -388,11 +394,14 @@ impl BlockQuantizedMoEKernel {
+         #[cfg(test)]
+         let mut counted_dense = false;
+         for (expert, expert_tasks) in tasks {
+-            let grouped_input = grouped_scratch.gather_rows(
+-                &input,
+-                hidden,
+-                expert_tasks.iter().map(|&(row, _)| row),
+-            )?;
++            let grouped_input = match contiguous_input_window(&input, hidden, &expert_tasks) {
++                Some(window) => window,
++                None => grouped_scratch.gather_rows(
++                    &input,
++                    hidden,
++                    expert_tasks.iter().map(|&(row, _)| row),
++                )?,
++            };
+             let dense = if use_dense {
+                 match self.dequantize_expert_group(
+                     inputs,
+@@ -625,6 +634,25 @@ impl BlockQuantizedMoEKernel {
+     }
+ }
+
++/// Borrow a forward-contiguous group without copying. Check actual ordering:
++/// reordered, repeated or discontiguous rows must retain the gather path.
++fn contiguous_input_window<'a>(
++    input: &'a [f32],
++    width: usize,
++    tasks: &[(usize, f32)],
++) -> Option<&'a [f32]> {
++    let first = tasks.first()?.0;
++    let end = first.checked_add(tasks.len())?;
++    if !tasks
++        .iter()
++        .enumerate()
++        .all(|(offset, &(row, _))| row == first + offset)
++    {
++        return None;
++    }
++    input.get(first.checked_mul(width)?..end.checked_mul(width)?)
++}
++
+ #[derive(Clone, Copy)]
+ struct Dimensions {
+     rows: usize,
+@@ -1607,6 +1635,104 @@ mod tests {
+         }
+     }
+
++    #[test]
++    fn contiguous_input_windows_borrow_subranges_and_reject_reordering() {
++        let input: Vec<f32> = (0..12).map(|i| i as f32).collect();
++        for (rows, start, count) in [(vec![0, 1, 2], 0, 6), (vec![1, 2], 2, 4), (vec![3], 6, 2)] {
++            let tasks: Vec<_> = rows.into_iter().map(|row| (row, 1.0)).collect();
++            let window = contiguous_input_window(&input, 2, &tasks).unwrap();
++            assert_eq!(window, &input[start..start + count]);
++            assert_eq!(
++                window.as_ptr(),
++                input[start..].as_ptr(),
++                "must borrow the original input storage"
++            );
++        }
++        for rows in [
++            vec![],
++            vec![0, 2],
++            vec![2, 1],
++            vec![1, 1],
++            vec![6],
++            vec![usize::MAX],
++        ] {
++            let tasks: Vec<_> = rows.into_iter().map(|row| (row, 1.0)).collect();
++            assert!(
++                contiguous_input_window(&input, 2, &tasks).is_none(),
++                "rows={tasks:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn contiguous_and_gathered_groups_share_one_execution_without_clobbering() {
++        for budget in [0, 4 * H * H * 4] {
++            let shapes = vec![
++                Some((DataType::Float32, vec![3, H])),
++                Some((DataType::Float32, vec![3, E])),
++                Some((DataType::Uint8, vec![E, H, 1, 17])),
++                None,
++                Some((DataType::Uint8, vec![E, H, 1, 17])),
++            ];
++            let (graph, node) = model_node(&shapes, &attrs("identity", 1, true, 0));
++            let ValidatedMetadata {
++                attributes,
++                formats,
++            } = validate_metadata(graph.node(node), None).unwrap();
++            let kernel = BlockQuantizedMoEKernel {
++                attributes,
++                formats,
++                constant_inputs: [false, false, true, false, true, false, false, false, false],
++                weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
++                projection_plan: projection_plan(),
++                weight_cache: WeightCache::with_limit(budget),
++            };
++            let values: Vec<_> = [0.125, 0.25, 0.5]
++                .into_iter()
++                .flat_map(|v| [v; H])
++                .collect();
++            let input = Owned::f32(&[3, H], &values);
++            let router = Owned::f32(&[3, E], &[4., -4., -4., 4., 4., -4.]);
++            let w1 = Owned::u8(&[E, H, 1, 17], &identity_projection([2, 2]));
++            let w2 = Owned::u8(&[E, H, 1, 17], &identity_projection([2, 2]));
++            let views = [
++                input.view(),
++                router.view(),
++                w1.view(),
++                TensorView::absent(DataType::Float32),
++                w2.view(),
++            ];
++            let metadata: Vec<_> = views
++                .iter()
++                .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
++                .collect();
++            let req = kernel.workspace_requirement(&metadata).unwrap();
++            let mut backing = vec![29.0f32; req.bytes as usize / 4];
++            let gather = backing.len() - 3 * H;
++            let mut output = Owned::zeros_f32(&[3, H]);
++            for _ in 0..2 {
++                kernel
++                    .execute_with_workspace(
++                        &views,
++                        &mut [output.view_mut()],
++                        Some(WorkspaceView::new(
++                            DevicePtrMut(backing.as_mut_ptr().cast()),
++                            req.bytes as usize,
++                        )),
++                    )
++                    .unwrap();
++                assert_eq!(output.to_f32(), values);
++                assert_eq!(&backing[gather..gather + H], &[0.125; H]);
++                assert_eq!(&backing[gather + H..gather + 2 * H], &[0.5; H]);
++                assert_eq!(
++                    &backing[gather + 2 * H..],
++                    &[29.0; H],
++                    "borrowed expert row must not touch the gather lane"
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn zero_hidden_empty_outputs_need_no_workspace_or_weight_decode() {
+         let shapes = vec![
+@@ -1686,6 +1812,11 @@ mod tests {
+             .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+             .collect();
+         let req = kernel.workspace_requirement(&metadata).unwrap();
++        assert_eq!(
++            req.bytes,
++            kernel.projection_plan.layout(1, H, H).unwrap().bytes() as u64,
++            "a one-row batch needs no gather reservation even before routing is known"
++        );
+         let mut scratch = vec![29.0f32; req.bytes as usize / 4];
+         assert!(!scratch.is_empty());
+         let mut output = Owned::zeros_f32(&[1, H]);
+@@ -1698,12 +1829,9 @@ mod tests {
+                 .execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace))
+                 .unwrap();
+             assert!(
+-                scratch[..scratch.len() - H]
+-                    .iter()
+-                    .all(|&value| value == 29.0),
++                scratch.iter().all(|&value| value == 29.0),
+                 "cold dense expansion and warm resident hits must leave streamed scratch untouched"
+             );
+-            assert_eq!(&scratch[scratch.len() - H..], &[0.125; H]);
+             assert_eq!(output.to_f32(), vec![0.125; H]);
+         }
+         assert_eq!(
+@@ -1821,7 +1949,7 @@ mod tests {
+                 .max(l2.bytes())
+                 .max(if separate { l3.bytes() } else { 0 });
+             assert_eq!(
+-                req.bytes, (max + rows * hidden * std::mem::size_of::<f32>()) as u64,
++                req.bytes, (max + if rows > 1 { rows * hidden * std::mem::size_of::<f32>() } else { 0 }) as u64,
+                 "serial experts/projections share max plus one gathered input, not k*E buffers"
+             );
+             assert!(max < l1.bytes() + l2.bytes());
