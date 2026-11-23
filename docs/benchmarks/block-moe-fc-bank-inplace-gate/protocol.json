@@ -1,0 +1,100 @@
+{
+  "purpose": "Evaluate serial in-place activation and its smaller actual backing against prior static-bias banks and the old allocation-based driver. Full prior eight synthetic cases, not CUDA/model throughput or a rebased-main adoption audit.",
+  "shapes": [
+    [
+      1,
+      32,
+      64,
+      1,
+      0,
+      0,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      1,
+      0,
+      0,
+      "block"
+    ],
+    [
+      1,
+      64,
+      128,
+      1,
+      1,
+      0,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      1,
+      2,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      3,
+      "block"
+    ],
+    [
+      1,
+      64,
+      128,
+      1,
+      0,
+      0,
+      "float"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      "float"
+    ]
+  ],
+  "arms": {
+    "before": "old kernels from 509144567",
+    "original": "prior static-bias banks from f0a2cd115",
+    "compact": "in-place activation/minimum serial banks at recorded candidate head",
+    "null": "identical old factory as before"
+  },
+  "processes_per_case": 4,
+  "rotations": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "batches": 8,
+  "target_cpu_ms": 250,
+  "excluded_pilot_minimum_cpu_ms": 50,
+  "minimum_batch_cpu_ms": 20,
+  "minimum_cpu_wall_ratio": 0.9,
+  "control_and_AA_gate_percent": 5,
+  "attempts": 1,
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "sampling": false,
+  "scope": "native Apple M1 Max, same executable/CPU crate, public strict prepare/run/output drop, independent funded pools/books; no CUDA/model/RSS claim"
+}

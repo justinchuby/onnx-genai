@@ -1,0 +1,175 @@
+
+/tmp/nxrt-bank-inplace-gate/inplace-gate-probe:	file format mach-o arm64
+
+Disassembly of section __TEXT,__text:
+
+00000001001cfa4c <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation>:
+1001cfa4c: d10443ff    	sub	sp, sp, #0x110
+1001cfa50: 6d073bef    	stp	d15, d14, [sp, #0x70]
+1001cfa54: 6d0833ed    	stp	d13, d12, [sp, #0x80]
+1001cfa58: 6d092beb    	stp	d11, d10, [sp, #0x90]
+1001cfa5c: 6d0a23e9    	stp	d9, d8, [sp, #0xa0]
+1001cfa60: a90b6ffc    	stp	x28, x27, [sp, #0xb0]
+1001cfa64: a90c67fa    	stp	x26, x25, [sp, #0xc0]
+1001cfa68: a90d5ff8    	stp	x24, x23, [sp, #0xd0]
+1001cfa6c: a90e57f6    	stp	x22, x21, [sp, #0xe0]
+1001cfa70: a90f4ff4    	stp	x20, x19, [sp, #0xf0]
+1001cfa74: a9107bfd    	stp	x29, x30, [sp, #0x100]
+1001cfa78: 910403fd    	add	x29, sp, #0x100
+1001cfa7c: aa0603f5    	mov	x21, x6
+1001cfa80: f9001fe3    	str	x3, [sp, #0x38]
+1001cfa84: aa0103f3    	mov	x19, x1
+1001cfa88: aa0003f6    	mov	x22, x0
+1001cfa8c: f9000be4    	str	x4, [sp, #0x10]
+1001cfa90: b4000ae4    	cbz	x4, 0x1001cfbec <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x1a0>
+1001cfa94: b4000ad5    	cbz	x21, 0x1001cfbec <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x1a0>
+1001cfa98: aa0203f9    	mov	x25, x2
+1001cfa9c: f94004e8    	ldr	x8, [x7, #0x8]
+1001cfaa0: bd4018e8    	ldr	s8, [x7, #0x18]
+1001cfaa4: 1e214109    	fneg	s9, s8
+1001cfaa8: 1e202108    	fcmp	s8, #0.0
+1001cfaac: 54000d6b    	b.lt	0x1001cfc58 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x20c>
+1001cfab0: f9001be8    	str	x8, [sp, #0x30]
+1001cfab4: d280001c    	mov	x28, #0x0               ; =0
+1001cfab8: d280001a    	mov	x26, #0x0               ; =0
+1001cfabc: d2800009    	mov	x9, #0x0                ; =0
+1001cfac0: 2d422cea    	ldp	s10, s11, [x7, #0x10]
+1001cfac4: d37ef6a8    	lsl	x8, x21, #2
+1001cfac8: a90017e8    	stp	x8, x5, [sp]
+1001cfacc: 1e28790c    	fminnm	s12, s8, s8
+1001cfad0: 1e2e100d    	fmov	s13, #1.00000000
+1001cfad4: aa1903f4    	mov	x20, x25
+1001cfad8: d2800017    	mov	x23, #0x0               ; =0
+1001cfadc: 9b057d38    	mul	x24, x9, x5
+1001cfae0: 91000528    	add	x8, x9, #0x1
+1001cfae4: a901a3f4    	stp	x20, x8, [sp, #0x18]
+1001cfae8: 5280003b    	mov	w27, #0x1               ; =1
+1001cfaec: f90017fa    	str	x26, [sp, #0x28]
+1001cfaf0: b4000139    	cbz	x25, 0x1001cfb14 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0xc8>
+1001cfaf4: 8b170380    	add	x0, x28, x23
+1001cfaf8: eb13001f    	cmp	x0, x19
+1001cfafc: 54000c82    	b.hs	0x1001cfc8c <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x240>
+1001cfb00: aa1403e8    	mov	x8, x20
+1001cfb04: f9401fe9    	ldr	x9, [sp, #0x38]
+1001cfb08: eb09035f    	cmp	x26, x9
+1001cfb0c: 54000203    	b.lo	0x1001cfb4c <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x100>
+1001cfb10: 14000066    	b	0x1001cfca8 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x25c>
+1001cfb14: d1000768    	sub	x8, x27, #0x1
+1001cfb18: f9401be9    	ldr	x9, [sp, #0x30]
+1001cfb1c: f100053f    	cmp	x9, #0x1
+1001cfb20: 9a970108    	csel	x8, x8, x23, eq
+1001cfb24: 8b180100    	add	x0, x8, x24
+1001cfb28: eb13001f    	cmp	x0, x19
+1001cfb2c: 54000b02    	b.hs	0x1001cfc8c <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x240>
+1001cfb30: 8b1702a8    	add	x8, x21, x23
+1001cfb34: f100053f    	cmp	x9, #0x1
+1001cfb38: 9a880368    	csel	x8, x27, x8, eq
+1001cfb3c: 8b180108    	add	x8, x8, x24
+1001cfb40: eb13011f    	cmp	x8, x19
+1001cfb44: 54000962    	b.hs	0x1001cfc70 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x224>
+1001cfb48: 8b080ac8    	add	x8, x22, x8, lsl #2
+1001cfb4c: bc607ac0    	ldr	s0, [x22, x0, lsl #2]
+1001cfb50: bd40010e    	ldr	s14, [x8]
+1001cfb54: 1e207800    	fminnm	s0, s0, s0
+1001cfb58: 1e2c780f    	fminnm	s15, s0, s12
+1001cfb5c: 1e2f0940    	fmul	s0, s10, s15
+1001cfb60: 1e202008    	fcmp	s0, #0.0
+1001cfb64: 5400008a    	b.ge	0x1001cfb74 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x128>
+1001cfb68: 941766db    	bl	0x1007a96d4 <dyld_stub_binder+0x1007a96d4>
+1001cfb6c: 4ea01c01    	mov.16b	v1, v0
+1001cfb70: 14000004    	b	0x1001cfb80 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x134>
+1001cfb74: 1e214000    	fneg	s0, s0
+1001cfb78: 941766d7    	bl	0x1007a96d4 <dyld_stub_binder+0x1007a96d4>
+1001cfb7c: 1e2e1001    	fmov	s1, #1.00000000
+1001cfb80: eb13035f    	cmp	x26, x19
+1001cfb84: 54000602    	b.hs	0x1001cfc44 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x1f8>
+1001cfb88: 910006f7    	add	x23, x23, #0x1
+1001cfb8c: 1e2d2800    	fadd	s0, s0, s13
+1001cfb90: 1e201820    	fdiv	s0, s1, s0
+1001cfb94: 1e2009e0    	fmul	s0, s15, s0
+1001cfb98: 1e2921c0    	fcmp	s14, s9
+1001cfb9c: 1e2e4d21    	fcsel	s1, s9, s14, mi
+1001cfba0: 1e282020    	fcmp	s1, s8
+1001cfba4: 1e21cd01    	fcsel	s1, s8, s1, gt
+1001cfba8: 1e212961    	fadd	s1, s11, s1
+1001cfbac: 1e200820    	fmul	s0, s1, s0
+1001cfbb0: bc3a7ac0    	str	s0, [x22, x26, lsl #2]
+1001cfbb4: 9100075a    	add	x26, x26, #0x1
+1001cfbb8: 91000b7b    	add	x27, x27, #0x2
+1001cfbbc: 91001294    	add	x20, x20, #0x4
+1001cfbc0: eb1702bf    	cmp	x21, x23
+1001cfbc4: 54fff961    	b.ne	0x1001cfaf0 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0xa4>
+1001cfbc8: a9426be9    	ldp	x9, x26, [sp, #0x20]
+1001cfbcc: 8b15035a    	add	x26, x26, x21
+1001cfbd0: a94017e8    	ldp	x8, x5, [sp]
+1001cfbd4: f9400ff4    	ldr	x20, [sp, #0x18]
+1001cfbd8: 8b080294    	add	x20, x20, x8
+1001cfbdc: 8b05039c    	add	x28, x28, x5
+1001cfbe0: f9400be8    	ldr	x8, [sp, #0x10]
+1001cfbe4: eb08013f    	cmp	x9, x8
+1001cfbe8: 54fff781    	b.ne	0x1001cfad8 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x8c>
+1001cfbec: f9400be8    	ldr	x8, [sp, #0x10]
+1001cfbf0: 9b087ea1    	mul	x1, x21, x8
+1001cfbf4: eb13003f    	cmp	x1, x19
+1001cfbf8: 540001c8    	b.hi	0x1001cfc30 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x1e4>
+1001cfbfc: aa1603e0    	mov	x0, x22
+1001cfc00: a9507bfd    	ldp	x29, x30, [sp, #0x100]
+1001cfc04: a94f4ff4    	ldp	x20, x19, [sp, #0xf0]
+1001cfc08: a94e57f6    	ldp	x22, x21, [sp, #0xe0]
+1001cfc0c: a94d5ff8    	ldp	x24, x23, [sp, #0xd0]
+1001cfc10: a94c67fa    	ldp	x26, x25, [sp, #0xc0]
+1001cfc14: a94b6ffc    	ldp	x28, x27, [sp, #0xb0]
+1001cfc18: 6d4a23e9    	ldp	d9, d8, [sp, #0xa0]
+1001cfc1c: 6d492beb    	ldp	d11, d10, [sp, #0x90]
+1001cfc20: 6d4833ed    	ldp	d13, d12, [sp, #0x80]
+1001cfc24: 6d473bef    	ldp	d15, d14, [sp, #0x70]
+1001cfc28: 910443ff    	add	sp, sp, #0x110
+1001cfc2c: d65f03c0    	ret
+1001cfc30: 90003ee3    	adrp	x3, 0x1009ab000 <_anon.c3660475e5512ed7f8302557be2c95ea.441+0xaf8>
+1001cfc34: 9106e063    	add	x3, x3, #0x1b8
+1001cfc38: d2800000    	mov	x0, #0x0                ; =0
+1001cfc3c: aa1303e2    	mov	x2, x19
+1001cfc40: 941765a1    	bl	0x1007a92c4 <__RNvNtNtCslWxY2MhVcag_4core5slice5index16slice_index_fail>
+1001cfc44: 90003ee2    	adrp	x2, 0x1009ab000 <_anon.c3660475e5512ed7f8302557be2c95ea.441+0xaf8>
+1001cfc48: 91086042    	add	x2, x2, #0x218
+1001cfc4c: aa1a03e0    	mov	x0, x26
+1001cfc50: aa1303e1    	mov	x1, x19
+1001cfc54: 94176536    	bl	0x1007a912c <__RNvNtCslWxY2MhVcag_4core9panicking18panic_bounds_check>
+1001cfc58: b5000179    	cbnz	x25, 0x1001cfc84 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x238>
+1001cfc5c: b4000173    	cbz	x19, 0x1001cfc88 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x23c>
+1001cfc60: f100051f    	cmp	x8, #0x1
+1001cfc64: 9a9f16a8    	csinc	x8, x21, xzr, ne
+1001cfc68: eb13011f    	cmp	x8, x19
+1001cfc6c: 54000283    	b.lo	0x1001cfcbc <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x270>
+1001cfc70: 90003ee2    	adrp	x2, 0x1009ab000 <_anon.c3660475e5512ed7f8302557be2c95ea.441+0xaf8>
+1001cfc74: 9107a042    	add	x2, x2, #0x1e8
+1001cfc78: aa0803e0    	mov	x0, x8
+1001cfc7c: aa1303e1    	mov	x1, x19
+1001cfc80: 9417652b    	bl	0x1007a912c <__RNvNtCslWxY2MhVcag_4core9panicking18panic_bounds_check>
+1001cfc84: b50000d3    	cbnz	x19, 0x1001cfc9c <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x250>
+1001cfc88: d2800000    	mov	x0, #0x0                ; =0
+1001cfc8c: 90003ee2    	adrp	x2, 0x1009ab000 <_anon.c3660475e5512ed7f8302557be2c95ea.441+0xaf8>
+1001cfc90: 91074042    	add	x2, x2, #0x1d0
+1001cfc94: aa1303e1    	mov	x1, x19
+1001cfc98: 94176525    	bl	0x1007a912c <__RNvNtCslWxY2MhVcag_4core9panicking18panic_bounds_check>
+1001cfc9c: f9401fe8    	ldr	x8, [sp, #0x38]
+1001cfca0: b50000e8    	cbnz	x8, 0x1001cfcbc <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe24compact_gated_activation+0x270>
+1001cfca4: d280001a    	mov	x26, #0x0               ; =0
+1001cfca8: 90003ee2    	adrp	x2, 0x1009ab000 <_anon.c3660475e5512ed7f8302557be2c95ea.441+0xaf8>
+1001cfcac: 91080042    	add	x2, x2, #0x200
+1001cfcb0: aa1a03e0    	mov	x0, x26
+1001cfcb4: f9401fe1    	ldr	x1, [sp, #0x38]
+1001cfcb8: 9417651d    	bl	0x1007a912c <__RNvNtCslWxY2MhVcag_4core9panicking18panic_bounds_check>
+1001cfcbc: 2d0823e9    	stp	s9, s8, [sp, #0x40]
+1001cfcc0: d0002c88    	adrp	x8, 0x100761000 <__RNvXs2_NtNtCslWxY2MhVcag_4core2io5errorNtNtB5_4repr4ReprNtNtB9_3fmt5Debug3fmt+0x294>
+1001cfcc4: 91017108    	add	x8, x8, #0x5c
+1001cfcc8: 910103e9    	add	x9, sp, #0x40
+1001cfccc: a904a3e9    	stp	x9, x8, [sp, #0x48]
+1001cfcd0: 910113e9    	add	x9, sp, #0x44
+1001cfcd4: a905a3e9    	stp	x9, x8, [sp, #0x58]
+1001cfcd8: b0003460    	adrp	x0, 0x10085c000 <_anon.b54f3591f8521b6b5f4ff3cdf20dee84.85+0x14>
+1001cfcdc: 912d9800    	add	x0, x0, #0xb66
+1001cfce0: f0003ec2    	adrp	x2, 0x1009aa000 <_anon.c3660475e5512ed7f8302557be2c95ea.210+0x98>
+1001cfce4: 91004042    	add	x2, x2, #0x10
+1001cfce8: 910123e1    	add	x1, sp, #0x48
+1001cfcec: 9417656c    	bl	0x1007a929c <__RNvNtCslWxY2MhVcag_4core9panicking9panic_fmt>
