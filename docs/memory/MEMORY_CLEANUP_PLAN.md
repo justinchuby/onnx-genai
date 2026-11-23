@@ -2231,3 +2231,49 @@ CPU 2,016 / session 295, MLAS CPU 2,058 / session 297, all 48 public executor
 integration tests and both strict CPU/session all-target Clippy configurations.
 Measured source is preserved separately and reconstructed exactly by its patch;
 those timing numbers are not reinterpreted as a fresh current-main experiment.
+
+### Resource granularity and the minimum EP contract
+
+The allocation unit is an independently owned execution lane or prepared
+artifact. Kernel-local regions are byte views within that ownership, not new
+quota requests. Serial nodes reuse a peak workspace; simultaneously live work
+requires distinct storage. Keep capacity and alignment planning outside the
+inner compute loops.
+
+An EP kernel declares its workspace planning capability and a checked
+`WorkspaceRequirement` (bytes, alignment and lifetime), then computes using
+the supplied `WorkspaceView`. `WorkspaceLayout` partitions composite scratch
+without allocating or charging. The executor owns graph preparation and
+workspace lifetimes; the provider supplies the backing owner and completion
+boundary. A provider bridge delegates the complete allocate/replace/deallocate
+workspace lifecycle to that same provider, rather than rebuilding accounting
+around its raw allocator.
+
+`PluginExecutionProvider` now forwards those three workspace operations to its
+supplied CPU provider. Previously, CPU fallback kernels used the trait's default
+raw-allocation adapter and bypassed the CPU managed workspace pool. The actual
+two-node QLinearMatMul fallback regression checks one 24-byte peak rather than
+16+24 bytes, stable allocation identity over repeated runs, idle reclamation and
+readmission, smaller shapes, oversized admission failure and final zero usage.
+The graph is built on CPU before installing the actual plugin bridge for
+planning/execution, so this regression requires no plugin compiler or dylib.
+
+Pool return retains physical backing and its charge. A sufficient warm checkout
+and return must make zero issuer callbacks, including zero-byte calls; actual
+refund follows proven physical release. Existing pool tests pin that callback
+contract. This is not a claim of zero pool-lock or execution overhead. CPU and
+CUDA workspace already carry their charge in managed backing ownership; neither
+needs a second outer lease on those paths.
+
+Prepared immutable cache entries retain their own grants at the granularity at
+which they can be published and reclaimed, including jointly admitted expert
+groups. Cold preparation obtains ownership; stable warm hits reuse it. Do not
+combine all weights into a session-wide slab that prevents independent idle
+eviction, or introduce a second prediction/credit ledger.
+
+One possible later optimization is retaining a lane during a continuously
+active decode phase, returning it at a scheduling yield, phase transition or
+request end. Measure the pool round-trip cost before changing that policy.
+Do not reuse capture pinning for scheduler ownership, keep a prefill high-water
+allocation throughout decode, or reclaim an active/asynchronous owner before
+its completion boundary. No such scheduling-policy change is made here.

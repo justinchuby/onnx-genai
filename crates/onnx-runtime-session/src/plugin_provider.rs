@@ -204,6 +204,35 @@ impl ExecutionProvider for PluginExecutionProvider {
         self.cpu.allocate(size, alignment)
     }
 
+    // Host fallback and plugin Compute scratch use the same CPU resource domain.
+    // Forward the complete owner lifecycle, not just the raw allocator: the
+    // default workspace adapter would bypass the CPU's funded execution pool.
+    fn allocate_workspace(
+        &self,
+        size: usize,
+        alignment: usize,
+        role: onnx_runtime_memory_api::MemoryRole,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceAllocation> {
+        self.cpu.allocate_workspace(size, alignment, role)
+    }
+
+    fn replace_workspace(
+        &self,
+        old: Option<onnx_runtime_ep_api::WorkspaceAllocation>,
+        size: usize,
+        alignment: usize,
+        role: onnx_runtime_memory_api::MemoryRole,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceAllocation> {
+        self.cpu.replace_workspace(old, size, alignment, role)
+    }
+
+    fn deallocate_workspace(
+        &self,
+        workspace: onnx_runtime_ep_api::WorkspaceAllocation,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.deallocate_workspace(workspace)
+    }
+
     fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
         self.cpu.deallocate(buffer)
     }
