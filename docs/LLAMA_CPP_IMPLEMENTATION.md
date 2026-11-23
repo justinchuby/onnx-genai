@@ -871,3 +871,29 @@ Final shared-parser validation: the same 12 cases passed with native-backend;
 strict native-engine all-target and server all-target Clippy passed after the
 unnecessary lazy region-construction closure was simplified. There are no
 remaining duplicate server parser definitions or compatibility aliases.
+
+Response candidate transactions: `ResponseParser::preview` returns a cumulative
+candidate projection without publishing or consuming it. A borrow-scoped guard
+restores the original buffer length, cursor, active/closed regions and seen flags
+on success, error and unwind. Closed region metadata uses copy-on-write sharing;
+raw body bytes and published text are not copied into checkpoints. Final preview
+uses the same boundary resolution, defaults and required-field checks as finish.
+
+Buffered chat now projects the final raw result once through this candidate path,
+rather than imposing streaming append-only delta checks on an intermediate parse.
+This fixes a pending regex opener that replaces earlier nonrepeated content only
+at EOF: buffered output can return its final empty replacement while live output
+still rejects retraction of already published text. Raw stop filtering is retained
+before classification. This is a shared-parser capability for the forthcoming
+channel constraint, not completed reasoning+JSON wire support.
+
+Validation: all 3 new candidate tests and the buffered projection regression
+passed; all 15 classifier tests passed with native-backend. Full server library:
+404 passed / 2 inherited ignores. Candidate tests check repeated/replaced fields,
+unchanged publication baselines, copy-on-write checkpoint restoration, Unicode,
+required-field and budget failures, defaults and injected unwind recovery.
+
+Strict native-engine all-target and server all-target Clippy passed on the final
+candidate-preview implementation. The HTTP reasoning+JSON admission guard remains
+in place until candidate token decoding and JSON recognizer composition are wired
+and verified; no compatibility ledger row is closed by this prerequisite alone.

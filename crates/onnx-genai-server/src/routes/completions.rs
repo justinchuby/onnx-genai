@@ -2754,10 +2754,7 @@ impl ChatProjection {
             self.prefix_output,
             self.max_bytes,
         )?;
-        let mut output = parser.feed(text_before_stop(&raw, &self.stop_sequences))?;
-        let tail = parser.finish()?;
-        output.content.push_str(&tail.content);
-        output.reasoning.push_str(&tail.reasoning);
+        let output = parser.preview(text_before_stop(&raw, &self.stop_sequences), true)?;
         Ok(ChannelDelta {
             content: output.content,
             reasoning: output.reasoning,
@@ -3756,6 +3753,39 @@ mod channel_gate_tests {
         assert_eq!(content, "answer");
         assert_eq!(reasoning, "new");
     }
+    #[test]
+    fn buffered_projection_resolves_final_replacements_without_streaming_retractions() {
+        let template = response_template::ResponseTemplate::compile(&serde_json::json!({
+            "start_anchor":"[a]", "fields":{"content":{"open_pattern":"<c>\\s*","close":"</c>"}}
+        }))
+        .unwrap();
+        let projection = ChatProjection {
+            template: Some(template),
+            prefix: Arc::from("[a]<c>old"),
+            prefix_output: response_template::PrefixOutput::Include,
+            max_bytes: 4096,
+            stop_sequences: Vec::new(),
+        };
+        let tokenizer = Tokenizer::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+        )
+        .unwrap();
+        let result = GenerateResult {
+            text: "</c><c>".into(),
+            token_ids: Vec::new(),
+            finish_reason: onnx_genai_engine::FinishReason::MaxTokens,
+            tool_calls: Vec::new(),
+            prefix_cache_hit_len: 0,
+            logprobs: None,
+            budget_cap: None,
+        };
+        assert_eq!(
+            projection.buffered(&result, &tokenizer).unwrap(),
+            ChannelDelta::default()
+        );
+    }
+
     #[test]
     fn undeclared_protocol_is_not_interpreted() {
         let projection = ChatProjection {

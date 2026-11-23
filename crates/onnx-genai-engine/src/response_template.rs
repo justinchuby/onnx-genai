@@ -410,7 +410,7 @@ impl ResponseTemplate {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Region {
     bytes: Range<usize>,
     visible: bool,
@@ -455,7 +455,7 @@ pub struct ResponseParser {
     pos: usize,
     current: Option<usize>,
     region: Option<Region>,
-    closed: Vec<Vec<Region>>,
+    closed: Vec<std::sync::Arc<Vec<Region>>>,
     seen: Vec<bool>,
     sent: ChatText,
     max_bytes: usize,
@@ -484,7 +484,9 @@ impl ResponseParser {
             "response parser prefix exceeds the {max_bytes}-byte buffer budget; shorten the assistant prefix"
         );
         let mut parser = Self {
-            closed: (0..spec.fields.len()).map(|_| Vec::new()).collect(),
+            closed: (0..spec.fields.len())
+                .map(|_| std::sync::Arc::new(Vec::new()))
+                .collect(),
             seen: vec![false; spec.fields.len()],
             current: spec.implicit,
             spec,
@@ -529,10 +531,11 @@ impl ResponseParser {
     }
     fn close(&mut self) {
         if let (Some(field), Some(region)) = (self.current, self.region.take()) {
+            let closed = std::sync::Arc::make_mut(&mut self.closed[field]);
             if !self.spec.fields[field].repeats {
-                self.closed[field].clear();
+                closed.clear();
             }
-            self.closed[field].push(region);
+            closed.push(region);
         }
         self.current = self.spec.implicit;
     }
@@ -694,7 +697,7 @@ impl ResponseParser {
             reasoning: reasoning.unwrap_or_default(),
         })
     }
-    pub fn feed(&mut self, text: &str) -> anyhow::Result<ChatText> {
+    fn append(&mut self, text: &str) -> anyhow::Result<()> {
         ensure!(
             self.buffer
                 .len()
@@ -704,11 +707,30 @@ impl ResponseParser {
             self.max_bytes
         );
         self.buffer.push_str(text);
+        Ok(())
+    }
+
+    /// Return the cumulative projected channels after a candidate, without consuming it.
+    /// Unlike `feed`, this returns a complete snapshot and does not publish a delta.
+    /// Final candidates also resolve pending boundaries, defaults and required fields.
+    /// The original parser state is restored on both success and failure.
+    pub fn preview(&mut self, text: &str, final_chunk: bool) -> anyhow::Result<ChatText> {
+        let trial = ResponseTrial::new(self);
+        trial.parser.append(text)?;
+        trial.parser.process(final_chunk)?;
+        if final_chunk {
+            trial.parser.validate_required()?;
+        }
+        Ok(trial.parser.snapshot(final_chunk))
+    }
+
+    pub fn feed(&mut self, text: &str) -> anyhow::Result<ChatText> {
+        self.append(text)?;
         self.process(false)?;
         self.delta(false)
     }
-    pub fn finish(mut self) -> anyhow::Result<ChatText> {
-        self.process(true)?;
+
+    fn validate_required(&self) -> anyhow::Result<()> {
         for (field, definition) in self.spec.fields.iter().enumerate() {
             ensure!(
                 definition.optional
@@ -718,7 +740,53 @@ impl ResponseParser {
                 definition.name
             );
         }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> anyhow::Result<ChatText> {
+        self.process(true)?;
+        self.validate_required()?;
         self.delta(true)
+    }
+}
+
+struct ResponseCheckpoint {
+    buffer_len: usize,
+    pos: usize,
+    current: Option<usize>,
+    region: Option<Region>,
+    closed: Vec<std::sync::Arc<Vec<Region>>>,
+    seen: Vec<bool>,
+}
+
+struct ResponseTrial<'a> {
+    parser: &'a mut ResponseParser,
+    checkpoint: ResponseCheckpoint,
+}
+
+impl<'a> ResponseTrial<'a> {
+    fn new(parser: &'a mut ResponseParser) -> Self {
+        let checkpoint = ResponseCheckpoint {
+            buffer_len: parser.buffer.len(),
+            pos: parser.pos,
+            current: parser.current,
+            region: parser.region.clone(),
+            closed: parser.closed.clone(),
+            seen: parser.seen.clone(),
+        };
+        Self { parser, checkpoint }
+    }
+}
+
+impl Drop for ResponseTrial<'_> {
+    fn drop(&mut self) {
+        let saved = &mut self.checkpoint;
+        self.parser.buffer.truncate(saved.buffer_len);
+        self.parser.pos = saved.pos;
+        self.parser.current = saved.current;
+        self.parser.region = saved.region.take();
+        self.parser.closed = std::mem::take(&mut saved.closed);
+        self.parser.seen = std::mem::take(&mut saved.seen);
     }
 }
 
@@ -753,6 +821,104 @@ mod tests {
         output.reasoning.push_str(&delta.reasoning);
         Ok(output)
     }
+    #[test]
+    fn preview_restores_replaced_repeated_regions_and_the_published_baseline() {
+        for repeats in [false, true] {
+            let spec = template(repeats);
+            let mut parser =
+                ResponseParser::new(spec.clone(), "[assistant]", PrefixOutput::Exclude, 16384)
+                    .unwrap();
+            let mut fresh =
+                ResponseParser::new(spec, "[assistant]", PrefixOutput::Exclude, 16384).unwrap();
+            assert_eq!(
+                parser.feed("<r>one</r>x").unwrap(),
+                fresh.feed("<r>one</r>x").unwrap()
+            );
+            let before = parser.closed.clone();
+            for _ in 0..2 {
+                let trial = parser.preview("<r>two</r>answer[end]", true).unwrap();
+                assert_eq!(trial.content, "answer");
+                assert_eq!(trial.reasoning, if repeats { "onetwo" } else { "two" });
+                assert!(
+                    before
+                        .iter()
+                        .zip(&parser.closed)
+                        .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+                );
+                assert_eq!(parser.buffer, "<r>one</r>x");
+            }
+            assert_eq!(
+                parser.feed("tail[end]").unwrap(),
+                fresh.feed("tail[end]").unwrap()
+            );
+            assert_eq!(parser.finish().unwrap(), fresh.finish().unwrap());
+        }
+    }
+
+    #[test]
+    fn preview_failures_and_unwinding_leave_required_fields_and_defaults_unchanged() {
+        let spec = ResponseTemplate::compile(&serde_json::json!({
+            "start_anchor":"[a]", "fields":{"content":{"open":"<c>","close":"</c>","optional":false}},
+            "defaults":{"reasoning_content":"default"}
+        })).unwrap();
+        let mut parser = ResponseParser::new(spec, "[a]", PrefixOutput::Include, 32).unwrap();
+        assert!(
+            parser
+                .preview("discard", true)
+                .unwrap_err()
+                .to_string()
+                .contains("required field")
+        );
+        assert!(
+            parser
+                .preview(&"x".repeat(33), false)
+                .unwrap_err()
+                .to_string()
+                .contains("buffer")
+        );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let trial = ResponseTrial::new(&mut parser);
+            trial.parser.append("<c>discard</c>").unwrap();
+            trial.parser.process(true).unwrap();
+            panic!("inject speculative parser unwind");
+        }));
+        assert!(panic.is_err());
+        assert!(parser.buffer.is_empty());
+        assert!(parser.seen.iter().all(|seen| !seen));
+        assert!(
+            parser
+                .preview("", true)
+                .unwrap_err()
+                .to_string()
+                .contains("required field")
+        );
+        let value = parser.preview("<c>保留</c>", true).unwrap();
+        assert_eq!(value.content, "保留");
+        assert_eq!(value.reasoning, "default");
+        assert!(parser.feed("<c>actual</c>").unwrap().content == "actual");
+        assert_eq!(parser.finish().unwrap().reasoning, "default");
+    }
+
+    #[test]
+    fn preview_final_projection_can_replace_text_that_streaming_already_published() {
+        let spec = ResponseTemplate::compile(&serde_json::json!({
+            "start_anchor":"[a]", "fields":{"content":{"open_pattern":"<c>\\s*","close":"</c>"}}
+        }))
+        .unwrap();
+        let mut parser =
+            ResponseParser::new(spec, "[a]<c>old", PrefixOutput::Include, 1024).unwrap();
+        assert_eq!(parser.preview("</c><c>", false).unwrap().content, "old");
+        assert_eq!(parser.preview("</c><c>", true).unwrap().content, "");
+        assert_eq!(parser.feed("</c><c>").unwrap().content, "old");
+        assert!(
+            parser
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("buffered output")
+        );
+    }
+
     #[test]
     fn ordinary_prefill_includes_closed_and_open_regions_even_without_generated_text() {
         let spec = template(true);
