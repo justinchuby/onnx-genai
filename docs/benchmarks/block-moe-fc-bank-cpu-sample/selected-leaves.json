@@ -1,0 +1,80 @@
+[
+  {
+    "round": 0,
+    "arm": "before",
+    "selected_leaf_counts_from_censored_list": {
+      "decode_mxfp4_block": 2830,
+      "gemm_bt_neon_block": 501,
+      "candidate_gated_activation_row": 0,
+      "memset": 14,
+      "condition_wait": 4371,
+      "thread_switch": 3280
+    },
+    "censored_list_total": 11825
+  },
+  {
+    "round": 0,
+    "arm": "banked",
+    "selected_leaf_counts_from_censored_list": {
+      "decode_mxfp4_block": 2646,
+      "gemm_bt_neon_block": 495,
+      "candidate_gated_activation_row": 81,
+      "memset": 16,
+      "condition_wait": 4326,
+      "thread_switch": 3261
+    },
+    "censored_list_total": 11601
+  },
+  {
+    "round": 0,
+    "arm": "null",
+    "selected_leaf_counts_from_censored_list": {
+      "decode_mxfp4_block": 2777,
+      "gemm_bt_neon_block": 510,
+      "candidate_gated_activation_row": 0,
+      "memset": 16,
+      "condition_wait": 4374,
+      "thread_switch": 3299
+    },
+    "censored_list_total": 11751
+  },
+  {
+    "round": 1,
+    "arm": "banked",
+    "selected_leaf_counts_from_censored_list": {
+      "decode_mxfp4_block": 2524,
+      "gemm_bt_neon_block": 457,
+      "candidate_gated_activation_row": 65,
+      "memset": 11,
+      "condition_wait": 4314,
+      "thread_switch": 3275
+    },
+    "censored_list_total": 11469
+  },
+  {
+    "round": 1,
+    "arm": "null",
+    "selected_leaf_counts_from_censored_list": {
+      "decode_mxfp4_block": 2593,
+      "gemm_bt_neon_block": 470,
+      "candidate_gated_activation_row": 0,
+      "memset": 10,
+      "condition_wait": 4314,
+      "thread_switch": 3375
+    },
+    "censored_list_total": 11613
+  },
+  {
+    "round": 1,
+    "arm": "before",
+    "selected_leaf_counts_from_censored_list": {
+      "decode_mxfp4_block": 2708,
+      "gemm_bt_neon_block": 441,
+      "candidate_gated_activation_row": 0,
+      "memset": 13,
+      "condition_wait": 4257,
+      "thread_switch": 3274
+    },
+    "censored_list_total": 11548
+  }
+]

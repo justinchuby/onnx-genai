@@ -1,0 +1,195 @@
+
+/tmp/nxrt-bank-cpu-sample/sample-probe:	file format mach-o arm64
+
+Disassembly of section __TEXT,__text:
+
+00000001001c4a2c <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row>:
+1001c4a2c: d10443ff    	sub	sp, sp, #0x110
+1001c4a30: 6d073bef    	stp	d15, d14, [sp, #0x70]
+1001c4a34: 6d0833ed    	stp	d13, d12, [sp, #0x80]
+1001c4a38: 6d092beb    	stp	d11, d10, [sp, #0x90]
+1001c4a3c: 6d0a23e9    	stp	d9, d8, [sp, #0xa0]
+1001c4a40: a90b6ffc    	stp	x28, x27, [sp, #0xb0]
+1001c4a44: a90c67fa    	stp	x26, x25, [sp, #0xc0]
+1001c4a48: a90d5ff8    	stp	x24, x23, [sp, #0xd0]
+1001c4a4c: a90e57f6    	stp	x22, x21, [sp, #0xe0]
+1001c4a50: a90f4ff4    	stp	x20, x19, [sp, #0xf0]
+1001c4a54: a9107bfd    	stp	x29, x30, [sp, #0x100]
+1001c4a58: 910403fd    	add	x29, sp, #0x100
+1001c4a5c: f100009f    	cmp	x4, #0x0
+1001c4a60: 9a850069    	csel	x9, x3, x5, eq
+1001c4a64: 9a840048    	csel	x8, x2, x4, eq
+1001c4a68: a90327e8    	stp	x8, x9, [sp, #0x30]
+1001c4a6c: b4000d21    	cbz	x1, 0x1001c4c10 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x1e4>
+1001c4a70: aa0603f7    	mov	x23, x6
+1001c4a74: aa0403f8    	mov	x24, x4
+1001c4a78: aa0303f6    	mov	x22, x3
+1001c4a7c: f9400ba8    	ldr	x8, [x29, #0x10]
+1001c4a80: f94004fb    	ldr	x27, [x7, #0x8]
+1001c4a84: b9400109    	ldr	w9, [x8]
+1001c4a88: b9002fe9    	str	w9, [sp, #0x2c]
+1001c4a8c: a940ad0a    	ldp	x10, x11, [x8, #0x8]
+1001c4a90: a941a109    	ldp	x9, x8, [x8, #0x18]
+1001c4a94: a901abe9    	stp	x9, x10, [sp, #0x18]
+1001c4a98: a900afe8    	stp	x8, x11, [sp, #0x8]
+1001c4a9c: bd4018e8    	ldr	s8, [x7, #0x18]
+1001c4aa0: 1e214109    	fneg	s9, s8
+1001c4aa4: 1e202108    	fcmp	s8, #0.0
+1001c4aa8: 54000ccb    	b.lt	0x1001c4c40 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x214>
+1001c4aac: aa0203f9    	mov	x25, x2
+1001c4ab0: aa0003f5    	mov	x21, x0
+1001c4ab4: d280001c    	mov	x28, #0x0               ; =0
+1001c4ab8: d2800013    	mov	x19, #0x0               ; =0
+1001c4abc: d37ef434    	lsl	x20, x1, #2
+1001c4ac0: 2d422cea    	ldp	s10, s11, [x7, #0x10]
+1001c4ac4: 1e28790c    	fminnm	s12, s8, s8
+1001c4ac8: 1e2e100d    	fmov	s13, #1.00000000
+1001c4acc: 14000013    	b	0x1001c4b18 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0xec>
+1001c4ad0: 1e214000    	fneg	s0, s0
+1001c4ad4: 941716f9    	bl	0x10078a6b8 <dyld_stub_binder+0x10078a6b8>
+1001c4ad8: 1e2e1001    	fmov	s1, #1.00000000
+1001c4adc: 1e2d2800    	fadd	s0, s0, s13
+1001c4ae0: 1e201820    	fdiv	s0, s1, s0
+1001c4ae4: 1e2921c0    	fcmp	s14, s9
+1001c4ae8: 1e2e4d21    	fcsel	s1, s9, s14, mi
+1001c4aec: 1e282020    	fcmp	s1, s8
+1001c4af0: 1e21cd01    	fcsel	s1, s8, s1, gt
+1001c4af4: 1e2009e0    	fmul	s0, s15, s0
+1001c4af8: 1e212961    	fadd	s1, s11, s1
+1001c4afc: 1e200820    	fmul	s0, s1, s0
+1001c4b00: bd000340    	str	s0, [x26]
+1001c4b04: 910006f7    	add	x23, x23, #0x1
+1001c4b08: 91000b9c    	add	x28, x28, #0x2
+1001c4b0c: 91000673    	add	x19, x19, #0x1
+1001c4b10: f1001294    	subs	x20, x20, #0x4
+1001c4b14: 540007e0    	b.eq	0x1001c4c10 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x1e4>
+1001c4b18: aa1503fa    	mov	x26, x21
+1001c4b1c: 910012b5    	add	x21, x21, #0x4
+1001c4b20: 52800028    	mov	w8, #0x1                ; =1
+1001c4b24: aa130508    	orr	x8, x8, x19, lsl #1
+1001c4b28: f100077f    	cmp	x27, #0x1
+1001c4b2c: 9a930389    	csel	x9, x28, x19, eq
+1001c4b30: 9a97010a    	csel	x10, x8, x23, eq
+1001c4b34: f100031f    	cmp	x24, #0x0
+1001c4b38: 9a930128    	csel	x8, x9, x19, eq
+1001c4b3c: 9a930140    	csel	x0, x10, x19, eq
+1001c4b40: eb16011f    	cmp	x8, x22
+1001c4b44: 540008a2    	b.hs	0x1001c4c58 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x22c>
+1001c4b48: bc687b20    	ldr	s0, [x25, x8, lsl #2]
+1001c4b4c: b9402fe9    	ldr	w9, [sp, #0x2c]
+1001c4b50: 34000189    	cbz	w9, 0x1001c4b80 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x154>
+1001c4b54: f94013e9    	ldr	x9, [sp, #0x20]
+1001c4b58: b40002a9    	cbz	x9, 0x1001c4bac <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x180>
+1001c4b5c: f9400be9    	ldr	x9, [sp, #0x10]
+1001c4b60: eb09011f    	cmp	x8, x9
+1001c4b64: 54000d42    	b.hs	0x1001c4d0c <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x2e0>
+1001c4b68: f94013e9    	ldr	x9, [sp, #0x20]
+1001c4b6c: bc687921    	ldr	s1, [x9, x8, lsl #2]
+1001c4b70: f9401fe8    	ldr	x8, [sp, #0x38]
+1001c4b74: eb08001f    	cmp	x0, x8
+1001c4b78: 54000223    	b.lo	0x1001c4bbc <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x190>
+1001c4b7c: 1400005f    	b	0x1001c4cf8 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x2cc>
+1001c4b80: f9401fe8    	ldr	x8, [sp, #0x38]
+1001c4b84: eb08001f    	cmp	x0, x8
+1001c4b88: 54000b82    	b.hs	0x1001c4cf8 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x2cc>
+1001c4b8c: f9401be8    	ldr	x8, [sp, #0x30]
+1001c4b90: bc60790e    	ldr	s14, [x8, x0, lsl #2]
+1001c4b94: 1e207800    	fminnm	s0, s0, s0
+1001c4b98: 1e2c780f    	fminnm	s15, s0, s12
+1001c4b9c: 1e2f0940    	fmul	s0, s10, s15
+1001c4ba0: 1e202008    	fcmp	s0, #0.0
+1001c4ba4: 54fff96a    	b.ge	0x1001c4ad0 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0xa4>
+1001c4ba8: 14000017    	b	0x1001c4c04 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x1d8>
+1001c4bac: 6f00e401    	movi.2d	v1, #0000000000000000
+1001c4bb0: f9401fe8    	ldr	x8, [sp, #0x38]
+1001c4bb4: eb08001f    	cmp	x0, x8
+1001c4bb8: 54000a02    	b.hs	0x1001c4cf8 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x2cc>
+1001c4bbc: f9401be8    	ldr	x8, [sp, #0x30]
+1001c4bc0: bc607902    	ldr	s2, [x8, x0, lsl #2]
+1001c4bc4: f9400fe8    	ldr	x8, [sp, #0x18]
+1001c4bc8: b40000e8    	cbz	x8, 0x1001c4be4 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x1b8>
+1001c4bcc: f94007e8    	ldr	x8, [sp, #0x8]
+1001c4bd0: eb08001f    	cmp	x0, x8
+1001c4bd4: 540006a2    	b.hs	0x1001c4ca8 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x27c>
+1001c4bd8: f9400fe8    	ldr	x8, [sp, #0x18]
+1001c4bdc: bc607903    	ldr	s3, [x8, x0, lsl #2]
+1001c4be0: 14000002    	b	0x1001c4be8 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x1bc>
+1001c4be4: 6f00e403    	movi.2d	v3, #0000000000000000
+1001c4be8: 1e212800    	fadd	s0, s0, s1
+1001c4bec: 1e23284e    	fadd	s14, s2, s3
+1001c4bf0: 1e207800    	fminnm	s0, s0, s0
+1001c4bf4: 1e2c780f    	fminnm	s15, s0, s12
+1001c4bf8: 1e2f0940    	fmul	s0, s10, s15
+1001c4bfc: 1e202008    	fcmp	s0, #0.0
+1001c4c00: 54fff68a    	b.ge	0x1001c4ad0 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0xa4>
+1001c4c04: 941716ad    	bl	0x10078a6b8 <dyld_stub_binder+0x10078a6b8>
+1001c4c08: 4ea01c01    	mov.16b	v1, v0
+1001c4c0c: 17ffffb4    	b	0x1001c4adc <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0xb0>
+1001c4c10: a9507bfd    	ldp	x29, x30, [sp, #0x100]
+1001c4c14: a94f4ff4    	ldp	x20, x19, [sp, #0xf0]
+1001c4c18: a94e57f6    	ldp	x22, x21, [sp, #0xe0]
+1001c4c1c: a94d5ff8    	ldp	x24, x23, [sp, #0xd0]
+1001c4c20: a94c67fa    	ldp	x26, x25, [sp, #0xc0]
+1001c4c24: a94b6ffc    	ldp	x28, x27, [sp, #0xb0]
+1001c4c28: 6d4a23e9    	ldp	d9, d8, [sp, #0xa0]
+1001c4c2c: 6d492beb    	ldp	d11, d10, [sp, #0x90]
+1001c4c30: 6d4833ed    	ldp	d13, d12, [sp, #0x80]
+1001c4c34: 6d473bef    	ldp	d15, d14, [sp, #0x70]
+1001c4c38: 910443ff    	add	sp, sp, #0x110
+1001c4c3c: d65f03c0    	ret
+1001c4c40: d2800008    	mov	x8, #0x0                ; =0
+1001c4c44: f100077f    	cmp	x27, #0x1
+1001c4c48: 9a9f16e9    	csinc	x9, x23, xzr, ne
+1001c4c4c: f100031f    	cmp	x24, #0x0
+1001c4c50: 9a9f0120    	csel	x0, x9, xzr, eq
+1001c4c54: b50000d6    	cbnz	x22, 0x1001c4c6c <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x240>
+1001c4c58: f0003de2    	adrp	x2, 0x100983000 <_anon.11c9c5cd631db8417a1bc534df02f8ae.413+0x948>
+1001c4c5c: 91080042    	add	x2, x2, #0x200
+1001c4c60: aa0803e0    	mov	x0, x8
+1001c4c64: aa1603e1    	mov	x1, x22
+1001c4c68: 9417152a    	bl	0x10078a110 <__RNvNtCslWxY2MhVcag_4core9panicking18panic_bounds_check>
+1001c4c6c: b9402fe8    	ldr	w8, [sp, #0x2c]
+1001c4c70: 36000248    	tbz	w8, #0x0, 0x1001c4cb8 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x28c>
+1001c4c74: f94013e8    	ldr	x8, [sp, #0x20]
+1001c4c78: f100011f    	cmp	x8, #0x0
+1001c4c7c: f9400be8    	ldr	x8, [sp, #0x10]
+1001c4c80: fa401900    	ccmp	x8, #0x0, #0x0, ne
+1001c4c84: 54000420    	b.eq	0x1001c4d08 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x2dc>
+1001c4c88: f9401fe8    	ldr	x8, [sp, #0x38]
+1001c4c8c: eb08001f    	cmp	x0, x8
+1001c4c90: 54000342    	b.hs	0x1001c4cf8 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x2cc>
+1001c4c94: f9400fe8    	ldr	x8, [sp, #0x18]
+1001c4c98: f100011f    	cmp	x8, #0x0
+1001c4c9c: f94007e8    	ldr	x8, [sp, #0x8]
+1001c4ca0: fa481000    	ccmp	x0, x8, #0x0, ne
+1001c4ca4: 54000103    	b.lo	0x1001c4cc4 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x298>
+1001c4ca8: b0003de2    	adrp	x2, 0x100981000 <_anon.f9cbb97ea432e6704329cb8fd63ea027.80+0xe8>
+1001c4cac: 91386042    	add	x2, x2, #0xe18
+1001c4cb0: f94007e1    	ldr	x1, [sp, #0x8]
+1001c4cb4: 94171517    	bl	0x10078a110 <__RNvNtCslWxY2MhVcag_4core9panicking18panic_bounds_check>
+1001c4cb8: f9401fe8    	ldr	x8, [sp, #0x38]
+1001c4cbc: eb08001f    	cmp	x0, x8
+1001c4cc0: 540001c2    	b.hs	0x1001c4cf8 <__RNvNtNtCslTkvSo5tf7a_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_row+0x2cc>
+1001c4cc4: 2d0823e9    	stp	s9, s8, [sp, #0x40]
+1001c4cc8: d0002be8    	adrp	x8, 0x100742000 <__RNvXs1_NtNtCslWxY2MhVcag_4core3num11float_parsefNtNtNtB9_3str6traits7FromStr8from_str+0x2f8>
+1001c4ccc: 9113a108    	add	x8, x8, #0x4e8
+1001c4cd0: 910103e9    	add	x9, sp, #0x40
+1001c4cd4: a904a3e9    	stp	x9, x8, [sp, #0x48]
+1001c4cd8: 910113e9    	add	x9, sp, #0x44
+1001c4cdc: a905a3e9    	stp	x9, x8, [sp, #0x58]
+1001c4ce0: f00033a0    	adrp	x0, 0x10083b000 <_anon.11c9c5cd631db8417a1bc534df02f8ae.56+0x34>
+1001c4ce4: 9119f800    	add	x0, x0, #0x67e
+1001c4ce8: d0003de2    	adrp	x2, 0x100982000 <_anon.11c9c5cd631db8417a1bc534df02f8ae.125+0x1b8>
+1001c4cec: 91052042    	add	x2, x2, #0x148
+1001c4cf0: 910123e1    	add	x1, sp, #0x48
+1001c4cf4: 94171563    	bl	0x10078a280 <__RNvNtCslWxY2MhVcag_4core9panicking9panic_fmt>
+1001c4cf8: f0003de2    	adrp	x2, 0x100983000 <_anon.11c9c5cd631db8417a1bc534df02f8ae.413+0x948>
+1001c4cfc: 91086042    	add	x2, x2, #0x218
+1001c4d00: f9401fe1    	ldr	x1, [sp, #0x38]
+1001c4d04: 94171503    	bl	0x10078a110 <__RNvNtCslWxY2MhVcag_4core9panicking18panic_bounds_check>
+1001c4d08: d2800008    	mov	x8, #0x0                ; =0
+1001c4d0c: b0003de2    	adrp	x2, 0x100981000 <_anon.f9cbb97ea432e6704329cb8fd63ea027.80+0xe8>
+1001c4d10: 91386042    	add	x2, x2, #0xe18
+1001c4d14: aa0803e0    	mov	x0, x8
+1001c4d18: f9400be1    	ldr	x1, [sp, #0x10]
+1001c4d1c: 941714fd    	bl	0x10078a110 <__RNvNtCslWxY2MhVcag_4core9panicking18panic_bounds_check>

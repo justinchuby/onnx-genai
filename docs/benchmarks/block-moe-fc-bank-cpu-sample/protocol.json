@@ -1,0 +1,38 @@
+{
+  "scope": "CPU stack diagnosis only, not a performance measurement; separate sampler overhead from prior formal benchmarks",
+  "case": [
+    8,
+    128,
+    256,
+    4,
+    0,
+    1,
+    "block"
+  ],
+  "orders": [
+    [
+      "before",
+      "banked",
+      "null"
+    ],
+    [
+      "banked",
+      "null",
+      "before"
+    ]
+  ],
+  "steady_window_wall_seconds": 15,
+  "sample_duration_seconds": 5,
+  "sample_interval_ms": 1,
+  "sample_command": [
+    "/usr/bin/sample",
+    "EXACT_OWN_CHILD_PID",
+    "5",
+    "1",
+    "-mayDie",
+    "-file",
+    "OUTPUT"
+  ],
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "sampler_only_targets_own_synthetic_child": true
+}

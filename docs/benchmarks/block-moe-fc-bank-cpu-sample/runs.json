@@ -1,0 +1,74 @@
+[
+  {
+    "round": 0,
+    "arm": "before",
+    "pid": 68191,
+    "ready": {
+      "arm": "before",
+      "workspace_bytes": 28672,
+      "factory_creates": 1
+    },
+    "output_sha256": "52010162565e21bf550b05aa28c30d4e0e5186826eda6e64bb99a930e39f92b3",
+    "sample_sha256": "4c7848c7860bb9d220ab41a25aef77cbf97ed790be94d016ea883dbf2f285a59"
+  },
+  {
+    "round": 0,
+    "arm": "banked",
+    "pid": 68260,
+    "ready": {
+      "arm": "banked",
+      "workspace_bytes": 49152,
+      "factory_creates": 1
+    },
+    "output_sha256": "52010162565e21bf550b05aa28c30d4e0e5186826eda6e64bb99a930e39f92b3",
+    "sample_sha256": "7cc158b0c438c17d75f3710d309a64d40d96c868f965b77a83cbc91c127b4dd4"
+  },
+  {
+    "round": 0,
+    "arm": "null",
+    "pid": 68321,
+    "ready": {
+      "arm": "null",
+      "workspace_bytes": 28672,
+      "factory_creates": 1
+    },
+    "output_sha256": "52010162565e21bf550b05aa28c30d4e0e5186826eda6e64bb99a930e39f92b3",
+    "sample_sha256": "f525433797404d1bc28b004bcb61d4d81d6a3a7b0954422a6786bab1c386fd66"
+  },
+  {
+    "round": 1,
+    "arm": "banked",
+    "pid": 68356,
+    "ready": {
+      "arm": "banked",
+      "workspace_bytes": 49152,
+      "factory_creates": 1
+    },
+    "output_sha256": "52010162565e21bf550b05aa28c30d4e0e5186826eda6e64bb99a930e39f92b3",
+    "sample_sha256": "ce045321f5b9043c84a0e980290c9e39ed355744bf1712d80f7c70924b06220b"
+  },
+  {
+    "round": 1,
+    "arm": "null",
+    "pid": 68507,
+    "ready": {
+      "arm": "null",
+      "workspace_bytes": 28672,
+      "factory_creates": 1
+    },
+    "output_sha256": "52010162565e21bf550b05aa28c30d4e0e5186826eda6e64bb99a930e39f92b3",
+    "sample_sha256": "bddb77828df996c369e960e7c61a53ab8778ca653029acbae23a5d48c04fff0d"
+  },
+  {
+    "round": 1,
+    "arm": "before",
+    "pid": 68574,
+    "ready": {
+      "arm": "before",
+      "workspace_bytes": 28672,
+      "factory_creates": 1
+    },
+    "output_sha256": "52010162565e21bf550b05aa28c30d4e0e5186826eda6e64bb99a930e39f92b3",
+    "sample_sha256": "992e3f40672154ff044db84ed029507ddf45478dc95e7542091d2bafeace2b6e"
+  }
+]
