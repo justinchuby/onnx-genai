@@ -1,0 +1,936 @@
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs b/crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs
+index e1492e11c..0f0859e06 100644
+--- a/crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs
+@@ -127,6 +127,46 @@ impl<'a> ProjectionScratch<'a> {
+         Ok(unsafe { std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast(), written) })
+     }
+ 
++    /// Gather in caller-selected whole-row tasks, preserving its threading
++    /// policy. Each returned element is written once; unused capacity is untouched.
++    pub(super) fn gather_rows_parallel(
++        &mut self,
++        input: &[f32],
++        width: usize,
++        rows: &[u32],
++        rows_per_task: std::num::NonZeroUsize,
++    ) -> Result<&mut [f32]> {
++        if width == 0 || rows.is_empty() {
++            return Ok(&mut []);
++        }
++        let count = rows.len().checked_mul(width).ok_or_else(|| {
++            EpError::KernelFailed(
++                "projection parallel gather size overflow; reduce routed batch dimensions".into(),
++            )
++        })?;
++        let capacity = self.storage.len();
++        let target = self.storage.get_mut(..count).ok_or_else(|| EpError::KernelFailed(
++            format!("projection parallel gather needs {count} values, workspace has {capacity}; prepare the complete grouped-input bound")
++        ))?;
++        // count above proves this clamped chunk multiplication addressable.
++        let chunk_rows = rows_per_task.get().min(rows.len());
++        target.par_chunks_mut(chunk_rows * width).zip(rows.par_chunks(chunk_rows)).try_for_each(|(target, rows)| -> Result<()> {
++            for (target, &row) in target.chunks_mut(width).zip(rows) {
++                let start = (row as usize).checked_mul(width).ok_or_else(|| EpError::KernelFailed(
++                    format!("projection input row {row} times width {width} overflows addressable storage")
++                ))?;
++                let source = input.get(start..).and_then(|rest| rest.get(..width)).ok_or_else(|| EpError::KernelFailed(
++                    format!("projection input row {row} of width {width} exceeds {} input values; validate routed row indices", input.len())
++                ))?;
++                for (target, &value) in target.iter_mut().zip(source) { target.write(value); }
++            }
++            Ok(())
++        })?;
++        // SAFETY: disjoint complete rows were initialized above. A failed
++        // gather never creates an f32 slice over partially initialized backing.
++        Ok(unsafe { std::slice::from_raw_parts_mut(target.as_mut_ptr().cast(), count) })
++    }
++
+     pub(super) fn initialized(&mut self) -> &mut [f32] {
+         if !self.initialized {
+             // SAFETY: binding exclusively lends every element. All-zero bytes
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/mod.rs b/crates/onnx-runtime-ep-cpu/src/kernels/mod.rs
+index 94cce713d..6f3c0d55a 100644
+--- a/crates/onnx-runtime-ep-cpu/src/kernels/mod.rs
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/mod.rs
+@@ -1294,7 +1294,7 @@ pub(crate) fn build_cpu_registry_with_resources(
+     );
+     rec.register(
+         OpKey::new("MoE", "com.microsoft", 1),
+-        onnx_runtime_ep_api::WorkspacePlanning::None,
++        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+         Box::new(moe::MoEFactory),
+     );
+     rec.register(
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/moe.rs b/crates/onnx-runtime-ep-cpu/src/kernels/moe.rs
+index a1c144e47..0e69155e0 100644
+--- a/crates/onnx-runtime-ep-cpu/src/kernels/moe.rs
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/moe.rs
+@@ -5,7 +5,10 @@
+ //! `fc2_experts_weights`, `fc2_experts_bias?`, `fc3_experts_weights?`,
+ //! `fc3_experts_bias?`. Weights use ORT's expert-major canonical layout.
+ 
+-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
++use onnx_runtime_ep_api::{
++    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
++    WorkspaceRequirement, WorkspaceView,
++};
+ use onnx_runtime_ir::{DataType, Node};
+ // Only the MLAS bucketing and the `#[cfg(test)]` reference algorithm still
+ // need an ordered map; the driver itself orders by expert through `RoutingPlan`.
+@@ -13,6 +16,7 @@ use onnx_runtime_ir::{DataType, Node};
+ use std::collections::BTreeMap;
+ 
+ use super::check_arity;
++use super::decoded_projection::ProjectionScratch;
+ use super::gelu::tanh_gelu;
+ #[cfg(not(feature = "mlas"))]
+ use super::matmul::gemm_bt;
+@@ -130,6 +134,8 @@ pub struct MoEFactory;
+ /// Float MoE kernel that groups routed rows by expert before expert GEMMs.
+ pub struct MoEKernel {
+     attributes: MoeAttributes,
++    // Fixed at creation so metadata bounds and dispatch use the same policy.
++    grouped_min_work: u64,
+ }
+ 
+ #[derive(Clone, Copy, Debug)]
+@@ -175,6 +181,7 @@ impl KernelFactory for MoEFactory {
+     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+         Ok(Box::new(MoEKernel {
+             attributes: float_moe_attributes(node)?,
++            grouped_min_work: grouped_min_work(),
+         }))
+     }
+ }
+@@ -235,8 +242,87 @@ impl MoeAttributes {
+     }
+ }
+ 
++impl MoEKernel {
++    fn gather_workspace_bytes(&self, shape: &[usize], inter: usize) -> Result<usize> {
++        if !matches!(shape.len(), 2 | 3) {
++            return Err(error(format!(
++                "input must be 2-D [rows, hidden] or 3-D [batch, sequence, hidden], got {shape:?}"
++            )));
++        }
++        let invalid = || {
++            error(format!(
++                "grouped input workspace overflows for input {shape:?}, inter_size={inter}, k={}; reduce batch or projection dimensions",
++                self.attributes.k
++            ))
++        };
++        let rows = shape[..shape.len() - 1]
++            .iter()
++            .try_fold(1usize, |n, &d| n.checked_mul(d))
++            .ok_or_else(invalid)?;
++        let hidden = shape[shape.len() - 1];
++        let elements = rows.checked_mul(hidden).ok_or_else(invalid)?;
++        // Check the original f32 span even when a singleton needs no gather.
++        std::alloc::Layout::array::<f32>(elements).map_err(|_| invalid())?;
++        let fc1 = self.attributes.checked_fc1_size(inter, "MoE")?;
++        // Actual expert groups contain at most rows entries. Do not use the
++        // current pool width: prepare and run may enter different Rayon pools.
++        let grouped_possible =
++            projection_work_units(rows, fc1, hidden, inter) >= self.grouped_min_work;
++        let elements = if grouped_possible {
++            elements
++                .checked_mul(self.attributes.k)
++                .ok_or_else(invalid)?
++        } else if rows <= 1 {
++            0
++        } else {
++            elements
++        };
++        let layout = std::alloc::Layout::array::<f32>(elements).map_err(|_| invalid())?;
++        Ok(layout.size())
++    }
++}
++
+ impl Kernel for MoEKernel {
++    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
++        let required = |index: usize, name: &str| {
++            inputs
++                .get(index)
++                .filter(|input| input.present)
++                .ok_or_else(|| {
++                    error(format!(
++                        "required input {index} ('{name}') is absent during workspace preparation"
++                    ))
++                })
++        };
++        let input = required(0, "input")?;
++        if !matches!(
++            input.dtype,
++            DataType::Float32 | DataType::Float16 | DataType::BFloat16
++        ) {
++            return Err(error(format!(
++                "input 0 requires Float32, Float16, or BFloat16, got {:?}",
++                input.dtype
++            )));
++        }
++        let fc2 = required(4, "fc2_experts_weights")?;
++        require_shape("fc2_experts_weights", fc2.shape, 3)?;
++        Ok(WorkspaceRequirement {
++            bytes: self.gather_workspace_bytes(input.shape, fc2.shape[2])? as u64,
++            alignment: std::mem::align_of::<f32>(),
++            ..WorkspaceRequirement::NONE
++        })
++    }
++
+     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
++        self.execute_with_workspace(inputs, outputs, None)
++    }
++
++    fn execute_with_workspace(
++        &self,
++        inputs: &[TensorView],
++        outputs: &mut [TensorMut],
++        workspace: Option<WorkspaceView>,
++    ) -> Result<()> {
+         check_arity("MoE", inputs, outputs, 5, 8, 1)?;
+         if outputs.len() != 1 {
+             return Err(error(format!(
+@@ -297,7 +383,14 @@ impl Kernel for MoEKernel {
+             )));
+         }
+         let hidden = *x_shape.last().unwrap();
+-        let rows = x_shape[..x_shape.len() - 1].iter().product::<usize>();
++        let rows = x_shape[..x_shape.len() - 1]
++            .iter()
++            .try_fold(1usize, |n, &d| n.checked_mul(d))
++            .ok_or_else(|| {
++                error(format!(
++                    "flattened input row count overflows for {x_shape:?}; reduce batch dimensions"
++                ))
++            })?;
+         require_shape("router_probs", inputs[1].shape, 2)?;
+         if inputs[1].shape[0] != rows {
+             return Err(error(format!(
+@@ -373,6 +466,12 @@ impl Kernel for MoEKernel {
+             (None, None)
+         };
+ 
++        let scratch_bytes = self.gather_workspace_bytes(x_shape, inter)?;
++        // SAFETY: CPU dispatch lends exclusive Host-accessible backing through
++        // this synchronous execution. No gathered reference escapes the call.
++        let mut scratch =
++            unsafe { ProjectionScratch::bind("MoE grouped input", scratch_bytes, workspace)? };
++
+         // Borrow rather than `into_owned()`. Expert weights are the largest
+         // tensors in the graph - a Mixtral-shaped `fc1` + `fc2` pair is 352 MiB
+         // - and they are contiguous f32 initializers in every real model, so
+@@ -390,12 +489,13 @@ impl Kernel for MoEKernel {
+             self.attributes.k,
+             self.attributes.normalize_routing_weights,
+         );
+-        let driver = if use_grouped_driver(&plan, expected_fc1, hidden, inter) {
+-            plan.build_row_slots();
+-            run_moe_grouped
+-        } else {
+-            run_moe_per_expert
+-        };
++        let driver =
++            if use_grouped_driver(&plan, expected_fc1, hidden, inter, self.grouped_min_work) {
++                plan.build_row_slots();
++                run_moe_grouped
++            } else {
++                run_moe_per_expert
++            };
+         let output = driver(
+             &plan,
+             &x,
+@@ -409,6 +509,7 @@ impl Kernel for MoEKernel {
+             hidden,
+             inter,
+             &self.attributes,
++            &mut scratch,
+         )?;
+         write_dense_f32_narrow("MoE", &mut outputs[0], &output)
+     }
+@@ -692,7 +793,7 @@ fn grouped_linear(
+ ///
+ /// This is a one-host calibration on an AMD EPYC 9V74 (16C/32T, 32 MiB L3).
+ /// `ONNX_GENAI_MOE_GROUPED_MIN_WORK` overrides it; `0` forces the grouped
+-/// driver on for every shape.
++/// driver on for every shape with multiple workers. Read at kernel creation.
+ const MOE_GROUPED_MIN_WORK: u64 = 300_000_000;
+ 
+ /// Whether the grouped/batched driver is expected to beat the per-expert loop.
+@@ -700,9 +801,15 @@ const MOE_GROUPED_MIN_WORK: u64 = 300_000_000;
+ /// The discriminator is the work in *one* expert's GEMMs, not the total: the
+ /// grouped driver's win comes from parallelising the gather, activation and
+ /// scatter, which only matters once MLAS is already saturating the machine
+-/// inside each expert's GEMM. `slots / groups` is the average rows per expert,
+-/// and `fc1_size + inter` counts both the FC1(+FC3) and FC2 passes.
+-fn use_grouped_driver(plan: &RoutingPlan, fc1_size: usize, hidden: usize, inter: usize) -> bool {
++/// inside each expert's GEMM. The largest group determines that opportunity;
++/// `fc1_size + inter` counts both the FC1(+FC3) and FC2 passes.
++fn use_grouped_driver(
++    plan: &RoutingPlan,
++    fc1_size: usize,
++    hidden: usize,
++    inter: usize,
++    min_work: u64,
++) -> bool {
+     let groups = plan.groups.len();
+     if groups == 0 {
+         return true;
+@@ -712,7 +819,7 @@ fn use_grouped_driver(plan: &RoutingPlan, fc1_size: usize, hidden: usize, inter:
+         // one with fewer intermediate buffers.
+         return false;
+     }
+-    grouped_work_units(plan, fc1_size, hidden, inter) >= grouped_min_work()
++    grouped_work_units(plan, fc1_size, hidden, inter) >= min_work
+ }
+ 
+ /// The gate's work estimate, split out so it can be pinned by a test on a
+@@ -722,28 +829,31 @@ fn use_grouped_driver(plan: &RoutingPlan, fc1_size: usize, hidden: usize, inter:
+ /// of its rows to one expert still has one large GEMM to hide the elementwise
+ /// stages behind, and the mean would hide it.
+ fn grouped_work_units(plan: &RoutingPlan, fc1_size: usize, hidden: usize, inter: usize) -> u64 {
+-    let rows_per_group = plan.groups.iter().map(|group| group.len).max().unwrap_or(0) as u64;
+-    rows_per_group
++    let rows_per_group = plan.groups.iter().map(|group| group.len).max().unwrap_or(0);
++    projection_work_units(rows_per_group, fc1_size, hidden, inter)
++}
++
++fn projection_work_units(rows: usize, fc1_size: usize, hidden: usize, inter: usize) -> u64 {
++    (rows as u64)
+         .saturating_mul(hidden as u64)
+-        .saturating_mul((fc1_size + inter) as u64)
++        .saturating_mul((fc1_size as u64).saturating_add(inter as u64))
+ }
+ 
+ fn grouped_min_work() -> u64 {
+-    // Deliberately not cached: the read is once per operator call, next to a
+-    // multi-millisecond GEMM, and caching it in a `OnceLock` would let whichever
+-    // test ran first freeze the value for the whole process.
++    // Read once per kernel, never process-global: later environment changes
++    // apply to newly created kernels, not already prepared workspace plans.
+     std::env::var("ONNX_GENAI_MOE_GROUPED_MIN_WORK")
+         .ok()
+         .and_then(|v| v.trim().parse::<u64>().ok())
+         .unwrap_or(MOE_GROUPED_MIN_WORK)
+ }
+ 
+-/// The per-expert driver: gather each expert's rows into a fresh buffer, run
++/// The per-expert driver: gather each expert's rows into the shared lane, run
+ /// the pair of expert GEMMs, then accumulate the weighted result.
+ ///
+-/// Kept as the small-shape path. It allocates per expert and leaves the
++/// Kept as the small-shape path. It leaves FC intermediates per expert and the
+ /// gather, activation and scatter serial, which is exactly the trade that wins
+-/// when each expert only has a handful of rows.
++/// when each expert only has a handful of rows. Gather storage is reused.
+ ///
+ /// Iterating `plan.groups` reproduces the ascending-expert order, and slots
+ /// inside a group are in ascending row order, so this is **bit-identical** to
+@@ -762,6 +872,7 @@ fn run_moe_per_expert(
+     hidden: usize,
+     inter: usize,
+     attributes: &MoeAttributes,
++    scratch: &mut ProjectionScratch<'_>,
+ ) -> Result<Vec<f32>> {
+     let mut output = vec![0.0f32; plan.rows * hidden];
+     if plan.slots() == 0 || hidden == 0 {
+@@ -770,13 +881,18 @@ fn run_moe_per_expert(
+     for group in &plan.groups {
+         let expert = group.expert;
+         let slots = group.start..group.start + group.len;
+-        let mut grouped_input = Vec::with_capacity(group.len * hidden);
+-        for slot in slots.clone() {
+-            let source = plan.slot_row[slot] as usize * hidden;
+-            grouped_input.extend_from_slice(&x[source..source + hidden]);
+-        }
++        let grouped_input = if group.len == 1 {
++            let source = plan.slot_row[group.start] as usize * hidden;
++            &x[source..source + hidden]
++        } else {
++            scratch.gather_rows(
++                x,
++                hidden,
++                slots.clone().map(|slot| plan.slot_row[slot] as usize),
++            )?
++        };
+         let expert_out = run_expert_grouped(
+-            &grouped_input,
++            grouped_input,
+             group.len,
+             &fc1_weights[expert * fc1_size * hidden..(expert + 1) * fc1_size * hidden],
+             fc1_bias.map(|b| &b[expert * fc1_size..(expert + 1) * fc1_size]),
+@@ -823,6 +939,7 @@ fn run_moe_grouped(
+     hidden: usize,
+     inter: usize,
+     attributes: &MoeAttributes,
++    scratch: &mut ProjectionScratch<'_>,
+ ) -> Result<Vec<f32>> {
+     let slots = plan.slots();
+     let mut output = vec![0.0f32; plan.rows * hidden];
+@@ -835,20 +952,23 @@ fn run_moe_grouped(
+         "run_moe_grouped needs the row->slot inversion; call build_row_slots first"
+     );
+ 
+-    let mut gathered = vec![0.0f32; slots * hidden];
+-    let slot_row = &plan.slot_row;
+-    for_each_row(&mut gathered, hidden, |slot, row| {
+-        let source = slot_row[slot] as usize * hidden;
+-        row.copy_from_slice(&x[source..source + hidden]);
+-    });
++    let gathered = match parallel_rows_per_task(slots, hidden) {
++        Some(rows_per_task) => scratch.gather_rows_parallel(
++            x,
++            hidden,
++            &plan.slot_row,
++            std::num::NonZeroUsize::new(rows_per_task).expect("parallel row tasks are nonempty"),
++        )?,
++        None => scratch.gather_rows(x, hidden, plan.slot_row.iter().map(|&row| row as usize))?,
++    };
+ 
+     let mut fc1_out = vec![0.0f32; slots * fc1_size];
+-    grouped_linear(&gathered, plan, fc1_weights, fc1_size, hidden, &mut fc1_out)?;
++    grouped_linear(gathered, plan, fc1_weights, fc1_size, hidden, &mut fc1_out)?;
+ 
+     let gate_source = if attributes.uses_separate_gate(fc3_weights.is_some()) {
+         let mut fc3_out = vec![0.0f32; slots * inter];
+         grouped_linear(
+-            &gathered,
++            gathered,
+             plan,
+             fc3_weights.expect("validated separate gate FC3"),
+             inter,
+@@ -859,7 +979,6 @@ fn run_moe_grouped(
+     } else {
+         None
+     };
+-    drop(gathered);
+ 
+     let activated = apply_activation(
+         fc1_out,
+@@ -1494,7 +1613,7 @@ mod activation_validation_tests {
+ mod tests {
+     use super::*;
+     use crate::CpuExecutionProvider;
+-    use crate::kernels::testutil::Owned;
++    use crate::kernels::testutil::{Owned, PreparedTestKernel};
+     use onnx_runtime_ep_api::ExecutionProvider;
+     use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
+     use onnx_runtime_loader::Model;
+@@ -1538,6 +1657,22 @@ mod tests {
+         (graph, node)
+     }
+ 
++    fn test_scratch(backing: &mut [f32]) -> ProjectionScratch<'_> {
++        let bytes = std::mem::size_of_val(backing);
++        // SAFETY: exclusive initialized Host slice lives through the test call.
++        unsafe {
++            ProjectionScratch::bind(
++                "MoE test",
++                bytes,
++                Some(WorkspaceView::new(
++                    onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
++                    bytes,
++                )),
++            )
++        }
++        .unwrap()
++    }
++
+     fn kernel(graph: &Graph, node: NodeId) -> Box<dyn Kernel> {
+         let model = Model::new(graph);
+         CpuExecutionProvider::new()
+@@ -1545,6 +1680,217 @@ mod tests {
+             .unwrap()
+     }
+ 
++    fn workspace_kernel(min_work: u64) -> MoEKernel {
++        let (graph, node) = model_node(
++            &[],
++            &[],
++            &[
++                ("k", Attribute::Int(2)),
++                ("activation_type", Attribute::String(b"identity".to_vec())),
++                ("normalize_routing_weights", Attribute::Int(1)),
++            ],
++        );
++        MoEKernel {
++            attributes: float_moe_attributes(graph.node(node)).unwrap(),
++            grouped_min_work: min_work,
++        }
++    }
++
++    #[test]
++    fn gather_workspace_bounds_cover_threshold_skew_and_pool_changes() {
++        use crate::kernels::testutil::RecordingGovernor;
++        use onnx_runtime_ep_api::DevicePtrMut;
++        use onnx_runtime_memory_api::Tier;
++        use onnx_runtime_memory_governor::{
++            HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
++        };
++        use std::sync::Arc;
++        const ROWS: usize = 3;
++        const H: usize = 4;
++        const E: usize = 4;
++        const K: usize = 2;
++        let one = rayon::ThreadPoolBuilder::new()
++            .num_threads(1)
++            .build()
++            .unwrap();
++        let four = rayon::ThreadPoolBuilder::new()
++            .num_threads(4)
++            .build()
++            .unwrap();
++        let input = Owned::f32(
++            &[ROWS, H],
++            &[1., 1., 1., 1., 2., 2., 2., 2., 3., 3., 3., 3.],
++        );
++        let fc1 = Owned::f32(&[E, H, H], &[1.; E * H * H]);
++        let fc2 = Owned::f32(&[E, H, H], &[1.; E * H * H]);
++        // The upper bound is exactly 3*4*(4+4)=96. Test both sides,
++        // plus an explicit grouped override; policy lives in the kernel.
++        for threshold in [97, 96, 0] {
++            let kernel = workspace_kernel(threshold);
++            let bytes = ROWS * H * 4 * if threshold <= 96 { K } else { 1 };
++            let books = RecordingGovernor::new_host(bytes as u64);
++            let manager = ProcessMemoryManager::new().unwrap();
++            let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
++            let cpu = CpuExecutionProvider::with_resources(
++                crate::CpuMemoryResources::default()
++                    .with_workspace_pool(pool.clone())
++                    .unwrap(),
++            );
++            let mut counts = None;
++            for router_values in [
++                [4., 4., 0., 0., 0., 0., 4., 4., 4., 0., 0., 4.],
++                [4., 4., 0., 0.].repeat(ROWS).try_into().unwrap(),
++            ] {
++                let router = Owned::f32(&[ROWS, E], &router_values);
++                let inputs = [
++                    input.view(),
++                    router.view(),
++                    fc1.view(),
++                    TensorView::absent(DataType::Float32),
++                    fc2.view(),
++                ];
++                let metadata: Vec<_> = inputs
++                    .iter()
++                    .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
++                    .collect();
++                let req = one
++                    .install(|| kernel.workspace_requirement(&metadata))
++                    .unwrap();
++                assert_eq!(req.bytes, bytes as u64);
++                let plan = RoutingPlan::build(&router_values, ROWS, E, K, true);
++                assert!(!one.install(|| use_grouped_driver(&plan, H, H, H, threshold)));
++                assert_eq!(
++                    four.install(|| use_grouped_driver(&plan, H, H, H, threshold)),
++                    four.install(|| moe_worker_budget() >= 2)
++                        && grouped_work_units(&plan, H, H, H) >= threshold
++                );
++                let mut output = Owned::f32(&[ROWS, H], &[-123.; ROWS * H]);
++                let mut invalid_backing = vec![0f32; bytes / 4];
++                for workspace in [
++                    None,
++                    Some(WorkspaceView::new(
++                        DevicePtrMut(invalid_backing.as_mut_ptr().cast()),
++                        bytes - 4,
++                    )),
++                    Some(WorkspaceView::new(
++                        DevicePtrMut(
++                            invalid_backing
++                                .as_mut_ptr()
++                                .cast::<u8>()
++                                .wrapping_add(1)
++                                .cast(),
++                        ),
++                        bytes,
++                    )),
++                ] {
++                    let err = kernel
++                        .execute_with_workspace(&inputs, &mut [output.view_mut()], workspace)
++                        .unwrap_err();
++                    assert!(err.to_string().contains("MoE grouped input"), "{err}");
++                    assert_eq!(output.to_f32(), [-123.; ROWS * H]);
++                }
++                for pool_threads in [&one, &four, &one, &four] {
++                    for _ in 0..17 {
++                        let mut backing = cpu
++                            .allocate_workspace(req.bytes as usize, req.alignment, req.role())
++                            .unwrap();
++                        pool_threads
++                            .install(|| {
++                                let view = WorkspaceView::new(
++                                    DevicePtrMut(backing.as_mut_ptr()),
++                                    backing.len(),
++                                );
++                                let inputs = [
++                                    input.view(),
++                                    router.view(),
++                                    fc1.view(),
++                                    TensorView::absent(DataType::Float32),
++                                    fc2.view(),
++                                ];
++                                kernel.execute_with_workspace(
++                                    &inputs,
++                                    &mut [output.view_mut()],
++                                    Some(view),
++                                )
++                            })
++                            .unwrap();
++                        cpu.deallocate_workspace(backing).unwrap();
++                        // Independent identity-weight oracle: FC2(FC1(x))=16*x.
++                        assert_eq!(
++                            output.to_f32(),
++                            [16., 16., 16., 16., 32., 32., 32., 32., 48., 48., 48., 48.]
++                        );
++                        let current = (books.claims(), books.releases());
++                        assert_eq!(
++                            *counts.get_or_insert(current),
++                            current,
++                            "warm workspace must never call its issuer, including zero bytes"
++                        );
++                        assert_eq!(books.used(Tier::Host), bytes as u64);
++                        assert_eq!(manager.snapshot().unwrap().allocations.len(), 1);
++                    }
++                }
++            }
++            pool.trim_idle(u64::MAX).unwrap();
++            assert_eq!(books.used(Tier::Host), 0);
++            assert_eq!(manager.process_used(Tier::Host), 0);
++        }
++    }
++
++    #[test]
++    fn gather_workspace_metadata_checks_empty_singleton_dtype_and_overflow() {
++        let kernel = workspace_kernel(MOE_GROUPED_MIN_WORK);
++        let requirement = |shape: &[usize], dtype, present| {
++            kernel.workspace_requirement(&[
++                TensorMetadata::new(dtype, shape, present),
++                TensorMetadata::new(dtype, &[], false),
++                TensorMetadata::new(dtype, &[], false),
++                TensorMetadata::new(dtype, &[], false),
++                TensorMetadata::new(dtype, &[4, 4, 4], true),
++            ])
++        };
++        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
++            assert_eq!(requirement(&[0, 4], dtype, true).unwrap().bytes, 0);
++            assert_eq!(requirement(&[1, 4], dtype, true).unwrap().bytes, 0);
++            assert_eq!(requirement(&[2, 3, 4], dtype, true).unwrap().bytes, 96);
++        }
++        for shape in [
++            &[][..],
++            &[4],
++            &[1, 2, 3, 4],
++            &[usize::MAX, 2, 4],
++            &[2, usize::MAX],
++        ] {
++            assert!(
++                requirement(shape, DataType::Float32, true).is_err(),
++                "{shape:?}"
++            );
++        }
++        assert!(requirement(&[3, 4], DataType::Int32, true).is_err());
++        assert!(requirement(&[3, 4], DataType::Float32, false).is_err());
++        assert!(
++            kernel
++                .workspace_requirement(&[])
++                .unwrap_err()
++                .to_string()
++                .contains("input 0")
++        );
++        assert!(
++            kernel
++                .workspace_requirement(&[TensorMetadata::new(DataType::Float32, &[3, 4], true)])
++                .unwrap_err()
++                .to_string()
++                .contains("fc2_experts_weights")
++        );
++        let grouped = workspace_kernel(0);
++        assert_eq!(grouped.gather_workspace_bytes(&[1, 4], 4).unwrap(), 32);
++        assert!(
++            grouped
++                .gather_workspace_bytes(&[isize::MAX as usize / 8, 2], 4)
++                .is_err()
++        );
++    }
++
+     fn assert_close(got: &[f32], want: &[f32]) {
+         assert_eq!(got.len(), want.len());
+         for (i, (&got, &want)) in got.iter().zip(want).enumerate() {
+@@ -1592,7 +1938,7 @@ mod tests {
+         let fc2_tensor = Owned::f32(&[EXPERTS, HIDDEN, INTER], &fc2);
+         let mut grouped = Owned::zeros_f32(&[ROWS, HIDDEN]);
+         kernel(&graph, node)
+-            .execute(
++            .execute_prepared(
+                 &[
+                     x.view(),
+                     router_tensor.view(),
+@@ -1780,7 +2126,7 @@ mod tests {
+         let fc2_bias = Owned::f32(&[2, 2], &[0.25, -0.25, 0.5, 0.5]);
+         let mut y = Owned::zeros_f32(&[2, 2]);
+         kernel(&graph, node)
+-            .execute(
++            .execute_prepared(
+                 &[
+                     x.view(),
+                     router.view(),
+@@ -1814,7 +2160,7 @@ mod tests {
+         let fc2 = Owned::f32(&[2, 2, 2], &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
+         let mut y = Owned::zeros_f32(&[1, 2]);
+         kernel(&graph, node)
+-            .execute(
++            .execute_prepared(
+                 &[
+                     x.view(),
+                     router.view(),
+@@ -1847,7 +2193,7 @@ mod tests {
+         let fc2 = Owned::bf16(&[2, 2, 2], &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
+         let mut y = Owned::zeros(DataType::BFloat16, &[1, 2]);
+         kernel(&graph, node)
+-            .execute(
++            .execute_prepared(
+                 &[
+                     x.view(),
+                     router.view(),
+@@ -1888,7 +2234,7 @@ mod tests {
+         let fc2 = Owned::f32(&[2, 2, 2], &[1.0, 0.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.5]);
+         let mut y = Owned::zeros_f32(&[1, 2, 2]);
+         kernel(&graph, node)
+-            .execute(
++            .execute_prepared(
+                 &[
+                     x.view(),
+                     router.view(),
+@@ -1944,7 +2290,7 @@ mod tests {
+         let fc3_bias = Owned::f32(&[2, 1], &[0.0, 0.5]);
+         let mut y = Owned::zeros_f32(&[1, 2]);
+         kernel(&graph, node)
+-            .execute(
++            .execute_prepared(
+                 &[
+                     x.view(),
+                     router.view(),
+@@ -1986,7 +2332,7 @@ mod tests {
+         let fc2 = Owned::f32(&[1, 1, 2], &[1.0, 0.5]);
+         let mut y = Owned::zeros_f32(&[1, 1]);
+         kernel(&graph, node)
+-            .execute(
++            .execute_prepared(
+                 &[
+                     x.view(),
+                     router.view(),
+@@ -2027,7 +2373,7 @@ mod tests {
+         let fc3 = Owned::f32(&[1, 1, 1], &[4.0]);
+         let mut y = Owned::zeros_f32(&[1, 1]);
+         kernel(&graph, node)
+-            .execute(
++            .execute_prepared(
+                 &[
+                     x.view(),
+                     router.view(),
+@@ -2140,6 +2486,8 @@ mod tests {
+                         fc3_bias.as_deref(),
+                     );
+                     plan.build_row_slots();
++                    let mut backing = vec![0f32; plan.slots() * HIDDEN];
++                    let mut scratch = test_scratch(&mut backing);
+                     let grouped = run_moe_grouped(
+                         &plan,
+                         &x,
+@@ -2153,6 +2501,7 @@ mod tests {
+                         HIDDEN,
+                         INTER,
+                         &attributes,
++                        &mut scratch,
+                     )
+                     .unwrap();
+                     let per_expert = run_moe_per_expert(
+@@ -2168,6 +2517,7 @@ mod tests {
+                         HIDDEN,
+                         INTER,
+                         &attributes,
++                        &mut scratch,
+                     )
+                     .unwrap();
+                     assert_eq!(
+@@ -2212,13 +2562,13 @@ mod tests {
+             // so the test still means something on a single-core runner, where
+             // the driver always answers "per-expert" regardless of shape.
+             assert_eq!(
+-                grouped_work_units(&plan, fc1_size, hidden, inter) >= grouped_min_work(),
++                grouped_work_units(&plan, fc1_size, hidden, inter) >= MOE_GROUPED_MIN_WORK,
+                 expect,
+                 "hidden={hidden} inter={inter} experts={experts} k={k} tokens={tokens}"
+             );
+             if moe_worker_budget() >= 2 {
+                 assert_eq!(
+-                    use_grouped_driver(&plan, fc1_size, hidden, inter),
++                    use_grouped_driver(&plan, fc1_size, hidden, inter, MOE_GROUPED_MIN_WORK),
+                     expect,
+                     "driver disagrees with the work estimate"
+                 );
+@@ -2258,13 +2608,13 @@ mod tests {
+             largest as u64 * HIDDEN as u64 * (fc1_size + INTER) as u64
+         );
+         assert!(
+-            grouped_work_units(&plan, fc1_size, HIDDEN, INTER) >= grouped_min_work(),
++            grouped_work_units(&plan, fc1_size, HIDDEN, INTER) >= MOE_GROUPED_MIN_WORK,
+             "the dominant group is large enough for the grouped driver"
+         );
+         // The same shape summarised by the mean would fall below the floor, so
+         // this test fails if the statistic is ever changed back.
+         let mean_work = (mean as u64) * (HIDDEN as u64) * ((fc1_size + INTER) as u64);
+-        assert!(mean_work < grouped_min_work());
++        assert!(mean_work < MOE_GROUPED_MIN_WORK);
+     }
+ 
+     /// The exact algorithm `run_moe_grouped` replaced: gather each expert's
+@@ -2392,6 +2742,8 @@ mod tests {
+                     );
+                     let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true);
+                     plan.build_row_slots();
++                    let mut backing = vec![0f32; plan.slots() * HIDDEN];
++                    let mut scratch = test_scratch(&mut backing);
+                     let got = run_moe_grouped(
+                         &plan,
+                         &input,
+@@ -2405,6 +2757,7 @@ mod tests {
+                         HIDDEN,
+                         INTER,
+                         &attributes,
++                        &mut scratch,
+                     )
+                     .unwrap();
+                     assert_eq!(
+@@ -2500,7 +2853,7 @@ mod tests {
+         let fc2_tensor = Owned::f32(&[EXPERTS, HIDDEN, INTER], &fc2);
+         let mut got = Owned::zeros_f32(&[ROWS, HIDDEN]);
+         kernel(&graph, node)
+-            .execute(
++            .execute_prepared(
+                 &[
+                     x.view(),
+                     router_tensor.view(),
+@@ -2615,7 +2968,7 @@ mod tests {
+                         });
+                     }
+                     kernel(&graph, node)
+-                        .execute(&views, &mut [got.view_mut()])
++                        .execute_prepared(&views, &mut [got.view_mut()])
+                         .unwrap();
+ 
+                     let attributes = MoeAttributes::from_node(graph.node(node)).unwrap();
+@@ -2703,7 +3056,7 @@ mod tests {
+ 
+         let mut borrowed = Owned::zeros_f32(&[ROWS, HIDDEN]);
+         kernel(&graph, node)
+-            .execute(
++            .execute_prepared(
+                 &[
+                     x.view(),
+                     router_tensor.view(),
+@@ -2716,7 +3069,7 @@ mod tests {
+             .unwrap();
+         let mut copied = Owned::zeros_f32(&[ROWS, HIDDEN]);
+         kernel(&graph, node)
+-            .execute(
++            .execute_prepared(
+                 &[
+                     x.view(),
+                     router_tensor.view(),
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs b/crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs
+index ecefaceab..e7310be17 100644
+--- a/crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs
+@@ -2105,7 +2105,7 @@ fn error(message: impl Into<String>) -> EpError {
+ mod tests {
+     use super::*;
+     use crate::CpuExecutionProvider;
+-    use crate::kernels::testutil::Owned;
++    use crate::kernels::testutil::{Owned, PreparedTestKernel};
+     use crate::weight_offload::{WeightOffloadMode, WeightOffloadStats, metrics};
+     use onnx_runtime_ep_api::{DevicePtr, ExecutionProvider};
+     use onnx_runtime_ir::{Attribute, DeviceId, Graph, NodeId, WeightRef, static_shape};
+@@ -3443,7 +3443,7 @@ mod tests {
+         let mut float_output = Owned::zeros_f32(&[rows, hidden]);
+         kernel(&float_graph, float_node)
+             .unwrap()
+-            .execute(
++            .execute_prepared(
+                 &[
+                     x.view(),
+                     router_tensor.view(),
+diff --git a/crates/onnx-runtime-ep-cpu/tests/decoded_projection_layout.rs b/crates/onnx-runtime-ep-cpu/tests/decoded_projection_layout.rs
+index 49673035e..d84e9534c 100644
+--- a/crates/onnx-runtime-ep-cpu/tests/decoded_projection_layout.rs
++++ b/crates/onnx-runtime-ep-cpu/tests/decoded_projection_layout.rs
+@@ -247,3 +247,68 @@ fn fixed_plan_rejects_overflow_and_mismatched_storage_before_decoding() {
+         .unwrap_err();
+     assert!(error.to_string().contains("bind the matching plan"));
+ }
++
++#[test]
++fn parallel_gather_initializes_complete_rows_and_recovers_after_refusal() {
++    use decoded_projection::ProjectionScratch;
++    use onnx_runtime_ep_api::{DevicePtrMut, WorkspaceView};
++    use std::{mem::MaybeUninit, num::NonZeroUsize};
++    let pool = rayon::ThreadPoolBuilder::new()
++        .num_threads(4)
++        .build()
++        .unwrap();
++    for chunk_rows in [1, 2, 8] {
++        pool.install(|| {
++            let mut backing = [MaybeUninit::<f32>::uninit(); 8];
++            let bytes = std::mem::size_of_val(&backing);
++            // SAFETY: private Host storage is exclusively lent within this call.
++            let mut scratch = unsafe {
++                ProjectionScratch::bind(
++                    "parallel gather fixture",
++                    bytes,
++                    Some(WorkspaceView::new(
++                        DevicePtrMut(backing.as_mut_ptr().cast()),
++                        bytes,
++                    )),
++                )
++            }
++            .unwrap();
++            let chunk = NonZeroUsize::new(chunk_rows).unwrap();
++            let input = [0., 1., 2., 3., 4., 5., 6., 7.];
++            assert!(
++                scratch
++                    .gather_rows_parallel(&input, 2, &[0, 1, 2, 3, 0], chunk)
++                    .unwrap_err()
++                    .to_string()
++                    .contains("workspace has 8")
++            );
++            assert!(
++                scratch
++                    .gather_rows_parallel(&input, 2, &[0, 8, 1], chunk)
++                    .unwrap_err()
++                    .to_string()
++                    .contains("exceeds 8 input values")
++            );
++            for _ in 0..3 {
++                assert_eq!(
++                    scratch
++                        .gather_rows_parallel(&input, 2, &[3, 1, 3], chunk)
++                        .unwrap(),
++                    [6., 7., 2., 3., 6., 7.]
++                );
++            }
++            assert!(
++                scratch
++                    .gather_rows_parallel(&[], 0, &[9], chunk)
++                    .unwrap()
++                    .is_empty()
++            );
++            assert!(
++                scratch
++                    .gather_rows_parallel(&input, 2, &[], chunk)
++                    .unwrap()
++                    .is_empty()
++            );
++        });
++    }
++}

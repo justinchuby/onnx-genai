@@ -1,0 +1,54 @@
+[
+  {
+    "shape": [
+      1,
+      64,
+      64,
+      1,
+      null
+    ],
+    "processes": 9,
+    "output_sha256": "2a7365fe4ee4f04db63c9b3747f06b0b1b4537878331849ada2bb6d9da115bcf",
+    "all_outputs_byte_equal": true,
+    "all_argmax_equal": true
+  },
+  {
+    "shape": [
+      512,
+      256,
+      256,
+      4,
+      "0"
+    ],
+    "processes": 9,
+    "output_sha256": "2c68170a48324b90cccf4d71c98ff635d4ddbc1641a95526ddf5d1f81f3092fc",
+    "all_outputs_byte_equal": true,
+    "all_argmax_equal": true
+  },
+  {
+    "shape": [
+      512,
+      1024,
+      1024,
+      4,
+      null
+    ],
+    "processes": 9,
+    "output_sha256": "53f80eeb9ebf539a7c879ef1835937cc4b712774ad18477e08bdea1c0c16bdee",
+    "all_outputs_byte_equal": true,
+    "all_argmax_equal": true
+  },
+  {
+    "shape": [
+      8,
+      256,
+      256,
+      1,
+      null
+    ],
+    "processes": 9,
+    "output_sha256": "13e12dbfb11fdcb83dfea8b6521355755d297903b612a94f246e86cad7e0353a",
+    "all_outputs_byte_equal": true,
+    "all_argmax_equal": true
+  }
+]

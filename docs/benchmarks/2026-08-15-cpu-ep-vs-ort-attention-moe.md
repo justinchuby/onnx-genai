@@ -1151,6 +1151,7 @@ inside each expert's own GEMM. Measured separation was 7.6e7 (losing) to 6.3e8
 
 This is a **one-host calibration** (AMD EPYC 9V74, 16C/32T, 32 MiB L3 shared per 16
 CPUs, AVX2/FMA, no AVX-512), overridable with `ONNX_GENAI_MOE_GROUPED_MIN_WORK`. The
+override is read at kernel creation; changing it affects newly created kernels. The
 falsifier `the_driver_gate_matches_the_measured_crossover` pins all nine calibration
 points, so changing the constant in a way that would flip a measured cell fails CI.
 

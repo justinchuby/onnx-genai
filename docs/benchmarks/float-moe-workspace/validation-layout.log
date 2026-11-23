@@ -1,0 +1,18 @@
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-workspace/crates/onnx-runtime-ep-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.26s
+     Running tests/decoded_projection_layout.rs (/tmp/nxrt-erf-nan-target/debug/deps/decoded_projection_layout-07d6052aa0a8232a)
+
+running 10 tests
+test incomplete_decoder_shards_fail_before_creating_state_or_projecting ... ok
+test decoded_projection::tests::composite_scratch_binds_disjoint_f32_regions_and_rejects_untyped_geometry ... ok
+test decoded_projection::tests::projection_scratch_rejects_invalid_layouts_and_accepts_empty_without_backing ... ok
+test fixed_plan_rejects_overflow_and_mismatched_storage_before_decoding ... ok
+test decoded_projection::tests::gathered_projection_input_initializes_only_actual_rows_and_reuses_capacity ... ok
+test decoded_projection::tests::projection_scratch_is_lazy_once_per_dispatch_and_only_borrows_the_needed_prefix ... ok
+test decoded_projection::tests::projection_scratch_partitions_each_projection_prefix_without_aliasing ... ok
+test parallel_gather_initializes_complete_rows_and_recovers_after_refusal ... ok
+test tiled_decoder_reuses_shard_state_and_preserves_partial_columns_and_bias ... ok
+test fixed_plan_bounds_shards_in_a_larger_pool_and_reuses_borrowed_scratch ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

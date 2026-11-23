@@ -155,6 +155,8 @@ onnx-runtime-session = { path = "../onnx-runtime-session", version = "=0.1.0-dev
 onnx-runtime-tracer = { workspace = true, optional = true }
 prost = { workspace = true }
 memmap2 = { workspace = true }
+# Stable physical file identity for linked external weights on Unix/Windows.
+same-file = "1"
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

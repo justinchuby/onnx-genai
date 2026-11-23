@@ -1820,21 +1820,18 @@ fn link_external_file(source: &Path, destination: &Path) -> std::io::Result<()> 
 }
 
 fn hash_file_identity(path: &Path, hasher: &mut impl Hasher) -> anyhow::Result<()> {
-    let metadata = path.metadata()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.dev().hash(hasher);
-        metadata.ino().hash(hasher);
-        metadata.mtime().hash(hasher);
-        metadata.mtime_nsec().hash(hasher);
-    }
-    #[cfg(not(unix))]
-    {
-        let modified = metadata.modified()?.duration_since(std::time::UNIX_EPOCH)?;
-        modified.as_secs().hash(hasher);
-        modified.subsec_nanos().hash(hasher);
-    }
+    // Query identity and timestamp through one open file. A replacement with
+    // the same length and modification time is still a different weight bank.
+    let file = std::fs::File::open(path).with_context(|| format!(
+        "could not open external initializer '{}' for linked-model cache identity; ensure the file exists and is readable", path.display()
+    ))?;
+    let modified = file.metadata().and_then(|metadata| metadata.modified())
+        .with_context(|| format!("could not inspect external initializer '{}' for linked-model caching; ensure its metadata is readable", path.display()))?;
+    let identity = same_file::Handle::from_file(file).with_context(|| format!(
+        "could not resolve physical file identity for external initializer '{}'; use a filesystem supporting file identity queries", path.display()
+    ))?;
+    identity.hash(hasher);
+    modified.hash(hasher);
     Ok(())
 }
 
@@ -2779,6 +2776,26 @@ pipeline:
 
         let replacement = test_root.join("replacement.bin");
         std::fs::write(&replacement, b"fedcba9876543210").unwrap();
+        // Construct the timestamp collision: replacing a bank must invalidate
+        // the cache even on filesystems where fast writes share a timestamp.
+        let original_modified = std::fs::metadata(&weights_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&replacement).unwrap().modified().unwrap(),
+            original_modified
+        );
+        assert_eq!(
+            std::fs::metadata(&replacement).unwrap().len(),
+            std::fs::metadata(&weights_path).unwrap().len()
+        );
         std::fs::rename(replacement, &weights_path).unwrap();
         let replacement_linked_path = materialize_linked_model(&linked).unwrap();
         assert_ne!(replacement_linked_path, linked_path);

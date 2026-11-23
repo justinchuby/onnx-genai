@@ -1,0 +1,25 @@
+{
+  "base": "d2165102d91a2d8b99ae886b3d29e272f78481cf",
+  "source_path": "/tmp/nxrt-float-moe-workspace",
+  "candidate_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs": "355acc330de7007c40bea5e33fba7846f9f405e8afec4b19acdcd949b297090c",
+    "crates/onnx-runtime-ep-cpu/src/kernels/mod.rs": "823eda04d490a0a178ea02428cb5d12d4470c974385e32bd171342795a0b498d",
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "2bff30b6620d1e27cba12496d22e057428b8fa88b9a06f292c9265f93215c0e2",
+    "crates/onnx-runtime-ep-cpu/tests/decoded_projection_layout.rs": "47750e0e08e0573c161b1a7138554cca41509aa9448b3f3a03a06d84b4f3ad95"
+  },
+  "probe_sha256": "2406dba91af134efe6b56b99764695e9a897641d857a928e4258e70c024d1064",
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "binaries": {
+    "baseline": {
+      "sha256": "49e0241aec483435f3f18ea49a82d6cde91d6c85ff3e2470cba8f2319696667c",
+      "symbol_count": 24975,
+      "mlas_symbols": 0
+    },
+    "after": {
+      "sha256": "03fbce5a82eca30151e3dd09afb3a4034f135566b1f4e808ecb18352da0ed770",
+      "symbol_count": 25105,
+      "mlas_symbols": 0
+    }
+  }
+}
