@@ -1,6 +1,7 @@
 //! Audited llama.cpp IQ quantization grids shared by CPU and GPU decoders.
 
 // Vendored byte-for-byte from llama.cpp commit b15ca938, ggml-common.h.
+// The upstream MIT notice is retained in ../GGML_LICENSE.
 // Keep the source order: decoders reinterpret each integer as little-endian magnitude bytes.
 
 #[rustfmt::skip]

@@ -337,6 +337,19 @@ impl ShapeInference {
             return Self::KernelSizedOutputs;
         }
 
+        if op == "DequantizePacked" && node.is_default_domain() && opset >= 29 {
+            return match onnx_runtime_ir::dequantize_packed::Metadata::from_node(node) {
+                Ok(metadata) => Self::StaticOutputs(vec![metadata.shape().to_vec()]),
+                Err(_) => Self::Declined {
+                    op_type: op.into(),
+                    domain: domain.into(),
+                    reason: DeclineReason::NodeNotShapeable(
+                        "DequantizePacked requires a valid format, logical shape, and output_dtype",
+                    ),
+                },
+            };
+        }
+
         if let Some(rule) = SharedNativeShapeRule::for_node(node) {
             let fallback = match rule {
                 SharedNativeShapeRule::ConstantOfShape => Self::ConstantOfShape,

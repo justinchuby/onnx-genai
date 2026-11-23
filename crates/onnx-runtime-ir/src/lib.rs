@@ -47,6 +47,7 @@
 #![forbid(unsafe_code)]
 
 mod arena;
+pub mod dequantize_packed;
 mod device;
 mod domain;
 mod dtype;

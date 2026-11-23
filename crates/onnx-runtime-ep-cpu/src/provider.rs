@@ -467,6 +467,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "DequantizePacked"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Err(reason) =
+                onnx_runtime_ir::dequantize_packed::validate_claim(op, shapes, input_dtypes)
+        {
+            deny!("DequantizePacked: {reason}");
+        }
         if op.op_type == "CompressedSparseAttention"
             && op.domain == "pkg.nxrt"
             && let Some(reason) = crate::kernels::compressed_sparse_attention::unsupported_reason(

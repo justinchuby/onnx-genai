@@ -2383,6 +2383,7 @@ dependencies = [
  "onnx-runtime-quantization",
  "onnx-runtime-shape-inference",
  "onnx-runtime-virtual-memory",
+ "sha2",
  "thiserror 2.0.19",
 ]
 

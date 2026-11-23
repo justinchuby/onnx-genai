@@ -57,6 +57,7 @@ pub mod csa_state_group;
 pub mod cumprod;
 pub mod cumsum;
 pub mod data_transform;
+mod dequantize_packed;
 pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
 pub mod dft;
@@ -359,6 +360,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "BlackmanWindow",
     "QuantizeLinear",
     "DequantizeLinear",
+    "DequantizePacked",
     "Dropout",
     "NonZero",
     "NonMaxSuppression",
@@ -547,6 +549,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
         (name, "") if onnx_runtime_ir::standard_math::OPS.iter().any(|&(op, _)| op == name) =>
             onnx_runtime_ir::standard_math::DTYPES,
 
@@ -962,6 +965,11 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
+    reg.register(
+        OpKey::new("DequantizePacked", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(dequantize_packed::Factory(runtime.clone())),
+    );
     reg.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),
         onnx_runtime_ep_api::WorkspacePlanning::None,

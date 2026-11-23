@@ -158,7 +158,7 @@ impl BlockFormat {
         }
     }
 
-    fn scalar_decoder(self) -> fn(&[u8], &mut [f32]) {
+    pub(super) fn scalar_decoder(self) -> fn(&[u8], &mut [f32]) {
         match self {
             Self::Mxfp4 => decode_mxfp4_block,
             Self::Iq4Nl => decode_iq4_nl_block,

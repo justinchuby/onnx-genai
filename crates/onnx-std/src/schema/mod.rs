@@ -420,6 +420,7 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/resize.yaml"),
     include_str!("../../schemas/standard/quantize_linear.yaml"),
     include_str!("../../schemas/standard/dequantize_linear.yaml"),
+    include_str!("../../schemas/standard/dequantize_packed.yaml"),
     include_str!("../../schemas/standard/dynamic_quantize_linear.yaml"),
     include_str!("../../schemas/standard/attention.yaml"),
     include_str!("../../schemas/standard/cast_like.yaml"),

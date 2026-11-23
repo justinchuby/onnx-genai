@@ -124,6 +124,87 @@ fn quantization_static_metadata_rejects_invalid_scalar_block_and_dtype_cases() {
     );
 }
 
+#[test]
+fn dequantize_packed_resolves_shape_and_checks_exact_payload() {
+    let packed = |format: &str, dims: Vec<i64>| {
+        with_attr(
+            with_attr(
+                node("DequantizePacked", 1, 1),
+                "format",
+                Attribute::String(format.as_bytes().to_vec()),
+            ),
+            "shape",
+            Attribute::Ints(dims),
+        )
+    };
+    let good = packed("gguf:q5_1", vec![2, 64]);
+    let inferred = run(&good, vec![tin(DataType::Uint8, vec![c(96)])], 29);
+    assert_eq!(out_dtype(&inferred), DataType::Float32);
+    assert_eq!(out_shape(&inferred), [c(2), c(64)]);
+    let double = with_attr(good.clone(), "output_dtype", Attribute::Int(11));
+    let inferred = run(
+        &double,
+        vec![tin(DataType::Uint8, vec![DimExpr::symbol(SymbolId(7))])],
+        29,
+    );
+    assert_eq!(out_dtype(&inferred), DataType::Float64);
+    assert_eq!(out_shape(&inferred), [c(2), c(64)]);
+    for (node, dtype, shape, reason) in [
+        (good.clone(), DataType::Int8, vec![c(96)], "UINT8"),
+        (good.clone(), DataType::Uint8, vec![c(96), c(1)], "rank one"),
+        (good.clone(), DataType::Uint8, vec![c(95)], "exactly 96"),
+        (good.clone(), DataType::Uint8, vec![c(97)], "exactly 96"),
+        (
+            with_attr(good, "output_dtype", Attribute::Int(7)),
+            DataType::Uint8,
+            vec![c(96)],
+            "output_dtype",
+        ),
+        (
+            packed("gguf:Q5_1", vec![32]),
+            DataType::Uint8,
+            vec![c(24)],
+            "unknown format",
+        ),
+        (
+            packed("gguf:q5_1:32", vec![32]),
+            DataType::Uint8,
+            vec![c(24)],
+            "unknown format",
+        ),
+        (
+            packed("gguf:q5_1", vec![]),
+            DataType::Uint8,
+            vec![c(0)],
+            "cannot be empty",
+        ),
+        (
+            packed("gguf:q5_1", vec![-1, 32]),
+            DataType::Uint8,
+            vec![c(0)],
+            "nonnegative",
+        ),
+        (
+            packed("gguf:q5_1", vec![0, 33]),
+            DataType::Uint8,
+            vec![c(0)],
+            "multiple of 32",
+        ),
+        (
+            packed("gguf:q5_1", vec![1_i64 << 55, 32]),
+            DataType::Uint8,
+            vec![c(0)],
+            "byte count",
+        ),
+    ] {
+        assert_invalid(
+            try_run(&node, vec![tin(dtype, shape)], 29).unwrap_err(),
+            "DequantizePacked",
+            reason,
+        );
+    }
+}
+
 fn sym(n: u32) -> DimExpr {
     DimExpr::symbol(SymbolId(n))
 }
