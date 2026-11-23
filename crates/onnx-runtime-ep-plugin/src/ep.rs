@@ -725,6 +725,7 @@ fn shape_inference_reads_runtime_values(
     use crate::compute::ShapeInference;
 
     match strategy {
+        ShapeInference::NativeRegistry { shape_operands, .. } => !shape_operands.is_empty(),
         ShapeInference::SharedNative { node, .. } if node.op_type == "DFT" => {
             node.inputs.get(1).is_some_and(Option::is_some)
                 || node.inputs.get(2).is_some_and(Option::is_some)
@@ -1897,6 +1898,26 @@ mod tests {
             assert!(
                 shape_inference_reads_runtime_values(&strategy, &node),
                 "{op} must not be claimed by a device plugin while its shape rule reads values"
+            );
+        }
+
+        for (op, reads_values) in [("Pack", false), ("Unpack", true)] {
+            let mut node = Node::new(
+                NodeId(0),
+                op,
+                vec![Some(ValueId(0)), Some(ValueId(1))],
+                vec![ValueId(100)],
+            );
+            node.version = Some(29);
+            let strategy = crate::compute::ShapeInference::for_node(&node, &[], 1);
+            assert!(matches!(
+                strategy,
+                crate::compute::ShapeInference::NativeRegistry { .. }
+            ));
+            assert_eq!(
+                shape_inference_reads_runtime_values(&strategy, &node),
+                reads_values,
+                "{op}"
             );
         }
 
