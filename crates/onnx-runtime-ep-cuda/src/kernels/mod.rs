@@ -120,6 +120,7 @@ pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod standard_attention;
 pub(crate) mod standard_claims;
+mod standard_math;
 pub mod stft;
 pub mod structural;
 pub mod tensor_scatter;
@@ -202,6 +203,11 @@ use pointwise::{
 pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMul",
     "Einsum",
+    "SwiGLU",
+    "GeGLU",
+    "Expm1",
+    "Log1p",
+    "LogCumSumExp",
     "MatMulNBits",
     "QMoE",
     "BlockQuantizedMatMul",
@@ -541,6 +547,8 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
+        (name, "") if onnx_runtime_ir::standard_math::OPS.iter().any(|&(op, _)| op == name) =>
+            onnx_runtime_ir::standard_math::DTYPES,
 
         // Block-quantized GEMM / MoE: f16/f32 activation + Uint8 packed weight.
         ("MatMulNBits", "com.microsoft")
@@ -718,6 +726,14 @@ pub fn build_cuda_registry_with_metrics(
     telemetry_registry: Arc<qmoe::RouteTelemetrySourceRegistry>,
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
+
+    for (name, since) in onnx_runtime_ir::standard_math::OPS {
+        reg.register(
+            OpKey::new(name, "", since),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(standard_math::Factory(runtime.clone())),
+        );
+    }
 
     let fft_plans = Arc::new(crate::cufft::CufftPlanCache::default());
     reg.register(

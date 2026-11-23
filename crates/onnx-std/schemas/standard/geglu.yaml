@@ -1,0 +1,10 @@
+domain: ""
+name: GeGLU
+since_version: 29
+doc: Gelu of A multiplied elementwise by B, without broadcasting.
+attributes:
+  - { name: approximate, type: string, default: "none" }
+inputs: [{ name: A, type_str: T }, { name: B, type_str: T }]
+outputs: [{ name: Y, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

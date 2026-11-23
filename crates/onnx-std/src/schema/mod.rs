@@ -430,6 +430,11 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/max.yaml"),
     include_str!("../../schemas/standard/rotary_embedding.yaml"),
     include_str!("../../schemas/standard/softplus.yaml"),
+    include_str!("../../schemas/standard/swiglu.yaml"),
+    include_str!("../../schemas/standard/geglu.yaml"),
+    include_str!("../../schemas/standard/expm1.yaml"),
+    include_str!("../../schemas/standard/log1p.yaml"),
+    include_str!("../../schemas/standard/log_cum_sum_exp.yaml"),
     include_str!("../../schemas/standard/squeeze.yaml"),
     include_str!("../../schemas/standard/top_k.yaml"),
     include_str!("../../schemas/standard/unsqueeze_v11.yaml"),
@@ -724,8 +729,8 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 99);
-        assert_eq!(registry.iter().count(), 111);
+        assert_eq!(registry.schemas.len(), 104);
+        assert_eq!(registry.iter().count(), 116);
 
         for (name, since_version) in [
             ("BitShift", 11),
@@ -1369,6 +1374,19 @@ type_constraints:
         assert_eq!(
             registry.lookup("Mod", "", 25).unwrap().attributes[0].default,
             Some(AttributeDefault::Int(0))
+        );
+    }
+}
+#[test]
+fn standard_math_schema_versions_and_dtypes() {
+    let registry = SchemaRegistry::builtins();
+    for (name, since) in onnx_runtime_ir::standard_math::OPS {
+        assert!(registry.lookup(name, "", since - 1).is_none());
+        let schema = registry.lookup(name, "", since).unwrap();
+        assert_eq!(schema.since_version, since);
+        assert_eq!(
+            schema.type_constraints[0].allowed,
+            onnx_runtime_ir::standard_math::DTYPES
         );
     }
 }
