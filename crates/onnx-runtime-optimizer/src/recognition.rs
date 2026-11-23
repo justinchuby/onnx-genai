@@ -99,6 +99,16 @@ impl RecognitionRule {
         self.anchor.is_producer_candidate(node)
     }
 
+    /// Match a component structurally; the caller checks the assembled rewrite
+    /// boundary once all components and retained outputs are known.
+    pub(crate) fn match_component_at<'g>(
+        &self,
+        session: &MatchSession<'g>,
+        root: NodeId,
+    ) -> std::result::Result<Option<Match<'g>>, PatternError> {
+        session.match_at(&self.pattern, root, MatchOptions::default())
+    }
+
     /// Visit deterministic closed-region matches using a prepared graph index.
     /// Returned values may escape; intermediate values must remain internal,
     /// including uses through descendant lexical captures.
