@@ -1688,7 +1688,12 @@ pub enum GenerateConstraint {
         prefix: String,
     },
     /// Constrain output to a JSON value accepted by the provided JSON Schema.
-    JsonSchema(String),
+    JsonSchema {
+        /// Serialized JSON Schema for the complete value.
+        schema: String,
+        /// Existing assistant text, excluded from newly generated output.
+        prefix: String,
+    },
     /// Constrain output to text matching the provided Rust regular expression.
     Regex(String),
     /// Constrain output to the provided llguidance Lark grammar.

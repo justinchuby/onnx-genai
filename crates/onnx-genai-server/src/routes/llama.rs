@@ -236,14 +236,6 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
         }
     }
     if request.continue_final_message {
-        if matches!(
-            request.response_format,
-            Some(crate::types::ResponseFormat::JsonSchema { .. })
-        ) {
-            return Err(ApiError::invalid_request(
-                "continue_final_message with response_format JSON Schema requires grammar state seeded from the assistant prefix; use json_object or unconstrained text continuation until prefix-aware schema grammar admission is available",
-            ));
-        }
         if request.add_generation_prompt {
             return Err(ApiError::invalid_request(
                 "continue_final_message=true requires add_generation_prompt=false; continuing an assistant message cannot open another assistant turn",
@@ -262,7 +254,10 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
         }
         if matches!(
             request.response_format,
-            Some(crate::types::ResponseFormat::JsonObject)
+            Some(
+                crate::types::ResponseFormat::JsonObject
+                    | crate::types::ResponseFormat::JsonSchema { .. }
+            )
         ) {
             let prefix = last
                 .content

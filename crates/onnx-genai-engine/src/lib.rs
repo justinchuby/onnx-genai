@@ -65,8 +65,9 @@ pub use engine::{
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
-    Constraint, ConstraintProcessor, JsonConstraint, LogitProcessor, ProcessorChain,
-    ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
+    Constraint, ConstraintPrefixError, ConstraintProcessor, JsonConstraint, LogitProcessor,
+    ProcessorChain, ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence,
+    TokenId,
 };
 pub use memory_authority::{
     DeviceCompatibilityDomain, DeviceMemoryAuthority, EngineMemoryAccounting,

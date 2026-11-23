@@ -1117,7 +1117,10 @@ fn response_format_maps_to_the_requested_generate_constraint() {
             .unwrap()
             .options
             .constraint,
-        Some(GenerateConstraint::JsonSchema(schema.to_string()))
+        Some(GenerateConstraint::JsonSchema {
+            schema: schema.to_string(),
+            prefix: String::new()
+        })
     );
     assert_eq!(
         build_generate_request(&text_request, &fixture_tokenizer())

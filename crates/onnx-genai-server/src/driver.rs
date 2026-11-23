@@ -246,6 +246,7 @@ pub(crate) enum DriverEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DriverFailureKind {
     Internal,
+    InvalidRequest,
     MemoryOverload,
     WorkerUnavailable,
     /// The caller asked the loaded package for something it cannot serve as
@@ -286,6 +287,15 @@ impl DriverFailure {
     }
 
     pub(crate) fn from_engine_error(error: &anyhow::Error) -> Self {
+        if let Some(prefix) = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<onnx_genai_engine::ConstraintPrefixError>())
+        {
+            return Self {
+                message: prefix.to_string(),
+                kind: DriverFailureKind::InvalidRequest,
+            };
+        }
         let memory_overload = error.chain().any(|source| {
             matches!(
                 source.downcast_ref::<SchedulerAdmissionError>(),

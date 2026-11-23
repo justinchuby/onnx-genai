@@ -6293,11 +6293,6 @@ mod llama_compat {
         );
         for (field, value, expected) in [
             (
-                "response_format",
-                json!({"type":"json_schema","json_schema":{"name":"object","schema":{"type":"object"}}}),
-                "grammar state",
-            ),
-            (
                 "add_generation_prompt",
                 json!(true),
                 "add_generation_prompt=false",
@@ -6358,6 +6353,30 @@ mod llama_compat {
         assert_eq!(status, StatusCode::OK, "{result}");
         assert_eq!(result["choices"][0]["message"]["content"], "}");
         assert_eq!(result["usage"]["completion_tokens"], 1);
+        let schema = json!({"type":"json_schema","json_schema":{"name":"empty_object","schema":{"type":"object","additionalProperties":false}}});
+        body["response_format"] = schema;
+        let (status, schema_result) =
+            call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{schema_result}");
+        assert_eq!(schema_result["choices"][0]["message"]["content"], "}");
+        assert_eq!(schema_result["usage"]["completion_tokens"], 1);
+        let mut invalid_schema_prefix = body.clone();
+        invalid_schema_prefix["messages"][0]["content"] = json!("{\"b\":");
+        let (status, error) = call(
+            router.clone(),
+            "POST",
+            "/v1/chat/completions",
+            invalid_schema_prefix,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("schema-valid partial value"),
+            "{error}"
+        );
         body["stream"] = json!(true);
         let response = router
             .clone()

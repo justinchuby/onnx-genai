@@ -55,14 +55,16 @@ pub(crate) fn build_processor_chain(
                     terminal_token_ids(options),
                 )));
             }
-            GenerateConstraint::JsonSchema(schema) => {
+            GenerateConstraint::JsonSchema { schema, prefix } => {
                 chain.add(Box::new(ConstraintProcessor::new(
                     build_llguidance_constraint(
                         GrammarConstraintKind::JsonSchema,
                         schema,
+                        prefix,
                         tokenizer,
                         &token_texts,
                         options.eos_token_id,
+                        &terminal_token_ids(options),
                     )?,
                     token_texts,
                     terminal_token_ids(options),
@@ -73,9 +75,11 @@ pub(crate) fn build_processor_chain(
                     build_llguidance_constraint(
                         GrammarConstraintKind::Regex,
                         regex,
+                        "",
                         tokenizer,
                         &token_texts,
                         options.eos_token_id,
+                        &terminal_token_ids(options),
                     )?,
                     token_texts,
                     terminal_token_ids(options),
@@ -86,9 +90,11 @@ pub(crate) fn build_processor_chain(
                     build_llguidance_constraint(
                         GrammarConstraintKind::Lark,
                         grammar,
+                        "",
                         tokenizer,
                         &token_texts,
                         options.eos_token_id,
+                        &terminal_token_ids(options),
                     )?,
                     token_texts,
                     terminal_token_ids(options),
@@ -404,10 +410,31 @@ pub(crate) fn push_unique_stop_sequence(
 fn build_llguidance_constraint(
     kind: GrammarConstraintKind,
     grammar: &str,
+    prefix: &str,
     tokenizer: &Tokenizer,
     token_texts: &[Option<String>],
     eos_token_id: Option<TokenId>,
+    endings: &[TokenId],
 ) -> anyhow::Result<Box<dyn crate::logits::Constraint>> {
+    if !prefix.is_empty() {
+        let ids = (0..token_texts.len())
+            .map(TokenId::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut bytes=crate::tokenization::token_pieces(tokenizer,&ids)
+            .context("prefilled grammar requires lossless tokenizer byte pieces; repair the package tokenizer decoder")?;
+        for (id, token) in tokenizer.inner().get_added_tokens_decoder() {
+            if token.special {
+                let piece = bytes
+                    .get_mut(usize::try_from(id)?)
+                    .context("special grammar token is outside the declared byte vocabulary")?;
+                piece.insert(0, llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER);
+            }
+        }
+        return LlguidanceConstraint::from_token_bytes_with_prefix(
+            kind, grammar, bytes, endings, prefix,
+        )
+        .map(|constraint| Box::new(constraint) as Box<dyn crate::logits::Constraint>);
+    }
     match LlguidanceConstraint::from_hf_tokenizer(
         kind,
         grammar,

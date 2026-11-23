@@ -609,3 +609,40 @@ generation and a forbidden premature EOS with stronger bias than the valid token
 Full native engine library: 837 passed / 1 inherited ignore. Full server library:
 403 passed / 2 inherited ignores. Strict engine/server all-target Clippy passed,
 including compilation of the updated public HTTP request-mapping tests.
+
+Schema-prefix milestone: `GenerateConstraint::JsonSchema` now owns its serialized
+schema and existing text prefix. Prefilled requests build a lossless byte
+vocabulary, frame tokenizer-declared special tokens and every declared ending,
+and consume the prefix into llguidance before the first model sample. Prefix
+bytes are grammar-only cells of at most 256 bytes, bounding additional trie depth
+independently of request length; UTF-8 scalars may span cells. These ids are outside
+the model vocabulary and are absent from sampling candidates, response bytes and
+usage. No codec fallback silently replaces incomplete bytes with decoded text.
+
+The JSON Schema compiler enters at the value rather than its optional RFC 8259
+leading whitespace. That whitespace stays in the prompt; only the recognizer's
+entry skips those four ASCII whitespace characters. Interior bytes stay exact.
+A vocabulary with no declared EOS receives a recognizer-only ending rather than
+silently assigning ordinary token 0 that role. Multiple real endings use the
+trie's EOS set. Prefix rejection carries `ConstraintPrefixError` through the
+worker boundary to HTTP 400, without classifying error text or converting runtime
+failures into request errors. Internal/public HTTP callers use the new schema
+variant without keeping a pre-release API alias. Reasoning continuation remains
+open work.
+
+The recognizer stores the sampled-vocabulary bound separately from its internal
+prefix cells, so a padded model logit tensor cannot expose a prefix cell as a real
+token. The regression deliberately includes that out-of-vocabulary candidate
+when an integer prefix could otherwise accept its bytes as another digit.
+Underlying parser errors remain typed sources inside `ConstraintPrefixError`;
+the worker's 400 classification retains the detailed cause and actionable repair.
+
+Schema-prefix validation: all four new engine regressions passed in the full
+native engine suite (841 passed / 1 inherited ignore): exact prefix-byte/schema
+masks, long UTF-8 chunks without an assumed token-0 EOS, multiple endings with
+padded model candidates, and an unsupported trie vocabulary returned as an error
+rather than a worker unwind. The real HTTP continuation case now covers both
+JSON object and JSON Schema suffix generation, streamed schema output, token
+usage and typed HTTP 400 refusal of an undeclared-property prefix. Full server:
+403 passed / 2 inherited ignores. Strict engine/server all-target Clippy passed
+on the final tree, including updated public HTTP integration callers.

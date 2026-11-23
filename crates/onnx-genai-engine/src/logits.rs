@@ -566,6 +566,16 @@ impl Constraint for JsonConstraint {
     }
 }
 
+/// Existing output could not be admitted into a requested grammar.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "existing assistant prefix is rejected by the declared grammar: {source:#}; continue a schema-valid partial value or change the requested grammar"
+)]
+pub struct ConstraintPrefixError {
+    #[source]
+    source: anyhow::Error,
+}
+
 /// llguidance-backed grammar constraint for JSON Schema, regex, and Lark grammars.
 ///
 /// The state machine is advanced from `ProcessorContext::generated_tokens` before
@@ -573,6 +583,7 @@ impl Constraint for JsonConstraint {
 /// unchanged while still using llguidance's compute-mask/commit-token loop.
 pub struct LlguidanceConstraint {
     kind: GrammarConstraintKind,
+    sampled_vocab_size: usize,
     inner: Mutex<LlguidanceState>,
 }
 
@@ -595,7 +606,7 @@ impl LlguidanceConstraint {
             byte_tokenizer.set_eos_token(eos_token_id);
         }
         let tok_env = byte_tokenizer.into_tok_env(Some(vocab_size))?;
-        Self::from_tok_env(kind, grammar, &tok_env)
+        Self::from_tok_env(kind, grammar, &tok_env, &[], vocab_size)
     }
 
     pub fn from_token_texts(
@@ -604,42 +615,142 @@ impl LlguidanceConstraint {
         token_texts: &[Option<String>],
         eos_token_id: Option<TokenId>,
     ) -> anyhow::Result<Self> {
-        let mut token_bytes = Vec::with_capacity(token_texts.len());
-        for (idx, text) in token_texts.iter().enumerate() {
-            if Some(idx as TokenId) == eos_token_id {
-                let mut bytes = b"<eos>".to_vec();
-                bytes.insert(0, TokTrie::SPECIAL_TOKEN_MARKER);
-                token_bytes.push(bytes);
-            } else {
-                token_bytes.push(text.as_deref().unwrap_or_default().as_bytes().to_vec());
-            }
+        let token_bytes = token_texts
+            .iter()
+            .map(|text| text.as_deref().unwrap_or_default().as_bytes().to_vec())
+            .collect();
+        Self::from_token_bytes(
+            kind,
+            grammar,
+            token_bytes,
+            &eos_token_id.into_iter().collect::<Vec<_>>(),
+            "",
+        )
+    }
+
+    /// Consume existing text exactly, independently of first-token normalization
+    /// or vocabulary boundaries. The extra grammar-only token is never exposed
+    /// to model sampling or counted as newly generated output.
+    pub(crate) fn from_token_bytes_with_prefix(
+        kind: GrammarConstraintKind,
+        grammar: &str,
+        token_bytes: Vec<Vec<u8>>,
+        endings: &[TokenId],
+        prefix: &str,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !prefix.is_empty(),
+            "prefilled grammar construction requires nonempty existing text"
+        );
+        // The schema compiler starts at the JSON value rather than its
+        // optional leading RFC 8259 whitespace. Preserve that whitespace in
+        // the actual prompt, but enter the value recognizer after it.
+        let value_prefix = match kind {
+            GrammarConstraintKind::JsonSchema => prefix.trim_start_matches([' ', '\t', '\r', '\n']),
+            _ => prefix,
+        };
+        Self::from_token_bytes(kind, grammar, token_bytes, endings, value_prefix)
+    }
+
+    fn from_token_bytes(
+        kind: GrammarConstraintKind,
+        grammar: &str,
+        mut token_bytes: Vec<Vec<u8>>,
+        endings: &[TokenId],
+        prefix: &str,
+    ) -> anyhow::Result<Self> {
+        let sampled_vocab_size = token_bytes.len();
+        anyhow::ensure!(
+            !token_bytes.is_empty(),
+            "grammar vocabulary is empty; load a tokenizer with declared token byte pieces"
+        );
+        for &ending in endings {
+            let bytes=token_bytes.get_mut(usize::try_from(ending)?)
+                .with_context(||format!("grammar ending token {ending} is outside its tokenizer vocabulary; repair the declared EOS set"))?;
+            *bytes = vec![TokTrie::SPECIAL_TOKEN_MARKER];
+            bytes.extend_from_slice(b"<eos>");
         }
+        // Bound trie depth independently of request length. Bytes can split a
+        // UTF-8 scalar here, just as real byte-fallback vocabulary pieces do.
+        const PREFIX_CHUNK_BYTES: usize = 256;
+        let mut prefix_ids = Vec::new();
+        for chunk in prefix.as_bytes().chunks(PREFIX_CHUNK_BYTES) {
+            let id = TokenId::try_from(token_bytes.len())
+                .context("grammar vocabulary has no room for an existing-prefix token")?;
+            token_bytes.push(chunk.to_vec());
+            prefix_ids.push(id);
+        }
+        // A tokenizer without a declared ending must not silently reserve its
+        // ordinary token 0 as EOS. This recognizer-only ending is never sampled.
+        let eos = match endings.first().copied() {
+            Some(id) => id,
+            None => {
+                let id = TokenId::try_from(token_bytes.len())
+                    .context("grammar vocabulary has no room for an internal ending")?;
+                let mut bytes = vec![TokTrie::SPECIAL_TOKEN_MARKER];
+                bytes.extend_from_slice(b"<eos>");
+                token_bytes.push(bytes);
+                id
+            }
+        };
+        let total_bytes = token_bytes.iter().try_fold(0usize, |sum, bytes| {
+            sum.checked_add(bytes.len())
+                .context("grammar byte vocabulary size overflow")
+        })?;
+        anyhow::ensure!(
+            u32::try_from(total_bytes).is_ok(),
+            "grammar byte vocabulary exceeds u32 offsets; shorten the existing prefix or use a smaller tokenizer vocabulary"
+        );
+        // toktrie 1.7 stores ids in 24 bits and reserves the all-ones id.
+        // Check this wire-format capacity before an id can be truncated.
+        const TOKTRIE_VOCAB_CAPACITY: usize = 0x00ff_ffff;
+        anyhow::ensure!(
+            token_bytes.len() <= TOKTRIE_VOCAB_CAPACITY,
+            "grammar vocabulary including prefix cells exceeds toktrie's 24-bit token capacity; shorten the prefix or use a tokenizer within the grammar backend's supported vocabulary range"
+        );
         let info = TokRxInfo {
-            vocab_size: token_bytes.len() as u32,
-            tok_eos: eos_token_id.unwrap_or(0),
+            vocab_size: u32::try_from(token_bytes.len())
+                .context("grammar vocabulary exceeds u32 token ids")?,
+            tok_eos: eos,
             tok_bos: None,
             tok_pad: None,
             tok_unk: None,
             tok_end_of_turn: None,
         };
-        let tok_trie = TokTrie::from(&info, &token_bytes);
+        let tok_trie = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||TokTrie::from(&info, &token_bytes)))
+            .map_err(|_|anyhow::anyhow!("grammar byte vocabulary exceeds the tokenizer trie's supported limits; shorten the existing prefix or repair oversized tokenizer pieces"))?;
+        let tok_trie = if endings.len() > 1 {
+            tok_trie.with_eos_tokens(endings)
+        } else {
+            tok_trie
+        };
         let tok_env: llguidance::toktrie::TokEnv =
             std::sync::Arc::new(ApproximateTokEnv::new(tok_trie));
-        Self::from_tok_env(kind, grammar, &tok_env)
+        Self::from_tok_env(kind, grammar, &tok_env, &prefix_ids, sampled_vocab_size)
     }
 
     fn from_tok_env(
         kind: GrammarConstraintKind,
         grammar: &str,
         tok_env: &llguidance::toktrie::TokEnv,
+        prefix_ids: &[TokenId],
+        sampled_vocab_size: usize,
     ) -> anyhow::Result<Self> {
         let grammar = top_level_grammar(kind, grammar)?;
         let factory = ParserFactory::new(tok_env, InferenceCapabilities::default(), &[])?;
         let parser = factory.create_parser(grammar)?;
+        let mut constraint = LlgConstraint::new(parser);
+        if !prefix_ids.is_empty() {
+            constraint.start_without_prompt();
+            constraint
+                .force_tokens(prefix_ids)
+                .map_err(|source| ConstraintPrefixError { source })?;
+        }
         Ok(Self {
             kind,
+            sampled_vocab_size,
             inner: Mutex::new(LlguidanceState {
-                constraint: LlgConstraint::new(parser),
+                constraint,
                 committed_len: 0,
             }),
         })
@@ -690,7 +801,9 @@ impl Constraint for LlguidanceConstraint {
         if step.is_stop() {
             return candidates
                 .iter()
-                .map(|candidate| candidate.is_eos)
+                .map(|candidate| {
+                    (candidate.token_id as usize) < self.sampled_vocab_size && candidate.is_eos
+                })
                 .collect();
         }
 
@@ -702,7 +815,7 @@ impl Constraint for LlguidanceConstraint {
             .iter()
             .map(|candidate| {
                 let idx = candidate.token_id as usize;
-                idx < mask.len() && mask.get(idx)
+                idx < self.sampled_vocab_size && idx < mask.len() && mask.get(idx)
             })
             .collect()
     }
@@ -4564,6 +4677,144 @@ mod tests {
         }
 
         generated_text
+    }
+
+    #[test]
+    fn prefilled_schema_consumes_exact_bytes_and_keeps_virtual_token_out_of_model_candidates() {
+        let bytes = vec![
+            b"{".to_vec(),
+            b"}".to_vec(),
+            b"\"a\":".to_vec(),
+            b"1".to_vec(),
+            b"true".to_vec(),
+            b"<eos>".to_vec(),
+        ];
+        let schema = r#"{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"],"additionalProperties":false}"#;
+        for prefix in ["{", " {\"a\":"] {
+            let constraint = LlguidanceConstraint::from_token_bytes_with_prefix(
+                GrammarConstraintKind::JsonSchema,
+                schema,
+                bytes.clone(),
+                &[5],
+                prefix,
+            )
+            .unwrap();
+            let candidates = bytes
+                .iter()
+                .enumerate()
+                .map(|(id, bytes)| TokenCandidate {
+                    token_id: id as u32,
+                    text: String::from_utf8(bytes.clone()).unwrap(),
+                    is_eos: id == 5,
+                })
+                .collect::<Vec<_>>();
+            let mask = constraint.allowed_next_tokens(&ProcessorContext::default(), &candidates);
+            assert_eq!(mask.len(), bytes.len());
+            assert!(
+                !mask[1],
+                "cannot close an incomplete required property: {mask:?}"
+            );
+            assert!(!mask[4], "integer schema cannot accept true: {mask:?}");
+            assert!(!mask[5]);
+            if prefix == "{" {
+                assert!(mask[2], "{mask:?}");
+            } else {
+                assert!(mask[3], "{mask:?}");
+            }
+        }
+        let error = LlguidanceConstraint::from_token_bytes_with_prefix(
+            GrammarConstraintKind::JsonSchema,
+            schema,
+            bytes,
+            &[5],
+            "{\"b\":",
+        )
+        .err()
+        .expect("undeclared property prefix must fail");
+        assert!(error.downcast_ref::<ConstraintPrefixError>().is_some());
+        assert!(
+            error.chain().count() > 1,
+            "preserve the underlying parser cause"
+        );
+    }
+
+    #[test]
+    fn prefilled_schema_chunks_long_utf8_and_does_not_reserve_ordinary_zero_without_eos() {
+        let prefix = format!("\"{}", "é".repeat(1024));
+        let constraint = LlguidanceConstraint::from_token_bytes_with_prefix(
+            GrammarConstraintKind::JsonSchema,
+            r#"{"type":"string"}"#,
+            vec![b"\"".to_vec(), b"x".to_vec()],
+            &[],
+            &prefix,
+        )
+        .unwrap();
+        let candidates = vec![
+            TokenCandidate {
+                token_id: 0,
+                text: "\"".into(),
+                is_eos: false,
+            },
+            TokenCandidate {
+                token_id: 1,
+                text: "x".into(),
+                is_eos: false,
+            },
+        ];
+        let mask = constraint.allowed_next_tokens(&ProcessorContext::default(), &candidates);
+        assert_eq!(mask.len(), 2);
+        assert!(
+            mask[0],
+            "ordinary token 0 must be allowed to close the string: {mask:?}"
+        );
+        assert!(mask[1], "{mask:?}");
+    }
+
+    #[test]
+    fn prefilled_schema_recognizes_every_declared_ending() {
+        let constraint = LlguidanceConstraint::from_token_bytes_with_prefix(
+            GrammarConstraintKind::JsonSchema,
+            r#"{"type":"integer"}"#,
+            vec![b"1".to_vec(), b"<eos>".to_vec(), b"<eot>".to_vec()],
+            &[1, 2],
+            "1",
+        )
+        .unwrap();
+        let candidates = (0..4)
+            .map(|id| TokenCandidate {
+                token_id: id,
+                text: String::new(),
+                is_eos: id == 1 || id == 2,
+            })
+            .collect::<Vec<_>>();
+        let mask = constraint.allowed_next_tokens(&ProcessorContext::default(), &candidates);
+        assert!(
+            !mask[3],
+            "grammar-only prefix must stay masked even with a padded model-logit candidate: {mask:?}"
+        );
+        assert!(
+            mask[1] && mask[2],
+            "all declared endings must be available after a complete value: {mask:?}"
+        );
+    }
+
+    #[test]
+    fn prefilled_schema_rejects_unsupported_vocabulary_without_unwinding_the_worker() {
+        let error = LlguidanceConstraint::from_token_bytes_with_prefix(
+            GrammarConstraintKind::JsonSchema,
+            r#"{"type":"object"}"#,
+            vec![vec![b'a'; 2048], b"<eos>".to_vec()],
+            &[1],
+            "{",
+        )
+        .err()
+        .expect("oversized trie chain must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("repair oversized tokenizer pieces"),
+            "{error:#}"
+        );
     }
 
     #[test]

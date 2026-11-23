@@ -637,6 +637,7 @@ pub(crate) fn generation_failure(error: DriverFailure) -> ApiError {
         // off the engine's own type, so neither status depends on wording.
         DriverFailureKind::PackageExecution(capability) => package_execution_failure(capability),
         DriverFailureKind::WorkerUnavailable => ApiError::unavailable(error.message),
+        DriverFailureKind::InvalidRequest => ApiError::invalid_request(error.message),
         DriverFailureKind::Internal => {
             ApiError::internal(format!("generation failed: {}", error.message))
         }
