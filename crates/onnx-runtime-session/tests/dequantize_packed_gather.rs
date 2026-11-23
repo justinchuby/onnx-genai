@@ -115,7 +115,7 @@ fn verify(
     width: usize,
     bytes: usize,
 ) {
-    assert_eq!(ops(&fused, dequantize_packed_gather::OP), 1, "{profile}");
+    assert_eq!(ops(&fused, "DequantizePackedGather"), 1, "{profile}");
     assert_eq!(ops(&fused, "DequantizePacked"), 0, "{profile}");
     assert_eq!(
         ops(&reference, dequantize_packed_gather::OP),

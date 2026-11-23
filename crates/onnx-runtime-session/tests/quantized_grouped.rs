@@ -1,6 +1,4 @@
-use onnx_runtime_ir::{
-    Attribute, DataType as D, Graph, Node, NodeId, TensorData, quantized_grouped, static_shape,
-};
+use onnx_runtime_ir::{Attribute, DataType as D, Graph, Node, NodeId, TensorData, static_shape};
 use onnx_runtime_session::{InferenceSession, Tensor};
 
 enum Spelling {
@@ -269,7 +267,7 @@ fn verify(build: impl Fn(Graph) -> InferenceSession) {
                 .graph()
                 .nodes
                 .values()
-                .any(|n| n.op_type == quantized_grouped::OP)
+                .any(|n| n.op_type == "AffineQuantizedGroupedMatMul")
         );
         assert!(!fused.graph().nodes.values().any(|n| {
             matches!(

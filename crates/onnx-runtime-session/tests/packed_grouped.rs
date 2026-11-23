@@ -1,6 +1,6 @@
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, TensorData, WeightRef, dequantize_packed::Format,
-    quantized_grouped, static_shape,
+    static_shape,
 };
 use onnx_runtime_session::{InferenceSession, Tensor};
 
@@ -78,7 +78,7 @@ fn compare(build: impl Fn(Graph) -> InferenceSession) {
                 .graph()
                 .nodes
                 .values()
-                .any(|node| node.op_type == quantized_grouped::PACKED_OP),
+                .any(|node| node.op_type == "PackedGroupedMatMul"),
             "{format:?}"
         );
         assert!(

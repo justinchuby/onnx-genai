@@ -152,6 +152,7 @@ echo ""
 echo "── Packed producer graph selection and parity ──"
 if ! cargo test --locked -p onnx-runtime-session --features gpu-tests \
     --test quantized_matmul --test dequantize_packed_gather --test packed_grouped \
+    --test affine_gather --test quantized_grouped \
     -- --include-ignored --nocapture 2>&1; then
     echo -e "${RED}FAILED: Packed producer graph tests${NC}"
     exit 1

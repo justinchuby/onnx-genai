@@ -214,6 +214,10 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Pack",
     "Unpack",
     "GroupedMatMul",
+    "AffineQuantizedGroupedMatMul",
+    "PackedGroupedMatMul",
+    "AffineQuantizedGather",
+    "DequantizePackedGather",
     "MatMulNBits",
     "QMoE",
     "BlockQuantizedMatMul",
@@ -555,6 +559,13 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
+        ("DequantizePackedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => {
+            onnx_runtime_ir::dequantize_packed::DTYPES
+        }
+        (
+            "PackedGroupedMatMul" | "AffineQuantizedGroupedMatMul" | "AffineQuantizedGather",
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+        ) => &[DataType::Float32],
         ("Pack", "") => &[DataType::Uint8],
         ("Unpack", "") => onnx_runtime_ir::packed_routed::WORD_DTYPES,
         ("GroupedMatMul", "") => onnx_runtime_ir::standard_math::DTYPES,
