@@ -146,11 +146,15 @@ fn grouped_input_workspace_bytes(shape: &[usize]) -> Result<usize> {
         )));
     }
     let elements = checked_product(shape, "grouped input workspace element count")?;
-    checked_byte_count(
+    let bytes = checked_byte_count(
         elements,
         std::mem::size_of::<f32>(),
         "grouped input workspace byte count",
-    )
+    )?;
+    let rows = checked_product(&shape[..shape.len() - 1], "grouped input row count")?;
+    // A single routed row can borrow its already contiguous input, avoiding
+    // both gather storage and an execution-slot round trip for decode.
+    Ok(if rows <= 1 { 0 } else { bytes })
 }
 
 impl Kernel for QMoEKernel {
@@ -1696,8 +1700,13 @@ fn write_grouped_contributions(
     let fc1_bias_range = checked_range(expert, fc1_size, "fc1 bias expert row")?;
     let fc2_bias_range = checked_range(expert, hidden, "fc2 bias expert row")?;
     let fc3_bias_range = checked_range(expert, inter, "fc3 bias expert row")?;
-    let grouped_input =
-        grouped_scratch.gather_rows(input, hidden, tasks.iter().map(|&(row, _, _)| row))?;
+    let grouped_input: &[f32] = if let [(row, _, _)] = tasks {
+        input.get(checked_range(*row, hidden, "input row")?).ok_or_else(|| {
+            error(format!("input row {row} of width {hidden} exceeds {} values; validate routed row indices", input.len()))
+        })?
+    } else {
+        grouped_scratch.gather_rows(input, hidden, tasks.iter().map(|&(row, _, _)| row))?
+    };
     let expert_out = match weights {
         ExpertExecution::Dense(weights) => run_expert_grouped(
             grouped_input,
@@ -2320,6 +2329,15 @@ mod tests {
                 .bytes,
             0
         );
+        for shape in [&[1, 16][..], &[1, 1, 16][..]] {
+            assert_eq!(
+                kernel
+                    .workspace_requirement(&[TensorMetadata::new(DataType::Float32, shape, true)])
+                    .unwrap()
+                    .bytes,
+                0
+            );
+        }
         for input in [
             TensorMetadata::new(DataType::Float32, &[2, 3], false),
             TensorMetadata::new(DataType::Int8, &[2, 3], true),
