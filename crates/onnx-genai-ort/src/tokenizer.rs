@@ -23,6 +23,7 @@ impl Default for TokenizationOptions {
 }
 
 /// Thin wrapper around `tokenizers::Tokenizer` for prompt/token id conversion.
+#[derive(Clone)]
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
     legacy_eos_token_ids: Vec<u32>,

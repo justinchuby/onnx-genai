@@ -976,3 +976,24 @@ Strict native-engine all-target and server all-target Clippy passed. Server
 runtime behavior was not changed or remeasured in this milestone. The HTTP joint
 reasoning+JSON guard remains; model-token decoding, pending-boundary viability
 and actual processor integration still require completion.
+
+Canonical candidate-decoder ownership: tokenizer handles can now be cloned for
+an owned request-local sampler, and the incremental text decoder can fork its
+existing lookbehind and special-token policy. Candidate completion, alternate
+continuations and failed terminal materialization leave the live decoder intact.
+The same upstream incremental decoder remains the sole text implementation;
+there is no isolated-token concatenation substitute.
+
+A shared decode-loop regression pins the terminal contract: selected EOS IDs
+are committed before stop decisions, remain in result history, and are decoded
+according to the declared special-token registration. Skip and preserve policies
+are distinct from the stop_on_eos control. Template projection sees the actual
+preserved spelling, so future JSON EOS checks must project that spelling through
+the declaration rather than silently dropping a token because of its role.
+
+Validation: all 8 native tokenization cases and the terminal-contract case passed;
+new fork cases also passed under default features. Both ORT tokenizer integration
+cases and the request-local special-token policy case passed. Strict native-engine,
+ORT and server all-target Clippy passed. No HTTP joint-constraint behavior was
+enabled by these ownership and contract changes; processor integration remains
+open, including partial-byte/framing viability and decoder context agreement.

@@ -21,7 +21,8 @@ pub enum SpecialTokenHandling {
 
 /// Request-local incremental detokenization state. Retains the decoder's
 /// necessary lookbehind rather than repeatedly decoding the whole generation.
-#[derive(Default)]
+/// Cloning forks that lookbehind and token policy for isolated candidate decoding.
+#[derive(Default, Clone)]
 pub struct TokenTextDecoder {
     special_tokens: SpecialTokenHandling,
     ids: Vec<u32>,
@@ -242,6 +243,69 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         Tokenizer::from_file(path).unwrap()
     }
+    #[test]
+    fn candidate_decoder_forks_preserve_partial_unicode_and_special_policy() {
+        for byte_level in [false, true] {
+            let tokenizer = tokenizer(byte_level).clone();
+            for policy in [SpecialTokenHandling::Skip, SpecialTokenHandling::Preserve] {
+                let mut live = TokenTextDecoder::new(policy);
+                assert_eq!(
+                    live.step(&tokenizer, 31).unwrap(),
+                    if policy == SpecialTokenHandling::Preserve {
+                        "tok31"
+                    } else {
+                        ""
+                    }
+                );
+                assert_eq!(live.step(&tokenizer, 4).unwrap(), "");
+                let mut terminal = live.clone();
+                assert_eq!(terminal.finish(&tokenizer).unwrap(), "�");
+                let mut accepted = live.clone();
+                assert_eq!(accepted.step(&tokenizer, 5).unwrap(), "é");
+                assert_eq!(live.step(&tokenizer, 5).unwrap(), "é");
+                assert_eq!(
+                    accepted.finish(&tokenizer).unwrap(),
+                    live.finish(&tokenizer).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_decoder_failure_does_not_change_live_lookbehind() {
+        let tokenizer = tokenizer(false);
+        let mut live = TokenTextDecoder::new(SpecialTokenHandling::Preserve);
+        live.step(&tokenizer, 4).unwrap();
+        assert_eq!(live.step(&tokenizer, 5).unwrap(), "é");
+        let mut rejected = live.clone();
+        assert_eq!(rejected.step(&tokenizer, 16).unwrap(), "");
+        assert!(
+            rejected
+                .finish(&tokenizer)
+                .unwrap_err()
+                .is::<NonMonotonicText>()
+        );
+        assert_eq!(live.step(&tokenizer, 31).unwrap(), "tok31");
+        assert_eq!(live.finish(&tokenizer).unwrap(), "");
+    }
+
+    #[test]
+    fn candidate_decoder_forks_keep_contextual_word_separators() {
+        let tokenizer = Tokenizer::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+        )
+        .unwrap();
+        let mut live = TokenTextDecoder::new(SpecialTokenHandling::Preserve);
+        assert_eq!(live.step(&tokenizer, 4).unwrap(), "hello");
+        let mut first = live.clone();
+        let mut second = live.clone();
+        assert_eq!(first.step(&tokenizer, 5).unwrap(), " world");
+        assert_eq!(second.step(&tokenizer, 6).unwrap(), " the");
+        assert_eq!(live.step(&tokenizer, 5).unwrap(), " world");
+        assert_eq!(live.finish(&tokenizer).unwrap(), "");
+    }
+
     #[test]
     fn protocol_decoder_preserves_specials_and_split_unicode() {
         for byte_level in [false, true] {
