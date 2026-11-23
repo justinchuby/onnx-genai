@@ -4647,6 +4647,65 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
+    fn content_dependent_kv_fixture(source: &str) -> anyhow::Result<String> {
+        use onnx_runtime_loader::proto::onnx::{AttributeProto, attribute_proto::AttributeType};
+        let mut model = onnx_std::textproto::from_textproto(source)?.to_proto()?;
+        let graph = model
+            .graph
+            .as_mut()
+            .context("native cancellation fixture needs a graph")?;
+        let cast = graph
+            .node
+            .iter_mut()
+            .find(|node| node.output == ["cast_input_ids"])
+            .context("native cancellation fixture needs the input Cast")?;
+        anyhow::ensure!(
+            cast.op_type == "Cast" && cast.input == ["attention_mask"],
+            "native cancellation fixture's Cast no longer consumes attention_mask"
+        );
+        cast.input = vec!["input_ids".into()];
+        for kind in ["key", "value"] {
+            let output = format!("present.0.{kind}");
+            let node = graph
+                .node
+                .iter_mut()
+                .find(|node| node.output == [output.as_str()])
+                .with_context(|| format!("native cancellation fixture needs {output}"))?;
+            anyhow::ensure!(
+                node.op_type == "Identity" && node.input == ["current_kv"],
+                "native cancellation fixture's {output} is no longer the current_kv identity"
+            );
+            node.op_type = "Concat".into();
+            node.input = vec![format!("past_key_values.0.{kind}"), "current_kv".into()];
+            node.attribute = vec![AttributeProto {
+                name: "axis".into(),
+                i: 2,
+                r#type: AttributeType::Int as i32,
+                ..AttributeProto::default()
+            }];
+        }
+        Ok(onnx_std::textproto::to_textproto(
+            &onnx_std::Model::from_proto(model)?,
+        )?)
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_content_dependent_kv_fixture_ignores_text_format_whitespace() -> anyhow::Result<()> {
+        let source =
+            include_str!("../../../../tests/fixtures/tiny-native-engine/model.onnx.textproto");
+        let expected = content_dependent_kv_fixture(source)?;
+        let lf = source.lines().collect::<Vec<_>>().join("\n");
+        for spelling in [
+            lf.replace('\n', "\r\n"),
+            lf.lines().map(str::trim).collect::<Vec<_>>().join(" "),
+        ] {
+            assert_eq!(content_dependent_kv_fixture(&spelling)?, expected);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
     #[test]
     fn native_cancelled_prompt_replacement_restores_exact_kv_contents() -> anyhow::Result<()> {
         use crate::pipeline::{GenerationBoundary, GenerationCancelled, GenerationControl};
@@ -4658,20 +4717,9 @@ mod tests {
         }
         // This fixture's KV must depend on token content; its constant logits
         // alone cannot distinguish an overwritten prefix from the old state.
-        let mut graph = std::fs::read_to_string(source.join("model.onnx.textproto"))?.replace(
-            "input: \"attention_mask\"\n    output: \"cast_input_ids\"",
-            "input: \"input_ids\"\n    output: \"cast_input_ids\"",
-        );
-        for kind in ["key", "value"] {
-            let before = format!(
-                "input: \"current_kv\"\n    output: \"present.0.{kind}\"\n    op_type: \"Identity\""
-            );
-            let after = format!(
-                "input: \"past_key_values.0.{kind}\"\n    input: \"current_kv\"\n    output: \"present.0.{kind}\"\n    op_type: \"Concat\"\n    attribute {{ name: \"axis\" i: 2 type: INT }}"
-            );
-            assert!(graph.contains(&before));
-            graph = graph.replace(&before, &after);
-        }
+        let graph = content_dependent_kv_fixture(&std::fs::read_to_string(
+            source.join("model.onnx.textproto"),
+        )?)?;
         std::fs::write(directory.path().join("model.onnx.textproto"), graph)?;
         let mut engine = Engine::from_dir(
             directory.path(),

@@ -1077,3 +1077,11 @@ The complete HTTP integration suite also passes all 37 cases after updating
 the suffix-without-FIM refusal assertion to the shared, metadata-driven admission
 message. The test verifies HTTP 400, invalid_request_error, the rejected suffix
 field and the remedy; no runtime behavior or refusal is weakened.
+Windows CI additionally exposed newline-sensitive test construction in the
+content-dependent KV cancellation fixture. Build that variant by parsing and
+editing ONNX nodes, then canonically printing the graph, instead of matching
+formatted source strings. CRLF and compact-layout equivalence and the original
+real KV rollback oracle both pass; strict native-engine library/tests Clippy
+passes. Production inference behavior is unchanged. Both required Linux checks
+passed on the preceding head; the Windows test correction is validated locally
+before restoring automatic integration on the updated head.
