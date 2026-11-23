@@ -245,8 +245,9 @@ they **do not** execute or build the upstream ORT implementation.
 ### Grammar quick reference
 
 The following describes the recommended implemented spellings, not the full
-upstream ORT grammar. `?`, `*`, and braces in this **EBNF** mean optional,
-repetition, and grouping; quoted punctuation is literal. Rules labelled
+upstream ORT grammar. In this **EBNF**, `[...]` or a suffix `?` means optional,
+`{...}` means repetition, and parentheses group alternatives; quoted
+punctuation is literal. Rules labelled
 **native** require `parse_native` / `PatternLibrary::parse_native`.
 Legacy port/interface forms are described after the coverage table.
 
@@ -262,6 +263,7 @@ returns      = expression {"," expression}
 expression   = atom {"|" atom}
 atom         = scoped_name | "_" | "None" | literal | call | "(" expression ")"
 call         = operator_or_pattern "(" [operands ["," attributes] | attributes] ")"
+operator_or_pattern = scoped_name
 attributes   = identifier "=" expression {"," identifier "=" expression}
 operands     = expression {"," expression}
 scoped_name  = identifier {("." | "::") identifier}
@@ -296,6 +298,11 @@ Attributes follow all positional operands, even in zero-input calls such as
 the op and the preceding components as the domain; `vendor.Op` and `vendor::Op`
 are equivalent. A qualified **value** name instead selects a composed instance's
 port. `*` is an operator wildcard, not an infix arithmetic operator.
+`min` and `max` are inclusive nonnegative integer bounds. `element_type` uses
+the implemented ONNX spellings, for example `float`, `double`, `float16`,
+`bfloat16`, `int64`, `uint8` and `bool`. The separate `tensor<T>` production
+binds a shared dtype variable. A `None`-only annotation is invalid: absence
+must accompany a present-value/attribute alternative or use an explicit hole.
 
 The grammar admits expressions recursively, but the **compiler rejects nested
 calls in positional operands**. Write `a = Sigmoid(x); return Mul(a, x)`, not
