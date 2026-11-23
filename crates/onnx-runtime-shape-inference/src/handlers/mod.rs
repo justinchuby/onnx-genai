@@ -19,6 +19,7 @@ mod loss;
 mod ml;
 mod movement;
 mod norm;
+mod packed_routed;
 mod pooling;
 mod recurrent;
 mod selection;
@@ -55,6 +56,7 @@ pub fn register_all(registry: &mut InferenceRegistry) {
     elementwise::register(registry);
     linalg::register(registry);
     norm::register(registry);
+    packed_routed::register(registry);
     movement::register(registry);
     data_ops::register(registry);
     pooling::register(registry);

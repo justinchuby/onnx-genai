@@ -57,6 +57,7 @@ mod graph_view;
 mod layout;
 mod node;
 pub mod onnx;
+pub mod packed_routed;
 pub mod pattern;
 pub mod standard_math;
 

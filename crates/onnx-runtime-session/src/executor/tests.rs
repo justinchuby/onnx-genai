@@ -10540,6 +10540,29 @@ fn dynamic_output_shapes_compress_boundary_counts() {
 }
 
 #[test]
+fn dynamic_output_shapes_unpack_reads_runtime_scalar_count() {
+    let mut node = Node::new(
+        NodeId(0),
+        "Unpack",
+        vec![Some(ValueId(0)), Some(ValueId(1))],
+        vec![ValueId(2)],
+    );
+    node.attributes.insert("bits".into(), Attribute::Int(3));
+    let shapes = [vec![2, 1], vec![]];
+    let dtypes = [DataType::Uint8, DataType::Int64];
+    for count in [1, 2] {
+        assert_eq!(
+            dynamic_output_shapes(&node, &shapes, &dtypes, &[None, Some(vec![count])], &[], 29),
+            Some(vec![vec![2, count as usize]])
+        );
+    }
+    assert_eq!(
+        dynamic_output_shapes(&node, &shapes, &dtypes, &[None, Some(vec![3])], &[], 29),
+        None
+    );
+}
+
+#[test]
 fn dynamic_output_shapes_stft_reads_runtime_step_and_frame_length() {
     let node = Node::new(
         NodeId(0),

@@ -331,6 +331,63 @@ fn standard_math_opset_gate_and_shape_contracts() {
     );
 }
 
+#[test]
+fn packed_routed_opset_gate_and_shape_contracts() {
+    let pack = with_attr(
+        with_attr(
+            with_attr(node("Pack", 1, 1), "bits", Attribute::Int(5)),
+            "axis",
+            Attribute::Int(0),
+        ),
+        "output_type",
+        Attribute::Int(12),
+    );
+    let values = || vec![tin(DataType::Uint8, vec![c(7), sym(0)])];
+    assert!(run(&pack, values(), 28)[0].type_info.is_none());
+    let out = run(&pack, values(), 29);
+    assert_eq!(out_dtype(&out), DataType::Uint32);
+    assert_eq!(out_shape(&out), vec![c(2), sym(0)]);
+
+    let unpack = with_attr(node("Unpack", 2, 1), "bits", Attribute::Int(5));
+    let packed = tin(DataType::Uint8, vec![sym(0), c(3)]);
+    let count = NodeIo {
+        type_info: Some(TypeInfo::new(DataType::Int64, vec![])),
+        shape_data: Some(ShapeData::scalar(DataType::Int64, c(4))),
+        value_type: None,
+    };
+    let out = run(&unpack, vec![packed.clone(), count.clone()], 29);
+    assert_eq!(out_shape(&out), vec![sym(0), c(4)]);
+    let out = run(&unpack, vec![packed, tin(DataType::Int64, vec![])], 29);
+    assert_symbolic(&out_shape(&out)[1]);
+    assert_invalid(
+        try_run(&unpack, vec![tin(DataType::Uint8, vec![c(2)]), count], 29).unwrap_err(),
+        "Unpack",
+        "exactly 3 words",
+    );
+
+    let routed = with_attr(node("GroupedMatMul", 4, 1), "transB", Attribute::Int(-1));
+    let inputs = || {
+        vec![
+            f32in(vec![sym(0), c(3)]),
+            f32in(vec![c(4), c(7), c(3)]),
+            tin(DataType::Int32, vec![sym(0), c(2)]),
+            f32in(vec![c(4), c(7)]),
+        ]
+    };
+    assert!(run(&routed, inputs(), 28)[0].type_info.is_none());
+    assert_eq!(
+        out_shape(&run(&routed, inputs(), 29)),
+        vec![sym(0), c(2), c(7)]
+    );
+    let mut invalid = inputs();
+    invalid[3] = f32in(vec![c(4), c(6)]);
+    assert_invalid(
+        try_run(&routed, invalid, 29).unwrap_err(),
+        "GroupedMatMul",
+        "bias output width",
+    );
+}
+
 fn assert_symbolic(dim: &DimExpr) {
     assert!(
         dim.as_const().is_none(),

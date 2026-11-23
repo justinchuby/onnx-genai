@@ -1389,4 +1389,48 @@ fn standard_math_schema_versions_and_dtypes() {
             onnx_runtime_ir::standard_math::DTYPES
         );
     }
+
+    #[test]
+    fn packed_routed_schema_versions_and_types() {
+        let registry = SchemaRegistry::builtins();
+        for (name, constraints) in [
+            (
+                "Pack",
+                vec![
+                    vec![DataType::Uint8],
+                    vec![DataType::Uint8, DataType::Uint32],
+                ],
+            ),
+            (
+                "Unpack",
+                vec![
+                    vec![DataType::Uint8, DataType::Uint32],
+                    vec![DataType::Int64],
+                    vec![DataType::Uint8],
+                ],
+            ),
+            (
+                "GroupedMatMul",
+                vec![
+                    onnx_runtime_ir::standard_math::DTYPES.to_vec(),
+                    vec![DataType::Int32, DataType::Int64],
+                ],
+            ),
+        ] {
+            assert!(registry.lookup(name, "", 28).is_none());
+            let schema = registry.lookup(name, "", 29).unwrap();
+            assert_eq!(schema.since_version, 29);
+            assert_eq!(
+                schema
+                    .type_constraints
+                    .iter()
+                    .map(|t| t.allowed.clone())
+                    .collect::<Vec<_>>(),
+                constraints,
+                "{name}"
+            );
+        }
+        let grouped = registry.lookup("GroupedMatMul", "", 29).unwrap();
+        assert!(grouped.inputs[3].optional);
+    }
 }

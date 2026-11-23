@@ -268,6 +268,18 @@ pub fn run_cuda(
     outputs: &[(DataType, Vec<usize>)],
     attrs: &[(&str, Attribute)],
 ) -> Vec<Vec<u8>> {
+    try_run_cuda(ep, op, domain, opset, inputs, outputs, attrs).unwrap()
+}
+
+pub fn try_run_cuda(
+    ep: &CudaExecutionProvider,
+    op: &str,
+    domain: &str,
+    opset: u64,
+    inputs: &[Tensor],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
     let (graph, node_id) = build_graph(op, domain, opset, inputs, outputs, attrs);
     let model = Model::new(&graph);
     let concrete_shapes = inputs
@@ -367,30 +379,31 @@ pub fn run_cuda(
         })
         .collect::<Vec<_>>();
     let mut workspace = None;
-    execute_kernel(
+    let execution = execute_kernel(
         ep,
         kernel.as_ref(),
         &input_views,
         &mut output_views,
         &mut workspace,
-    )
-    .unwrap();
+    );
 
-    let result = outputs
-        .iter()
-        .zip(&output_buffers)
-        .map(|((dtype, shape), buffer)| {
-            let mut bytes = vec![0; dtype.storage_bytes(shape.iter().product())];
-            if !bytes.is_empty() {
-                unsafe {
-                    ep.runtime()
-                        .dtoh(&mut bytes, cuptr(buffer.as_ptr()))
-                        .unwrap()
-                };
-            }
-            bytes
-        })
-        .collect();
+    let result = execution.map(|()| {
+        outputs
+            .iter()
+            .zip(&output_buffers)
+            .map(|((dtype, shape), buffer)| {
+                let mut bytes = vec![0; dtype.storage_bytes(shape.iter().product())];
+                if !bytes.is_empty() {
+                    unsafe {
+                        ep.runtime()
+                            .dtoh(&mut bytes, cuptr(buffer.as_ptr()))
+                            .unwrap()
+                    };
+                }
+                bytes
+            })
+            .collect()
+    });
     for buffer in input_buffers {
         ep.deallocate(buffer).unwrap();
     }
@@ -442,6 +455,17 @@ pub fn run_cpu(
     outputs: &[(DataType, Vec<usize>)],
     attrs: &[(&str, Attribute)],
 ) -> Vec<Vec<u8>> {
+    try_run_cpu(op, domain, opset, inputs, outputs, attrs).unwrap()
+}
+
+pub fn try_run_cpu(
+    op: &str,
+    domain: &str,
+    opset: u64,
+    inputs: &[Tensor],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
     let ep = CpuExecutionProvider::new();
     let (graph, node_id) = build_graph(op, domain, opset, inputs, outputs, attrs);
     let model = Model::new(&graph);
@@ -494,9 +518,9 @@ pub fn run_cpu(
             )
         })
         .collect::<Vec<_>>();
-    execute_cpu_kernel(&ep, kernel.as_ref(), &input_views, &mut output_views).unwrap();
+    execute_cpu_kernel(&ep, kernel.as_ref(), &input_views, &mut output_views)?;
     drop(output_views);
-    output_bytes
+    Ok(output_bytes)
 }
 
 /// Construct the default CUDA EP or panic. CPU-only runs rely on the `gpu-tests`

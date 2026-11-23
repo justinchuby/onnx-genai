@@ -1,0 +1,15 @@
+domain: ""
+name: Unpack
+since_version: 29
+doc: Unpack a little-bit-order stream of words along one axis into count UINT8 codes per row.
+attributes:
+  - { name: axis, type: int, default: -1 }
+  - { name: bits, type: int }
+  - { name: radix, type: int }
+  - { name: group_size, type: int }
+inputs: [{ name: X, type_str: TWord }, { name: count, type_str: TCount }]
+outputs: [{ name: Y, type_str: T }]
+type_constraints:
+  - { type_param: TWord, allowed: [uint8, uint32] }
+  - { type_param: TCount, allowed: [int64] }
+  - { type_param: T, allowed: [uint8] }
