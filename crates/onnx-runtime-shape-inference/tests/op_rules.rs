@@ -485,7 +485,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        226,
+        230,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -7041,6 +7041,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "DequantizeLinear", 21),
     ("", "DequantizeLinear", 23),
     ("", "DequantizeLinear", 25),
+    ("", "DequantizePacked", 29),
     ("", "Det", 11),
     ("", "Div", 1),
     ("", "Dropout", 1),
@@ -7073,6 +7074,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "GridSample", 16),
     ("", "GroupNormalization", 18),
     ("", "GroupNormalization", 21),
+    ("", "GroupedMatMul", 29),
     ("", "HammingWindow", 17),
     ("", "HannWindow", 17),
     ("", "HardSigmoid", 1),
@@ -7119,6 +7121,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "OneHot", 11),
     ("", "Or", 1),
     ("", "PRelu", 16),
+    ("", "Pack", 29),
     ("", "Pad", 1),
     ("", "Pow", 1),
     ("", "QLinearMatMul", 10),
@@ -7207,6 +7210,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Transpose", 1),
     ("", "Trilu", 14),
     ("", "Unique", 11),
+    ("", "Unpack", 29),
     ("", "Unsqueeze", 1),
     ("", "Unsqueeze", 13),
     ("", "Where", 1),
