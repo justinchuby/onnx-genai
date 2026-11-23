@@ -17,6 +17,7 @@ pub(super) fn workspace_planning_for_node(
     }
     if is_control_flow_op(&node.op_type, &node.domain)
         || is_sequence_op(&node.op_type, &node.domain)
+        || is_state_op(&node.op_type, &node.domain)
     {
         return WorkspacePlanning::None;
     }
@@ -196,6 +197,72 @@ pub(super) fn merge_workspace_peak(
 }
 
 impl Executor {
+    pub(crate) fn set_state_runtime_config(&mut self, config: StateRuntimeConfig) -> Result<()> {
+        if let crate::AttentionCacheMode::Paged { page_size: 0 } = config.attention {
+            return Err(SessionError::StateOp {
+                op: "<configuration>".to_string(),
+                reason: "attention paged cache page_size must be greater than zero".to_string(),
+            });
+        }
+        self.state_config = config;
+        Ok(())
+    }
+
+    pub(crate) fn run_values(
+        &mut self,
+        inputs: &[(&str, SessionInput<'_>)],
+    ) -> Result<Vec<SessionOutput>> {
+        let mut tensors = Vec::new();
+        let mut opaque_inputs = HashMap::new();
+        for &(name, input) in inputs {
+            let vid =
+                self.input_index
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| SessionError::InputNotFound {
+                        name: name.to_string(),
+                    })?;
+            match input {
+                SessionInput::Tensor(tensor) => {
+                    if self.opaque_value_ids.contains(&vid) {
+                        return Err(SessionError::StateOp {
+                            op: "<graph input>".to_string(),
+                            reason: format!(
+                                "input {name:?} is declared as ONNX opaque state, but a Tensor was supplied; pass SessionInput::Opaque"
+                            ),
+                        });
+                    }
+                    tensors.push((name, tensor));
+                }
+                SessionInput::Opaque(value) => {
+                    let expected = value_opaque_kind(self.graph.value(vid)).ok_or_else(|| {
+                        SessionError::StateOp {
+                            op: "<graph input>".to_string(),
+                            reason: format!(
+                                "input {name:?} is not a supported ONNX opaque state input; pass a Tensor instead"
+                            ),
+                        }
+                    })?;
+                    if value.kind != expected {
+                        return Err(SessionError::StateOp {
+                            op: "<graph input>".to_string(),
+                            reason: format!(
+                                "input {name:?} expects opaque {}, but received {}; connect the matching state output",
+                                expected.onnx_name(),
+                                value.kind.onnx_name()
+                            ),
+                        });
+                    }
+                    opaque_inputs.insert(vid, value.clone());
+                }
+            }
+        }
+        self.pending_opaque_inputs = opaque_inputs;
+        let result = self.run_outputs(&tensors);
+        self.pending_opaque_inputs.clear();
+        result
+    }
+
     fn constant_i64_values(&self, value: ValueId) -> Option<Vec<i64>> {
         if let Some(WeightRef::Inline(tensor)) = self.graph.initializers.get(&value) {
             return match tensor.dtype {
@@ -1126,6 +1193,10 @@ impl Executor {
                         op: "<graph output>".to_string(),
                         reason: "the tensor-only run API received a Sequence graph output; use InferenceSession::run_outputs to preserve sequence values".to_string(),
                     }),
+                    SessionOutput::Opaque(_) => Err(SessionError::StateOp {
+                        op: "<graph output>".to_string(),
+                        reason: "the tensor-only run API received opaque state; use InferenceSession::run_values".to_string(),
+                    }),
                 }
             })
             .collect()
@@ -1186,6 +1257,10 @@ impl Executor {
                 Some(SessionOutput::Sequence(_)) => Err(SessionError::SequenceOp {
                     op: "<graph output>".to_string(),
                     reason: "run_with_device_bindings cannot return an unbound Sequence graph output; use run_outputs without tensor device bindings".to_string(),
+                }),
+                Some(SessionOutput::Opaque(_)) => Err(SessionError::StateOp {
+                    op: "<graph output>".to_string(),
+                    reason: "run_with_device_bindings cannot return opaque state; use run_values without device bindings".to_string(),
                 }),
             })
             .collect()
@@ -1256,6 +1331,14 @@ impl Executor {
                             return Ok(DeviceGraphCaptureResult::NotCapturable(
                                 CaptureDeclineReport::one(CaptureDecline::graph(
                                     "device graph capture cannot return a Sequence graph output",
+                                )),
+                            ));
+                        }
+                        Some(SessionOutput::Opaque(_)) => {
+                            self.reset_device_graph()?;
+                            return Ok(DeviceGraphCaptureResult::NotCapturable(
+                                CaptureDeclineReport::one(CaptureDecline::graph(
+                                    "device graph capture cannot return an opaque state graph output",
                                 )),
                             ));
                         }

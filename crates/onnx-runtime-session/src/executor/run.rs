@@ -414,6 +414,12 @@ impl Executor {
         // run-scoped (element Arcs from a prior run must not leak in).
         self.sequences.clear();
         self.seq_elem_values.clear();
+        self.opaque_values.clear();
+        self.opaque_values.extend(
+            self.pending_opaque_inputs
+                .iter()
+                .map(|(&id, value)| (id, value.clone())),
+        );
         self.restore_shared_buffers()?;
         Ok(())
     }
@@ -434,6 +440,9 @@ impl Executor {
 
         // Every required input must be supplied.
         for &vid in &self.required_inputs {
+            if self.opaque_value_ids.contains(&vid) {
+                continue;
+            }
             let provided = external.inputs.contains_key(&vid)
                 || inputs
                     .iter()
@@ -1055,6 +1064,16 @@ impl Executor {
                     ))
                 })?;
                 results.push(Some(SessionOutput::Sequence(sequence)));
+                continue;
+            }
+            if self.opaque_value_ids.contains(&vid) {
+                let value = self.opaque_values.get(&vid).cloned().ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "opaque graph output value#{} has no live runtime value",
+                        vid.0
+                    ))
+                })?;
+                results.push(Some(SessionOutput::Opaque(value)));
                 continue;
             }
 

@@ -600,6 +600,9 @@ pub(crate) struct Executor {
     /// build; these values own no [`DeviceBuffer`] and are skipped by buffer
     /// sizing — their storage lives in [`Self::sequences`] at run time.
     pub(super) sequence_values: HashSet<ValueId>,
+    /// Values whose declared ONNX type is one of the prototype opaque state
+    /// types. They own no tensor buffer and are carried through `opaque_values`.
+    pub(super) opaque_value_ids: HashSet<ValueId>,
     /// Most recent activation-memory planner result from a measured top-level
     /// eager run once shapes and view aliases are concrete. Stage-2 replay and
     /// nested runs skip re-planning and leave this as the last measured top-level
@@ -618,6 +621,12 @@ pub(crate) struct Executor {
     /// source rather than deep-copying bytes (see [`crate::sequence`] for the
     /// no-copy + no-race invariants). Cleared each run.
     pub(super) sequences: HashMap<ValueId, SequenceValue>,
+    /// Run-scoped opaque values, including graph inputs and state-op outputs.
+    pub(super) opaque_values: HashMap<ValueId, OpaqueValue>,
+    /// Opaque graph inputs staged by `run_values` for the next ordinary run.
+    pub(super) pending_opaque_inputs: HashMap<ValueId, OpaqueValue>,
+    /// Runtime-selected physical state policy; graph semantics remain unchanged.
+    pub(super) state_config: StateRuntimeConfig,
     /// Run-scoped **zero-copy** backing for a *tensor* value whose bytes are a
     /// shared sequence element (the output of `SequenceAt`): the tensor aliases
     /// the element's `Arc` instead of owning a `DeviceBuffer`, so no bytes are

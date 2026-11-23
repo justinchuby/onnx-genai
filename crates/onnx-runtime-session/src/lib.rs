@@ -44,6 +44,10 @@ pub use onnx_runtime_ep_api::WorkspaceRequirement;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };
+pub use opaque::{
+    AttentionCacheMode, CausalConvStateMode, LinearAttentionStateMode, OpaqueStateKind,
+    OpaqueValue, SessionInput, StateRuntimeConfig,
+};
 pub use plugin_provider::{PluginExecutionProvider, is_plugin_fused_node};
 pub use tensor::{
     DeviceBindingTransferStats, DeviceIoBinding, ExternalMemorySpec, Tensor, cpu_allocator,
@@ -55,6 +59,7 @@ mod epcontext;
 mod executor;
 mod fp16_decode;
 pub mod hetero;
+mod opaque;
 mod plugin_provider;
 pub mod sequence;
 mod tensor;
@@ -70,13 +75,14 @@ fn trace_span(name: &'static str, cat: &'static str) -> Option<SpanGuard> {
 pub enum SessionOutput {
     Tensor(Tensor),
     Sequence(sequence::SequenceValue),
+    Opaque(OpaqueValue),
 }
 
 impl SessionOutput {
     pub fn as_tensor(&self) -> Option<&Tensor> {
         match self {
             Self::Tensor(tensor) => Some(tensor),
-            Self::Sequence(_) => None,
+            Self::Sequence(_) | Self::Opaque(_) => None,
         }
     }
 
@@ -84,13 +90,14 @@ impl SessionOutput {
         match self {
             Self::Tensor(_) => None,
             Self::Sequence(sequence) => Some(sequence),
+            Self::Opaque(_) => None,
         }
     }
 
     pub fn into_tensor(self) -> Option<Tensor> {
         match self {
             Self::Tensor(tensor) => Some(tensor),
-            Self::Sequence(_) => None,
+            Self::Sequence(_) | Self::Opaque(_) => None,
         }
     }
 
@@ -98,6 +105,21 @@ impl SessionOutput {
         match self {
             Self::Tensor(_) => None,
             Self::Sequence(sequence) => Some(sequence),
+            Self::Opaque(_) => None,
+        }
+    }
+
+    pub fn as_opaque(&self) -> Option<&OpaqueValue> {
+        match self {
+            Self::Opaque(value) => Some(value),
+            Self::Tensor(_) | Self::Sequence(_) => None,
+        }
+    }
+
+    pub fn into_opaque(self) -> Option<OpaqueValue> {
+        match self {
+            Self::Opaque(value) => Some(value),
+            Self::Tensor(_) | Self::Sequence(_) => None,
         }
     }
 }
@@ -320,6 +342,9 @@ mod error {
 
         #[error("Sequence op {op}: {reason}")]
         SequenceOp { op: String, reason: String },
+
+        #[error("state op {op}: {reason}")]
+        StateOp { op: String, reason: String },
 
         #[error("control-flow op {op}: {reason}")]
         ControlFlow { op: String, reason: String },
@@ -1360,6 +1385,19 @@ impl InferenceSession {
     /// Run inference and preserve tensor or sequence graph-output types.
     pub fn run_outputs(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<SessionOutput>> {
         self.exec.run_outputs(inputs)
+    }
+
+    /// Run inference with tensor and ONNX opaque-state inputs.
+    pub fn run_values(
+        &mut self,
+        inputs: &[(&str, SessionInput<'_>)],
+    ) -> Result<Vec<SessionOutput>> {
+        self.exec.run_values(inputs)
+    }
+
+    /// Select physical storage policies for prototype opaque state values.
+    pub fn set_state_runtime_config(&mut self, config: StateRuntimeConfig) -> Result<()> {
+        self.exec.set_state_runtime_config(config)
     }
 
     /// F5 Stage 1 decode-plan memo activity counters `(primed, rebuilt, replayed,

@@ -353,6 +353,7 @@ pub(super) fn reject_unsupported_operators(
             || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
             || is_sequence_op(&node.op_type, &node.domain)
+            || is_state_op(&node.op_type, &node.domain)
         {
             continue;
         }
@@ -481,6 +482,7 @@ pub(super) fn collect_cuda_coverage_issues(
             || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
             || is_sequence_op(&node.op_type, &node.domain)
+            || is_state_op(&node.op_type, &node.domain)
         {
             continue;
         }
@@ -1089,7 +1091,7 @@ impl Executor {
         let has_symbols =
             Self::collect_value_metadata(&graph, &order, &mut value_shapes, &mut value_dtypes);
 
-        let (sequence_values, control_flow_output_values) =
+        let (sequence_values, opaque_value_ids, control_flow_output_values) =
             Self::classify_special_values(&graph, &order);
         let all_value_ids = value_shapes.keys().copied().collect();
 
@@ -1152,11 +1154,15 @@ impl Executor {
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
+            opaque_value_ids,
             activation_memory_plan: None,
             shared_buffers: HashMap::new(),
             parked_input_buffers: Vec::new(),
             capture_deferred_frees: Vec::new(),
             sequences: HashMap::new(),
+            opaque_values: HashMap::new(),
+            pending_opaque_inputs: HashMap::new(),
+            state_config: StateRuntimeConfig::default(),
             seq_elem_values: HashMap::new(),
             execution_provider_fallback_report,
             trace: TraceContext::noop(),
@@ -1668,11 +1674,11 @@ impl Executor {
     /// its list in `sequences` at run time) and the outputs of every
     /// control-flow node (seeded into the capture plan so downstream capturable
     /// consumers do not each form an eager seam). Returns
-    /// `(sequence_values, control_flow_output_values)`.
+    /// `(sequence_values, opaque_value_ids, control_flow_output_values)`.
     fn classify_special_values(
         graph: &Graph,
         order: &[NodeId],
-    ) -> (HashSet<ValueId>, HashSet<ValueId>) {
+    ) -> (HashSet<ValueId>, HashSet<ValueId>, HashSet<ValueId>) {
         let mut sequence_values: HashSet<ValueId> = HashSet::new();
         for &nid in order {
             let node = graph.node(nid);
@@ -1682,6 +1688,21 @@ impl Executor {
                 }
             }
         }
+
+        let opaque_value_ids = graph
+            .values
+            .iter()
+            .filter_map(|(id, value)| {
+                let opaque = matches!(
+                    value
+                        .declared_type
+                        .as_ref()
+                        .and_then(|ty| ty.value.as_ref()),
+                    Some(onnx_runtime_ir::onnx::type_proto::Value::OpaqueType(_))
+                );
+                opaque.then_some(id)
+            })
+            .collect();
 
         let mut control_flow_output_values: HashSet<ValueId> = HashSet::new();
         for &nid in order {
@@ -1693,7 +1714,11 @@ impl Executor {
             }
         }
 
-        (sequence_values, control_flow_output_values)
+        (
+            sequence_values,
+            opaque_value_ids,
+            control_flow_output_values,
+        )
     }
 
     /// Build the structural per-node plan in topological order, skipping
@@ -1942,7 +1967,7 @@ impl Executor {
             // Sequence-typed values have no meaningful tensor shape and are
             // never buffer-sized; skip them so a static graph does not trip the
             // unresolved-shape check on a sequence value.
-            if self.sequence_values.contains(&vid) {
+            if self.sequence_values.contains(&vid) || self.opaque_value_ids.contains(&vid) {
                 continue;
             }
             match shape.as_ref().and_then(|shape| substitute(shape, bindings)) {
@@ -2412,7 +2437,7 @@ impl Executor {
             }
             // Sequence-typed values own no tensor buffer (their list lives in
             // `sequences` at run time), so never size one for them.
-            if self.sequence_values.contains(&vid) {
+            if self.sequence_values.contains(&vid) || self.opaque_value_ids.contains(&vid) {
                 continue;
             }
             let dtype = self.value_dtypes[&vid];
@@ -2492,6 +2517,12 @@ impl Executor {
                 if span.is_some() {
                     skipped_sequence += 1;
                 }
+                continue;
+            }
+            // Prototype opaque-state ops are executor structural nodes. Their
+            // inputs/outputs include non-tensor values that the EP Kernel ABI
+            // cannot represent, so they deliberately have no leaf kernel.
+            if is_state_op(&node.op_type, &node.domain) {
                 continue;
             }
             if !self.plan[i]
