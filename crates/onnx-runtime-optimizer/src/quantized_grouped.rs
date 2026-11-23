@@ -28,12 +28,18 @@ impl OptimizationPass for QuantizedGroupedFusion {
             if graph.node(id).op_type != "GroupedMatMul" {
                 continue;
             }
-            if let Ok((mut dead, replacement)) = quantized_grouped::recognize(
+            let recognized = quantized_grouped::recognize(
                 graph,
                 graph.node(id),
                 &|v| literal(graph, ctx, v),
                 &|v| captured.contains(&v),
-            ) {
+            )
+            .or_else(|_| {
+                quantized_grouped::recognize_packed(graph, graph.node(id), &|v| {
+                    captured.contains(&v)
+                })
+            });
+            if let Ok((mut dead, replacement)) = recognized {
                 graph.replace_node(id, replacement);
                 // Consumers must be disconnected before their producers are removed.
                 dead.sort_unstable_by_key(|id| std::cmp::Reverse(positions[id]));

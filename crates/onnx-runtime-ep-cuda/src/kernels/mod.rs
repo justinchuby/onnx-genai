@@ -58,6 +58,7 @@ pub mod cumprod;
 pub mod cumsum;
 pub mod data_transform;
 mod dequantize_packed;
+mod dequantize_packed_gather;
 pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
 pub mod dft;
@@ -749,6 +750,15 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new(
+            onnx_runtime_ir::quantized_grouped::PACKED_OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(packed_routed::PackedFactory(runtime.clone())),
+    );
+    reg.register(
+        OpKey::new(
             onnx_runtime_ir::affine_gather::OP,
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
@@ -1005,6 +1015,15 @@ pub fn build_cuda_registry_with_metrics(
         OpKey::new("DequantizePacked", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(dequantize_packed::Factory(runtime.clone())),
+    );
+    reg.register(
+        OpKey::new(
+            onnx_runtime_ir::dequantize_packed_gather::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(dequantize_packed_gather::Factory(runtime.clone())),
     );
     reg.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),

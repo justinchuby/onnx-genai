@@ -237,6 +237,7 @@ pub(crate) fn cuda_optimization_passes(
     vec![
         Box::new(onnx_runtime_optimizer::quantized_grouped::QuantizedGroupedFusion),
         Box::new(onnx_runtime_optimizer::affine_gather::AffineGatherFusion),
+        Box::new(onnx_runtime_optimizer::dequantize_packed_gather::DequantizePackedGatherFusion),
         Box::new(CudaSiluFusion),
         // Collapse the SSM/linear-attention `Reciprocal(Sqrt(x))` normalize-scale
         // glue into a single byte-identical `rsqrt` kernel (drops the standalone

@@ -148,6 +148,16 @@ if ! cargo test -p onnx-runtime-ep-cuda --features cuda \
 fi
 echo ""
 
+# Packed producer graphs must select and execute the native CUDA fusions.
+echo "── Packed producer graph selection and parity ──"
+if ! cargo test --locked -p onnx-runtime-session --features gpu-tests \
+    --test quantized_matmul --test dequantize_packed_gather --test packed_grouped \
+    -- --include-ignored --nocapture 2>&1; then
+    echo -e "${RED}FAILED: Packed producer graph tests${NC}"
+    exit 1
+fi
+echo ""
+
 # Phase 5: Attention (critical path)
 echo "── Phase 5: Attention kernels ──"
 if ! cargo test -p onnx-runtime-ep-cuda --features cuda \

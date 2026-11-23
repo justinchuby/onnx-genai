@@ -779,11 +779,9 @@ must specify an immutable scalar count equal to K.
 
 For GGUF, emit a flat UINT8 initializer, opset-29 `DequantizePacked` with
 logical shape `[N,K]`, and a swap transpose. Blocks must fit within each
-row without padding. A redundant FLOAT-to-FLOAT Cast before the transpose
-is allowed. The fused formats are `iq1_s`, `iq1_m`, `iq2_xxs`, `iq2_xs`,
-`iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_nl`, `iq4_xs`, `q2_k`, `q3_k`, `q5_k`,
-`q6_k`, and `q8_0`. The other profiles, including `q4_k` and `mxfp4`,
-retain standalone decoding. Precision-changing casts, shared decoded
+row without padding. A redundant FLOAT-to-FLOAT Cast before or after the
+transpose is allowed. All 27 standard GGUF profiles use the same block
+decoder as standalone `DequantizePacked`. Precision-changing casts, shared decoded
 values, shared inline GGUF bytes, or other layouts also retain the original
 graph.
 
@@ -791,3 +789,9 @@ CUDA uses these fusions only when the activation is statically known to
 contain one row and launch geometry permits it. CPU can stream decoded
 rows for multiple activation rows. Neither fused path materializes the
 full decoded weight matrix.
+
+Packed Gather fuses when axis 0 selects whole block-aligned slices, preserving
+the decoded dtype. Packed `GroupedMatMul` fuses unbiassed FLOAT projections
+with integer routes and `transB=1` when the `[experts, outputs, depth]`
+weight bank is row-aligned. These paths decode only selected slices or expert
+projection blocks. Shared decoded tensors retain the original graph.

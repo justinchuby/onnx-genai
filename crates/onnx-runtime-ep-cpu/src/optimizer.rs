@@ -87,6 +87,9 @@ pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     passes.push(Box::new(
         onnx_runtime_optimizer::affine_gather::AffineGatherFusion,
     ));
+    passes.push(Box::new(
+        onnx_runtime_optimizer::dequantize_packed_gather::DequantizePackedGatherFusion,
+    ));
     passes.push(Box::new(CpuSiluFusion));
     let projection_fusion = ProjectionFusion::new();
     if projection_fusion.enabled() {

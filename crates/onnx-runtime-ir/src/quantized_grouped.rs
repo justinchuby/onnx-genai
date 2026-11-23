@@ -6,6 +6,96 @@ use crate::{
 };
 
 pub const OP: &str = "AffineQuantizedGroupedMatMul";
+pub const PACKED_OP: &str = "PackedGroupedMatMul";
+
+pub fn recognize_packed(
+    g: &Graph,
+    root: &Node,
+    captured: &impl Fn(ValueId) -> bool,
+) -> Result<(Vec<NodeId>, Node), &'static str> {
+    let [Some(a), Some(w), Some(idx)] = root.inputs.as_slice() else {
+        return Err("expected unbiassed grouped projection");
+    };
+    let [Some(y)] = root.outputs.as_slice() else {
+        return Err("expected one grouped projection output");
+    };
+    if root.op_type != "GroupedMatMul"
+        || !is_default_domain(&root.domain)
+        || !root.overload.is_empty()
+        || g.effective_opset(root) != Some(29)
+        || root.attributes.len() != 1
+        || root.attr("transB").and_then(Attribute::as_int) != Some(1)
+        || g.value(*a).dtype != DataType::Float32
+        || g.value(*y).dtype != DataType::Float32
+        || !matches!(g.value(*idx).dtype, DataType::Int32 | DataType::Int64)
+    {
+        return Err("expected transposed FLOAT GroupedMatMul with integer routes and no bias");
+    }
+    let dq = standard_producer(g, *w, "DequantizePacked")?;
+    if g.effective_opset(dq) != Some(29)
+        || !dq
+            .attributes
+            .keys()
+            .all(|name| matches!(name.as_str(), "format" | "shape" | "output_dtype"))
+    {
+        return Err("expected standard DequantizePacked-29 attributes");
+    }
+    let [Some(packed)] = dq.inputs.as_slice() else {
+        return Err("DequantizePacked requires one packed input");
+    };
+    let metadata = crate::dequantize_packed::Metadata::from_node(dq)
+        .map_err(|_| "invalid DequantizePacked metadata")?;
+    let [groups, n, k] = metadata.shape() else {
+        return Err("decoded packed expert bank must have shape [groups,N,K]");
+    };
+    let static_shape = |id| {
+        g.value(id).tensor_shape().and_then(|shape| {
+            shape
+                .iter()
+                .map(|d| d.as_static())
+                .collect::<Option<Vec<_>>>()
+        })
+    };
+    if *groups == 0
+        || *n == 0
+        || *k == 0
+        || metadata.dtype() != DataType::Float32
+        || g.value(*w).dtype != DataType::Float32
+        || static_shape(*w).as_deref() != Some(metadata.shape())
+        || g.value(*packed).dtype != DataType::Uint8
+        || static_shape(*packed).as_deref() != Some(&[metadata.packed_bytes()])
+        || static_shape(*a)
+            .as_deref()
+            .is_none_or(|shape| !matches!(shape, [m, depth] if *m > 0 && *depth == *k))
+        || static_shape(*idx)
+            .as_deref()
+            .is_none_or(|shape| !matches!(shape, [m, _] if *m == static_shape(*a).unwrap()[0]))
+        || static_shape(*y).as_deref()
+            != static_shape(*idx)
+                .map(|shape| vec![shape[0], shape[1], *n])
+                .as_deref()
+    {
+        return Err("packed expert bank or grouped projection shapes are incompatible");
+    }
+    let decoded = g.value(*w);
+    if decoded.is_graph_output
+        || captured(*w)
+        || decoded
+            .consumers
+            .nodes()
+            .iter()
+            .any(|&consumer| consumer != root.id)
+    {
+        return Err("decoded expert bank has another use");
+    }
+    let mut replacement = root.clone();
+    replacement.domain = RUNTIME_DOMAIN.into();
+    replacement.op_type = PACKED_OP.into();
+    replacement.version = Some(1);
+    replacement.inputs = vec![Some(*a), Some(*packed), Some(*idx)];
+    replacement.attributes = dq.attributes.clone();
+    Ok((vec![dq.id], replacement))
+}
 
 pub fn recognize(
     g: &Graph,
