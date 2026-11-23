@@ -1,0 +1,95 @@
+{
+  "shapes_rows_H_I_threads_dense_gateMode_op": [
+    [
+      1,
+      32,
+      64,
+      1,
+      0,
+      0,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      1,
+      0,
+      0,
+      "block"
+    ],
+    [
+      1,
+      64,
+      128,
+      1,
+      1,
+      0,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      1,
+      2,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      3,
+      "block"
+    ],
+    [
+      1,
+      64,
+      128,
+      1,
+      0,
+      0,
+      "float"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      "float"
+    ]
+  ],
+  "gate_modes": {
+    "0": "identity",
+    "1": "separate FC3",
+    "2": "interleaved SwiGLU",
+    "3": "split SwiGLU"
+  },
+  "arms": [
+    "baseline",
+    "after",
+    "null"
+  ],
+  "processes_per_arm_case": 3,
+  "batches": 9,
+  "target_loop_and_control_cpu_ms": 250,
+  "minimum_cpu_ms": 20,
+  "minimum_cpu_wall_ratio": 0.9,
+  "control_gate_percent": 5,
+  "attempts": 1,
+  "scope": "public session strict prepare/run/output-owner drop; Float cases exercise the shared existing per-expert driver at the default threshold"
+}

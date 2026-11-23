@@ -1,0 +1,43 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-53b93bd9d65a9d6e)
+kernels::block_quantized_matmul::tests::benchmark_prefill_4096x4096_m64: test
+kernels::block_quantized_matmul::tests::block_quantized_matmul_manifest_counter_proves_dense_f32_dequant_dispatch: test
+kernels::block_quantized_matmul::tests::bounded_projection_empty_rows_skip_expansion_and_preserve_bias_validation: test
+kernels::block_quantized_matmul::tests::bounded_projection_matches_dense_and_f64_for_all_formats_and_tail_shapes: test
+kernels::block_quantized_matmul::tests::bounded_projection_refreshes_strided_weights_for_all_activation_storage_types: test
+kernels::block_quantized_matmul::tests::cached_dense_matches_uncached_for_supported_formats_and_activation_dtypes: test
+kernels::block_quantized_matmul::tests::constant_mxfp4_weight_uses_bounded_cached_dense_path: test
+kernels::block_quantized_matmul::tests::dense_layout_decoder_rejects_bad_geometry_payload_and_target_without_panicking: test
+kernels::block_quantized_matmul::tests::dense_layouts_fill_the_given_target_and_match_for_all_formats_with_tails: test
+kernels::block_quantized_matmul::tests::dense_weight_identity_rekeys_when_the_constant_source_changes: test
+kernels::block_quantized_matmul::tests::dense_weight_identity_uses_mmap_owner_metadata_not_just_address: test
+kernels::block_quantized_matmul::tests::e8m0_decode_covers_subnormal_extremes_and_nan: test
+kernels::block_quantized_matmul::tests::glm52_k_quant_and_q8_known_blocks_match_ggml_layouts: test
+kernels::block_quantized_matmul::tests::governed_projection_refusal_matches_streaming_for_all_formats_storage_and_layouts: test
+kernels::block_quantized_matmul::tests::iq1_m_decodes_bitsliced_fp16_two_odd_scales_and_vector_deltas: test
+kernels::block_quantized_matmul::tests::iq1_s_decodes_eleven_bit_grids_odd_scale_and_delta: test
+kernels::block_quantized_matmul::tests::iq2_s_decodes_ten_bit_grids_explicit_signs_and_nibble_scales: test
+kernels::block_quantized_matmul::tests::iq2_xs_decodes_nine_bit_grids_sign_table_and_nibble_scales: test
+kernels::block_quantized_matmul::tests::iq2_xxs_decodes_packed_grid_sign_and_scale_metadata: test
+kernels::block_quantized_matmul::tests::iq3_s_decodes_grid_high_bits_signs_and_odd_subscales: test
+kernels::block_quantized_matmul::tests::iq3_xxs_decodes_two_grids_packed_signs_and_scale: test
+kernels::block_quantized_matmul::tests::iq4_nl_uses_llama_codebook_and_fp16_scale: test
+kernels::block_quantized_matmul::tests::iq4_xs_decodes_six_bit_subscales_and_iq4_nl_values: test
+kernels::block_quantized_matmul::tests::mxfp4_batched_matmul_with_partial_block_and_bias_matches_reference: test
+kernels::block_quantized_matmul::tests::mxfp4_bfloat16_decode_and_prefill_match_widened_reference: test
+kernels::block_quantized_matmul::tests::mxfp4_known_block_matches_ocp_e2m1_and_llama_layout: test
+kernels::block_quantized_matmul::tests::new_iq_formats_register_with_upstream_block_sizes: test
+kernels::block_quantized_matmul::tests::prepared_projection_bounds_caller_target_and_rejects_invalid_extents_before_writes: test
+kernels::block_quantized_matmul::tests::prepared_projection_fills_caller_destination_and_preserves_separate_previous_output: test
+kernels::block_quantized_matmul::tests::provider_factories_share_derived_grants_with_host_kv_and_recover_after_release: test
+kernels::block_quantized_matmul::tests::selected_decoders_are_bit_exact_with_scalar_reference: test
+kernels::block_quantized_matmul::tests::streamed_rows_match_dense_projection_oracle_for_all_formats_and_tails: test
+kernels::block_quantized_matmul::tests::streamed_rows_reject_invalid_extents_before_computation: test
+kernels::block_quantized_matmul::tests::streamed_workspace_is_required_and_warm_loans_make_no_issuer_calls: test
+kernels::block_quantized_matmul::tests::vendored_iq_grid_fingerprints_match_llama_cpp: test
+kernels::block_quantized_matmul::tests::weight_cache_concurrent_miss_builds_once: test
+kernels::block_quantized_matmul::tests::weight_cache_disabled_and_oversize_entries_are_not_retained: test
+kernels::block_quantized_matmul::tests::weight_cache_env_parser_handles_disable_whitespace_and_overflow: test
+kernels::block_quantized_matmul::tests::weight_cache_is_bounded_and_lru_evicts: test
+
+39 tests, 0 benchmarks

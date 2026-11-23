@@ -2432,3 +2432,27 @@ ignored per configuration), as do block MoE tests (29 each) and strict all-targe
 CPU Clippy in both configurations. Caller-owned poisoned targets, separate prior
 outputs, guard regions, short/oversized destinations, malformed input/packed/bias
 spans, short scratch, empty axes and partial blocks are covered.
+
+
+### Candidate: shared BlockQuantizedMoE FC banks
+
+The candidate phase driver accepts dense or packed projections writing into
+caller-provided prefixes. Float and block experts share the same gather,
+FC1/FC3, activation and FC2 live-range rule. Block binds decoded scratch, two
+expert banks and a cross-expert accumulator in one checked lane; no per-expert
+quota, new pool, retention flag or public EP API is introduced. The private
+owned QMoE driver remains in real use.
+
+Native and MLAS-reference Block MoE (29), float MoE (24 plus one existing ignored)
+and block MatMul (38 plus one existing ignored) checks pass, as do strict
+all-target Clippy in both configurations. Resource tests pin first-warm zero
+issuer callbacks, full retained-capacity charges, trim-to-zero, short-workspace
+rejection and output preservation after an admitted computation failure.
+
+This is **not adopted**. The [72-process study](../benchmarks/block-moe-fc-banks/README.md)
+has six unqualified cells, and the two qualified cells still show large A/A
+shifts with overlapping process ranges. It establishes output/capacity agreement,
+not a performance conclusion. Preserve all failed gates and keep the candidate
+in draft while improving attribution. Fixed bank capacity increases retention
+even for a singleton that borrows its input; no RSS or full-process cap claim
+follows from removing FC result Vecs.

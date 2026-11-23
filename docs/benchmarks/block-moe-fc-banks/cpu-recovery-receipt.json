@@ -1,0 +1,79 @@
+{
+  "scope": "exact CPU test IDs from this chat completed native/MLAS logs; current failed native linker objects only",
+  "removed": [
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-53b93bd9d65a9d6e",
+      "bytes": 99934552
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.00.rcgu.o",
+      "bytes": 21309424
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.12.rcgu.o",
+      "bytes": 29049872
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.10.rcgu.o",
+      "bytes": 8993128
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.02.rcgu.o",
+      "bytes": 13388384
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.06.rcgu.o",
+      "bytes": 22980184
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.14.rcgu.o",
+      "bytes": 12119584
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.08.rcgu.o",
+      "bytes": 30505384
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.04.rcgu.o",
+      "bytes": 14619832
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.01.rcgu.o",
+      "bytes": 8131080
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.13.rcgu.o",
+      "bytes": 16083496
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.2lbhm6d1s1p73zy7zuskpy7k5.rcgu.o",
+      "bytes": 1752
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.11.rcgu.o",
+      "bytes": 11401288
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.03.rcgu.o",
+      "bytes": 11569208
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.07.rcgu.o",
+      "bytes": 17552808
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.15.rcgu.o",
+      "bytes": 20820888
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.09.rcgu.o",
+      "bytes": 12802168
+    },
+    {
+      "path": "/private/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a.onnx_runtime_ep_cpu.a3efe1a89b5ed626-cgu.05.rcgu.o",
+      "bytes": 31044944
+    }
+  ],
+  "logical_bytes": 382307976,
+  "kept": "other packages, incremental directories, dependencies, all source and measurement outputs"
+}

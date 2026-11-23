@@ -1,0 +1,28 @@
+{"status": "queued", "pid": 38759, "action": "Wait for the peer batch on the shared stable flock; no heavy process has started."}
+{"status": "acquired", "pid": 38759, "command": ["python", "/tmp/nxrt-block-fc-workspace/validate.py"]}
+native-block_quantized_moe-list
+
+native-block_quantized_moe-tests
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 2022 filtered out; finished in 0.24s
+native-moe-list
+
+native-moe-tests
+test result: ok. 24 passed; 0 failed; 1 ignored; 0 measured; 2026 filtered out; finished in 0.12s
+native-block_quantized_matmul-list
+
+native-block_quantized_matmul-tests
+test result: ok. 38 passed; 0 failed; 1 ignored; 0 measured; 2012 filtered out; finished in 0.20s
+native clippy
+mlas-block_quantized_moe-list
+
+mlas-block_quantized_moe-tests
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 2079 filtered out; finished in 0.31s
+mlas-moe-list
+
+mlas-moe-tests
+test result: ok. 24 passed; 0 failed; 1 ignored; 0 measured; 2083 filtered out; finished in 0.15s
+mlas-block_quantized_matmul-list
+
+mlas-block_quantized_matmul-tests
+test result: ok. 38 passed; 0 failed; 1 ignored; 0 measured; 2069 filtered out; finished in 0.26s
+mlas clippy

@@ -1,0 +1,4 @@
+{"status": "queued", "pid": 34333, "action": "Wait for the peer batch on the shared stable flock; no heavy process has started."}
+{"status": "acquired", "pid": 34333, "command": ["python", "/tmp/nxrt-block-fc-workspace/math-check.py"]}
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2049 filtered out; finished in 0.00s

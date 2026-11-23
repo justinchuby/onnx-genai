@@ -1,0 +1,4 @@
+{"status": "queued", "pid": 37791, "action": "Wait for the peer batch on the shared stable flock; no heavy process has started."}
+{"status": "acquired", "pid": 37791, "command": ["python", "/tmp/nxrt-block-fc-workspace/check-constant-bits.py"]}
+coefficient f32_bits=0x3f4c422a f64_bits=0x3fe9884533d43651
+

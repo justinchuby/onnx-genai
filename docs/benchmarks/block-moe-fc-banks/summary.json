@@ -1,0 +1,562 @@
+[
+  {
+    "shape": [
+      1,
+      32,
+      64,
+      1,
+      0,
+      0,
+      "block"
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "baseline": {
+        "cpu_us_median": 12.41610619469025,
+        "cpu_us_range": [
+          12.301356932153395,
+          15.06690265486726
+        ],
+        "wall_us_median": 12.420629262536874,
+        "wall_us_range": [
+          12.33269911504425,
+          17.24380289085546
+        ],
+        "control_ms_median": 236.72700000000015,
+        "workspace_bytes": [
+          1280
+        ]
+      },
+      "after": {
+        "cpu_us_median": 13.757109144542781,
+        "cpu_us_range": [
+          11.910678466076698,
+          14.674867256637164
+        ],
+        "wall_us_median": 15.712121415929204,
+        "wall_us_range": [
+          11.911976401179942,
+          15.910683421828907
+        ],
+        "control_ms_median": 248.89899999999977,
+        "workspace_bytes": [
+          1536
+        ]
+      },
+      "null": {
+        "cpu_us_median": 14.250914454277295,
+        "cpu_us_range": [
+          12.608318584070796,
+          14.443185840707967
+        ],
+        "wall_us_median": 15.228805309734511,
+        "wall_us_range": [
+          12.612126312684365,
+          16.033502949852508
+        ],
+        "control_ms_median": 244.93399999999977,
+        "workspace_bytes": [
+          1280
+        ]
+      }
+    },
+    "after_over_baseline": 1.1080051127805277,
+    "null_over_baseline": 1.1477764631532952,
+    "control_after_over_baseline": 1.0514178779775845,
+    "control_null_over_baseline": 1.034668626730367,
+    "minimum_cpu_wall_ratio": 0.8016294984394565,
+    "duration_pass": true,
+    "control_5pct_pass": false
+  },
+  {
+    "shape": [
+      8,
+      128,
+      256,
+      1,
+      0,
+      0,
+      "block"
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "baseline": {
+        "cpu_us_median": 501.15368852459017,
+        "cpu_us_range": [
+          490.934426229508,
+          561.4713114754098
+        ],
+        "wall_us_median": 504.99188729508194,
+        "wall_us_range": [
+          490.9540655737705,
+          610.301911885246
+        ],
+        "control_ms_median": 245.81500000000034,
+        "workspace_bytes": [
+          18432
+        ]
+      },
+      "after": {
+        "cpu_us_median": 491.25819672131126,
+        "cpu_us_range": [
+          485.93237704918033,
+          549.2581967213113
+        ],
+        "wall_us_median": 491.45039139344266,
+        "wall_us_range": [
+          486.0567786885246,
+          590.619536885246
+        ],
+        "control_ms_median": 246.80900000000028,
+        "workspace_bytes": [
+          26624
+        ]
+      },
+      "null": {
+        "cpu_us_median": 505.65778688524586,
+        "cpu_us_range": [
+          486.41393442622933,
+          545.284836065574
+        ],
+        "wall_us_median": 506.5093913934426,
+        "wall_us_range": [
+          486.5022192622951,
+          602.9021516393442
+        ],
+        "control_ms_median": 246.394,
+        "workspace_bytes": [
+          18432
+        ]
+      }
+    },
+    "after_over_baseline": 0.9802545765303824,
+    "null_over_baseline": 1.008987459264075,
+    "control_after_over_baseline": 1.0040436913939341,
+    "control_null_over_baseline": 1.0023554298964654,
+    "minimum_cpu_wall_ratio": 0.8355710205317598,
+    "duration_pass": true,
+    "control_5pct_pass": true
+  },
+  {
+    "shape": [
+      1,
+      64,
+      128,
+      1,
+      1,
+      0,
+      "block"
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "baseline": {
+        "cpu_us_median": 13.142502294940337,
+        "cpu_us_range": [
+          12.919974080673907,
+          14.266051082671847
+        ],
+        "wall_us_median": 13.146473459690048,
+        "wall_us_range": [
+          12.922034991090232,
+          15.66294524542362
+        ],
+        "control_ms_median": 237.5310000000006,
+        "workspace_bytes": [
+          2560
+        ]
+      },
+      "after": {
+        "cpu_us_median": 12.719477293590366,
+        "cpu_us_range": [
+          12.544629839624164,
+          13.905124466763866
+        ],
+        "wall_us_median": 12.719889032885144,
+        "wall_us_range": [
+          12.551647389167883,
+          15.315151574059078
+        ],
+        "control_ms_median": 247.06599999999978,
+        "workspace_bytes": [
+          3072
+        ]
+      },
+      "null": {
+        "cpu_us_median": 13.091527620281887,
+        "cpu_us_range": [
+          12.916086181759272,
+          14.381932069766194
+        ],
+        "wall_us_median": 13.124127058696475,
+        "wall_us_range": [
+          12.91639888762892,
+          16.159880879097145
+        ],
+        "control_ms_median": 235.7349999999996,
+        "workspace_bytes": [
+          2560
+        ]
+      }
+    },
+    "after_over_baseline": 0.9678124460733152,
+    "null_over_baseline": 0.996121387425736,
+    "control_after_over_baseline": 1.0401421288168666,
+    "control_null_over_baseline": 0.9924388816617578,
+    "minimum_cpu_wall_ratio": 0.7637906397369363,
+    "duration_pass": true,
+    "control_5pct_pass": true
+  },
+  {
+    "shape": [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      "block"
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "baseline": {
+        "cpu_us_median": 1372.1920529801307,
+        "cpu_us_range": [
+          1353.3973509933764,
+          1744.2317880794703
+        ],
+        "wall_us_median": 475.7218543046357,
+        "wall_us_range": [
+          406.5482913907285,
+          713.5529801324503
+        ],
+        "control_ms_median": 236.65100000000018,
+        "workspace_bytes": [
+          28672
+        ]
+      },
+      "after": {
+        "cpu_us_median": 1701.5430463576158,
+        "cpu_us_range": [
+          1364.5364238410584,
+          1872.3377483443705
+        ],
+        "wall_us_median": 782.3829999999999,
+        "wall_us_range": [
+          505.16970198675494,
+          856.2958079470199
+        ],
+        "control_ms_median": 240.29900000000026,
+        "workspace_bytes": [
+          49152
+        ]
+      },
+      "null": {
+        "cpu_us_median": 1700.7682119205301,
+        "cpu_us_range": [
+          1338.814569536424,
+          1907.788079470199
+        ],
+        "wall_us_median": 695.0535298013245,
+        "wall_us_range": [
+          467.02980132450335,
+          909.1710794701986
+        ],
+        "control_ms_median": 242.0009999999997,
+        "workspace_bytes": [
+          28672
+        ]
+      }
+    },
+    "after_over_baseline": 1.240018146630568,
+    "null_over_baseline": 1.2394534775411334,
+    "control_after_over_baseline": 1.0154151049435671,
+    "control_null_over_baseline": 1.0226071303311606,
+    "minimum_cpu_wall_ratio": 1.0712036301721821,
+    "duration_pass": true,
+    "control_5pct_pass": true
+  },
+  {
+    "shape": [
+      8,
+      128,
+      256,
+      4,
+      1,
+      2,
+      "block"
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "baseline": {
+        "cpu_us_median": 986.0387931034483,
+        "cpu_us_range": [
+          804.3879310344824,
+          1113.3965517241388
+        ],
+        "wall_us_median": 430.12050862068963,
+        "wall_us_range": [
+          248.52190948275862,
+          537.7356336206897
+        ],
+        "control_ms_median": 264.4360000000003,
+        "workspace_bytes": [
+          32768
+        ]
+      },
+      "after": {
+        "cpu_us_median": 988.913793103449,
+        "cpu_us_range": [
+          734.14224137931,
+          1084.5862068965514
+        ],
+        "wall_us_median": 462.17025862068965,
+        "wall_us_range": [
+          211.05441810344828,
+          480.15804310344834
+        ],
+        "control_ms_median": 235.74299999999982,
+        "workspace_bytes": [
+          53248
+        ]
+      },
+      "null": {
+        "cpu_us_median": 964.1077586206897,
+        "cpu_us_range": [
+          854.9267241379307,
+          1106.2327586206914
+        ],
+        "wall_us_median": 449.35811637931033,
+        "wall_us_range": [
+          301.49604741379306,
+          520.9457629310344
+        ],
+        "control_ms_median": 244.75900000000019,
+        "workspace_bytes": [
+          32768
+        ]
+      }
+    },
+    "after_over_baseline": 1.0029157067856855,
+    "null_over_baseline": 0.9777584465883608,
+    "control_after_over_baseline": 0.8914935939130813,
+    "control_null_over_baseline": 0.9255888003146314,
+    "minimum_cpu_wall_ratio": 1.3111904040228564,
+    "duration_pass": true,
+    "control_5pct_pass": false
+  },
+  {
+    "shape": [
+      8,
+      128,
+      256,
+      4,
+      0,
+      3,
+      "block"
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "baseline": {
+        "cpu_us_median": 1341.8506493506507,
+        "cpu_us_range": [
+          1075.662337662337,
+          1549.1818181818187
+        ],
+        "wall_us_median": 527.1469155844156,
+        "wall_us_range": [
+          412.9997272727273,
+          688.8779805194806
+        ],
+        "control_ms_median": 238.69899999999998,
+        "workspace_bytes": [
+          32768
+        ]
+      },
+      "after": {
+        "cpu_us_median": 1543.7857142857158,
+        "cpu_us_range": [
+          1303.8701298701299,
+          1625.064935064935
+        ],
+        "wall_us_median": 684.5746753246755,
+        "wall_us_range": [
+          490.6055194805195,
+          753.1758636363637
+        ],
+        "control_ms_median": 252.57400000000007,
+        "workspace_bytes": [
+          53248
+        ]
+      },
+      "null": {
+        "cpu_us_median": 1177.1818181818185,
+        "cpu_us_range": [
+          1163.3181818181824,
+          1579.090909090913
+        ],
+        "wall_us_median": 446.05627922077923,
+        "wall_us_range": [
+          336.54681168831166,
+          697.7613636363636
+        ],
+        "control_ms_median": 239.5830000000001,
+        "workspace_bytes": [
+          32768
+        ]
+      }
+    },
+    "after_over_baseline": 1.1504899707227372,
+    "null_over_baseline": 0.8772822957245511,
+    "control_after_over_baseline": 1.0581276000318396,
+    "control_null_over_baseline": 1.0037034088957228,
+    "minimum_cpu_wall_ratio": 1.4266203968802484,
+    "duration_pass": true,
+    "control_5pct_pass": false
+  },
+  {
+    "shape": [
+      1,
+      64,
+      128,
+      1,
+      0,
+      0,
+      "float"
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "baseline": {
+        "cpu_us_median": 11.007472858015694,
+        "cpu_us_range": [
+          10.811486581754943,
+          12.198994219109833
+        ],
+        "wall_us_median": 11.02080100578089,
+        "wall_us_range": [
+          10.81779423790948,
+          14.041186868449499
+        ],
+        "control_ms_median": 245.87899999999996,
+        "workspace_bytes": [
+          1024
+        ]
+      },
+      "after": {
+        "cpu_us_median": 10.92325045824131,
+        "cpu_us_range": [
+          10.767213422944964,
+          12.065798749823761
+        ],
+        "wall_us_median": 10.923326831790195,
+        "wall_us_range": [
+          10.777439629647038,
+          13.88797762842506
+        ],
+        "control_ms_median": 245.17200000000062,
+        "workspace_bytes": [
+          1024
+        ]
+      },
+      "null": {
+        "cpu_us_median": 10.87023546552616,
+        "cpu_us_range": [
+          10.81562250317244,
+          12.10654697560746
+        ],
+        "wall_us_median": 10.877410631198005,
+        "wall_us_range": [
+          10.817001127978566,
+          13.771421816985479
+        ],
+        "control_ms_median": 238.57000000000016,
+        "workspace_bytes": [
+          1024
+        ]
+      }
+    },
+    "after_over_baseline": 0.9923486161755054,
+    "null_over_baseline": 0.987532343321692,
+    "control_after_over_baseline": 0.9971246019383545,
+    "control_null_over_baseline": 0.970273996559284,
+    "minimum_cpu_wall_ratio": 0.8084556656921337,
+    "duration_pass": true,
+    "control_5pct_pass": true
+  },
+  {
+    "shape": [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      "float"
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "baseline": {
+        "cpu_us_median": 727.6633165829137,
+        "cpu_us_range": [
+          704.5326633165829,
+          1015.0904522613073
+        ],
+        "wall_us_median": 247.4790603015075,
+        "wall_us_range": [
+          219.5123567839196,
+          436.82160804020106
+        ],
+        "control_ms_median": 240.81399999999985,
+        "workspace_bytes": [
+          28672
+        ]
+      },
+      "after": {
+        "cpu_us_median": 644.4472361809043,
+        "cpu_us_range": [
+          627.9246231155784,
+          1076.3668341708542
+        ],
+        "wall_us_median": 195.85929648241205,
+        "wall_us_range": [
+          190.4336281407035,
+          463.18530150753764
+        ],
+        "control_ms_median": 237.11800000000017,
+        "workspace_bytes": [
+          28672
+        ]
+      },
+      "null": {
+        "cpu_us_median": 679.723618090452,
+        "cpu_us_range": [
+          664.5175879396985,
+          1039.4170854271347
+        ],
+        "wall_us_median": 208.96210050251258,
+        "wall_us_range": [
+          192.57328140703518,
+          426.2692613065327
+        ],
+        "control_ms_median": 240.53200000000018,
+        "workspace_bytes": [
+          28672
+        ]
+      }
+    },
+    "after_over_baseline": 0.8856393080349443,
+    "null_over_baseline": 0.9341182970201313,
+    "control_after_over_baseline": 0.9846520551130761,
+    "control_null_over_baseline": 0.9988289717375249,
+    "minimum_cpu_wall_ratio": 1.5356317278475078,
+    "duration_pass": true,
+    "control_5pct_pass": true
+  }
+]

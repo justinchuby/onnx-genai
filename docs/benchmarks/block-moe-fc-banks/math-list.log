@@ -1,0 +1,6 @@
+    Finished `release` profile [optimized] target(s) in 0.12s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-b628ea968ce0c22f)
+kernels::standard_math::tests::gated_activation_rejects_broadcasting_before_writing: test
+kernels::standard_math::tests::scan_preserves_small_prefix_and_handles_interleaved_lanes: test
+
+2 tests, 0 benchmarks

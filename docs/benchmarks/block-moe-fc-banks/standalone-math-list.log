@@ -1,0 +1,13 @@
+   Compiling onnx-runtime-ir v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-workspace/crates/onnx-runtime-ir)
+   Compiling onnx-runtime-memory-governor v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-workspace/crates/onnx-runtime-memory-governor)
+   Compiling onnx-runtime-shape-inference v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-workspace/crates/onnx-runtime-shape-inference)
+   Compiling onnx-runtime-optimizer v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-workspace/crates/onnx-runtime-optimizer)
+   Compiling onnx-runtime-loader v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-workspace/crates/onnx-runtime-loader)
+   Compiling onnx-runtime-ep-api v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-workspace/crates/onnx-runtime-ep-api)
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-workspace/crates/onnx-runtime-ep-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 28.01s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a)
+kernels::standard_math::tests::gated_activation_rejects_broadcasting_before_writing: test
+kernels::standard_math::tests::scan_preserves_small_prefix_and_handles_interleaved_lanes: test
+
+2 tests, 0 benchmarks

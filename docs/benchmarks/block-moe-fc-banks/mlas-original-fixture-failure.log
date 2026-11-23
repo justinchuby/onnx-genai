@@ -1,0 +1,50 @@
+    Finished `release` profile [optimized] target(s) in 0.25s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-440f89539a052cc8)
+
+running 29 tests
+test kernels::block_quantized_moe::tests::block_quantized_moe_claim_gate_accepts_valid_and_omitted_optionals ... ok
+test kernels::block_quantized_moe::tests::block_quantized_moe_claim_gate_rejects_static_optional_and_fc3_errors_with_symbolic_dims ... ok
+test kernels::block_quantized_moe::tests::block_quantized_moe_claim_gate_rejects_bad_dtype_format_and_arity ... ok
+test kernels::block_quantized_moe::tests::block_quantized_moe_silu_matches_dense_reference ... ok
+test kernels::block_quantized_moe::tests::block_quantized_moe_fused_swiglu_matches_dense_reference ... ok
+test kernels::block_quantized_moe::tests::block_quantized_moe_manifest_counter_proves_dense_f32_expert_dispatch ... ok
+test kernels::block_quantized_moe::tests::block_quantized_moe_topk_selects_the_highest_scoring_expert ... ok
+test kernels::block_quantized_moe::tests::block_quantized_moe_matches_dense_reference_topk_softmax ... ok
+test kernels::block_quantized_moe::tests::block_quantized_moe_swiglu_attributes_affect_dense_reference ... ok
+test kernels::block_quantized_moe::tests::fc3_format_wiring_mismatch_is_typed_rejected ... ok
+test kernels::block_quantized_moe::tests::glm52_native_formats_are_accepted_per_projection ... ok
+test kernels::block_quantized_moe::tests::constant_moe_expert_weights_reuse_bounded_cached_dense_path ... ok
+test kernels::block_quantized_moe::tests::block_quantized_moe_relu_and_gelu_match_dense_reference ... ok
+test kernels::block_quantized_moe::tests::dense_resident_experts_do_not_initialize_projection_scratch ... ok
+test kernels::block_quantized_moe::tests::projection_layout_contract_is_byte_exact_and_rejects_tails ... ok
+test kernels::block_quantized_moe::tests::projection_layout_rejects_overflowing_dimensions ... ok
+test kernels::block_quantized_moe::tests::block_quantized_moe_router_weights_and_normalization_match_reference ... ok
+test kernels::block_quantized_moe::tests::workspace_metadata_validates_optional_slots_and_empty_rows ... ok
+test kernels::block_quantized_moe::tests::nonconstant_fc3_matches_dense_reference_for_unfused_gated_activations ... ok
+test kernels::block_quantized_moe::tests::expert_banks_cover_fc_phases_and_accumulator_without_warm_issuer_calls ... FAILED
+test kernels::block_quantized_moe::tests::zero_hidden_empty_outputs_need_no_workspace_or_weight_decode ... ok
+test kernels::block_quantized_moe::tests::zero_budget_streaming_reads_fresh_and_strided_expert_bytes ... ok
+test kernels::block_quantized_moe::tests::block_quantized_moe_is_bit_deterministic ... ok
+test kernels::block_quantized_moe::tests::provider_moe_factories_share_atomic_projection_group_grants ... ok
+test kernels::block_quantized_moe::tests::one_expert_expansion_is_shared_by_every_row_routed_to_it ... ok
+test kernels::block_quantized_moe::tests::mixed_fc1_fc2_formats_match_per_projection_dense_reference ... ok
+test kernels::block_quantized_moe::tests::mixed_unfused_gate_uses_independent_fc3_format ... ok
+test kernels::block_quantized_moe::tests::cached_moe_matches_uncached_for_all_supported_block_formats ... ok
+test kernels::block_quantized_moe::tests::streamed_experts_preserve_grouped_routing_mixed_formats_biases_and_gates ... ok
+
+failures:
+
+---- kernels::block_quantized_moe::tests::expert_banks_cover_fc_phases_and_accumulator_without_warm_issuer_calls stdout ----
+
+thread '<unnamed>' (9722580) panicked at crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs:1867:13:
+backend operation BlockQuantizedMoE execution workspace binding failed: kernel execution failed: workspace needs 2688 bytes aligned to 4, received 2432 bytes at 0x7800800000; prepare and pass the kernel's workspace requirement before execution
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Host workspace registration remains pinned by outstanding ownership: mechanism MechanismIdentity(opaque(1, 3)) still owns 1 quarantined allocation(s); removal would lose ownership that was deliberately retained; finish managed releases before retiring its context
+
+
+failures:
+    kernels::block_quantized_moe::tests::expert_banks_cover_fc_phases_and_accumulator_without_warm_issuer_calls
+
+test result: FAILED. 28 passed; 1 failed; 0 ignored; 0 measured; 2079 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `-p onnx-runtime-ep-cpu --lib`

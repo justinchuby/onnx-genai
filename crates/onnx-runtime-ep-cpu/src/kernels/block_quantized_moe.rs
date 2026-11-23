@@ -38,8 +38,11 @@ use super::block_quantized_matmul::{
     decode_dense_weight_into, linear_packed_prepared, projection_plan,
 };
 use super::decoded_projection::ProjectionScratch;
+#[cfg(test)]
+use super::moe::run_expert_grouped;
 use super::moe::{
-    ExpertProjection, MoeAttributes, routing_weights, run_expert_grouped, run_expert_projections,
+    DenseExpertWeights, ExpertProjection, ExpertProjections, MoeAttributes, MoeWorkspace,
+    expert_bank_widths, routing_weights,
 };
 use super::{check_arity, to_dense_f32, write_dense_f32};
 
@@ -253,10 +256,10 @@ impl Kernel for BlockQuantizedMoEKernel {
 }
 
 impl BlockQuantizedMoEKernel {
-    fn execution_workspace_layout(&self, dims: Dimensions) -> Result<WorkspaceLayout<3>> {
+    fn execution_workspace_layout(&self, dims: Dimensions) -> Result<WorkspaceLayout<4>> {
         // A validated empty final output cannot consume projections or gathers.
         if dims.rows == 0 || dims.hidden == 0 {
-            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 3]);
+            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 4]);
         }
         // Experts and their projections execute serially. An expert receives a
         // row at most once, so total rows bound every group, independent of k.
@@ -274,16 +277,21 @@ impl BlockQuantizedMoEKernel {
         let projection =
             std::alloc::Layout::from_size_align(projection_bytes, projection_alignment)
                 .map_err(|_| error("decoded projection workspace exceeds addressable capacity"))?;
-        let gathered_elements = dims.rows.checked_mul(dims.hidden).ok_or_else(|| {
-            error("grouped input rows times hidden width overflow; reduce batch dimensions")
-        })?;
-        let gathered = std::alloc::Layout::array::<f32>(gathered_elements).map_err(|_| {
-            error("grouped input workspace exceeds addressable capacity; reduce batch dimensions")
-        })?;
-        // The accumulator is live across all experts, so it cannot alias the
-        // projection or gather region. One input-sized region covers the full
-        // output without any expert-count or top-k multiplier.
-        WorkspaceLayout::new([projection, gathered, gathered])
+        let widths = expert_bank_widths(
+            &self.attributes,
+            dims.hidden,
+            dims.inter,
+            dims.fc1_size,
+            self.formats.fc3.is_some(),
+        )?;
+        let region = |width: usize| {
+            let elements = dims.rows.checked_mul(width).ok_or_else(|| error("expert workspace rows times width overflow; reduce batch or projection dimensions"))?;
+            std::alloc::Layout::array::<f32>(elements).map_err(|_| error("expert workspace exceeds addressable capacity; reduce batch or projection dimensions"))
+        };
+        let [a, b] = widths;
+        // Decoding is independent; the two expert banks follow phase lifetimes.
+        // The accumulator spans all experts and cannot alias any of them.
+        WorkspaceLayout::new([projection, region(a)?, region(b)?, region(dims.hidden)?])
     }
 
     fn execute_prepared_experts(
@@ -318,13 +326,14 @@ impl BlockQuantizedMoEKernel {
         let layout = self.execution_workspace_layout(dimensions)?;
         // SAFETY: one checked layout lends disjoint Host regions for this
         // dispatch. Neither short borrow nor a projection output escapes.
-        let [mut scratch, mut grouped_scratch, mut accumulator] = unsafe {
+        let [mut scratch, input_bank, projection_bank, mut accumulator] = unsafe {
             ProjectionScratch::bind_layout(
                 "BlockQuantizedMoE execution workspace binding",
                 layout,
                 workspace,
             )?
         };
+        let mut expert_workspace = MoeWorkspace::new(input_bank, projection_bank);
         let Dimensions {
             rows,
             hidden,
@@ -391,11 +400,6 @@ impl BlockQuantizedMoEKernel {
         #[cfg(test)]
         let mut counted_dense = false;
         for (expert, expert_tasks) in tasks {
-            let grouped_input = grouped_scratch.gather_rows(
-                &input,
-                hidden,
-                expert_tasks.iter().map(|&(row, _)| row),
-            )?;
             let dense = if use_dense {
                 match self.dequantize_expert_group(
                     inputs,
@@ -432,21 +436,23 @@ impl BlockQuantizedMoEKernel {
                 let fc1 = &weights[0];
                 let fc2 = &weights[1];
                 let fc3 = weights.get(2);
-                run_expert_grouped(
-                    grouped_input,
-                    expert_tasks.len(),
-                    fc1.as_slice(),
-                    fc1_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
-                    fc2.as_slice(),
-                    fc2_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
-                    fc3.map(|weight| weight.as_slice()),
-                    fc3_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                expert_workspace.run_dense_expert(
+                    &input,
+                    expert_tasks.iter().map(|&(row, _)| row),
+                    DenseExpertWeights {
+                        fc1: fc1.as_slice(),
+                        fc1_bias: fc1_bias
+                            .as_deref()
+                            .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
+                        fc2: fc2.as_slice(),
+                        fc2_bias: fc2_bias
+                            .as_deref()
+                            .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
+                        fc3: fc3.map(|weight| weight.as_slice()),
+                        fc3_bias: fc3_bias
+                            .as_deref()
+                            .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                    },
                     fc1_size,
                     hidden,
                     inter,
@@ -483,29 +489,25 @@ impl BlockQuantizedMoEKernel {
                         )
                     })
                     .transpose()?;
-                run_expert_projections(
-                    grouped_input,
-                    expert_tasks.len(),
-                    &fc1,
-                    fc1_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
-                    &fc2,
-                    fc2_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
-                    fc3.as_ref(),
-                    fc3_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                expert_workspace.run_projected_expert(
+                    &input,
+                    expert_tasks.iter().map(|&(row, _)| row),
+                    ExpertProjections {
+                        fc1: &fc1,
+                        fc1_bias: fc1_bias
+                            .as_deref()
+                            .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
+                        fc2: &fc2,
+                        fc2_bias: fc2_bias
+                            .as_deref()
+                            .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
+                        fc3: fc3.as_ref(),
+                        fc3_bias: fc3_bias
+                            .as_deref()
+                            .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                    },
                     &self.attributes,
-                    |projection, input, rows, bias| {
-                        let elements = rows.checked_mul(projection.out_features).ok_or_else(|| error("expert projection output element count overflows; reduce batch or expert dimensions"))?;
-                        let mut output = super::decoded_projection::zeroed_f32(
-                            OP,
-                            "expert projection output staging",
-                            elements,
-                        )?;
+                    |projection, input, rows, bias, output| {
                         linear_packed_prepared(
                             projection.format,
                             &projection.bytes,
@@ -516,9 +518,8 @@ impl BlockQuantizedMoEKernel {
                             bias,
                             self.projection_plan,
                             scratch.initialized(),
-                            &mut output,
-                        )?;
-                        Ok(output)
+                            output,
+                        )
                     },
                 )?
             };
@@ -1709,12 +1710,12 @@ mod tests {
                 .execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace))
                 .unwrap();
             assert!(
-                scratch[..scratch.len() - 2 * H]
+                scratch[..scratch.len() - 3 * H]
                     .iter()
                     .all(|&value| value == 29.0),
                 "cold dense expansion and warm resident hits must leave streamed scratch untouched"
             );
-            assert_eq!(&scratch[scratch.len() - 2 * H..], &[0.125; 2 * H]);
+            assert_eq!(&scratch[scratch.len() - 3 * H..], &[0.125; 3 * H]);
             assert_eq!(output.to_f32(), vec![0.125; H]);
         }
         assert_eq!(
@@ -1725,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_workspace_covers_projection_gather_and_accumulator_without_warm_issuer_calls() {
+    fn expert_banks_cover_fc_phases_and_accumulator_without_warm_issuer_calls() {
         use crate::kernels::testutil::RecordingGovernor;
         use onnx_runtime_memory_governor::{HolderId, HostWorkspacePool, ProcessMemoryManager};
         use std::num::NonZeroUsize;
@@ -1771,7 +1772,7 @@ mod tests {
                 .with_workspace_pool(pool.clone())
                 .unwrap();
             let cpu = CpuExecutionProvider::initialized_with_resources(resources).unwrap();
-            let kernel = BlockQuantizedMoEKernel {
+            let mut kernel = BlockQuantizedMoEKernel {
                 attributes,
                 formats,
                 constant_inputs: [false; 9],
@@ -1831,12 +1832,19 @@ mod tests {
                 .bytes()
                 .max(l2.bytes())
                 .max(if separate { l3.bytes() } else { 0 });
+            let bank_widths = if activation == "identity" {
+                hidden + inter
+            } else {
+                hidden.max(inter) + (fc1_size + if separate { inter } else { 0 }).max(hidden)
+            };
             assert_eq!(
-                req.bytes, (max + 2 * rows * hidden * std::mem::size_of::<f32>()) as u64,
-                "serial experts/projections share max plus gather and accumulator, not k*E buffers"
+                req.bytes, (max + rows * (bank_widths + hidden) * std::mem::size_of::<f32>()) as u64,
+                "serial experts share decoding, two phase banks and one accumulator, without k*E multiplication"
             );
             assert!(max < l1.bytes() + l2.bytes());
             let mut output = Owned::zeros_f32(&[rows, hidden]);
+            output.bytes.fill(0x5a);
+            let untouched = output.bytes.clone();
             let err = kernel
                 .execute(&views, &mut [output.view_mut()])
                 .unwrap_err();
@@ -1845,8 +1853,35 @@ mod tests {
                     .contains("BlockQuantizedMoE execution workspace binding"),
                 "{err}"
             );
+            assert_eq!(output.bytes, untouched, "missing workspace must not publish output");
+            let mut backing = cpu.allocate_workspace(req.bytes as usize, req.alignment, req.role()).unwrap();
+            let short = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr()), req.bytes as usize - 4);
+            let error = kernel.execute_with_workspace(&views, &mut [output.view_mut()], Some(short)).unwrap_err();
+            assert!(error.to_string().contains("execution workspace binding"), "{error}");
+            assert_eq!(output.bytes, untouched, "short workspace must not publish output");
+            let original_plan = kernel.projection_plan;
+            kernel.projection_plan = super::super::decoded_projection::DecodedProjectionPlan::new(NonZeroUsize::new(1).unwrap(), NonZeroUsize::new(3).unwrap());
+            // A smaller frame leaves room even when the invalid tile enlarges
+            // decoding on the one-row MLAS path. Reach compute, not a capacity refusal.
+            let failed_input = Owned::f32(&[1, hidden], &vec![0.001; hidden]);
+            let failed_router = Owned::f32(&[1, experts], &[4., 3., -4., -5.]);
+            let mut failed_views = views;
+            failed_views[0] = failed_input.view();
+            failed_views[1] = failed_router.view();
+            let failed_metadata: Vec<_> = failed_views.iter().map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent())).collect();
+            assert!(kernel.workspace_requirement(&failed_metadata).unwrap().bytes <= backing.len() as u64);
+            let mut failed_output = Owned::zeros_f32(&[1, hidden]);
+            failed_output.bytes.fill(0x5a);
+            let failure_before = failed_output.bytes.clone();
+            let workspace = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr()), backing.len());
+            let error = kernel.execute_with_workspace(&failed_views, &mut [failed_output.view_mut()], Some(workspace)).unwrap_err();
+            kernel.projection_plan = original_plan;
+            assert!(error.to_string().contains("disagree with plan"), "{error}");
+            assert_eq!(failed_output.bytes, failure_before, "failed projection must not publish partial output");
+            assert_eq!(output.bytes, untouched);
+            cpu.deallocate_workspace(backing).unwrap();
             let mut expected = None;
-            let mut counts = None;
+            let mut counts = Some((books.claims(), books.releases()));
             for _ in 0..17 {
                 let mut backing = cpu
                     .allocate_workspace(req.bytes as usize, req.alignment, req.role())

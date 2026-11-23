@@ -278,19 +278,7 @@ impl MoEKernel {
         } else {
             rows
         };
-        let separate_gate = self.attributes.uses_separate_gate(has_fc3);
-        let widths = if self.attributes.is_gated(has_fc3) {
-            // A: gather -> activated; B: FC1+FC3 -> expert output.
-            [
-                hidden.max(inter),
-                fc1.checked_add(if separate_gate { inter } else { 0 })
-                    .ok_or_else(invalid)?
-                    .max(hidden),
-            ]
-        } else {
-            // A: gather -> expert output; B: FC1 -> in-place activation.
-            [hidden, inter]
-        };
+        let widths = expert_bank_widths(&self.attributes, hidden, inter, fc1, has_fc3)?;
         let regions = widths.map(|width| {
             let elements = bound.checked_mul(width).ok_or_else(invalid)?;
             std::alloc::Layout::array::<f32>(elements).map_err(|_| invalid())
@@ -924,7 +912,7 @@ fn run_moe_per_expert<'out>(
         let slots = group.start..group.start + group.len;
         let expert_out = scratch.run_dense_expert(
             x,
-            &plan.slot_row[slots.clone()],
+            plan.slot_row[slots.clone()].iter().map(|&row| row as usize),
             DenseExpertWeights {
                 fc1: &fc1_weights[expert * fc1_size * hidden..(expert + 1) * fc1_size * hidden],
                 fc1_bias: fc1_bias.map(|b| &b[expert * fc1_size..(expert + 1) * fc1_size]),
@@ -1162,60 +1150,130 @@ fn apply_gated_activation(
 }
 
 /// Two exclusive banks, reused only after the previous phase's final read.
-struct MoeWorkspace<'a> {
+pub(super) struct MoeWorkspace<'a> {
     input: ProjectionScratch<'a>,
     projection: ProjectionScratch<'a>,
 }
-struct DenseExpertWeights<'a> {
-    fc1: &'a [f32],
-    fc1_bias: Option<&'a [f32]>,
-    fc2: &'a [f32],
-    fc2_bias: Option<&'a [f32]>,
-    fc3: Option<&'a [f32]>,
-    fc3_bias: Option<&'a [f32]>,
+pub(super) struct DenseExpertWeights<'a> {
+    pub(super) fc1: &'a [f32],
+    pub(super) fc1_bias: Option<&'a [f32]>,
+    pub(super) fc2: &'a [f32],
+    pub(super) fc2_bias: Option<&'a [f32]>,
+    pub(super) fc3: Option<&'a [f32]>,
+    pub(super) fc3_bias: Option<&'a [f32]>,
 }
-impl MoeWorkspace<'_> {
+pub(super) struct ExpertProjections<'a, P> {
+    pub(super) fc1: &'a P,
+    pub(super) fc1_bias: Option<&'a [f32]>,
+    pub(super) fc2: &'a P,
+    pub(super) fc2_bias: Option<&'a [f32]>,
+    pub(super) fc3: Option<&'a P>,
+    pub(super) fc3_bias: Option<&'a [f32]>,
+}
+
+/// Bank widths follow live ranges, independently of the projection encoding.
+pub(super) fn expert_bank_widths(
+    attributes: &MoeAttributes,
+    hidden: usize,
+    inter: usize,
+    fc1: usize,
+    has_fc3: bool,
+) -> Result<[usize; 2]> {
+    if attributes.is_gated(has_fc3) {
+        let projections = fc1.checked_add(if attributes.uses_separate_gate(has_fc3) { inter } else { 0 }).ok_or_else(|| error(format!("expert bank width overflows for hidden={hidden}, intermediate={inter}, FC1={fc1}; reduce projection dimensions")))?;
+        Ok([hidden.max(inter), projections.max(hidden)])
+    } else {
+        Ok([hidden, inter])
+    }
+}
+
+impl<'a> MoeWorkspace<'a> {
+    pub(super) fn new(input: ProjectionScratch<'a>, projection: ProjectionScratch<'a>) -> Self {
+        Self { input, projection }
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn run_dense_expert(
+    pub(super) fn run_dense_expert(
         &mut self,
         x: &[f32],
-        row_indices: &[u32],
+        row_indices: impl ExactSizeIterator<Item = usize>,
         weights: DenseExpertWeights<'_>,
         fc1_size: usize,
         hidden: usize,
         inter: usize,
         attributes: &MoeAttributes,
     ) -> Result<&[f32]> {
+        let fc1 = DenseExpertProjection {
+            weights: weights.fc1,
+            out_features: fc1_size,
+            in_features: hidden,
+        };
+        let fc2 = DenseExpertProjection {
+            weights: weights.fc2,
+            out_features: hidden,
+            in_features: inter,
+        };
+        let fc3 = weights.fc3.map(|weights| DenseExpertProjection {
+            weights,
+            out_features: inter,
+            in_features: hidden,
+        });
+        self.run_projected_expert(
+            x,
+            row_indices,
+            ExpertProjections {
+                fc1: &fc1,
+                fc1_bias: weights.fc1_bias,
+                fc2: &fc2,
+                fc2_bias: weights.fc2_bias,
+                fc3: fc3.as_ref(),
+                fc3_bias: weights.fc3_bias,
+            },
+            attributes,
+            |projection, input, rows, bias, output| {
+                linear_grouped_into(
+                    input,
+                    rows,
+                    projection.weights,
+                    bias,
+                    projection.out_features,
+                    projection.in_features,
+                    output,
+                )
+            },
+        )
+    }
+
+    pub(super) fn run_projected_expert<P: ExpertProjection>(
+        &mut self,
+        x: &[f32],
+        mut row_indices: impl ExactSizeIterator<Item = usize>,
+        weights: ExpertProjections<'_, P>,
+        attributes: &MoeAttributes,
+        mut apply: impl FnMut(&P, &[f32], usize, Option<&[f32]>, &mut [f32]) -> Result<()>,
+    ) -> Result<&[f32]> {
         let rows = row_indices.len();
+        let hidden = weights.fc1.in_features();
+        let fc1_size = weights.fc1.out_features();
+        let inter = weights.fc2.in_features();
         let input = if rows == 1 {
-            let start = row_indices[0] as usize * hidden;
+            let start = row_indices.next().expect("one expert row") * hidden;
             &x[start..start + hidden]
         } else {
-            self.input
-                .gather_rows(x, hidden, row_indices.iter().map(|&row| row as usize))?
+            self.input.gather_rows(x, hidden, row_indices)?
         };
         let separate = attributes.uses_separate_gate(weights.fc3.is_some());
         let projections = self
             .projection
             .zeroed_prefix(rows * (fc1_size + if separate { inter } else { 0 }))?;
         let (fc1, fc3) = projections.split_at_mut(rows * fc1_size);
-        linear_grouped_into(
-            input,
-            rows,
-            weights.fc1,
-            weights.fc1_bias,
-            fc1_size,
-            hidden,
-            fc1,
-        )?;
+        apply(weights.fc1, input, rows, weights.fc1_bias, fc1)?;
         let fc3 = if separate {
-            linear_grouped_into(
+            apply(
+                weights.fc3.expect("validated separate FC3"),
                 input,
                 rows,
-                weights.fc3.expect("validated separate FC3"),
                 weights.fc3_bias,
-                inter,
-                hidden,
                 fc3,
             )?;
             Some(&*fc3)
@@ -1224,7 +1282,7 @@ impl MoeWorkspace<'_> {
         };
         if attributes.is_gated(weights.fc3.is_some()) {
             let activated = self.input.zeroed_prefix(rows * inter)?;
-            // Keep the per-expert activation serial, as before.
+            // Preserve serial per-expert activation and already-applied bias.
             if inter != 0 {
                 for (row, target) in activated.chunks_mut(inter).enumerate() {
                     gated_activation_row(
@@ -1238,30 +1296,14 @@ impl MoeWorkspace<'_> {
                 }
             }
             let output = self.projection.zeroed_prefix(rows * hidden)?;
-            linear_grouped_into(
-                activated,
-                rows,
-                weights.fc2,
-                weights.fc2_bias,
-                hidden,
-                inter,
-                output,
-            )?;
+            apply(weights.fc2, activated, rows, weights.fc2_bias, output)?;
             Ok(output)
         } else {
             for value in fc1.iter_mut() {
                 *value = activate(attributes.activation, *value);
             }
             let output = self.input.zeroed_prefix(rows * hidden)?;
-            linear_grouped_into(
-                fc1,
-                rows,
-                weights.fc2,
-                weights.fc2_bias,
-                hidden,
-                inter,
-                output,
-            )?;
+            apply(weights.fc2, fc1, rows, weights.fc2_bias, output)?;
             Ok(output)
         }
     }
