@@ -95,16 +95,24 @@ pub(super) unsafe fn block(a: &[f32], bt: &[f32], c: &mut [f32], rows: usize, k:
             }
         }
     }
+    // Keep the portable four-row reuse for the column remainder too: calling
+    // a separate one-row kernel would reload each tail weight four times.
     if full_cols < n {
-        for i in 0..full_rows {
-            super::gemm_bt_block_portable(
-                &a[i * k..(i + 1) * k],
-                &bt[full_cols * k..],
-                &mut c[i * n + full_cols..(i + 1) * n],
-                1,
-                k,
-                n - full_cols,
-            );
+        for i in (0..full_rows).step_by(4) {
+            let ar = std::array::from_fn::<_, 4, _>(|row| &a[(i + row) * k..(i + row + 1) * k]);
+            for j in full_cols..n {
+                let br = &bt[j * k..(j + 1) * k];
+                let mut acc = [0.0f32; 4];
+                for p in 0..k {
+                    let weight = br[p];
+                    for row in 0..4 {
+                        acc[row] += ar[row][p] * weight;
+                    }
+                }
+                for row in 0..4 {
+                    c[(i + row) * n + j] = acc[row];
+                }
+            }
         }
     }
     if full_rows < rows {
