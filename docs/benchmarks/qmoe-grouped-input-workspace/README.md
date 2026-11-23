@@ -150,3 +150,10 @@ a CUDA library/device. Source scan and checker self-tests plus strict CUDA
 all-target Clippy pass. host-target-source.json records this test-only follow-up;
 the two measured CPU runtime files remain unchanged. Historical measured CUDA
 oracle files and source patches are preserved rather than rewritten.
+
+
+The CUDA compile Linux lane explicitly executes qmoe_cpu_oracle with the cuda
+feature and !cancelled(), independently of earlier compile-step success. It uses
+scripts/test_step.sh to reject an empty/all-ignored run. Running that exact step
+locally without CUDA reports the named oracle passed and TEST_STEP_EXECUTED=1.
+Workflow integrity, required-tier and package/lint coverage checks pass.
