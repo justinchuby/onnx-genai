@@ -2866,7 +2866,6 @@ mod tests {
                     owner,
                     onnx_runtime_ir::DeviceId::cpu(),
                 ),
-                None,
             ))
         }
         fn deallocate_workspace(&self, allocation: crate::WorkspaceAllocation) -> Result<()> {
@@ -2878,8 +2877,7 @@ mod tests {
                         .into(),
                 ));
             }
-            let (buffer, lease) = allocation.into_parts();
-            assert!(lease.is_none());
+            let buffer = allocation.into_buffer();
             let crate::BoundBufferOwnership::Managed(owner) =
                 buffer.into_bound_ownership().unwrap()
             else {

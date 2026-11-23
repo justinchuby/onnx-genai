@@ -214,7 +214,7 @@ call; it owns the governed workspace preparation path
 | `weight_paging.rs:643` | multi-region lazy QMoE weight binding | `weight.region_bytes_len()` | weight tensor storage | weight binding/page lifetime | governed by weight residency budget, not workspace contract |
 
 #751 governs the `IndexShare` slice — routing it through
-`Kernel::workspace_requirement`, prepare-only planning, `reserve_workspace`, and
+`Kernel::workspace_requirement`, prepare-only planning, `allocate_workspace`, and
 `MappedGrowthGrant` rather than a kernel-owned raw scratch pool. `IndexShare` is
 a real but **low-byte** governed slice, not the largest live bypass in this
 table. Before #751, its two `present_key`/`present_value` staging segments (the
@@ -2224,7 +2224,7 @@ There are two ways a CUDA kernel can obtain device scratch:
 
 - **Governed** — the kernel reports a size through
   `Kernel::workspace_requirement` and the session executor reserves it via
-  `ExecutionProvider::{reserve_workspace, prepare_mapped_growth, allocate}`
+  `ExecutionProvider::allocate_workspace` (a provider-owned allocation transaction)
   *before execution*. This counts against the device authority, so a
   capacity shortfall surfaces as a pre-header **HTTP 429** (`MemoryOverload`)
   through `DriverFailure::from_engine_error`, never as a late 500/OOM.

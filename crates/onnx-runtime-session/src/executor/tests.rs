@@ -5653,32 +5653,35 @@ impl ExecutionProvider for WeightDeliveryEp {
         Ok(Some(Box::new(TestGuardHandle(proof))))
     }
 
-    fn reserve_workspace(
+    fn allocate_workspace(
         &self,
-        bytes: u64,
+        size: usize,
+        alignment: usize,
         role: onnx_runtime_memory_api::MemoryRole,
-    ) -> onnx_runtime_ep_api::Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceAllocation> {
+        let bytes = size as u64;
         assert_eq!(role, MemoryRole::Workspace { step_scoped: false });
-        self.deliveries.lock().unwrap().push("reserve_workspace");
-        // Static-bytes fixtures reserve exactly `workspace_bytes`. The per-row
+        self.deliveries.lock().unwrap().push("allocate_workspace");
+        // Static-bytes fixtures allocate exactly `workspace_bytes`. The per-row
         // fixture (`workspace_bytes_per_row != 0`, e.g.
         // `inference_session_fallback_workspace_grows_retries_and_reuses`)
-        // reserves `rows * per_row`, so the governed reservation legitimately
+        // allocates `rows * per_row`, so the workspace allocation legitimately
         // scales with the input row count — 2048 for 2 rows, 4096 for 4. This
         // method has no row count to recompute the exact figure, so it asserts
-        // the non-vacuous invariant that the reservation is a positive multiple
+        // the non-vacuous invariant that the allocation is a positive multiple
         // of the per-row size (the exact bytes are separately pinned at each
-        // call site). A zero or mis-sized reservation still fails here.
+        // call site). A zero or mis-sized allocation still fails here.
         if self.workspace_bytes_per_row == 0 {
             assert_eq!(bytes, self.workspace_bytes);
         } else {
             assert!(
                 bytes != 0 && bytes.is_multiple_of(self.workspace_bytes_per_row),
-                "per-row workspace reservation {bytes} must be a positive multiple of {}",
+                "per-row workspace allocation {bytes} must be a positive multiple of {}",
                 self.workspace_bytes_per_row
             );
         }
-        Ok(None)
+        self.allocate(size, alignment)
+            .map(onnx_runtime_ep_api::WorkspaceAllocation::new)
     }
 }
 
@@ -5850,8 +5853,8 @@ fn prepare_reserves_static_index_share_workspace() {
     assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 768);
     assert_eq!(
         deliveries.lock().unwrap().as_slice(),
-        ["reserve_workspace"],
-        "IndexShare prepare must use the governed workspace path instead of an internal raw allocation"
+        ["allocate_workspace"],
+        "IndexShare prepare must use the executor workspace path instead of a kernel-internal allocation"
     );
 }
 
@@ -8345,7 +8348,7 @@ fn lazy_weight_execution_borrows_prepared_workspace_with_logical_geometry() {
         }
         assert_eq!(
             &*deliveries.lock().unwrap(),
-            &["reserve_workspace", "lazy", "lazy", "lazy"]
+            &["allocate_workspace", "lazy", "lazy", "lazy"]
         );
         drop(executor);
         std::fs::remove_file(path).unwrap();
@@ -8369,7 +8372,10 @@ fn lazy_weight_workspace_metadata_follows_execution_slots() {
     let output = executor.run(&[]).unwrap();
     assert_eq!(output[0].as_bytes(), &[1, 2, 3, 4]);
     assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 64);
-    assert_eq!(&*deliveries.lock().unwrap(), &["reserve_workspace", "lazy"]);
+    assert_eq!(
+        &*deliveries.lock().unwrap(),
+        &["allocate_workspace", "lazy"]
+    );
     drop(executor);
     std::fs::remove_file(path).unwrap();
 }

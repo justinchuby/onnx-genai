@@ -2277,3 +2277,27 @@ request end. Measure the pool round-trip cost before changing that policy.
 Do not reuse capture pinning for scheduler ownership, keep a prefill high-water
 allocation throughout decode, or reclaim an active/asynchronous owner before
 its completion boundary. No such scheduling-policy change is made here.
+
+### Workspace has one physical and accounting owner
+
+`WorkspaceAllocation` now wraps only `DeviceBuffer`; its constructor takes the
+buffer, and `into_buffer` returns it unchanged. The optional outer `MemoryLease`,
+`ExecutionProvider::reserve_workspace`, CUDA's unused reserve override and global
+compatibility-lease quarantine are removed, without compatibility aliases.
+CPU, CUDA and Host plugin scratch retain their actual managed backing owner;
+quota, physical ownership and release settlement travel together.
+
+The default workspace adapter retains `prepare_mapped_growth` and passes its
+grant to `allocate_with_mapped_growth`, or uses the provider's raw allocator.
+That adapter does not make a raw allocator governed. Managed providers supply
+one allocation transaction or borrow a funded lane. There is no replacement
+reserve hook, extra credit ledger or per-kernel quota request.
+
+The default return delegates to the same provider's deallocator. Pool return
+keeps backing charged; physical completion can refund it. A failed or abandoned
+managed release quarantines the allocation with its charge intact. CUDA's
+allocation-specific settlement barrier and replacement wait remain unchanged;
+removing an outer lease must not make an accepted enqueue count as completion.
+The old compatibility-lease failure test is replaced by real managed backing
+and ledger/process-manager checks. Existing incomplete-release, warm zero-issuer
+callback and CUDA host-side barrier tests remain applicable.

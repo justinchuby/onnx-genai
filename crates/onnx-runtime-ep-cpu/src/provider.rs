@@ -688,7 +688,6 @@ impl ExecutionProvider for CpuExecutionProvider {
             })?;
         Ok(onnx_runtime_ep_api::WorkspaceAllocation::new(
             DeviceBuffer::from_managed_allocation(owner, self.device),
-            None,
         ))
     }
     fn deallocate_workspace(
@@ -696,10 +695,7 @@ impl ExecutionProvider for CpuExecutionProvider {
         workspace: onnx_runtime_ep_api::WorkspaceAllocation,
     ) -> Result<()> {
         let pool = self.workspace_pool()?;
-        let (buffer, lease) = workspace.into_parts();
-        if lease.is_some() {
-            return Err(EpError::KernelFailed("CPU managed workspace must carry its charge in the backing owner, without an outer lease; return workspace from this provider's allocate_workspace".into()));
-        }
+        let buffer = workspace.into_buffer();
         let onnx_runtime_ep_api::BoundBufferOwnership::Managed(owner)=buffer.into_bound_ownership().map_err(|_|EpError::KernelFailed("CPU workspace is missing managed backing ownership; use this provider's allocate_workspace".into()))? else {
             return Err(EpError::KernelFailed("CPU workspace must retain its managed backing owner; return workspace obtained from this provider's allocate_workspace".into()));
         };
@@ -1116,13 +1112,9 @@ mod tests {
         let slot = first.allocate_workspace(64, 16, role).unwrap();
         let identity = slot.managed_owner().unwrap().identity();
         let wrapper = std::ptr::from_ref(slot.managed_owner().unwrap());
-        let (buffer, lease) = slot.into_parts();
-        assert!(
-            lease.is_none(),
-            "managed backing must be the sole charge owner"
-        );
+        let buffer = slot.into_buffer();
         first
-            .deallocate_workspace(onnx_runtime_ep_api::WorkspaceAllocation::new(buffer, None))
+            .deallocate_workspace(onnx_runtime_ep_api::WorkspaceAllocation::new(buffer))
             .unwrap();
         for _ in 0..32 {
             let next = second.allocate_workspace(16, 8, role).unwrap();
