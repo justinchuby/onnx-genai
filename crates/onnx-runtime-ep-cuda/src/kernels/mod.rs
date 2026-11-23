@@ -736,6 +736,17 @@ pub fn build_cuda_registry_with_metrics(
     telemetry_registry: Arc<qmoe::RouteTelemetrySourceRegistry>,
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
+    reg.register(
+        OpKey::new(
+            onnx_runtime_ir::affine_gather::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(gather::GatherFactory {
+            runtime: runtime.clone(),
+        }),
+    );
     for name in onnx_runtime_ir::packed_routed::OPS {
         reg.register(
             OpKey::new(name, "", 29),

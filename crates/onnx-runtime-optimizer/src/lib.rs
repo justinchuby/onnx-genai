@@ -35,6 +35,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod affine_gather;
 mod constant_folding;
 mod dead_node;
 mod error;
