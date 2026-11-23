@@ -1,0 +1,7 @@
+{
+  "path": "/tmp/nxrt-miri-shared-view-target",
+  "regular_files": 1895,
+  "logical_bytes": 794877079,
+  "miri_receipt_sha256": "8b7910aed2a588ab0a04bc8c5e099e0b7be361bfb2a6f703ad1ce8481051e70a",
+  "retained": "Expected-failure and four passing Miri logs, tested source hashes and scripts are archived; no shared host-lock inode or other session target is removed."
+}

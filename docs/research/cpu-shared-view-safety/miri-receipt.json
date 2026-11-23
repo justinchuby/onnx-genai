@@ -1,0 +1,25 @@
+{
+  "base": "098f7d3f1052746d1600d91de2b436e359a7b2be",
+  "candidate_mod_sha256": "fe5444eb657833ef2954fc79bec14548d61486469d0d720cebdd902595422f10",
+  "miri_flags": "default; inherited MIRIFLAGS removed",
+  "tests": [
+    {
+      "name": "kernels::tests::shared_numeric_accessors_accept_unaligned_origins_and_strides",
+      "passed": true
+    },
+    {
+      "name": "kernels::tests::direct_f32_borrow_checks_alignment_but_accepts_empty_byte_storage",
+      "passed": true
+    },
+    {
+      "name": "kernels::selection::tests::arg_reductions_accept_unaligned_contiguous_f32_logits",
+      "passed": true
+    },
+    {
+      "name": "kernels::selection::tests::argmax_contiguous_f32_borrows_logits",
+      "passed": true
+    }
+  ],
+  "before": "Expected undefined behavior detected in the named regression test",
+  "candidate_restored": true
+}

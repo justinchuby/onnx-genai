@@ -2028,8 +2028,17 @@ pub fn to_dense_f32(view: &TensorView) -> Result<Vec<f32>> {
         // starting at `origin`, bounds-checked against the backing allocation by
         // the owning EP (ep-api safety invariant #1). `f32` has no invalid bit
         // patterns.
-        let slice = unsafe { std::slice::from_raw_parts(origin, n) };
-        out.extend_from_slice(slice);
+        // Copy bytes so a valid byte-backed view need not also satisfy f32
+        // reference alignment. Vec capacity proves the destination byte extent;
+        // every f32 bit pattern is valid, and the new allocation cannot alias.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                origin.cast::<u8>(),
+                out.as_mut_ptr().cast::<u8>(),
+                n * std::mem::size_of::<f32>(),
+            );
+            out.set_len(n);
+        }
         return Ok(out);
     }
     let mut idx = vec![0usize; view.shape.len()];
@@ -2041,7 +2050,7 @@ pub fn to_dense_f32(view: &TensorView) -> Result<Vec<f32>> {
         // has already checked that range against the backing allocation via
         // `strided::view_in_bounds` (ep-api safety invariant #1). We never read
         // past the addressed extent, and `f32` has no invalid bit patterns.
-        out.push(unsafe { *origin.offset(off) });
+        out.push(unsafe { origin.offset(off).read_unaligned() });
         if !next_index(view.shape, &mut idx) {
             break;
         }
@@ -2106,8 +2115,16 @@ pub(crate) fn contiguous_f32_slice<'a>(view: &'a TensorView<'_>) -> Result<&'a [
         .ok_or_else(|| EpError::InvalidTensorView {
             reason: "direct f32 slice byte count overflow or exceeds isize::MAX".into(),
         })?;
-    // SAFETY: as above, with `Float32` alignment additionally checked by
-    // `TensorView::validate`.
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if !view.data_ptr::<f32>().is_aligned() {
+        return Err(EpError::InvalidTensorView {
+            reason: "direct f32 slice requires an aligned element origin; use the owned conversion for byte-backed unaligned storage".into(),
+        });
+    }
+    // SAFETY: the validated contiguous host view covers `len` readable f32
+    // values, the byte extent is addressable, and its element origin is aligned.
     Ok(unsafe { std::slice::from_raw_parts(view.data_ptr::<f32>(), len) })
 }
 
@@ -2128,7 +2145,7 @@ pub fn to_dense_i64(view: &TensorView) -> Result<Vec<i64>> {
                 let off = elem_offset(view.strides, &idx);
                 // SAFETY: see `to_dense_f32` — in-shape offset over a validated,
                 // bounds-checked view; `i64` has no invalid bit patterns.
-                out.push(unsafe { *origin.offset(off) });
+                out.push(unsafe { origin.offset(off).read_unaligned() });
                 if !next_index(view.shape, &mut idx) {
                     break;
                 }
@@ -2139,7 +2156,7 @@ pub fn to_dense_i64(view: &TensorView) -> Result<Vec<i64>> {
             loop {
                 let off = elem_offset(view.strides, &idx);
                 // SAFETY: as above, for a 4-byte element type.
-                out.push(unsafe { *origin.offset(off) } as i64);
+                out.push(unsafe { origin.offset(off).read_unaligned() } as i64);
                 if !next_index(view.shape, &mut idx) {
                     break;
                 }
@@ -2180,8 +2197,16 @@ pub fn write_dense_f32(out: &mut TensorMut, data: &[f32]) -> Result<()> {
         // f32 starting at `origin`, bounds-checked against the backing
         // allocation by the owning EP (ep-api safety invariant #1). `data.len()`
         // was checked to equal `n` above, so every element is written once.
-        let slice = unsafe { std::slice::from_raw_parts_mut(origin, n) };
-        slice.copy_from_slice(data);
+        // Byte copying preserves the bulk path for unaligned storage without
+        // constructing an invalid typed reference. As with copy_from_slice,
+        // the caller must not alias the source and destination storage.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().cast::<u8>(),
+                origin.cast::<u8>(),
+                std::mem::size_of_val(data),
+            );
+        }
         return Ok(());
     }
     let strides = out.strides;
@@ -2196,7 +2221,7 @@ pub fn write_dense_f32(out: &mut TensorMut, data: &[f32]) -> Result<()> {
         // per invariant #1). Each address is written exactly once because the
         // row-major walk visits every logical index once.
         unsafe {
-            *origin.offset(off) = data[i];
+            origin.offset(off).write_unaligned(data[i]);
         }
         i += 1;
         if !next_index(shape, &mut idx) {
@@ -2923,6 +2948,135 @@ mod tests {
                 entry.op_type
             );
         }
+    }
+
+    #[test]
+    fn shared_numeric_accessors_accept_unaligned_origins_and_strides() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::DeviceId;
+
+        let floats = [f32::from_bits(0x7fc0_1234), -0., -3.5];
+        for dtype in [DataType::Float32, DataType::Int32, DataType::Int64] {
+            let encoded: Vec<Vec<u8>> = match dtype {
+                DataType::Float32 => floats.iter().map(|v| v.to_le_bytes().to_vec()).collect(),
+                DataType::Int32 => [-7i32, 0, 99]
+                    .iter()
+                    .map(|v| v.to_le_bytes().to_vec())
+                    .collect(),
+                _ => [-7i64, 0, 99]
+                    .iter()
+                    .map(|v| v.to_le_bytes().to_vec())
+                    .collect(),
+            };
+            let size = dtype.byte_size();
+            for stride in [1i64, 2, -2] {
+                let strides = [stride];
+                for offset in [0, size] {
+                    // Aligned backing + one byte establishes misalignment even
+                    // under allocators that normally overalign small objects.
+                    let mut backing = [0u64; 8];
+                    let len = std::mem::size_of_val(&backing);
+                    // SAFETY: unique byte access to live all-bits-valid u64 storage.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), len)
+                    };
+                    bytes.fill(0xa5);
+                    let origin = offset + if stride < 0 { 4 * size } else { 0 };
+                    let positions: Vec<usize> = (0..3)
+                        .map(|i| (1 + origin) as isize + i * stride as isize * size as isize)
+                        .map(|i| i as usize)
+                        .collect();
+                    let mut touched = vec![false; bytes.len()];
+                    for (&start, value) in positions.iter().zip(&encoded) {
+                        bytes[start..start + size].copy_from_slice(value);
+                        touched[start..start + size].fill(true);
+                    }
+                    {
+                        let view = TensorView::new(
+                            DevicePtr(bytes.as_ptr().wrapping_add(1).cast()),
+                            dtype,
+                            &[3],
+                            &strides,
+                            DeviceId::cpu(),
+                        )
+                        .with_byte_offset(origin);
+                        if dtype == DataType::Float32 {
+                            assert_eq!(
+                                to_dense_f32(&view)
+                                    .unwrap()
+                                    .iter()
+                                    .map(|v| v.to_bits())
+                                    .collect::<Vec<_>>(),
+                                floats.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                            );
+                        } else {
+                            assert_eq!(to_dense_i64(&view).unwrap(), [-7, 0, 99]);
+                        }
+                    }
+                    if dtype == DataType::Float32 {
+                        for &start in &positions {
+                            bytes[start..start + size].fill(0);
+                        }
+                        let mut out = TensorMut::new(
+                            DevicePtrMut(bytes.as_mut_ptr().wrapping_add(1).cast()),
+                            dtype,
+                            &[3],
+                            &strides,
+                            DeviceId::cpu(),
+                        )
+                        .with_byte_offset(origin);
+                        write_dense_f32(&mut out, &floats).unwrap();
+                        for (&start, value) in positions.iter().zip(&encoded) {
+                            assert_eq!(&bytes[start..start + size], value);
+                        }
+                    }
+                    for (&byte, touched) in bytes.iter().zip(touched) {
+                        if !touched {
+                            assert_eq!(byte, 0xa5);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_f32_borrow_checks_alignment_but_accepts_empty_byte_storage() {
+        use onnx_runtime_ep_api::DevicePtr;
+        use onnx_runtime_ir::DeviceId;
+        let storage = [0u64; 2];
+        let pointer = storage.as_ptr().cast::<u8>().wrapping_add(1);
+        let view = TensorView::new(
+            DevicePtr(pointer.cast()),
+            DataType::Float32,
+            &[1],
+            &[1],
+            DeviceId::cpu(),
+        );
+        let error = contiguous_f32_slice(&view).unwrap_err().to_string();
+        assert!(
+            error.contains("aligned element origin") && error.contains("owned conversion"),
+            "{error}"
+        );
+        let empty = TensorView::new(
+            DevicePtr(pointer.cast()),
+            DataType::Float32,
+            &[0],
+            &[1],
+            DeviceId::cpu(),
+        );
+        assert!(contiguous_f32_slice(&empty).unwrap().is_empty());
+        let floats = [1f32, 2.];
+        let aligned = TensorView::new(
+            DevicePtr(floats.as_ptr().cast()),
+            DataType::Float32,
+            &[2],
+            &[1],
+            DeviceId::cpu(),
+        );
+        let borrowed = contiguous_f32_slice(&aligned).unwrap();
+        assert_eq!(borrowed.as_ptr(), floats.as_ptr());
+        assert_eq!(borrowed, floats);
     }
 
     #[test]
