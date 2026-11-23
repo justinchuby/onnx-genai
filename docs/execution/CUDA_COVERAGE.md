@@ -283,12 +283,12 @@ codes match. `Unpack` yields `UINT8`; use matching zero-point types or cast
 both operands consistently. An omitted ONNX zero point means zero, not the
 Mobius QMoE default of eight.
 
-The native packed projection fusion covers transposed, unbiased FLOAT
+The native affine projection fusion covers transposed, unbiased FLOAT
 `GroupedMatMul` with last-axis blocked affine weights, accepting either
 `Unpack` or the unsigned nibble expansion used by Mobius. It does not claim
-direct sub-byte initializers, GGUF `DequantizePacked`, or whole-MoE routing,
-activation, and reduction. The original graph remains unchanged when a
-decoded intermediate is shared or the layout cannot be proved.
+direct sub-byte initializers or whole-MoE routing, activation, and reduction.
+The GGUF `DequantizePacked` path is described below. The original graph remains
+unchanged when a decoded intermediate is shared or the layout cannot be proved.
 
 ## Source-derived coverage audit
 
