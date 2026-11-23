@@ -1,0 +1,16 @@
+{
+  "base": "098f7d3f1052746d1600d91de2b436e359a7b2be",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-api/src/tensor.rs": "edd3703c6ea3b1a4239d4e7b90aa908e4bee17a5a1678c9283261aba78263a2f",
+    "crates/onnx-runtime-ep-cpu/src/kernels/mod.rs": "fe5444eb657833ef2954fc79bec14548d61486469d0d720cebdd902595422f10",
+    "crates/onnx-runtime-ep-cpu/src/kernels/selection.rs": "e4f5ca3403531a4d8d211519f673646ce818468c9886a28148c9970d498e3ad5"
+  },
+  "patch_sha256": "d65cf7b1e9a1899ce82bd763d9a4405c937015e3ff0ba70f08e965943ec777cf",
+  "miri_flags": "default; no checks disabled",
+  "host_lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "native_passed": 2026,
+  "native_ignored": 20,
+  "mlas_passed": 2068,
+  "mlas_ignored": 35,
+  "session_passed": 296
+}

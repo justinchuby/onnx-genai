@@ -323,6 +323,7 @@ fn arg_reduce_contiguous_f32(
     if input.dtype != DataType::Float32
         || !input.device.is_host_accessible()
         || !input.is_contiguous()
+        || !input.data_ptr::<f32>().is_aligned()
     {
         return Ok(false);
     }
@@ -1035,8 +1036,61 @@ mod tests {
     }
 
     #[test]
+    fn arg_reductions_accept_unaligned_contiguous_f32_logits() {
+        use onnx_runtime_ep_api::DevicePtr;
+        use onnx_runtime_ir::DeviceId;
+        let mut storage = [0u64; 4];
+        let len = std::mem::size_of_val(&storage);
+        // SAFETY: unique byte access to live all-bits-valid u64 storage.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<u8>(), len) };
+        for (i, value) in [1f32, 4., 4., 5., 0., 0.].iter().enumerate() {
+            bytes[1 + i * 4..1 + (i + 1) * 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let input = TensorView::new(
+            DevicePtr(bytes.as_ptr().wrapping_add(1).cast()),
+            DataType::Float32,
+            &[2, 3],
+            &[3, 1],
+            DeviceId::cpu(),
+        );
+        assert!(input.is_contiguous());
+        assert!(!input.data_ptr::<f32>().is_aligned());
+        for (op, name) in [(ArgOp::Max, "ArgMax"), (ArgOp::Min, "ArgMin")] {
+            for last in [false, true] {
+                let kernel = ArgKernel {
+                    op,
+                    axis: -1,
+                    keepdims: false,
+                    select_last_index: last,
+                };
+                let mut output = Owned::zeros(DataType::Int64, &[2]);
+                assert!(
+                    !arg_reduce_contiguous_f32(&kernel, name, &input, &mut output.view_mut())
+                        .unwrap()
+                );
+                kernel.execute(&[input], &mut [output.view_mut()]).unwrap();
+                let expected = match (op, last) {
+                    (ArgOp::Max, false) => [1, 0],
+                    (ArgOp::Max, true) => [2, 0],
+                    (ArgOp::Min, false) => [0, 1],
+                    (ArgOp::Min, true) => [0, 2],
+                };
+                assert_eq!(output.to_i64(), expected, "{name} last={last}");
+            }
+        }
+    }
+
+    #[test]
     fn argmax_contiguous_f32_borrows_logits() {
-        let x = Owned::f32(&[2, 3], &[1., 4., 2., 5., 0., 3.]);
+        let values = [1f32, 4., 2., 5., 0., 3.];
+        let x = TensorView::new(
+            onnx_runtime_ep_api::DevicePtr(values.as_ptr().cast()),
+            DataType::Float32,
+            &[2, 3],
+            &[3, 1],
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
         let mut y = Owned::zeros(DataType::Int64, &[2]);
         let kernel = ArgKernel {
             op: ArgOp::Max,
@@ -1046,7 +1100,7 @@ mod tests {
         };
 
         assert!(
-            arg_reduce_contiguous_f32(&kernel, "ArgMax", &x.view(), &mut y.view_mut()).unwrap(),
+            arg_reduce_contiguous_f32(&kernel, "ArgMax", &x, &mut y.view_mut()).unwrap(),
             "contiguous Float32 logits must use the borrowed-slice path"
         );
         assert_eq!(y.to_i64(), vec![1, 0]);

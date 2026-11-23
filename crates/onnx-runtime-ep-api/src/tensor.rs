@@ -93,8 +93,9 @@ impl DevicePtrMut {
 /// Shared invariant check for both view kinds (§5.3 DLPack import path).
 ///
 /// Verifies the properties a kernel relies on: matching rank between `shape`
-/// and `strides`, a raw-view-representable dtype, and a `byte_offset` that keeps
-/// the element origin aligned to the element size. Storage bounds cannot be
+/// and `strides`, a raw-view-representable dtype, and a `byte_offset` that is
+/// a multiple of the element size. Base-pointer alignment is not guaranteed;
+/// typed slice borrowers must check the actual element origin. Storage bounds cannot be
 /// checked here — the view does not know its backing allocation size — so that
 /// remains the owning EP's responsibility.
 fn validate_view(
