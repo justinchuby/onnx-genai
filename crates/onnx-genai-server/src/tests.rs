@@ -6646,6 +6646,63 @@ mod llama_compat {
             .remove("close");
         config["response_template"]["fields"]["reasoning_content"]["close_pattern"] =
             json!(r"\[/r\]");
+        // The same real model must admit regex-framed reasoning+schema output.
+        config["response_template"]["fields"]["reasoning_content"]["close_pattern"] =
+            json!(r"\[/r\]\s*");
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let regex_router =
+            app(AppState::load(scratch.path(), Some("regex-reasoning".into())).unwrap());
+        for stream in [false, true] {
+            let body = json!({"messages":[{"role":"assistant","reasoning_content":"old ","content":"discarded"}],
+                "continue_final_message":"reasoning_content","response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"n":{"const":1}},"required":["n"],"additionalProperties":false}}},
+                "stream":stream,"logprobs":true,"max_tokens":1,"temperature":0,"logit_bias":{"22":1000,"23":2000}});
+            if stream {
+                let response = regex_router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let events =
+                    sse_json_events(&to_bytes(response.into_body(), usize::MAX).await.unwrap());
+                assert!(
+                    !events.iter().any(|event| event.get("error").is_some()),
+                    "{events:?}"
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                        .collect::<String>(),
+                    r#"{"n":1}"#
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter_map(
+                            |event| event["choices"][0]["delta"]["reasoning_content"].as_str()
+                        )
+                        .collect::<String>(),
+                    "new"
+                );
+            } else {
+                let (status, result) =
+                    call(regex_router.clone(), "POST", "/v1/chat/completions", body).await;
+                assert_eq!(status, StatusCode::OK, "{result}");
+                assert_eq!(result["choices"][0]["message"]["content"], r#"{"n":1}"#);
+                assert_eq!(result["choices"][0]["message"]["reasoning_content"], "new");
+            }
+        }
+        // Unicode word assertions still require a non-DFA byte-prefix resolver.
+        config["response_template"]["fields"]["reasoning_content"]["close_pattern"] =
+            json!(r"\[/r\]\b");
         std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
         let router = app(AppState::load(scratch.path(), Some("reasoning-prefill".into())).unwrap());
         for stream in [false, true] {
