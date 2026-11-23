@@ -40,6 +40,7 @@ pub mod activations;
 pub mod argreduce;
 pub mod attention;
 pub mod batch_normalization;
+mod bit_packing;
 pub mod bitwise;
 pub mod block_quant;
 pub mod block_quantized_matmul;
@@ -79,6 +80,7 @@ mod gqa_decode_fp16;
 pub mod grid_sample;
 pub mod group_normalization;
 pub mod group_query_attention;
+mod grouped_matmul;
 pub mod hardmax;
 pub mod index_share;
 pub mod index_transform;
@@ -98,7 +100,6 @@ pub mod non_max_suppression;
 pub mod nonzero;
 pub mod normalization;
 pub mod onehot;
-mod packed_routed;
 pub mod packed_varlen_attention;
 pub mod pad;
 pub mod paged_attention;
@@ -122,7 +123,6 @@ pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod standard_attention;
 pub(crate) mod standard_claims;
-mod standard_math;
 pub mod stft;
 pub mod structural;
 pub mod tensor_scatter;
@@ -745,7 +745,7 @@ pub fn build_cuda_registry_with_metrics(
             1,
         ),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(packed_routed::AffineFactory(runtime.clone())),
+        Box::new(grouped_matmul::AffineFactory(runtime.clone())),
     );
     reg.register(
         OpKey::new(
@@ -758,19 +758,30 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    for name in onnx_runtime_ir::packed_routed::OPS {
+    for name in ["Pack", "Unpack"] {
         reg.register(
             OpKey::new(name, "", 29),
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(packed_routed::Factory(runtime.clone())),
+            Box::new(bit_packing::Factory(runtime.clone())),
         );
     }
 
+    reg.register(
+        OpKey::new("GroupedMatMul", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(grouped_matmul::Factory(runtime.clone())),
+    );
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
+        let factory: Box<dyn onnx_runtime_ep_api::KernelFactory> = match name {
+            "Expm1" | "Log1p" => Box::new(elementwise::StableUnaryFactory(runtime.clone())),
+            "SwiGLU" | "GeGLU" => Box::new(activations::GatedActivationFactory(runtime.clone())),
+            "LogCumSumExp" => Box::new(cumsum::LogCumSumExpFactory(runtime.clone())),
+            _ => unreachable!("unregistered standard math family for {name}"),
+        };
         reg.register(
             OpKey::new(name, "", since),
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(standard_math::Factory(runtime.clone())),
+            factory,
         );
     }
 

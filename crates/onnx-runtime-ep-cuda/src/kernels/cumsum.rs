@@ -3,8 +3,12 @@
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
+use super::elementwise::{FloatMathSource, launch_float_math};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
+use onnx_runtime_ir::standard_math::Math;
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
@@ -305,5 +309,51 @@ impl Kernel for CumSumKernel {
                 "CumSum capture signature lock was poisoned",
             ),
         }
+    }
+}
+
+const LOG_CUM_SUM_EXP_SOURCE: &str = concat!(
+    include_str!("float_math_prelude.cuh"),
+    include_str!("log_cum_sum_exp.cu")
+);
+
+pub(super) struct LogCumSumExpFactory(pub Arc<CudaRuntime>);
+
+impl KernelFactory for LogCumSumExpFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(LogCumSumExpKernel {
+            op: Math::from_node(node).map_err(EpError::KernelFailed)?,
+            runtime: Arc::clone(&self.0),
+        }))
+    }
+}
+
+struct LogCumSumExpKernel {
+    op: Math,
+    runtime: Arc<CudaRuntime>,
+}
+
+impl Kernel for LogCumSumExpKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let (stem, alpha) = match self.op {
+            Math::LogCumSumExp { .. } => ("scan", 0.),
+            _ => unreachable!("operator registered to its family"),
+        };
+        launch_float_math(
+            &self.runtime,
+            self.op,
+            FloatMathSource {
+                module: "log_cum_sum_exp",
+                source: LOG_CUM_SUM_EXP_SOURCE,
+                stem,
+                alpha,
+            },
+            inputs,
+            outputs,
+        )
+    }
+
+    fn capture_support(&self) -> CaptureSupport {
+        CaptureSupport::Supported
     }
 }
