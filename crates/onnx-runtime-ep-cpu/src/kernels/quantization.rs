@@ -129,6 +129,12 @@ impl Kernel for DequantizeLinearKernel {
             )));
         }
         let zp = if inputs.len() == 3 && !inputs[2].is_absent() {
+            if inputs[2].dtype != inputs[0].dtype {
+                return Err(EpError::KernelFailed(format!(
+                    "DequantizeLinear: zero_point dtype {:?} must match input dtype {:?}",
+                    inputs[2].dtype, inputs[0].dtype
+                )));
+            }
             read_integers("DequantizeLinear", &inputs[2])?
         } else {
             vec![0]

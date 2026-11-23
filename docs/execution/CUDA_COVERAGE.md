@@ -108,7 +108,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Gemm` | `` | ✅ | **cuBLASLt** + NVRTC bias | `Y=α·A'·B'+β·C`, transA/transB, α/β; fused NVRTC `β·C` broadcast-bias epilogue (`gemm.rs`). f32. |
 | `FusedMatMulBias` | `com.microsoft` | ✅ | **cuBLASLt** `CUBLASLT_EPILOGUE_BIAS` | Dense rank-2 f32/f16/bf16 with an exact per-N bias vector; bias add is fused into GEMM with no elementwise pass. |
 | `FusedGemm` | `com.microsoft` | ✅ | **cuBLASLt** `CUBLASLT_EPILOGUE_{BIAS,RELU_BIAS,GELU_BIAS}` | Dense rank-2 f32/f16/bf16; transA/transB and α. CUDA 13's `GELU_BIAS` is the tanh/0.044715 GELU approximation (H200 output differs from exact-erf at the expected ~2.2e-4 for x=1.5); cuBLASLt exposes no exact-erf selector, so this deliberately follows the vendor epilogue rather than adding a separate pass. Bias must be per-N and `beta=1` because `BIAS_POINTER` is unscaled; other β values fail explicitly. Missing `activation` defaults to Relu for the repository optimizer's existing `FusedGemm` contract; empty/Identity selects plain BIAS. |
-| `MatMulNBits` | `com.microsoft` | ✅ | **NVRTC-custom + cuBLASLt** | Standard packed INT4 `[N, ceil(K/block_size), block_size/2]` weights are block-wise dequantized to f32 on-device, then multiplied by f32 activations with full-f32 accumulation. Supports optional packed zero points, group indices, and fused per-N bias. |
+| `MatMulNBits` | `com.microsoft` | ✅ | **NVRTC-custom + cuBLASLt** | Supports optional packed zero points, group indices, and fused per-N bias. The native optimizer also lowers eligible standard FP32 `DequantizeLinear` → `MatMul` RHS patterns to a single packed GEMV that rounds each decoded weight before accumulation. |
 | `QMoE` | `com.microsoft` | ✅ | **NVRTC grouped block-dequant expert GEMV/GEMM** | Single-GPU resident: exact ORT expert-major affine INT1/INT2/INT4/INT8 layouts, optional packed zero points and expert biases, top-k routing/normalization, Relu/Gelu/Silu/Identity and fused or separate-gate SwiGLU. Decode uses per-route GEMV; prefill counts and prefix-groups routes by expert, gathers contiguous rows, runs a tiled dequant-GEMM for experts with at least two tokens, then deterministically combines weighted route outputs. f32/f16/bf16 activations use f32 accumulation; the other T-typed float operands (router_probs, fc1/fc2/fc3 scales, expert biases, and the optional aggregation weights) may independently be f32 or the same half type as the input — matching ORT's single type parameter `T` — and any half operand is losslessly widened to f32 before the unchanged f32 routing/dequant kernels run, so an all-fp16 fused QMoE export runs natively and the pure-f32 path stays byte-identical. tile width, shared-memory fallback, launch width, and saturation grid derive from detected device limits. Native IQ/MXFP4 blocks remain explicitly unsupported because the ORT QMoE affine inputs cannot encode those layouts; they require a block-quantized MoE operator. Weight paging/prefetch and expert-parallel sharding are deferred. |
 
 ### Convolution
@@ -561,7 +561,8 @@ periodic modes. This raises `CUDA_COVERED_OPS` from **136** to **140** and CPU
 standard-domain parity from **107 / 141** to **111 / 141**.
 
 The issue #67 operator-coverage batch 9 adds per-tensor `QuantizeLinear` and
-`DequantizeLinear` (f32 with scalar scale and optional scalar i8/u8 zero point),
+`DequantizeLinear` (f32 with scalar or blocked scale, with optional matching
+INT4/UINT4 or INT8/UINT8 zero points),
 deterministic inference-mode `Dropout` (identity data plus optional all-true
 mask), and `NonZero` coordinate extraction for f32/f16/bf16. Inline GPU parity
 covers signed and unsigned quantization, saturation and ties-to-even rounding,

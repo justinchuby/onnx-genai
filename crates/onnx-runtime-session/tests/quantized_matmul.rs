@@ -243,7 +243,7 @@ fn packed_rhs_matches_native_cuda() {
         prefill
             .run(&[("A", &Tensor::from_f32(&[m, 35], &[1.0; 105]).unwrap())])
             .unwrap()[0]
-            .shape(),
+            .shape,
         &[m, 7]
     );
 }
