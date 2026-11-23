@@ -1,5 +1,7 @@
 # In-place serial expert activation and minimum bank capacity
 
+**Rejected candidate:** the qualified dense interleaved case regresses +15.43% wall versus the current static-bias draft despite smaller retained backing. Do not merge this branch or update #2469 to this runtime version. Correct numerical/resource behavior does not establish acceptable inference performance.
+
 Runtime candidate: `af268c19e3cb6e93c4901db7a5b11d3fdc5464d7`.
 Prior static-bias bank kernels: `f0a2cd115`; old modules:
 `509144567` (Block uses owned FC results; Float already uses admitted phase banks). This single native Apple M1 Max synthetic CPU experiment covers the
@@ -92,4 +94,4 @@ adjustment elsewhere. The measured binary remains
 `/tmp/nxrt-bank-inplace-gate/inplace-gate-probe`. All scope limitations still apply
 when comparing this report with earlier paired/static-bias studies.
 
-Decision: **do not adopt this candidate or update #2469 to this runtime head**. Four of eight cells qualify. The qualified dense interleaved case regresses +15.43% wall/+7.75% CPU versus the current static-bias bank draft, despite a 4,096-byte lower retained lane. Streamed split still costs +4.84% wall/+2.08% CPU relative to the old driver. The qualified separate-FC3 streamed case is +3.40% wall/+0.61% CPU versus old, so the original issue is not resolved. Smaller physical retention and correct coarse ownership do not outweigh the observed performance tradeoffs. Failed controls remain, including the unqualified Float grouped-size case with large A/A drift; no speed result is claimed for them. Keep the previous draft at `244fda6c2`; investigate the activation/storage implementation rather than change quota granularity.
+Decision: **do not adopt this candidate or update #2469 to this runtime head**. Four of eight cells qualify. The qualified dense interleaved case regresses +15.43% wall/+7.75% CPU versus the current static-bias bank draft, despite a 4,096-byte lower retained lane. Streamed split still costs +4.84% wall/+2.08% CPU relative to the old driver. The qualified separate-FC3 streamed case is +3.40% wall/+0.61% CPU versus old, so the original issue is not resolved. Smaller physical retention and correct coarse ownership do not outweigh the observed performance tradeoffs. Failed controls remain, including the unqualified multi-row Float case with large A/A drift; no speed result is claimed for them. Keep the previous draft at `244fda6c2`; investigate the activation/storage implementation rather than change quota granularity.
