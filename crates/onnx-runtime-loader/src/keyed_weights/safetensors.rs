@@ -75,6 +75,13 @@ pub(super) fn parse(data: &[u8]) -> Result<Entries, String> {
         }
         let dtype = match tensor.dtype.as_str() {
             "BOOL" => DataType::Bool,
+            "F4" => DataType::Float4E2M1,
+            "F6_E2M3" | "F6_E3M2" => {
+                return Err(format!(
+                    "SafeTensors key {key:?} uses {}, but nxrt cannot represent the corresponding ONNX FLOAT6 dtype yet; re-export both the model and the weights with a supported dtype",
+                    tensor.dtype
+                ));
+            }
             "I8" => DataType::Int8,
             "U8" => DataType::Uint8,
             "I16" => DataType::Int16,
@@ -99,6 +106,14 @@ pub(super) fn parse(data: &[u8]) -> Result<Entries, String> {
                 ));
             }
         };
+        // The format requires whole-byte tensors, unlike ONNX, which pads an
+        // odd FLOAT4 element count. A nonempty F4 shape needs an even dimension.
+        if dtype == DataType::Float4E2M1 && tensor.shape.iter().all(|dim| dim % 2 != 0) {
+            return Err(format!(
+                "SafeTensors key {key:?}: F4 shape {:?} does not fill whole bytes; export an even number of logical elements",
+                tensor.shape
+            ));
+        }
         let size =
             byte_len(dtype, &tensor.shape).map_err(|e| format!("SafeTensors key {key:?}: {e}"))?;
         if stop - start != size {

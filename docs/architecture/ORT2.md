@@ -1673,8 +1673,13 @@ and use supported encodings.
   shape and dtype must match exactly. Supports `BOOL`, signed/unsigned
   8/16/32/64-bit integers, `F16`, `BF16`, `F32`, `F64`, `C64`,
   `F8_E4M3` (ONNX `FLOAT8E4M3FN`), `F8_E5M2`, their `FNUZ` variants,
-  and `F8_E8M0`. Other encodings, including sub-byte SafeTensors dtypes,
-  are rejected.
+  `F8_E8M0`, and `F4` (ONNX `FLOAT4E2M1`). `F4` uses low-nibble-first
+  packing and must have a whole-byte payload: unlike ONNX, SafeTensors
+  cannot store an odd number of `F4` values by padding the final nibble.
+  Use the logical shape in the SafeTensors header, not the byte shape
+  exposed by PyTorch's `float4_e2m1fn_x2`. ONNX defines FLOAT6 types, but
+  nxrt does not yet represent them internally, so `F6_E2M3` and `F6_E3M2`
+  are rejected rather than being reinterpreted as bytes or another dtype.
 * **GGUF:** accepts little-endian v2 and v3. Dense `F32`, `F16`, `BF16`,
   `F64`, and `I8`/`I16`/`I32`/`I64` map to their exact ONNX scalar dtype.
   GGML's first dimension is contiguous; the ONNX shape is the reversed

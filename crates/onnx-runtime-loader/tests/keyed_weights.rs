@@ -246,6 +246,67 @@ fn binds_safetensors_and_ordinary_data_with_explicit_precedence() {
 }
 
 #[test]
+fn binds_safetensors_float4_in_onnx_nibble_order() {
+    let dir = directory("keyed_safetensors_f4");
+    // safetensors.torch.save({"packed": torch.tensor([0x21, 0xf9],
+    // dtype=torch.uint8).view(torch.float4_e2m1fn_x2)}) with safetensors 0.8.0.
+    // ONNX encodes [0.5, 1.0, -0.5, -6.0] in these same two bytes.
+    let path = dir.join("torch_float4.safetensors");
+    std::fs::write(&path, b"@\0\0\0\0\0\0\0{\"packed\":{\"dtype\":\"F4\",\"shape\":[4],\"data_offsets\":[0,2]}}      \x21\xf9").unwrap();
+    let file = KeyedWeightFile::safetensors(path);
+    let (graph, store) = load_model_bytes_with_keyed_weights(
+        &model(vec![initializer("packed", 23, &[4], &[])]),
+        &dir,
+        &[file],
+    )
+    .unwrap();
+    assert_eq!(
+        mapped_bytes(&store, graph.initializers.values().next().unwrap()),
+        [0x21, 0xf9]
+    );
+
+    let odd = safetensors(
+        &dir,
+        "odd.safetensors",
+        r#"{"packed":{"dtype":"F4","shape":[3],"data_offsets":[0,2]}}"#,
+        &[0x21, 0x09],
+    );
+    let error = load_model_bytes_with_keyed_weights(
+        &model(vec![initializer("packed", 23, &[3], &[])]),
+        &dir,
+        &[odd],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("does not fill whole bytes"), "{error}");
+}
+
+#[test]
+fn diagnoses_float6_runtime_dtype_limitation() {
+    let dir = directory("keyed_safetensors_f6");
+    for (kind, bytes) in [
+        ("F6_E2M3", [0x24, 0xc2, 0x40]),
+        ("F6_E3M2", [0x28, 0xe3, 0x40]),
+    ] {
+        let header =
+            format!(r#"{{"packed":{{"dtype":"{kind}","shape":[4],"data_offsets":[0,3]}}}}"#);
+        let file = safetensors(&dir, &format!("{kind}.safetensors"), &header, &bytes);
+        let error = load_model_bytes_with_keyed_weights(
+            &model(vec![initializer("packed", 2, &[3], &[])]),
+            &dir,
+            &[file],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(kind)
+                && error.contains("cannot represent the corresponding ONNX FLOAT6 dtype"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn diagnoses_mapping_and_metadata_errors() {
     let dir = directory("keyed_mapping_errors");
     let header = r#"{"weight":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}"#;
