@@ -134,6 +134,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Gelu` | `` | ✅ | **NVRTC-custom** | Standard-domain opset-20 exact or tanh-approximate GELU (`elementwise.rs`). |
 | `SwiGLU`, `GeGLU` | `` | ✅ | **NVRTC-custom** | Opsets 28/29 respectively; identical input shapes, no broadcasting. f16/bf16/f32/f64. |
 | `Expm1`, `Log1p`, `LogCumSumExp` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64. Stable small-value math and log-domain prefix accumulation. |
+| `Pack`, `Unpack` | `` | ✅ | **NVRTC-custom** | Opset 29; fixed-bit and grouped-radix encoding along arbitrary axes, with UINT8/UINT32 words. Eager CUDA only. |
+| `GroupedMatMul` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64, INT32/INT64 routes, either weight layout, optional bias. Eager CUDA only. |
 | `Gelu`, `Silu` | `com.microsoft` | ✅ | **NVRTC-custom** | Contrib activation forms (`elementwise.rs`). |
 | `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`, `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16 with CPU-matched formulas (`pointwise.rs`); `Round` uses ties-to-even and `Sign` preserves NaN. |
 | `Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`, `Atan`, `Asinh`, `Acosh`, `Atanh` | `` | ✅ | **NVRTC-custom** | Trigonometric/hyperbolic family (`pointwise.rs`); f32/f16/bf16 with half storage widened to f32 compute, matching the CPU EP's f32-widened reference. |
@@ -221,6 +223,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Reshape`, `Squeeze`, `Unsqueeze` | `` | ✅ | **memcpy** | Dtype-agnostic D2D copy into the executor's pre-shaped output; modern axes inputs and legacy attributes are accepted. |
 | `Transpose` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed byte copy; explicit permutation or default axis reversal. |
 | `Gather` | `` | ✅ | **NVRTC-custom** | Axis-parametric contiguous indexed copy; Int32/Int64 indices, negative index wrap, arbitrary index rank. |
+| `AffineQuantizedGather` | `pkg.nxrt` | ✅ | **NVRTC-custom** | EP fusion for single-use per-tensor FLOAT `DequantizeLinear` on INT8/UINT8 data feeding `Gather`; decodes only selected elements. |
 | `GatherElements` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic contiguous element gather with Int64 indices, negative axes/indices, and CPU-matched rank/dimension validation. |
 | `ScatterElements` (v11 & v16) | `` | ✅ | **NVRTC-custom** | Deterministic f32/Int64 updates in row-major input order. Opset 16 supports `none`, `add`, `mul`, `min`, and `max`; duplicate indices therefore preserve CPU last-write/sequential-reduction semantics. |
 | `TopK` (v10) | `` | ✅ | **NVRTC-custom** | Deterministic f32 per-slice selection with input `K`, arbitrary/negative axis, largest/smallest modes, and CPU tie-breaking by lower source index. |
@@ -262,6 +265,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`, `BitShift` | `` | ✅ | **NVRTC-custom** | Integer bitwise family, including broadcasting and CPU-matched over-shift behavior. |
 | `ConstantOfShape`, `OneHot`, `TensorScatter` | `` | ✅ | **NVRTC / device materialization** | Shape-driven construction and fixed-capacity scatter paths with explicit dtype, bounds, and capture checks. |
 | `QuantizeLinear`, `DequantizeLinear`, `QLinearMatMul`, `DynamicQuantizeLinear` | `` | ✅ | **NVRTC quantization** | Per-tensor/per-axis constraints and supported integer storage are enforced by each kernel's claim gate. |
+| `DequantizePacked` | `` | ✅ | **NVRTC block decode** | All 27 opset-29 GGUF profiles decode directly from device-resident UINT8 payloads into FLOAT, FLOAT16, BFLOAT16, or DOUBLE. |
 | `Dropout`, `NonZero` | `` | ✅ | **NVRTC-custom** | Inference Dropout and bounded dynamic-output coordinate extraction; dynamic metadata paths decline capture where host materialization is required. |
 | `Resize`, `GridSample`, `ConvTranspose` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling and transposed-convolution subsets; unsupported coordinate modes, cubic/volumetric cases, and output-shape policies fail closed. |
 

@@ -420,6 +420,7 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/resize.yaml"),
     include_str!("../../schemas/standard/quantize_linear.yaml"),
     include_str!("../../schemas/standard/dequantize_linear.yaml"),
+    include_str!("../../schemas/standard/dequantize_packed.yaml"),
     include_str!("../../schemas/standard/dynamic_quantize_linear.yaml"),
     include_str!("../../schemas/standard/attention.yaml"),
     include_str!("../../schemas/standard/cast_like.yaml"),
@@ -435,6 +436,9 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/expm1.yaml"),
     include_str!("../../schemas/standard/log1p.yaml"),
     include_str!("../../schemas/standard/log_cum_sum_exp.yaml"),
+    include_str!("../../schemas/standard/pack.yaml"),
+    include_str!("../../schemas/standard/unpack.yaml"),
+    include_str!("../../schemas/standard/grouped_mat_mul.yaml"),
     include_str!("../../schemas/standard/squeeze.yaml"),
     include_str!("../../schemas/standard/top_k.yaml"),
     include_str!("../../schemas/standard/unsqueeze_v11.yaml"),
@@ -729,10 +733,11 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 104);
-        assert_eq!(registry.iter().count(), 116);
+        assert_eq!(registry.schemas.len(), 108);
+        assert_eq!(registry.iter().count(), 120);
 
         for (name, since_version) in [
+            ("DequantizePacked", 29),
             ("BitShift", 11),
             ("BitwiseAnd", 18),
             ("BitwiseOr", 18),
@@ -1384,9 +1389,57 @@ fn standard_math_schema_versions_and_dtypes() {
         assert!(registry.lookup(name, "", since - 1).is_none());
         let schema = registry.lookup(name, "", since).unwrap();
         assert_eq!(schema.since_version, since);
-        assert_eq!(
-            schema.type_constraints[0].allowed,
-            onnx_runtime_ir::standard_math::DTYPES
+        assert_allowed_types(
+            &schema.type_constraints[0].allowed,
+            onnx_runtime_ir::standard_math::DTYPES,
         );
     }
+}
+
+#[test]
+fn packed_routed_schema_versions_and_types() {
+    let registry = SchemaRegistry::builtins();
+    for (name, constraints) in [
+        (
+            "Pack",
+            vec![
+                vec![DataType::Uint8],
+                vec![DataType::Uint8, DataType::Uint32],
+            ],
+        ),
+        (
+            "Unpack",
+            vec![
+                vec![DataType::Uint8, DataType::Uint32],
+                vec![DataType::Int64],
+                vec![DataType::Uint8],
+            ],
+        ),
+        (
+            "GroupedMatMul",
+            vec![
+                onnx_runtime_ir::standard_math::DTYPES.to_vec(),
+                vec![DataType::Int32, DataType::Int64],
+            ],
+        ),
+    ] {
+        assert!(registry.lookup(name, "", 28).is_none());
+        let schema = registry.lookup(name, "", 29).unwrap();
+        assert_eq!(schema.since_version, 29);
+        assert_eq!(schema.type_constraints.len(), constraints.len(), "{name}");
+        for (constraint, expected) in schema.type_constraints.iter().zip(constraints) {
+            assert_allowed_types(&constraint.allowed, &expected);
+        }
+    }
+
+    let grouped = registry.lookup("GroupedMatMul", "", 29).unwrap();
+    assert!(grouped.inputs[3].optional);
+}
+
+#[cfg(test)]
+fn assert_allowed_types(actual: &[DataType], expected: &[DataType]) {
+    assert!(
+        actual.len() == expected.len() && expected.iter().all(|dtype| actual.contains(dtype)),
+        "expected the same dtype set, got {actual:?}, expected {expected:?}"
+    );
 }

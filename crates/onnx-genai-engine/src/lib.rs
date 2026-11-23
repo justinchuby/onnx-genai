@@ -16,6 +16,7 @@ pub mod embedding;
 pub mod engine;
 pub mod fim;
 pub mod json_cursor;
+mod json_prefix;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
 pub mod logits;

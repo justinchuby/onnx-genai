@@ -1,6 +1,11 @@
 //! Audited llama.cpp IQ quantization grids shared by CPU and GPU decoders.
 
+#[cfg(feature = "test-conformance")]
+#[doc(hidden)]
+pub mod dequantize_packed_conformance;
+
 // Vendored byte-for-byte from llama.cpp commit b15ca938, ggml-common.h.
+// The upstream MIT notice is retained in ../GGML_LICENSE.
 // Keep the source order: decoders reinterpret each integer as little-endian magnitude bytes.
 
 #[rustfmt::skip]

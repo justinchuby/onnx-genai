@@ -670,9 +670,11 @@ impl LlguidanceConstraint {
         // optional leading RFC 8259 whitespace. Preserve that whitespace in
         // the actual prompt, but enter the value recognizer after it.
         let value_prefix = match kind {
-            GrammarConstraintKind::JsonSchema => {
-                canonical_json_prefix(prefix).map_err(|source| ConstraintPrefixError { source })?
-            }
+            GrammarConstraintKind::JsonSchema => std::borrow::Cow::Owned(
+                crate::json_prefix::JsonPrefix::parse(prefix)
+                    .map_err(|source| ConstraintPrefixError { source })?
+                    .into_lexical(),
+            ),
             _ => std::borrow::Cow::Borrowed(prefix),
         };
         Self::from_token_bytes(kind, grammar, token_bytes, endings, &value_prefix)
@@ -782,86 +784,6 @@ impl LlguidanceConstraint {
             }),
         })
     }
-}
-
-// llguidance's JSON string lexer expects canonical spelling of non-control
-// Unicode. Normalize completed escapes only in the recognizer's existing
-// prefix; the request prompt and newly generated output retain their own bytes.
-pub(crate) fn canonical_json_prefix(prefix: &str) -> anyhow::Result<std::borrow::Cow<'_, str>> {
-    let value = prefix.trim_start_matches([' ', '\t', '\r', '\n']);
-    let source_offset = prefix.len() - value.len();
-    let prefix = value;
-    if !prefix.contains("\\u") && !prefix.contains("\\/") {
-        return Ok(std::borrow::Cow::Borrowed(prefix));
-    }
-    let mut output = String::with_capacity(prefix.len());
-    let mut in_string = false;
-    let mut at = 0;
-    while at < prefix.len() {
-        let rest = &prefix[at..];
-        let byte = rest.as_bytes()[0];
-        if byte == b'"' {
-            in_string = !in_string;
-        } else if in_string && byte == b'\\' {
-            let bytes = rest.as_bytes();
-            if bytes.get(1) == Some(&b'/') {
-                output.push('/');
-                at += 2;
-                continue;
-            }
-            if bytes.get(1) == Some(&b'u') && bytes.len() >= 6 {
-                let code = std::str::from_utf8(&bytes[2..6])
-                    .ok()
-                    .and_then(|hex| u16::from_str_radix(hex, 16).ok());
-                if let Some(code) = code {
-                    let length = if (0xd800..=0xdbff).contains(&code) {
-                        12
-                    } else {
-                        6
-                    };
-                    if bytes.len() >= length && rest.is_char_boundary(length) {
-                        let quoted = format!("\"{}\"", &rest[..length]);
-                        let decoded: String = serde_json::from_str(&quoted).with_context(|| {
-                            format!("existing JSON prefix has an invalid Unicode escape at byte {}; supply a complete valid scalar or surrogate pair", source_offset + at)
-                        })?;
-                        // The string-value lexer quotes ASCII controls, including DEL;
-                        // serde_json alone leaves DEL literal.
-                        let mut canonical = serde_json::to_string(&decoded)
-                            .context("encode canonical JSON prefix escape")?;
-                        if decoded.chars().next().is_some_and(|c| c.is_ascii_control())
-                            && canonical.as_bytes().get(1) != Some(&b'\\')
-                        {
-                            canonical = format!("\"\\u{code:04x}\"");
-                        }
-                        output.push_str(&canonical[1..canonical.len() - 1]);
-                        at += length;
-                        continue;
-                    }
-                }
-            }
-            // Preserve unfinished escapes for the grammar to continue. Skip
-            // complete ordinary escapes so an escaped quote does not end a string.
-            if let Some(&escaped) = bytes.get(1)
-                && escaped.is_ascii()
-            {
-                output.push('\\');
-                output.push(char::from(escaped));
-                at += 2;
-                continue;
-            }
-        }
-        let character = rest
-            .chars()
-            .next()
-            .context("JSON prefix cursor lost its UTF-8 boundary")?;
-        output.push(character);
-        at += character.len_utf8();
-    }
-    Ok(if output == prefix {
-        std::borrow::Cow::Borrowed(prefix)
-    } else {
-        std::borrow::Cow::Owned(output)
-    })
 }
 
 fn top_level_grammar(
@@ -5041,7 +4963,7 @@ mod tests {
         .expect("unpaired low surrogate must be rejected");
         assert!(error.is::<ConstraintPrefixError>());
         assert!(
-            format!("{error:#}").contains("invalid Unicode escape at byte 1"),
+            format!("{error:#}").contains("invalid JSON string escape at byte 1"),
             "{error:#}"
         );
         assert!(error.chain().count() > 1);
@@ -5055,7 +4977,7 @@ mod tests {
         .err()
         .expect("invalid Unicode prefix after whitespace must be rejected");
         assert!(
-            format!("{whitespace_error:#}").contains("invalid Unicode escape at byte 3"),
+            format!("{whitespace_error:#}").contains("invalid JSON string escape at byte 3"),
             "{whitespace_error:#}"
         );
     }

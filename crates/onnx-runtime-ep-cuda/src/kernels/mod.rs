@@ -57,6 +57,7 @@ pub mod csa_state_group;
 pub mod cumprod;
 pub mod cumsum;
 pub mod data_transform;
+mod dequantize_packed;
 pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
 pub mod dft;
@@ -97,6 +98,7 @@ pub mod non_max_suppression;
 pub mod nonzero;
 pub mod normalization;
 pub mod onehot;
+mod packed_routed;
 pub mod packed_varlen_attention;
 pub mod pad;
 pub mod paged_attention;
@@ -208,6 +210,9 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Expm1",
     "Log1p",
     "LogCumSumExp",
+    "Pack",
+    "Unpack",
+    "GroupedMatMul",
     "MatMulNBits",
     "QMoE",
     "BlockQuantizedMatMul",
@@ -359,6 +364,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "BlackmanWindow",
     "QuantizeLinear",
     "DequantizeLinear",
+    "DequantizePacked",
     "Dropout",
     "NonZero",
     "NonMaxSuppression",
@@ -547,6 +553,10 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
+        ("Pack", "") => &[DataType::Uint8],
+        ("Unpack", "") => onnx_runtime_ir::packed_routed::WORD_DTYPES,
+        ("GroupedMatMul", "") => onnx_runtime_ir::standard_math::DTYPES,
         (name, "") if onnx_runtime_ir::standard_math::OPS.iter().any(|&(op, _)| op == name) =>
             onnx_runtime_ir::standard_math::DTYPES,
 
@@ -726,6 +736,24 @@ pub fn build_cuda_registry_with_metrics(
     telemetry_registry: Arc<qmoe::RouteTelemetrySourceRegistry>,
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
+    reg.register(
+        OpKey::new(
+            onnx_runtime_ir::affine_gather::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(gather::GatherFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    for name in onnx_runtime_ir::packed_routed::OPS {
+        reg.register(
+            OpKey::new(name, "", 29),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(packed_routed::Factory(runtime.clone())),
+        );
+    }
 
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
         reg.register(
@@ -962,6 +990,11 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
+    reg.register(
+        OpKey::new("DequantizePacked", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(dequantize_packed::Factory(runtime.clone())),
+    );
     reg.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),
         onnx_runtime_ep_api::WorkspacePlanning::None,

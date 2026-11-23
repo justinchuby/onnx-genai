@@ -2356,6 +2356,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     // data-dependent coordinate extraction.
     p.push(sweep("QuantizeLinear", quantize_linear_cases()));
     p.push(sweep("DequantizeLinear", dequantize_linear_cases()));
+    p.push(dedicated(
+        "DequantizePacked",
+        "dequantize_packed_gpu.rs",
+        "native device decode against all 27 pinned GGML oracle digests",
+    ));
     p.push(sweep("QLinearMatMul", qlinear_matmul_cases()));
     p.push(sweep("Resize", resize_cases()));
     p.push(sweep("ConvTranspose", conv_transpose_cases()));
@@ -2418,6 +2423,13 @@ fn conformance_profile() -> Vec<ProfileEntry> {
             op,
             "standard_math_gpu.rs",
             "independent CPU and native CUDA math expectations",
+        ));
+    }
+    for op in ["Pack", "Unpack", "GroupedMatMul"] {
+        p.push(dedicated(
+            op,
+            "packed_routed_gpu.rs",
+            "pinned opset-29 vectors and input validation on native CPU and CUDA",
         ));
     }
     p.push(dedicated(

@@ -268,6 +268,32 @@ pub fn run_cuda(
     outputs: &[(DataType, Vec<usize>)],
     attrs: &[(&str, Attribute)],
 ) -> Vec<Vec<u8>> {
+    try_run_cuda(ep, op, domain, opset, inputs, outputs, attrs).unwrap()
+}
+
+pub fn try_run_cuda(
+    ep: &CudaExecutionProvider,
+    op: &str,
+    domain: &str,
+    opset: u64,
+    inputs: &[Tensor],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
+    try_run_cuda_with_origin_offset(ep, op, domain, opset, inputs, outputs, attrs, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_run_cuda_with_origin_offset(
+    ep: &CudaExecutionProvider,
+    op: &str,
+    domain: &str,
+    opset: u64,
+    inputs: &[Tensor],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+    offset: usize,
+) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
     let (graph, node_id) = build_graph(op, domain, opset, inputs, outputs, attrs);
     let model = Model::new(&graph);
     let concrete_shapes = inputs
@@ -309,11 +335,16 @@ pub fn run_cuda(
     let input_buffers = inputs
         .iter()
         .map(|tensor| {
-            let buffer = ep.allocate(tensor.bytes.len().max(1), 256).unwrap();
+            let buffer = ep
+                .allocate(tensor.bytes.len().max(1) + offset, 256)
+                .unwrap();
             if !tensor.bytes.is_empty() {
                 unsafe {
                     ep.runtime()
-                        .htod(&tensor.bytes, cuptr(buffer.as_ptr()))
+                        .htod(
+                            &tensor.bytes,
+                            cuptr(buffer.as_ptr().cast::<u8>().wrapping_add(offset).cast()),
+                        )
                         .unwrap()
                 };
             }
@@ -333,7 +364,7 @@ pub fn run_cuda(
                 return TensorView::absent(tensor.dtype);
             }
             TensorView::new(
-                DevicePtr(buffer.as_ptr()),
+                DevicePtr(buffer.as_ptr().cast::<u8>().wrapping_add(offset).cast()),
                 tensor.dtype,
                 &tensor.shape,
                 strides,
@@ -344,8 +375,11 @@ pub fn run_cuda(
     let mut output_buffers = outputs
         .iter()
         .map(|(dtype, shape)| {
-            ep.allocate(dtype.storage_bytes(shape.iter().product()).max(1), 256)
-                .unwrap()
+            ep.allocate(
+                dtype.storage_bytes(shape.iter().product()).max(1) + offset,
+                256,
+            )
+            .unwrap()
         })
         .collect::<Vec<DeviceBuffer>>();
     let output_strides = outputs
@@ -358,7 +392,7 @@ pub fn run_cuda(
         .zip(&output_strides)
         .map(|(((dtype, shape), buffer), strides)| {
             TensorMut::new(
-                DevicePtrMut(buffer.as_mut_ptr()),
+                DevicePtrMut(buffer.as_mut_ptr().cast::<u8>().wrapping_add(offset).cast()),
                 *dtype,
                 shape,
                 strides,
@@ -367,30 +401,34 @@ pub fn run_cuda(
         })
         .collect::<Vec<_>>();
     let mut workspace = None;
-    execute_kernel(
+    let execution = execute_kernel(
         ep,
         kernel.as_ref(),
         &input_views,
         &mut output_views,
         &mut workspace,
-    )
-    .unwrap();
+    );
 
-    let result = outputs
-        .iter()
-        .zip(&output_buffers)
-        .map(|((dtype, shape), buffer)| {
-            let mut bytes = vec![0; dtype.storage_bytes(shape.iter().product())];
-            if !bytes.is_empty() {
-                unsafe {
-                    ep.runtime()
-                        .dtoh(&mut bytes, cuptr(buffer.as_ptr()))
-                        .unwrap()
-                };
-            }
-            bytes
-        })
-        .collect();
+    let result = execution.map(|()| {
+        outputs
+            .iter()
+            .zip(&output_buffers)
+            .map(|((dtype, shape), buffer)| {
+                let mut bytes = vec![0; dtype.storage_bytes(shape.iter().product())];
+                if !bytes.is_empty() {
+                    unsafe {
+                        ep.runtime()
+                            .dtoh(
+                                &mut bytes,
+                                cuptr(buffer.as_ptr().cast::<u8>().wrapping_add(offset).cast()),
+                            )
+                            .unwrap()
+                    };
+                }
+                bytes
+            })
+            .collect()
+    });
     for buffer in input_buffers {
         ep.deallocate(buffer).unwrap();
     }
@@ -442,6 +480,17 @@ pub fn run_cpu(
     outputs: &[(DataType, Vec<usize>)],
     attrs: &[(&str, Attribute)],
 ) -> Vec<Vec<u8>> {
+    try_run_cpu(op, domain, opset, inputs, outputs, attrs).unwrap()
+}
+
+pub fn try_run_cpu(
+    op: &str,
+    domain: &str,
+    opset: u64,
+    inputs: &[Tensor],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
     let ep = CpuExecutionProvider::new();
     let (graph, node_id) = build_graph(op, domain, opset, inputs, outputs, attrs);
     let model = Model::new(&graph);
@@ -494,9 +543,9 @@ pub fn run_cpu(
             )
         })
         .collect::<Vec<_>>();
-    execute_cpu_kernel(&ep, kernel.as_ref(), &input_views, &mut output_views).unwrap();
+    execute_cpu_kernel(&ep, kernel.as_ref(), &input_views, &mut output_views)?;
     drop(output_views);
-    output_bytes
+    Ok(output_bytes)
 }
 
 /// Construct the default CUDA EP or panic. CPU-only runs rely on the `gpu-tests`

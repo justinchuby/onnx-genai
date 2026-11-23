@@ -280,6 +280,7 @@ pub fn input_dtype_constraints_for_op(
         (3, F32_ONLY),
     ];
     match (op_type, domain) {
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::INPUT_DTYPES,
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
         ("RotaryEmbedding", "com.microsoft") => MSFT_ROTARY_SLOTS,
@@ -306,6 +307,7 @@ pub fn output_dtype_constraints_for_op(
 ) -> &'static [(usize, &'static [DataType])] {
     static DSA_INDEX_SELECT_OUTPUTS: &[(usize, &[DataType])] = &[(0, I64_ONLY)];
     match (op_type, domain) {
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::OUTPUT_DTYPES,
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
         _ => &[],
     }
@@ -369,6 +371,9 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // Static union across Einsum-12 and Einsum-28. The provider performs
         // the required opset-aware BFloat16 gate before claiming the node.
         ("Einsum", "") => EINSUM_DTYPES,
+        ("Pack", "") => &[DataType::Uint8],
+        ("Unpack", "") => onnx_runtime_ir::packed_routed::WORD_DTYPES,
+        ("GroupedMatMul", "") => onnx_runtime_ir::standard_math::DTYPES,
         (name, "")
             if onnx_runtime_ir::standard_math::OPS
                 .iter()
@@ -476,6 +481,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("IsInf", "") | ("IsNaN", "") | ("EyeLike", "") => FLOAT_DTYPES,
 
         // Quantization: specific types but advertise broad.
+        ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
         ("QuantizeLinear", "")
         | ("DequantizeLinear", "")
         | ("DynamicQuantizeLinear", "")
@@ -598,6 +604,7 @@ mod half_gemm;
 // The GEMV is an F16C/AVX2 kernel with no portable body: off x86 the decode
 // path is unchanged, so the module is not compiled at all rather than left as
 // dead code.
+mod dequantize_packed;
 pub mod governed_weight_cache;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod half_gemv;
@@ -621,6 +628,7 @@ pub mod msft_attention;
 pub mod multi_head_attention;
 pub mod onehot;
 pub mod packed_multi_head_attention;
+mod packed_routed;
 pub mod packed_varlen_attention;
 pub mod pad;
 pub mod planar_block_quant;
@@ -698,6 +706,9 @@ pub const PHASE1_OPS: &[&str] = &[
     "Expm1",
     "Log1p",
     "LogCumSumExp",
+    "Pack",
+    "Unpack",
+    "GroupedMatMul",
     "Add",
     "Relu",
     "Reshape",
@@ -1039,6 +1050,22 @@ pub(crate) fn build_cpu_registry_with_resources(
     let dense_weight_cache_bytes = resources.weight_cache_limits().dense_bytes;
     let retain_caches = resources.cache_retention().is_admitted();
     let mut rec = OpRegistry::new();
+    rec.register(
+        OpKey::new(
+            onnx_runtime_ir::affine_gather::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(gather::AffineGatherFactory),
+    );
+    for name in onnx_runtime_ir::packed_routed::OPS {
+        rec.register(
+            OpKey::new(name, "", 29),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(packed_routed::Factory),
+        );
+    }
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
         rec.register(
             OpKey::new(name, "", since),
@@ -1567,6 +1594,11 @@ pub(crate) fn build_cpu_registry_with_resources(
             Box::new(quantization::DequantizeLinearFactory),
         );
     }
+    rec.register(
+        OpKey::new("DequantizePacked", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(dequantize_packed::Factory),
+    );
     rec.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3354,9 +3386,9 @@ mod tests {
         // `TensorScatter` (opset-24 KV-cache update) adds one more, and the
         // standard-domain `CausalConvWithState` (opset 27) adds one alongside
         // its `com.microsoft` spelling.
-        // `STFT` adds its opset-17 standard-domain registration.
+        // `STFT` and `DequantizePacked` each add a standard-domain registration.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 106 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 107 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }

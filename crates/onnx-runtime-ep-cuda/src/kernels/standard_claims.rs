@@ -37,6 +37,9 @@ pub(crate) fn unsupported_reason(
         "Mod" => mod_op(node, input_dtypes),
         "QuantizeLinear" => quantize_linear(node, input_dtypes),
         "DequantizeLinear" => dequantize_linear(node, input_dtypes),
+        "DequantizePacked" => {
+            onnx_runtime_ir::dequantize_packed::validate_claim(node, input_shapes, input_dtypes)
+        }
         "Dropout" => dropout(node, input_dtypes),
         "NonZero" => nonzero(node, input_dtypes),
         "AffineGrid" => affine_grid(node, input_dtypes),

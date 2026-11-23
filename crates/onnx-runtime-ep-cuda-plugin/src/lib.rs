@@ -233,8 +233,17 @@ mod cuda_impl {
                     .expect("registered CUDA opset must fit ORT's i32 version ABI"),
                 end_version: schema_end_version(&descriptors, index),
                 supported_dtypes: d.supported_dtypes,
-                input_dtype_constraints: &[],
-                output_dtype_constraints: &[],
+                input_dtype_constraints: if d.domain.is_empty() && d.op_type == "DequantizePacked" {
+                    onnx_runtime_ir::dequantize_packed::INPUT_DTYPES
+                } else {
+                    &[]
+                },
+                output_dtype_constraints: if d.domain.is_empty() && d.op_type == "DequantizePacked"
+                {
+                    onnx_runtime_ir::dequantize_packed::OUTPUT_DTYPES
+                } else {
+                    &[]
+                },
             })
             .collect()
     }

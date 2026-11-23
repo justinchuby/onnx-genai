@@ -1,0 +1,300 @@
+   Compiling onnx-runtime-memory-governor v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-memory-governor)
+   Compiling onnx-runtime-memory-api v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-memory-api)
+   Compiling onnx-runtime-virtual-memory v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-virtual-memory)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.41s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_memory_api-8454d1fe40f9e1dc)
+
+running 21 tests
+test allocator::tests::device_keys_distinguish_host_and_accelerators ... ok
+test allocator::tests::eager_allocator_requires_only_the_ordinary_contract ... ok
+test allocator::tests::host_allocations_are_aligned_as_requested ... ok
+test allocator::tests::live_host_allocations_are_distinct_and_writable ... ok
+test allocator::tests::zero_byte_allocation_is_non_null ... ok
+test allocator::tests::invalid_alignment_is_refused_with_a_reason ... ok
+test binding::tests::failed_select_clears_a_retired_prior_instead_of_restoring_it ... ok
+test binding::tests::a_later_registration_heals_a_cleared_selection ... ok
+test binding::tests::failed_select_clears_a_removed_prior_instead_of_restoring_it ... ok
+test binding::tests::failed_select_does_not_overwrite_a_newer_selection ... ok
+test binding::tests::device_loss_racing_a_select_cannot_leave_a_lost_mechanism_selected ... ok
+test binding::tests::retirement_and_device_loss_drop_the_current_selection ... ok
+test binding::tests::failed_select_restores_the_prior_healthy_selection ... ok
+test capability::tests::shared_mapping_discovery_is_independent_of_virtual_backing ... ok
+test binding::tests::retire_racing_a_select_cannot_leave_the_retired_mechanism_selected ... ok
+test capability::tests::virtual_backing_is_discovered_and_used_before_canonical_release ... ok
+test deferred::tests::failure_is_the_only_unchanged_shape ... ok
+test binding::tests::two_failed_selects_never_leave_a_dead_mechanism_selected ... ok
+test deferred::tests::states_answer_ownership_and_callback_questions ... ok
+test deferred::tests::zero_unmapped_bytes_is_a_valid_complete_outcome ... ok
+test tests::tier_order_and_names_are_stable ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/binding_registry.rs (/tmp/nxrt-erf-nan-target/debug/deps/binding_registry-448b4dd83179bb3d)
+
+running 15 tests
+test binding_identity_names_every_registered_axis_and_opaque_generation ... ok
+test context_survives_frontend_drop_until_bound_metadata_retires ... ok
+test registry_owner_keeps_context_after_binding_retires_first ... ok
+test reused_virtual_address_gets_new_generation_and_rejects_stale_view ... ok
+test erased_third_party_allocator_remains_supported ... ok
+test allocator_drop_runs_while_context_and_authority_pins_are_alive ... ok
+test device_loss_invalidates_without_free_or_resource_refund ... ok
+test no_registry_or_mechanism_lock_is_held_across_allocator_or_capability_callbacks ... ok
+test shared_prefix_and_allocation_must_have_the_same_binding ... ok
+test context_termination_requires_in_flight_allocator_callbacks_to_quiesce ... ok
+test shared_prefix_drops_before_context_pin_after_terminal_registry_teardown ... ok
+test switch_pins_old_release_and_capability_while_new_binding_uses_new_mechanism ... ok
+test trusted_composite_is_explicit_and_foreign_registration_is_rejected ... ok
+test wrong_device_authority_mechanism_and_binding_fail_before_operation ... ok
+test concurrent_register_lookup_switch_invalidate_and_teardown_is_consistent ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/capability_extensibility.rs (/tmp/nxrt-erf-nan-target/debug/deps/capability_extensibility-dfd03f11d014f5d8)
+
+running 1 test
+test third_party_capabilities_are_independently_discoverable_after_erasure ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/deferred_release.rs (/tmp/nxrt-erf-nan-target/debug/deps/deferred_release-4ab4ac40b14d59aa)
+
+running 23 tests
+test a_dropped_enqueue_error_quarantines_rather_than_losing_the_request ... ok
+test an_adopted_allocation_is_generation_checked_like_an_issued_one ... ok
+test address_reuse_cannot_resurrect_a_released_generation ... ok
+test a_dropped_owning_allocation_is_quarantined_not_freed ... ok
+test a_refused_request_can_be_recovered_and_executed_by_the_caller ... ok
+test a_retired_record_cannot_be_released_twice ... ok
+test a_dropped_adopted_allocation_is_quarantined_not_freed ... ok
+test a_queued_request_becomes_device_lost_quarantine_and_keeps_its_pins ... ok
+test a_view_that_outlives_its_owner_can_never_be_validated_or_release_anything ... ok
+test an_abandoned_prepared_request_is_quarantined_not_freed ... ok
+test an_allocator_failure_after_preparation_is_conservatively_quarantined ... ok
+test cpu_immediate_owning_release_completes_synchronously_without_a_queue ... ok
+test device_loss_refuses_preparation_and_keeps_the_owner ... ok
+test enqueue_failure_quarantines_the_exact_request ... ok
+test mapped_refunds_are_reported_and_zero_is_never_a_failure_proxy ... ok
+test outstanding_and_cloned_views_block_physical_release ... ok
+test queued_ownership_blocks_teardown_until_it_settles ... ok
+test queued_release_defers_the_allocator_until_the_queue_executes_it ... ok
+test the_legacy_adapter_still_validates_generation_before_the_allocator_runs ... ok
+test zero_byte_allocation_releases_completely_with_zero_bytes ... ok
+test queue_and_allocator_callbacks_never_run_under_a_registry_or_mechanism_lock ... ok
+test deferred_stress_never_grows_the_queue_without_bound ... ok
+test concurrent_final_releases_free_every_allocation_exactly_once ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_memory_governor-9443d226c1173700)
+
+running 77 tests
+test large_alloc_cache::tests::allocations_below_the_floor_are_never_retained ... ok
+test large_alloc_cache::tests::a_tiny_allowance_disables_retention_rather_than_overshooting ... ok
+test large_alloc_cache::tests::allocations_above_the_ceiling_are_never_retained ... ok
+test large_alloc_cache::tests::a_zero_budget_disables_retention_entirely ... ok
+test large_alloc_cache::tests::a_released_large_block_is_handed_back_to_the_next_matching_request ... ok
+test large_alloc_cache::tests::a_cached_block_is_never_served_to_a_different_layout ... ok
+test large_alloc_cache::tests::disabled_retention_leaves_the_floor_pending_through_allocation_and_release ... ok
+test large_alloc_cache::tests::drain_releases_every_retained_block ... ok
+test large_alloc_cache::tests::explicit_floor_below_the_probe_ladder_preserves_recycling ... ok
+test large_alloc_cache::tests::the_budget_is_never_exceeded_even_transiently ... ok
+test large_alloc_cache::tests::the_budget_tracks_the_process_memory_allowance ... ok
+test large_alloc_cache::tests::the_configured_floor_decides_what_is_retained ... ok
+test large_alloc_cache::tests::concurrently_live_blocks_never_overlap ... ok
+test large_alloc_cache::tests::a_block_retained_by_its_caller_is_never_recycled_underneath_it ... ok
+test large_alloc_cache::tests::the_wrapper_reports_the_inner_device ... ok
+test shareability::tests::a_zero_granule_is_refused_not_divided_by ... ok
+test shareability::tests::boundary_waste_is_the_remainder_and_whole_fragment_when_unshareable ... ok
+test shareability::tests::cpu_mmap_4kib_granule_shares_essentially_any_prefix_in_any_layout ... ok
+test shareability::tests::head_major_threshold_is_exactly_8192_tokens_at_2mib ... ok
+test shareability::tests::qwen14b_2000_token_prefix_at_2mib_matches_the_worked_table ... ok
+test shareability::tests::qwen14b_2000_token_prefix_at_64kib_makes_head_major_shareable ... ok
+test shareability::tests::small_model_needs_token_major_or_finer_granule_at_2mib ... ok
+test shareability::tests::total_bytes_per_token_is_layout_invariant ... ok
+test shared_prefix::tests::blocks_fallback_when_rollback_fails ... ok
+test shared_prefix::tests::commits_both_targets_without_rollback ... ok
+test shared_prefix::tests::first_map_refusal_needs_no_rollback ... ok
+test shared_prefix::tests::refuses_before_mapping_when_rollback_capability_is_absent ... ok
+test shared_prefix::tests::rolls_back_first_map_before_private_fallback ... ok
+test tests::a_partly_shrunk_lease_returns_exactly_its_remainder_on_drop ... ok
+test tests::a_refused_growth_leaves_the_lease_at_its_original_size ... ok
+test tests::a_zero_byte_reservation_is_legal_and_holds_nothing ... ok
+test tests::a_refused_reservation_does_not_disturb_what_is_already_leased ... ok
+test tests::a_tier_grants_exactly_its_limit_and_not_one_byte_more ... ok
+test tests::allocator_commit_failure_restores_allowances_and_reservation ... ok
+test tests::capacity_unavailable_keeps_the_refusal_underneath_it_downcastable ... ok
+test tests::an_overflowing_request_is_refused_rather_than_wrapping ... ok
+test tests::capacity_unavailable_reports_no_cause_when_it_decided_alone ... ok
+test tests::confirmed_context_discharges_all_mapped_allowance_clones_exactly_once ... ok
+test tests::dropping_a_grown_lease_returns_the_grown_total ... ok
+test tests::dropping_a_lease_returns_its_bytes_once ... ok
+test tests::governors_over_one_ledger_share_authority_but_independent_ledgers_do_not ... ok
+test tests::exhausting_one_tier_does_not_consume_another ... ok
+test tests::failed_pinned_reclaim_rolls_back_allowances_and_reservation ... ok
+test tests::grant_capacity_converts_exact_headroom_without_rechecking_it ... ok
+test tests::grant_reserves_future_reclaimed_capacity_before_it_is_free ... ok
+test tests::growing_a_lease_only_claims_the_difference ... ok
+test tests::concurrent_reservations_never_oversubscribe_a_tier ... ok
+test tests::kv_reclaims_the_full_lent_budget_from_weights_across_bucketed_growth ... ok
+test tests::live_grant_blocks_ordinary_claims_and_requester_page_in ... ok
+test tests::lowering_a_limit_below_live_usage_revokes_nothing ... ok
+test tests::mapped_allowances_coordinate_holders_without_double_charging_physical_bytes ... ok
+test tests::mapped_growth_transfers_unused_allowance_before_reclaiming ... ok
+test tests::mapped_growth_claims_unassigned_allowance_for_sequential_arena_allocations ... ok
+test tests::mapped_growth_refuses_after_unassigned_allowance_is_exhausted ... ok
+test tests::oversubscribed_bytes_reports_excess_beyond_the_limit ... ok
+test tests::reclaim_callback_runs_outside_authority_and_claim_locks ... ok
+test tests::registration_is_weak_explicit_and_priority_ordered ... ok
+test tests::record_committed_records_already_taken_bytes_even_over_limit ... ok
+test tests::repeated_lease_cycles_do_not_drift ... ok
+test tests::shrinking_returns_only_what_the_lease_actually_holds ... ok
+test tests::retained_mapped_growth_releases_operation_guard_and_keeps_residual_attributed ... ok
+test tests::shrinking_then_dropping_releases_each_byte_once ... ok
+test tests::unused_mapped_growth_returns_new_unassigned_allowance ... ok
+test workspace::tests::alternating_capacity_alignment_and_owned_views_preserve_exclusive_warm_slots ... ok
+test workspace::tests::delegation_and_foreign_returns_do_not_duplicate_or_lose_charges ... ok
+test workspace::tests::incomplete_physical_release_never_refunds_or_reuses_the_backing ... ok
+test workspace::tests::owned_host_registration_retires_after_idle_backing_and_its_binding ... ok
+test workspace::tests::concurrent_runs_own_distinct_slots_and_only_idle_storage_yields_to_kv ... ok
+test workspace::tests::warm_runs_reuse_peak_capacity_and_its_exact_original_grant ... ok
+test large_alloc_cache::tests::concurrent_allocate_and_release_never_hands_out_a_live_block_twice ... ok
+test tests::reserve_racing_limit_shrink_never_exceeds_the_committed_limit ... ok
+test tests::reserved_to_mapped_transition_never_exposes_capacity ... ok
+test tests::concurrent_mapped_growth_waits_in_fifo_order ... ok
+test large_alloc_cache::tests::automatic_floor_stays_pending_for_requests_outside_the_candidate_band ... ok
+test large_alloc_cache::tests::explicit_resolution_uses_the_shared_calibration_even_when_retention_is_disabled ... ok
+test large_alloc_cache::tests::calibration_returns_a_usable_floor ... ok
+test large_alloc_cache::tests::calibration_has_bounded_first_use_cost ... ok
+
+test result: ok. 77 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/lease_partition.rs (/tmp/nxrt-erf-nan-target/debug/deps/lease_partition-c62bb8b54893c797)
+
+running 3 tests
+test split_and_absorb_preserve_real_ledger_headroom ... ok
+test invalid_zero_and_whole_splits_never_lose_or_duplicate_a_grant ... ok
+test group_partition_transfers_ownership_without_accounting_callbacks ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lease_pressure.rs (/tmp/nxrt-erf-nan-target/debug/deps/lease_pressure-e2a58b1b5d3c932d)
+
+running 5 tests
+test lease_pressure_growth_overflow_is_rejected_before_the_accountant ... ok
+test lease_pressure_registration_is_weak_cancellable_and_authority_scoped ... ok
+test lease_pressure_reentry_is_bounded_and_later_rounds_remain_enabled ... ok
+test lease_pressure_reserve_grow_and_sibling_share_shortfall_admission ... ok
+test lease_pressure_uses_actual_books_and_preserves_callback_errors ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/process_memory_manager.rs (/tmp/nxrt-erf-nan-target/debug/deps/process_memory_manager-50d022545dd3178b)
+
+running 36 tests
+test canonical_authority_view_is_recreated_while_an_alias_remains ... ok
+test authority_managed_charge_requires_parent_delegation_under_a_finite_limit ... ok
+test device_loss_broadcasts_to_all_sibling_contexts_without_manager_locks ... ok
+test abandoning_a_prepared_release_quarantines_without_refund ... ok
+test device_loss_retains_charge_until_context_termination ... ok
+test compatibility_bytes_are_labeled_unattributed ... ok
+test authority_delegations_cannot_double_grant_process_capacity ... ok
+test different_devices_and_authorities_are_not_conflated ... ok
+test erased_third_party_allocator_adapter_remains_supported ... ok
+test exact_manager_identity_distinguishes_independent_instances ... ok
+test failed_unlimited_to_finite_transition_is_atomic_and_retryable_after_release ... ok
+test finite_limit_adopts_unlimited_authority_managed_charges_without_double_counting ... ok
+test holder_ids_are_manager_issued_not_caller_selected ... ok
+test holder_identity_cannot_cross_authority_boundaries ... ok
+test last_token_drop_cannot_reinsert_after_context_termination ... ok
+test concurrent_process_grants_never_oversubscribe ... ok
+test finite_limit_racing_unlimited_publication_cannot_miss_the_live_charge ... ok
+test manager_can_drop_before_a_live_allocation_settles ... ok
+test manager_can_drop_with_a_prepared_release_still_live ... ok
+test mechanism_switch_keeps_old_allocation_on_its_original_release_path ... ok
+test multiple_sessions_share_a_canonical_authority_without_sharing_bindings ... ok
+test pressure_callback_failure_preserves_its_cause_and_refunds_new_process_quota ... ok
+test pressure_callback_is_reentrant_and_runs_without_manager_locks ... ok
+test process_quota_checked_arithmetic_refuses_wraparound ... ok
+test quarantine_never_uses_allocation_length_to_refund_rounded_charge ... ok
+test pressure_uses_one_shared_round_for_either_quota_or_authority_shortfall ... ok
+test quarantined_rollback_keeps_charge_and_prevents_reuse ... ok
+test quiescent_registration_teardown_releases_registry_pins ... ok
+test reserve_allocate_commit_and_publish_failures_roll_back_exactly ... ok
+test settlement_token_drop_with_waiter_retains_quarantined_snapshot ... ok
+test shared_aliases_do_not_double_count_physical_or_charged_bytes ... ok
+test transaction_rejects_owner_issued_by_another_binding ... ok
+test unidentified_retained_ownership_never_receives_a_false_refund ... ok
+test uma_device_views_reuse_one_canonical_authority_and_physical_identity ... ok
+test deterministic_switch_and_teardown_stress ... ok
+test context_termination_waits_for_manager_publication_and_rejects_new_work ... ok
+
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/third_party_governor.rs (/tmp/nxrt-erf-nan-target/debug/deps/third_party_governor-94052542e825b060)
+
+running 5 tests
+test a_refused_reservation_disturbs_nothing ... ok
+test a_third_party_governor_can_grant_and_reclaim_leases ... ok
+test a_third_party_governor_is_usable_as_a_trait_object ... ok
+test growing_a_lease_charges_the_implementors_own_accounting ... ok
+test the_implementors_policy_decides_what_is_refused ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_virtual_memory-36e02237ea38339c)
+
+running 22 tests
+test buffer::tests::backing_accounting_rejects_a_different_authority_before_reservation ... ok
+test buffer::tests::a_shrink_within_a_granule_keeps_the_page ... ok
+test buffer::tests::growth_leases_exactly_what_it_commits ... ok
+test buffer::tests::growing_past_the_reservation_is_refused_and_names_the_capacity ... ok
+test buffer::tests::backing_accounting_accepts_the_same_authority_without_double_charge ... ok
+test buffer::tests::contents_survive_growth ... ok
+test buffer::tests::reserving_address_space_leases_nothing ... ok
+test buffer::tests::shrinking_returns_committed_pages ... ok
+test buffer::tests::dropping_the_buffer_returns_its_budget ... ok
+test buffer::tests::a_refused_lease_leaves_the_buffer_untouched ... ok
+test buffer::tests::the_address_does_not_change_as_the_buffer_grows ... ok
+test tests::a_delegated_refusal_is_reported_as_itself_not_as_an_os_error ... ok
+test tests::a_misaligned_offset_is_refused_and_names_the_next_legal_value ... ok
+test tests::blocks_mapped_out_of_order_with_gaps_each_land_at_their_own_offset ... ok
+test tests::granularity_is_a_power_of_two_that_every_legal_offset_is_a_multiple_of ... ok
+test tests::mapping_over_a_live_block_is_refused ... ok
+test tests::mapping_past_the_end_reports_how_far_it_overruns ... ok
+test tests::reserving_far_more_than_ram_succeeds_because_nothing_is_committed ... ok
+test tests::the_rounded_value_a_misalignment_error_suggests_is_itself_legal ... ok
+test tests::unmapping_an_unmapped_offset_is_a_no_op ... ok
+test tests::unmapping_one_block_leaves_its_neighbour_intact ... ok
+test tests::separately_mapped_blocks_read_back_as_one_contiguous_buffer ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests onnx_runtime_memory_api
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests onnx_runtime_memory_governor
+
+running 1 test
+test crates/onnx-runtime-memory-governor/src/lib.rs - (line 81) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+test crates/onnx-runtime-memory-governor/src/lib.rs - (line 88) - compile fail ... ok
+test crates/onnx-runtime-memory-governor/src/lib.rs - (line 92) - compile fail ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+all doctests ran in 0.53s; merged doctests compilation took 0.22s
+   Doc-tests onnx_runtime_virtual_memory
+
+running 1 test
+test crates/onnx-runtime-virtual-memory/src/lib.rs - (line 63) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+

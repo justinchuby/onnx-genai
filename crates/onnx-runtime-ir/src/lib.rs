@@ -46,7 +46,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod affine_gather;
 mod arena;
+pub mod dequantize_packed;
 mod device;
 mod domain;
 mod dtype;
@@ -57,6 +59,7 @@ mod graph_view;
 mod layout;
 mod node;
 pub mod onnx;
+pub mod packed_routed;
 pub mod pattern;
 pub mod standard_math;
 

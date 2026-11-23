@@ -148,6 +148,19 @@ const TEST_ONLY: &[&str] = &["TotallyFakeOp"];
 /// model of production, and an op still counts as declining unless *some* point
 /// in the matrix yields a rule.
 fn declines(op_type: &str, domain: &str) -> bool {
+    if domain.is_empty() && op_type == "DequantizePacked" {
+        let mut node = Node::new(NodeId(0), op_type, vec![Some(ValueId(0))], vec![ValueId(1)]);
+        node.version = Some(29);
+        node.attributes
+            .insert("format".into(), Attribute::String(b"gguf:q4_0".to_vec()));
+        node.attributes
+            .insert("shape".into(), Attribute::Ints(vec![32]));
+        return !matches!(
+            ShapeInference::for_node(&node, &[vec![None]], 1),
+            ShapeInference::StaticOutputs(shapes) if shapes == vec![vec![32]]
+        );
+    }
+
     if (domain, op_type) == ("pkg.nxrt", "DsaIndexSelect") {
         let inputs = (0..4).map(|i| Some(ValueId(i))).collect();
         let mut node = Node::new(NodeId(0), op_type, inputs, vec![ValueId(100)]);

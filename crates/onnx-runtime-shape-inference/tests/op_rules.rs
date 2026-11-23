@@ -124,6 +124,87 @@ fn quantization_static_metadata_rejects_invalid_scalar_block_and_dtype_cases() {
     );
 }
 
+#[test]
+fn dequantize_packed_resolves_shape_and_checks_exact_payload() {
+    let packed = |format: &str, dims: Vec<i64>| {
+        with_attr(
+            with_attr(
+                node("DequantizePacked", 1, 1),
+                "format",
+                Attribute::String(format.as_bytes().to_vec()),
+            ),
+            "shape",
+            Attribute::Ints(dims),
+        )
+    };
+    let good = packed("gguf:q5_1", vec![2, 64]);
+    let inferred = run(&good, vec![tin(DataType::Uint8, vec![c(96)])], 29);
+    assert_eq!(out_dtype(&inferred), DataType::Float32);
+    assert_eq!(out_shape(&inferred), [c(2), c(64)]);
+    let double = with_attr(good.clone(), "output_dtype", Attribute::Int(11));
+    let inferred = run(
+        &double,
+        vec![tin(DataType::Uint8, vec![DimExpr::symbol(SymbolId(7))])],
+        29,
+    );
+    assert_eq!(out_dtype(&inferred), DataType::Float64);
+    assert_eq!(out_shape(&inferred), [c(2), c(64)]);
+    for (node, dtype, shape, reason) in [
+        (good.clone(), DataType::Int8, vec![c(96)], "UINT8"),
+        (good.clone(), DataType::Uint8, vec![c(96), c(1)], "rank one"),
+        (good.clone(), DataType::Uint8, vec![c(95)], "exactly 96"),
+        (good.clone(), DataType::Uint8, vec![c(97)], "exactly 96"),
+        (
+            with_attr(good, "output_dtype", Attribute::Int(7)),
+            DataType::Uint8,
+            vec![c(96)],
+            "output_dtype",
+        ),
+        (
+            packed("gguf:Q5_1", vec![32]),
+            DataType::Uint8,
+            vec![c(24)],
+            "unknown format",
+        ),
+        (
+            packed("gguf:q5_1:32", vec![32]),
+            DataType::Uint8,
+            vec![c(24)],
+            "unknown format",
+        ),
+        (
+            packed("gguf:q5_1", vec![]),
+            DataType::Uint8,
+            vec![c(0)],
+            "cannot be empty",
+        ),
+        (
+            packed("gguf:q5_1", vec![-1, 32]),
+            DataType::Uint8,
+            vec![c(0)],
+            "nonnegative",
+        ),
+        (
+            packed("gguf:q5_1", vec![0, 33]),
+            DataType::Uint8,
+            vec![c(0)],
+            "multiple of 32",
+        ),
+        (
+            packed("gguf:q5_1", vec![1_i64 << 57, 32]),
+            DataType::Uint8,
+            vec![c(0)],
+            "byte count",
+        ),
+    ] {
+        assert_invalid(
+            try_run(&node, vec![tin(dtype, shape)], 29).unwrap_err(),
+            "DequantizePacked",
+            reason,
+        );
+    }
+}
+
 fn sym(n: u32) -> DimExpr {
     DimExpr::symbol(SymbolId(n))
 }
@@ -331,6 +412,63 @@ fn standard_math_opset_gate_and_shape_contracts() {
     );
 }
 
+#[test]
+fn packed_routed_opset_gate_and_shape_contracts() {
+    let pack = with_attr(
+        with_attr(
+            with_attr(node("Pack", 1, 1), "bits", Attribute::Int(5)),
+            "axis",
+            Attribute::Int(0),
+        ),
+        "output_type",
+        Attribute::Int(12),
+    );
+    let values = || vec![tin(DataType::Uint8, vec![c(7), sym(0)])];
+    assert!(run(&pack, values(), 28)[0].type_info.is_none());
+    let out = run(&pack, values(), 29);
+    assert_eq!(out_dtype(&out), DataType::Uint32);
+    assert_eq!(out_shape(&out), vec![c(2), sym(0)]);
+
+    let unpack = with_attr(node("Unpack", 2, 1), "bits", Attribute::Int(5));
+    let packed = tin(DataType::Uint8, vec![sym(0), c(3)]);
+    let count = NodeIo {
+        type_info: Some(TypeInfo::new(DataType::Int64, vec![])),
+        shape_data: Some(ShapeData::scalar(DataType::Int64, c(4))),
+        value_type: None,
+    };
+    let out = run(&unpack, vec![packed.clone(), count.clone()], 29);
+    assert_eq!(out_shape(&out), vec![sym(0), c(4)]);
+    let out = run(&unpack, vec![packed, tin(DataType::Int64, vec![])], 29);
+    assert_symbolic(&out_shape(&out)[1]);
+    assert_invalid(
+        try_run(&unpack, vec![tin(DataType::Uint8, vec![c(2)]), count], 29).unwrap_err(),
+        "Unpack",
+        "exactly 3 words",
+    );
+
+    let routed = with_attr(node("GroupedMatMul", 4, 1), "transB", Attribute::Int(-1));
+    let inputs = || {
+        vec![
+            f32in(vec![sym(0), c(3)]),
+            f32in(vec![c(4), c(7), c(3)]),
+            tin(DataType::Int32, vec![sym(0), c(2)]),
+            f32in(vec![c(4), c(7)]),
+        ]
+    };
+    assert!(run(&routed, inputs(), 28)[0].type_info.is_none());
+    assert_eq!(
+        out_shape(&run(&routed, inputs(), 29)),
+        vec![sym(0), c(2), c(7)]
+    );
+    let mut invalid = inputs();
+    invalid[3] = f32in(vec![c(4), c(6)]);
+    assert_invalid(
+        try_run(&routed, invalid, 29).unwrap_err(),
+        "GroupedMatMul",
+        "bias output width",
+    );
+}
+
 fn assert_symbolic(dim: &DimExpr) {
     assert!(
         dim.as_const().is_none(),
@@ -347,7 +485,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        226,
+        231,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -356,7 +494,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        271,
+        276,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -6903,6 +7041,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "DequantizeLinear", 21),
     ("", "DequantizeLinear", 23),
     ("", "DequantizeLinear", 25),
+    ("", "DequantizePacked", 29),
     ("", "Det", 11),
     ("", "Div", 1),
     ("", "Dropout", 1),
@@ -6935,6 +7074,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "GridSample", 16),
     ("", "GroupNormalization", 18),
     ("", "GroupNormalization", 21),
+    ("", "GroupedMatMul", 29),
     ("", "HammingWindow", 17),
     ("", "HannWindow", 17),
     ("", "HardSigmoid", 1),
@@ -6981,6 +7121,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "OneHot", 11),
     ("", "Or", 1),
     ("", "PRelu", 16),
+    ("", "Pack", 29),
     ("", "Pad", 1),
     ("", "Pow", 1),
     ("", "QLinearMatMul", 10),
@@ -7069,6 +7210,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Transpose", 1),
     ("", "Trilu", 14),
     ("", "Unique", 11),
+    ("", "Unpack", 29),
     ("", "Unsqueeze", 1),
     ("", "Unsqueeze", 13),
     ("", "Where", 1),
@@ -7106,6 +7248,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("com.microsoft", "SimplifiedLayerNormalization", 1),
     ("com.microsoft", "SkipLayerNormalization", 1),
     ("com.microsoft", "SkipSimplifiedLayerNormalization", 1),
+    ("pkg.nxrt", "AffineQuantizedGather", 1),
     ("pkg.nxrt", "BlockQuantizedMatMul", 1),
     ("pkg.nxrt", "BlockQuantizedMoE", 1),
     ("pkg.nxrt", "CompressedSparseAttention", 1),

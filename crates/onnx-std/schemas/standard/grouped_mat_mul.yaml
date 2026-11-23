@@ -1,0 +1,15 @@
+domain: ""
+name: GroupedMatMul
+since_version: 29
+doc: Multiply each input row by selected group matrices and optionally add the selected bias.
+attributes:
+  - { name: transB, type: int, default: 0 }
+inputs:
+  - { name: input, type_str: T }
+  - { name: weights, type_str: T }
+  - { name: group_indices, type_str: Tind }
+  - { name: bias, type_str: T, optional: true }
+outputs: [{ name: output, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }
+  - { type_param: Tind, allowed: [int32, int64] }
