@@ -807,3 +807,23 @@ Criterion functional smoke selected and passed both the five-processor chain and
 the cached grammar mask using valid grammar history; no performance claim is made.
 Reasoning plus JSON is still refused: shared classifier/grammar lowering and
 special framing-token semantics remain necessary before enabling that feature.
+
+Ordinary-prefill projection now differs explicitly from continuation projection.
+Pinned upstream `common_chat_session` primes its emitted baseline only for an
+explicit continuation without echo. The response parser therefore takes a typed
+include/exclude policy: ordinary requests include declared assistant content and
+reasoning from the final anchored template region; continuations exclude existing
+bytes while retaining their parser state. Buffered output, live SSE and logprob
+replay share this policy. Region visibility is named independently of whether its
+bytes came from generation. This fixes lost static template prefill without
+changing continuation suffix behavior.
+
+Validation: full server library 415 passed / 2 inherited ignores and strict
+all-target Clippy passed. After extending the real ONNX fixture to cover both
+content and reasoning prefill, all 2 ordinary-prefill cases and the original
+real response-projection case passed; strict all-target Clippy passed again.
+The fixture checks buffered/SSE, logprobs on/off and stops before/within generated
+text. Parser tests cover closed/open repeated regions, Unicode chunk boundaries,
+prefix-only completion and last-anchor selection. All 9 selected continuation
+cases passed. Constrained prefill and reasoning+JSON still require further work;
+this milestone does not enable their missing grammar integration.

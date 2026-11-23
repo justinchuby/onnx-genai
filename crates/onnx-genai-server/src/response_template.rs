@@ -412,8 +412,8 @@ impl ResponseTemplate {
 #[derive(Debug, Default)]
 struct Region {
     text: String,
-    prefix_bytes: usize,
-    generated: bool,
+    omitted_prefix_bytes: usize,
+    visible: bool,
 }
 impl Region {
     fn output<'a>(&'a self, field: &Field) -> &'a str {
@@ -425,7 +425,7 @@ impl Region {
         };
         let start = text.as_ptr() as usize - self.text.as_ptr() as usize;
         let end = start + text.len();
-        let from = start.max(self.prefix_bytes);
+        let from = start.max(self.omitted_prefix_bytes);
         if from >= end {
             ""
         } else {
@@ -440,10 +440,17 @@ pub(crate) struct ChatText {
     pub reasoning: String,
 }
 
+/// Whether assistant text already rendered by the template belongs to this output.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PrefixOutput {
+    Include,
+    Exclude,
+}
+
 pub(crate) struct ResponseParser {
     spec: std::sync::Arc<ResponseTemplate>,
     buffer: String,
-    prefix_end: usize,
+    omitted_prefix_end: usize,
     pos: usize,
     current: Option<usize>,
     region: Option<Region>,
@@ -457,6 +464,7 @@ impl ResponseParser {
     pub fn new(
         spec: std::sync::Arc<ResponseTemplate>,
         prefix: &str,
+        prefix_output: PrefixOutput,
         max_bytes: usize,
     ) -> anyhow::Result<Self> {
         let at = spec
@@ -480,7 +488,10 @@ impl ResponseParser {
             current: spec.implicit,
             spec,
             buffer: prefix.into(),
-            prefix_end: prefix.len(),
+            omitted_prefix_end: match prefix_output {
+                PrefixOutput::Include => 0,
+                PrefixOutput::Exclude => prefix.len(),
+            },
             pos: 0,
             region: None,
             sent: ChatText::default(),
@@ -508,8 +519,11 @@ impl ResponseParser {
         if let Some(field) = self.current {
             let region = self.region.get_or_insert_with(Region::default);
             region.text.push_str(&self.buffer[range.clone()]);
-            region.prefix_bytes += range.end.min(self.prefix_end).saturating_sub(range.start);
-            region.generated |= range.end > self.prefix_end;
+            region.omitted_prefix_bytes += range
+                .end
+                .min(self.omitted_prefix_end)
+                .saturating_sub(range.start);
+            region.visible |= range.end > self.omitted_prefix_end;
             self.seen[field] = true;
         }
     }
@@ -571,7 +585,7 @@ impl ResponseParser {
                     self.close();
                     self.current = Some(field);
                     self.region = Some(Region {
-                        generated: range.end > self.prefix_end,
+                        visible: range.end > self.omitted_prefix_end,
                         ..Default::default()
                     });
                     self.seen[field] = true;
@@ -638,7 +652,7 @@ impl ResponseParser {
                 self.closed[field].iter().chain(active).collect()
             };
             let mut first = true;
-            for region in regions.into_iter().filter(|region| region.generated) {
+            for region in regions.into_iter().filter(|region| region.visible) {
                 if !first {
                     target.push_str(&definition.join);
                 }
@@ -727,7 +741,7 @@ mod tests {
         prefix: &str,
         chunks: &[&str],
     ) -> anyhow::Result<ChatText> {
-        let mut parser = ResponseParser::new(spec, prefix, 16384)?;
+        let mut parser = ResponseParser::new(spec, prefix, PrefixOutput::Exclude, 16384)?;
         let mut output = ChatText::default();
         for chunk in chunks {
             let delta = parser.feed(chunk)?;
@@ -739,6 +753,46 @@ mod tests {
         output.reasoning.push_str(&delta.reasoning);
         Ok(output)
     }
+    #[test]
+    fn ordinary_prefill_includes_closed_and_open_regions_even_without_generated_text() {
+        let spec = template(true);
+        for (prefix, suffix, content, reasoning) in [
+            (
+                "history[assistant]old[user]again[assistant]<r> first </r><r> second ",
+                "尾巴</r>答案",
+                "答案",
+                "firstsecond 尾巴",
+            ),
+            ("[assistant] answer ", "", "answer", ""),
+            (
+                "[assistant]<r> thought </r> answer ",
+                "",
+                "answer",
+                "thought",
+            ),
+        ] {
+            for split in suffix
+                .char_indices()
+                .map(|(at, _)| at)
+                .chain(std::iter::once(suffix.len()))
+            {
+                let mut parser =
+                    ResponseParser::new(spec.clone(), prefix, PrefixOutput::Include, 16384)
+                        .unwrap();
+                let mut out = parser.feed(&suffix[..split]).unwrap();
+                for delta in [
+                    parser.feed(&suffix[split..]).unwrap(),
+                    parser.finish().unwrap(),
+                ] {
+                    out.content.push_str(&delta.content);
+                    out.reasoning.push_str(&delta.reasoning);
+                }
+                assert_eq!(out.content, content);
+                assert_eq!(out.reasoning, reasoning);
+            }
+        }
+    }
+
     #[test]
     fn response_template_regions_prime_last_turn_and_exclude_raw_prefix_whitespace() {
         let spec = template(true);
@@ -795,18 +849,21 @@ mod tests {
     #[test]
     fn response_template_reopened_field_can_rebuild_a_published_prefix_without_echo() {
         let spec = template(false);
-        let mut parser = ResponseParser::new(spec.clone(), "[assistant]", 1024).unwrap();
+        let mut parser =
+            ResponseParser::new(spec.clone(), "[assistant]", PrefixOutput::Exclude, 1024).unwrap();
         assert_eq!(parser.feed("<r>one").unwrap().reasoning, "one");
         for chunk in ["</r><r>", "o", "n", "e"] {
             assert!(parser.feed(chunk).unwrap().reasoning.is_empty());
         }
         assert_eq!(parser.feed(" more</r>").unwrap().reasoning, " more");
         assert!(parser.finish().unwrap().reasoning.is_empty());
-        let mut parser = ResponseParser::new(spec.clone(), "[assistant]", 1024).unwrap();
+        let mut parser =
+            ResponseParser::new(spec.clone(), "[assistant]", PrefixOutput::Exclude, 1024).unwrap();
         parser.feed("<r>one</r><r>on").unwrap();
         // The whole first feed projects only the most recent value.
         assert_eq!(parser.finish().unwrap().reasoning, "");
-        let mut parser = ResponseParser::new(spec, "[assistant]", 1024).unwrap();
+        let mut parser =
+            ResponseParser::new(spec, "[assistant]", PrefixOutput::Exclude, 1024).unwrap();
         parser.feed("<r>one").unwrap();
         assert!(parser.feed("</r><r>on").unwrap().reasoning.is_empty());
         assert!(
@@ -827,7 +884,8 @@ mod tests {
                 .reasoning,
             "two"
         );
-        let mut parser = ResponseParser::new(spec, "[assistant]", 1024).unwrap();
+        let mut parser =
+            ResponseParser::new(spec, "[assistant]", PrefixOutput::Exclude, 1024).unwrap();
         assert_eq!(parser.feed("<r>one").unwrap().reasoning, "one");
         let error = parser.feed("</r><r>two").unwrap_err().to_string();
         assert!(error.contains("buffered output"), "{error}");
@@ -848,7 +906,7 @@ mod tests {
             );
         }
         let spec=ResponseTemplate::compile(&serde_json::json!({"start_anchor":"a","fields":{"content":{"open":"<c>","optional":false}}})).unwrap();
-        let mut parser = ResponseParser::new(spec.clone(), "a", 8).unwrap();
+        let mut parser = ResponseParser::new(spec.clone(), "a", PrefixOutput::Exclude, 8).unwrap();
         assert!(
             parser
                 .feed("123456789")

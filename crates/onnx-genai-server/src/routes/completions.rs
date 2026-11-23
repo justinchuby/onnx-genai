@@ -705,7 +705,12 @@ async fn run_chat_completion(
         output_budget,
         handle.model_max_context,
     )?;
-    let projection = ChatProjection::new(&handle, &prepared, state.config.replay_buffer_bytes)?;
+    let projection = ChatProjection::new(
+        &handle,
+        &prepared,
+        &request,
+        state.config.replay_buffer_bytes,
+    )?;
     projection.start().map_err(|error| {
         ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
     })?;
@@ -851,7 +856,12 @@ async fn stream_chat_completion(
         output_budget,
         handle.model_max_context,
     )?;
-    let projection = ChatProjection::new(&handle, &prepared, state.config.replay_buffer_bytes)?;
+    let projection = ChatProjection::new(
+        &handle,
+        &prepared,
+        &request,
+        state.config.replay_buffer_bytes,
+    )?;
     let initial_gate = projection.start().map_err(|error| {
         ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
     })?;
@@ -2536,6 +2546,7 @@ fn render_prompt(
             crate::response_template::ResponseParser::new(
                 spec.clone(),
                 &prompt,
+                crate::response_template::PrefixOutput::Exclude,
                 prompt.len().max(1),
             )?
             .require_open_text_channel(selected_field)?;
@@ -2661,6 +2672,7 @@ fn committed_chat_tool_calls(result: &GenerateResult) -> Option<Vec<ChatMessageT
 struct ChatProjection {
     template: Option<Arc<crate::response_template::ResponseTemplate>>,
     prefix: Arc<str>,
+    prefix_output: crate::response_template::PrefixOutput,
     max_bytes: usize,
     stop_sequences: Vec<String>,
 }
@@ -2668,6 +2680,7 @@ impl ChatProjection {
     fn new(
         handle: &ModelHandle,
         prepared: &PreparedGenerateRequest,
+        request: &ChatCompletionRequest,
         max_bytes: usize,
     ) -> Result<Self, ApiError> {
         let prefix = if handle.response_template.is_some() {
@@ -2678,6 +2691,11 @@ impl ChatProjection {
         Ok(Self {
             template: handle.response_template.clone(),
             prefix: Arc::from(prefix),
+            prefix_output: if request.continue_final_message.is_enabled() {
+                crate::response_template::PrefixOutput::Exclude
+            } else {
+                crate::response_template::PrefixOutput::Include
+            },
             max_bytes,
             stop_sequences: prepared
                 .request
@@ -2700,6 +2718,7 @@ impl ChatProjection {
                     crate::response_template::ResponseParser::new(
                         template.clone(),
                         &self.prefix,
+                        self.prefix_output,
                         self.max_bytes,
                     )
                 })
@@ -2731,6 +2750,7 @@ impl ChatProjection {
         let mut parser = crate::response_template::ResponseParser::new(
             template.clone(),
             &self.prefix,
+            self.prefix_output,
             self.max_bytes,
         )?;
         let mut output = parser.feed(text_before_stop(&raw, &self.stop_sequences))?;
@@ -3720,6 +3740,7 @@ mod channel_gate_tests {
         let mut parser = crate::response_template::ResponseParser::new(
             template,
             "history<assistant><think>prior",
+            crate::response_template::PrefixOutput::Exclude,
             4096,
         )
         .unwrap();
@@ -3741,6 +3762,7 @@ mod channel_gate_tests {
         let projection = ChatProjection {
             template: None,
             prefix: Arc::from(""),
+            prefix_output: crate::response_template::PrefixOutput::Include,
             max_bytes: 4096,
             stop_sequences: Vec::new(),
         };

@@ -185,8 +185,13 @@ same channel-state check when a response template is declared. Plain Rust reques
 builders reject reasoning continuation because they have no model parser contract.
 Tool-call messages and replay into a persistent inference session remain rejected.
 JSON or forced output constraints need a channel-aware grammar before reasoning
-continuation can use them; implicit prefill and thinking-budget controls also
-remain open compatibility work.
+continuation can use them; constrained implicit prefill and thinking-budget
+controls remain open compatibility work.
+
+Without explicit continuation, declared content/reasoning text in the template
+prefill is included in the response, matching upstream session projection.
+The same include/exclude policy governs buffered, SSE and logprob replay; only
+the final assistant region after the declared start anchor is considered.
 `response_format: {"type":"json_object"}` continuation validates the original
 assistant prefix as partial JSON and constrains prefix plus new suffix at each
 step. Grammar validity and EOS eligibility use prefix plus suffix; only newly

@@ -8800,8 +8800,11 @@ mod native_compat {
     }
 }
 
-#[tokio::test]
-async fn declared_response_template_projects_real_generation_for_buffered_and_streamed_chat() {
+async fn assert_declared_output_projection(
+    prefix: &str,
+    generated: &str,
+    cases: &[(Option<&str>, &str, &str)],
+) {
     let scratch = tempfile::tempdir().unwrap();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     for entry in std::fs::read_dir(source).unwrap() {
@@ -8820,12 +8823,12 @@ async fn declared_response_template_projects_real_generation_for_buffered_and_st
         .0
         .clone();
     vocab.remove(&old);
-    vocab.insert("<think>秘密</think>答案".into(), json!(22));
+    vocab.insert(generated.into(), json!(22));
     std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
     std::fs::write(
         scratch.path().join("tokenizer_config.json"),
         json!({
-            "chat_template":"{% for m in messages %}{{ m.content }}{% endfor %}<assistant>",
+            "chat_template":(["{% for m in messages %}{{ m.content }}{% endfor %}<assistant>", prefix].concat()),
             "response_template":{"start_anchor":"<assistant>","fields":{
                 "content":{"content":"text"},
                 "reasoning_content":{"open":"<think>","close":"</think>","content":"text"}
@@ -8835,11 +8838,7 @@ async fn declared_response_template_projects_real_generation_for_buffered_and_st
     )
     .unwrap();
     let router = app(AppState::load(scratch.path(), Some("declared-output".into())).unwrap());
-    for (stop, expected_content, expected_reasoning) in [
-        (None, "答案", "秘密"),
-        (Some("密"), "", "秘"),
-        (Some("案"), "答", "秘密"),
-    ] {
+    for &(stop, expected_content, expected_reasoning) in cases {
         for stream in [false, true] {
             for logprobs in [false, true] {
                 let mut body = json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1,"temperature":0,
@@ -8891,11 +8890,52 @@ async fn declared_response_template_projects_real_generation_for_buffered_and_st
                         "{value}"
                     );
                     assert_eq!(
-                        value["choices"][0]["message"]["reasoning_content"], expected_reasoning,
+                        value["choices"][0]["message"]["reasoning_content"]
+                            .as_str()
+                            .unwrap_or(""),
+                        expected_reasoning,
                         "{value}"
                     );
                 }
             }
         }
     }
+}
+
+#[tokio::test]
+async fn declared_response_template_projects_real_generation_for_buffered_and_streamed_chat() {
+    assert_declared_output_projection(
+        "",
+        "<think>秘密</think>答案",
+        &[
+            (None, "答案", "秘密"),
+            (Some("密"), "", "秘"),
+            (Some("案"), "答", "秘密"),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ordinary_template_prefill_is_emitted_for_buffered_streamed_and_logprob_chat() {
+    assert_declared_output_projection(
+        "<think>预填",
+        "秘密</think>答案",
+        &[
+            (None, "答案", "预填秘密"),
+            (Some("密"), "", "预填秘"),
+            (Some("案"), "答", "预填秘密"),
+        ],
+    )
+    .await;
+    assert_declared_output_projection(
+        "预填",
+        "答案",
+        &[
+            (None, "预填答案", ""),
+            (Some("案"), "预填答", ""),
+            (Some("答"), "预填", ""),
+        ],
+    )
+    .await;
 }
