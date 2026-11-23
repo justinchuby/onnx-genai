@@ -1,0 +1,11 @@
+{"status": "queued", "pid": 20767, "action": "Wait for the peer batch on the shared stable flock; no heavy process has started."}
+{"status": "acquired", "pid": 20767, "command": ["python", "/tmp/nxrt-block-moe-accumulator/validate.py"]}
+removed old private-target test binaries 298470160
+list
+selected 29
+ok
+tests
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 2019 filtered out; finished in 0.25s
+ok
+clippy
+ok

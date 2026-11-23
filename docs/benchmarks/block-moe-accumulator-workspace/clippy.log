@@ -1,0 +1,4 @@
+    Checking onnx-runtime-memory-governor v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-memory-governor)
+    Checking onnx-runtime-ep-api v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-api)
+    Checking onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cpu)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.61s

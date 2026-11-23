@@ -1,0 +1,17 @@
+{"status": "queued", "pid": 21311, "action": "Wait for the peer batch on the shared stable flock; no heavy process has started."}
+{"status": "acquired", "pid": 21311, "command": ["python", "/tmp/nxrt-block-moe-accumulator/driver.py"]}
+{"stage": "build", "arm": "baseline"}
+{"stage": "build", "arm": "after"}
+source restored
+
+thread '<unnamed>' (9588278) panicked at src/main.rs:158:10:
+called `Result::unwrap()` on an `Err` value: UnsupportedOp { op_type: "BlockQuantizedMoE", domain: "pkg.nxrt", node: "<unnamed node #0>", opset: Known(1), reason: "kernel execution failed: BlockQuantizedMoE: claim metadata must cover all 7 positional inputs (got 5 shapes and 5 dtypes)", execution_providers: "cpu_ep" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+Traceback (most recent call last):
+  File "/tmp/nxrt-block-moe-accumulator/driver.py", line 50, in <module>
+    pilot=run('baseline',shape,8,'pilot-excluded');(artifact/f'pilot-{shape[0]}-{shape[1]}-{shape[3]}-{shape[4]}-{shape[5]}.json').write_text(json.dumps(pilot,indent=2)+'\n');reps[shape]=max(1,math.ceil(100/pilot['cpu_ms_per_call']))
+  File "/tmp/nxrt-block-moe-accumulator/driver.py", line 44, in run
+    if result.returncode:print(result.stdout[-2000:]+result.stderr[-4000:],flush=True);raise RuntimeError(prefix)
+                                                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: pilot-excluded-baseline-m1-h32-n64-t1-dense0-gated0
