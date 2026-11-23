@@ -146,6 +146,10 @@ __device__ void affine_grouped(const B* x, const B* w, const B* indices, const B
     const B* zeros, B* y, unsigned* status, U routes, U lanes, U groups, U selections,
     U k, U n, U block_size, int zero) {
     const U blocks = k / block_size;
+    GRID(i, groups * n * blocks) {
+        const float scale = read<float>(scales, i);
+        if (!(scale > 0.0f) || !isfinite(scale)) atomicOr(status, 2u);
+    }
     GRID(i, n == 0 ? routes : lanes) {
         const U route = n == 0 ? i : i / n;
         const I group = read<I>(indices, route);

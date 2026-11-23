@@ -49,7 +49,7 @@ struct Affine {
 impl Kernel for Affine {
     fn capture_support(&self) -> CaptureSupport {
         CaptureSupport::unsupported(
-            "grouped projection reads the route-validation status on the host",
+            "grouped projection reads the scale and route validation status on the host",
         )
     }
 
@@ -62,7 +62,8 @@ impl Kernel for Affine {
                 "quantized CUDA projection requires contiguous tensors",
             ));
         }
-        if l.routes == 0 {
+        let scale_count = l.groups * l.n * (l.k / self.config.block);
+        if l.routes == 0 && scale_count == 0 {
             return Ok(());
         }
         let flag = GraphDeviceAllocation::allocate(&self.runtime, 4)?;
@@ -115,12 +116,19 @@ impl Kernel for Affine {
             .arg(&block)
             .arg(&zero);
         // SAFETY: validated extents and ABI, with live allocations through synchronization.
-        unsafe { launch.launch(launch_config(l.lanes.max(l.routes))) }
+        unsafe { launch.launch(launch_config(l.lanes.max(l.routes).max(scale_count))) }
             .map_err(|e| driver_err(&format!("launch {entry}"), e))?;
         let mut bytes = [0; 4];
         // SAFETY: the live flag covers exactly four bytes.
         unsafe { self.runtime.dtoh(&mut bytes, status)? };
-        if u32::from_ne_bytes(bytes) != 0 {
+        let status = u32::from_ne_bytes(bytes);
+        if status & 2 != 0 {
+            return Err(fail(
+                op,
+                "DequantizeLinear scales must be positive and finite",
+            ));
+        }
+        if status & 1 != 0 {
             return Err(fail(
                 op,
                 format!(

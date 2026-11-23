@@ -3340,8 +3340,8 @@ mod tests {
     #[test]
     fn registry_has_all_phase1_ops() {
         let reg = build_cpu_registry();
-        // Every Phase-1 op has at least one factory, and each resolves at a
-        // modern opset. `Softmax` is registered twice (legacy v1 + per-axis
+        // Every Phase-1 op has at least one factory at the current opset.
+        // `Softmax` is registered twice (legacy v1 + per-axis
         // v13), and `LayerNormalization`, `FusedMatMulBias`, `FusedGemm`,
         // `FusedAttention` and the fused exact-GELU `Gelu` add contrib
         // (`com.microsoft`) entries. Standard `ai.onnx::Attention` is registered
@@ -3400,7 +3400,7 @@ mod tests {
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
         assert_eq!(reg.len(), PHASE1_OPS.len() + 109 + mlas_registrations);
         for op in PHASE1_OPS {
-            assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
+            assert!(reg.lookup(op, "", 29).is_some(), "missing factory for {op}");
         }
         // Softmax selects legacy at opset ≤ 12 and per-axis at opset ≥ 13.
         assert!(reg.lookup("Softmax", "", 12).is_some());

@@ -72,6 +72,7 @@ pub fn recognize(
         }
         let cast = standard_producer(g, id, "Cast")?;
         if g.value(id).dtype != DataType::Uint4
+            || g.effective_opset(cast) != Some(29)
             || cast.attributes.len() != 1
             || cast.attr("to").and_then(Attribute::as_int) != Some(21)
         {
@@ -103,12 +104,15 @@ pub fn recognize(
             let [Some(dims)] = fill.inputs.as_slice() else {
                 return Err("invalid static zero points");
             };
-            if fill.attributes.len() != 1
+            if g.effective_opset(fill) != Some(29)
+                || fill.attributes.len() != 1
                 || !matches!(fill.attr("value"), Some(Attribute::Tensor(t))
                     if t.dtype == DataType::Uint8 && t.dims == [1] && t.data.as_slice() == [8])
                 || !(literal(*dims).as_deref() == Some(&[*e as i64, *n as i64, blocks as i64])
                     || standard_producer(g, *dims, "Shape").is_ok_and(|n| {
-                        n.inputs.as_slice() == [Some(scale)] && n.attributes.is_empty()
+                        g.effective_opset(n) == Some(29)
+                            && n.inputs.as_slice() == [Some(scale)]
+                            && n.attributes.is_empty()
                     }))
             {
                 return Err("unsupported zero-point source");
@@ -183,7 +187,8 @@ fn zero_source(
             .div_ceil(2)
             .checked_mul(2)
             .ok_or("block count overflows")?;
-        if !slice.attributes.is_empty()
+        if g.effective_opset(slice) != Some(29)
+            || !slice.attributes.is_empty()
             || before.len() != 3
             || after.len() != 3
             || before[..2] != after[..2]
@@ -210,7 +215,13 @@ pub fn nibble_source(
     count: usize,
     literal: &impl Fn(ValueId) -> Option<Vec<i64>>,
 ) -> Result<(ValueId, Vec<NodeId>), &'static str> {
-    let node = |v, op| standard_producer(g, v, op);
+    let node = |v, op| {
+        let n = standard_producer(g, v, op)?;
+        if g.effective_opset(n) != Some(29) {
+            return Err("unpacked codes must use the opset-29 operator forms");
+        }
+        Ok(n)
+    };
     let input = |n: &Node, i: usize| n.inputs.get(i).copied().flatten().ok_or("missing input");
     let one_attr = |n: &Node, attr: &str, value| {
         n.attributes.len() == 1 && n.attr(attr).and_then(|a| a.as_int()) == Some(value)
@@ -222,8 +233,7 @@ pub fn nibble_source(
         else {
             return Err("not an Unpack");
         };
-        if g.effective_opset(unpack) != Some(29)
-            || unpack.inputs.len() != 2
+        if unpack.inputs.len() != 2
             || unpack
                 .attributes
                 .keys()

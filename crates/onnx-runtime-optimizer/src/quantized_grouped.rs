@@ -65,6 +65,7 @@ fn literal(graph: &Graph, ctx: &PassContext, id: ValueId) -> Option<Vec<i64>> {
         let node = graph.node(value.producer?);
         if node.op_type != "Constant"
             || !onnx_runtime_ir::is_default_domain(&node.domain)
+            || graph.effective_opset(node) != Some(29)
             || !node.overload.is_empty()
             || !node.inputs.is_empty()
             || node.attributes.len() != 1

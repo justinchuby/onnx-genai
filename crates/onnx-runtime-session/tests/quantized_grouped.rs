@@ -6,6 +6,7 @@ use onnx_runtime_session::{InferenceSession, Tensor};
 enum Spelling {
     Unpack,
     Bitwise,
+    BitwiseWithZero,
     Dense,
 }
 
@@ -26,7 +27,8 @@ fn graph(spelling: Spelling) -> Graph {
         input("W", D::Uint8, &[2, 2, 2])
     };
     let s = (!dense).then(|| input("S", D::Float32, &[2, 2, 1]));
-    let z = matches!(spelling, Spelling::Unpack).then(|| input("Z", D::Uint8, &[2, 2, 1]));
+    let z = matches!(spelling, Spelling::Unpack | Spelling::BitwiseWithZero)
+        .then(|| input("Z", D::Uint8, &[2, 2, 1]));
     let mut op = |name, inputs, dtype, shape: &[usize], attrs: &[(&str, Attribute)]| {
         let v = g.create_value(dtype, static_shape(shape.iter().copied()));
         let mut n = Node::new(NodeId(0), name, inputs, vec![v]);
@@ -34,6 +36,87 @@ fn graph(spelling: Spelling) -> Graph {
             .extend(attrs.iter().map(|(k, a)| (k.to_string(), a.clone())));
         g.insert_node(n);
         v
+    };
+    let mut bitwise_unpack = |value, bytes: usize, infer_width: bool| {
+        let u8_const = |n| Attribute::Tensor(TensorData::from_raw(D::Uint8, vec![], vec![n]));
+        let mask = op(
+            "Constant",
+            vec![],
+            D::Uint8,
+            &[],
+            &[("value", u8_const(15))],
+        );
+        let shift = op("Constant", vec![], D::Uint8, &[], &[("value", u8_const(4))]);
+        let axes = op(
+            "Constant",
+            vec![],
+            D::Int64,
+            &[1],
+            &[("value_ints", Attribute::Ints(vec![-1]))],
+        );
+        let shape = op(
+            "Constant",
+            vec![],
+            D::Int64,
+            &[3],
+            &[(
+                "value_ints",
+                Attribute::Ints(vec![
+                    2,
+                    2,
+                    if infer_width { -1 } else { (bytes * 2) as i64 },
+                ]),
+            )],
+        );
+        let low = op(
+            "BitwiseAnd",
+            vec![Some(value), Some(mask)],
+            D::Uint8,
+            &[2, 2, bytes],
+            &[],
+        );
+        let high = op(
+            "BitShift",
+            vec![Some(value), Some(shift)],
+            D::Uint8,
+            &[2, 2, bytes],
+            &[("direction", Attribute::String("RIGHT".into()))],
+        );
+        let low = op(
+            "Unsqueeze",
+            vec![Some(low), Some(axes)],
+            D::Uint8,
+            &[2, 2, bytes, 1],
+            &[],
+        );
+        let high = op(
+            "Unsqueeze",
+            vec![Some(high), Some(axes)],
+            D::Uint8,
+            &[2, 2, bytes, 1],
+            &[],
+        );
+        let pairs = op(
+            "Concat",
+            vec![Some(low), Some(high)],
+            D::Uint8,
+            &[2, 2, bytes, 2],
+            &[("axis", Attribute::Int(-1))],
+        );
+        op(
+            "Reshape",
+            vec![Some(pairs), Some(shape)],
+            D::Uint8,
+            &[2, 2, bytes * 2],
+            &[],
+        )
+    };
+    let bitwise = matches!(spelling, Spelling::Bitwise | Spelling::BitwiseWithZero);
+    let expanded_weights = bitwise.then(|| bitwise_unpack(w, 2, false));
+    let expanded_zero = if matches!(spelling, Spelling::BitwiseWithZero) {
+        z.map(|z| bitwise_unpack(z, 1, true))
+    } else {
+        None
     };
     let weights = match spelling {
         Spelling::Dense => w,
@@ -53,83 +136,43 @@ fn graph(spelling: Spelling) -> Graph {
                 &[("bits", Attribute::Int(4))],
             )
         }
-        Spelling::Bitwise => {
-            let u8_const = |n| Attribute::Tensor(TensorData::from_raw(D::Uint8, vec![], vec![n]));
-            let mask = op(
-                "Constant",
-                vec![],
+        Spelling::Bitwise | Spelling::BitwiseWithZero => op(
+            "Cast",
+            vec![expanded_weights],
+            D::Uint4,
+            &[2, 2, 4],
+            &[("to", Attribute::Int(i64::from(D::Uint4.to_onnx())))],
+        ),
+    };
+    let weights = if let Some(s) = s {
+        let zero = if let Some(expanded_zero) = expanded_zero {
+            let mut constant = |v| {
+                op(
+                    "Constant",
+                    vec![],
+                    D::Int64,
+                    &[1],
+                    &[("value_ints", Attribute::Ints(vec![v]))],
+                )
+            };
+            let start = constant(0);
+            let end = constant(1);
+            let axis = constant(2);
+            let sliced = op(
+                "Slice",
+                vec![Some(expanded_zero), Some(start), Some(end), Some(axis)],
                 D::Uint8,
-                &[],
-                &[("value", u8_const(15))],
-            );
-            let shift = op("Constant", vec![], D::Uint8, &[], &[("value", u8_const(4))]);
-            let axes = op(
-                "Constant",
-                vec![],
-                D::Int64,
-                &[1],
-                &[("value_ints", Attribute::Ints(vec![-1]))],
-            );
-            let shape = op(
-                "Constant",
-                vec![],
-                D::Int64,
-                &[3],
-                &[("value_ints", Attribute::Ints(vec![2, 2, 4]))],
-            );
-            let low = op(
-                "BitwiseAnd",
-                vec![Some(w), Some(mask)],
-                D::Uint8,
-                &[2, 2, 2],
-                &[],
-            );
-            let high = op(
-                "BitShift",
-                vec![Some(w), Some(shift)],
-                D::Uint8,
-                &[2, 2, 2],
-                &[("direction", Attribute::String("RIGHT".into()))],
-            );
-            let low = op(
-                "Unsqueeze",
-                vec![Some(low), Some(axes)],
-                D::Uint8,
-                &[2, 2, 2, 1],
-                &[],
-            );
-            let high = op(
-                "Unsqueeze",
-                vec![Some(high), Some(axes)],
-                D::Uint8,
-                &[2, 2, 2, 1],
-                &[],
-            );
-            let pairs = op(
-                "Concat",
-                vec![Some(low), Some(high)],
-                D::Uint8,
-                &[2, 2, 2, 2],
-                &[("axis", Attribute::Int(-1))],
-            );
-            let bytes = op(
-                "Reshape",
-                vec![Some(pairs), Some(shape)],
-                D::Uint8,
-                &[2, 2, 4],
+                &[2, 2, 1],
                 &[],
             );
             op(
                 "Cast",
-                vec![Some(bytes)],
+                vec![Some(sliced)],
                 D::Uint4,
-                &[2, 2, 4],
+                &[2, 2, 1],
                 &[("to", Attribute::Int(i64::from(D::Uint4.to_onnx())))],
             )
-        }
-    };
-    let weights = if let Some(s) = s {
-        let zero = if let Some(z) = z {
+        } else if let Some(z) = z {
             let count = op(
                 "Constant",
                 vec![],
@@ -200,8 +243,12 @@ fn verify(build: impl Fn(Graph) -> InferenceSession) {
     let z = Tensor::from_raw(D::Uint8, vec![2, 2, 1], &zeros).unwrap();
     let s = Tensor::from_f32(&[2, 2, 1], &scales).unwrap();
     let mut oracle = build(graph(Spelling::Dense));
-    for spelling in [Spelling::Unpack, Spelling::Bitwise] {
-        let use_z = matches!(spelling, Spelling::Unpack);
+    for spelling in [
+        Spelling::Unpack,
+        Spelling::Bitwise,
+        Spelling::BitwiseWithZero,
+    ] {
+        let use_z = matches!(spelling, Spelling::Unpack | Spelling::BitwiseWithZero);
         let decoded: Vec<_> = codes
             .iter()
             .enumerate()
@@ -236,6 +283,18 @@ fn verify(build: impl Fn(Graph) -> InferenceSession) {
         }
         let got = fused.run(&inputs).unwrap();
         assert_eq!(got[0].to_vec_f32(), expected);
+        let only_first = Tensor::from_i64(&[2, 2], &[0; 4]).unwrap();
+        let bad_scale = Tensor::from_f32(&[2, 2, 1], &[0.125, 0.0625, f32::NAN, 0.5]).unwrap();
+        inputs[1].1 = &only_first;
+        inputs[3].1 = &bad_scale;
+        assert!(
+            fused
+                .run(&inputs)
+                .unwrap_err()
+                .to_string()
+                .contains("scales must be positive and finite")
+        );
+        inputs[3].1 = &s;
         let bad = Tensor::from_i64(&[2, 2], &[1, 0, -1, 1]).unwrap();
         inputs[1].1 = &bad;
         assert!(
@@ -245,6 +304,33 @@ fn verify(build: impl Fn(Graph) -> InferenceSession) {
                 .to_string()
                 .contains("group_indices")
         );
+    }
+}
+
+#[test]
+fn matcher_keeps_unfused_graph_on_unsupported_version_or_shared_output() {
+    use onnx_runtime_optimizer::{
+        OptimizationPass, PassContext, quantized_grouped::QuantizedGroupedFusion,
+    };
+    for shared in [false, true] {
+        let mut g = graph(Spelling::Bitwise);
+        let op = if shared {
+            "DequantizeLinear"
+        } else {
+            "Unsqueeze"
+        };
+        let n = g.nodes.values().find(|n| n.op_type == op).unwrap();
+        if shared {
+            g.add_output(n.outputs[0].unwrap());
+        } else {
+            let id = n.id;
+            g.node_mut(id).version = Some(11);
+        }
+        QuantizedGroupedFusion
+            .run(&mut g, &PassContext::new())
+            .unwrap();
+        assert!(g.nodes.values().any(|n| n.op_type == "GroupedMatMul"));
+        assert!(g.nodes.values().any(|n| n.op_type == "DequantizeLinear"));
     }
 }
 
