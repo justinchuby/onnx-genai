@@ -614,9 +614,9 @@ The issue #67 operator-coverage batch 13 adds `QLinearMatMul` and `Resize`.
 `QLinearMatMul` preserves the CPU reference's wrapping i32 accumulation,
 ties-to-even requantization, and per-tensor/per-row/per-column quantization for
 Int8 and Uint8. `Resize` supports nearest and N-D linear interpolation with
-`half_pixel`, `align_corners`, and `asymmetric` coordinates, scales or sizes,
-selected axes, and all four standard nearest rounding modes. Cubic,
-`pytorch_half_pixel`, `tf_crop_and_resize`, `half_pixel_symmetric`, antialiasing,
+`half_pixel`, `align_corners`, `asymmetric`, and Resize-19 `half_pixel_symmetric`
+coordinates, scales or sizes, selected axes, and all four standard nearest
+rounding modes. Cubic, `pytorch_half_pixel`, `tf_crop_and_resize`, antialiasing,
 and non-stretch aspect policies remain fail-closed at the claim gate. GPU parity
 covers quantized signed/unsigned and batched per-axis cases plus nearest/linear
 upsampling and downsampling across the supported coordinate and control modes.

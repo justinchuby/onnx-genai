@@ -278,16 +278,11 @@ fn resize(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
             ));
         }
     }
-    match node
+    if let Some(value) = node
         .attr("coordinate_transformation_mode")
         .and_then(Attribute::as_str)
     {
-        None | Some("half_pixel" | "align_corners" | "asymmetric") => {}
-        Some(value) => {
-            return Err(format!(
-                "coordinate_transformation_mode {value:?} unsupported"
-            ));
-        }
+        super::resize::CoordinateMode::parse(value)?;
     }
     match node.attr("nearest_mode").and_then(Attribute::as_str) {
         None | Some("round_prefer_floor" | "round_prefer_ceil" | "floor" | "ceil") => {}
