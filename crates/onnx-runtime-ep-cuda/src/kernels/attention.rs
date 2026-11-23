@@ -752,12 +752,8 @@ impl AttentionKernel {
                 &KvCacheStrides::head_major_bnsh(),
             )
         } else {
-            let scratch = workspace
-                .map(|view| {
-                    let layout = phase2a_scratch_layout(dtype, batch, self.num_heads, sq, sk)?;
-                    Phase2aScratch::bind(&layout, Some(view))
-                })
-                .transpose()?;
+            let layout = phase2a_scratch_layout(dtype, batch, self.num_heads, sq, sk)?;
+            let scratch = Phase2aScratch::bind(&layout, workspace)?;
             run_attention_phase2a(
                 &self.runtime,
                 dtype,
@@ -781,7 +777,7 @@ impl AttentionKernel {
                 0,
                 0,
                 0.0,
-                scratch,
+                Some(scratch),
             )
         }
     }
@@ -819,8 +815,8 @@ pub(super) fn run_attention_phase2a(
     let elem_size = dtype.element_size();
     let scores_bytes = phase2a_scores_layout(dtype, batch, num_heads, sq, sk)?.size();
     // The governed path hands us pre-reserved scratch carved from the executor's
-    // workspace. Eager dispatch and the MHA/GQA callers still request disposable
-    // scratch, which must be freed here. `owned` records which contract applies.
+    // workspace. The MHA/GQA callers still request disposable scratch, which
+    // must be freed here. `owned` records which contract applies.
     //
     // The cuBLASLt workspace is *not* part of that ownership: it carries no
     // state between calls and this runtime's stream is serial, so one buffer
@@ -972,9 +968,9 @@ pub(super) fn run_attention_phase2a(
 
 impl Kernel for AttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        // Eager dispatch currently calls this entry point without preparation.
-        // Its temporary scratch remains owned by the shared Phase-2a engine
-        // until eager dispatch also adopts the executor workspace contract.
+        // Fused execution needs no external scratch. A Phase-2a route requires
+        // the caller to query its requirement and supply a prepared workspace;
+        // missing admission must never become an implicit raw allocation.
         self.run(inputs, outputs, None)
     }
 

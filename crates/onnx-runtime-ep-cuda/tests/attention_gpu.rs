@@ -960,6 +960,38 @@ fn attention_rejects_unsupported_dtype_and_rank() {
         "{msg}"
     );
 
+    // The explicit Phase-2a route must reject a missing prepared owner even
+    // with valid geometry. It must not silently allocate scores/cuBLASLt scratch.
+    let shape4 = [1usize, 4, 4, 4];
+    let strides4 = compute_contiguous_strides(&shape4);
+    let inputs4 = [TensorView::new(
+        DevicePtr(buf.as_ptr()),
+        DataType::Float32,
+        &shape4,
+        &strides4,
+        dev,
+    ); 3];
+    let output4 = TensorMut::new(
+        DevicePtrMut(out.as_mut_ptr()),
+        DataType::Float32,
+        &shape4,
+        &strides4,
+        dev,
+    );
+    let phase2a = AttentionKernel::new_phase2a(runtime, false, 4, 4, None).unwrap();
+    assert!(
+        common::runtime_workspace_requirement(&phase2a, &inputs4)
+            .unwrap()
+            .bytes
+            > 0
+    );
+    let error = phase2a.execute(&inputs4, &mut [output4]).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("cuda_ep Attention") && message.contains("execute_with_workspace"),
+        "{message}"
+    );
+
     ep.deallocate(buf).unwrap();
     ep.deallocate(out).unwrap();
 }
