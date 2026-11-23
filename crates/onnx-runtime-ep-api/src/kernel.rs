@@ -887,8 +887,37 @@ pub struct BlockQuantizedMoeTraffic {
     pub byte_hit_rate: Option<f64>,
 }
 
+/// A borrowed, dense host string tensor. It has no byte or device representation.
+pub struct HostStringInput<'a> {
+    pub shape: &'a [usize],
+    pub values: &'a [String],
+}
+
+/// An owned output whose shape may be determined by the string kernel.
+pub struct HostKernelOutput {
+    pub shape: Vec<usize>,
+    pub data: HostKernelData,
+}
+
+/// Managed strings or ordinary little-endian tensor bytes.
+pub enum HostKernelData {
+    Strings(Vec<String>),
+    Raw { dtype: DataType, bytes: Vec<u8> },
+}
+
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
 pub trait Kernel: Send + KernelType {
+    /// Execute on borrowed host strings without a raw-byte tensor ABI.
+    fn execute_host_strings(
+        &self,
+        _inputs: &[HostStringInput<'_>],
+    ) -> Result<Vec<HostKernelOutput>> {
+        Err(crate::EpError::KernelFailed(
+            "kernel does not support native host string tensors; use a string-aware host kernel"
+                .into(),
+        ))
+    }
+
     /// Tell the kernel which positional inputs are immutable graph constants.
     ///
     /// The session calls this exactly once, immediately after construction.

@@ -477,6 +477,15 @@ pub(super) fn collect_cuda_coverage_issues(
 ) -> Result<()> {
     let graph_claims = onnx_runtime_ep_api::GraphKernelClaims::query(ep, graph)?;
     for (node_id, node) in graph.nodes.iter() {
+        if super::host_strings::uses_managed_strings(graph, node) {
+            issues.push(ExecutionProviderDecline {
+                node: format_node_identity(scope, node_id, node),
+                domain: canonical_domain(node),
+                op_type: node.op_type.clone(),
+                reason: "managed tensor(string) values have no device representation; use a string-aware host provider".into(),
+            });
+            continue;
+        }
         if graph_claims.contains(node_id)
             || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
@@ -1080,6 +1089,7 @@ impl Executor {
             Vec::new()
         };
 
+        let string_initializers = Self::load_string_initializers(&graph, ep.as_ref())?;
         let (mut value_shapes, mut value_dtypes, buffers, buffer_shapes) =
             Self::materialize_initializers(&graph, &weights, ep.as_ref(), &weight_handles)?;
 
@@ -1131,6 +1141,8 @@ impl Executor {
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
             buffers,
+            string_initializers,
+            string_values: HashMap::new(),
             buffer_shapes,
             has_unknown_rank: value_shapes.values().any(Option::is_none),
             value_shapes,
@@ -1544,6 +1556,9 @@ impl Executor {
             let dims = weight.dims().to_vec();
             value_dtypes.insert(vid, dtype);
             value_shapes.insert(vid, Some(dims.iter().map(|&d| Dim::Static(d)).collect()));
+            if dtype == DataType::String {
+                continue;
+            }
             let value = graph.value(vid);
             let prepared_only = !value.is_graph_output
                 && !value.consumers.is_empty()
@@ -1781,6 +1796,7 @@ impl Executor {
             }
             plan.push(NodePlan {
                 node_id: nid,
+                managed_strings: super::host_strings::uses_managed_strings(graph, node),
                 graph_kernel,
                 workspace_planning: super::bindings::workspace_planning_for_node(
                     ep,
@@ -2409,6 +2425,9 @@ impl Executor {
                 continue;
             }
             let dtype = self.value_dtypes[&vid];
+            if dtype == DataType::String {
+                continue;
+            }
             let Some(dims) = resolved.get(&vid) else {
                 continue;
             };

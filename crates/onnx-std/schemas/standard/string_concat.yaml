@@ -1,0 +1,10 @@
+# ONNX 622adf94d4e720142950aa8178f7357d52e63db0, onnx/defs/text/defs.cc
+name: StringConcat
+since_version: 20
+doc: Concatenate corresponding UTF-8 strings using multidirectional broadcasting.
+inputs:
+  - { name: X, type_str: T }
+  - { name: Y, type_str: T }
+outputs: [{ name: Z, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [string] }

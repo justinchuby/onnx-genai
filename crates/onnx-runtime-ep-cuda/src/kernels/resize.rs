@@ -1,4 +1,4 @@
-//! Common ONNX `Resize` modes implemented as one N-D NVRTC interpolation kernel.
+//! Common ONNX `Resize` modes implemented with N-D NVRTC interpolation.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -53,7 +53,8 @@ __device__ __forceinline__ unsigned long long nearest_index(
   return (unsigned long long)selected;
 }
 
-extern "C" __global__ void resize_nd(
+template <bool Symmetric>
+__device__ __forceinline__ void resize_nd_impl(
     const void* input, void* output, const unsigned long long* integer_metadata,
     const double* scales, unsigned long long output_elements, int rank, int dtype,
     int interpolation_mode, int coordinate_mode, int nearest_mode) {
@@ -73,9 +74,14 @@ extern "C" __global__ void resize_nd(
       const unsigned long long output_coordinate =
           remaining / output_strides[axis];
       remaining %= output_strides[axis];
-      const double coordinate = source_coordinate(
-          output_coordinate, input_dimensions[axis], output_dimensions[axis],
-          scales[axis], coordinate_mode);
+      double coordinate;
+      if (Symmetric) {
+        coordinate = scales[rank + axis] + ((double)output_coordinate + 0.5) / scales[axis] - 0.5;
+      } else {
+        coordinate = source_coordinate(
+            output_coordinate, input_dimensions[axis], output_dimensions[axis],
+            scales[axis], coordinate_mode);
+      }
       if (interpolation_mode == 0) {
         lower_offset += nearest_index(coordinate, input_dimensions[axis], nearest_mode)
                         * input_strides[axis];
@@ -117,6 +123,22 @@ extern "C" __global__ void resize_nd(
     store_resize_value(output, dtype, output_linear, (float)sum);
   }
 }
+
+extern "C" __global__ void resize_nd(
+    const void* input, void* output, const unsigned long long* metadata,
+    const double* scales, unsigned long long elements, int rank, int dtype,
+    int interpolation_mode, int coordinate_mode, int nearest_mode) {
+  resize_nd_impl<false>(input, output, metadata, scales, elements, rank, dtype,
+                        interpolation_mode, coordinate_mode, nearest_mode);
+}
+
+extern "C" __global__ void resize_nd_symmetric(
+    const void* input, void* output, const unsigned long long* metadata,
+    const double* scales, unsigned long long elements, int rank, int dtype,
+    int interpolation_mode, int coordinate_mode, int nearest_mode) {
+  resize_nd_impl<true>(input, output, metadata, scales, elements, rank, dtype,
+                       interpolation_mode, coordinate_mode, nearest_mode);
+}
 "#;
 
 #[derive(Clone, Copy)]
@@ -126,10 +148,26 @@ enum InterpolationMode {
 }
 
 #[derive(Clone, Copy)]
-enum CoordinateMode {
+pub(super) enum CoordinateMode {
     HalfPixel,
     AlignCorners,
     Asymmetric,
+    HalfPixelSymmetric,
+}
+
+impl CoordinateMode {
+    pub(super) fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "half_pixel" => Ok(Self::HalfPixel),
+            "align_corners" => Ok(Self::AlignCorners),
+            "asymmetric" => Ok(Self::Asymmetric),
+            "half_pixel_symmetric" => Ok(Self::HalfPixelSymmetric),
+            other => Err(format!(
+                "coordinate_transformation_mode {other:?} unsupported; expected half_pixel, \
+                 align_corners, asymmetric, or half_pixel_symmetric (Resize-19)"
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -165,20 +203,12 @@ impl KernelFactory for ResizeFactory {
         } else {
             "half_pixel"
         };
-        let coordinate_mode = match node
-            .attr("coordinate_transformation_mode")
-            .and_then(Attribute::as_str)
-            .unwrap_or(coordinate_default)
-        {
-            "half_pixel" => CoordinateMode::HalfPixel,
-            "align_corners" => CoordinateMode::AlignCorners,
-            "asymmetric" => CoordinateMode::Asymmetric,
-            other => {
-                return Err(not_implemented(format!(
-                    "Resize coordinate_transformation_mode {other:?} (supported: half_pixel, align_corners, asymmetric)"
-                )));
-            }
-        };
+        let coordinate_mode = CoordinateMode::parse(
+            node.attr("coordinate_transformation_mode")
+                .and_then(Attribute::as_str)
+                .unwrap_or(coordinate_default),
+        )
+        .map_err(|reason| not_implemented(format!("Resize {reason}")))?;
         let nearest_default = if self.since_version == 10 {
             "floor"
         } else {
@@ -373,6 +403,18 @@ impl Kernel for ResizeKernel {
         if output.numel() == 0 {
             return Ok(());
         }
+        let symmetric = matches!(self.coordinate_mode, CoordinateMode::HalfPixelSymmetric)
+            && scales_input.is_some();
+        if symmetric {
+            // Sizes specify the exact extent, so only scales can truncate it.
+            // Append one offset per axis to the existing scale upload.
+            scales.reserve(rank);
+            for axis in 0..rank {
+                let input_width = input.shape[axis] as f64;
+                let adjustment = output.shape[axis] as f64 / (input_width * scales[axis]);
+                scales.push(input_width * 0.5 * (1.0 - adjustment));
+            }
+        }
         let input_strides = compute_contiguous_strides(input.shape);
         let output_strides = compute_contiguous_strides(output.shape);
         let integer_metadata = input
@@ -391,6 +433,14 @@ impl Kernel for ResizeKernel {
             .iter()
             .flat_map(|value| value.to_ne_bytes())
             .collect::<Vec<_>>();
+        let entry = if symmetric {
+            "resize_nd_symmetric"
+        } else {
+            "resize_nd"
+        };
+        let function = self
+            .runtime
+            .nvrtc_function("resize_common_v2", SOURCE, entry)?;
         let integer_pointer = upload_bytes(&self.runtime, &integer_bytes)?;
         let scale_pointer = match upload_bytes(&self.runtime, &scale_bytes) {
             Ok(pointer) => pointer,
@@ -399,9 +449,6 @@ impl Kernel for ResizeKernel {
                 return Err(error);
             }
         };
-        let function = self
-            .runtime
-            .nvrtc_function("resize_common_v1", SOURCE, "resize_nd")?;
         let input_pointer = cuptr(input.data_ptr::<u8>() as *const c_void);
         let output_pointer = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
         let output_elements = output.numel() as u64;
@@ -411,7 +458,7 @@ impl Kernel for ResizeKernel {
             InterpolationMode::Linear => 1,
         };
         let coordinate_mode = match self.coordinate_mode {
-            CoordinateMode::HalfPixel => 0i32,
+            CoordinateMode::HalfPixel | CoordinateMode::HalfPixelSymmetric => 0i32,
             CoordinateMode::AlignCorners => 1,
             CoordinateMode::Asymmetric => 2,
         };
@@ -506,11 +553,6 @@ mod tests {
                 "coordinate_transformation_mode",
                 Attribute::String(b"pytorch_half_pixel".to_vec()),
                 "coordinate_transformation_mode \"pytorch_half_pixel\" unsupported",
-            ),
-            (
-                "coordinate_transformation_mode",
-                Attribute::String(b"half_pixel_symmetric".to_vec()),
-                "coordinate_transformation_mode \"half_pixel_symmetric\" unsupported",
             ),
             ("antialias", Attribute::Int(1), "antialias=1 unsupported"),
             (

@@ -29,6 +29,12 @@
 # row for something we intentionally skip, and to distinguish "not yet done"
 # from "decided against."
 
+[[exclusion]]
+op = "ImageDecoder"
+variant = "opset20"
+platform = "all"
+reason = "Standard ImageDecoder-20 is intentionally unsupported, not an unoptimized kernel."
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MatMul (f16) — aarch64-apple-darwin
 # ═══════════════════════════════════════════════════════════════════════════════
