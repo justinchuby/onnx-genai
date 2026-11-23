@@ -181,7 +181,7 @@ fn declines(op_type: &str, domain: &str) -> bool {
         );
     }
 
-    const OPSETS: &[i64] = &[1, 13, 18, 22, 23];
+    const OPSETS: &[i64] = &[1, 13, 18, 22, 23, 28, 29];
     const SHAPES: &[&[usize]] = &[&[8], &[4, 8], &[2, 3, 8], &[1, 3, 8, 8]];
     /// The integer attributes `for_node` reads, with values consistent with
     /// `SHAPES` (width 8, so `N`/`K` of 8 and a valid `axis`/`num_groups`).
