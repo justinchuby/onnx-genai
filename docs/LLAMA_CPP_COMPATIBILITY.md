@@ -503,6 +503,22 @@ actionable capability error before SSE.
 Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and
 `ignore_eos=true`. Neutral `grammar_lazy=false`, `grammar_triggers=[]` and
 `preserved_tokens=[]` are accepted. Active lazy grammars, triggers, preserved
-tokens remain open compatibility work. Native
-`n_probs` and `completion_probabilities` also remain open; native GBNF acceptance
-does not imply support for those reporting fields.
+tokens remain open compatibility work. Native probability reporting is described below.
+
+
+## Native token probabilities
+
+`/completion` and `/infill` accept nonnegative `n_probs` (0 disables reporting)
+and boolean `post_sampling_probs`. Counts are clamped to the actual vocabulary.
+The default reports the original model distribution before grammar masks,
+penalties, temperature or truncation. Setting `post_sampling_probs=true` reports
+the processed distribution instead. The sampling path and random stream are
+unchanged by reporting.
+
+Buffered responses contain `completion_probabilities`; streaming token events
+contain their own probability item. Each item includes `id`, `token`, `bytes` and
+either `logprob`/`top_logprobs` or `prob`/`top_probs`. Alternative entries carry
+their own IDs, decoded byte pieces and score. Invalid UTF-8 suffixes are omitted
+from `token` while original `bytes` remain intact. Zero probabilities use a
+finite lowest log-probability in JSON; processed alternatives with zero mass
+are excluded.

@@ -13,7 +13,7 @@ use crate::decode::{
     run_decode_step,
 };
 use crate::decode_loop::{
-    DecodeLoopState, commit_selected_token, logprob_for_token, reached_context_limit,
+    DecodeLoopState, ProbabilitySnapshot, commit_selected_token, reached_context_limit,
 };
 use crate::engine::{Engine, MISSING_ORT_SESSION};
 use crate::kv_bridge::{
@@ -2371,12 +2371,13 @@ impl Engine {
                     })?,
                 step: step + idx,
             };
+            let probabilities = ProbabilitySnapshot::capture(options, &target_logits[idx]);
             let target_token =
                 select_next_token_with_rng(&mut target_logits[idx], &context, options, chain, rng)?;
             if let (Some(top_logprobs), Some(logprobs)) =
                 (options.top_logprobs, candidate_logprobs.as_mut())
             {
-                logprobs.push(logprob_for_token(
+                logprobs.push(probabilities.for_token(
                     &target_logits[idx],
                     target_token,
                     top_logprobs,
@@ -2468,6 +2469,12 @@ impl Engine {
                     })?,
                 step: step + draft_tokens.len(),
             };
+            let probabilities = ProbabilitySnapshot::capture(
+                options,
+                target_logits
+                    .last()
+                    .context("target verification did not produce next-token logits")?,
+            );
             let token = select_next_token_with_rng(
                 target_logits
                     .last_mut()
@@ -2480,13 +2487,15 @@ impl Engine {
             if let (Some(top_logprobs), Some(logprobs)) =
                 (options.top_logprobs, commit_logprobs.as_mut())
             {
-                logprobs.push(logprob_for_token(
-                    target_logits
-                        .last()
-                        .context("target verification did not produce next-token logits")?,
-                    token,
-                    top_logprobs,
-                ));
+                logprobs.push(
+                    probabilities.for_token(
+                        target_logits
+                            .last()
+                            .context("target verification did not produce next-token logits")?,
+                        token,
+                        top_logprobs,
+                    ),
+                );
             }
             context.generated_tokens.push(token);
             commit_tokens.push(token);

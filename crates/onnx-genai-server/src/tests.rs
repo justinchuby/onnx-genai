@@ -243,6 +243,106 @@ mod gbnf_wire {
                 );
             }
         }
+        for post in [false, true] {
+            for stream in [false, true] {
+                let body = json!({"prompt":"hello", "n_predict":1, "temperature":0,
+                    "n_probs":2, "post_sampling_probs":post, "stream":stream,
+                    "logit_bias":{"5":1000.0}});
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::post("/completion")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{}",
+                    String::from_utf8_lossy(&bytes)
+                );
+                let value: Value = if stream {
+                    let events = sse_json_events(&bytes);
+                    assert!(
+                        !events.iter().any(|event| event.get("error").is_some()),
+                        "{events:?}"
+                    );
+                    events
+                        .into_iter()
+                        .find(|event| event.get("completion_probabilities").is_some())
+                        .expect("stream token has probabilities")
+                } else {
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+                let selected = &value["completion_probabilities"][0];
+                assert_eq!(selected["id"], 5, "{value}");
+                assert_eq!(selected["bytes"], json!(b"world"), "{value}");
+                let score_key = if post { "prob" } else { "logprob" };
+                let top_key = if post { "top_probs" } else { "top_logprobs" };
+                let score = selected[score_key]
+                    .as_f64()
+                    .expect("finite selected probability");
+                assert!(if post { score > 0.99 } else { score < -0.1 }, "{value}");
+                let top = selected[top_key]
+                    .as_array()
+                    .expect("native top probabilities");
+                assert!(!top.is_empty() && top.len() <= 2, "{value}");
+                assert!(
+                    top.iter()
+                        .all(|token| token[score_key].is_number() && token["bytes"].is_array()),
+                    "{value}"
+                );
+            }
+        }
+        let response=router.clone().oneshot(Request::post("/completion").header(header::CONTENT_TYPE,"application/json")
+            .body(Body::from(json!({"prompt":"hello","n_predict":1,"temperature":0,"n_probs":2,"post_sampling_probs":true}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["completion_probabilities"][0]["prob"], 1.0, "{value}");
+        let body = json!({"prompt":"hello","n_predict":1,"temperature":0,"n_probs":2,
+            "stop":["world"],"logit_bias":{"5":1000.0}});
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/completion")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["content"], "");
+        assert_eq!(value["completion_probabilities"], json!([]));
+        for fields in [
+            json!({"n_probs":-1}),
+            json!({"n_probs":"2"}),
+            json!({"post_sampling_probs":1}),
+        ] {
+            let mut body = json!({"prompt":"hello","stream":true,"n_predict":1});
+            body.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/completion")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
         for fields in [
             json!({"grammar":"root ::= \"hello\"", "grammar_lazy":true}),
             json!({"grammar":"root ::= \"hello\"", "grammar_triggers":[{"type":0,"value":"hello"}]}),

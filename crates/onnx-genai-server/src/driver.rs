@@ -3830,6 +3830,7 @@ mod driver_delivery_tests {
 
     fn token(id: u32) -> GenerateToken {
         GenerateToken {
+            logprob: None,
             token_id: id,
             text: format!("t{id}"),
             finish_reason: None,

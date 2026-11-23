@@ -1386,3 +1386,33 @@ after its final budget assertion was added. Coverage includes actual Unicode byt
 compound-token choices, model token IDs, all three buffered/SSE endpoints on
 Native CPU and explicit ORT, invalid Lark syntax and out-of-range IDs. Active
 lazy grammars, preserved tokens and native probability reporting remain open.
+
+
+### Native probability protocol follow-up
+
+The pinned upstream server-context `populate_token_probs` distinguishes original
+model probabilities from processed sampler candidates. Native requests now parse
+`n_probs` and `post_sampling_probs` explicitly. `LogprobSource` selects the
+distribution, and an opt-in snapshot preserves model logits before mutation in
+shared decoding, continuous rows, speculative acceptance and bonus verification.
+No snapshot allocation occurs when reporting is disabled or processed logits
+are requested. Existing probability callers retain the processed-logit default. Native post-sampling
+reporting uses the effective sampler distribution, including greedy point mass.
+A foreign final sampler must request model or processed-logit scores because its
+internal distribution is not inspectable.
+
+Committed `GenerateToken` events carry their matching optional `TokenLogprob`;
+transactional publication also retains it. Native buffered and SSE outputs
+serialize IDs, actual byte pieces, finite scores and top-N alternatives. Partial
+UTF-8 is retained in bytes and truncated in token text, zero processed mass is
+excluded, and buffered stop-word probabilities are omitted using tokenization
+without automatic special tokens, matching the pinned upstream contract.
+
+Final implementation validation passed engine 950 / 1 inherited ignore; server
+450 / 2 inherited ignores; HTTP 37; CLI 71. This includes continuous-row
+metadata, UTF-8/zero-score, stop-word and greedy point-mass coverage. Full strict
+engine/server/CLI Clippy passed with -D warnings, including the final zero-mass
+and floating-point-underflow encoding assertions. Lazy activation,
+preserved tokens, slot/adapter persistence, model management/audio and the full
+acceptance matrix remain open; neither this increment nor a parent PR merge
+completes the overall goal.

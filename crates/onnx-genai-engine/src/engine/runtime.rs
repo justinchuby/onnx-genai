@@ -221,6 +221,11 @@ impl DecoderTurnParticipant {
         let pieces = crate::tokenization::token_texts(Some(tokenizer), &result.token_ids)?;
         for (index, (token_id, text)) in result.token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
+                logprob: result
+                    .logprobs
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .cloned(),
                 token_id,
                 text,
                 finish_reason: (index + 1 == result.token_ids.len())

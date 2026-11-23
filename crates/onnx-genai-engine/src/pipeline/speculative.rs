@@ -1749,6 +1749,7 @@ impl WorkflowRuntime {
         if let Some(callback) = callback.as_mut() {
             for (index, token) in published_tokens.iter().copied().enumerate() {
                 if let Err(error) = callback(crate::config::GenerateToken {
+                    logprob: None,
                     token_id: token,
                     text: host.token_text[index].clone(),
                     finish_reason: (index + 1 == published_tokens.len())
@@ -2654,6 +2655,7 @@ impl WorkflowRuntime {
             let pieces = crate::tokenization::token_texts(tokenizer, &generated)?;
             for (index, (token, text)) in generated.iter().copied().zip(pieces).enumerate() {
                 callback(crate::config::GenerateToken {
+                    logprob: None,
                     token_id: token,
                     text,
                     finish_reason: (index + 1 == generated.len()).then(|| finish_reason.clone()),

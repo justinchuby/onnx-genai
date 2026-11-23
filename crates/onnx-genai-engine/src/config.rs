@@ -1395,10 +1395,12 @@ pub struct GenerateOptions {
     pub reasoning_budget: Option<crate::reasoning::ReasoningBudget>,
     /// Return per-token log probabilities and this many highest-probability alternatives.
     ///
-    /// Values are computed from the final post-processor distribution used for sampling.
+    /// Values use logprob_source, defaulting to the processed sampling distribution.
     /// The chosen token is always included in `TokenLogprob::top`, in addition to the
     /// requested alternatives when it is not already among them.
     pub top_logprobs: Option<usize>,
+    /// Select model-output or processed logits for probability reporting.
+    pub logprob_source: LogprobSource,
     /// Force a cold start (full KV reset) even when session-persistent KV reuse
     /// is available. Default is `false`, which allows the engine to reuse cached
     /// KV state for matching prompt prefixes. Set to `true` for A/B measurement
@@ -1447,6 +1449,7 @@ impl Default for GenerateOptions {
             constraint: None,
             reasoning_budget: None,
             top_logprobs: None,
+            logprob_source: LogprobSource::default(),
             cold_start: false,
             semantic_prefix_len: None,
         }
@@ -2153,6 +2156,18 @@ pub struct GenerateResult {
     pub budget_cap: Option<GenerationBudgetCap>,
 }
 
+/// Distribution used for requested token log probabilities.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogprobSource {
+    /// Original model output, before grammar, penalties, temperature or truncation.
+    Model,
+    /// Logits after the processor chain, before the final token selector.
+    #[default]
+    Processed,
+    /// Effective default sampler distribution, including a greedy point mass.
+    Sampling,
+}
+
 /// Log-probability metadata for one generated token.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenLogprob {
@@ -2165,8 +2180,10 @@ pub struct TokenLogprob {
 }
 
 /// Per-token streaming event shape for future callback/iterator APIs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GenerateToken {
+    /// Probability for this committed token, when requested.
+    pub logprob: Option<TokenLogprob>,
     pub token_id: TokenId,
     /// Incrementally decoded text, including required decoder lookbehind.
     /// May be empty while a UTF-8 sequence is incomplete; terminal delivery
