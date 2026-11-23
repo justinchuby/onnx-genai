@@ -3428,7 +3428,8 @@ mod tests {
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
         // The EP-owned affine Gather and grouped-projection fusions each add one.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 109 + mlas_registrations);
+        // Opset-28 Cast and the packed FLOAT6 projection add two registrations.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 111 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")

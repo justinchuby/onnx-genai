@@ -12401,6 +12401,9 @@ mod weight_cache_accounting {
             "DequantizePacked" => {
                 NoWeightCache("decodes each block into stack scratch and writes the caller output")
             }
+            "Float6Projection" => {
+                NoWeightCache("reads packed weights directly and keeps only tile accumulators")
+            }
             "GroupedMatMul" => NoWeightCache(
                 "indexes weight layouts directly using execution-local dense views or copies",
             ),
