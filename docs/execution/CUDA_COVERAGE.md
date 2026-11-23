@@ -766,7 +766,8 @@ is allowed. The fused formats are `iq1_s`, `iq1_m`, `iq2_xxs`, `iq2_xs`,
 `iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_nl`, `iq4_xs`, `q2_k`, `q3_k`, `q5_k`,
 `q6_k`, and `q8_0`. The other profiles, including `q4_k` and `mxfp4`,
 retain standalone decoding. Precision-changing casts, shared decoded
-values, or other layouts also retain the original graph.
+values, shared inline GGUF bytes, or other layouts also retain the original
+graph.
 
 CUDA uses these fusions only when the activation is statically known to
 contain one row and launch geometry permits it. CPU can stream decoded

@@ -130,6 +130,11 @@ fn lower_gguf(
         && !captured.contains(&p.weight)
         && !graph.value(p.weight).is_graph_output
         && !graph.value(p.weight).is_graph_input;
+    // Reshaping an external reference preserves the backing bytes, but a
+    // second inline initializer would allocate another full packed matrix.
+    if !owned && matches!(source, WeightRef::Inline(_)) {
+        return;
+    }
     let mut weight = if owned {
         graph.initializers.remove(&p.weight).expect("checked above")
     } else {

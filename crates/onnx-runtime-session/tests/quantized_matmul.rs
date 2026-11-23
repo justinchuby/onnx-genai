@@ -214,7 +214,7 @@ fn packed_rhs_matches_native_cpu() {
 }
 
 fn gguf_parity(build: impl Fn(Graph) -> InferenceSession, m: usize) {
-    let make = |expose, supported| {
+    let make = |expose, supported, expose_packed| {
         let mut g = Graph::new();
         g.opset_imports.insert(String::new(), 29);
         let a = g.create_named_value("A", DataType::Float32, static_shape([m, 64]));
@@ -252,10 +252,13 @@ fn gguf_parity(build: impl Fn(Graph) -> InferenceSession, m: usize) {
         if expose {
             g.add_output(w);
         }
+        if expose_packed {
+            g.add_output(data);
+        }
         g
     };
-    let mut baseline = build(make(true, true));
-    let mut fused = build(make(false, true));
+    let mut baseline = build(make(true, true, false));
+    let mut fused = build(make(false, true, false));
     assert!(
         baseline
             .graph()
@@ -281,15 +284,17 @@ fn gguf_parity(build: impl Fn(Graph) -> InferenceSession, m: usize) {
     for (a, b) in actual.into_iter().zip(reference) {
         assert!((a - b).abs() <= 2e-6 * b.abs().max(1.0), "{a} vs {b}");
     }
-    let mut unsupported = build(make(false, false));
-    assert!(
-        unsupported
-            .graph()
-            .nodes
-            .values()
-            .any(|n| n.op_type == "DequantizePacked")
-    );
-    assert_eq!(unsupported.run(&[("A", &a)]).unwrap()[0].shape, &[m, 5]);
+    for (supported, expose_packed) in [(false, false), (true, true)] {
+        let mut unfused = build(make(false, supported, expose_packed));
+        assert!(
+            unfused
+                .graph()
+                .nodes
+                .values()
+                .any(|n| n.op_type == "DequantizePacked")
+        );
+        assert_eq!(unfused.run(&[("A", &a)]).unwrap()[0].shape, &[m, 5]);
+    }
 }
 
 #[cfg(feature = "cuda")]
