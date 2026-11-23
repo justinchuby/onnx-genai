@@ -35,6 +35,7 @@
 
 pub mod abi;
 pub mod affine_gather;
+pub mod bit_cast;
 pub mod epcontext;
 pub mod host_parallel;
 pub mod kernel;

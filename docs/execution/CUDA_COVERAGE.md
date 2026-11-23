@@ -217,6 +217,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-------|
 | `Cast` | `` | ✅ | **NVRTC-custom** | Element-wise dtype conversion; f32/f64/f16/bf16/int8-64/uint8-64/bool, ONNX saturating float→int. Two NVRTC modules keep f16/bf16 (which need NVRTC's built-in `cuda_fp16.h`/`cuda_bf16.h`) out of the common integer/f32 path (`cast.rs`). |
 | `CastLike` | `` | ✅ | **NVRTC-custom** | Same kernel as `Cast`; target dtype taken from the output tensor. |
+| `BitCast` (v26) | `` | ✅ | **Device copy** | Preserves exact bytes for equal-width dtypes, including dense packed 2- and 4-bit tensors. Uses an asynchronous stream copy when storage cannot be reused. |
 | `Identity` | `` | ✅ | **memcpy** (D2D) | Straight dtype-agnostic device copy into the pre-shaped output (`movement.rs`). |
 | `Flatten` | `` | ✅ | **memcpy** (D2D) | Dtype-agnostic D2D copy; the 2-D output shape is metadata-only, so the bytes are copied unchanged (`movement.rs`). |
 | `Concat` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic byte copy, arbitrary/negative axis, multiple inputs. |
@@ -241,7 +242,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `BiasGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | Exact (erf) GELU of `X + bias` with the bias broadcast over the last dimension; f32/f16/bf16, GELU evaluated in `double` and the `-inf → 0` guard matched to the CPU EP (`fused_gelu.rs`). |
 | `FastGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | Tanh-approximation GELU of `X` plus an optional last-dim bias (1- or 2-input arity); f32/f16/bf16, matched to the CPU EP. |
 | `QuickGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | `X · sigmoid(alpha · X)` with the `com.microsoft` default `alpha=1.702`; f32/f16/bf16, numerically stable sigmoid matched to the CPU EP. |
-| `CumProd` (v26) | `` | ✅ | **NVRTC-custom** | Deterministic per-lane cumulative product (f32/i64) honouring `exclusive`/`reverse`, mirroring the `CumSum` scan (`cumprod.rs`). |
+| `CumProd` (v26) | `` | ✅ | **NVRTC-custom** | Deterministic per-lane product for all eight schema dtypes, with an int32/int64 scalar axis. An immutable initializer axis needs no host read and supports graph capture; a runtime axis is validated on the host. |
 | `ArgMax` | `` | ✅ | **NVRTC-custom** | Per-lane axis reduction to Int64 indices (f32/f16/bf16 widened to f32), honouring `keepdims` and `select_last_index`; first-index tie-break matched to the CPU EP (`argreduce.rs`). |
 | `ArgMin` | `` | ✅ | **NVRTC-custom** | Per-lane axis reduction to Int64 indices (f32/f16/bf16 widened to f32), honouring `keepdims` and `select_last_index`; first-index tie-break matched to the CPU EP (`argreduce.rs`). |
 | `GatherND` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed copy with Int32/Int64 indices, negative index wrapping, arbitrary tuple depth, and `batch_dims`; eager execution validates indices before launch and graph capture uses the device error latch (`structural.rs`). |

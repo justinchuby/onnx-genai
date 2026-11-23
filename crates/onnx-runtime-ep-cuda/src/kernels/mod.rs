@@ -40,6 +40,7 @@ pub mod activations;
 pub mod argreduce;
 pub mod attention;
 pub mod batch_normalization;
+pub mod bit_cast;
 pub mod bitwise;
 pub mod block_quant;
 pub mod block_quantized_matmul;
@@ -194,7 +195,7 @@ use pointwise::{
 ///   `FastGelu` (tanh GELU of `X`+ optional bias), and `QuickGelu`
 ///   (`X·sigmoid(alpha·X)`), f32/f16/bf16, matched to the CPU EP
 ///   `contrib_fused.rs` (GELU evaluated in `double`).
-/// * **CumProd** — deterministic per-lane cumulative product (f32/i64) with the
+/// * **CumProd** — deterministic per-lane cumulative product with the
 ///   `exclusive`/`reverse` attributes, mirroring the `CumSum` scan.
 /// * **ArgMax / ArgMin** — axis reduction to `Int64` indices (f32/f16/bf16)
 ///   honouring `keepdims` and `select_last_index`, matched to the CPU EP
@@ -260,6 +261,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "RMSNormalization",
     "Cast",
     "CastLike",
+    "BitCast",
     "ReduceSum",
     "ReduceMean",
     "ReduceMax",
@@ -402,6 +404,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
 // `build_cpu_registry_with_descriptors` pattern.
 
 use onnx_runtime_ir::DataType;
+use onnx_runtime_ir::opset26::{BIT_CAST_TYPES, CUM_PROD_TYPES};
 
 /// Descriptor of one registered CUDA op for plugin kernel-registry
 /// advertisement. Derived from the real [`OpRegistry`] registration keys — not
@@ -548,6 +551,8 @@ static CUDA_EINSUM_DTYPES: &[DataType] = &[
 /// kernels. Fail closed to the float compute set for unrecognised ops.
 pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     match (op_type, domain) {
+        ("BitCast", "") => BIT_CAST_TYPES,
+        ("CumProd", "") => CUM_PROD_TYPES,
         ("DFT", "") => CUDA_DFT_DTYPES,
         ("STFT", "") => CUDA_STFT_DTYPES,
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
@@ -663,7 +668,6 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("ArgMax", _)
         | ("ArgMin", _)
         | ("CumSum", _)
-        | ("CumProd", _)
         | ("ReduceSum", _)
         | ("ReduceMean", _)
         | ("ReduceMax", _)
@@ -862,6 +866,11 @@ pub fn build_cuda_registry_with_metrics(
         Box::new(cumprod::CumProdFactory {
             runtime: runtime.clone(),
         }),
+    );
+    reg.register(
+        OpKey::new("BitCast", "", 26),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(bit_cast::BitCastFactory(runtime.clone())),
     );
     reg.register(
         OpKey::new("ArgMax", "", 1),

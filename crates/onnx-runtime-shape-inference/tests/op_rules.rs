@@ -352,6 +352,31 @@ fn out_dtype(outs: &[NodeIo]) -> DataType {
 }
 
 #[test]
+fn opset26_bitcast_and_cumprod_validate_while_preserving_shape() {
+    let mut cast = node("BitCast", 1, 1);
+    cast.attributes.insert(
+        "to".into(),
+        Attribute::Int(i64::from(DataType::Int32.to_onnx())),
+    );
+    let shape = vec![c(2), c(5)];
+    let out = run(&cast, vec![f32in(shape.clone())], 26);
+    assert_eq!(out_dtype(&out), DataType::Int32);
+    assert_eq!(out_shape(&out), shape);
+    cast.attributes.insert(
+        "to".into(),
+        Attribute::Int(i64::from(DataType::Int64.to_onnx())),
+    );
+    assert!(try_run(&cast, vec![f32in(shape.clone())], 26).is_err());
+
+    let prod = node("CumProd", 2, 1);
+    let axis = |shape| tin(DataType::Int32, shape);
+    let out = run(&prod, vec![f32in(shape.clone()), axis(vec![])], 26);
+    assert_eq!(out_dtype(&out), DataType::Float32);
+    assert_eq!(out_shape(&out), shape);
+    assert!(try_run(&prod, vec![f32in(shape), axis(vec![c(1)])], 26).is_err());
+}
+
+#[test]
 fn standard_math_opset_gate_and_shape_contracts() {
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
         let arity = if ["SwiGLU", "GeGLU"].contains(&name) {
