@@ -1,0 +1,15 @@
+domain: ""
+name: Pack
+since_version: 29
+doc: Pack UINT8 codes into a little-bit-order stream of UINT8 or UINT32 words along one axis.
+attributes:
+  - { name: axis, type: int, default: -1 }
+  - { name: bits, type: int }
+  - { name: radix, type: int }
+  - { name: group_size, type: int }
+  - { name: output_type, type: int, default: 2 }
+inputs: [{ name: X, type_str: T }]
+outputs: [{ name: Y, type_str: TWord }]
+type_constraints:
+  - { type_param: T, allowed: [uint8] }
+  - { type_param: TWord, allowed: [uint8, uint32] }

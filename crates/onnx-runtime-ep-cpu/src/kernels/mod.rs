@@ -371,6 +371,9 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // Static union across Einsum-12 and Einsum-28. The provider performs
         // the required opset-aware BFloat16 gate before claiming the node.
         ("Einsum", "") => EINSUM_DTYPES,
+        ("Pack", "") => &[DataType::Uint8],
+        ("Unpack", "") => onnx_runtime_ir::packed_routed::WORD_DTYPES,
+        ("GroupedMatMul", "") => onnx_runtime_ir::standard_math::DTYPES,
         (name, "")
             if onnx_runtime_ir::standard_math::OPS
                 .iter()
@@ -625,6 +628,7 @@ pub mod msft_attention;
 pub mod multi_head_attention;
 pub mod onehot;
 pub mod packed_multi_head_attention;
+mod packed_routed;
 pub mod packed_varlen_attention;
 pub mod pad;
 pub mod planar_block_quant;
@@ -702,6 +706,9 @@ pub const PHASE1_OPS: &[&str] = &[
     "Expm1",
     "Log1p",
     "LogCumSumExp",
+    "Pack",
+    "Unpack",
+    "GroupedMatMul",
     "Add",
     "Relu",
     "Reshape",
@@ -1043,6 +1050,13 @@ pub(crate) fn build_cpu_registry_with_resources(
     let dense_weight_cache_bytes = resources.weight_cache_limits().dense_bytes;
     let retain_caches = resources.cache_retention().is_admitted();
     let mut rec = OpRegistry::new();
+    for name in onnx_runtime_ir::packed_routed::OPS {
+        rec.register(
+            OpKey::new(name, "", 29),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(packed_routed::Factory),
+        );
+    }
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
         rec.register(
             OpKey::new(name, "", since),

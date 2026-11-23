@@ -37,6 +37,7 @@ pub mod abi;
 pub mod epcontext;
 pub mod host_parallel;
 pub mod kernel;
+pub mod packed_routed;
 pub mod provider;
 pub mod registry;
 pub mod standard_math;

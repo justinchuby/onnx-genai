@@ -98,6 +98,7 @@ pub mod non_max_suppression;
 pub mod nonzero;
 pub mod normalization;
 pub mod onehot;
+mod packed_routed;
 pub mod packed_varlen_attention;
 pub mod pad;
 pub mod paged_attention;
@@ -209,6 +210,9 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Expm1",
     "Log1p",
     "LogCumSumExp",
+    "Pack",
+    "Unpack",
+    "GroupedMatMul",
     "MatMulNBits",
     "QMoE",
     "BlockQuantizedMatMul",
@@ -550,6 +554,9 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
+        ("Pack", "") => &[DataType::Uint8],
+        ("Unpack", "") => onnx_runtime_ir::packed_routed::WORD_DTYPES,
+        ("GroupedMatMul", "") => onnx_runtime_ir::standard_math::DTYPES,
         (name, "") if onnx_runtime_ir::standard_math::OPS.iter().any(|&(op, _)| op == name) =>
             onnx_runtime_ir::standard_math::DTYPES,
 
@@ -729,6 +736,13 @@ pub fn build_cuda_registry_with_metrics(
     telemetry_registry: Arc<qmoe::RouteTelemetrySourceRegistry>,
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
+    for name in onnx_runtime_ir::packed_routed::OPS {
+        reg.register(
+            OpKey::new(name, "", 29),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(packed_routed::Factory(runtime.clone())),
+        );
+    }
 
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
         reg.register(

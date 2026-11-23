@@ -40,7 +40,7 @@ macro_rules! evaluate {
                     for (a, &b) in data.iter_mut().zip(b) {
                         let x = *a;
                         let v = if tanh {
-                            ((0.797_884_560_802_865_4 as $float)
+                            ((0.797_884_560_802_865_4_f64 as $float)
                                 * (x + (0.044715 as $float) * x * x * x))
                                 .tanh()
                         } else {
