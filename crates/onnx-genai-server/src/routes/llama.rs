@@ -220,11 +220,17 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
     }
     ChatTemplate::validate_kwargs(&request.chat_template_kwargs)
         .map_err(|err| ApiError::invalid_request(err.to_string()))?;
+    crate::reasoning_request::ReasoningRequest::extract(request).map_err(|error| {
+        ApiError::invalid_request(format!("invalid reasoning controls: {error:#}"))
+    })?;
     for (key, value) in &request.extensions {
+        if crate::reasoning_request::ReasoningRequest::is_field(key) {
+            continue;
+        }
         let accepted = match key.as_str() {
             "reasoning_format" => value == "auto" || value == "deepseek",
             // These opt into optional progress/control facilities, not a different decoding algorithm.
-            "reasoning_control" | "return_progress" | "timings_per_token" => value.is_boolean(),
+            "return_progress" | "timings_per_token" => value.is_boolean(),
             "sse_ping_interval" => value.as_f64().is_some_and(|n| n >= 0.0),
             "cache_prompt" | "ignore_eos" => value.is_boolean(),
             "logit_bias" => value.is_object() || value.is_array(),

@@ -374,10 +374,26 @@ fn anthropic_request(mut body: Map<String, Value>) -> Result<ChatCompletionReque
                     json!({"enable_thinking":false}),
                 );
             }
+            Some("enabled") => {
+                let budget = thinking
+                    .get("budget_tokens")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    .unwrap_or_else(|| json!(10000));
+                if !budget
+                    .as_i64()
+                    .is_some_and(|value| (-1..=i64::from(i32::MAX)).contains(&value))
+                {
+                    return Err(ApiError::invalid_request(
+                        "thinking.budget_tokens must be -1 or a non-negative integer no greater than 2147483647",
+                    ));
+                }
+                body.insert("thinking_budget_tokens".into(), budget);
+            }
             Some("adaptive") => {}
             _ => {
                 return Err(ApiError::invalid_request(
-                    "thinking must be type=disabled or adaptive; explicit thinking token budgets are not yet supported",
+                    "thinking.type must be disabled, adaptive or enabled; use thinking.budget_tokens with enabled",
                 ));
             }
         }
@@ -888,7 +904,7 @@ mod transport_tests {
         );
         let request = anthropic_request(json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":12,"system":[{"type":"text","text":"help"}]}).as_object().unwrap().clone()).unwrap();
         assert_eq!(request.messages.len(), 2);
-        assert!(anthropic_request(json!({"messages":[],"max_tokens":12,"thinking":{"type":"enabled","budget_tokens":10}}).as_object().unwrap().clone()).is_err());
+        assert!(anthropic_request(json!({"messages":[],"max_tokens":12,"thinking":{"type":"enabled","budget_tokens":-2}}).as_object().unwrap().clone()).is_err());
     }
 
     async fn wire(events: Vec<Event>) -> String {
@@ -1019,5 +1035,25 @@ mod transport_tests {
                 .unwrap_err()
                 .contains("finish reason and usage")
         );
+    }
+}
+
+#[cfg(test)]
+mod reasoning_budget_tests {
+    use super::*;
+    #[test]
+    fn reasoning_budget_anthropic_enabled_preserves_budget_and_upstream_default() {
+        for (thinking, expected) in [
+            (json!({"type":"enabled","budget_tokens":0}), 0),
+            (json!({"type":"enabled"}), 10000),
+            (json!({"type":"enabled","budget_tokens":null}), 10000),
+        ] {
+            let body = json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":12000,"thinking":thinking});
+            let request = anthropic_request(body.as_object().unwrap().clone()).unwrap();
+            assert_eq!(request.extensions["thinking_budget_tokens"], expected);
+        }
+        let body = json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":12,"thinking":{"type":"enabled","budget_tokens":-2}});
+        let error = anthropic_request(body.as_object().unwrap().clone()).unwrap_err();
+        assert!(error.message.contains("thinking.budget_tokens"));
     }
 }

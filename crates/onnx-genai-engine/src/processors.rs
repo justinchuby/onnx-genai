@@ -108,12 +108,12 @@ pub(crate) fn build_processor_chain(
                     terminal_token_ids(options),
                 )));
             }
-            GenerateConstraint::Regex(regex) => {
+            GenerateConstraint::Regex { pattern, prefix } => {
                 chain.add(Box::new(ConstraintProcessor::new(
                     build_llguidance_constraint(
                         GrammarConstraintKind::Regex,
-                        regex,
-                        "",
+                        pattern,
+                        prefix,
                         tokenizer,
                         &token_texts,
                         options.eos_token_id,
@@ -141,6 +141,18 @@ pub(crate) fn build_processor_chain(
         }
     }
 
+    if let Some(budget) = &options.reasoning_budget {
+        for id in budget.forced_tokens() {
+            anyhow::ensure!(
+                !matches!(
+                    options.logit_bias.get(id),
+                    Some(crate::logits::LogitBias::Ban)
+                ),
+                "reasoning closer token {id} is banned by logit_bias; allow all declared forced closing tokens before enabling the budget or live control"
+            );
+        }
+        chain.add(Box::new(budget.processor()?));
+    }
     chain.begin_optional_stages();
     if let Some(mirostat) = options.mirostat.filter(|_| samples) {
         // Mirostat owns selection policy and, like upstream, replaces the

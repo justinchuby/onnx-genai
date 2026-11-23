@@ -1387,6 +1387,8 @@ pub struct GenerateOptions {
     pub speculative_mode: Option<SpeculativeMode>,
     /// Optional constrained decoding grammar. None preserves unconstrained generation.
     pub constraint: Option<GenerateConstraint>,
+    /// Resolved reasoning protocol, finite budget and optional live end signal.
+    pub reasoning_budget: Option<crate::reasoning::ReasoningBudget>,
     /// Return per-token log probabilities and this many highest-probability alternatives.
     ///
     /// Values are computed from the final post-processor distribution used for sampling.
@@ -1438,6 +1440,7 @@ impl Default for GenerateOptions {
             num_speculative_tokens: None,
             speculative_mode: None,
             constraint: None,
+            reasoning_budget: None,
             top_logprobs: None,
             cold_start: false,
             semantic_prefix_len: None,
@@ -1712,7 +1715,11 @@ pub enum GenerateConstraint {
         prefix: String,
     },
     /// Constrain output to text matching the provided Rust regular expression.
-    Regex(String),
+    Regex {
+        pattern: String,
+        /// Existing assistant prefill consumed by the grammar, excluded from new output.
+        prefix: String,
+    },
     /// Constrain existing prefix plus output to the provided llguidance Lark grammar.
     Lark {
         /// Complete grammar, including any declared response framing.

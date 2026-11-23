@@ -205,6 +205,12 @@ impl ByteStreamContract {
 }
 
 impl ByteStreamState {
+    pub(crate) fn has_pending_prefix(&self) -> bool {
+        self.strips
+            .iter()
+            .any(|strip| matches!(strip,StripState::Matching {matched,..} if !matched.is_empty()))
+    }
+
     pub(crate) fn is_identity(&self) -> bool {
         self.strips
             .iter()

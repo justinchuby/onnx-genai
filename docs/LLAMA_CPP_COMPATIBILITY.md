@@ -83,6 +83,29 @@ rejected because these models execute in-process with explicit nxrt settings.
   remain ordinary history. `dry_penalty_last_n` bounds prompt/generated history,
   with -1 for full history and 0 to disable DRY.
 
+Reasoning budgets use `reasoning_budget_tokens` or its upstream
+`thinking_budget_tokens` spelling; the former takes precedence if both are sent.
+`-1` leaves the counter unlimited, and `0` forces a close as soon as a declared
+reasoning block is active. Chat derives its opener/closers and final assistant
+prefill from `response_template`. Implicit reasoning channels may end at a
+content opener. Patterned boundaries require an explicit matching delimiter;
+forcing requires a lossless tokenizer round-trip. Native/legacy callers may
+supply `reasoning_budget_start_tag`, `reasoning_budget_end_tags` (or singular
+`reasoning_budget_end_tag`) and `generation_prompt` directly. The first closer
+is forced after optional `reasoning_budget_message` text. Existing assistant
+reasoning prefill counts toward the budget; old conversation turns do not.
+Each new reasoning block receives a fresh budget. Pending Unicode completes
+before forcing, and global output/context limits can still truncate the close.
+A closer banned by `logit_bias` is rejected before generation or SSE admission.
+
+`generation_prompt` also seeds JSON, JSON Schema, Regex and Lark grammars without
+requiring an enabled reasoning budget. It is not echoed in newly generated text.
+Anthropic `thinking.type=enabled` maps `budget_tokens` through the same counter,
+with the upstream default of 10,000 when omitted. Optional control hints on a
+model with no usable reasoning protocol leave its ordinary chat behavior intact.
+HTTP `/control` is still pending and `nxrt_capabilities.reasoning_control`
+remains false; automatic hints do not advertise an unavailable live controller.
+
 Legacy `/v1/completions` uses the same generation-control parser, validation,
 token biases, model sampling defaults and context admission as chat/native
 completion. Its `model` is optional and responses report the resolved model ID.
@@ -208,8 +231,7 @@ property name still has a backend lexical mismatch; its previously supported raw
 key spelling is preserved. Ordinary string values and free property names accept
 escaped DEL. Ordinary JSON output without a response template uses the same
 byte-oriented schema recognition, including split escapes and surrogate pairs.
-Forced tool/Lark output policies during
-reasoning continuation and thinking-budget controls also remain unsupported.
+Forced tool/Lark output policies during reasoning continuation remain unsupported.
 
 Ordinary JSON decoding follows the tokenizer's normal special-token policy;
 protocol-channel projection preserves markers for its declared parser. An EOS
@@ -321,8 +343,7 @@ the actual admitted prompt count (including media/session expansion) from the
 shared chat transaction, carried in its first chunk as `nxrt_prompt_tokens`.
 
 Responses and Messages share the chat tool/package capability checks. Stateful
-Responses continuation/storage, hosted tools and explicit thinking budgets are
-rejected. Streaming adapters preserve reasoning, tool argument deltas, usage and
+Responses continuation/storage and hosted tools are rejected. Streaming adapters preserve reasoning, tool argument deltas, usage and
 termination, and report upstream stream failures as errors.
 
 Native `/tts` accepts `input` or `prompt`, optional model, and the package's

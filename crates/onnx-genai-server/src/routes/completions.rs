@@ -56,7 +56,9 @@ pub(crate) async fn completions(
             &state.config,
             handle.model_max_context,
         )?;
-        if prepared.generation.options_mut().constraint.is_some() {
+        if prepared.generation.options_mut().constraint.is_some()
+            || prepared.generation.options_mut().reasoning_budget.is_some()
+        {
             prepared
                 .generation
                 .options_mut()
@@ -1387,14 +1389,33 @@ fn prepare_audio_generate_request(
     tokenizer: &Tokenizer,
     output_budget: usize,
 ) -> Result<PreparedGenerateRequest, ApiError> {
+    let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget)
+        .map_err(|error| {
+            ApiError::invalid_request(format!("invalid audio generation controls: {error:#}"))
+        })?;
+    crate::reasoning_request::ReasoningRequest::extract(request)
+        .and_then(|controls| {
+            controls.apply(
+                &mut options,
+                tokenizer,
+                crate::reasoning_request::BudgetContext::Raw,
+            )
+        })
+        .map_err(|error| {
+            ApiError::invalid_request(format!("invalid audio reasoning controls: {error:#}"))
+        })?;
+    if options.reasoning_budget.is_some() {
+        options.validate_processors(tokenizer).map_err(|error| {
+            ApiError::invalid_request(format!("invalid audio reasoning protocol: {error:#}"))
+        })?;
+    }
     let token_ids = audio_decoder_prompt(tokenizer, None)?;
     let prompt_tokens = token_ids.len();
     Ok(PreparedGenerateRequest {
         response_prefix: None,
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
-            options: build_generate_options_with_tokenizer(request, tokenizer, output_budget)
-                .map_err(|err| ApiError::invalid_request(err.to_string()))?,
+            options,
         },
         prompt_tokens,
     })
@@ -1914,6 +1935,17 @@ pub(crate) fn prepare_completion(
         handle.generation_defaults.as_ref(),
         &chat_sampling_overrides(&request.sampling),
     );
+    crate::reasoning_request::ReasoningRequest::extract(&request.sampling)
+        .and_then(|controls| {
+            controls.apply(
+                &mut options,
+                &handle.tokenizer,
+                crate::reasoning_request::BudgetContext::Raw,
+            )
+        })
+        .map_err(|error| {
+            ApiError::invalid_request(format!("invalid completion reasoning controls: {error:#}"))
+        })?;
     if let Some(suffix) = request.suffix.as_ref() {
         let fim_config = handle
             .fim_config
@@ -2120,7 +2152,17 @@ fn prepare_generate_request(
             ),
         "reasoning continuation with this constrained output policy requires a channel-aware generation grammar; use response_format with a compatible declared response_template"
     );
-    if options.constraint.is_some() {
+    if request.input_audio().is_empty() {
+        crate::reasoning_request::ReasoningRequest::extract(request)?.apply(
+            &mut options,
+            tokenizer,
+            crate::reasoning_request::BudgetContext::Chat {
+                template: context.response_template,
+                prompt: &prompt,
+            },
+        )?;
+    }
+    if options.constraint.is_some() || options.reasoning_budget.is_some() {
         options.validate_processors(tokenizer)
             .context("resolve requested output constraint against the model tokenizer and declared response template")?;
     }

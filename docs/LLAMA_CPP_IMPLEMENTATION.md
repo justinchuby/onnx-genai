@@ -1218,3 +1218,32 @@ stalled-reader timeout, cross-origin credential isolation and connection quota
 release and active SSE continuing beyond the idle interval. The full server
 library suite passed 419 tests with 2 inherited ignores. Strict server all-target
 Clippy passed. This increment does not complete the remaining delivery items.
+
+
+## Declared reasoning budgets and grammar prefill
+
+Reasoning budgets lower into a mandatory engine processor shared by host sampling
+paths. A resolved token protocol validates open/end/forced IDs, supports finite
+or unlimited windows, tracks natural closes, re-arms on repeated blocks and
+finishes split Unicode before forcing. Generated-history checkpoints preserve
+manual-control revisions and forced-token position through rewind and independent
+sampler branches. Existing prefill is charged but never consumes an ungenerated
+forced close. Forced IDs cannot resurrect a banned or grammar-rejected logit.
+
+The server resolves chat protocols from declared response boundaries and the
+final assistant anchor, with authored closer order retained separately from
+longest-match scanning. Native/legacy callers can supply an explicit protocol.
+Ordinary models retain compatibility with the upstream UI's unconditional
+optional arming hint, while explicit finite protocols fail actionably when they
+cannot be represented. JSON/Schema/Regex/Lark share generation_prompt prefill;
+the Regex Rust API now carries pattern and prefix with all callers updated.
+Anthropic enabled thinking budgets lower to the same request controls.
+
+Real ONNX buffered/logprob-SSE requests prove forced close followed by answer
+publication for zero/one-token budgets; native and legacy wire routes preserve
+raw protocol text. Actual Native-backend inference also passes the forced-close
+contract. The full engine suite passed 932 tests (1 inherited ignore), and the
+full server suite passed 432 tests (2 inherited ignores). Strict engine/server
+all-target Clippy passed. These are functional checks without performance claims.
+HTTP completion-ID control registration and POST /control are not wired yet.
+Other unchecked delivery items remain required.
