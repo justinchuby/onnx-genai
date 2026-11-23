@@ -1,0 +1,481 @@
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs b/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs
+index 0281ce171..b128d4b28 100644
+--- a/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs
+@@ -28,7 +28,7 @@ use std::sync::Arc;
+ use std::sync::atomic::{AtomicUsize, Ordering};
+
+ use onnx_runtime_ep_api::{
+-    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
++    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView, WorkspaceLayout,
+     WorkspaceRequirement, WorkspaceView,
+ };
+ use onnx_runtime_ir::{DataType, Node, Shape};
+@@ -226,7 +226,12 @@ impl Kernel for BlockQuantizedMoEKernel {
+
+     fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+         let dims = validate_runtime_shapes(inputs, None, &self.attributes, self.formats)?;
+-        self.projection_workspace(dims)
++        let layout = self.execution_workspace_layout(dims)?;
++        Ok(WorkspaceRequirement {
++            bytes: layout.bytes() as u64,
++            alignment: layout.alignment(),
++            ..WorkspaceRequirement::NONE
++        })
+     }
+
+     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+@@ -248,20 +253,34 @@ impl Kernel for BlockQuantizedMoEKernel {
+ }
+
+ impl BlockQuantizedMoEKernel {
+-    fn projection_workspace(&self, dims: Dimensions) -> Result<WorkspaceRequirement> {
++    fn execution_workspace_layout(&self, dims: Dimensions) -> Result<WorkspaceLayout<2>> {
++        // A validated empty final output cannot consume projections or gathers.
++        if dims.rows == 0 || dims.hidden == 0 {
++            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 2]);
++        }
+         // Experts and their projections execute serially. An expert receives a
+         // row at most once, so total rows bound every group, independent of k.
+         // Cover streamed fallback even when a dense resident set is available.
+-        let mut requirement = WorkspaceRequirement::NONE;
++        let mut projection_bytes = 0usize;
++        let mut projection_alignment = 1usize;
+         for (k, n) in [(dims.hidden, dims.fc1_size), (dims.inter, dims.hidden)]
+             .into_iter()
+             .chain(self.formats.fc3.map(|_| (dims.hidden, dims.inter)))
+         {
+             let layout = self.projection_plan.layout(dims.rows, k, n)?;
+-            requirement.bytes = requirement.bytes.max(layout.bytes() as u64);
+-            requirement.alignment = requirement.alignment.max(layout.alignment());
++            projection_bytes = projection_bytes.max(layout.bytes());
++            projection_alignment = projection_alignment.max(layout.alignment());
+         }
+-        Ok(requirement)
++        let projection =
++            std::alloc::Layout::from_size_align(projection_bytes, projection_alignment)
++                .map_err(|_| error("decoded projection workspace exceeds addressable capacity"))?;
++        let gathered_elements = dims.rows.checked_mul(dims.hidden).ok_or_else(|| {
++            error("grouped input rows times hidden width overflow; reduce batch dimensions")
++        })?;
++        let gathered = std::alloc::Layout::array::<f32>(gathered_elements).map_err(|_| {
++            error("grouped input workspace exceeds addressable capacity; reduce batch dimensions")
++        })?;
++        WorkspaceLayout::new([projection, gathered])
+     }
+
+     fn execute_prepared_experts(
+@@ -290,17 +309,19 @@ impl BlockQuantizedMoEKernel {
+             &self.attributes,
+             self.formats,
+         )?;
+-        let requirement = self.projection_workspace(dimensions)?;
+-        // SAFETY: the executor exclusively lends valid Host storage for this
+-        // dispatch. Sequential applies return owned outputs, so no scratch view
+-        // escapes. Initialization is deferred until the first streamed apply.
+-        let mut scratch = unsafe {
+-            ProjectionScratch::bind(
+-                "BlockQuantizedMoE streamed workspace binding",
+-                requirement.bytes as usize,
++        if dimensions.rows == 0 || dimensions.hidden == 0 {
++            return write_dense_f32(&mut outputs[0], &[]);
++        }
++        let layout = self.execution_workspace_layout(dimensions)?;
++        // SAFETY: one checked layout lends disjoint Host regions for this
++        // dispatch. Neither short borrow nor a projection output escapes.
++        let [mut scratch, mut grouped_scratch] = unsafe {
++            ProjectionScratch::bind_layout(
++                "BlockQuantizedMoE execution workspace binding",
++                layout,
+                 workspace,
+-            )
+-        }?;
++            )?
++        };
+         let Dimensions {
+             rows,
+             hidden,
+@@ -367,10 +388,11 @@ impl BlockQuantizedMoEKernel {
+         #[cfg(test)]
+         let mut counted_dense = false;
+         for (expert, expert_tasks) in tasks {
+-            let mut grouped_input = Vec::with_capacity(expert_tasks.len() * hidden);
+-            for &(row, _) in &expert_tasks {
+-                grouped_input.extend_from_slice(&input[row * hidden..(row + 1) * hidden]);
+-            }
++            let grouped_input = grouped_scratch.gather_rows(
++                &input,
++                hidden,
++                expert_tasks.iter().map(|&(row, _)| row),
++            )?;
+             let dense = if use_dense {
+                 match self.dequantize_expert_group(
+                     inputs,
+@@ -408,7 +430,7 @@ impl BlockQuantizedMoEKernel {
+                 let fc2 = &weights[1];
+                 let fc3 = weights.get(2);
+                 run_expert_grouped(
+-                    &grouped_input,
++                    grouped_input,
+                     expert_tasks.len(),
+                     fc1.as_slice(),
+                     fc1_bias
+@@ -459,7 +481,7 @@ impl BlockQuantizedMoEKernel {
+                     })
+                     .transpose()?;
+                 run_expert_projections(
+-                    &grouped_input,
++                    grouped_input,
+                     expert_tasks.len(),
+                     &fc1,
+                     fc1_bias
+@@ -1585,6 +1607,47 @@ mod tests {
+         }
+     }
+
++    #[test]
++    fn zero_hidden_empty_outputs_need_no_workspace_or_weight_decode() {
++        let shapes = vec![
++            Some((DataType::Float32, vec![1, 0])),
++            Some((DataType::Float32, vec![1, E])),
++            Some((DataType::Uint8, vec![E, H, 0, 17])),
++            None,
++            Some((DataType::Uint8, vec![E, 0, 1, 17])),
++        ];
++        let (graph, node) = model_node(&shapes, &attrs("identity", 1, true, 0));
++        let kernel = CpuExecutionProvider::new()
++            .get_kernel(graph.node(node), &[], 1)
++            .unwrap();
++        let metadata: Vec<_> = shapes
++            .iter()
++            .map(|input| match input {
++                Some((dtype, shape)) => TensorMetadata::new(*dtype, shape, true),
++                None => TensorMetadata::new(DataType::Float32, &[], false),
++            })
++            .collect();
++        assert_eq!(kernel.workspace_requirement(&metadata).unwrap().bytes, 0);
++        let input = Owned::f32(&[1, 0], &[]);
++        let router = Owned::f32(&[1, E], &[4., -4.]);
++        let fc1 = Owned::u8(&[E, H, 0, 17], &[]);
++        let fc2 = Owned::u8(&[E, 0, 1, 17], &[]);
++        let mut output = Owned::zeros_f32(&[1, 0]);
++        kernel
++            .execute(
++                &[
++                    input.view(),
++                    router.view(),
++                    fc1.view(),
++                    TensorView::absent(DataType::Float32),
++                    fc2.view(),
++                ],
++                &mut [output.view_mut()],
++            )
++            .unwrap();
++        assert!(output.to_f32().is_empty());
++    }
++
+     #[test]
+     fn dense_resident_experts_do_not_initialize_projection_scratch() {
+         let shapes = vec![
+@@ -1635,9 +1698,12 @@ mod tests {
+                 .execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace))
+                 .unwrap();
+             assert!(
+-                scratch.iter().all(|&value| value == 29.0),
++                scratch[..scratch.len() - H]
++                    .iter()
++                    .all(|&value| value == 29.0),
+                 "cold dense expansion and warm resident hits must leave streamed scratch untouched"
+             );
++            assert_eq!(&scratch[scratch.len() - H..], &[0.125; H]);
+             assert_eq!(output.to_f32(), vec![0.125; H]);
+         }
+         assert_eq!(
+@@ -1648,7 +1714,7 @@ mod tests {
+     }
+
+     #[test]
+-    fn streamed_workspace_is_one_projection_max_with_no_warm_issuer_callbacks() {
++    fn streamed_workspace_is_projection_max_plus_one_gather_with_no_warm_issuer_callbacks() {
+         use crate::kernels::testutil::RecordingGovernor;
+         use onnx_runtime_memory_governor::{HolderId, HostWorkspacePool, ProcessMemoryManager};
+         use std::num::NonZeroUsize;
+@@ -1755,8 +1821,8 @@ mod tests {
+                 .max(l2.bytes())
+                 .max(if separate { l3.bytes() } else { 0 });
+             assert_eq!(
+-                req.bytes, max as u64,
+-                "serial experts/projections share max, not sum or k*E"
++                req.bytes, (max + rows * hidden * std::mem::size_of::<f32>()) as u64,
++                "serial experts/projections share max plus one gathered input, not k*E buffers"
+             );
+             assert!(max < l1.bytes() + l2.bytes());
+             let mut output = Owned::zeros_f32(&[rows, hidden]);
+@@ -1765,7 +1831,7 @@ mod tests {
+                 .unwrap_err();
+             assert!(
+                 err.to_string()
+-                    .contains("BlockQuantizedMoE streamed workspace binding"),
++                    .contains("BlockQuantizedMoE execution workspace binding"),
+                 "{err}"
+             );
+             let mut expected = None;
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs b/crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs
+index d32d020c3..e1492e11c 100644
+--- a/crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs
+@@ -32,23 +32,99 @@ impl<'a> ProjectionScratch<'a> {
+         let region = std::alloc::Layout::array::<f32>(elements).map_err(|_| {
+             EpError::KernelFailed(format!("{operation}: {bytes} scratch bytes exceed addressable capacity; reduce batch or projection dimensions"))
+         })?;
+-        let [region] = WorkspaceLayout::new([region])?
+-            .bind(workspace)
+-            .map_err(|source| EpError::Backend {
+-                operation,
+-                source: Box::new(source),
++        // SAFETY: the caller lends the complete Host workspace exclusively.
++        let [scratch] =
++            unsafe { Self::bind_layout(operation, WorkspaceLayout::new([region])?, workspace)? };
++        Ok(scratch)
++    }
++
++    /// Bind one checked composite layout, validating f32 regions before any
++    /// typed references are formed. No region is initialized by binding.
++    ///
++    /// # Safety
++    /// Nonempty backing must be live, Host-accessible and exclusively lent for
++    /// `'a`, including every region and all short borrows made from its owners.
++    pub(super) unsafe fn bind_layout<const N: usize>(
++        operation: &'static str,
++        layout: WorkspaceLayout<N>,
++        workspace: Option<WorkspaceView>,
++    ) -> Result<[Self; N]> {
++        let regions = layout.bind(workspace).map_err(|source| EpError::Backend {
++            operation,
++            source: Box::new(source),
++        })?;
++        for (index, region) in regions.iter().enumerate() {
++            if !region.bytes().is_multiple_of(std::mem::size_of::<f32>())
++                || (region.bytes() != 0
++                    && !(region.ptr().0 as usize).is_multiple_of(std::mem::align_of::<f32>()))
++            {
++                return Err(EpError::KernelFailed(format!(
++                    "{operation}: region {index} has {} bytes at {:#x}, which is not aligned complete f32 storage; declare f32 workspace layouts",
++                    region.bytes(),
++                    region.ptr().0 as usize,
++                )));
++            }
++        }
++        Ok(regions.map(|region| {
++            let storage = if region.bytes() == 0 {
++                &mut []
++            } else {
++                // SAFETY: complete layout validation proves capacity, address
++                // range and disjointness; the checks above prove f32 geometry.
++                // The caller guarantees Host accessibility and exclusive lifetime.
++                unsafe {
++                    std::slice::from_raw_parts_mut(
++                        region.ptr().0.cast(),
++                        region.bytes() / std::mem::size_of::<f32>(),
++                    )
++                }
++            };
++            Self {
++                storage,
++                initialized: false,
++            }
++        }))
++    }
++
++    /// Gather only the requested rows, initializing every returned value by
++    /// copying it. Unused capacity is untouched; no whole-lane clear is needed.
++    pub(super) fn gather_rows(
++        &mut self,
++        input: &[f32],
++        width: usize,
++        rows: impl Iterator<Item = usize>,
++    ) -> Result<&mut [f32]> {
++        if width == 0 {
++            return Ok(&mut []);
++        }
++        let mut written = 0usize;
++        for row in rows {
++            let start = row.checked_mul(width).ok_or_else(|| {
++                EpError::KernelFailed(format!(
++                    "projection input row {row} times width {width} overflows addressable storage"
++                ))
+             })?;
+-        let storage = if elements == 0 {
+-            &mut []
+-        } else {
+-            // SAFETY: the checked layout proves non-null/aligned capacity;
+-            // the caller guarantees Host accessibility, exclusivity and lifetime.
+-            unsafe { std::slice::from_raw_parts_mut(region.ptr().0.cast(), elements) }
+-        };
+-        Ok(Self {
+-            storage,
+-            initialized: false,
+-        })
++            let source = input.get(start..).and_then(|rest| rest.get(..width)).ok_or_else(|| EpError::KernelFailed(
++                format!("projection input row {row} of width {width} exceeds {} input values; validate routed row indices", input.len())
++            ))?;
++            let end = written.checked_add(width).ok_or_else(|| {
++                EpError::KernelFailed(
++                    "projection input gather size overflow; reduce routed batch dimensions".into(),
++                )
++            })?;
++            let capacity = self.storage.len();
++            let target = self.storage.get_mut(written..end).ok_or_else(|| EpError::KernelFailed(
++                format!("projection input gather needs {end} values, workspace has {capacity}; prepare the complete grouped-input bound")
++            ))?;
++            for (target, &value) in target.iter_mut().zip(source) {
++                target.write(value);
++            }
++            written = end;
++        }
++        // SAFETY: each complete target row was initialized above, and written
++        // counts actual copied values, without trusting an iterator size hint.
++        // The returned prefix is exclusive and cannot outlive this short borrow.
++        Ok(unsafe { std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast(), written) })
+     }
+
+     pub(super) fn initialized(&mut self) -> &mut [f32] {
+@@ -412,6 +488,138 @@ mod tests {
+     use onnx_runtime_ep_api::DevicePtrMut;
+     use std::num::NonZeroUsize;
+
++    #[test]
++    fn composite_scratch_binds_disjoint_f32_regions_and_rejects_untyped_geometry() {
++        let mut backing = [MaybeUninit::new(29.0f32); 16];
++        let view = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 16 * 4);
++        let layout = WorkspaceLayout::new([
++            std::alloc::Layout::array::<f32>(4).unwrap(),
++            std::alloc::Layout::array::<f32>(3).unwrap(),
++        ])
++        .unwrap();
++        {
++            // SAFETY: live aligned Host backing is exclusively lent to both regions.
++            let [mut projection, mut gathered] =
++                unsafe { ProjectionScratch::bind_layout("composite test", layout, Some(view)) }
++                    .unwrap();
++            assert_eq!(
++                gathered
++                    .gather_rows(&[1., 2., 3.], 3, [0].into_iter())
++                    .unwrap(),
++                &[1., 2., 3.]
++            );
++            projection.initialized().fill(7.);
++            assert_eq!(
++                gathered.initialized(),
++                &[0.; 3],
++                "a prefix copy does not initialize the entire owner"
++            );
++            assert_eq!(projection.initialized(), &[7.; 4]);
++        }
++        // SAFETY: this fixture initialized the entire backing before binding.
++        assert!(
++            backing[7..]
++                .iter()
++                .all(|x| unsafe { x.assume_init() } == 29.)
++        );
++        let odd = WorkspaceLayout::new([std::alloc::Layout::array::<u8>(3).unwrap()]).unwrap();
++        // SAFETY: backing accessibility/lifetime are valid; f32 geometry is checked by bind_layout.
++        let error = unsafe { ProjectionScratch::bind_layout("odd region", odd, Some(view)) }
++            .err()
++            .unwrap()
++            .to_string();
++        assert!(
++            error.contains("region 0") && error.contains("complete f32"),
++            "{error}"
++        );
++        let byte_layout =
++            WorkspaceLayout::new([std::alloc::Layout::array::<u8>(4).unwrap()]).unwrap();
++        let misaligned = WorkspaceView::new(
++            DevicePtrMut(view.ptr().0.cast::<u8>().wrapping_add(1).cast()),
++            4,
++        );
++        // SAFETY: the live byte region is addressable; bind_layout must reject its f32 alignment.
++        let error = unsafe {
++            ProjectionScratch::bind_layout("misaligned region", byte_layout, Some(misaligned))
++        }
++        .err()
++        .unwrap()
++        .to_string();
++        assert!(
++            error.contains("region 0") && error.contains("aligned"),
++            "{error}"
++        );
++    }
++
++    #[test]
++    fn gathered_projection_input_initializes_only_actual_rows_and_reuses_capacity() {
++        let mut backing = [MaybeUninit::new(29.0f32); 16];
++        let view = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 16 * 4);
++        // SAFETY: the test exclusively lends live aligned Host storage.
++        let mut scratch =
++            unsafe { ProjectionScratch::bind("gather test", 16 * 4, Some(view)) }.unwrap();
++        let input = [1., 2., 3., 4., 5., 6.];
++        assert_eq!(
++            scratch
++                .gather_rows(&input, 2, [2, 0, 2].into_iter())
++                .unwrap(),
++            &[5., 6., 1., 2., 5., 6.]
++        );
++        assert!(
++            !scratch.initialized,
++            "a valid prefix is not a whole-lane initialization proof"
++        );
++        assert_eq!(
++            scratch.gather_rows(&input, 2, [1].into_iter()).unwrap(),
++            &[3., 4.]
++        );
++        // SAFETY: the test initially filled every value; gathering only copies f32.
++        let values: Vec<_> = scratch
++            .storage
++            .iter()
++            .map(|x| unsafe { x.assume_init() })
++            .collect();
++        assert_eq!(&values[2..6], &[1., 2., 5., 6.]);
++        assert!(values[6..].iter().all(|&x| x == 29.));
++        assert!(
++            scratch
++                .gather_rows(&input, 2, [].into_iter())
++                .unwrap()
++                .is_empty()
++        );
++        assert!(
++            scratch
++                .gather_rows(&input, 0, [0].into_iter())
++                .unwrap()
++                .is_empty()
++        );
++        assert!(
++            scratch
++                .gather_rows(&input, 2, [3].into_iter())
++                .unwrap_err()
++                .to_string()
++                .contains("row 3")
++        );
++        assert!(
++            scratch
++                .gather_rows(&input, 2, [usize::MAX].into_iter())
++                .unwrap_err()
++                .to_string()
++                .contains("overflows")
++        );
++        assert!(
++            scratch
++                .gather_rows(&input, 2, [0; 9].into_iter())
++                .unwrap_err()
++                .to_string()
++                .contains("workspace has 16")
++        );
++        // A partially written failure never grants a whole-lane proof. The
++        // ordinary initialized path must still establish every remaining value.
++        assert!(!scratch.initialized);
++        assert!(scratch.initialized().iter().all(|&x| x == 0.));
++    }
++
+     #[test]
+     fn projection_scratch_is_lazy_once_per_dispatch_and_only_borrows_the_needed_prefix() {
+         let mut backing = [MaybeUninit::new(37.0f32); 32];

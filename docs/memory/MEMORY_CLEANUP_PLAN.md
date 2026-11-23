@@ -2200,3 +2200,34 @@ The authorized read-only resource-design review found the execution-slot issue
 and confirmed its fix. Validation driver and logs remain
 `/tmp/nxrt-lazy-workspace-check.py` and `/tmp/nxrt-lazy-workspace-*.log`; all
 build/test work held the shared stable host lock.
+
+
+### Grouped MoE input shares the existing funded lane
+
+BlockQuantizedMoE no longer allocates a gathered input Vec for each expert. One
+disjoint rows*hidden f32 region shares the already funded execution workspace
+with the maximum serial FC projection scratch. Experts reuse it in sequence;
+no expert-count/top-k multiplication, per-group lease or new EP API is added.
+Gathering initializes only copied prefixes; unused capacity stays untouched.
+The common private f32 binder validates the complete layout once and all typed
+region geometry before forming MaybeUninit references. Dense hits still avoid
+clearing projection scratch. Full metadata validation precedes an empty-output
+fast path with zero scratch, also fixing previously failed zero-hidden decoding.
+
+[Controlled public-session evidence](../benchmarks/moe-grouped-input-workspace/README.md)
+records original and refined candidates, exact source/binary hashes, 54 final
+outputs, the excluded four-thread control failure and one qualified nine-output
+focused repeat. M1 Max single-thread point estimates are -1.08% to +1.30% CPU;
+a possible approximately 0.103 us tiny-case cost is retained. The focused four-
+thread medians are essentially unchanged with overlapping ranges. There is no
+universal zero-overhead or isolated speedup claim. All full outputs/argmaxes
+match; physical workspace equals the declared expanded bound and teardown/trim
+returns Host usage to zero. The existing 4,096-cycle tests retain zero warm
+issuer callbacks, including zero-byte calls. Original conversions, routing,
+FC intermediates and output vectors remain outside this scratch migration.
+
+Rebased integration with merged ARM64 math/lazy-workspace work passes native
+CPU 2,016 / session 295, MLAS CPU 2,058 / session 297, all 48 public executor
+integration tests and both strict CPU/session all-target Clippy configurations.
+Measured source is preserved separately and reconstructed exactly by its patch;
+those timing numbers are not reinterpreted as a fresh current-main experiment.

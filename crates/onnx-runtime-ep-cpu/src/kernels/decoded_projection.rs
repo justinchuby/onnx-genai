@@ -32,23 +32,99 @@ impl<'a> ProjectionScratch<'a> {
         let region = std::alloc::Layout::array::<f32>(elements).map_err(|_| {
             EpError::KernelFailed(format!("{operation}: {bytes} scratch bytes exceed addressable capacity; reduce batch or projection dimensions"))
         })?;
-        let [region] = WorkspaceLayout::new([region])?
-            .bind(workspace)
-            .map_err(|source| EpError::Backend {
-                operation,
-                source: Box::new(source),
+        // SAFETY: the caller lends the complete Host workspace exclusively.
+        let [scratch] =
+            unsafe { Self::bind_layout(operation, WorkspaceLayout::new([region])?, workspace)? };
+        Ok(scratch)
+    }
+
+    /// Bind one checked composite layout, validating f32 regions before any
+    /// typed references are formed. No region is initialized by binding.
+    ///
+    /// # Safety
+    /// Nonempty backing must be live, Host-accessible and exclusively lent for
+    /// `'a`, including every region and all short borrows made from its owners.
+    pub(super) unsafe fn bind_layout<const N: usize>(
+        operation: &'static str,
+        layout: WorkspaceLayout<N>,
+        workspace: Option<WorkspaceView>,
+    ) -> Result<[Self; N]> {
+        let regions = layout.bind(workspace).map_err(|source| EpError::Backend {
+            operation,
+            source: Box::new(source),
+        })?;
+        for (index, region) in regions.iter().enumerate() {
+            if !region.bytes().is_multiple_of(std::mem::size_of::<f32>())
+                || (region.bytes() != 0
+                    && !(region.ptr().0 as usize).is_multiple_of(std::mem::align_of::<f32>()))
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "{operation}: region {index} has {} bytes at {:#x}, which is not aligned complete f32 storage; declare f32 workspace layouts",
+                    region.bytes(),
+                    region.ptr().0 as usize,
+                )));
+            }
+        }
+        Ok(regions.map(|region| {
+            let storage = if region.bytes() == 0 {
+                &mut []
+            } else {
+                // SAFETY: complete layout validation proves capacity, address
+                // range and disjointness; the checks above prove f32 geometry.
+                // The caller guarantees Host accessibility and exclusive lifetime.
+                unsafe {
+                    std::slice::from_raw_parts_mut(
+                        region.ptr().0.cast(),
+                        region.bytes() / std::mem::size_of::<f32>(),
+                    )
+                }
+            };
+            Self {
+                storage,
+                initialized: false,
+            }
+        }))
+    }
+
+    /// Gather only the requested rows, initializing every returned value by
+    /// copying it. Unused capacity is untouched; no whole-lane clear is needed.
+    pub(super) fn gather_rows(
+        &mut self,
+        input: &[f32],
+        width: usize,
+        rows: impl Iterator<Item = usize>,
+    ) -> Result<&mut [f32]> {
+        if width == 0 {
+            return Ok(&mut []);
+        }
+        let mut written = 0usize;
+        for row in rows {
+            let start = row.checked_mul(width).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "projection input row {row} times width {width} overflows addressable storage"
+                ))
             })?;
-        let storage = if elements == 0 {
-            &mut []
-        } else {
-            // SAFETY: the checked layout proves non-null/aligned capacity;
-            // the caller guarantees Host accessibility, exclusivity and lifetime.
-            unsafe { std::slice::from_raw_parts_mut(region.ptr().0.cast(), elements) }
-        };
-        Ok(Self {
-            storage,
-            initialized: false,
-        })
+            let source = input.get(start..).and_then(|rest| rest.get(..width)).ok_or_else(|| EpError::KernelFailed(
+                format!("projection input row {row} of width {width} exceeds {} input values; validate routed row indices", input.len())
+            ))?;
+            let end = written.checked_add(width).ok_or_else(|| {
+                EpError::KernelFailed(
+                    "projection input gather size overflow; reduce routed batch dimensions".into(),
+                )
+            })?;
+            let capacity = self.storage.len();
+            let target = self.storage.get_mut(written..end).ok_or_else(|| EpError::KernelFailed(
+                format!("projection input gather needs {end} values, workspace has {capacity}; prepare the complete grouped-input bound")
+            ))?;
+            for (target, &value) in target.iter_mut().zip(source) {
+                target.write(value);
+            }
+            written = end;
+        }
+        // SAFETY: each complete target row was initialized above, and written
+        // counts actual copied values, without trusting an iterator size hint.
+        // The returned prefix is exclusive and cannot outlive this short borrow.
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast(), written) })
     }
 
     pub(super) fn initialized(&mut self) -> &mut [f32] {
@@ -411,6 +487,138 @@ mod tests {
     use super::*;
     use onnx_runtime_ep_api::DevicePtrMut;
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn composite_scratch_binds_disjoint_f32_regions_and_rejects_untyped_geometry() {
+        let mut backing = [MaybeUninit::new(29.0f32); 16];
+        let view = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 16 * 4);
+        let layout = WorkspaceLayout::new([
+            std::alloc::Layout::array::<f32>(4).unwrap(),
+            std::alloc::Layout::array::<f32>(3).unwrap(),
+        ])
+        .unwrap();
+        {
+            // SAFETY: live aligned Host backing is exclusively lent to both regions.
+            let [mut projection, mut gathered] =
+                unsafe { ProjectionScratch::bind_layout("composite test", layout, Some(view)) }
+                    .unwrap();
+            assert_eq!(
+                gathered
+                    .gather_rows(&[1., 2., 3.], 3, [0].into_iter())
+                    .unwrap(),
+                &[1., 2., 3.]
+            );
+            projection.initialized().fill(7.);
+            assert_eq!(
+                gathered.initialized(),
+                &[0.; 3],
+                "a prefix copy does not initialize the entire owner"
+            );
+            assert_eq!(projection.initialized(), &[7.; 4]);
+        }
+        // SAFETY: this fixture initialized the entire backing before binding.
+        assert!(
+            backing[7..]
+                .iter()
+                .all(|x| unsafe { x.assume_init() } == 29.)
+        );
+        let odd = WorkspaceLayout::new([std::alloc::Layout::array::<u8>(3).unwrap()]).unwrap();
+        // SAFETY: backing accessibility/lifetime are valid; f32 geometry is checked by bind_layout.
+        let error = unsafe { ProjectionScratch::bind_layout("odd region", odd, Some(view)) }
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("region 0") && error.contains("complete f32"),
+            "{error}"
+        );
+        let byte_layout =
+            WorkspaceLayout::new([std::alloc::Layout::array::<u8>(4).unwrap()]).unwrap();
+        let misaligned = WorkspaceView::new(
+            DevicePtrMut(view.ptr().0.cast::<u8>().wrapping_add(1).cast()),
+            4,
+        );
+        // SAFETY: the live byte region is addressable; bind_layout must reject its f32 alignment.
+        let error = unsafe {
+            ProjectionScratch::bind_layout("misaligned region", byte_layout, Some(misaligned))
+        }
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            error.contains("region 0") && error.contains("aligned"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn gathered_projection_input_initializes_only_actual_rows_and_reuses_capacity() {
+        let mut backing = [MaybeUninit::new(29.0f32); 16];
+        let view = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 16 * 4);
+        // SAFETY: the test exclusively lends live aligned Host storage.
+        let mut scratch =
+            unsafe { ProjectionScratch::bind("gather test", 16 * 4, Some(view)) }.unwrap();
+        let input = [1., 2., 3., 4., 5., 6.];
+        assert_eq!(
+            scratch
+                .gather_rows(&input, 2, [2, 0, 2].into_iter())
+                .unwrap(),
+            &[5., 6., 1., 2., 5., 6.]
+        );
+        assert!(
+            !scratch.initialized,
+            "a valid prefix is not a whole-lane initialization proof"
+        );
+        assert_eq!(
+            scratch.gather_rows(&input, 2, [1].into_iter()).unwrap(),
+            &[3., 4.]
+        );
+        // SAFETY: the test initially filled every value; gathering only copies f32.
+        let values: Vec<_> = scratch
+            .storage
+            .iter()
+            .map(|x| unsafe { x.assume_init() })
+            .collect();
+        assert_eq!(&values[2..6], &[1., 2., 5., 6.]);
+        assert!(values[6..].iter().all(|&x| x == 29.));
+        assert!(
+            scratch
+                .gather_rows(&input, 2, [].into_iter())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            scratch
+                .gather_rows(&input, 0, [0].into_iter())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            scratch
+                .gather_rows(&input, 2, [3].into_iter())
+                .unwrap_err()
+                .to_string()
+                .contains("row 3")
+        );
+        assert!(
+            scratch
+                .gather_rows(&input, 2, [usize::MAX].into_iter())
+                .unwrap_err()
+                .to_string()
+                .contains("overflows")
+        );
+        assert!(
+            scratch
+                .gather_rows(&input, 2, [0; 9].into_iter())
+                .unwrap_err()
+                .to_string()
+                .contains("workspace has 16")
+        );
+        // A partially written failure never grants a whole-lane proof. The
+        // ordinary initialized path must still establish every remaining value.
+        assert!(!scratch.initialized);
+        assert!(scratch.initialized().iter().all(|&x| x == 0.));
+    }
 
     #[test]
     fn projection_scratch_is_lazy_once_per_dispatch_and_only_borrows_the_needed_prefix() {

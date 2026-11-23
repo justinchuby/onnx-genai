@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView, WorkspaceLayout,
     WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node, Shape};
@@ -226,7 +226,12 @@ impl Kernel for BlockQuantizedMoEKernel {
 
     fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
         let dims = validate_runtime_shapes(inputs, None, &self.attributes, self.formats)?;
-        self.projection_workspace(dims)
+        let layout = self.execution_workspace_layout(dims)?;
+        Ok(WorkspaceRequirement {
+            bytes: layout.bytes() as u64,
+            alignment: layout.alignment(),
+            ..WorkspaceRequirement::NONE
+        })
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -248,20 +253,34 @@ impl Kernel for BlockQuantizedMoEKernel {
 }
 
 impl BlockQuantizedMoEKernel {
-    fn projection_workspace(&self, dims: Dimensions) -> Result<WorkspaceRequirement> {
+    fn execution_workspace_layout(&self, dims: Dimensions) -> Result<WorkspaceLayout<2>> {
+        // A validated empty final output cannot consume projections or gathers.
+        if dims.rows == 0 || dims.hidden == 0 {
+            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 2]);
+        }
         // Experts and their projections execute serially. An expert receives a
         // row at most once, so total rows bound every group, independent of k.
         // Cover streamed fallback even when a dense resident set is available.
-        let mut requirement = WorkspaceRequirement::NONE;
+        let mut projection_bytes = 0usize;
+        let mut projection_alignment = 1usize;
         for (k, n) in [(dims.hidden, dims.fc1_size), (dims.inter, dims.hidden)]
             .into_iter()
             .chain(self.formats.fc3.map(|_| (dims.hidden, dims.inter)))
         {
             let layout = self.projection_plan.layout(dims.rows, k, n)?;
-            requirement.bytes = requirement.bytes.max(layout.bytes() as u64);
-            requirement.alignment = requirement.alignment.max(layout.alignment());
+            projection_bytes = projection_bytes.max(layout.bytes());
+            projection_alignment = projection_alignment.max(layout.alignment());
         }
-        Ok(requirement)
+        let projection =
+            std::alloc::Layout::from_size_align(projection_bytes, projection_alignment)
+                .map_err(|_| error("decoded projection workspace exceeds addressable capacity"))?;
+        let gathered_elements = dims.rows.checked_mul(dims.hidden).ok_or_else(|| {
+            error("grouped input rows times hidden width overflow; reduce batch dimensions")
+        })?;
+        let gathered = std::alloc::Layout::array::<f32>(gathered_elements).map_err(|_| {
+            error("grouped input workspace exceeds addressable capacity; reduce batch dimensions")
+        })?;
+        WorkspaceLayout::new([projection, gathered])
     }
 
     fn execute_prepared_experts(
@@ -290,17 +309,19 @@ impl BlockQuantizedMoEKernel {
             &self.attributes,
             self.formats,
         )?;
-        let requirement = self.projection_workspace(dimensions)?;
-        // SAFETY: the executor exclusively lends valid Host storage for this
-        // dispatch. Sequential applies return owned outputs, so no scratch view
-        // escapes. Initialization is deferred until the first streamed apply.
-        let mut scratch = unsafe {
-            ProjectionScratch::bind(
-                "BlockQuantizedMoE streamed workspace binding",
-                requirement.bytes as usize,
+        if dimensions.rows == 0 || dimensions.hidden == 0 {
+            return write_dense_f32(&mut outputs[0], &[]);
+        }
+        let layout = self.execution_workspace_layout(dimensions)?;
+        // SAFETY: one checked layout lends disjoint Host regions for this
+        // dispatch. Neither short borrow nor a projection output escapes.
+        let [mut scratch, mut grouped_scratch] = unsafe {
+            ProjectionScratch::bind_layout(
+                "BlockQuantizedMoE execution workspace binding",
+                layout,
                 workspace,
-            )
-        }?;
+            )?
+        };
         let Dimensions {
             rows,
             hidden,
@@ -367,10 +388,11 @@ impl BlockQuantizedMoEKernel {
         #[cfg(test)]
         let mut counted_dense = false;
         for (expert, expert_tasks) in tasks {
-            let mut grouped_input = Vec::with_capacity(expert_tasks.len() * hidden);
-            for &(row, _) in &expert_tasks {
-                grouped_input.extend_from_slice(&input[row * hidden..(row + 1) * hidden]);
-            }
+            let grouped_input = grouped_scratch.gather_rows(
+                &input,
+                hidden,
+                expert_tasks.iter().map(|&(row, _)| row),
+            )?;
             let dense = if use_dense {
                 match self.dequantize_expert_group(
                     inputs,
@@ -408,7 +430,7 @@ impl BlockQuantizedMoEKernel {
                 let fc2 = &weights[1];
                 let fc3 = weights.get(2);
                 run_expert_grouped(
-                    &grouped_input,
+                    grouped_input,
                     expert_tasks.len(),
                     fc1.as_slice(),
                     fc1_bias
@@ -459,7 +481,7 @@ impl BlockQuantizedMoEKernel {
                     })
                     .transpose()?;
                 run_expert_projections(
-                    &grouped_input,
+                    grouped_input,
                     expert_tasks.len(),
                     &fc1,
                     fc1_bias
@@ -1586,6 +1608,47 @@ mod tests {
     }
 
     #[test]
+    fn zero_hidden_empty_outputs_need_no_workspace_or_weight_decode() {
+        let shapes = vec![
+            Some((DataType::Float32, vec![1, 0])),
+            Some((DataType::Float32, vec![1, E])),
+            Some((DataType::Uint8, vec![E, H, 0, 17])),
+            None,
+            Some((DataType::Uint8, vec![E, 0, 1, 17])),
+        ];
+        let (graph, node) = model_node(&shapes, &attrs("identity", 1, true, 0));
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(graph.node(node), &[], 1)
+            .unwrap();
+        let metadata: Vec<_> = shapes
+            .iter()
+            .map(|input| match input {
+                Some((dtype, shape)) => TensorMetadata::new(*dtype, shape, true),
+                None => TensorMetadata::new(DataType::Float32, &[], false),
+            })
+            .collect();
+        assert_eq!(kernel.workspace_requirement(&metadata).unwrap().bytes, 0);
+        let input = Owned::f32(&[1, 0], &[]);
+        let router = Owned::f32(&[1, E], &[4., -4.]);
+        let fc1 = Owned::u8(&[E, H, 0, 17], &[]);
+        let fc2 = Owned::u8(&[E, 0, 1, 17], &[]);
+        let mut output = Owned::zeros_f32(&[1, 0]);
+        kernel
+            .execute(
+                &[
+                    input.view(),
+                    router.view(),
+                    fc1.view(),
+                    TensorView::absent(DataType::Float32),
+                    fc2.view(),
+                ],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+        assert!(output.to_f32().is_empty());
+    }
+
+    #[test]
     fn dense_resident_experts_do_not_initialize_projection_scratch() {
         let shapes = vec![
             Some((DataType::Float32, vec![1, H])),
@@ -1635,9 +1698,12 @@ mod tests {
                 .execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace))
                 .unwrap();
             assert!(
-                scratch.iter().all(|&value| value == 29.0),
+                scratch[..scratch.len() - H]
+                    .iter()
+                    .all(|&value| value == 29.0),
                 "cold dense expansion and warm resident hits must leave streamed scratch untouched"
             );
+            assert_eq!(&scratch[scratch.len() - H..], &[0.125; H]);
             assert_eq!(output.to_f32(), vec![0.125; H]);
         }
         assert_eq!(
@@ -1648,7 +1714,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_workspace_is_one_projection_max_with_no_warm_issuer_callbacks() {
+    fn streamed_workspace_is_projection_max_plus_one_gather_with_no_warm_issuer_callbacks() {
         use crate::kernels::testutil::RecordingGovernor;
         use onnx_runtime_memory_governor::{HolderId, HostWorkspacePool, ProcessMemoryManager};
         use std::num::NonZeroUsize;
@@ -1755,8 +1821,8 @@ mod tests {
                 .max(l2.bytes())
                 .max(if separate { l3.bytes() } else { 0 });
             assert_eq!(
-                req.bytes, max as u64,
-                "serial experts/projections share max, not sum or k*E"
+                req.bytes, (max + rows * hidden * std::mem::size_of::<f32>()) as u64,
+                "serial experts/projections share max plus one gathered input, not k*E buffers"
             );
             assert!(max < l1.bytes() + l2.bytes());
             let mut output = Owned::zeros_f32(&[rows, hidden]);
@@ -1765,7 +1831,7 @@ mod tests {
                 .unwrap_err();
             assert!(
                 err.to_string()
-                    .contains("BlockQuantizedMoE streamed workspace binding"),
+                    .contains("BlockQuantizedMoE execution workspace binding"),
                 "{err}"
             );
             let mut expected = None;
