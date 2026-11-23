@@ -36,6 +36,10 @@ const Q5_K_BLOCK_BYTES: usize = 176;
 const Q6_K_BLOCK_BYTES: usize = 210;
 const Q8_0_BLOCK_BYTES: usize = 34;
 const BLOCK_THREADS: u32 = 256;
+pub(crate) fn packed_matmul_layout(name: &str) -> Option<(usize, usize)> {
+    let format = BlockFormat::parse(name).ok()?;
+    Some((format.qk(), format.block_bytes()))
+}
 const GEMM_TILE_M: u32 = 8;
 const CUDA_MAX_GRID_DIM_Y: u32 = 65_535;
 // 4K row tiles saturate the device while keeping the grid-stride path testable.
