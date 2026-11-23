@@ -55,6 +55,27 @@ pub enum EagerError {
     #[error("execution provider error: {0}")]
     Kernel(#[from] onnx_runtime_ep_api::EpError),
 
+    /// Context for workspace preparation and execution through the selected EP.
+    #[error("eager execution of '{domain}::{op_type}' on {device:?} failed: {source}")]
+    Execution {
+        op_type: String,
+        domain: String,
+        device: DeviceId,
+        #[source]
+        source: Box<EagerError>,
+    },
+
+    /// Preserve both failures when execution and consuming workspace release fail.
+    #[error(
+        "eager op '{op}' failed: {execution}; additionally workspace release failed: {release}"
+    )]
+    WorkspaceRelease {
+        op: String,
+        #[source]
+        execution: Box<EagerError>,
+        release: Box<EagerError>,
+    },
+
     /// An error escaping the shape-inference engine itself.
     #[error("shape-inference engine error: {0}")]
     ShapeInferEngine(#[from] onnx_runtime_shape_inference::ShapeInferError),
