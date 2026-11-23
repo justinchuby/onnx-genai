@@ -642,6 +642,208 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn reasoning_budget_wire_http_control_reaches_real_sampler_and_releases() {
+        use onnx_genai_engine::{
+            GeneratePrompt, GenerateRequest, ToolCallPolicy, logits::LogitBias,
+        };
+        use tower::ServiceExt as _;
+        let (_scratch, state) = model_state();
+        let handle = state.registry.lookup_loaded("").unwrap().unwrap();
+        let router = crate::app(state.clone());
+        let mut options = GenerateOptions {
+            max_new_tokens: 2,
+            stop_on_eos: false,
+            greedy: true,
+            ..Default::default()
+        };
+        options.logit_bias.insert(4, LogitBias::Add(1000.0));
+        let controls =
+            ReasoningRequest::extract(&request(json!({"reasoning_control":true}))).unwrap();
+        controls
+            .apply(
+                &mut options,
+                &handle.tokenizer,
+                BudgetContext::Chat {
+                    template: handle.response_template.as_ref(),
+                    prompt: "anchor tok22",
+                },
+            )
+            .unwrap();
+        let budget = options.reasoning_budget.as_ref().unwrap();
+        let registration = state
+            .completion_controls
+            .register("chatcmpl-control-test", Some(budget.control()))
+            .unwrap();
+        let unarmed = state
+            .completion_controls
+            .register("chatcmpl-unarmed", None)
+            .unwrap();
+        async fn control(router: axum::Router, body: Value) -> (axum::http::StatusCode, Value) {
+            let response = router
+                .oneshot(
+                    axum::http::Request::post("/control")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+        for invalid in [
+            json!({"action":"reasoning_end"}),
+            json!({"id":"x","action":"cancel"}),
+            json!({"id":"","action":"reasoning_end"}),
+        ] {
+            assert_eq!(
+                control(router.clone(), invalid).await.0,
+                axum::http::StatusCode::BAD_REQUEST
+            );
+        }
+        for id in ["unknown", "chatcmpl-unarmed"] {
+            let (status, body) =
+                control(router.clone(), json!({"id":id,"action":"reasoning_end"})).await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert_eq!(body["success"], false);
+        }
+        assert_eq!(
+            control(
+                router.clone(),
+                json!({"id":"chatcmpl-control-test","action":"reasoning_end"})
+            )
+            .await
+            .1,
+            json!({"success":true})
+        );
+        // The HTTP lookup and real ONNX decoder share this exact resolved budget.
+        // Signal before submission avoids a timing race with the tiny model.
+        let generation = handle
+            .engine
+            .submit_generation(
+                None,
+                GenerateRequest {
+                    prompt: GeneratePrompt::TokenIds(vec![4]),
+                    options,
+                },
+                ToolCallPolicy::Disabled,
+                None,
+            )
+            .await
+            .unwrap();
+        generation.admission.await.unwrap().unwrap();
+        let mut events = generation.events;
+        let result = loop {
+            match events.recv().await.unwrap() {
+                crate::driver::DriverEvent::Finished(result) => break result,
+                crate::driver::DriverEvent::Error(error) => panic!("{error:?}"),
+                _ => {}
+            }
+        };
+        assert_eq!(result.token_ids, [23, 4]);
+        drop(registration);
+        assert_eq!(
+            control(
+                router.clone(),
+                json!({"id":"chatcmpl-control-test","action":"reasoning_end"})
+            )
+            .await
+            .1["success"],
+            false
+        );
+        drop(unarmed);
+    }
+
+    #[tokio::test]
+    async fn reasoning_budget_wire_control_capacity_and_completed_ids() {
+        use tower::ServiceExt as _;
+        let (_scratch, state) = model_state_with_config(crate::ServerConfig {
+            max_queue_depth: 1,
+            ..Default::default()
+        });
+        let router = crate::app(state.clone());
+        let occupied = state
+            .completion_controls
+            .register("occupied", None)
+            .unwrap();
+        let response = post(
+            router.clone(),
+            json!({"messages":[{"role":"user","content":"hello"}],"stream":true,"max_tokens":1}),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        drop(occupied);
+        for path in ["/v1/chat/completions", "/v1/completions"] {
+            for stream in [false, true] {
+                let mut body = json!({"max_tokens":2,"stream":stream,"reasoning_control":true});
+                if path == "/v1/chat/completions" {
+                    body["messages"] = json!([{"role":"user","content":"hello"}]);
+                    body["reasoning_budget_tokens"] = json!(0);
+                } else {
+                    body["prompt"] = json!("hello");
+                }
+                let response = router
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::post(path)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let id = if stream {
+                    let value: Value = serde_json::from_str(
+                        text.lines()
+                            .find_map(|line| line.strip_prefix("data: "))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    value["id"].as_str().unwrap().to_owned()
+                } else {
+                    serde_json::from_slice::<Value>(&bytes).unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                };
+                let response = router
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::post("/control")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                json!({"id":id,"action":"reasoning_end"}).to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let value: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 1 << 20)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(value["success"], false, "{value}");
+                // A one-entry registry admits the next request after completion.
+                let guard = state
+                    .completion_controls
+                    .register("released", None)
+                    .unwrap();
+                drop(guard);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn reasoning_budget_wire_banned_closer_is_rejected_before_sse_headers() {
         let (_scratch, state) = model_state();
         let response = post(

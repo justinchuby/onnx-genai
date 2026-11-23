@@ -240,6 +240,7 @@ fn index_completion_publications(
         .collect()
 }
 struct StartedCompletion {
+    _registration: crate::completion_control::Registration,
     events: mpsc::Receiver<DriverEvent>,
     prompt_tokens: usize,
 }
@@ -281,6 +282,7 @@ fn add_completion_usage(total: &mut Usage, next: &Usage) -> Result<(), ApiError>
 }
 async fn start_completion(
     state: &AppState,
+    id: &str,
     handle: &ModelHandle,
     request: &CompletionRequest,
     mut prepared: PreparedCompletion,
@@ -297,11 +299,17 @@ async fn start_completion(
         &state.config,
         handle.model_max_context,
     )?;
+    let registration = state.completion_controls.register_request(
+        id,
+        &request.sampling,
+        prepared.generation.options_mut(),
+    )?;
     let session = open_session_after_admission(state, handle, conversational, lease).await?;
     let generation = submit_completion(handle, prepared.generation, session).await?;
     await_driver_admission(generation.admission).await?;
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     Ok(StartedCompletion {
+        _registration: registration,
         events: generation.events,
         prompt_tokens,
     })
@@ -313,9 +321,10 @@ async fn run_completion(
     prepared: PreparedCompletion,
     client_session_id: Option<&str>,
 ) -> Result<CompletionResponse, ApiError> {
-    let id = text_completion_id();
+    let id = text_completion_id()?;
     let created = now_unix();
-    let started = start_completion(state, handle, &request, prepared, client_session_id).await?;
+    let started =
+        start_completion(state, &id, handle, &request, prepared, client_session_id).await?;
     let collected = collect_generation_with_publications(started.events)
         .await
         .map_err(generation_failure)?;
@@ -459,8 +468,10 @@ async fn stream_completions(
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
     let is_batch = !rest.is_empty();
     let (request, prepared) = first;
+    let id = text_completion_id()?;
     let started = start_completion(
         &state,
+        &id,
         &handle,
         &request,
         prepared,
@@ -475,7 +486,6 @@ async fn stream_completions(
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
-    let id = text_completion_id();
     let created = now_unix();
     let model = handle.id.clone();
     let (tx, rx) = mpsc::channel(16);
@@ -529,7 +539,7 @@ async fn stream_completions(
                 break;
             };
             index += 1;
-            let started = tokio::select! { biased; _=tx.closed()=>return Ok(()),started=start_completion(&state,&handle,&request,prepared,None)=>started };
+            let started = tokio::select! { biased; _=tx.closed()=>return Ok(()),started=start_completion(&state,&id,&handle,&request,prepared,None)=>started };
             match started {
                 Ok(started) => current = started,
                 Err(error) => {
@@ -684,7 +694,7 @@ async fn run_chat_completion(
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
 ) -> Result<ChatCompletionResponse, ApiError> {
-    let id = completion_id();
+    let id = completion_id()?;
     let created = now_unix();
     let model = request.model.clone();
     let requested_top_logprobs = request
@@ -729,6 +739,10 @@ async fn run_chat_completion(
     projection.start().map_err(|error| {
         ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
     })?;
+    let registration =
+        state
+            .completion_controls
+            .register_request(&id, &request, &prepared.request.options)?;
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
@@ -755,6 +769,7 @@ async fn run_chat_completion(
     let result = collect_generation_with_publications(generation.events)
         .await
         .map_err(generation_failure);
+    drop(registration);
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
 
     let session_token_count = if let Some(session) = session_for_count {
@@ -834,7 +849,7 @@ async fn stream_chat_completion(
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
-    let id = completion_id();
+    let id = completion_id()?;
     let created = now_unix();
     let model = request.model.clone();
     let requested_top_logprobs = request
@@ -880,6 +895,10 @@ async fn stream_chat_completion(
     let initial_gate = projection.start().map_err(|error| {
         ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
     })?;
+    let registration =
+        state
+            .completion_controls
+            .register_request(&id, &request, &prepared.request.options)?;
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
@@ -904,6 +923,7 @@ async fn stream_chat_completion(
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
 
     tokio::spawn(async move {
+        let _registration = registration;
         send_stream_chunk(&tx, role_chunk(&id, created, &model, prompt_tokens)).await?;
 
         if request.has_tool_context() {
@@ -3160,12 +3180,12 @@ async fn send_tool_call_deltas(
     send_stream_chunk(tx, done_chunk(id, created, model, "tool_calls")).await
 }
 
-fn completion_id() -> String {
-    format!("chatcmpl-{}", now_unix())
+fn completion_id() -> Result<String, ApiError> {
+    crate::completion_control::new_id("chatcmpl-")
 }
 
-fn text_completion_id() -> String {
-    format!("cmpl-{}", now_unix())
+fn text_completion_id() -> Result<String, ApiError> {
+    crate::completion_control::new_id("cmpl-")
 }
 
 #[cfg(test)]
@@ -3951,6 +3971,7 @@ mod completion_delivery_tests {
     #[tokio::test]
     async fn failed_or_truncated_completion_delivery_never_claims_finished_usage() {
         let tokenizer = tokenizer();
+        let controls = crate::completion_control::CompletionControls::new(1);
         for explicit_error in [false, true] {
             let (source, events) = mpsc::channel(2);
             if explicit_error {
@@ -3967,6 +3988,7 @@ mod completion_delivery_tests {
                 &tx,
                 ("id", 1, "model", 3),
                 StartedCompletion {
+                    _registration: controls.register("id", None).unwrap(),
                     events,
                     prompt_tokens: 3,
                 },
@@ -3977,6 +3999,8 @@ mod completion_delivery_tests {
             )
             .await
             .unwrap();
+            let released = controls.register("id", None).unwrap();
+            drop(released);
             let CompletionDelivery::Failed(error) = delivery else {
                 panic!("unfinished source must fail instead of claiming completed usage");
             };
@@ -3994,6 +4018,7 @@ mod completion_delivery_tests {
     #[tokio::test]
     async fn disconnected_completion_delivery_releases_its_source_without_finishing() {
         let tokenizer = tokenizer();
+        let controls = crate::completion_control::CompletionControls::new(1);
         let (source, events) = mpsc::channel(2);
         let (tx, rx) = mpsc::channel(2);
         drop(rx);
@@ -4001,6 +4026,7 @@ mod completion_delivery_tests {
             &tx,
             ("id", 1, "model", 0),
             StartedCompletion {
+                _registration: controls.register("id", None).unwrap(),
                 events,
                 prompt_tokens: 3,
             },
@@ -4012,6 +4038,8 @@ mod completion_delivery_tests {
         .await
         .unwrap();
         assert!(matches!(delivery, CompletionDelivery::Disconnected));
+        let released = controls.register("id", None).unwrap();
+        drop(released);
         assert!(source.is_closed());
     }
 }

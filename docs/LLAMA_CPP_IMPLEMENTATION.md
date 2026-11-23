@@ -1245,5 +1245,14 @@ raw protocol text. Actual Native-backend inference also passes the forced-close
 contract. The full engine suite passed 932 tests (1 inherited ignore), and the
 full server suite passed 432 tests (2 inherited ignores). Strict engine/server
 all-target Clippy passed. These are functional checks without performance claims.
-HTTP completion-ID control registration and POST /control are not wired yet.
+Live chat and legacy completions own bounded registrations until their consumer
+ends, with replay producers retaining control independently of reader reconnects.
+128-bit operating-system-random completion IDs prevent timestamp collisions.
+POST /control validates the action and signals the same resolved engine budget;
+unknown/finished and unarmed IDs return success:false. Native budget requests do
+not yet publish IDs for manual control. The final server suite passed 436 tests (2 inherited ignores), including HTTP
+control reaching real ONNX inference, capacity/completed-ID coverage and failure/
+disconnect cleanup. Strict server all-target Clippy passed. The manual-signal
+inference test signals before submission to avoid racing the tiny fixture; it
+does not claim an end-to-end midstream timing test.
 Other unchecked delivery items remain required.

@@ -25,6 +25,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/detokenize` | `tokens`, optional `model`; preserves special tokens, rejects absent vocabulary IDs |
 | POST | `/apply-template` | Chat request fields; same prompt renderer as chat inference |
 | POST | `/v1/chat/completions`, `/chat/completions` | Buffered/streaming text, tools, reasoning, declared image/audio inputs |
+| POST | `/control` | End the current reasoning block of an armed live chat/legacy completion |
 | POST | `/v1/completions` | OpenAI text/token/mixed prompt batches, shared controls, declared text FIM and optional stream usage |
 | POST | `/v1/embeddings` | Existing OpenAI embedding contract |
 | POST | `/completion`, `/completions`, `/infill` | Native buffered/streaming completion, bounded text/token/mixed batches, declared FIM metadata |
@@ -103,8 +104,17 @@ requiring an enabled reasoning budget. It is not echoed in newly generated text.
 Anthropic `thinking.type=enabled` maps `budget_tokens` through the same counter,
 with the upstream default of 10,000 when omitted. Optional control hints on a
 model with no usable reasoning protocol leave its ordinary chat behavior intact.
-HTTP `/control` is still pending and `nxrt_capabilities.reasoning_control`
-remains false; automatic hints do not advertise an unavailable live controller.
+`POST /control` accepts `{"id":"<completion-id>","action":"reasoning_end"}`
+for live chat and legacy completion IDs. Requests must opt in with
+`reasoning_control=true` and resolve a usable reasoning protocol to be armed.
+Unknown/finished IDs and unarmed completions return `success:false`; missing IDs
+and unsupported actions return HTTP 400. A successful signal finishes the current
+reasoning block using the same Unicode-safe forced close. `nxrt_capabilities.reasoning_control`
+reports endpoint availability, not a claim that every model has a reasoning channel.
+Registrations are bounded by `max_queue_depth` across the server and released
+when their generation consumer ends; replay readers share their producer's
+registration. Native completions retain budget support but do not publish a
+completion ID for manual control.
 
 Legacy `/v1/completions` uses the same generation-control parser, validation,
 token biases, model sampling defaults and context admission as chat/native
@@ -282,8 +292,8 @@ spelling. Literal escaped backslashes keep their meaning. Grammar-only byte chun
 may still split UTF-8 scalars. Invalid schema prefixes return a typed 400 error. Tokenizers without an interpretable
 lossless byte codec fail explicitly rather than using lossy token decoding.
 Optional progress/control subscription fields from Llama Chat are accepted, but
-`/props.nxrt_capabilities` advertises resumable streams and reports realtime
-reasoning control as unavailable. Per-token timing/progress events are not promised.
+`/props.nxrt_capabilities` advertises resumable streams and the live reasoning
+control endpoint. Per-token timing/progress events are not promised.
 An SSE request with `X-Conversation-Id` retains generation independently of its
 HTTP reader. Reconnect with `/v1/stream?conv_id=ID&from=BYTE_OFFSET`; DELETE cancels
 the producer. Retention defaults to 16 streams and 4 MiB per stream, with completed
