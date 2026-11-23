@@ -227,6 +227,7 @@ fn check_edges(cuda: Option<&CudaExecutionProvider>) {
 }
 
 #[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "CUDA conformance target")]
 fn cpu_dequantize_packed_conformance() {
     check_corpus(None);
     check_edges(None);
