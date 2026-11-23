@@ -437,6 +437,15 @@ impl<'a> From<Cow<'a, [f32]>> for DenseOperand<'a> {
     }
 }
 
+impl<'a> DenseOperand<'a> {
+    pub(super) fn borrowed(values: &'a [f32]) -> Self {
+        Self(DenseOperandStorage::Direct(Cow::Borrowed(values)))
+    }
+    pub(super) fn funded(values: Arc<GrantedWeight>) -> Self {
+        Self(DenseOperandStorage::Funded(values))
+    }
+}
+
 enum DenseOperandStorage<'a> {
     Direct(Cow<'a, [f32]>),
     Funded(Arc<GrantedWeight>),
@@ -490,16 +499,30 @@ fn transpose_source_into(
     n: usize,
     output: &mut [f32],
 ) -> Result<()> {
-    validate_f32_widen_input("CPU B transpose source", source)?;
+    // SAFETY: f32 and MaybeUninit<f32> have identical layouts; output is
+    // exclusive and f32 has no destructor. The common fill initializes all
+    // elements before returning a readable slice.
+    let uninit =
+        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast(), output.len()) };
+    transpose_source_uninit(source, k, n, uninit).map(|_| ())
+}
+
+pub(super) fn transpose_source_uninit<'a>(
+    source: &TensorView<'_>,
+    k: usize,
+    n: usize,
+    output: &'a mut [std::mem::MaybeUninit<f32>],
+) -> Result<&'a mut [f32]> {
+    validate_f32_widen_input("CPU operand transpose source", source)?;
     if !transpose_source_geometry(source, k, n) || k.checked_mul(n) != Some(output.len()) {
         return Err(EpError::KernelFailed(format!(
-            "CPU B transpose [{k}, {n}] has source shape {:?} and {} output elements; supply a matching matrix or promoted B vector and complete output storage",
+            "CPU operand transpose [{k}, {n}] has source shape {:?} and {} output elements; supply a matching matrix or promoted vector and complete output storage",
             source.shape,
             output.len()
         )));
     }
     if output.is_empty() {
-        return Ok(());
+        return Ok(&mut []);
     }
     if source.dtype == DataType::Float32
         && source.is_contiguous()
@@ -508,16 +531,16 @@ fn transpose_source_into(
         // SAFETY: validated host-contiguous aligned f32 storage has exactly
         // the checked matrix extent; source backing bounds are the EP contract.
         let values = unsafe { std::slice::from_raw_parts(source.data_ptr::<f32>(), output.len()) };
-        return weight_transpose::transpose_row_major_into(values, k, n, output);
+        return weight_transpose::transpose_map_uninit(k, n, output, |i, j| values[i * n + j]);
     }
     let (sr, sc) = if source.shape.len() == 1 {
         (source.strides[0] as isize, 0)
     } else {
         (source.strides[0] as isize, source.strides[1] as isize)
     };
-    dispatch_float!(source.dtype,"CPU B transpose conversion",T=>{
+    dispatch_float!(source.dtype,"CPU operand transpose conversion",T=>{
         let origin=source.data_ptr::<T>() as usize;
-        weight_transpose::transpose_map_into(k,n,output,|i,j| {
+        weight_transpose::transpose_map_uninit(k,n,output,|i,j| {
             // SAFETY: the validated original host view addresses this logical
             // coordinate. Transposition changes traversal, never source bounds;
             // the caller supplies backing bounds under the TensorView contract.
@@ -751,6 +774,10 @@ impl MatMulPrepack {
         }
     }
 
+    pub(super) fn retains_constant(&self, index: usize) -> bool {
+        self.retain_caches && self.constant_inputs[index]
+    }
+
     /// Borrow unchanged contiguous f32 storage. Materialized constants obtain
     /// their complete f32 payload grant before conversion, whether retained or
     /// call-owned. Dynamic activation conversion remains a separate scratch scope.
@@ -870,8 +897,9 @@ impl MatMulPrepack {
         });
     }
 
-    /// Gemm's row-major backend requires this layout even when retention is
-    /// disabled. Its call-owned copy must still be funded before building.
+    /// Gemm's retained-B route requires an owned layout. Cache refusal still
+    /// funds a call-owned copy before building; dynamic/nonretained operands
+    /// instead use the execution workspace.
     pub(super) fn required_transposed_b(
         &self,
         source: &TensorView<'_>,

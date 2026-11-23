@@ -2043,6 +2043,29 @@ pub(crate) mod testutil {
                 releases: std::sync::atomic::AtomicUsize::new(0),
             }))
         }
+        pub fn new_host(host_bytes: u64) -> Self {
+            Self(std::sync::Arc::new(RecordingBooks {
+                governor: onnx_runtime_memory_governor::LedgerGovernor::new(
+                    onnx_runtime_memory_governor::LeaseLedger::new_for_device(
+                        onnx_runtime_memory_api::DeviceKey::HOST,
+                        0,
+                        host_bytes,
+                        0,
+                    ),
+                ),
+                claims: std::sync::atomic::AtomicUsize::new(0),
+                releases: std::sync::atomic::AtomicUsize::new(0),
+            }))
+        }
+        /// Probe the actual test issuer; MemoryLease deliberately skips a
+        /// zero-byte drop, so that wrapper cannot falsify this counter itself.
+        pub fn probe_zero_release(&self) {
+            onnx_runtime_memory_governor::LeaseAccounting::release(
+                self.0.as_ref(),
+                onnx_runtime_memory_api::Tier::Host,
+                0,
+            );
+        }
         pub fn claims(&self) -> usize {
             self.0.claims.load(std::sync::atomic::Ordering::Relaxed)
         }

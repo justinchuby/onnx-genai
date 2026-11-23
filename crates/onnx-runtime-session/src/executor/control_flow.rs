@@ -175,14 +175,14 @@ impl ChildExecutor {
         formal_inputs: &[&Tensor],
         outer_scope: &HashMap<String, Tensor>,
     ) -> Result<Vec<Tensor>> {
-        self.run_with_workspace(formal_inputs, outer_scope, None)
+        self.run_with_workspace(formal_inputs, outer_scope, InheritedWorkspaces::default())
     }
 
     pub(crate) fn run_with_workspace(
         &mut self,
         formal_inputs: &[&Tensor],
         outer_scope: &HashMap<String, Tensor>,
-        workspace: Option<WorkspaceView>,
+        workspace: InheritedWorkspaces,
     ) -> Result<Vec<Tensor>> {
         if self.formal_names.len() != formal_inputs.len() {
             return Err(SessionError::Internal(format!(
@@ -229,11 +229,10 @@ impl ChildExecutor {
         };
 
         self.runs += 1;
-        self.compiled[cache_index].exec.inherited_workspace =
-            workspace.map(|view| (view.ptr().0 as usize, view.bytes()));
+        self.compiled[cache_index].exec.inherited_workspace = workspace;
         self.compiled[cache_index]
             .exec
-            .workspace_preparation_required = workspace.is_some();
+            .workspace_preparation_required = workspace.has_any();
         let inputs = self
             .input_names
             .iter()
@@ -659,17 +658,18 @@ impl Executor {
             self.subgraph_execs.insert(prepared.key.clone(), child);
         }
 
-        let workspace = self
-            .persistent_workspace
-            .as_mut()
-            .or(self.step_workspace.as_mut())
-            .map(|prepared| {
-                WorkspaceView::new(DevicePtrMut(prepared.buffer.as_mut_ptr()), prepared.bytes)
-            })
-            .or_else(|| {
-                self.inherited_workspace
-                    .map(|(ptr, bytes)| WorkspaceView::new(DevicePtrMut(ptr as *mut _), bytes))
-            });
+        let workspace = InheritedWorkspaces {
+            persistent: self.inherited_workspace.persistent.or_else(|| {
+                self.persistent_workspace
+                    .as_mut()
+                    .map(|prepared| (prepared.buffer.as_mut_ptr() as usize, prepared.bytes))
+            }),
+            step: self.inherited_workspace.step.or_else(|| {
+                self.step_workspace
+                    .as_mut()
+                    .map(|prepared| (prepared.buffer.as_mut_ptr() as usize, prepared.bytes))
+            }),
+        };
         let child = self
             .subgraph_execs
             .get_mut(&prepared.key)

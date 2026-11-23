@@ -1192,7 +1192,7 @@ impl Executor {
             persistent_workspace: None,
             step_workspace: None,
             pin_step_workspace: false,
-            inherited_workspace: None,
+            inherited_workspace: InheritedWorkspaces::default(),
             workspace_preparation_required: false,
         };
 

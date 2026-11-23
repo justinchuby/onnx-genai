@@ -772,8 +772,28 @@ pub(crate) struct Executor {
     /// Non-owning view of an enclosing executor's prepared workspace. Nested
     /// control-flow executors run sequentially, so they may reuse the parent's
     /// peak allocation without reserving or allocating a second buffer.
-    pub(super) inherited_workspace: Option<(usize, usize)>,
+    pub(super) inherited_workspace: InheritedWorkspaces,
     pub(super) workspace_preparation_required: bool,
+}
+
+/// Parent scratch remains separated by lifetime; a step must never borrow and
+/// overwrite persistent contents merely because that allocation exists first.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct InheritedWorkspaces {
+    pub(super) persistent: Option<(usize, usize)>,
+    pub(super) step: Option<(usize, usize)>,
+}
+impl InheritedWorkspaces {
+    pub(super) fn view(self, lifetime: WorkspaceLifetime) -> Option<WorkspaceView> {
+        match lifetime {
+            WorkspaceLifetime::SessionPersistent => self.persistent,
+            WorkspaceLifetime::StepScoped => self.step,
+        }
+        .map(|(ptr, bytes)| WorkspaceView::new(DevicePtrMut(ptr as *mut _), bytes))
+    }
+    pub(super) fn has_any(self) -> bool {
+        self.persistent.is_some() || self.step.is_some()
+    }
 }
 
 pub(super) struct PreparedWorkspace {

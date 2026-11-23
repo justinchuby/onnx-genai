@@ -606,9 +606,7 @@ impl Executor {
             capturing: matches!(capture, OpCaptureTrace::Captured),
             persistent_workspace: &mut self.persistent_workspace,
             step_workspace: &mut self.step_workspace,
-            inherited_workspace: self
-                .inherited_workspace
-                .map(|(ptr, bytes)| WorkspaceView::new(DevicePtrMut(ptr as *mut _), bytes)),
+            inherited_workspace: self.inherited_workspace,
             workspace_preparation_required: self.workspace_preparation_required,
             eager_workspace_growth: matches!(capture, OpCaptureTrace::Eager),
         };
@@ -1707,7 +1705,7 @@ struct KernelDispatchContext<'a> {
     capturing: bool,
     persistent_workspace: &'a mut Option<PreparedWorkspace>,
     step_workspace: &'a mut Option<PreparedWorkspace>,
-    inherited_workspace: Option<WorkspaceView>,
+    inherited_workspace: InheritedWorkspaces,
     workspace_preparation_required: bool,
     /// True when this node is dispatched on a plain eager run (no device-graph
     /// capture in progress), so growing a prepared workspace slot in place is
@@ -2050,7 +2048,7 @@ impl KernelDispatchContext<'_> {
             };
             let workspace = if requirement.bytes == 0 {
                 None
-            } else if let Some(inherited) = self.inherited_workspace {
+            } else if let Some(inherited) = self.inherited_workspace.view(requirement.lifetime) {
                 let required = usize::try_from(requirement.bytes).map_err(|_| {
                     EpError::KernelFailed(format!(
                         "kernel workspace requirement {} does not fit usize",
