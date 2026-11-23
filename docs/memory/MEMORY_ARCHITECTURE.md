@@ -87,6 +87,12 @@ at the graph's planned peak; sequential kernels borrow regions of that lane.
 Prepared weights retain grants per independently published/reclaimed artifact
 (or a jointly used expert group), and KV grows in capacity blocks or batches.
 No per-row, per-tile, per-token or per-expert workspace quota API is needed.
+The peak follows actual overlap: take the maximum across serial phases and
+sum regions that must coexist, including nested control-flow execution. Concurrent
+lanes need separate exclusive capacity. Retain per-artifact weight ownership so
+reclaiming one artifact does not require retiring an entire session slab. KV
+appends within funded blocks need no new grant; block growth may be batched
+without charging the declared maximum context up front.
 
 A warm workspace checkout that fits retained capacity makes zero issuer calls,
 including zero-byte requests. Growth, backing creation and actual release are
@@ -100,6 +106,11 @@ quarantined backing retains its charge until physical release is settled.
 The EP contract remains metadata planning plus an exclusive workspace borrow;
 common runtime ownership handles admission and pooling. Internal bank partitioning
 is an EP implementation detail, not a collection of separately charged resources.
+The kernel declares/refines layout requirements and consumes a borrowed view;
+the provider supplies backing and completion evidence. Providers do not need
+per-kernel budgets, private scratch pools, or a second quota ledger. Context
+retirement guards, asynchronous settlement and capture pins remain separate
+contracts rather than one retention flag.
 Keep release/replacement settlement contracts for asynchronous providers. Further
 run-boundary pooling optimization requires evidence of overhead; request lifetime
 must not implicitly pin a prefill-sized lane throughout decode.
