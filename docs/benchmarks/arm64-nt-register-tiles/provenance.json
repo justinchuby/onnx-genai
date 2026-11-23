@@ -1,0 +1,66 @@
+{
+  "head": "eab5878c5273e8486ee2c6b728eb813f03f20e3f",
+  "base": "bb1b14cf3f564e7b41ac6b5cc30df19a77b0105c",
+  "source_path": "/tmp/nxrt-compact-wire-grants",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs": "38a71c4f9aa2f787235bdc40d4f0b7c8064ca300c12605cb6da32a72e78072d8",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_neon.rs": "394580501bedcd8c8a7b9889001bbe3bacf4a343fb6c696f521d873f4a9399e9"
+  },
+  "probe_sha256": "4c93e4ef81f836e5b36604ee595b672ea8437da8f0cb8681aae4d76cc120b2f0",
+  "shared_lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "binaries": {
+    "baseline": {
+      "sha256": "1e33ee3b095292a234f92b0ac6d1682dd65f3de7c77993b0dc5b2f04c1607e91",
+      "symbols": 978,
+      "mlas_symbols": 0,
+      "nt_neon_symbols": 0
+    },
+    "after": {
+      "sha256": "a69cbedd4a3f293c8c965c6d5fe9a666ccfa2b5437ac1368bd0eb02e07d1b91e",
+      "symbols": 980,
+      "mlas_symbols": 0,
+      "nt_neon_symbols": 1,
+      "instruction_counts": {
+        "fmul": 44,
+        "fadd": 92,
+        "fmla": 0,
+        "fmadd": 0,
+        "faddp": 0,
+        "trn1": 2,
+        "trn2": 2,
+        "zip1": 0,
+        "zip2": 2
+      }
+    },
+    "research": {
+      "sha256": "64f057cf5be3ba247ec8aac3c5a1c6131f0c64f24d77fe8b67f95881d50bbd20",
+      "symbols": 2271,
+      "mlas_symbols": 116,
+      "nt_neon_symbols": 1,
+      "instruction_counts": {
+        "fmul": 44,
+        "fadd": 92,
+        "fmla": 0,
+        "fmadd": 0,
+        "faddp": 0,
+        "trn1": 2,
+        "trn2": 2,
+        "zip1": 0,
+        "zip2": 2
+      }
+    }
+  },
+  "environment_overrides": {
+    "RAYON_NUM_THREADS": "1",
+    "MLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "ONNX_GENAI_MLAS_THREADPOOL_THREADS": "1"
+  },
+  "reused_baseline": {
+    "path": "/tmp/nxrt-neon-nt-perf",
+    "sha256": "1e33ee3b095292a234f92b0ac6d1682dd65f3de7c77993b0dc5b2f04c1607e91",
+    "revision": "bb1b14cf3f564e7b41ac6b5cc30df19a77b0105c"
+  }
+}
