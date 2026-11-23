@@ -768,14 +768,52 @@ impl<T: Any> KernelType for T {
     }
 }
 
+/// A workspace extent derived from a validated, pinned binding allocation.
+/// Bare graph tokens cannot construct one or grant address-coverage permission.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkspaceCaptureSpan {
+    binding: onnx_runtime_memory_api::BindingIdentity,
+    start: usize,
+    bytes: usize,
+}
+
+impl WorkspaceCaptureSpan {
+    pub fn binding(self) -> onnx_runtime_memory_api::BindingIdentity {
+        self.binding
+    }
+
+    pub fn require_context(
+        self,
+        expected: onnx_runtime_memory_api::ProviderContextIdentity,
+    ) -> Result<()> {
+        let actual = self.binding.provider_context();
+        if actual != expected {
+            return Err(crate::EpError::KernelFailed(format!(
+                "workspace capture pin belongs to provider context {actual:?}, expected {expected:?}; allocate capture workspace through this provider"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether one pinned owner covers the entire requested byte range.
+    pub fn covers(self, address: usize, bytes: usize) -> bool {
+        self.start
+            .checked_add(self.bytes)
+            .zip(address.checked_add(bytes))
+            .is_some_and(|(limit, end)| address >= self.start && end <= limit)
+    }
+}
+
 /// Immutable owner retained by an installed device graph.
 ///
-/// Kernels return these owners before capture begins so address-bearing
-/// resources are pinned before any CUDA node can embed their pointers.
+/// Kernels and executors return these owners before capture begins so address-
+/// bearing resources are pinned before any device node can embed their pointers.
+/// Workspace coverage is granted only by a validated binding-issued view.
 #[derive(Clone)]
 pub struct DeviceGraphResource {
     identity: usize,
     owner: Arc<dyn Any + Send + Sync>,
+    workspace_span: Option<WorkspaceCaptureSpan>,
 }
 
 impl DeviceGraphResource {
@@ -783,7 +821,42 @@ impl DeviceGraphResource {
     where
         T: Any + Send + Sync,
     {
-        Self { identity, owner }
+        Self {
+            identity,
+            owner,
+            workspace_span: None,
+        }
+    }
+
+    /// Pin a complete workspace through its binding-issued owner. Creation is
+    /// capture preparation work; it does not reserve or refund memory quota.
+    pub fn for_workspace(owner: &onnx_runtime_memory_api::OwningAllocation) -> Result<Self> {
+        let pin = owner.view(0, owner.len()).map_err(|error| crate::EpError::KernelFailed(format!(
+            "cannot pin workspace for device graph capture: {error}; retain its live binding-issued owner until graph retirement"
+        )))?;
+        let span = pin.binding().with_view(pin.view(), |validated| WorkspaceCaptureSpan {
+            binding: pin.allocation_identity().binding(),
+            start: validated.as_ptr().as_ptr() as usize,
+            bytes: validated.len(),
+        }).map_err(|error| crate::EpError::KernelFailed(format!(
+            "cannot validate workspace for device graph capture: {error}; allocate it through the active provider binding"
+        )))?;
+        if span.start.checked_add(span.bytes).is_none() {
+            return Err(crate::EpError::KernelFailed(
+                "workspace capture extent wraps the address space; use a valid binding allocation"
+                    .into(),
+            ));
+        }
+        let pin = Arc::new(pin);
+        Ok(Self {
+            identity: Arc::as_ptr(&pin) as usize,
+            owner: pin,
+            workspace_span: Some(span),
+        })
+    }
+
+    pub fn workspace_span(&self) -> Option<WorkspaceCaptureSpan> {
+        self.workspace_span
     }
 
     pub fn identity(&self) -> usize {

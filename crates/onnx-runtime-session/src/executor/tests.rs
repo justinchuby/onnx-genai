@@ -17605,3 +17605,119 @@ fn output_workspace_metadata_reaches_nested_control_flow_preparation() {
             .all(|facts| facts == &[OutputMetadata::tensor(DataType::Float32, &[3])])
     );
 }
+
+#[test]
+fn workspace_capture_pins_use_existing_lane_without_issuer_callbacks() {
+    let (mut executor, _ep, books, _manager) = completed_workspace_fixture(true);
+    let input = completed_workspace_input(2);
+    executor
+        .prepare_with_device_bindings(&[("input", &input)], &mut [])
+        .unwrap();
+    let callbacks = books.callbacks();
+    let first = executor.workspace_capture_resources().unwrap();
+    assert_eq!(first.len(), 1);
+    let prepared = executor.step_workspace.as_ref().unwrap();
+    assert!(
+        first[0]
+            .workspace_span()
+            .unwrap()
+            .covers(prepared.buffer.as_ptr() as usize, prepared.bytes)
+    );
+    let installed = first.clone();
+    let provisional = executor.workspace_capture_resources().unwrap();
+    assert_eq!(
+        prepared.buffer.bound_owner().unwrap().outstanding_views(),
+        2
+    );
+    drop(first);
+    drop(provisional);
+    assert_eq!(
+        prepared.buffer.bound_owner().unwrap().outstanding_views(),
+        1
+    );
+    drop(installed);
+    assert_eq!(
+        prepared.buffer.bound_owner().unwrap().outstanding_views(),
+        0
+    );
+    assert_eq!(books.callbacks(), callbacks);
+    assert_eq!(books.used(Tier::Host), 64);
+    drop(executor);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn workspace_capture_default_cannot_silently_discard_real_pins() {
+    let (mut executor, ep, _books, _manager) = completed_workspace_fixture(true);
+    executor
+        .prepare_with_device_bindings(&[("input", &completed_workspace_input(2))], &mut [])
+        .unwrap();
+    let resources = executor.workspace_capture_resources().unwrap();
+    let error = ep
+        .begin_owned_device_graph_capture(
+            executor.graph_owner,
+            DeviceGraphSlot::Primary,
+            None,
+            &[],
+            resources,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("implement begin_owned_device_graph_capture"),
+        "{error}"
+    );
+    assert_eq!(
+        executor
+            .step_workspace
+            .as_ref()
+            .unwrap()
+            .buffer
+            .bound_owner()
+            .unwrap()
+            .outstanding_views(),
+        0
+    );
+}
+
+#[test]
+fn workspace_capture_inherited_addresses_cannot_manufacture_ownership() {
+    let (mut executor, _ep, _books, _manager) = completed_workspace_fixture(true);
+    executor.inherited_workspace = InheritedWorkspaces {
+        persistent: Some((0x1000, 64)),
+        step: None,
+    };
+    let error = executor.workspace_capture_resources().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("parent executor that owns their backing")
+    );
+    executor.inherited_workspace = InheritedWorkspaces::default();
+}
+
+#[test]
+fn workspace_capture_cannot_silently_skip_unpinned_raw_backing() {
+    let (mut executor, _ep, _books, _manager) = completed_workspace_fixture(true);
+    let mut backing = [0u8; 64];
+    // SAFETY: this scoped backing remains live and exclusive until the test
+    // removes the borrowed lane; it is never handed to provider deallocation.
+    let buffer = unsafe {
+        DeviceBuffer::from_borrowed_mut_parts(
+            backing.as_mut_ptr().cast(),
+            onnx_runtime_ir::DeviceId::cpu(),
+            backing.len(),
+            1,
+        )
+    }
+    .unwrap();
+    executor.step_workspace = Some(PreparedWorkspace {
+        buffer: WorkspaceAllocation::new(buffer),
+        bytes: 64,
+        alignment: 1,
+    });
+    let error = executor.workspace_capture_resources().err().unwrap();
+    assert!(error.to_string().contains("binding-owned workspace"));
+    drop(executor.step_workspace.take());
+}

@@ -141,6 +141,30 @@ referencing graph slots. This preserves the old owner on refusal. Host contracts
 cover the ownership, pressure and failure paths; CUDA execution and throughput
 still require a device runner.
 
+### Workspace capture ownership
+
+The canonical owned-capture hook accepts caller resources alongside kernels.
+At each capture segment, the executor obtains real `OwnedView` pins from its
+binding-owned workspace lanes; it does not create a pin during normal inference.
+The installed graph retains those pins, and premature owner release remains
+refused while any segment references the allocation. Growth and pressure
+retirement still require graph retirement first; refusal or quarantine is not
+used as a normal release sequence.
+
+A workspace resource carries a private span derived through binding validation,
+including the provider-context identity. Arbitrary tokens cannot grant workspace
+coverage. CUDA combines caller and kernel resources once and validates all their
+workspace contexts before beginning capture. One active resource registry retains
+the same real resource Arcs as the graph lifecycle. Providers that do not retain
+caller resources explicitly refuse the capture rather than dropping pins.
+
+Raw workspace has no transferable binding ownership and is refused at this
+capture boundary. Inherited child views cannot manufacture a parent owner;
+independent capture must be driven by the executor that owns the backing. Current
+child execution remains scoped execution through the parent's live workspace.
+This bridge adds no allocator, pool, quota ledger, or warm inference callback.
+The remaining GQA metadata owner below has not yet moved into the composite.
+
 ### CUDA GQA temporary storage
 
 GQA uses one prepared composite for packed staging, Q/output transposes,

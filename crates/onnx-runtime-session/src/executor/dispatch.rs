@@ -327,6 +327,29 @@ impl Executor {
         Ok(())
     }
 
+    /// Capture is cold: pin each actual owned lane once per segment. Inherited
+    /// raw views cannot manufacture an independent capture ownership capability.
+    pub(super) fn workspace_capture_resources(
+        &self,
+    ) -> Result<Vec<onnx_runtime_ep_api::DeviceGraphResource>> {
+        if self.inherited_workspace.has_any() {
+            return Err(EpError::KernelFailed(
+                "independent capture cannot pin inherited raw workspace views; capture through the parent executor that owns their backing".into()
+            ).into());
+        }
+        [&self.persistent_workspace, &self.step_workspace]
+            .into_iter()
+            .flatten()
+            .filter(|prepared| !prepared.buffer.is_empty())
+            .map(|prepared| {
+                prepared.buffer.device_graph_resource()?.ok_or_else(|| EpError::KernelFailed(
+                    "device graph capture requires binding-owned workspace; allocate the lane through a provider that supplies generation-checked ownership before capture".into()
+                ))
+            })
+            .collect::<onnx_runtime_ep_api::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Run the plan against a [`CaptureSchedule`], interleaving captured device
     /// graphs with eager seam nodes.
     ///
@@ -374,12 +397,14 @@ impl Executor {
                 match mode {
                     RunMode::Capture => {
                         let token = {
+                            let resources = self.workspace_capture_resources()?;
                             let kernels = self.collect_segment_kernels(seg, resolved)?;
                             ep.begin_owned_device_graph_capture(
                                 self.graph_owner,
                                 self.graph_slot,
                                 self.cap().device_graph_token,
                                 &kernels,
+                                resources,
                             )?
                         };
                         self.cap_mut().device_graph_token = Some(token);
