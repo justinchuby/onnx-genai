@@ -201,8 +201,8 @@ pub struct Tensor {
     /// this crate produces.
     pub layout: TensorLayout,
     device: DeviceId,
-    /// `Some` while the tensor is live; taken by [`Drop`] to free exactly once.
-    buffer: Option<DeviceBuffer>,
+    /// Host strings own UTF-8 values, never a raw memory allocation.
+    storage: TensorStorage,
     /// The EP that allocated [`Tensor::buffer`] and must deallocate it.
     allocator: Arc<dyn ExecutionProvider>,
     /// Optional opaque guard that owns *foreign* memory this tensor merely
@@ -216,6 +216,34 @@ pub struct Tensor {
     /// crate (the Python binding) — this crate only stores and drops it, so it
     /// stays free of DLPack ABI knowledge.
     import_guard: Option<Box<dyn core::any::Any + Send + Sync>>,
+}
+
+enum TensorStorage {
+    Raw(Option<DeviceBuffer>),
+    Strings(Arc<Vec<String>>),
+}
+
+impl TensorStorage {
+    fn raw(&self) -> Option<&DeviceBuffer> {
+        match self {
+            Self::Raw(buffer) => buffer.as_ref(),
+            Self::Strings(_) => None,
+        }
+    }
+
+    fn raw_mut(&mut self) -> Option<&mut DeviceBuffer> {
+        match self {
+            Self::Raw(buffer) => buffer.as_mut(),
+            Self::Strings(_) => None,
+        }
+    }
+
+    fn take_raw(&mut self) -> Option<DeviceBuffer> {
+        match self {
+            Self::Raw(buffer) => buffer.take(),
+            Self::Strings(_) => None,
+        }
+    }
 }
 
 /// Debug counters for host traffic explicitly requested through a persistent
@@ -368,6 +396,11 @@ impl DeviceIoBinding {
             allocation_bytes,
             committed_ranges,
         } = spec;
+        if dtype == DataType::String {
+            return Err(SessionError::Internal(format!(
+                "device binding '{input_name}' cannot represent tensor(string); pass a Tensor::from_strings host input or collect a host output"
+            )));
+        }
         validate_logical_shape(&physical_shape, &logical_shape)?;
         let bytes = checked_expected_bytes(dtype, &physical_shape)
             .ok_or_else(|| SessionError::ShapeOverflow {
@@ -467,6 +500,11 @@ impl DeviceIoBinding {
             allocation_bytes: _,
             committed_ranges: _,
         } = spec;
+        if dtype == DataType::String {
+            return Err(SessionError::Internal(format!(
+                "external binding '{input_name}' cannot represent tensor(string); pass a Tensor::from_strings host input or collect a host output"
+            )));
+        }
         validate_logical_shape(&physical_shape, &logical_shape)?;
         let required = checked_expected_bytes(dtype, &physical_shape)
             .ok_or_else(|| SessionError::ShapeOverflow {
@@ -1121,7 +1159,7 @@ impl Tensor {
         shape: Vec<usize>,
     ) -> Result<Self> {
         let mut tensor = Self::allocate_cpu(dtype, shape)?;
-        let destination = tensor.buffer.as_mut().ok_or_else(|| {
+        let destination = tensor.storage.raw_mut().ok_or_else(|| {
             SessionError::Internal("new host output tensor has no backing buffer".into())
         })?;
         if source.len() != destination.len() {
@@ -1141,6 +1179,7 @@ impl Tensor {
     }
 
     pub(crate) fn allocate_cpu(dtype: DataType, shape: Vec<usize>) -> Result<Self> {
+        Self::require_raw_dtype(dtype)?;
         let numel = shape.iter().try_fold(1usize, |product, &dim| {
             product.checked_mul(dim).ok_or_else(|| {
                 SessionError::Internal(format!(
@@ -1161,14 +1200,14 @@ impl Tensor {
             shape,
             layout,
             device: buffer.device(),
-            buffer: Some(buffer),
+            storage: TensorStorage::Raw(Some(buffer)),
             allocator,
             import_guard: None,
         })
     }
 
     pub(crate) fn copy_from_host_at(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
-        let buffer = self.buffer.as_mut().ok_or_else(|| {
+        let buffer = self.storage.raw_mut().ok_or_else(|| {
             SessionError::Internal("Tensor buffer is unavailable for writing".to_string())
         })?;
         self.allocator.copy_from_host_at(bytes, buffer, offset)?;
@@ -1185,6 +1224,7 @@ impl Tensor {
         shape: Vec<usize>,
         bytes: &[u8],
     ) -> Result<Self> {
+        Self::require_raw_dtype(dtype)?;
         let expected =
             checked_expected_bytes(dtype, &shape).ok_or_else(|| SessionError::ShapeOverflow {
                 value: "Tensor::from_raw_in".to_string(),
@@ -1205,7 +1245,7 @@ impl Tensor {
             shape,
             layout,
             device: buffer.device(),
-            buffer: Some(buffer),
+            storage: TensorStorage::Raw(Some(buffer)),
             allocator,
             import_guard: None,
         })
@@ -1222,6 +1262,7 @@ impl Tensor {
     /// these bytes twice and memcpys between them, which on a hybrid decoder's
     /// per-layer `conv_state`/`recurrent_state` is the whole cost of the call.
     pub fn zeros(dtype: DataType, shape: Vec<usize>) -> Result<Self> {
+        Self::require_raw_dtype(dtype)?;
         let allocator = shared_cpu_ep();
         let numel: usize = shape.iter().product();
         let expected = dtype.storage_bytes(numel);
@@ -1331,7 +1372,7 @@ impl Tensor {
             shape,
             layout: TensorLayout::contiguous(),
             device,
-            buffer: Some(buffer),
+            storage: TensorStorage::Raw(Some(buffer)),
             allocator,
             import_guard: None,
         }
@@ -1355,12 +1396,55 @@ impl Tensor {
         Self::from_raw(DataType::Int64, shape.to_vec(), &bytes)
     }
 
+    fn require_raw_dtype(dtype: DataType) -> Result<()> {
+        if dtype == DataType::String {
+            return Err(SessionError::Internal(
+                "tensor(string) has no raw layout; use Tensor::from_strings and Tensor::as_strings"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Build a host string tensor, taking ownership of its UTF-8 elements.
+    pub fn from_strings(shape: Vec<usize>, values: Vec<String>) -> Result<Self> {
+        let count =
+            onnx_runtime_ir::checked_numel(&shape).ok_or_else(|| SessionError::ShapeOverflow {
+                value: "Tensor::from_strings".into(),
+                dims: shape.clone(),
+            })?;
+        if count != values.len() {
+            return Err(SessionError::Internal(format!(
+                "Tensor::from_strings: shape {shape:?} requires {count} elements, got {}",
+                values.len()
+            )));
+        }
+        let allocator = shared_cpu_ep();
+        Ok(Self {
+            dtype: DataType::String,
+            shape,
+            layout: TensorLayout::contiguous(),
+            device: allocator.device_id(),
+            storage: TensorStorage::Strings(Arc::new(values)),
+            allocator,
+            import_guard: None,
+        })
+    }
+
+    /// Borrow the row-major UTF-8 elements of a string tensor.
+    pub fn as_strings(&self) -> Option<&[String]> {
+        match &self.storage {
+            TensorStorage::Strings(values) => Some(values),
+            TensorStorage::Raw(_) => None,
+        }
+    }
+
     pub(crate) fn into_shared_parts(
         mut self,
     ) -> (Arc<SharedTensorBuffer>, DataType, Vec<usize>, TensorLayout) {
         let buffer = self
-            .buffer
-            .take()
+            .storage
+            .take_raw()
             .expect("Tensor buffer taken only by into_shared_parts or Drop");
         let storage = SharedTensorBuffer::with_guard(
             Arc::clone(&self.allocator),
@@ -1419,7 +1503,7 @@ impl Tensor {
             shape,
             layout,
             device: buffer.device(),
-            buffer: Some(buffer),
+            storage: TensorStorage::Raw(Some(buffer)),
             allocator,
             import_guard: Some(guard),
         }
@@ -1440,7 +1524,7 @@ impl Tensor {
     /// `kDLCUDA` tensor without a host round-trip. Returns null for an empty
     /// (zero-element) tensor.
     pub fn device_ptr(&self) -> *const std::ffi::c_void {
-        if self.numel() == 0 {
+        if self.dtype == DataType::String || self.numel() == 0 {
             std::ptr::null()
         } else {
             self.buffer().as_ptr()
@@ -1460,13 +1544,25 @@ impl Tensor {
         Ok(())
     }
 
-    /// Deep-copy this tensor while reporting allocation and shape failures.
+    /// Clone this tensor while reporting allocation and shape failures.
+    /// The immutable payload of a string tensor is shared.
     ///
     /// Prefer this over [`Clone`] in fallible runtime control-flow paths where an
     /// allocator failure must be propagated instead of panicking.
     pub fn try_clone(&self) -> SequenceResult<Tensor> {
         const OP: &str = "Tensor::try_clone";
         let shape = clone_shape(OP, &self.shape)?;
+        if let TensorStorage::Strings(values) = &self.storage {
+            return Ok(Self {
+                shape,
+                dtype: self.dtype,
+                layout: self.layout.clone(),
+                device: self.device,
+                storage: TensorStorage::Strings(Arc::clone(values)),
+                allocator: Arc::clone(&self.allocator),
+                import_guard: None,
+            });
+        }
         if checked_expected_bytes(self.dtype, &shape).is_none() {
             return Err(SequenceError::ShapeOverflow {
                 op: OP,
@@ -1484,12 +1580,14 @@ impl Tensor {
     }
 
     fn buffer(&self) -> &DeviceBuffer {
-        self.buffer
-            .as_ref()
-            .expect("Tensor buffer taken only in Drop")
+        self.storage
+            .raw()
+            .expect("tensor(string) has no raw bytes; use Tensor::as_strings")
     }
 
-    /// Borrow the raw little-endian element bytes (host tensors only).
+    /// Borrow raw little-endian element bytes (fixed-width host tensors only).
+    ///
+    /// For `tensor(string)`, use [`Self::as_strings`] instead.
     pub fn as_bytes(&self) -> &[u8] {
         let n = self.dtype.storage_bytes(self.numel());
         &host_bytes(self.buffer())[..n]
@@ -1499,6 +1597,7 @@ impl Tensor {
     /// buffer. Used by control-flow iteration inputs whose dtype/shape stay
     /// constant while their values change.
     pub(crate) fn overwrite_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        Self::require_raw_dtype(self.dtype)?;
         let expected = self.dtype.storage_bytes(self.numel());
         if bytes.len() != expected {
             return Err(SessionError::Internal(format!(
@@ -1509,8 +1608,8 @@ impl Tensor {
             )));
         }
         let buffer = self
-            .buffer
-            .as_mut()
+            .storage
+            .raw_mut()
             .expect("Tensor buffer taken only in Drop");
         self.allocator.copy_from_host(bytes, buffer)?;
         Ok(())
@@ -1599,7 +1698,7 @@ impl std::fmt::Debug for Tensor {
 
 impl Drop for Tensor {
     fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
+        if let Some(buffer) = self.storage.take_raw() {
             // `DeviceBuffer` has no `Drop`; the owning EP must free it exactly
             // once (ep-api §4.4 invariant #2). Errors here cannot be surfaced
             // from `drop`, so we swallow them — a failed free leaks, never
