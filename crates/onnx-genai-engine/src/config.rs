@@ -1682,8 +1682,11 @@ fn describe_supported(contract: &GenerationContract) -> String {
 /// Built-in constrained decoding grammars.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateConstraint {
-    /// Constrain output to one complete, well-formed JSON value.
-    Json,
+    /// Constrain the existing prefix plus new output to one complete JSON value.
+    Json {
+        /// Existing assistant content consumed by the grammar, excluded from new output.
+        prefix: String,
+    },
     /// Constrain output to a JSON value accepted by the provided JSON Schema.
     JsonSchema(String),
     /// Constrain output to text matching the provided Rust regular expression.

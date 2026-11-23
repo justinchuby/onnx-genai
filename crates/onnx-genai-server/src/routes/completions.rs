@@ -2279,7 +2279,18 @@ fn validate_sampling_range(value: Option<f32>, field: &str) -> Result<(), ApiErr
 
 fn response_format_constraint(request: &ChatCompletionRequest) -> Option<GenerateConstraint> {
     match request.response_format.as_ref()? {
-        ResponseFormat::JsonObject => Some(GenerateConstraint::Json),
+        ResponseFormat::JsonObject => Some(GenerateConstraint::Json {
+            prefix: if request.continue_final_message {
+                request
+                    .messages
+                    .last()
+                    .and_then(|message| message.content.as_ref())
+                    .map(|content| content.text())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            },
+        }),
         ResponseFormat::JsonSchema { json_schema } => serde_json::to_string(&json_schema.schema)
             .ok()
             .map(GenerateConstraint::JsonSchema),

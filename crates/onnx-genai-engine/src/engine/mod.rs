@@ -1628,7 +1628,9 @@ mod tests {
             repetition_penalty: 1.1,
             frequency_penalty: 0.2,
             presence_penalty: 0.3,
-            constraint: Some(GenerateConstraint::Json),
+            constraint: Some(GenerateConstraint::Json {
+                prefix: String::new(),
+            }),
             ..Default::default()
         };
 
@@ -1759,7 +1761,9 @@ mod tests {
     #[test]
     fn json_constraint_defers_stop_until_value_is_complete() {
         let options = GenerateOptions {
-            constraint: Some(GenerateConstraint::Json),
+            constraint: Some(GenerateConstraint::Json {
+                prefix: String::new(),
+            }),
             stop_sequences: vec![StopSequence::Text("}".to_string())],
             ..Default::default()
         };
@@ -1790,7 +1794,9 @@ mod tests {
     #[test]
     fn incomplete_json_constraint_rejects_length_finishes() {
         let options = GenerateOptions {
-            constraint: Some(GenerateConstraint::Json),
+            constraint: Some(GenerateConstraint::Json {
+                prefix: String::new(),
+            }),
             ..Default::default()
         };
         for reason in [FinishReason::MaxTokens, FinishReason::Length] {

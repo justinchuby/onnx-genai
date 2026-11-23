@@ -48,9 +48,9 @@ pub(crate) fn build_processor_chain(
         let tokenizer = tokenizer.context("constrained decoding requires a tokenizer")?;
         let token_texts = tokenizer_token_texts(tokenizer);
         match constraint {
-            GenerateConstraint::Json => {
+            GenerateConstraint::Json { prefix } => {
                 chain.add(Box::new(ConstraintProcessor::new(
-                    Box::new(JsonConstraint),
+                    Box::new(JsonConstraint::new(prefix.clone())?),
                     token_texts,
                     terminal_token_ids(options),
                 )));
@@ -431,18 +431,26 @@ fn build_llguidance_constraint(
     }
 }
 
+fn constrained_json_is_complete(options: &GenerateOptions, generated: &str) -> Option<bool> {
+    let GenerateConstraint::Json { prefix } = options.constraint.as_ref()? else {
+        return None;
+    };
+    if prefix.is_empty() {
+        Some(JsonConstraint::is_complete(generated))
+    } else {
+        Some(JsonConstraint::is_complete(&format!("{prefix}{generated}")))
+    }
+}
+
 pub(crate) fn ensure_constrained_finish(
     options: &GenerateOptions,
     generated_text: &str,
     finish_reason: FinishReason,
 ) -> anyhow::Result<()> {
     if matches!(
-        (&options.constraint, finish_reason),
-        (
-            Some(GenerateConstraint::Json),
-            FinishReason::MaxTokens | FinishReason::Length
-        )
-    ) && !JsonConstraint::is_complete(generated_text)
+        finish_reason,
+        FinishReason::MaxTokens | FinishReason::Length
+    ) && constrained_json_is_complete(options, generated_text) == Some(false)
     {
         anyhow::bail!(
             "JSON constrained decoding stopped before a complete JSON value; increase max_new_tokens or max_context"
@@ -506,8 +514,7 @@ pub(crate) fn finish_reason_after_token(
 
     match chain.signal(context) {
         Some(ProcessorSignal::StopSequence { index })
-            if !matches!(&options.constraint, Some(GenerateConstraint::Json))
-                || JsonConstraint::is_complete(&context.generated_text) =>
+            if constrained_json_is_complete(options, &context.generated_text) != Some(false) =>
         {
             Some(FinishReason::StopSequence { index })
         }
@@ -1467,6 +1474,32 @@ mod ordered_sampler_tests {
         assert_eq!(
             logits,
             vec![3.0, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY]
+        );
+    }
+}
+
+#[cfg(test)]
+mod json_continuation_tests {
+    use super::*;
+    #[test]
+    fn json_continuation_finish_and_stop_use_prefix_plus_suffix() {
+        let options = GenerateOptions {
+            constraint: Some(GenerateConstraint::Json { prefix: "{".into() }),
+            ..Default::default()
+        };
+        ensure_constrained_finish(&options, "}", FinishReason::MaxTokens).unwrap();
+        assert!(ensure_constrained_finish(&options, "", FinishReason::Length).is_err());
+        let mut chain = ProcessorChain::new();
+        chain.add(Box::new(StopSequenceProcessor::new(vec![
+            StopSequence::Text("}".into()),
+        ])));
+        let context = ProcessorContext {
+            generated_text: "}".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            finish_reason_after_token(5, &options, &chain, &context),
+            Some(FinishReason::StopSequence { index: 0 })
         );
     }
 }

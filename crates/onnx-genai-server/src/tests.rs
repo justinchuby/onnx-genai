@@ -6294,7 +6294,7 @@ mod llama_compat {
         for (field, value, expected) in [
             (
                 "response_format",
-                json!({"type":"json_object"}),
+                json!({"type":"json_schema","json_schema":{"name":"object","schema":{"type":"object"}}}),
                 "grammar state",
             ),
             (
@@ -6331,6 +6331,63 @@ mod llama_compat {
                 "{error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn json_continuation_generates_only_the_valid_missing_suffix() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        vocab.remove("world");
+        vocab.insert("}".into(), json!(5));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("json-prefix".into())).unwrap());
+        let mut body = json!({"messages":[{"role":"assistant","content":"{"}],"continue_final_message":true,
+            "add_generation_prompt":false,"response_format":{"type":"json_object"},"max_tokens":1,"temperature":0,"logit_bias":{"5":1000,"3":10000}});
+        let (status, result) =
+            call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["choices"][0]["message"]["content"], "}");
+        assert_eq!(result["usage"]["completion_tokens"], 1);
+        body["stream"] = json!(true);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = sse_json_events(&bytes)
+            .iter()
+            .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+            .collect::<String>();
+        assert_eq!(text, "}");
+        body["messages"][0]["content"] = json!("not JSON");
+        let (status, error) = call(router, "POST", "/v1/chat/completions", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("valid partial JSON"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

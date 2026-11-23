@@ -593,3 +593,19 @@ Unicode and original whitespace, earlier matching text, dropped/duplicated/
 transformed content, shared count/generation preparation, buffered and SSE HTTP,
 and actionable refusal of conflicting flags, tool-call/reasoning-only prefixes,
 JSON grammar without prefix state, and persistent-session replay.
+
+JSON-prefix follow-up: the typed `GenerateConstraint::Json` now owns its existing
+text prefix. The shared JSON recognizer consumes that prefix plus the generated
+suffix, while response bytes and usage remain suffix-only. The same joined text
+controls EOS masks, stop-sequence completion and output-budget validation.
+Non-continuation callers explicitly construct an empty prefix; all internal and
+HTTP integration callers are updated without retaining the old unit variant.
+Invalid prefixes fail before HTTP inference admission and at engine constraint
+construction. JSON Schema still needs its own llguidance prefix-state contract.
+
+JSON-prefix validation: both selected engine continuation cases passed; all four
+selected server continuation cases passed, including real buffered/SSE suffix-only
+generation and a forbidden premature EOS with stronger bias than the valid token.
+Full native engine library: 837 passed / 1 inherited ignore. Full server library:
+403 passed / 2 inherited ignores. Strict engine/server all-target Clippy passed,
+including compilation of the updated public HTTP request-mapping tests.

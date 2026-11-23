@@ -236,9 +236,12 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
         }
     }
     if request.continue_final_message {
-        if request.wants_constrained_json() {
+        if matches!(
+            request.response_format,
+            Some(crate::types::ResponseFormat::JsonSchema { .. })
+        ) {
             return Err(ApiError::invalid_request(
-                "continue_final_message with response_format JSON requires grammar state seeded from the assistant prefix; use unconstrained text continuation until prefix-aware grammar admission is available",
+                "continue_final_message with response_format JSON Schema requires grammar state seeded from the assistant prefix; use json_object or unconstrained text continuation until prefix-aware schema grammar admission is available",
             ));
         }
         if request.add_generation_prompt {
@@ -256,6 +259,21 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
             return Err(ApiError::invalid_request(
                 "continue_final_message cannot resume an assistant message containing tool_calls; finish the tool results before continuing",
             ));
+        }
+        if matches!(
+            request.response_format,
+            Some(crate::types::ResponseFormat::JsonObject)
+        ) {
+            let prefix = last
+                .content
+                .as_ref()
+                .map(|content| content.text())
+                .unwrap_or_default();
+            onnx_genai_engine::JsonConstraint::new(prefix).map_err(|error| {
+                ApiError::invalid_request(format!(
+                    "continue_final_message JSON prefix rejected: {error}"
+                ))
+            })?;
         }
         if last
             .content

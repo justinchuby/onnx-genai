@@ -508,9 +508,20 @@ impl LogitProcessor for ConstraintProcessor {
 /// tokens that keep the prefix valid and completable. EOS is allowed only after
 /// a complete, balanced JSON value. JSON Schema constraints are future work.
 #[derive(Debug, Clone, Default)]
-pub struct JsonConstraint;
+pub struct JsonConstraint {
+    prefix: String,
+}
 
 impl JsonConstraint {
+    /// Seed the recognizer with existing output, leaving new-token history separate.
+    pub fn new(prefix: String) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            Self::prefix_is_valid(&prefix),
+            "JSON constraint prefix is not a valid partial JSON value; continue a syntactically valid JSON prefix or omit constrained JSON output"
+        );
+        Ok(Self { prefix })
+    }
+
     pub fn prefix_is_valid(text: &str) -> bool {
         JsonPrefixParser::parse(text).is_ok()
     }
@@ -526,7 +537,12 @@ impl Constraint for JsonConstraint {
         context: &ProcessorContext,
         candidates: &[TokenCandidate],
     ) -> Vec<bool> {
-        let complete = Self::is_complete(&context.generated_text);
+        let generated = if self.prefix.is_empty() {
+            std::borrow::Cow::Borrowed(context.generated_text.as_str())
+        } else {
+            std::borrow::Cow::Owned(format!("{}{}", self.prefix, context.generated_text))
+        };
+        let complete = Self::is_complete(&generated);
         candidates
             .iter()
             .map(|candidate| {
@@ -537,9 +553,8 @@ impl Constraint for JsonConstraint {
                 if candidate.text.is_empty() {
                     return false;
                 }
-                let mut next =
-                    String::with_capacity(context.generated_text.len() + candidate.text.len());
-                next.push_str(&context.generated_text);
+                let mut next = String::with_capacity(generated.len() + candidate.text.len());
+                next.push_str(&generated);
                 next.push_str(&candidate.text);
                 Self::prefix_is_valid(&next)
             })
@@ -4518,7 +4533,7 @@ mod tests {
 
     fn generate_scripted_json(script: &[TokenId], eos_token_id: TokenId) -> String {
         let processor = ConstraintProcessor::new(
-            Box::new(JsonConstraint),
+            Box::new(JsonConstraint::default()),
             json_token_texts(),
             vec![eos_token_id],
         );
@@ -4552,9 +4567,46 @@ mod tests {
     }
 
     #[test]
+    fn json_continuation_prefix_controls_initial_and_complete_masks() {
+        assert!(
+            JsonConstraint::new("not JSON".into())
+                .unwrap_err()
+                .to_string()
+                .contains("valid partial JSON")
+        );
+        let processor = ConstraintProcessor::new(
+            Box::new(JsonConstraint::new("{\"a\":".into()).unwrap()),
+            json_token_texts(),
+            vec![14],
+        );
+        let mut logits = vec![0.0; json_token_texts().len()];
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
+        assert!(logits[5].is_finite()); // 1 may complete the pending value.
+        assert_eq!(logits[6], f32::NEG_INFINITY); // } cannot omit that value.
+        assert_eq!(logits[14], f32::NEG_INFINITY);
+        let mut logits = vec![0.0; json_token_texts().len()];
+        processor
+            .process(
+                &mut logits,
+                &ProcessorContext {
+                    generated_text: "1}".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(logits[14].is_finite());
+        assert_eq!(logits[1], f32::NEG_INFINITY);
+    }
+
+    #[test]
     fn json_constraint_masks_invalid_tokens_and_allows_eos_only_when_complete() {
-        let processor =
-            ConstraintProcessor::new(Box::new(JsonConstraint), json_token_texts(), vec![14]);
+        let processor = ConstraintProcessor::new(
+            Box::new(JsonConstraint::default()),
+            json_token_texts(),
+            vec![14],
+        );
 
         let mut logits = vec![0.0; json_token_texts().len()];
         logits[6] = 10.0;

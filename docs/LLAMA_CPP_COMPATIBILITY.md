@@ -163,9 +163,14 @@ Explicit content continuation accepts `continue_final_message=true` with
 boundary is proven by a second render rather than guessed from an EOS spelling
 or an earlier matching quote; original prefix whitespace is preserved. Template
 rendering, token counting and generation share this prompt. Tool-call messages,
-reasoning-only continuation, constrained JSON without a prefix-seeded grammar,
+reasoning-only continuation, JSON Schema without a prefix-seeded llguidance state,
 and replay into a persistent inference session are still rejected with actionable errors. Thinking budgets and other unsupported
 active controls also remain explicit request errors.
+`response_format: {"type":"json_object"}` continuation validates the original
+assistant prefix as partial JSON and constrains prefix plus new suffix at each
+step. EOS, stop sequences and output-budget completion use that same complete
+value; only newly generated suffix bytes and tokens appear in the response.
+Invalid JSON prefixes are rejected before inference admission.
 Optional progress/control subscription fields from Llama Chat are accepted, but
 `/props.nxrt_capabilities` advertises resumable streams and reports realtime
 reasoning control as unavailable. Per-token timing/progress events are not promised.
