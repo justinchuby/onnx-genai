@@ -1,6 +1,7 @@
 //! Model-token constraints over the shared declared response projection.
 use crate::json_cursor::{JsonByteBudgetExceeded, JsonByteCursor, JsonCandidate};
-use crate::logits::{Constraint, ProcessorContext, TokenCandidate, TokenId, canonical_json_prefix};
+use crate::json_prefix::{InvalidJsonEscape, JsonPrefix};
+use crate::logits::{Constraint, ProcessorContext, TokenCandidate, TokenId};
 use crate::response_template::{
     IncompleteResponseUtf8, MissingResponseField, NonMonotonicProjection, PrefixOutput,
     ResponseBufferExceeded, ResponseParser, ResponseTemplate, projection_extension,
@@ -91,9 +92,18 @@ impl ResponseJsonConstraint {
         let parser =
             ResponseParser::new(template.clone(), prefix, PrefixOutput::Include, max_bytes)?;
         let raw = parser.json_content(false);
-        let canonical = canonical_json_prefix(&raw)?.into_owned();
         let mut json = JsonByteCursor::new(schema, max_bytes)?;
-        json.commit(canonical.as_bytes()).context("rendered assistant prefill is not a viable projected JSON prefix; repair the selected content prefix or schema")?;
+        let normalized = JsonPrefix::parse(&raw)?;
+        ensure!(
+            matches!(
+                normalized.preview(&mut json, "", b"")?,
+                JsonCandidate::Viable { .. }
+            ),
+            "rendered assistant prefill is not a viable projected JSON prefix; repair the selected content prefix or schema"
+        );
+        let canonical = normalized.canonical;
+        json.commit(canonical.as_bytes())
+            .context("commit normalized assistant prefill to the projected JSON recognizer")?;
         Ok(Self {
             template,
             prefix: prefix.into(),
@@ -123,7 +133,7 @@ impl ResponseJsonConstraint {
         state.decoder = TokenTextDecoder::new(SpecialTokenHandling::Preserve);
         state.history.clear();
         state.raw = state.parser.json_content(false);
-        state.canonical = canonical_json_prefix(&state.raw)?.into_owned();
+        state.canonical = JsonPrefix::parse(&state.raw)?.canonical;
         state.json.reset();
         state.json.commit(state.canonical.as_bytes())?;
         state.ended = false;
@@ -146,20 +156,9 @@ impl ResponseJsonConstraint {
         } else {
             view.grammar_json_content()
         };
-        let canonical = canonical_json_prefix(&grammar)?;
+        let normalized = JsonPrefix::parse(&grammar)?;
         let pending = view.pending_json_bytes()?.unwrap_or_default();
-        let combined;
-        let bytes = if pending.is_empty() {
-            canonical.as_bytes()
-        } else {
-            combined = [canonical.as_bytes(), pending].concat();
-            &combined
-        };
-        let status = if let Some(suffix) = bytes.strip_prefix(base_canonical.as_bytes()) {
-            json.preview(suffix)?
-        } else {
-            json.preview_root(bytes)?
-        };
+        let status = normalized.preview(json, base_canonical, pending)?;
         if let JsonCandidate::Viable { complete } = status
             && (!terminal || complete)
         {
@@ -168,12 +167,8 @@ impl ResponseJsonConstraint {
         // End trimming can hide whitespace only after a complete value. An
         // incomplete JSON string must validate its provisional trailing data.
         if pending.is_empty() || view.pending_can_be_trimmed() {
-            let trimmed = canonical_json_prefix(&published)?;
-            let status = if let Some(suffix) = trimmed.strip_prefix(base_canonical) {
-                json.preview(suffix.as_bytes())?
-            } else {
-                json.preview_root(trimmed.as_bytes())?
-            };
+            let trimmed = JsonPrefix::parse(&published)?;
+            let status = trimmed.preview(json, base_canonical, b"")?;
             return Ok(matches!(status, JsonCandidate::Viable { complete: true }));
         }
         Ok(false)
@@ -226,6 +221,7 @@ impl ResponseJsonConstraint {
                     || error.is::<ResponseBufferExceeded>()
                     || error.is::<JsonByteBudgetExceeded>()
                     || error.is::<NonMonotonicText>()
+                    || error.is::<InvalidJsonEscape>()
                     || error.is::<NonMonotonicProjection>() =>
             {
                 Ok(false)
@@ -254,7 +250,7 @@ impl ResponseJsonConstraint {
         };
         if projection_extension(&raw, &state.raw, self.endings.contains(&id), "content")?.is_some()
         {
-            let canonical = canonical_json_prefix(&raw)?.into_owned();
+            let canonical = JsonPrefix::parse(&raw)?.canonical;
             if let Some(suffix) = canonical.strip_prefix(&state.canonical) {
                 state.json.commit(suffix.as_bytes())?;
             } else {
@@ -413,6 +409,67 @@ mod tests {
             )
             .unwrap();
         logits
+    }
+
+    #[test]
+    fn response_json_processor_checks_split_escapes_in_generation_and_existing_prefill() {
+        let tokenizer = byte_tokenizer(
+            true,
+            &[
+                (4, "\\"),
+                (5, "u"),
+                (6, "0"),
+                (7, "4"),
+                (8, "1"),
+                (9, "2"),
+                (16, "\""),
+                (22, "[/r]\""),
+                (23, "\\ud800\\u0000"),
+            ],
+        );
+        let mut options = options();
+        if let Some(GenerateConstraint::ResponseJson { schema, .. }) = &mut options.constraint {
+            *schema = json!({"const":"A"});
+        }
+        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        for history in [
+            vec![22],
+            vec![22, 4],
+            vec![22, 4, 5],
+            vec![22, 4, 5, 6],
+            vec![22, 4, 5, 6, 6],
+            vec![22, 4, 5, 6, 6, 7],
+        ] {
+            let logits = mask(&chain, &history);
+            assert!(
+                !logits[3].is_finite() && !logits[16].is_finite() && !logits[23].is_finite(),
+                "{history:?}"
+            );
+        }
+        let pending = mask(&chain, &[22, 4, 5, 6, 6, 7]);
+        assert!(pending[8].is_finite() && !pending[9].is_finite());
+        assert!(mask(&chain, &[22, 4, 5, 6, 6, 7, 8])[16].is_finite());
+        assert!(mask(&chain, &[22, 4, 5, 6, 6, 7, 8, 16])[3].is_finite());
+        // Replacing the generated history must recover the pending scalar domain.
+        assert_eq!(pending, mask(&chain, &[22, 4, 5, 6, 6, 7]));
+
+        let spelling = r#""\u0041""#;
+        let ids = [16, 4, 5, 6, 6, 7, 8, 16];
+        for split in 0..=spelling.len() {
+            if let Some(GenerateConstraint::ResponseJson { prefix, .. }) = &mut options.constraint {
+                *prefix = format!("A[r]old[/r]{}", &spelling[..split]);
+            }
+            let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+            let mut history = Vec::new();
+            for &id in &ids[split..] {
+                assert!(
+                    mask(&chain, &history)[id as usize].is_finite(),
+                    "split {split}, history {history:?}, next {id}"
+                );
+                history.push(id);
+            }
+            assert!(mask(&chain, &history)[3].is_finite(), "split {split}");
+        }
     }
 
     #[test]

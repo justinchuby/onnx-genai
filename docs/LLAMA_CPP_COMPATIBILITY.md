@@ -193,9 +193,17 @@ before generation/SSE admission. Supported combinations currently use literal
 boundaries or regex boundaries with a resolved byte DFA, plus root
 ByteLevel/ByteFallback or canonical non-byte decoders. Pending Unicode bytes,
 regex priority, greedy/lazy continuations and EOF assertions share the publication
-parser's boundary rules. Regexes requiring unsupported DFA look assertions,
-contextual byte-decoder sequences and incomplete Unicode escape spelling remain
-open compatibility work. Forced tool/Lark output policies during
+parser's boundary rules. Regexes requiring unsupported DFA look assertions
+and contextual byte-decoder sequences remain open compatibility work.
+Projected JSON accepts split Unicode escapes and surrogate pairs, including
+string constants, known property names, string patterns and scalar length limits.
+An unfinished escape must have a schema-valid scalar completion and never permits
+EOF. Original prompt and output spelling is retained. Escaped DEL in a schema-declared
+property name still has a backend lexical mismatch; its previously supported raw
+key spelling is preserved. Ordinary string values and free property names accept
+escaped DEL. Plain token-trie JSON Schema
+generation still requires equivalent escape support.
+Forced tool/Lark output policies during
 reasoning continuation and thinking-budget controls also remain unsupported.
 
 Without explicit continuation, declared content/reasoning text in the template
