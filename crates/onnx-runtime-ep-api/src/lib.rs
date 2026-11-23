@@ -35,6 +35,7 @@
 
 pub mod abi;
 pub mod affine_gather;
+pub mod attention_window;
 pub mod bit_cast;
 pub mod epcontext;
 pub mod host_parallel;
@@ -54,12 +55,13 @@ pub use error::{EpError, Result};
 pub use host_parallel::HostParallel;
 pub use kernel::{
     ARG_BYTES, ARG_DEVICE, ARG_FLOPS, ARG_KERNEL_VARIANT, ARG_KERNEL_VARIANT_REASON,
-    BlockQuantizedMoeTraffic, CAT_KERNEL_WORKER, CaptureSupport, Cost, DeviceGraphResource, Kernel,
-    KernelConstantInput, KernelInput, KernelMatch, KernelSizedOutput, KernelSizedOutputMetadata,
-    KernelSizedOutputPolicy, KernelVariantSelection, TensorMetadata, ViewOutput, WorkspaceLifetime,
-    WorkspacePlanning, WorkspaceRequirement, WorkspaceView, kernel_variant_tracing_enabled,
-    kernel_worker_span, record_kernel_metrics, record_kernel_variant_selection,
-    record_kernel_variant_stage_selection, structural_input_bytes,
+    BlockQuantizedMoeTraffic, CAT_KERNEL_WORKER, CaptureSupport, Cost, DeviceGraphResource,
+    HostKernelData, HostKernelOutput, HostStringInput, Kernel, KernelConstantInput, KernelInput,
+    KernelMatch, KernelSizedOutput, KernelSizedOutputMetadata, KernelSizedOutputPolicy,
+    KernelVariantSelection, TensorMetadata, ViewOutput, WorkspaceLifetime, WorkspacePlanning,
+    WorkspaceRequirement, WorkspaceView, kernel_variant_tracing_enabled, kernel_worker_span,
+    record_kernel_metrics, record_kernel_variant_selection, record_kernel_variant_stage_selection,
+    structural_input_bytes,
 };
 pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{

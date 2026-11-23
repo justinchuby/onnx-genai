@@ -377,6 +377,30 @@ fn opset26_bitcast_and_cumprod_validate_while_preserving_shape() {
 }
 
 #[test]
+fn text_ops_infer_broadcast_match_and_dynamic_split_shapes() {
+    let a = tin(DataType::String, vec![c(2), c(1)]);
+    let b = tin(DataType::String, vec![c(0)]);
+    let concat = run(&node("StringConcat", 2, 1), vec![a, b], 20);
+    assert_eq!(out_dtype(&concat), DataType::String);
+    assert_eq!(out_shape(&concat), [c(2), c(0)]);
+
+    let x = || tin(DataType::String, vec![sym(0), c(3)]);
+    let matched = run(&node("RegexFullMatch", 1, 1), vec![x()], 20);
+    assert_eq!(out_dtype(&matched), DataType::Bool);
+    assert_eq!(out_shape(&matched), [sym(0), c(3)]);
+
+    let split = run(&node("StringSplit", 1, 2), vec![x()], 20);
+    assert_eq!(out_dtype(&split), DataType::String);
+    let parts = out_shape(&split);
+    assert_eq!(&parts[..2], &[sym(0), c(3)]);
+    assert_eq!(parts.len(), 3);
+    assert!(parts[2].as_symbol().is_some());
+    assert_ne!(parts[2], sym(0));
+    assert_eq!(out_dtype(&split[1..]), DataType::Int64);
+    assert_eq!(out_shape(&split[1..]), [sym(0), c(3)]);
+}
+
+#[test]
 fn standard_math_opset_gate_and_shape_contracts() {
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
         let arity = if ["SwiGLU", "GeGLU"].contains(&name) {
@@ -510,7 +534,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        232,
+        235,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -519,7 +543,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        277,
+        280,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -7175,6 +7199,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "ReduceProd", 1),
     ("", "ReduceSum", 1),
     ("", "ReduceSumSquare", 1),
+    ("", "RegexFullMatch", 20),
     ("", "Relu", 1),
     ("", "Reshape", 1),
     ("", "Resize", 10),
@@ -7218,7 +7243,9 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Sqrt", 1),
     ("", "Squeeze", 1),
     ("", "Squeeze", 13),
+    ("", "StringConcat", 20),
     ("", "StringNormalizer", 10),
+    ("", "StringSplit", 20),
     ("", "Sub", 1),
     ("", "Sum", 1),
     ("", "SwiGLU", 28),

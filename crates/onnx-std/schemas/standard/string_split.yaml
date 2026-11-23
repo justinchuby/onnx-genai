@@ -1,0 +1,15 @@
+# ONNX 622adf94d4e720142950aa8178f7357d52e63db0, onnx/defs/text/defs.cc
+name: StringSplit
+since_version: 20
+doc: Split each UTF-8 string and pad substring rows to the longest row.
+inputs: [{ name: X, type_str: T1 }]
+outputs:
+  - { name: Y, type_str: T2 }
+  - { name: Z, type_str: T3 }
+attributes:
+  - { name: delimiter, type: string }
+  - { name: maxsplit, type: int }
+type_constraints:
+  - { type_param: T1, allowed: [string] }
+  - { type_param: T2, allowed: [string] }
+  - { type_param: T3, allowed: [int64] }
