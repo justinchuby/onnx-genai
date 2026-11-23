@@ -175,6 +175,8 @@ fn measure(device: &str, build: impl Fn(Graph) -> InferenceSession) {
                 .collect();
             let a = candidate.run(&inputs).unwrap()[0].to_vec_f32();
             let b = baseline.run(&inputs).unwrap()[0].to_vec_f32();
+            assert!(!a.is_empty());
+            assert_eq!(a.len(), b.len());
             assert!(
                 a.iter()
                     .zip(&b)
@@ -209,6 +211,9 @@ fn measure(device: &str, build: impl Fn(Graph) -> InferenceSession) {
             };
             sample(&mut baseline);
             sample(&mut candidate);
+            if let Some(tuned) = &mut tuned {
+                sample(tuned);
+            }
             let (mut original, mut fused, mut tuned_ms) = (Vec::new(), Vec::new(), Vec::new());
             for i in 0..5 {
                 if i % 2 == 0 {
