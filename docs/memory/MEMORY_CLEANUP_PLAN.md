@@ -2160,6 +2160,6 @@ return funding. Final local checks pass: native CPU 2,002/session 291; optional 
 authority-privacy/integration/doctests; and all 12 required real-ORT shared-EP
 conformance tests on cached ORT 1.32. Strict all-target checks pass for the
 native API/CPU/session/engine/plugin stack and CUDA (`cuda,gpu-tests`, compile
-only). Before/after performance evidence remains required before publication.
+only). Before/after performance evidence is recorded in [the session workspace report](../benchmarks/session-workspace/README.md): 36 exact-output process runs, qualified controls and overlapping CPU ranges, with no distinguishable regression on this CPU tier.
 CUDA device execution and full-model throughput are not established on the
 current CPU-only host.
