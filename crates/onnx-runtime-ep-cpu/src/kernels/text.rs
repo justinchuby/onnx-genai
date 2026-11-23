@@ -491,14 +491,15 @@ mod tests {
         let outputs = StringConcatKernel
             .execute_host_strings(&[strings(&[], &lhs), strings(&[], &rhs)])
             .unwrap();
-        assert_eq!(outputs[0].shape, []);
+        assert!(outputs[0].shape.is_empty());
         assert_eq!(string_data(&outputs[0]), ["cats"]);
 
         let empty: [String; 0] = [];
         let singleton = ["suffix".to_owned()];
         let outputs = StringConcatKernel
             .execute_host_strings(&[strings(&[2, 0, 3], &empty), strings(&[1, 1, 3], &singleton)])
-            .unwrap_err();
+            .err()
+            .expect("shape/value mismatch must fail");
         assert!(
             outputs.to_string().contains("but 1 strings were supplied"),
             "shape/value validation must run before zero-extent broadcasting"

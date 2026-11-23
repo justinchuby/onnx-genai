@@ -1050,6 +1050,8 @@ impl Drop for Executor {
                 drop(buf);
             }
         }
+        self.workspace_reuse
+            .retire(self.ep.as_ref(), safe_to_release);
         if let Some(workspace) = self.persistent_workspace.take() {
             if safe_to_release {
                 let _ = self.ep.deallocate_workspace(workspace.buffer);
@@ -1100,6 +1102,8 @@ mod dynamic_shapes;
 mod geometry;
 use dynamic_shapes::*;
 use geometry::*;
+mod workspace_reuse;
+use workspace_reuse::{WorkspaceCompletion, WorkspaceReplacement, WorkspaceReuse};
 mod bindings;
 #[cfg(test)]
 use bindings::{AxisBound, PlannedInputShape};

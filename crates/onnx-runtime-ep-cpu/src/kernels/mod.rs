@@ -1337,22 +1337,15 @@ pub(crate) fn build_cpu_registry_with_resources(
     // Standard `ai.onnx::Attention`: the richer SDPA op with 3D/4D inputs,
     // GQA/MQA head sharing, a KV cache (`past_*`/`present_*`), causal masking,
     // softcap, and up to four outputs. Distinct from the contrib
-    // `FusedAttention` above. Added at opset 23 and revised at opset 24; since
-    // no newer version exists, the opset-24 kernel serves model opsets 24, 25
-    // and 26 (the registry resolves the highest `since_version <= opset`). Both
-    // versions are registered so opset-23 models keep the original
-    // `qk_matmul_output_mode` 1↔2 ordering while opset-24+ models get the
-    // swapped ordering and `nonpad_kv_seqlen` support.
-    rec.register(
-        OpKey::new("Attention", "", 23),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(attention::AttentionFactory { since_version: 23 }),
-    );
-    rec.register(
-        OpKey::new("Attention", "", 24),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(attention::AttentionFactory { since_version: 24 }),
-    );
+    // `FusedAttention` above. The registry selects the newest revision at or
+    // below the model opset; external KV lengths start at 24, windows at 25.
+    for since_version in [23, 24, 25] {
+        rec.register(
+            OpKey::new("Attention", "", u64::from(since_version)),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(attention::AttentionFactory { since_version }),
+        );
+    }
     // The optimizer's exact-GELU fusion emits `com.microsoft::Gelu`; bind its
     // CPU kernel in the same contrib domain (there is no standard-domain `Gelu`
     // op, so it is registered only under `com.microsoft`).
@@ -3413,7 +3406,7 @@ mod tests {
         // v13), and `LayerNormalization`, `FusedMatMulBias`, `FusedGemm`,
         // `FusedAttention` and the fused exact-GELU `Gelu` add contrib
         // (`com.microsoft`) entries. Standard `ai.onnx::Attention` is registered
-        // at both opset 23 and 24 (two default-domain entries not in
+        // at opsets 23, 24 and 25 (three default-domain entries not in
         // `PHASE1_OPS`). The standard LLM primitives `Gelu` (opset 20),
         // `RMSNormalization` (23), `RotaryEmbedding` (23) and `Swish` (24) add
         // four more default-domain entries not in `PHASE1_OPS`; `Softmax` and
@@ -3466,7 +3459,7 @@ mod tests {
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
         // The EP-owned affine Gather and grouped-projection fusions each add one.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 112 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 113 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")
@@ -3601,7 +3594,7 @@ mod tests {
         assert!(reg.lookup("Swish", "", 23).is_none());
         // Standard ai.onnx::Attention resolves at opsets 23–26 (default domain
         // and the `ai.onnx` alias), but not below its since-version. Opset 23
-        // resolves to the v23 kernel; 24/25/26 resolve to the v24 kernel.
+        // resolves to the v23 kernel; 24 to v24; 25/26 to v25.
         assert!(reg.lookup("Attention", "", 23).is_some());
         assert!(reg.lookup("Attention", "", 24).is_some());
         assert!(reg.lookup("Attention", "", 25).is_some());

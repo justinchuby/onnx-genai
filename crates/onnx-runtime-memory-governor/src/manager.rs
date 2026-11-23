@@ -876,30 +876,19 @@ impl ProcessMemoryManager {
         self.ensure_manager(authority.manager, "authority")?;
         let raw = self.inner.next()?;
         let holder = HolderId::new(raw);
-        let registry = authority
-            .record
-            .governor
-            .as_ref()
-            .and_then(|governor| governor.pressure_registry(authority.device().tier));
+        let registry = if responder.is_some() {
+            authority
+                .pressure_registry()
+                .map_err(AllocationTransactionError::Memory)?
+        } else {
+            None
+        };
         let registration = match (&responder, registry) {
-            (Some(responder), Some(registry)) => {
-                let governor = authority
-                    .record
-                    .governor
-                    .as_ref()
-                    .expect("registry came from the authority governor");
+            (Some(responder), Some(registry)) => Some(
                 registry
-                    .validate(
-                        governor.authority_id(authority.device().tier),
-                        authority.device().tier,
-                    )
-                    .map_err(AllocationTransactionError::Memory)?;
-                Some(
-                    registry
-                        .register(responder)
-                        .map_err(AllocationTransactionError::Memory)?,
-                )
-            }
+                    .register(responder)
+                    .map_err(AllocationTransactionError::Memory)?,
+            ),
             _ => None,
         };
         let fallback = if registration.is_none() {
@@ -1608,6 +1597,20 @@ impl RegisteredMemoryAuthority {
 
     pub fn label(&self) -> &str {
         &self.record.label
+    }
+
+    /// Existing pressure capability of this exact physical authority and tier.
+    /// This creates neither a holder nor an accounting domain.
+    pub fn pressure_registry(&self) -> Result<Option<crate::PressureRegistry>, MemoryError> {
+        let Some(governor) = self.record.governor.as_ref() else {
+            return Ok(None);
+        };
+        let tier = self.device().tier;
+        let registry = governor.pressure_registry(tier);
+        if let Some(registry) = registry.as_ref() {
+            registry.validate(governor.authority_id(tier), tier)?;
+        }
+        Ok(registry)
     }
 
     pub fn has_process_delegation(&self, tier: Tier) -> bool {
@@ -3272,6 +3275,12 @@ pub struct AllocationSettlementWait {
 impl AllocationSettlementWait {
     pub fn identity(&self) -> AllocationIdentity {
         self.charge.snapshot().identity
+    }
+
+    /// Current authority charge, for a cold pressure round to record before
+    /// retiring this owner. Only Released status proves that charge was refunded.
+    pub fn charged_bytes(&self) -> u64 {
+        self.charge.snapshot().charged_bytes
     }
 
     pub fn status(&self) -> AllocationSettlementStatus {

@@ -2347,6 +2347,21 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(())
     }
 
+    /// Existing pressure registry for the authority funding workspace backing.
+    ///
+    /// Executors may retain completed workspace only when this returns a
+    /// registry, so idle capacity remains reclaimable. This cold capability
+    /// lookup must use the workspace allocator's actual authority/tier, without
+    /// creating another budget or holder. The provider's `deallocate_workspace`
+    /// must retire backing and settle its charge rather than move the owner to
+    /// another retained cache. Pending/captured owners remain with the executor
+    /// and never enter reclaimable idle storage.
+    fn workspace_pressure_registry(
+        &self,
+    ) -> Result<Option<onnx_runtime_memory_governor::PressureRegistry>> {
+        Ok(None)
+    }
+
     /// Block until all pending work on this EP completes.
     fn sync(&self) -> Result<()>;
 

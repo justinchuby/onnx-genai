@@ -111,9 +111,26 @@ the provider supplies backing and completion evidence. Providers do not need
 per-kernel budgets, private scratch pools, or a second quota ledger. Context
 retirement guards, asynchronous settlement and capture pins remain separate
 contracts rather than one retention flag.
-Keep release/replacement settlement contracts for asynchronous providers. Further
-run-boundary pooling optimization requires evidence of overhead; request lifetime
-must not implicitly pin a prefill-sized lane throughout decode.
+A successful request that actually synchronizes and validates its device work
+can return its step workspace to one reclaimable idle cell per executor lane.
+The next fitting run takes back the same owner and original charge. The provider
+opts in by exposing its existing workspace authority's pressure registry through
+`workspace_pressure_registry`; registration is cold and does not create a holder,
+budget or provider-private pool. Without that capability, the executor preserves
+its normal provider retirement path. Zero requirements do not enroll or allocate.
+
+Pressure removes only idle owners and invokes the original provider release path
+outside the cell lock. It may wait for allocation-specific settlement on that cold
+path; only verified release reports the retired authority charge. Active and
+capture-referenced owners never enter the idle cell. Pending device-binding runs
+continue through provider deferred retirement, so zero warm issuer calls are not
+claimed for that path. No per-token completion synchronization is added.
+
+Installed capture addresses also prevent workspace replacement: preparation or
+runtime refinement that needs larger capacity or alignment must first retire all
+referencing graph slots. This preserves the old owner on refusal. Host contracts
+cover the ownership, pressure and failure paths; CUDA execution and throughput
+still require a device runner.
 
 ### CPU compressed-projection scratch
 

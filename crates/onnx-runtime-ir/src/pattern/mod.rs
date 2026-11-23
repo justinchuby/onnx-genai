@@ -27,7 +27,7 @@ mod syntax;
 
 pub use builder::{
     AttributeType, AttributeValue, Body, Input, NodeBuilder, PatternAttribute, PatternBuilder,
-    PatternValue,
+    PatternSequence, PatternValue,
 };
 pub use execute::{
     AttributeCapture, BindingView, BoundaryPolicy, DimensionValue, Match, MatchBudget,
