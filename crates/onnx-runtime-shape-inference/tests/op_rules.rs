@@ -270,6 +270,52 @@ fn out_dtype(outs: &[NodeIo]) -> DataType {
     outs[0].type_info.as_ref().unwrap().dtype
 }
 
+#[test]
+fn standard_math_opset_gate_and_shape_contracts() {
+    for (name, since) in onnx_runtime_ir::standard_math::OPS {
+        let arity = if ["SwiGLU", "GeGLU"].contains(&name) {
+            2
+        } else {
+            1
+        };
+        let n = node(name, arity, 1);
+        let inputs = || vec![tin(DataType::Float64, vec![c(2), c(3)]); arity];
+        assert!(
+            run(&n, inputs(), since - 1)[0].type_info.is_none(),
+            "{name}"
+        );
+        let y = run(&n, inputs(), since);
+        assert_eq!(out_dtype(&y), DataType::Float64);
+        assert_eq!(out_shape(&y), vec![c(2), c(3)]);
+    }
+    let geglu = node("GeGLU", 2, 1);
+    assert_invalid(
+        try_run(
+            &geglu,
+            vec![f32in(vec![c(2), c(3)]), f32in(vec![c(1), c(3)])],
+            29,
+        )
+        .unwrap_err(),
+        "GeGLU",
+        "no broadcasting",
+    );
+    assert_invalid(
+        try_run(
+            &with_attr(geglu, "approximate", Attribute::String(b"fast".to_vec())),
+            vec![f32in(vec![]), f32in(vec![])],
+            29,
+        )
+        .unwrap_err(),
+        "GeGLU",
+        "'none' or 'tanh'",
+    );
+    assert_invalid(
+        try_run(&node("LogCumSumExp", 1, 1), vec![f32in(vec![])], 29).unwrap_err(),
+        "LogCumSumExp",
+        "axis 0 is out of range",
+    );
+}
+
 fn assert_symbolic(dim: &DimExpr) {
     assert!(
         dim.as_const().is_none(),
@@ -286,7 +332,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        221,
+        226,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -295,7 +341,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        266,
+        271,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -6852,6 +6898,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Erf", 1),
     ("", "Exp", 1),
     ("", "Expand", 8),
+    ("", "Expm1", 29),
     ("", "EyeLike", 9),
     ("", "Flatten", 1),
     ("", "Floor", 1),
@@ -6862,6 +6909,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "GatherND", 11),
     ("", "GatherND", 12),
     ("", "GatherND", 13),
+    ("", "GeGLU", 29),
     ("", "Gelu", 20),
     ("", "Gemm", 1),
     ("", "GlobalAveragePool", 1),
@@ -6890,6 +6938,8 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "LessOrEqual", 12),
     ("", "LinearAttention", 1),
     ("", "Log", 1),
+    ("", "Log1p", 29),
+    ("", "LogCumSumExp", 29),
     ("", "LogSoftmax", 1),
     ("", "LpNormalization", 1),
     ("", "LpPool", 1),
@@ -6990,6 +7040,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "StringNormalizer", 10),
     ("", "Sub", 1),
     ("", "Sum", 1),
+    ("", "SwiGLU", 28),
     ("", "Swish", 24),
     ("", "Tan", 7),
     ("", "Tanh", 1),

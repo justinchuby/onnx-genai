@@ -1,0 +1,10 @@
+domain: ""
+name: SwiGLU
+since_version: 28
+doc: Swish of A multiplied elementwise by B, without broadcasting.
+attributes:
+  - { name: alpha, type: float, default: 1.0 }
+inputs: [{ name: A, type_str: T }, { name: B, type_str: T }]
+outputs: [{ name: Y, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

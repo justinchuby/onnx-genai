@@ -369,6 +369,13 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // Static union across Einsum-12 and Einsum-28. The provider performs
         // the required opset-aware BFloat16 gate before claiming the node.
         ("Einsum", "") => EINSUM_DTYPES,
+        (name, "")
+            if onnx_runtime_ir::standard_math::OPS
+                .iter()
+                .any(|&(op, _)| op == name) =>
+        {
+            onnx_runtime_ir::standard_math::DTYPES
+        }
 
         // Float-only ops (dispatch_float! or explicit float handling).
         ("Sqrt", "")
@@ -640,6 +647,7 @@ pub mod slice;
 pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod split;
+mod standard_math;
 pub mod stft;
 pub mod tensor_scatter;
 pub mod transpose;
@@ -685,6 +693,11 @@ pub mod nchwc;
 pub const PHASE1_OPS: &[&str] = &[
     "MatMul",
     "Einsum",
+    "SwiGLU",
+    "GeGLU",
+    "Expm1",
+    "Log1p",
+    "LogCumSumExp",
     "Add",
     "Relu",
     "Reshape",
@@ -1026,6 +1039,13 @@ pub(crate) fn build_cpu_registry_with_resources(
     let dense_weight_cache_bytes = resources.weight_cache_limits().dense_bytes;
     let retain_caches = resources.cache_retention().is_admitted();
     let mut rec = OpRegistry::new();
+    for (name, since) in onnx_runtime_ir::standard_math::OPS {
+        rec.register(
+            OpKey::new(name, "", since),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(standard_math::Factory),
+        );
+    }
     register_cnn_ops(&mut rec);
     rec.register(
         OpKey::new("MatMul", "", 1),

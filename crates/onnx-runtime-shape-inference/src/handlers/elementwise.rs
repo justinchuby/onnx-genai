@@ -17,6 +17,75 @@ pub fn unary(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+fn standard_math(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    use onnx_runtime_ir::standard_math::{DTYPES, Math};
+
+    let invalid = |detail| ShapeInferError::Invalid {
+        op: ctx.op().to_owned(),
+        detail,
+    };
+    let op = Math::from_node(ctx.node).map_err(invalid)?;
+    if ctx.num_inputs() != op.input_count()
+        || ctx.num_outputs() != 1
+        || (0..op.input_count()).any(|i| !ctx.has_input(i))
+    {
+        return Err(invalid(format!(
+            "expected {} input(s) and one output",
+            op.input_count()
+        )));
+    }
+    if let Some(rank) = ctx.input_rank(0) {
+        op.axis(rank).map_err(invalid)?;
+    }
+    for i in 0..op.input_count() {
+        if let Some(dtype) = ctx.input_dtype(i)
+            && !DTYPES.contains(&dtype)
+        {
+            return Err(invalid(format!(
+                "input {i} is {dtype:?}; expected f16, bf16, f32 or f64"
+            )));
+        }
+    }
+    if op.input_count() == 1 {
+        return unary(ctx);
+    }
+    if let (Some(a), Some(b)) = (ctx.input_dtype(0), ctx.input_dtype(1))
+        && a != b
+    {
+        return Err(invalid(format!(
+            "A and B must have the same dtype, got {a:?} and {b:?}"
+        )));
+    }
+    if let (Some(a), Some(b)) = (ctx.input_shape(0), ctx.input_shape(1)) {
+        if a.len() != b.len()
+            || a.iter()
+                .zip(b)
+                .any(|(x, y)| matches!((x.as_const(), y.as_const()), (Some(x), Some(y)) if x != y))
+        {
+            return Err(invalid(format!(
+                "A and B must have identical shapes (no broadcasting), got {a:?} and {b:?}"
+            )));
+        }
+        let shape = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| {
+                if y.as_const().is_some() {
+                    y.clone()
+                } else {
+                    x.clone()
+                }
+            })
+            .collect();
+        if let Some(dtype) = ctx.input_dtype(0).or_else(|| ctx.input_dtype(1)) {
+            ctx.set_output(0, dtype, shape);
+        }
+    } else if let Some(t) = ctx.input_type(0).or_else(|| ctx.input_type(1)).cloned() {
+        ctx.set_output_type(0, t);
+    }
+    Ok(())
+}
+
 /// Broadcasting binary op (`Add`, `Sub`, `Mul`, `Div`, `Pow`, …).
 pub fn binary(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
@@ -173,6 +242,9 @@ fn const_binop(x: &DimExpr, y: &DimExpr, f: fn(i64, i64) -> i64) -> Option<DimEx
 
 /// Register the elementwise family.
 pub fn register(reg: &mut InferenceRegistry) {
+    for (name, since) in onnx_runtime_ir::standard_math::OPS {
+        reg.register("", name, since, standard_math);
+    }
     for op in [
         "Relu",
         "Erf",

@@ -128,6 +128,7 @@ EXPECTED_CUDA_TARGETS_BY_DIR = {
             "standard_attention_fp16_gpu",
             "standard_attention_gpu",
             "stft_gpu",
+            "standard_math_gpu",
             "varlen_attention_gpu",
             "weight_offload_churn_gpu",
             "weight_offload_gpu",

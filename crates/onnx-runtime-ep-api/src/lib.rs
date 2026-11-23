@@ -39,6 +39,7 @@ pub mod host_parallel;
 pub mod kernel;
 pub mod provider;
 pub mod registry;
+pub mod standard_math;
 pub mod tensor;
 pub mod weight;
 pub mod workspace;

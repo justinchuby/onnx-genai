@@ -2413,6 +2413,13 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "einsum_gpu.rs",
         "canonical-plan cuBLASLt contractions and zero-copy views",
     ));
+    for op in ["SwiGLU", "GeGLU", "Expm1", "Log1p", "LogCumSumExp"] {
+        p.push(dedicated(
+            op,
+            "standard_math_gpu.rs",
+            "independent CPU and native CUDA math expectations",
+        ));
+    }
     p.push(dedicated(
         "MatMulNBits",
         "matmul_nbits_gpu.rs",
