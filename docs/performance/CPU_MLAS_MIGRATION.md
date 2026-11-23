@@ -1765,3 +1765,17 @@ null arms, corrected single-thread reference, source/executable hashes and
 rejected evidence are recorded. MLAS still wins several shapes, so the family
 remains ungraduated and the optional research reference remains. No model-wide,
 CUDA, x86 or universal memory/performance claim follows from these results.
+
+
+## Contiguous MoE input borrowing remains an unadopted candidate
+
+[A controlled candidate study](../benchmarks/moe-input-window-candidate/README.md)
+checks borrowing actual contiguous row windows instead of copying grouped input.
+It passes numerical/resource tests and removes 128–1,024 single-row workspace
+bytes in the measured fixtures, but produces no repeatable latency benefit.
+Original qualified +3.85%/+8.53% streamed CPU observations are not reproduced at
+their initial magnitudes by one independent repeat; null shifts and outliers
+remain material. Candidate runtime code is not landed. Preserve the full data
+and reconstruction patch, retain the coarse gather path, and require profiling
+before adding another hot-path branch. This does not graduate a compute family
+or remove the optional MLAS reference.
