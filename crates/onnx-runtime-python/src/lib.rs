@@ -775,13 +775,13 @@ impl InferenceSession {
                 let name: String = key.extract().map_err(|_| {
                     PyTypeError::new_err("keyword-argument input names must be strings")
                 })?;
-                let Some(meta) = self.inputs.iter().find(|m| m.name == name) else {
+                if !self.inputs.iter().any(|m| m.name == name) {
                     let known: Vec<&str> = self.inputs.iter().map(|m| m.name.as_str()).collect();
                     return Err(PyValueError::new_err(format!(
                         "unknown input {name:?} passed as a keyword argument. Model \
                          inputs are: {known:?}"
                     )));
-                };
+                }
                 if feed.contains(&name)? {
                     return Err(PyValueError::new_err(format!(
                         "input {name:?} was supplied both positionally and as a \
@@ -820,12 +820,12 @@ impl InferenceSession {
             let name: String = key.extract().map_err(|_| {
                 PyTypeError::new_err("input_feed keys must be strings (input names)")
             })?;
-            if !self.inputs.iter().any(|m| m.name == name) {
+            let Some(meta) = self.inputs.iter().find(|m| m.name == name) else {
                 let known: Vec<&str> = self.inputs.iter().map(|m| m.name.as_str()).collect();
                 return Err(PyValueError::new_err(format!(
                     "unknown input {name:?} in input_feed. Model inputs are: {known:?}"
                 )));
-            }
+            };
             // Prefer a zero-copy DLPack borrow when the value exposes the
             // producer protocol (torch.Tensor, numpy ≥ 1.23, …) and lives on a
             // CPU, contiguous buffer; otherwise fall back to the numpy copy
