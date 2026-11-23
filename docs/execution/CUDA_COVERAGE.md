@@ -201,7 +201,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
 | `Attention` | `com.microsoft` | ✅ | **NVRTC tiled online-softmax + Phase-2a fallback** | Phase-2b fused f32/f16/bf16 prefill, including GQA and additive masks; measured auto-gate retains the cuBLAS baseline where faster. See `CUDA_FLASH_ATTENTION.md`. |
-| `Attention` (opset 23/24) | `` | ✅ | **deterministic CUDA EP fallback** | Standard ONNX SDPA with 3D/4D layouts, GQA, bool/additive masks, and in-op KV cache. f32. |
+| `Attention` (opset 23/24/25) | `` | ✅ | **CUDA row kernel; split-KV on eligible unwindowed decode** | Standard ONNX SDPA with 3D/4D layouts, GQA, bool/additive masks, and KV cache. Opset 25 windows bound the score and value loops; windowed calls retain logical KV extents rather than using mask-derived frozen capacity. f32/f16/bf16. |
 | `RotaryEmbedding` (opset 23) | `` | ✅ | **deterministic CUDA EP fallback** | f32 interleaved/non-interleaved RoPE, partial rotary dimensions, and optional position-id gathering. |
 | `RotaryEmbedding` | `com.microsoft` | ✅ | **NVRTC-custom** | Contrib-domain RoPE registration with shape/dtype/attribute validation in `rotary_embedding.rs`. |
 | `MultiHeadAttention` | `com.microsoft` | ✅ | **cuBLASLt Phase-2a SDPA + NVRTC layout adapters** | Contiguous f32/f16/bf16 separate Q/K/V. Query is BSH; K/V may be BSH or BNSH. Supports optional same-dtype projection bias, broadcast additive attention bias, Int32/Int64 key-padding mask, causal mode, and paired BNSH past/present KV. Q/K/V head sizes must match. Packed QKV/KV, DecoderMaskedMHA inputs, unequal V head size, and mixed float dtypes fail closed. Per-call scratch, a host-resolved padding mask, and a trailing synchronization make graph capture unsupported (`multi_head_attention.rs`). |
@@ -614,9 +614,9 @@ The issue #67 operator-coverage batch 13 adds `QLinearMatMul` and `Resize`.
 `QLinearMatMul` preserves the CPU reference's wrapping i32 accumulation,
 ties-to-even requantization, and per-tensor/per-row/per-column quantization for
 Int8 and Uint8. `Resize` supports nearest and N-D linear interpolation with
-`half_pixel`, `align_corners`, and `asymmetric` coordinates, scales or sizes,
-selected axes, and all four standard nearest rounding modes. Cubic,
-`pytorch_half_pixel`, `tf_crop_and_resize`, `half_pixel_symmetric`, antialiasing,
+`half_pixel`, `align_corners`, `asymmetric`, and Resize-19 `half_pixel_symmetric`
+coordinates, scales or sizes, selected axes, and all four standard nearest
+rounding modes. Cubic, `pytorch_half_pixel`, `tf_crop_and_resize`, antialiasing,
 and non-stretch aspect policies remain fail-closed at the claim gate. GPU parity
 covers quantized signed/unsigned and batched per-axis cases plus nearest/linear
 upsampling and downsampling across the supported coordinate and control modes.

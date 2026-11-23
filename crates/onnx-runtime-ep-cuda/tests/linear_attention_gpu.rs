@@ -586,7 +586,7 @@ fn opset27_recurrent_and_range_release_ab() {
                 }
             }
             let mut samples = [Vec::new(), Vec::new()];
-            for rep in 0..7 {
+            for rep in 0..12 {
                 for arm in [rep % 2, (rep + 1) % 2] {
                     synchronize();
                     let start = std::time::Instant::now();
@@ -607,7 +607,7 @@ fn opset27_recurrent_and_range_release_ab() {
                 samples[0], samples[1]
             );
         };
-        for (seq, label, iterations) in [(1, "decode", 60), (64, "prefill", 12)] {
+        for (seq, label, iterations) in [(1, "decode", 1024), (64, "prefill", 128)] {
             let cfg = Config {
                 label,
                 batch: 1,
@@ -648,7 +648,7 @@ fn opset27_recurrent_and_range_release_ab() {
                 iterations,
             );
         }
-        for (length, iterations) in [(32, 60), (65_536, 30)] {
+        for (length, iterations) in [(32, 1024), (65_536, 256)] {
             compare(
                 "Range",
                 &format!("len={length}"),

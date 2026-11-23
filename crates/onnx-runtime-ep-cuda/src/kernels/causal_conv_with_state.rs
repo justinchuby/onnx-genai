@@ -359,7 +359,11 @@ impl Kernel for CausalConvWithStateKernel {
         let has_state = i32::from(state.is_some());
         let has_present_flag = i32::from(has_present);
         let activation = if self.activation == ConvActivation::Silu {
-            if self.standard { 2 } else { 1 }
+            if self.standard && dtype != DataType::Float32 {
+                2
+            } else {
+                1
+            }
         } else {
             0
         };

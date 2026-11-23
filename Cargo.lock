@@ -2321,6 +2321,7 @@ name = "onnx-runtime-ep-cpu"
 version = "0.1.0-dev.6"
 dependencies = [
  "atomic-wait",
+ "cc",
  "criterion",
  "half",
  "libc",

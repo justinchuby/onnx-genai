@@ -492,6 +492,34 @@ pub fn sdpa_f32(
     sdpa_f32_scalar(t, cfg, bias, mask, y, qk);
 }
 
+/// Windowed SDPA with one valid key interval per (batch, query) row.
+pub(super) fn sdpa_f32_windowed(
+    t: &SdpaTensors,
+    cfg: &SdpaConfig,
+    bias: &dyn AttnBias,
+    y: &mut [f32],
+    qk: Option<QkCapture>,
+    bounds: &[(usize, usize)],
+) {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    if qk.is_none() {
+        let simd = cfg!(target_arch = "aarch64");
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let simd = simd || crate::backend::has_simd_x86();
+        let max_width = bounds
+            .iter()
+            .map(|(start, end)| end - start)
+            .max()
+            .unwrap_or(0);
+        if simd && max_width < t.kv_seq {
+            sdpa_f32_simd_impl::<true>(t, cfg, bias, &NoMask, y, bounds, max_width);
+            return;
+        }
+    }
+    let _ = bounds;
+    sdpa_f32(t, cfg, bias, &NoMask, y, qk);
+}
+
 /// The route a **production** (default, MLAS-free) build takes for this shape,
 /// selected explicitly rather than through [`sdpa_f32`]'s `cfg` ladder.
 ///
@@ -1217,6 +1245,19 @@ fn sdpa_f32_simd(
     mask: &dyn KeyMask,
     y: &mut [f32],
 ) {
+    sdpa_f32_simd_impl::<false>(t, cfg, bias, mask, y, &[], t.kv_seq);
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+fn sdpa_f32_simd_impl<const WINDOWED: bool>(
+    t: &SdpaTensors,
+    cfg: &SdpaConfig,
+    bias: &dyn AttnBias,
+    mask: &dyn KeyMask,
+    y: &mut [f32],
+    bounds: &[(usize, usize)],
+    max_width: usize,
+) {
     #[cfg(test)]
     SDPA_SIMD_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -1252,7 +1293,7 @@ fn sdpa_f32_simd(
     // exactly one task. Nothing is shared but the read-only operands, so the
     // partition reproduces the serial result bit-for-bit whatever the split.
     let rows = batch * num_heads * q_seq;
-    let work_per_row = kv_seq.saturating_mul(head_size + v_head_size);
+    let work_per_row = max_width.saturating_mul(head_size + v_head_size);
 
     // `v_head_size == 0` is a degenerate but reachable shape -- this route has
     // no non-empty precondition, unlike the MLAS and Accelerate ones -- and it
@@ -1265,10 +1306,10 @@ fn sdpa_f32_simd(
     };
 
     let Some(min_rows_per_task) = fan_out else {
-        let mut scores = vec![0.0f32; kv_seq];
+        let mut scores = vec![0.0f32; max_width];
         for row in 0..rows {
             let y_base = row * v_head_size;
-            sdpa_simd_row(
+            sdpa_simd_row::<WINDOWED>(
                 row,
                 t,
                 cfg,
@@ -1278,6 +1319,7 @@ fn sdpa_f32_simd(
                 heads_per_kv,
                 &mut scores,
                 &mut y[y_base..y_base + v_head_size],
+                bounds,
             );
         }
         return;
@@ -1295,7 +1337,7 @@ fn sdpa_f32_simd(
     // forward pass.
     let row_body = |row: usize, y_row: &mut [f32]| {
         with_row_scores(|scores| {
-            sdpa_simd_row(
+            sdpa_simd_row::<WINDOWED>(
                 row,
                 t,
                 cfg,
@@ -1305,6 +1347,7 @@ fn sdpa_f32_simd(
                 heads_per_kv,
                 scores,
                 y_row,
+                bounds,
             );
         });
     };
@@ -1449,7 +1492,7 @@ fn sdpa_rows_per_task(rows: usize, work_per_row: usize) -> Option<usize> {
 /// owned scratch, resized on first use and reused for every later row.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
-fn sdpa_simd_row(
+fn sdpa_simd_row<const WINDOWED: bool>(
     row: usize,
     t: &SdpaTensors,
     cfg: &SdpaConfig,
@@ -1459,6 +1502,7 @@ fn sdpa_simd_row(
     heads_per_kv: usize,
     scores: &mut Vec<f32>,
     y_row: &mut [f32],
+    bounds: &[(usize, usize)],
 ) {
     let SdpaTensors {
         q,
@@ -1481,15 +1525,19 @@ fn sdpa_simd_row(
     let b = row / (q_seq * num_heads);
     let kv_n = head / heads_per_kv;
 
-    if scores.len() != kv_seq {
-        scores.resize(kv_seq, 0.0);
-    }
+    let (begin, end) = if WINDOWED {
+        bounds[b * q_seq + i]
+    } else {
+        (0, kv_seq)
+    };
+    scores.resize(end - begin, 0.0);
 
     let q_base = row * head_size;
     let q_slice = &q[q_base..q_base + head_size];
 
     // scores[j] = combined_scale * dot(Q, K_j) [+softcap] + bias + mask
-    for (j, sc) in scores.iter_mut().enumerate() {
+    for (idx, sc) in scores.iter_mut().enumerate() {
+        let j = begin + idx;
         let k_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * head_size;
         let mut s = dot_f32(q_slice, &k[k_base..k_base + head_size]) * combined_scale;
         if let Some(softcap) = cfg.softcap {
@@ -1507,11 +1555,11 @@ fn sdpa_simd_row(
 
     // context: Y[i] = sum_j(probs[j] * V[j, :]) via NEON AXPY
     y_row.fill(0.0);
-    for (j, &probability) in scores.iter().enumerate() {
+    for (idx, &probability) in scores.iter().enumerate() {
         if probability == 0.0 {
             continue;
         }
-        let v_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * v_head_size;
+        let v_base = ((b * num_kv_heads + kv_n) * kv_seq + begin + idx) * v_head_size;
         axpy_f32(y_row, probability, &v[v_base..v_base + v_head_size]);
     }
 }
@@ -4024,8 +4072,17 @@ mod tests {
             let mut y = vec![0.0f32; batch * heads * q_seq * dv];
             for (row, y_row) in y.chunks_mut(dv).enumerate() {
                 with_row_scores(|scores| {
-                    sdpa_simd_row(
-                        row, &tensors, &cfg, &NoBias, &NoMask, 0.125, 1, scores, y_row,
+                    sdpa_simd_row::<false>(
+                        row,
+                        &tensors,
+                        &cfg,
+                        &NoBias,
+                        &NoMask,
+                        0.125,
+                        1,
+                        scores,
+                        y_row,
+                        &[],
                     );
                 });
             }
