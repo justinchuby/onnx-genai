@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use std::collections::BTreeMap;
 
 use onnx_genai::StopSequence;
@@ -423,9 +424,8 @@ impl ChatCompletionRequest {
                         .as_ref()
                         .map(|content| content.text())
                         .unwrap_or_default();
-                    onnx_genai_engine::JsonConstraint::new(prefix).map_err(|error| {
-                        anyhow::anyhow!("continue_final_message JSON prefix rejected: {error}")
-                    })?;
+                    onnx_genai_engine::validate_json_prefix(&prefix)
+                        .context("continue_final_message JSON prefix rejected")?;
                 }
             }
         }
