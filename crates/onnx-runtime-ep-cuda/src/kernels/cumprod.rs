@@ -127,14 +127,8 @@ mod tests {
         let rt = ep.runtime();
         let context = rt.cuda_context();
         let stream = rt.stream();
-        let kernel = CumProdKernel {
-            runtime: rt.clone(),
-            flags: 0,
-            fixed_axis: Some(0),
-        };
         let device = DeviceId::cuda(0);
         let axis_dev = rt.alloc_raw(8).unwrap();
-        unsafe { rt.htod(&0_i64.to_le_bytes(), axis_dev).unwrap() };
         let axis = TensorView::new(
             DevicePtr(axis_dev as usize as *const c_void),
             DataType::Int64,
@@ -164,7 +158,17 @@ mod tests {
                 "#, "baseline").unwrap();
         let mut first_shape_medians = None;
         const LAUNCHES: usize = 96;
-        for shape in [[8usize, 4096usize], [4096, 128], [8, 4096]] {
+        let short = ([8usize, 4096usize], 0);
+        for (case, (shape, dim)) in [short, ([4096, 128], 0), ([128, 4096], 1), short]
+            .into_iter()
+            .enumerate()
+        {
+            let kernel = CumProdKernel {
+                runtime: rt.clone(),
+                flags: 0,
+                fixed_axis: Some(dim as i64),
+            };
+            unsafe { rt.htod(&(dim as i64).to_le_bytes(), axis_dev).unwrap() };
             let strides = compute_contiguous_strides(&shape);
             let count = shape[0] * shape[1];
             let x = rt.alloc_raw(count * 4).unwrap();
@@ -187,8 +191,9 @@ mod tests {
                     device,
                 )
             };
-            let lanes = shape[1] as u64;
-            let width = shape[0] as u64;
+            let width = shape[dim] as u64;
+            let lanes = count as u64 / width;
+            let inner = shape[dim + 1..].iter().product::<usize>() as u64;
             let config = LaunchConfig {
                 grid_dim: (lanes.div_ceil(u64::from(BLOCK)) as u32, 1, 1),
                 block_dim: (BLOCK, 1, 1),
@@ -202,7 +207,7 @@ mod tests {
                         .arg(&y)
                         .arg(&lanes)
                         .arg(&width)
-                        .arg(&lanes)
+                        .arg(&inner)
                         .arg(&0_i32)
                         .arg(&0_i32);
                     unsafe { builder.launch(config).unwrap() };
@@ -227,6 +232,15 @@ mod tests {
                     rt.end_graph_capture().unwrap();
                     rt.replay_graph().unwrap();
                     rt.synchronize().unwrap();
+                    if case == 0 && rep == 0 && arm == 0 {
+                        let ramp = std::time::Instant::now();
+                        while ramp.elapsed().as_secs() < 8 {
+                            for _ in 0..16 {
+                                rt.replay_graph().unwrap();
+                            }
+                            rt.synchronize().unwrap();
+                        }
+                    }
                     let start = context
                         .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
                         .unwrap();
@@ -245,11 +259,11 @@ mod tests {
             for (arm, times) in ["baseline", "opset-26"].into_iter().zip(&mut samples) {
                 times.sort_by(f64::total_cmp);
                 eprintln!(
-                    "CumProd CUDA {shape:?} {arm}: {:.3} us [{:.3}, {:.3}]",
+                    "CumProd CUDA {shape:?} axis={dim} {arm}: {:.3} us [{:.3}, {:.3}]",
                     times[2], times[0], times[4]
                 );
             }
-            if shape == [8, 4096] {
+            if (shape, dim) == short {
                 let medians = [samples[0][2], samples[1][2]];
                 if let Some(first) = first_shape_medians {
                     eprintln!("CUDA [8, 4096] start/end drift: {first:?} -> {medians:?} us");
