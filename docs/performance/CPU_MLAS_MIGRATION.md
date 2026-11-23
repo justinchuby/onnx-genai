@@ -1779,3 +1779,24 @@ remain material. Candidate runtime code is not landed. Preserve the full data
 and reconstruction patch, retain the coarse gather path, and require profiling
 before adding another hot-path branch. This does not graduate a compute family
 or remove the optional MLAS reference.
+
+
+## Eight-row ARM64 NT register reuse
+
+The ARM64 NT tile now reuses each four-column B register transpose across
+up to eight output rows, retaining the original K order and separate
+multiply/add rounding. Four-row/column tails and portable bottom rows remain;
+there is no packed payload, heap scratch, quota operation or new EP API.
+
+[Controlled M1 Max evidence](../benchmarks/arm64-nt-eight-rows/README.md)
+records 90 original default processes, one 27-process focused repeat of the
+three control-drift cells, nine paired same-binary MLAS processes, and 27
+original/focused actual-session processes. Qualified wide serial fixtures use
+about 20–22% less CPU; a warm resident MoE session uses 20.7% less in the focused
+repeat. The original dense session timing is excluded because its null control
+fails; it remains recorded. Streamed session timing has no established change.
+All default/focused full outputs and row argmaxes match. The smallest fixture
+costs about 0.75 ns more per call. Workspace requirements/backing stay unchanged.
+Native still trails MLAS by about 1.48–2.04x in the paired shapes; the family
+remains ungraduated and the optional research reference remains. No full-model,
+CUDA or universal memory/performance conclusion follows from these fixtures.

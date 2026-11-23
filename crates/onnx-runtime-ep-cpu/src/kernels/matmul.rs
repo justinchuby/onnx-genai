@@ -4557,6 +4557,7 @@ mod tests {
         let inputs = input.repeat(4);
         let mut output = [f32::NAN; 16];
         let before = gemm_bt_neon::block_calls();
+        let wide_before = gemm_bt_neon::eight_row_tiles();
         gemm_bt_serial_with_backend(&weights, &inputs, &mut output, 4, K, 4, CpuBackend::Generic)
             .unwrap();
         assert_eq!(
@@ -4589,6 +4590,32 @@ mod tests {
             "unit-row calls retain the existing portable route"
         );
         assert_eq!(decode.map(f32::to_bits), [0x3fd9_6455; 4]);
+        assert_eq!(gemm_bt_neon::eight_row_tiles(), wide_before);
+        let mut wide_weights = weights;
+        wide_weights.resize(8 * K, 0.0);
+        let mut wide_output = [f32::NAN; 32];
+        gemm_bt_serial_with_backend(
+            &wide_weights,
+            &inputs,
+            &mut wide_output,
+            8,
+            K,
+            4,
+            CpuBackend::Generic,
+        )
+        .unwrap();
+        assert_eq!(gemm_bt_neon::block_calls(), before + 2);
+        assert_eq!(
+            gemm_bt_neon::eight_row_tiles(),
+            wide_before + 1,
+            "the public entry must actually execute an eight-row output tile"
+        );
+        for column in 0..4 {
+            assert_eq!(wide_output[column].to_bits(), 0x3fd9_6455);
+            assert_eq!(wide_output[4 + column].to_bits(), 0x3fd9_6457);
+            assert!(wide_output[4 + column] > wide_output[column]);
+        }
+        assert!(wide_output[8..].iter().all(|&value| value == 0.0));
     }
 
     #[test]

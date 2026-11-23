@@ -1,0 +1,75 @@
+{
+  "head": "077746f0329a410f862245701816fb8f4acdc0c8",
+  "base": "911fcbd78ee1eb0a82b471b164aa02cff2d33c32",
+  "source_path": "/tmp/nxrt-compact-wire-grants",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs": "677aad997e0ae7aa464cd02d701570a22e9e599ae8d51ff54516a38919baec87",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_neon.rs": "66461a50207729a93baccfedbb6b749483801e2fb4bbfe4754cdd99ffded15a7"
+  },
+  "probe_sha256": "4c93e4ef81f836e5b36604ee595b672ea8437da8f0cb8681aae4d76cc120b2f0",
+  "shared_lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "binaries": {
+    "baseline": {
+      "sha256": "4236115dc21ab08a9d29b5127b0343225de673bfabb29d2e510bf78c6662dbb2",
+      "symbols": 980,
+      "mlas_symbols": 0,
+      "nt_neon_symbols": 1,
+      "instruction_counts": {
+        "fmul": 44,
+        "fadd": 92,
+        "fmla": 0,
+        "fmadd": 0,
+        "faddp": 0,
+        "trn1": 2,
+        "trn2": 2,
+        "zip1": 0,
+        "zip2": 2
+      },
+      "vector_stack_accesses": 0
+    },
+    "after": {
+      "sha256": "b0c753e8fd90369e7a29af40debd764330286f5639c9f6a867ea4ddd93054936",
+      "symbols": 980,
+      "mlas_symbols": 0,
+      "nt_neon_symbols": 1,
+      "instruction_counts": {
+        "fmul": 84,
+        "fadd": 132,
+        "fmla": 0,
+        "fmadd": 0,
+        "faddp": 0,
+        "trn1": 4,
+        "trn2": 4,
+        "zip1": 0,
+        "zip2": 4
+      },
+      "vector_stack_accesses": 0
+    },
+    "research": {
+      "sha256": "7919abba349fd4bced6949af5143673d1ad705224e57733e8eae2ae88221b79f",
+      "symbols": 2271,
+      "mlas_symbols": 116,
+      "nt_neon_symbols": 1,
+      "instruction_counts": {
+        "fmul": 84,
+        "fadd": 132,
+        "fmla": 0,
+        "fmadd": 0,
+        "faddp": 0,
+        "trn1": 4,
+        "trn2": 4,
+        "zip1": 0,
+        "zip2": 4
+      },
+      "vector_stack_accesses": 0
+    }
+  },
+  "environment_overrides": {
+    "RAYON_NUM_THREADS": "1",
+    "MLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "ONNX_GENAI_MLAS_THREADPOOL_THREADS": "1"
+  }
+}
