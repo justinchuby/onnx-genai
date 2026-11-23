@@ -609,6 +609,7 @@ async fn prepare_chat_input(
         has_session,
         &PromptContext {
             chat_template: handle.chat_template.as_deref(),
+            response_template: handle.response_template.as_ref(),
             tool_protocol: handle.tool_protocol.as_ref(),
             image_placeholder: placeholder.as_deref(),
             generation_defaults: handle.generation_defaults.as_ref(),
@@ -1832,7 +1833,7 @@ pub fn build_generate_request(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
 ) -> anyhow::Result<GenerateRequest> {
-    request.validate_continuation()?;
+    request.validate_plain_continuation()?;
     Ok(GenerateRequest {
         prompt: GeneratePrompt::Text(build_prompt(request)),
         options: build_generate_options_with_tokenizer(
@@ -1852,7 +1853,7 @@ pub fn build_generate_request_with_protocol(
     protocol: &ToolProtocol,
     tokenizer: &Tokenizer,
 ) -> anyhow::Result<GenerateRequest> {
-    request.validate_continuation()?;
+    request.validate_plain_continuation()?;
     let mut options = build_generate_options_with_tokenizer(
         request,
         tokenizer,
@@ -2018,6 +2019,7 @@ fn positional_image_placeholder(
 /// fail, so they are passed as one value instead of four positional arguments.
 struct PromptContext<'a> {
     chat_template: Option<&'a ChatTemplate>,
+    response_template: Option<&'a Arc<crate::response_template::ResponseTemplate>>,
     tool_protocol: Option<&'a ToolProtocol>,
     image_placeholder: Option<&'a str>,
     generation_defaults: Option<&'a GenerationDefaults>,
@@ -2068,6 +2070,11 @@ fn prepare_generate_request(
         apply_tool_output_constraint(&mut options, protocol, request)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
+    anyhow::ensure!(
+        request.continuation_mode() != crate::types::ChatContinuation::Reasoning
+            || options.constraint.is_none(),
+        "reasoning continuation with a constrained output policy needs a channel-aware generation grammar; omit the output constraint until that capability is available"
+    );
     Ok(PreparedGenerateRequest {
         response_prefix: Some(prompt),
         request: GenerateRequest {
@@ -2431,6 +2438,7 @@ pub(super) fn render_model_prompt(
         request,
         &PromptContext {
             chat_template: handle.chat_template.as_deref(),
+            response_template: handle.response_template.as_ref(),
             tool_protocol: handle.tool_protocol.as_ref(),
             image_placeholder: placeholder.as_deref(),
             generation_defaults: handle.generation_defaults.as_ref(),
@@ -2444,7 +2452,14 @@ fn render_prompt(
     context: &PromptContext<'_>,
 ) -> anyhow::Result<String> {
     request.validate_continuation()?;
+    let continuation = request.continuation_mode();
     ChatTemplate::validate_kwargs(&request.chat_template_kwargs)?;
+    if continuation == crate::types::ChatContinuation::Reasoning {
+        anyhow::ensure!(
+            context.chat_template.is_some() && context.response_template.is_some(),
+            "reasoning continuation requires a declared response_template and a chat template preserving reasoning_content; provide those model assets before resuming reasoning"
+        );
+    }
     if let Some(chat_template) = context.chat_template {
         let messages = request
             .messages
@@ -2463,7 +2478,7 @@ fn render_prompt(
                     rendered_tools
                         .as_ref()
                         .and_then(|rendered| rendered.tools_json.as_deref()),
-                    request.add_generation_prompt,
+                    request.effective_add_generation_prompt(),
                     request
                         .reasoning_effort
                         .or(context.default_reasoning_effort)
@@ -2476,6 +2491,11 @@ fn render_prompt(
         if !request.continue_final_message.is_enabled() {
             return Ok(rendered);
         }
+        let selected_field = if continuation == crate::types::ChatContinuation::Reasoning {
+            "reasoning_content"
+        } else {
+            "content"
+        };
         // Prove which occurrence belongs to the final message. Searching just
         // for its text could accidentally select an earlier identical quote
         // when a template drops the final assistant turn.
@@ -2489,14 +2509,18 @@ fn render_prompt(
             !rendered.contains(&marker),
             "continuation template probe collides with literal prompt content; retry the request"
         );
-        probe
+        let final_message = probe
             .last_mut()
-            .context("continue_final_message requires a final assistant message")?
-            .content = marker.clone();
+            .context("continue_final_message requires a final assistant message")?;
+        if continuation == crate::types::ChatContinuation::Reasoning {
+            final_message.reasoning_content = Some(marker.clone());
+        } else {
+            final_message.content = marker.clone();
+        }
         let probe = render(&probe)?;
         anyhow::ensure!(
             probe.matches(&marker).count() == 1,
-            "continue_final_message requires a chat template that preserves final assistant content exactly once; repair the template rather than dropping or duplicating that message"
+            "continue_final_message requires a chat template that preserves the selected final assistant field exactly once (field {selected_field:?}); repair the template rather than dropping or duplicating that field"
         );
         let boundary = probe
             .find(&marker)
@@ -2506,8 +2530,19 @@ fn render_prompt(
             rendered.starts_with(prefix),
             "continue_final_message cannot prove the final assistant boundary because template framing changes with its content; use a template with stable assistant framing"
         );
-        return continue_rendered_prompt(request, rendered, context.image_placeholder, boundary);
+        let prompt =
+            continue_rendered_prompt(request, rendered, context.image_placeholder, boundary)?;
+        if let Some(spec) = context.response_template {
+            crate::response_template::ResponseParser::new(
+                spec.clone(),
+                &prompt,
+                prompt.len().max(1),
+            )?
+            .require_open_text_channel(selected_field)?;
+        }
+        return Ok(prompt);
     }
+    request.validate_plain_continuation()?;
     let prefix = context
         .tool_protocol
         .map(|protocol| protocol.render(request))
@@ -2530,17 +2565,25 @@ fn continue_rendered_prompt(
     boundary: usize,
 ) -> anyhow::Result<String> {
     if request.continue_final_message.is_enabled() {
-        let content = request
+        let last = request
             .messages
             .last()
-            .and_then(|message| message.content.as_ref())
-            .context("continue_final_message requires final assistant content")?
-            .render(image_placeholder);
+            .context("continue_final_message requires a final assistant message")?;
+        let content = if request.continuation_mode() == crate::types::ChatContinuation::Reasoning {
+            last.reasoning_content
+                .clone()
+                .context("continue_final_message requires final assistant reasoning_content")?
+        } else {
+            last.content
+                .as_ref()
+                .context("continue_final_message requires final assistant content")?
+                .render(image_placeholder)
+        };
         // Validate the proven boundary against either literal or HF-trimmed
         // content, then restore the original prefix bytes for continuation.
         anyhow::ensure!(
             !content.trim().is_empty(),
-            "continue_final_message requires nonempty assistant content"
+            "continue_final_message requires a nonempty selected assistant field"
         );
         anyhow::ensure!(
             prompt[boundary..].starts_with(&content)
@@ -2590,7 +2633,7 @@ fn build_prompt_with_tool_prefix(
             prompt.push('\n');
         }
     }
-    if request.add_generation_prompt {
+    if request.effective_add_generation_prompt() {
         prompt.push_str("<|assistant|>\n");
     }
     prompt
@@ -3117,6 +3160,7 @@ mod prompt_rendering_tests {
     ) -> PromptContext<'a> {
         PromptContext {
             chat_template: Some(template),
+            response_template: None,
             tool_protocol: None,
             image_placeholder: None,
             generation_defaults: None,
@@ -3151,6 +3195,7 @@ mod prompt_rendering_tests {
             false,
             &PromptContext {
                 chat_template: None,
+                response_template: None,
                 tool_protocol: Some(&protocol),
                 image_placeholder: None,
                 generation_defaults: None,
@@ -3164,6 +3209,47 @@ mod prompt_rendering_tests {
         assert_eq!(
             tool_protocol::request_policy(&request),
             onnx_genai_engine::ToolCallPolicy::Required
+        );
+    }
+
+    #[test]
+    fn continuation_checks_the_selected_declared_parser_channel() {
+        let template = ChatTemplate::from_source(
+            "A[r]{{ messages[0].reasoning_content }}[/r]{{ messages[0].content }}Z",
+        );
+        let request:ChatCompletionRequest=serde_json::from_value(json!({"messages":[{"role":"assistant","reasoning_content":"old","content":"answer"}],"continue_final_message":"content"})).unwrap();
+        let spec = crate::response_template::ResponseTemplate::compile(
+            &json!({"start_anchor":"A","fields":{
+                "reasoning_content":{"open":"[r]","close":"[/r]"},"content":{}
+            }}),
+        )
+        .unwrap();
+        let mut context = context(&template, None);
+        context.response_template = Some(&spec);
+        assert_eq!(
+            render_prompt(&request, &context).unwrap(),
+            "A[r]old[/r]answer"
+        );
+        let mismatched = crate::response_template::ResponseTemplate::compile(
+            &json!({"start_anchor":"A","fields":{
+                "reasoning_content":{"open":"[r]","close":"[/r]"},"content":{"open":"[c]"}
+            }}),
+        )
+        .unwrap();
+        context.response_template = Some(&mismatched);
+        let error = render_prompt(&request, &context).unwrap_err().to_string();
+        assert!(
+            error.contains("field \"content\" open") && error.contains("active field is None"),
+            "{error}"
+        );
+        let mut reasoning = request;
+        reasoning.continue_final_message = crate::types::ChatContinuation::Reasoning;
+        let dropping = ChatTemplate::from_source("A{{ messages[0].content }}Z");
+        context.chat_template = Some(&dropping);
+        let error = render_prompt(&reasoning, &context).unwrap_err().to_string();
+        assert!(
+            error.contains("exactly once") && error.contains("reasoning_content"),
+            "{error}"
         );
     }
 
@@ -3188,7 +3274,7 @@ mod prompt_rendering_tests {
             render_prompt(&request, &context(&dropping, None))
                 .unwrap_err()
                 .to_string()
-                .contains("preserves final assistant content exactly once")
+                .contains("preserves the selected final assistant field exactly once")
         );
         let duplicated = ChatTemplate::from_source(
             "{% for message in messages %}{{ message.content }}{{ message.content }}{% endfor %}",
@@ -3210,6 +3296,7 @@ mod prompt_rendering_tests {
         );
         let builtin = PromptContext {
             chat_template: None,
+            response_template: None,
             tool_protocol: None,
             image_placeholder: None,
             generation_defaults: None,

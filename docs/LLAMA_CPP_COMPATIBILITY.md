@@ -158,14 +158,24 @@ error. Ending roles do not imply special-token types: only tokenizer-declared
 special pieces are suppressed during prefix matching.
 The selector requires lossless tokenizer byte pieces and declared ending roles.
 
-Explicit content continuation accepts `continue_final_message=true` or `"content"` with
-`add_generation_prompt=false` and a nonempty final assistant text. The template
-boundary is proven by a second render rather than guessed from an EOS spelling
-or an earlier matching quote; original prefix whitespace is preserved. Template
-rendering, token counting and generation share this prompt. Tool-call messages,
-reasoning-only continuation and replay into a persistent inference session are
-still rejected with actionable errors. Thinking budgets and other unsupported
-active controls also remain explicit request errors.
+Explicit continuation accepts `true`, `"content"` or `"reasoning_content"` and
+suppresses `add_generation_prompt` even when that flag is true/default, matching
+upstream. The selected final assistant text must be nonempty. A template probe
+proves its boundary rather than guessing an EOS spelling or an earlier quote;
+original prefix whitespace is preserved. Rendering, token counting and generation
+share this prompt.
+
+Reasoning continuation requires a declared response template and a chat template
+preserving `reasoning_content`. The parser must remain inside that declared
+channel after the actual prompt is truncated. Existing reasoning is consumed as
+prefill state and excluded from buffered/SSE/logprob output; newly generated
+reasoning and answer text retain separate fields. Content continuation uses the
+same channel-state check when a response template is declared. Plain Rust request
+builders reject reasoning continuation because they have no model parser contract.
+Tool-call messages and replay into a persistent inference session remain rejected.
+JSON or forced output constraints need a channel-aware grammar before reasoning
+continuation can use them; implicit prefill and thinking-budget controls also
+remain open compatibility work.
 `response_format: {"type":"json_object"}` continuation validates the original
 assistant prefix as partial JSON and constrains prefix plus new suffix at each
 step. Grammar validity and EOS eligibility use prefix plus suffix; only newly
@@ -181,9 +191,9 @@ for buffered, live and logprob SSE output, including reasoning channels.
 Continuation intent follows the pinned upstream wire forms: `false`/`null` disable
 explicit continuation, `true` selects content unless the final message contains
 only reasoning, and `"content"` / `"reasoning_content"` select their named fields.
-Reasoning continuation is recognized but still refused until its parser state can
-be resumed. Unknown values fail with the accepted forms. HTTP rendering/counting/
-generation and the public Rust request builders share continuation validation.
+Unknown values fail with the accepted forms. HTTP rendering/counting/generation
+and the public Rust request builders share request-shape validation; model-aware
+preparation additionally proves the selected parser channel.
 JSON Schema continuation seeds llguidance from lossless vocabulary bytes and the
 existing assistant prefix. Grammar-only prefix chunks never become model
 candidates or response tokens. Optional leading JSON whitespace remains in the

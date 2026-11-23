@@ -737,3 +737,27 @@ terminal stop boundary. Strict native-engine and server all-target Clippy passed
 JSON SSE now uses ordinary incremental delivery rather than collecting the whole
 value before sending content. Remaining delivery rows, including reasoning
 continuation and structured tool projection, stay open.
+
+Reasoning continuation now uses the declared response parser's actual prefill
+state. Request-shape validation selects and validates the final field; model-aware
+rendering proves its unique template position and verifies that the truncated
+prefix leaves that same parser channel open. This check also covers content
+continuations on packages with declared response templates. Direct model-free
+Rust builders refuse reasoning continuation with a missing-contract error.
+
+Explicit continuation suppresses `add_generation_prompt` regardless of the
+request's default/explicit true flag, matching pinned upstream
+[`common/chat.cpp`](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/chat.cpp#L1547).
+Reasoning prefix bytes are consumed without echo; ordinary, streamed and logprob
+output share the existing generated-only projection. A prefix that closes the
+selected channel is rejected before inference. Reasoning plus JSON/forced output
+grammars still requires a channel-aware grammar implementation; implicit prefill,
+structured tool projection and persistent-session continuation remain open work.
+
+Reasoning-continuation validation: all 9 selected continuation cases passed,
+including real ONNX explicit/auto reasoning prefixes, discarded pre-existing
+answer content, template/count/inference agreement, buffered/SSE/logprob suffix-only
+output, default-true generation-prompt suppression, closed-channel rejection,
+missing declarations and constrained-grammar refusal. Full server library:
+412 passed / 2 inherited ignores. Strict server all-target Clippy passed.
+The unchanged engine layer was not remeasured for this server-only milestone.

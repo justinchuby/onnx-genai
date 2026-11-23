@@ -6303,15 +6303,10 @@ mod llama_compat {
             (
                 "continue_final_message",
                 json!("reasoning_content"),
-                "resumable reasoning-parser",
+                "requires nonempty final assistant reasoning_content",
             ),
             ("continue_final_message", json!("auto"), "must be null"),
             ("continue_final_message", json!(1), "must be null"),
-            (
-                "add_generation_prompt",
-                json!(true),
-                "add_generation_prompt=false",
-            ),
             (
                 "messages",
                 json!([{"role":"user","content":"hello"}]),
@@ -6325,7 +6320,7 @@ mod llama_compat {
             (
                 "messages",
                 json!([{"role":"assistant","content":"","reasoning_content":"unfinished"}]),
-                "reasoning-only",
+                "content requires nonempty final assistant content",
             ),
         ] {
             let mut invalid = body.clone();
@@ -6341,6 +6336,18 @@ mod llama_compat {
                 "{error}"
             );
         }
+        let mut unsupported = body.clone();
+        unsupported["continue_final_message"] = json!(true);
+        unsupported["messages"] = json!([{"role":"assistant","reasoning_content":"unfinished"}]);
+        let (status, error) = call(router, "POST", "/v1/chat/completions", unsupported).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("requires a declared response_template"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -6354,13 +6361,150 @@ mod llama_compat {
         assert!(
             matches!(generated.prompt,onnx_genai::GeneratePrompt::Text(ref text) if text=="<|assistant|>\nworld")
         );
+        request.add_generation_prompt = true;
+        let generated = build_generate_request(&request, &fixture_tokenizer()).unwrap();
+        assert!(
+            matches!(generated.prompt,onnx_genai::GeneratePrompt::Text(ref text) if text=="<|assistant|>\nworld")
+        );
         request.continue_final_message = crate::ChatContinuation::Reasoning;
+        request.messages.last_mut().unwrap().reasoning_content = Some("unfinished".into());
         assert!(
             build_generate_request(&request, &fixture_tokenizer())
                 .unwrap_err()
                 .to_string()
-                .contains("resumable reasoning-parser")
+                .contains("requires a declared response_template")
         );
+    }
+
+    #[tokio::test]
+    async fn reasoning_continuation_resumes_declared_channel_without_echoing_prefill() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        let old = vocab
+            .iter()
+            .find(|(_, id)| id.as_u64() == Some(22))
+            .unwrap()
+            .0
+            .clone();
+        vocab.remove(&old);
+        vocab.insert("new[/r]answer".into(), json!(22));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        std::fs::write(scratch.path().join("tokenizer_config.json"),json!({
+            "chat_template":"{% for m in messages %}[assistant][r]{{ m.reasoning_content }}[/r]{{ m.content }}[end]{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
+            "response_template":{"start_anchor":"[assistant]","fields":{
+                "reasoning_content":{"open":"[r]","close":"[/r]","content":"text"},"content":{"content":"text"}
+            }}
+        }).to_string()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("reasoning-prefill".into())).unwrap());
+        for (mode, content) in [
+            (json!("reasoning_content"), Some("discarded")),
+            (json!(true), None),
+        ] {
+            let mut message = json!({"role":"assistant","reasoning_content":"old "});
+            if let Some(content) = content {
+                message["content"] = json!(content);
+            }
+            // An explicit continuation overrides even the default true generation-prompt flag.
+            let body = json!({"messages":[message],"continue_final_message":mode,"max_tokens":1,"temperature":0,"logit_bias":{"22":1000}});
+            let (status, prompt) =
+                call(router.clone(), "POST", "/apply-template", body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{prompt}");
+            assert_eq!(prompt["prompt"], "[assistant][r]old ");
+            let (status, count) = call(
+                router.clone(),
+                "POST",
+                "/v1/chat/completions/input_tokens",
+                body.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{count}");
+            for logprobs in [false, true] {
+                let mut request = body.clone();
+                request["logprobs"] = json!(logprobs);
+                let (status, result) = call(
+                    router.clone(),
+                    "POST",
+                    "/v1/chat/completions",
+                    request.clone(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{result}");
+                assert_eq!(
+                    result["choices"][0]["message"]["reasoning_content"], "new",
+                    "{result}"
+                );
+                assert_eq!(
+                    result["choices"][0]["message"]["content"], "answer",
+                    "{result}"
+                );
+                assert_eq!(result["usage"]["completion_tokens"], 1);
+                assert_eq!(result["usage"]["prompt_tokens"], count["input_tokens"]);
+                request["stream"] = json!(true);
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(request.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let events =
+                    sse_json_events(&to_bytes(response.into_body(), usize::MAX).await.unwrap());
+                assert!(
+                    !events.iter().any(|event| event.get("error").is_some()),
+                    "{events:?}"
+                );
+                let reasoning = events
+                    .iter()
+                    .filter_map(|event| event["choices"][0]["delta"]["reasoning_content"].as_str())
+                    .collect::<String>();
+                let content = events
+                    .iter()
+                    .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                    .collect::<String>();
+                assert_eq!(reasoning, "new", "{events:?}");
+                assert_eq!(content, "answer", "{events:?}");
+            }
+            let mut invalid = body.clone();
+            invalid["messages"][0]["reasoning_content"] = json!("old[/r]");
+            let (status, error) =
+                call(router.clone(), "POST", "/v1/chat/completions", invalid).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("leave response_template field"),
+                "{error}"
+            );
+            let mut constrained = body.clone();
+            constrained["response_format"] = json!({"type":"json_object"});
+            let (status, error) =
+                call(router.clone(), "POST", "/v1/chat/completions", constrained).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("channel-aware generation grammar"),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -392,14 +392,6 @@ impl ChatCompletionRequest {
         if !self.continue_final_message.is_enabled() {
             return Ok(());
         }
-        anyhow::ensure!(
-            self.continuation_mode() != ChatContinuation::Reasoning,
-            "continue_final_message reasoning_content and reasoning-only auto continuation need resumable reasoning-parser state; send a new user turn until that capability is available"
-        );
-        anyhow::ensure!(
-            !self.add_generation_prompt,
-            "continue_final_message requires add_generation_prompt=false; continuing an assistant message cannot open another assistant turn"
-        );
         let last=self.messages.last().filter(|message|message.role.trim()=="assistant")
             .ok_or_else(||anyhow::anyhow!("continue_final_message requires a final assistant message; append the assistant text to continue"))?;
         anyhow::ensure!(
@@ -409,21 +401,50 @@ impl ChatCompletionRequest {
                 .is_some_and(|calls| !calls.is_empty()),
             "continue_final_message cannot resume an assistant message containing tool_calls; finish the tool results before continuing"
         );
-        if self.wants_constrained_json() {
-            let prefix = last
-                .content
-                .as_ref()
-                .map(|content| content.text())
-                .unwrap_or_default();
-            onnx_genai_engine::JsonConstraint::new(prefix).map_err(|error| {
-                anyhow::anyhow!("continue_final_message JSON prefix rejected: {error}")
-            })?;
+        match self.continuation_mode() {
+            ChatContinuation::Reasoning => {
+                anyhow::ensure!(
+                    last.reasoning_content
+                        .as_ref()
+                        .is_some_and(|text| !text.trim().is_empty()),
+                    "continue_final_message reasoning_content requires nonempty final assistant reasoning_content; provide the reasoning prefix to resume"
+                );
+                anyhow::ensure!(
+                    !self.wants_constrained_json(),
+                    "reasoning continuation with response_format needs a channel-aware generation grammar; omit response_format until that grammar capability is available"
+                );
+            }
+            _ => {
+                anyhow::ensure!(
+                    last.content
+                        .as_ref()
+                        .is_some_and(|content| !content.text().trim().is_empty()),
+                    "continue_final_message content requires nonempty final assistant content; provide the answer prefix to resume"
+                );
+                if self.wants_constrained_json() {
+                    let prefix = last
+                        .content
+                        .as_ref()
+                        .map(|content| content.text())
+                        .unwrap_or_default();
+                    onnx_genai_engine::JsonConstraint::new(prefix).map_err(|error| {
+                        anyhow::anyhow!("continue_final_message JSON prefix rejected: {error}")
+                    })?;
+                }
+            }
         }
+        Ok(())
+    }
+
+    pub(crate) fn effective_add_generation_prompt(&self) -> bool {
+        self.add_generation_prompt && !self.continue_final_message.is_enabled()
+    }
+
+    pub(crate) fn validate_plain_continuation(&self) -> anyhow::Result<()> {
+        self.validate_continuation()?;
         anyhow::ensure!(
-            last.content
-                .as_ref()
-                .is_some_and(|content| !content.text().trim().is_empty()),
-            "continue_final_message currently requires nonempty final assistant content; reasoning-only continuation needs a resumable reasoning-parser state"
+            self.continuation_mode() != ChatContinuation::Reasoning,
+            "reasoning continuation requires a declared response_template and a chat template preserving reasoning_content; use model-aware server preparation rather than the plain prompt builder"
         );
         Ok(())
     }

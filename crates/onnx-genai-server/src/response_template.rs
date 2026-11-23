@@ -490,6 +490,17 @@ impl ResponseParser {
         Ok(parser)
     }
 
+    pub(crate) fn require_open_text_channel(&self, name: &str) -> anyhow::Result<()> {
+        let active = self
+            .current
+            .map(|field| self.spec.fields[field].name.as_str());
+        ensure!(
+            active == Some(name),
+            "continue_final_message requires the rendered prefix to leave response_template field {name:?} open, but the active field is {active:?}; repair the chat/response template boundaries or remove a closing delimiter from the continuation prefix"
+        );
+        Ok(())
+    }
+
     fn accumulate(&mut self, range: Range<usize>) {
         if range.is_empty() {
             return;
