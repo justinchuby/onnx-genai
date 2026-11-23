@@ -48,8 +48,8 @@ mod tests {
 
     #[test]
     fn bitcast_copies_raw_payload_at_byte_offset() {
-        let bytes = [0xaa, 0x21, 0x03, 0xbb];
-        let mut dest = [0xcc; 4];
+        let bytes = [0xaa_u8, 0x21, 0x03, 0xbb];
+        let mut dest = [0xcc_u8; 4];
         let input = TensorView::new(
             DevicePtr(bytes.as_ptr().cast()),
             DataType::Uint4,
