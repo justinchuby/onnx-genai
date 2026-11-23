@@ -1,0 +1,3377 @@
+diff --git a/crates/onnx-runtime-ep-cpu/Cargo.toml b/crates/onnx-runtime-ep-cpu/Cargo.toml
+index fa800ecdd..8d55cdb25 100644
+--- a/crates/onnx-runtime-ep-cpu/Cargo.toml
++++ b/crates/onnx-runtime-ep-cpu/Cargo.toml
+@@ -41,6 +41,8 @@ mlas = ["dep:mlas-sys"]
+ # gated further at runtime by ONNX_GENAI_PROFILE_GQA=1. Off by default; adds no
+ # code to production builds.
+ gqa_phase_profile = []
++# Isolated same-process performance attribution experiment; never enabled by default.
++expert_bank_pair_probe = []
+ # Test-only rendezvous and accounting used to prove same-session Einsum overlap.
+ # Shipped builds do not enable this, so the production kernel has no probe load
+ # and cannot be armed through the plugin ABI.
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/mod.rs b/crates/onnx-runtime-ep-cpu/src/kernels/mod.rs
+index 732ef8e5b..21121e707 100644
+--- a/crates/onnx-runtime-ep-cpu/src/kernels/mod.rs
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/mod.rs
+@@ -3665,3 +3665,10 @@ mod tests {
+ 
+ mod decoded_projection;
+ pub(crate) mod weight_cache;
++
++#[cfg(feature = "expert_bank_pair_probe")]
++pub(crate) mod expert_bank_probe;
++#[cfg(feature = "expert_bank_pair_probe")]
++mod probe_before_block_quantized_moe;
++#[cfg(feature = "expert_bank_pair_probe")]
++mod probe_before_moe;
+diff --git a/crates/onnx-runtime-ep-cpu/src/lib.rs b/crates/onnx-runtime-ep-cpu/src/lib.rs
+index 7d59a13f7..50f03c4d8 100644
+--- a/crates/onnx-runtime-ep-cpu/src/lib.rs
++++ b/crates/onnx-runtime-ep-cpu/src/lib.rs
+@@ -72,6 +72,8 @@ pub mod weight_offload;
+ 
+ pub use backend::CpuBackend;
+ pub use dispatch_ledger::{Backend as DispatchBackend, KernelFamily, effective_backend};
++#[cfg(feature = "expert_bank_pair_probe")]
++pub use kernels::expert_bank_probe::ExpertBankProbeArm;
+ pub use kernels::{CpuOpDescriptor, build_cpu_registry_with_descriptors, supported_dtypes_for_op};
+ pub use optimizer::{
+     ConvBatchNormActivationFusion, MatMulNBitsBiasFusion, ProjectionFusion, SiblingProjectionMerge,
+diff --git a/crates/onnx-runtime-ep-cpu/src/provider.rs b/crates/onnx-runtime-ep-cpu/src/provider.rs
+index 9a3a0b4b1..949f855ab 100644
+--- a/crates/onnx-runtime-ep-cpu/src/provider.rs
++++ b/crates/onnx-runtime-ep-cpu/src/provider.rs
+@@ -38,6 +38,10 @@ use crate::optimizer::cpu_optimization_passes;
+ /// registry is also exposed to the session (Track D) so placement and kernel
+ /// instantiation share one source of truth.
+ pub struct CpuExecutionProvider {
++    #[cfg(feature = "expert_bank_pair_probe")]
++    probe_alignment: usize,
++    #[cfg(feature = "expert_bank_pair_probe")]
++    probe_address: std::sync::atomic::AtomicUsize,
+     device: DeviceId,
+     initialized: bool,
+     registry: OpRegistry,
+@@ -106,6 +110,32 @@ fn default_cpu_memory() -> std::sync::Arc<dyn onnx_runtime_memory_api::DeviceAll
+ }
+ 
+ impl CpuExecutionProvider {
++    /// Experimental cold factory selection. Never enabled in a shipped build.
++    #[cfg(feature = "expert_bank_pair_probe")]
++    pub fn initialized_with_expert_bank_probe(
++        resources: CpuMemoryResources,
++        arm: crate::ExpertBankProbeArm,
++        alignment: usize,
++        creates: std::sync::Arc<std::sync::atomic::AtomicUsize>,
++    ) -> Result<Self> {
++        assert!(alignment.is_power_of_two());
++        let mut provider = Self::with_resources(resources);
++        provider.probe_alignment = alignment;
++        crate::kernels::expert_bank_probe::configure(
++            &mut provider.registry,
++            &provider.resources,
++            arm,
++            creates,
++        );
++        provider.initialize(&EpConfig::default())?;
++        Ok(provider)
++    }
++    #[cfg(feature = "expert_bank_pair_probe")]
++    pub fn expert_bank_probe_address(&self) -> usize {
++        self.probe_address
++            .load(std::sync::atomic::Ordering::Relaxed)
++    }
++
+     /// Construct a CPU EP bound to `CPU:0` with all Phase-1 kernels registered.
+     pub fn new() -> Self {
+         Self::with_resources(CpuMemoryResources::default())
+@@ -114,6 +144,10 @@ impl CpuExecutionProvider {
+     /// Construct all CPU factories with the same immutable session resources.
+     pub fn with_resources(resources: CpuMemoryResources) -> Self {
+         Self {
++            #[cfg(feature = "expert_bank_pair_probe")]
++            probe_alignment: 1,
++            #[cfg(feature = "expert_bank_pair_probe")]
++            probe_address: std::sync::atomic::AtomicUsize::new(0),
+             device: DeviceId::cpu(),
+             initialized: false,
+             registry: build_cpu_registry_with_resources(resources.clone()),
+@@ -684,6 +718,8 @@ impl ExecutionProvider for CpuExecutionProvider {
+         alignment: usize,
+         role: onnx_runtime_memory_api::MemoryRole,
+     ) -> Result<onnx_runtime_ep_api::WorkspaceAllocation> {
++        #[cfg(feature = "expert_bank_pair_probe")]
++        let alignment = alignment.max(self.probe_alignment);
+         let owner = self
+             .workspace_pool()?
+             .checkout(size, alignment, role)
+@@ -691,6 +727,11 @@ impl ExecutionProvider for CpuExecutionProvider {
+                 operation: "borrow CPU execution workspace",
+                 source: Box::new(source),
+             })?;
++        #[cfg(feature = "expert_bank_pair_probe")]
++        self.probe_address.store(
++            owner.as_ptr().as_ptr() as usize,
++            std::sync::atomic::Ordering::Relaxed,
++        );
+         Ok(onnx_runtime_ep_api::WorkspaceAllocation::new(
+             DeviceBuffer::from_managed_allocation(owner, self.device),
+         ))
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/expert_bank_probe.rs b/crates/onnx-runtime-ep-cpu/src/kernels/expert_bank_probe.rs
+new file mode 100644
+index 000000000..9c3a251a8
+--- /dev/null
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/expert_bank_probe.rs
+@@ -0,0 +1,71 @@
++//! Cold factory selection for an isolated attribution experiment.
++//! Returned kernels have no probe wrapper or hot-path mode branch.
++use crate::CpuMemoryResources;
++use onnx_runtime_ep_api::{Kernel, KernelFactory, OpKey, OpRegistry, Result, WorkspacePlanning};
++use onnx_runtime_ir::Node;
++use std::sync::{
++    Arc,
++    atomic::{AtomicUsize, Ordering},
++};
++
++#[derive(Clone, Copy, Debug)]
++pub enum ExpertBankProbeArm {
++    Before,
++    Banked,
++}
++
++struct CountedFactory<F> {
++    factory: F,
++    creates: Arc<AtomicUsize>,
++}
++impl<F: KernelFactory> KernelFactory for CountedFactory<F> {
++    fn create(&self, node: &Node, shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
++        let kernel = self.factory.create(node, shapes)?;
++        self.creates.fetch_add(1, Ordering::Relaxed);
++        Ok(kernel)
++    }
++}
++
++pub(crate) fn configure(
++    registry: &mut OpRegistry,
++    resources: &CpuMemoryResources,
++    arm: ExpertBankProbeArm,
++    creates: Arc<AtomicUsize>,
++) {
++    let weights = resources.weight_memory().clone();
++    let limit = resources.weight_cache_limits().dense_bytes;
++    let (block, float): (Box<dyn KernelFactory>, Box<dyn KernelFactory>) = match arm {
++        ExpertBankProbeArm::Before => (
++            Box::new(CountedFactory {
++                factory: super::probe_before_block_quantized_moe::BlockQuantizedMoEFactory::new(
++                    weights, limit,
++                ),
++                creates: creates.clone(),
++            }),
++            Box::new(CountedFactory {
++                factory: super::probe_before_moe::MoEFactory,
++                creates,
++            }),
++        ),
++        ExpertBankProbeArm::Banked => (
++            Box::new(CountedFactory {
++                factory: super::block_quantized_moe::BlockQuantizedMoEFactory::new(weights, limit),
++                creates: creates.clone(),
++            }),
++            Box::new(CountedFactory {
++                factory: super::moe::MoEFactory,
++                creates,
++            }),
++        ),
++    };
++    registry.register(
++        OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
++        WorkspacePlanning::Metadata,
++        block,
++    );
++    registry.register(
++        OpKey::new("MoE", "com.microsoft", 1),
++        WorkspacePlanning::Metadata,
++        float,
++    );
++}
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/probe_before_block_quantized_moe.rs b/crates/onnx-runtime-ep-cpu/src/kernels/probe_before_block_quantized_moe.rs
+new file mode 100644
+index 000000000..319eac483
+--- /dev/null
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/probe_before_block_quantized_moe.rs
+@@ -0,0 +1,1396 @@
++//! CPU parity oracle for `pkg.nxrt::BlockQuantizedMoE` (mixed-projection ABI).
++//!
++//! Each routed expert carries an independent native block-quantized format for
++//! every projection: `fc1_format` (gate/up), `fc2_format` (down), and
++//! `fc3_format` (the separate gate of an unfused SwiGLU / gated-GLU). This is a
++//! hard requirement of real GLM-5.2 GGUF checkpoints, whose routed experts pack
++//! `ffn_gate/up_exps` and `ffn_down_exps` at *different* qtypes and block widths
++//! (e.g. `IQ1_S` gate/up with `IQ3_XXS` down). A single uniform format cannot
++//! represent them.
++//!
++//! Every consumer — the schema/claim validator, this CPU oracle, and the CUDA
++//! claim gate — derives its byte offsets, strides and decode parameters from one
++//! property-typed `ProjectionLayout` contract (qtype, elements/block,
++//! bytes/block, logical K/N, per-row and per-expert bank strides, expert count).
++//! The GLM-5.2 IQ/K-quant/Q8 layouts are decoded by the CPU parity oracle.
++//!
++//! The expert's complete f32 projection set is cached when it fits the dense
++//! cache budget. Otherwise, compressed rows are decoded into a bounded reusable tile
++//! per worker shard and applied to every routed token in that expert group.
++//! This bounds temporary decoded weight storage without introducing a second
++//! routing or activation implementation. It is row-streamed f32 computation,
++//! not an integer/quantized-domain dot product.
++
++use super::weight_cache::{WeightCache, WeightCacheStatus, WeightLoad, WeightSpec};
++use std::borrow::Cow;
++use std::collections::BTreeMap;
++use std::sync::Arc;
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++use onnx_runtime_ep_api::{
++    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView, WorkspaceLayout,
++    WorkspaceRequirement, WorkspaceView,
++};
++use onnx_runtime_ir::{DataType, Node, Shape};
++
++use super::block_quantized_matmul::{
++    BlockFormat, DenseWeightCacheKey, DenseWeightIdentity, DenseWeightLayout,
++    decode_dense_weight_into, linear_packed_prepared, projection_plan,
++};
++use super::decoded_projection::ProjectionScratch;
++use super::probe_before_moe::{
++    ExpertProjection, MoeAttributes, routing_weights, run_expert_grouped, run_expert_projections,
++};
++use super::{check_arity, to_dense_f32, write_dense_f32};
++
++const OP: &str = "BlockQuantizedMoE";
++const LAYOUT_VERSION: i64 = 1;
++
++pub static BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS: AtomicUsize = AtomicUsize::new(0);
++pub static BLOCK_QUANT_MOE_DENSE_EXPANSIONS: AtomicUsize = AtomicUsize::new(0);
++
++const INPUT_NAMES: [&str; 9] = [
++    "input",
++    "router_logits",
++    "fc1_experts_weights",
++    "fc1_experts_bias",
++    "fc2_experts_weights",
++    "fc2_experts_bias",
++    "fc3_experts_weights",
++    "fc3_experts_bias",
++    "router_weights",
++];
++
++#[cfg(test)]
++static BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++
++/// Per-projection native block formats for one `BlockQuantizedMoE` node.
++///
++/// `fc1` (gate/up) and `fc2` (down) are always present; `fc3` (the separate gate
++/// of an unfused SwiGLU / gated-GLU) is present exactly when the `fc3` weights
++/// input is wired. The three formats are independent — this is the whole point
++/// of the mixed-projection ABI.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct ProjectionFormats {
++    fc1: BlockFormat,
++    fc2: BlockFormat,
++    fc3: Option<BlockFormat>,
++}
++
++/// One property-typed packed-projection layout contract, shared by the claim
++/// validator and the CPU oracle (and mirrored by the CUDA claim gate).
++///
++/// A packed projection tensor has shape `[experts, out_features, blocks_per_row,
++/// block_bytes]` where `blocks_per_row = in_features / qk`. Partial native
++/// blocks are rejected.
++/// embedded per block (the IQ/MXFP4 formats are self-describing), so there is no
++/// external scale or codebook tensor. Every byte offset the kernel touches is
++/// derived from this contract, never recomputed ad hoc.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct ProjectionLayout {
++    format: BlockFormat,
++    in_features: usize,
++    out_features: usize,
++    experts: usize,
++}
++
++impl ProjectionLayout {
++    fn new(format: BlockFormat, out_features: usize, in_features: usize, experts: usize) -> Self {
++        Self {
++            format,
++            in_features,
++            out_features,
++            experts,
++        }
++    }
++
++    fn qk(&self) -> usize {
++        self.format.qk()
++    }
++
++    fn block_bytes(&self) -> usize {
++        self.format.block_bytes()
++    }
++
++    fn blocks_per_row(&self) -> usize {
++        self.in_features.div_ceil(self.qk())
++    }
++
++    /// Packed tensor shape `[E, N, blocks_per_row, block_bytes]`.
++    fn packed_shape(&self) -> [usize; 4] {
++        [
++            self.experts,
++            self.out_features,
++            self.blocks_per_row(),
++            self.block_bytes(),
++        ]
++    }
++
++    /// Bank stride of one packed output row, in bytes.
++    fn row_stride_bytes(&self) -> Result<usize> {
++        self.blocks_per_row()
++            .checked_mul(self.block_bytes())
++            .ok_or_else(|| error("packed row byte stride overflow"))
++    }
++
++    /// Bank stride of one expert (all its output rows), in bytes.
++    fn expert_stride_bytes(&self) -> Result<usize> {
++        self.out_features
++            .checked_mul(self.row_stride_bytes()?)
++            .ok_or_else(|| error("packed expert byte stride overflow"))
++    }
++
++    /// Total packed bytes across every expert.
++    fn total_bytes(&self) -> Result<usize> {
++        self.experts
++            .checked_mul(self.expert_stride_bytes()?)
++            .ok_or_else(|| error("packed projection byte count overflow"))
++    }
++
++    /// Byte range `start..end` of one expert's bank within the packed tensor.
++    fn expert_byte_range(&self, expert: usize) -> Result<std::ops::Range<usize>> {
++        let stride = self.expert_stride_bytes()?;
++        let start = expert
++            .checked_mul(stride)
++            .ok_or_else(|| error("expert byte offset overflow"))?;
++        let end = start
++            .checked_add(stride)
++            .ok_or_else(|| error("expert byte range overflow"))?;
++        Ok(start..end)
++    }
++}
++
++pub struct BlockQuantizedMoEFactory {
++    memory: crate::DerivedWeightMemory,
++    cache_bytes: usize,
++}
++
++impl BlockQuantizedMoEFactory {
++    pub(super) fn new(memory: crate::DerivedWeightMemory, cache_bytes: usize) -> Self {
++        Self {
++            memory,
++            cache_bytes,
++        }
++    }
++}
++
++pub struct BlockQuantizedMoEKernel {
++    attributes: MoeAttributes,
++    formats: ProjectionFormats,
++    constant_inputs: [bool; 9],
++    weight_identities: [DenseWeightIdentity; 3],
++    weight_cache: WeightCache<DenseWeightCacheKey>,
++    projection_plan: super::decoded_projection::DecodedProjectionPlan,
++}
++
++#[derive(Debug)]
++struct ValidatedMetadata {
++    attributes: MoeAttributes,
++    formats: ProjectionFormats,
++}
++
++impl KernelFactory for BlockQuantizedMoEFactory {
++    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
++        let ValidatedMetadata {
++            attributes,
++            formats,
++        } = validate_metadata(node, None)?;
++        Ok(Box::new(BlockQuantizedMoEKernel {
++            attributes,
++            formats,
++            constant_inputs: [false; 9],
++            weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
++            projection_plan: projection_plan(),
++            weight_cache: WeightCache::new(self.memory.clone(), self.cache_bytes),
++        }))
++    }
++}
++
++pub(crate) fn unsupported_reason(
++    node: &Node,
++    shapes: &[Shape],
++    input_dtypes: &[DataType],
++) -> Option<Cow<'static, str>> {
++    validate_metadata(node, Some((shapes, input_dtypes)))
++        .err()
++        .map(|error| Cow::Owned(error.to_string()))
++}
++
++impl Kernel for BlockQuantizedMoEKernel {
++    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
++        for (index, is_constant) in constant_inputs.iter().copied().enumerate().take(9) {
++            self.constant_inputs[index] = is_constant;
++        }
++    }
++
++    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
++        let dims = validate_runtime_shapes(inputs, None, &self.attributes, self.formats)?;
++        let layout = self.execution_workspace_layout(dims)?;
++        Ok(WorkspaceRequirement {
++            bytes: layout.bytes() as u64,
++            alignment: layout.alignment(),
++            ..WorkspaceRequirement::NONE
++        })
++    }
++
++    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
++        self.execute_prepared_experts(inputs, outputs, None)
++    }
++
++    fn execute_with_workspace(
++        &self,
++        inputs: &[TensorView],
++        outputs: &mut [TensorMut],
++        workspace: Option<WorkspaceView>,
++    ) -> Result<()> {
++        self.execute_prepared_experts(inputs, outputs, workspace)
++    }
++
++    fn supports_strided_input(&self, _input_idx: usize) -> bool {
++        true
++    }
++}
++
++impl BlockQuantizedMoEKernel {
++    fn execution_workspace_layout(&self, dims: Dimensions) -> Result<WorkspaceLayout<3>> {
++        // A validated empty final output cannot consume projections or gathers.
++        if dims.rows == 0 || dims.hidden == 0 {
++            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 3]);
++        }
++        // Experts and their projections execute serially. An expert receives a
++        // row at most once, so total rows bound every group, independent of k.
++        // Cover streamed fallback even when a dense resident set is available.
++        let mut projection_bytes = 0usize;
++        let mut projection_alignment = 1usize;
++        for (k, n) in [(dims.hidden, dims.fc1_size), (dims.inter, dims.hidden)]
++            .into_iter()
++            .chain(self.formats.fc3.map(|_| (dims.hidden, dims.inter)))
++        {
++            let layout = self.projection_plan.layout(dims.rows, k, n)?;
++            projection_bytes = projection_bytes.max(layout.bytes());
++            projection_alignment = projection_alignment.max(layout.alignment());
++        }
++        let projection =
++            std::alloc::Layout::from_size_align(projection_bytes, projection_alignment)
++                .map_err(|_| error("decoded projection workspace exceeds addressable capacity"))?;
++        let gathered_elements = dims.rows.checked_mul(dims.hidden).ok_or_else(|| {
++            error("grouped input rows times hidden width overflow; reduce batch dimensions")
++        })?;
++        let gathered = std::alloc::Layout::array::<f32>(gathered_elements).map_err(|_| {
++            error("grouped input workspace exceeds addressable capacity; reduce batch dimensions")
++        })?;
++        // The accumulator is live across all experts, so it cannot alias the
++        // projection or gather region. One input-sized region covers the full
++        // output without any expert-count or top-k multiplier.
++        WorkspaceLayout::new([projection, gathered, gathered])
++    }
++
++    fn execute_prepared_experts(
++        &self,
++        inputs: &[TensorView],
++        outputs: &mut [TensorMut],
++        workspace: Option<WorkspaceView>,
++    ) -> Result<()> {
++        check_arity(OP, inputs, outputs, 5, 9, 1)?;
++        if outputs[0].dtype != DataType::Float32 {
++            return Err(error(format!(
++                "output dtype {:?} unsupported; expected Float32",
++                outputs[0].dtype
++            )));
++        }
++
++        let metadata: [_; 9] = std::array::from_fn(|index| {
++            inputs.get(index).map_or(
++                TensorMetadata::new(DataType::Float32, &[], false),
++                |input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()),
++            )
++        });
++        let dimensions = validate_runtime_shapes(
++            &metadata,
++            Some(outputs[0].shape),
++            &self.attributes,
++            self.formats,
++        )?;
++        if dimensions.rows == 0 || dimensions.hidden == 0 {
++            return write_dense_f32(&mut outputs[0], &[]);
++        }
++        let layout = self.execution_workspace_layout(dimensions)?;
++        // SAFETY: one checked layout lends disjoint Host regions for this
++        // dispatch. Neither short borrow nor a projection output escapes.
++        let [mut scratch, mut grouped_scratch, mut accumulator] = unsafe {
++            ProjectionScratch::bind_layout(
++                "BlockQuantizedMoE execution workspace binding",
++                layout,
++                workspace,
++            )?
++        };
++        let Dimensions {
++            rows,
++            hidden,
++            experts,
++            inter,
++            fc1_size,
++        } = dimensions;
++
++        let input = to_dense_f32(&inputs[0])?;
++        let router_logits = to_dense_f32(&inputs[1])?;
++        let router_weights = optional_dense(inputs, 8)?;
++        let fc1_bias = optional_dense(inputs, 3)?;
++        let fc2_bias = optional_dense(inputs, 5)?;
++        let fc3_bias = optional_dense(inputs, 7)?;
++
++        let mut tasks = BTreeMap::<usize, Vec<(usize, f32)>>::new();
++        for row in 0..rows {
++            let range = row * experts..(row + 1) * experts;
++            let mut route = routing_weights(
++                &router_logits[range.clone()],
++                router_weights
++                    .as_deref()
++                    .map(|weights| &weights[range.clone()]),
++                self.attributes.k,
++                self.attributes.normalize_routing_weights,
++            );
++            route.sort_unstable_by_key(|&(expert, _)| expert);
++            for (expert, weight) in route {
++                tasks.entry(expert).or_default().push((row, weight));
++            }
++        }
++
++        let output = accumulator.zeroed_prefix(rows * hidden)?;
++        // A dense resident set must fit as a whole: separately admitting
++        // projections can evict an Arc still held by this expert call and
++        // hide its live expansion outside the cache's resident-byte count.
++        let dense_bytes = fc1_size
++            .checked_mul(hidden)
++            .and_then(|count| {
++                hidden
++                    .checked_mul(inter)
++                    .and_then(|down| count.checked_add(down))
++            })
++            .and_then(|count| {
++                if optional_input(inputs, 6).is_some() {
++                    inter
++                        .checked_mul(hidden)
++                        .and_then(|up| count.checked_add(up))
++                } else {
++                    Some(count)
++                }
++            })
++            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
++            .ok_or_else(|| error("expert dense resident-set byte count overflow"))?;
++        let cache_budget = if tasks.is_empty() {
++            0
++        } else {
++            self.weight_cache.byte_limit()
++        };
++        let use_dense = dense_bytes <= cache_budget;
++        let mut dense_experts = 0usize;
++        let mut streamed_experts = 0usize;
++        let mut grant_refusal = None;
++        #[cfg(test)]
++        let mut counted_dense = false;
++        for (expert, expert_tasks) in tasks {
++            let grouped_input = grouped_scratch.gather_rows(
++                &input,
++                hidden,
++                expert_tasks.iter().map(|&(row, _)| row),
++            )?;
++            let dense = if use_dense {
++                match self.dequantize_expert_group(
++                    inputs,
++                    expert,
++                    Dimensions {
++                        rows,
++                        hidden,
++                        experts,
++                        inter,
++                        fc1_size,
++                    },
++                )? {
++                    WeightLoad::Ready(loaded) => {
++                        #[cfg(test)]
++                        if !counted_dense {
++                            BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS.fetch_add(1, Ordering::Relaxed);
++                            counted_dense = true;
++                        }
++                        dense_experts += 1;
++                        Some(loaded.weights)
++                    }
++                    WeightLoad::Declined(reason) => {
++                        grant_refusal = Some(reason);
++                        None
++                    }
++                }
++            } else {
++                None
++            };
++            if dense.is_none() {
++                streamed_experts += 1;
++            }
++            let expert_output = if let Some(weights) = dense {
++                let fc1 = &weights[0];
++                let fc2 = &weights[1];
++                let fc3 = weights.get(2);
++                run_expert_grouped(
++                    grouped_input,
++                    expert_tasks.len(),
++                    fc1.as_slice(),
++                    fc1_bias
++                        .as_deref()
++                        .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
++                    fc2.as_slice(),
++                    fc2_bias
++                        .as_deref()
++                        .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
++                    fc3.map(|weight| weight.as_slice()),
++                    fc3_bias
++                        .as_deref()
++                        .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
++                    fc1_size,
++                    hidden,
++                    inter,
++                    &self.attributes,
++                )?
++            } else {
++                let fc1 = packed_projection(
++                    &inputs[2],
++                    self.formats.fc1,
++                    expert,
++                    fc1_size,
++                    hidden,
++                    experts,
++                )?;
++                let fc2 = packed_projection(
++                    &inputs[4],
++                    self.formats.fc2,
++                    expert,
++                    hidden,
++                    inter,
++                    experts,
++                )?;
++                let fc3 = optional_input(inputs, 6)
++                    .map(|packed| {
++                        packed_projection(
++                            packed,
++                            self.formats
++                                .fc3
++                                .ok_or_else(|| error("fc3 format missing for streamed expert"))?,
++                            expert,
++                            inter,
++                            hidden,
++                            experts,
++                        )
++                    })
++                    .transpose()?;
++                run_expert_projections(
++                    grouped_input,
++                    expert_tasks.len(),
++                    &fc1,
++                    fc1_bias
++                        .as_deref()
++                        .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
++                    &fc2,
++                    fc2_bias
++                        .as_deref()
++                        .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
++                    fc3.as_ref(),
++                    fc3_bias
++                        .as_deref()
++                        .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
++                    &self.attributes,
++                    |projection, input, rows, bias| {
++                        let elements = rows.checked_mul(projection.out_features).ok_or_else(|| error("expert projection output element count overflows; reduce batch or expert dimensions"))?;
++                        let mut output = super::decoded_projection::zeroed_f32(
++                            OP,
++                            "expert projection output staging",
++                            elements,
++                        )?;
++                        linear_packed_prepared(
++                            projection.format,
++                            &projection.bytes,
++                            input,
++                            rows,
++                            projection.in_features,
++                            projection.out_features,
++                            bias,
++                            self.projection_plan,
++                            scratch.initialized(),
++                            &mut output,
++                        )?;
++                        Ok(output)
++                    },
++                )?
++            };
++            for (grouped_row, (row, route_weight)) in expert_tasks.into_iter().enumerate() {
++                for feature in 0..hidden {
++                    output[row * hidden + feature] +=
++                        route_weight * expert_output[grouped_row * hidden + feature];
++                }
++            }
++        }
++        // One annotation describes the whole node; a mixed operation must not
++        // report only the final expert's path.
++        if streamed_experts == 0 {
++            onnx_runtime_ep_api::record_kernel_variant!(
++                "block_moe.dense_resident_set",
++                "{dense_experts} dense expert sets, {dense_bytes} bytes per set; cache budget {cache_budget} bytes"
++            );
++        } else {
++            onnx_runtime_ep_api::record_kernel_variant!(
++                "block_moe.streamed_rows",
++                "{streamed_experts} row-streamed and {dense_experts} dense expert sets; {dense_bytes} dense bytes per set, cache budget {cache_budget} bytes; last Host grant refusal: {grant_refusal:?}"
++            );
++        }
++        write_dense_f32(&mut outputs[0], output)
++    }
++
++    fn dequantize_expert_group(
++        &self,
++        inputs: &[TensorView],
++        expert: usize,
++        dims: Dimensions,
++    ) -> Result<WeightLoad> {
++        let mut projections = vec![
++            (2, dims.fc1_size, dims.hidden, self.formats.fc1, 1u8),
++            (4, dims.hidden, dims.inter, self.formats.fc2, 2u8),
++        ];
++        if optional_input(inputs, 6).is_some() {
++            projections.push((
++                6,
++                dims.inter,
++                dims.hidden,
++                self.formats.fc3.ok_or_else(|| {
++                    error("fc3_experts_weights present but fc3_format is missing")
++                })?,
++                3,
++            ));
++        }
++        let mut sources = Vec::with_capacity(projections.len());
++        let mut keys = Vec::with_capacity(projections.len());
++        let mut sizes = Vec::with_capacity(projections.len());
++        for (slot, out_features, in_features, format, role) in projections {
++            let packed = &inputs[slot];
++            let layout = ProjectionLayout::new(format, out_features, in_features, dims.experts);
++            expert_byte_count(packed, &layout)?;
++            let resolved = if self.constant_inputs[slot] {
++                Some(self.weight_identities[usize::from(role - 1)].resolve(
++                    packed,
++                    format,
++                    in_features,
++                    out_features,
++                    role,
++                    Some(expert),
++                    || packed_expert_bytes(packed, &layout, expert),
++                )?)
++            } else {
++                None
++            };
++            let bytes = out_features
++                .checked_mul(in_features)
++                .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
++                .ok_or_else(|| error("dense expert projection byte count overflow"))?;
++            keys.push(resolved.as_ref().map(|resolved| Arc::clone(&resolved.key)));
++            sizes.push(bytes);
++            sources.push((
++                packed,
++                layout,
++                format,
++                out_features,
++                in_features,
++                resolved.and_then(|resolved| resolved.payload),
++            ));
++        }
++        let specs: Vec<_> = keys
++            .iter()
++            .zip(&sizes)
++            .map(|(key, bytes)| match key.as_deref() {
++                Some(key) => WeightSpec::cached(key),
++                None => Ok(WeightSpec::transient(*bytes)),
++            })
++            .collect::<Result<Vec<_>>>()?;
++        let loaded = self.weight_cache.load_group(&specs, |index, output| {
++            BLOCK_QUANT_MOE_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
++            let (packed, layout, format, out_features, in_features, payload) = &mut sources[index];
++            let bytes = match payload.take() {
++                Some(bytes) => bytes,
++                None => packed_expert_bytes(packed, layout, expert)?,
++            };
++            decode_dense_weight_into(
++                *format,
++                *in_features,
++                *out_features,
++                &bytes,
++                output,
++                DenseWeightLayout::Nk,
++            )
++        })?;
++        if let WeightLoad::Ready(loaded) = &loaded {
++            for status in &loaded.statuses {
++                if *status == WeightCacheStatus::Hit {
++                    BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS.fetch_add(1, Ordering::Relaxed);
++                }
++            }
++        }
++        Ok(loaded)
++    }
++}
++
++#[derive(Clone, Copy)]
++struct Dimensions {
++    rows: usize,
++    hidden: usize,
++    experts: usize,
++    inter: usize,
++    fc1_size: usize,
++}
++
++fn validate_runtime_shapes(
++    inputs: &[TensorMetadata<'_>],
++    output_shape: Option<&[usize]>,
++    attributes: &MoeAttributes,
++    formats: ProjectionFormats,
++) -> Result<Dimensions> {
++    if !(5..=9).contains(&inputs.len()) {
++        return Err(error(format!(
++            "workspace metadata needs 5..=9 positional inputs, got {}; preserve absent optional slots",
++            inputs.len()
++        )));
++    }
++    for &index in &[0, 1, 2, 4] {
++        if !inputs[index].present {
++            return Err(error(format!(
++                "required input {index} ('{}') is absent",
++                INPUT_NAMES[index]
++            )));
++        }
++    }
++    for (index, input) in inputs.iter().enumerate().filter(|(_, input)| input.present) {
++        require_dtype(
++            index,
++            input,
++            if matches!(index, 2 | 4 | 6) {
++                DataType::Uint8
++            } else {
++                DataType::Float32
++            },
++        )?;
++    }
++    let input_shape = inputs[0].shape;
++    if !matches!(input_shape.len(), 2 | 3) {
++        return Err(error(format!(
++            "input must be [rows,H] or [B,S,H], got {input_shape:?}"
++        )));
++    }
++    if let Some(output_shape) = output_shape
++        && output_shape != input_shape
++    {
++        return Err(error(format!(
++            "output shape {output_shape:?} must equal input shape {input_shape:?}"
++        )));
++    }
++    let hidden = *input_shape.last().expect("validated non-empty input rank");
++    let rows = checked_product(&input_shape[..input_shape.len() - 1], "input rows")?;
++    require_exact_rank(1, inputs[1].shape, 2)?;
++    if inputs[1].shape[0] != rows {
++        return Err(error(format!(
++            "router_logits rows {} must equal flattened input rows {rows}",
++            inputs[1].shape[0]
++        )));
++    }
++    let experts = inputs[1].shape[1];
++    if attributes.k > experts {
++        return Err(error(format!(
++            "requires 0 < k <= num_experts, got k={} and num_experts={experts}",
++            attributes.k
++        )));
++    }
++    require_exact_rank(2, inputs[2].shape, 4)?;
++    require_exact_rank(4, inputs[4].shape, 4)?;
++    if inputs[2].shape[0] != experts || inputs[4].shape[0] != experts {
++        return Err(error(format!(
++            "expert weight counts must equal router num_experts {experts}"
++        )));
++    }
++    if inputs[4].shape[1] != hidden {
++        return Err(error(format!(
++            "fc2_experts_weights must start [experts={experts}, H={hidden}], got {:?}",
++            inputs[4].shape
++        )));
++    }
++    let fc1_size = inputs[2].shape[1];
++    let inter = if attributes.swiglu_fusion == 0 {
++        fc1_size
++    } else {
++        if !fc1_size.is_multiple_of(2) {
++            return Err(error(format!(
++                "fused SwiGLU fc1_out must be even, got {fc1_size}"
++            )));
++        }
++        fc1_size / 2
++    };
++    if inter == 0 {
++        return Err(error("inferred inter dimension must be non-zero"));
++    }
++    let expected_fc1 = attributes.checked_fc1_size(inter, OP)?;
++    if fc1_size != expected_fc1 {
++        return Err(error(format!(
++            "fc1_experts_weights dimension 1 must be {expected_fc1}, got {fc1_size}"
++        )));
++    }
++    validate_packed_shape(
++        2,
++        inputs[2].shape,
++        ProjectionLayout::new(formats.fc1, fc1_size, hidden, experts),
++    )?;
++    validate_packed_shape(
++        4,
++        inputs[4].shape,
++        ProjectionLayout::new(formats.fc2, hidden, inter, experts),
++    )?;
++    validate_bias(inputs, 3, experts, fc1_size)?;
++    validate_bias(inputs, 5, experts, hidden)?;
++
++    let has_fc3 = optional_metadata(inputs, 6).is_some();
++    if has_fc3 != formats.fc3.is_some() {
++        return Err(error(
++            "fc3_format must be present exactly when fc3_experts_weights is wired",
++        ));
++    }
++    if attributes.uses_separate_gate(has_fc3) {
++        let fc3 = optional_metadata(inputs, 6)
++            .ok_or_else(|| error("unfused swiglu requires input 6 fc3_experts_weights"))?;
++        let fc3_format = formats
++            .fc3
++            .ok_or_else(|| error("fc3_experts_weights requires the fc3_format attribute"))?;
++        validate_packed_shape(
++            6,
++            fc3.shape,
++            ProjectionLayout::new(fc3_format, inter, hidden, experts),
++        )?;
++        validate_bias(inputs, 7, experts, inter)?;
++    } else {
++        if has_fc3 {
++            return Err(error(
++                "fc3_experts_weights is only valid for unfused swiglu or silu gated-GLU",
++            ));
++        }
++        if optional_metadata(inputs, 7).is_some() {
++            return Err(error("fc3_experts_bias requires fc3_experts_weights"));
++        }
++    }
++    if let Some(weights) = optional_metadata(inputs, 8)
++        && weights.shape != [rows, experts]
++    {
++        return Err(error(format!(
++            "router_weights must have shape [{rows}, {experts}], got {:?}",
++            weights.shape
++        )));
++    }
++    Ok(Dimensions {
++        rows,
++        hidden,
++        experts,
++        inter,
++        fc1_size,
++    })
++}
++
++fn validate_packed_shape(index: usize, shape: &[usize], layout: ProjectionLayout) -> Result<()> {
++    if !layout.in_features.is_multiple_of(layout.qk()) {
++        return Err(error(format!(
++            "input {index} ('{}') has input width {} with a partial {:?} block tail; \
++             full blocks of {} elements are required",
++            INPUT_NAMES[index],
++            layout.in_features,
++            layout.format,
++            layout.qk()
++        )));
++    }
++    let expected = layout.packed_shape();
++    if shape != expected {
++        return Err(error(format!(
++            "input {index} ('{}') must have shape {expected:?}, got {shape:?}",
++            INPUT_NAMES[index]
++        )));
++    }
++    Ok(())
++}
++
++struct PackedExpertProjection<'a> {
++    bytes: Cow<'a, [u8]>,
++    format: BlockFormat,
++    out_features: usize,
++    in_features: usize,
++}
++impl ExpertProjection for PackedExpertProjection<'_> {
++    fn out_features(&self) -> usize {
++        self.out_features
++    }
++    fn in_features(&self) -> usize {
++        self.in_features
++    }
++}
++
++fn packed_projection<'a>(
++    packed: &'a TensorView<'_>,
++    format: BlockFormat,
++    expert: usize,
++    out_features: usize,
++    in_features: usize,
++    experts: usize,
++) -> Result<PackedExpertProjection<'a>> {
++    let layout = ProjectionLayout::new(format, out_features, in_features, experts);
++    expert_byte_count(packed, &layout)?;
++    Ok(PackedExpertProjection {
++        bytes: packed_expert_bytes(packed, &layout, expert)?,
++        format,
++        out_features,
++        in_features,
++    })
++}
++
++fn expert_byte_count(packed: &TensorView, layout: &ProjectionLayout) -> Result<usize> {
++    let expert_bytes = layout.expert_stride_bytes()?;
++    let expected = layout.total_bytes()?;
++    if packed.byte_size() != expected {
++        return Err(error(format!(
++            "packed projection contains {} bytes, expected {expected}",
++            packed.byte_size()
++        )));
++    }
++    Ok(expert_bytes)
++}
++
++fn packed_expert_bytes<'a>(
++    packed: &'a TensorView<'_>,
++    layout: &ProjectionLayout,
++    expert: usize,
++) -> Result<Cow<'a, [u8]>> {
++    packed.validate()?;
++    if packed.dtype != DataType::Uint8 {
++        return Err(error(format!(
++            "packed expert dtype {:?} unsupported; expected Uint8",
++            packed.dtype
++        )));
++    }
++    if expert >= packed.shape[0] {
++        return Err(error(format!(
++            "expert index {expert} is out of range for {} experts",
++            packed.shape[0]
++        )));
++    }
++    // The bank offset/stride is derived from the one shared layout contract.
++    let range = layout.expert_byte_range(expert)?;
++    let expert_bytes = range.len();
++    if packed.is_contiguous() {
++        let len = packed.byte_size();
++        // SAFETY: the validated contiguous Uint8 view has `len` logical bytes,
++        // and `range` was derived from the already-validated expert-major shape.
++        // The returned borrow cannot outlive the input view.
++        let bytes = unsafe { std::slice::from_raw_parts(packed.data_ptr::<u8>(), len) };
++        return bytes
++            .get(range)
++            .map(Cow::Borrowed)
++            .ok_or_else(|| error("expert byte range exceeds packed projection"));
++    }
++
++    if packed.shape.len() != 4 {
++        return Err(error(format!(
++            "packed expert tensor must have rank 4, got {:?}",
++            packed.shape
++        )));
++    }
++    let mut dense = Vec::with_capacity(expert_bytes);
++    let origin = packed.data_ptr::<u8>();
++    for output in 0..packed.shape[1] {
++        for block in 0..packed.shape[2] {
++            for byte in 0..packed.shape[3] {
++                let index = [expert, output, block, byte];
++                let offset = crate::strided::elem_offset(packed.strides, &index);
++                // SAFETY: every component of `index` is within the validated
++                // view shape, so the executor's backing-bounds gate guarantees
++                // this element address is readable.
++                dense.push(unsafe { *origin.offset(offset) });
++            }
++        }
++    }
++    if dense.len() != expert_bytes {
++        return Err(error(format!(
++            "materialized expert contains {} bytes, expected {expert_bytes}",
++            dense.len()
++        )));
++    }
++    Ok(Cow::Owned(dense))
++}
++
++fn dequantize_expert_slice(
++    format: BlockFormat,
++    packed: &[u8],
++    out_features: usize,
++    in_features: usize,
++) -> Result<Vec<f32>> {
++    let elements = out_features
++        .checked_mul(in_features)
++        .ok_or_else(|| error("expert oracle weight element count overflow"))?;
++    let mut output = vec![0.0; elements];
++    decode_dense_weight_into(
++        format,
++        in_features,
++        out_features,
++        packed,
++        &mut output,
++        DenseWeightLayout::Nk,
++    )?;
++    Ok(output)
++}
++
++/// Decode one expert projection with the authoritative CPU GGUF decoder and
++/// return row-major `[out_features, in_features]` values widened to f64.
++///
++/// This is an oracle/testing seam; production CPU execution retains its cached
++/// f32 path.
++#[doc(hidden)]
++pub fn decode_expert_projection_f64(
++    format: &str,
++    packed: &[u8],
++    out_features: usize,
++    in_features: usize,
++) -> Result<Vec<f64>> {
++    let format = BlockFormat::parse(format)?;
++    dequantize_expert_slice(format, packed, out_features, in_features)
++        .map(|values| values.into_iter().map(f64::from).collect())
++}
++
++fn validate_attributes(node: &Node) -> Result<()> {
++    for name in node.attributes.keys() {
++        if !matches!(
++            name.as_str(),
++            "k" | "activation_type"
++                | "normalize_routing_weights"
++                | "swiglu_fusion"
++                | "activation_alpha"
++                | "activation_beta"
++                | "swiglu_limit"
++                | "fc1_format"
++                | "fc2_format"
++                | "fc3_format"
++                | "block_layout_version"
++        ) {
++            return Err(error(format!(
++                "attribute '{name}' is not part of the BlockQuantizedMoE ABI"
++            )));
++        }
++    }
++    Ok(())
++}
++
++fn parse_format_attr(node: &Node, name: &str) -> Result<BlockFormat> {
++    node.attr(name)
++        .ok_or_else(|| error(format!("missing required string attribute '{name}'")))?
++        .as_str()
++        .ok_or_else(|| error(format!("attribute '{name}' must be a UTF-8 string")))
++        .and_then(BlockFormat::parse)
++}
++
++fn optional_format_attr(node: &Node, name: &str) -> Result<Option<BlockFormat>> {
++    match node.attr(name) {
++        None => Ok(None),
++        Some(attr) => attr
++            .as_str()
++            .ok_or_else(|| error(format!("attribute '{name}' must be a UTF-8 string")))
++            .and_then(BlockFormat::parse)
++            .map(Some),
++    }
++}
++
++/// Parse the per-projection formats. `fc3_format` must be present exactly when
++/// the `fc3_experts_weights` input (index 6) is wired on the node.
++fn parse_projection_formats(node: &Node) -> Result<ProjectionFormats> {
++    let fc1 = parse_format_attr(node, "fc1_format")?;
++    let fc2 = parse_format_attr(node, "fc2_format")?;
++    let fc3_wired = node.inputs.get(6).is_some_and(Option::is_some);
++    let fc3_attr = optional_format_attr(node, "fc3_format")?;
++    match (fc3_wired, fc3_attr) {
++        (true, Some(fc3)) => Ok(ProjectionFormats {
++            fc1,
++            fc2,
++            fc3: Some(fc3),
++        }),
++        (true, None) => Err(error(
++            "fc3_experts_weights is wired but the required fc3_format attribute is missing",
++        )),
++        (false, Some(_)) => Err(error(
++            "fc3_format is only valid when fc3_experts_weights is wired",
++        )),
++        (false, None) => Ok(ProjectionFormats {
++            fc1,
++            fc2,
++            fc3: None,
++        }),
++    }
++}
++
++fn validate_metadata(
++    node: &Node,
++    claim_metadata: Option<(&[Shape], &[DataType])>,
++) -> Result<ValidatedMetadata> {
++    validate_attributes(node)?;
++    let attributes = MoeAttributes::from_block_quantized_node(node)?;
++    let layout_version = optional_int_attr(node, "block_layout_version")?.unwrap_or(1);
++    if layout_version != LAYOUT_VERSION {
++        return Err(error(format!(
++            "block_layout_version must be {LAYOUT_VERSION}, got {layout_version}"
++        )));
++    }
++    let formats = parse_projection_formats(node)?;
++    if let Some((shapes, dtypes)) = claim_metadata {
++        validate_claim_metadata(node, shapes, dtypes, &attributes, formats).map_err(error)?;
++    }
++    Ok(ValidatedMetadata {
++        attributes,
++        formats,
++    })
++}
++
++fn validate_claim_metadata(
++    node: &Node,
++    shapes: &[Shape],
++    dtypes: &[DataType],
++    attributes: &MoeAttributes,
++    formats: ProjectionFormats,
++) -> std::result::Result<(), String> {
++    if !(5..=9).contains(&node.inputs.len()) {
++        return Err(format!(
++            "expected 5 to 9 positional inputs, got {}",
++            node.inputs.len()
++        ));
++    }
++    if node.outputs.len() != 1 {
++        return Err(format!(
++            "expected exactly 1 output, got {}",
++            node.outputs.len()
++        ));
++    }
++    if shapes.len() != node.inputs.len() || dtypes.len() != node.inputs.len() {
++        return Err(format!(
++            "claim metadata must cover all {} positional inputs (got {} shapes and {} dtypes)",
++            node.inputs.len(),
++            shapes.len(),
++            dtypes.len()
++        ));
++    }
++    for &index in &[0, 1, 2, 4] {
++        if node.inputs[index].is_none() {
++            return Err(format!(
++                "required input {index} ('{}') is omitted",
++                INPUT_NAMES[index]
++            ));
++        }
++    }
++    for index in 0..node.inputs.len() {
++        if node.inputs[index].is_none() {
++            if dtypes[index] != DataType::Undefined {
++                return Err(format!(
++                    "omitted input {index} ('{}') must use dtype Undefined",
++                    INPUT_NAMES[index]
++                ));
++            }
++            continue;
++        }
++        let expected = if matches!(index, 2 | 4 | 6) {
++            DataType::Uint8
++        } else {
++            DataType::Float32
++        };
++        if dtypes[index] != expected {
++            return Err(format!(
++                "input {index} ('{}') dtype {:?} unsupported; expected {expected:?}",
++                INPUT_NAMES[index], dtypes[index]
++            ));
++        }
++    }
++    if !matches!(shapes[0].len(), 2 | 3) {
++        return Err(format!(
++            "input 0 ('input') rank {} unsupported; expected 2 or 3",
++            shapes[0].len()
++        ));
++    }
++    if shapes[1].len() != 2 {
++        return Err(format!(
++            "input 1 ('router_logits') rank {} unsupported; expected 2",
++            shapes[1].len()
++        ));
++    }
++    for &index in &[2, 4] {
++        if shapes[index].len() != 4 {
++            return Err(format!(
++                "input {index} ('{}') rank {} unsupported; expected 4",
++                INPUT_NAMES[index],
++                shapes[index].len()
++            ));
++        }
++    }
++    for &index in &[3, 5, 7, 8] {
++        if node.inputs.get(index).is_some_and(Option::is_some) && shapes[index].len() != 2 {
++            return Err(format!(
++                "input {index} ('{}') rank {} unsupported; expected 2",
++                INPUT_NAMES[index],
++                shapes[index].len()
++            ));
++        }
++    }
++    if node.inputs.get(6).is_some_and(Option::is_some) && shapes[6].len() != 4 {
++        return Err(format!(
++            "input 6 ('fc3_experts_weights') rank {} unsupported; expected 4",
++            shapes[6].len()
++        ));
++    }
++    validate_partial_claim_shapes(node, shapes, attributes, formats)?;
++    Ok(())
++}
++
++fn validate_partial_claim_shapes(
++    node: &Node,
++    shapes: &[Shape],
++    attributes: &MoeAttributes,
++    formats: ProjectionFormats,
++) -> std::result::Result<(), String> {
++    let hidden = shapes[0].last().and_then(|dim| dim.as_static());
++    let experts = shapes[1][1].as_static();
++    let rows = shapes[0][..shapes[0].len() - 1]
++        .iter()
++        .map(|dim| dim.as_static())
++        .try_fold(Some(1usize), |rows, dim| match (rows, dim) {
++            (Some(rows), Some(dim)) => rows
++                .checked_mul(dim)
++                .map(Some)
++                .ok_or_else(|| "input row count overflow".to_string()),
++            _ => Ok(None),
++        })?;
++    if let Some(experts) = experts
++        && attributes.k > experts
++    {
++        return Err(format!("k={} exceeds num_experts={experts}", attributes.k));
++    }
++    check_static_axis(shapes, 1, 0, rows, "router_logits rows")?;
++    require_same_static_axis(shapes, 2, 0, 1, 1, "fc1 expert count")?;
++    require_same_static_axis(shapes, 4, 0, 1, 1, "fc2 expert count")?;
++    if let (Some(fc2_hidden), Some(hidden)) = (shapes[4][1].as_static(), hidden)
++        && fc2_hidden != hidden
++    {
++        return Err(format!(
++            "fc2 output width {fc2_hidden} must equal hidden size {hidden}"
++        ));
++    }
++    if let Some(block_bytes) = shapes[2][3].as_static()
++        && block_bytes != formats.fc1.block_bytes()
++    {
++        return Err(format!(
++            "fc1 block byte width {block_bytes} must equal {}",
++            formats.fc1.block_bytes()
++        ));
++    }
++    if let Some(block_bytes) = shapes[4][3].as_static()
++        && block_bytes != formats.fc2.block_bytes()
++    {
++        return Err(format!(
++            "fc2 block byte width {block_bytes} must equal {}",
++            formats.fc2.block_bytes()
++        ));
++    }
++    let fc1_size = shapes[2][1].as_static();
++    let inter = fc1_size.and_then(|fc1_size| {
++        if attributes.swiglu_fusion == 0 {
++            Some(fc1_size)
++        } else {
++            (fc1_size % 2 == 0).then_some(fc1_size / 2)
++        }
++    });
++    if attributes.swiglu_fusion != 0 && fc1_size.is_some() && inter.is_none() {
++        return Err("fused SwiGLU fc1_out must be even".into());
++    }
++    if inter == Some(0) {
++        return Err("inferred inter dimension must be non-zero".into());
++    }
++    check_static_packed_shape(shapes, 2, experts, fc1_size, hidden, formats.fc1)?;
++    check_static_packed_shape(shapes, 4, experts, hidden, inter, formats.fc2)?;
++    check_static_optional_shape(node, shapes, 3, experts, fc1_size)?;
++    check_static_optional_shape(node, shapes, 5, experts, hidden)?;
++
++    let has_fc3 = node.inputs.get(6).is_some_and(Option::is_some);
++    if attributes.uses_separate_gate(has_fc3) {
++        if !has_fc3 {
++            return Err("unfused swiglu requires fc3_experts_weights".into());
++        }
++        let fc3_format = formats
++            .fc3
++            .ok_or_else(|| "fc3_experts_weights requires the fc3_format attribute".to_string())?;
++        check_static_packed_shape(shapes, 6, experts, inter, hidden, fc3_format)?;
++        check_static_optional_shape(node, shapes, 7, experts, inter)?;
++    } else if has_fc3 || node.inputs.get(7).is_some_and(Option::is_some) {
++        return Err("fc3 inputs are only valid for unfused swiglu or silu gated-GLU".into());
++    }
++    check_static_optional_shape(node, shapes, 8, rows, experts)?;
++    Ok(())
++}
++
++fn check_static_packed_shape(
++    shapes: &[Shape],
++    index: usize,
++    experts: Option<usize>,
++    out_features: Option<usize>,
++    in_features: Option<usize>,
++    format: BlockFormat,
++) -> std::result::Result<(), String> {
++    if let Some(width) = in_features
++        && !width.is_multiple_of(format.qk())
++    {
++        return Err(format!(
++            "input {index} ('{}') input width {width} has a partial {:?} block tail; \
++             full blocks of {} elements are required",
++            INPUT_NAMES[index],
++            format,
++            format.qk()
++        ));
++    }
++    check_static_axis(shapes, index, 0, experts, "expert count")?;
++    check_static_axis(shapes, index, 1, out_features, "output width")?;
++    check_static_axis(
++        shapes,
++        index,
++        2,
++        in_features.map(|width| width / format.qk()),
++        "block count",
++    )?;
++    check_static_axis(
++        shapes,
++        index,
++        3,
++        Some(format.block_bytes()),
++        "block byte width",
++    )
++}
++
++fn check_static_optional_shape(
++    node: &Node,
++    shapes: &[Shape],
++    index: usize,
++    rows: Option<usize>,
++    width: Option<usize>,
++) -> std::result::Result<(), String> {
++    if node.inputs.get(index).is_some_and(Option::is_some) {
++        check_static_axis(shapes, index, 0, rows, "dimension 0")?;
++        check_static_axis(shapes, index, 1, width, "dimension 1")?;
++    }
++    Ok(())
++}
++
++fn check_static_axis(
++    shapes: &[Shape],
++    index: usize,
++    axis: usize,
++    expected: Option<usize>,
++    name: &str,
++) -> std::result::Result<(), String> {
++    if let (Some(actual), Some(expected)) = (shapes[index][axis].as_static(), expected)
++        && actual != expected
++    {
++        return Err(format!(
++            "input {index} ('{}') {name} {actual} must equal {expected}",
++            INPUT_NAMES[index]
++        ));
++    }
++    Ok(())
++}
++
++fn require_same_static_axis(
++    shapes: &[Shape],
++    left_input: usize,
++    left_axis: usize,
++    right_input: usize,
++    right_axis: usize,
++    name: &str,
++) -> std::result::Result<(), String> {
++    if let (Some(left), Some(right)) = (
++        shapes[left_input][left_axis].as_static(),
++        shapes[right_input][right_axis].as_static(),
++    ) && left != right
++    {
++        return Err(format!("{name} {left} must equal {right}"));
++    }
++    Ok(())
++}
++
++fn validate_bias(
++    inputs: &[TensorMetadata<'_>],
++    index: usize,
++    experts: usize,
++    width: usize,
++) -> Result<()> {
++    if let Some(input) = optional_metadata(inputs, index)
++        && input.shape != [experts, width]
++    {
++        return Err(error(format!(
++            "{} must have shape [{experts}, {width}], got {:?}",
++            INPUT_NAMES[index], input.shape
++        )));
++    }
++    Ok(())
++}
++
++fn require_exact_rank(index: usize, shape: &[usize], expected: usize) -> Result<()> {
++    if shape.len() != expected {
++        return Err(error(format!(
++            "input {index} ('{}') must have rank {expected}, got {shape:?}",
++            INPUT_NAMES[index]
++        )));
++    }
++    Ok(())
++}
++
++fn require_dtype(index: usize, input: &TensorMetadata<'_>, expected: DataType) -> Result<()> {
++    if input.dtype != expected {
++        return Err(error(format!(
++            "input {index} ('{}') dtype {:?} unsupported; expected {expected:?}",
++            INPUT_NAMES[index], input.dtype
++        )));
++    }
++    Ok(())
++}
++
++fn optional_metadata<'a>(
++    inputs: &'a [TensorMetadata<'a>],
++    index: usize,
++) -> Option<&'a TensorMetadata<'a>> {
++    inputs.get(index).filter(|input| input.present)
++}
++
++fn optional_input<'a>(inputs: &'a [TensorView<'a>], index: usize) -> Option<&'a TensorView<'a>> {
++    inputs.get(index).filter(|input| !input.is_absent())
++}
++
++fn optional_dense(inputs: &[TensorView], index: usize) -> Result<Option<Vec<f32>>> {
++    optional_input(inputs, index).map(to_dense_f32).transpose()
++}
++
++fn checked_product(shape: &[usize], name: &str) -> Result<usize> {
++    shape.iter().try_fold(1usize, |product, &dimension| {
++        product
++            .checked_mul(dimension)
++            .ok_or_else(|| error(format!("{name} overflow")))
++    })
++}
++
++fn optional_int_attr(node: &Node, name: &str) -> Result<Option<i64>> {
++    node.attr(name)
++        .map(|attr| {
++            attr.as_int()
++                .ok_or_else(|| error(format!("attribute '{name}' must be an integer")))
++        })
++        .transpose()
++}
++
++fn error(message: impl Into<String>) -> EpError {
++    EpError::KernelFailed(format!("{OP}: {}", message.into()))
++}
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/probe_before_moe.rs b/crates/onnx-runtime-ep-cpu/src/kernels/probe_before_moe.rs
+new file mode 100644
+index 000000000..13da81da0
+--- /dev/null
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/probe_before_moe.rs
+@@ -0,0 +1,1771 @@
++//! Float32 reference kernel for ORT 1.27 `com.microsoft::MoE`.
++//!
++//! The positional inputs are:
++//! `input`, `router_probs`, `fc1_experts_weights`, `fc1_experts_bias?`,
++//! `fc2_experts_weights`, `fc2_experts_bias?`, `fc3_experts_weights?`,
++//! `fc3_experts_bias?`. Weights use ORT's expert-major canonical layout.
++
++use onnx_runtime_ep_api::{
++    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView, WorkspaceLayout,
++    WorkspaceRequirement, WorkspaceView,
++};
++use onnx_runtime_ir::{DataType, Node};
++// Only the MLAS bucketing and the `#[cfg(test)]` reference algorithm still
++// need an ordered map; the driver itself orders by expert through `RoutingPlan`.
++#[cfg(any(feature = "mlas", test))]
++use std::collections::BTreeMap;
++
++use super::check_arity;
++use super::decoded_projection::ProjectionScratch;
++use super::gelu::tanh_gelu;
++#[cfg(not(feature = "mlas"))]
++use super::matmul::gemm_bt;
++use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Activation {
++    Relu,
++    Gelu,
++    Silu,
++    Swiglu,
++    Identity,
++}
++
++impl Activation {
++    pub fn from_kernel_id(id: i32) -> Option<Self> {
++        match id {
++            0 => Some(Self::Relu),
++            1 => Some(Self::Gelu),
++            2 => Some(Self::Silu),
++            3 => Some(Self::Swiglu),
++            4 => Some(Self::Identity),
++            _ => None,
++        }
++    }
++
++    pub fn kernel_id(self) -> i32 {
++        match self {
++            Self::Relu => 0,
++            Self::Gelu => 1,
++            Self::Silu => 2,
++            Self::Swiglu => 3,
++            Self::Identity => 4,
++        }
++    }
++
++    pub fn name(self) -> &'static str {
++        match self {
++            Self::Relu => "relu",
++            Self::Gelu => "gelu",
++            Self::Silu => "silu",
++            Self::Swiglu => "swiglu",
++            Self::Identity => "identity",
++        }
++    }
++}
++
++/// Finite default that is numerically equivalent to an unclipped SwiGLU for
++/// every finite `f32` input while preserving the fail-closed attribute contract.
++pub const DEFAULT_SWIGLU_LIMIT: f32 = f32::MAX;
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct MoeActivationAttributes {
++    pub activation: Activation,
++    pub swiglu_fusion: usize,
++    pub activation_alpha: f32,
++    pub activation_beta: f32,
++    pub swiglu_limit: f32,
++}
++
++/// Single validation authority shared by CPU MoE/QMoE and CUDA
++/// QMoE/BlockQuantizedMoE/planar-MoE.
++pub fn validate_moe_activation_attributes(
++    activation_name: &str,
++    swiglu_fusion: i64,
++    activation_alpha: f32,
++    activation_beta: f32,
++    swiglu_limit: f32,
++) -> std::result::Result<MoeActivationAttributes, String> {
++    let activation = match activation_name {
++        "relu" => Activation::Relu,
++        "gelu" => Activation::Gelu,
++        "silu" => Activation::Silu,
++        "swiglu" => Activation::Swiglu,
++        "identity" => Activation::Identity,
++        other => {
++            return Err(format!(
++                "unsupported activation_type '{other}' (supported: relu, gelu, silu, swiglu, identity)"
++            ));
++        }
++    };
++    if !(0..=2).contains(&swiglu_fusion) {
++        return Err(format!(
++            "swiglu_fusion must be 0, 1, or 2, got {swiglu_fusion}"
++        ));
++    }
++    if activation != Activation::Swiglu && swiglu_fusion != 0 {
++        return Err("swiglu_fusion is only valid when activation_type='swiglu'".into());
++    }
++    for (name, value) in [
++        ("activation_alpha", activation_alpha),
++        ("activation_beta", activation_beta),
++    ] {
++        if !value.is_finite() {
++            return Err(format!("attribute {name} must be finite, got {value}"));
++        }
++    }
++    if !swiglu_limit.is_finite() || swiglu_limit <= 0.0 {
++        return Err(format!(
++            "attribute swiglu_limit must be positive and finite, got {swiglu_limit}"
++        ));
++    }
++    Ok(MoeActivationAttributes {
++        activation,
++        swiglu_fusion: swiglu_fusion as usize,
++        activation_alpha,
++        activation_beta,
++        swiglu_limit,
++    })
++}
++
++/// Factory for the ORT contrib `MoE` operator.
++pub struct MoEFactory;
++
++/// Float MoE kernel that groups routed rows by expert before expert GEMMs.
++pub struct MoEKernel {
++    attributes: MoeAttributes,
++    // Fixed at creation so metadata bounds and dispatch use the same policy.
++    grouped_min_work: u64,
++}
++
++#[derive(Clone, Copy, Debug)]
++pub(super) struct MoeAttributes {
++    pub k: usize,
++    pub activation: Activation,
++    pub normalize_routing_weights: bool,
++    pub swiglu_fusion: usize,
++    activation_alpha: f32,
++    activation_beta: f32,
++    swiglu_limit: f32,
++}
++
++/// Every attribute check `MoEFactory::create` performs, in one place so that
++/// [`unsupported_reason`] and the factory cannot disagree.
++fn float_moe_attributes(node: &Node) -> Result<MoeAttributes> {
++    let attributes = MoeAttributes::from_node(node)?;
++    if int_attr(node, "block_size", 0)? != 0 {
++        return Err(error(
++            "block_size is a QMoE quantization attribute and is unsupported by float MoE",
++        ));
++    }
++    Ok(attributes)
++}
++
++/// Why this kernel cannot run a given `MoE` node, if it cannot.
++///
++/// Must be answered at *claim* time. `GetCapability` consults only the dtype
++/// and shape filters, so a rejection raised later, in the kernel factory,
++/// arrives after ORT has compiled the node onto this EP and is a **hard session
++/// failure that no fallback recovers from**. ORT's own CPU `MoE` kernel runs
++/// configurations this one does not yet implement — `use_sparse_mixer=1` most
++/// notably, which real sparse-mixer mixtures set — so claiming and then failing
++/// would take a model that works today and kill it at `CreateSession`.
++///
++/// Implemented by running the factory's own attribute parse, so a limit cannot
++/// be added to `create` without appearing here too.
++pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
++    float_moe_attributes(node).err().map(|e| e.to_string())
++}
++
++impl KernelFactory for MoEFactory {
++    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
++        Ok(Box::new(MoEKernel {
++            attributes: float_moe_attributes(node)?,
++            grouped_min_work: grouped_min_work(),
++        }))
++    }
++}
++
++impl MoeAttributes {
++    pub(super) fn from_node(node: &Node) -> Result<Self> {
++        Self::from_node_impl(node, true)
++    }
++
++    pub(super) fn from_block_quantized_node(node: &Node) -> Result<Self> {
++        Self::from_node_impl(node, false)
++    }
++
++    fn from_node_impl(node: &Node, parse_sparse_mixer: bool) -> Result<Self> {
++        let k = int_attr(node, "k", 1)?;
++        if k <= 0 {
++            return Err(error(format!("k must be > 0, got {k}")));
++        }
++        let activation_name = match node.attr("activation_type") {
++            Some(attr) => attr
++                .as_str()
++                .ok_or_else(|| error("attribute activation_type must be a string"))?,
++            None => "relu",
++        };
++        let normalize = bool_attr(node, "normalize_routing_weights", false)?;
++        if parse_sparse_mixer && bool_attr(node, "use_sparse_mixer", false)? {
++            return Err(error(
++                "use_sparse_mixer=1 is unsupported by the Phase-1 CPU reference kernel",
++            ));
++        }
++        let swiglu_fusion = int_attr(node, "swiglu_fusion", 0)?;
++        let activation_alpha = float_attr(node, "activation_alpha", 1.0)?;
++        let activation_beta = float_attr(node, "activation_beta", 0.0)?;
++        let swiglu_limit = float_attr(node, "swiglu_limit", DEFAULT_SWIGLU_LIMIT)?;
++        let activation_attributes = validate_moe_activation_attributes(
++            activation_name,
++            swiglu_fusion,
++            activation_alpha,
++            activation_beta,
++            swiglu_limit,
++        )
++        .map_err(error)?;
++        Ok(Self {
++            k: k as usize,
++            activation: activation_attributes.activation,
++            normalize_routing_weights: normalize,
++            swiglu_fusion: activation_attributes.swiglu_fusion,
++            activation_alpha: activation_attributes.activation_alpha,
++            activation_beta: activation_attributes.activation_beta,
++            swiglu_limit: activation_attributes.swiglu_limit,
++        })
++    }
++
++    fn swiglu(&self, gate: f32, linear: f32) -> f32 {
++        let g = gate.min(self.swiglu_limit);
++        let l = linear.clamp(-self.swiglu_limit, self.swiglu_limit);
++        g * sigmoid(self.activation_alpha * g) * (l + self.activation_beta)
++    }
++}
++
++impl MoEKernel {
++    fn workspace_layout(
++        &self,
++        shape: &[usize],
++        inter: usize,
++        has_fc3: bool,
++    ) -> Result<WorkspaceLayout<3>> {
++        if !matches!(shape.len(), 2 | 3) {
++            return Err(error(format!(
++                "input must be 2-D [rows, hidden] or 3-D [batch, sequence, hidden], got {shape:?}"
++            )));
++        }
++        let invalid = || {
++            error(format!(
++                "execution workspace overflows for input {shape:?}, inter_size={inter}, k={}; reduce batch or projection dimensions",
++                self.attributes.k
++            ))
++        };
++        let rows = shape[..shape.len() - 1]
++            .iter()
++            .try_fold(1usize, |n, &d| n.checked_mul(d))
++            .ok_or_else(invalid)?;
++        let hidden = shape[shape.len() - 1];
++        let input_elements = rows.checked_mul(hidden).ok_or_else(invalid)?;
++        let accumulator =
++            std::alloc::Layout::array::<f32>(input_elements).map_err(|_| invalid())?;
++        let fc1 = self.attributes.checked_fc1_size(inter, "MoE")?;
++        let grouped_possible =
++            projection_work_units(rows, fc1, hidden, inter) >= self.grouped_min_work;
++        let bound = if hidden == 0 {
++            0
++        } else if grouped_possible {
++            rows.checked_mul(self.attributes.k).ok_or_else(invalid)?
++        } else {
++            rows
++        };
++        let separate_gate = self.attributes.uses_separate_gate(has_fc3);
++        let widths = if self.attributes.is_gated(has_fc3) {
++            // A: gather -> activated; B: FC1+FC3 -> expert output.
++            [
++                hidden.max(inter),
++                fc1.checked_add(if separate_gate { inter } else { 0 })
++                    .ok_or_else(invalid)?
++                    .max(hidden),
++            ]
++        } else {
++            // A: gather -> expert output; B: FC1 -> in-place activation.
++            [hidden, inter]
++        };
++        let regions = widths.map(|width| {
++            let elements = bound.checked_mul(width).ok_or_else(invalid)?;
++            std::alloc::Layout::array::<f32>(elements).map_err(|_| invalid())
++        });
++        let [a, b] = regions;
++        WorkspaceLayout::new([a?, b?, accumulator])
++    }
++}
++
++impl Kernel for MoEKernel {
++    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
++        let required = |index: usize, name: &str| {
++            inputs
++                .get(index)
++                .filter(|input| input.present)
++                .ok_or_else(|| {
++                    error(format!(
++                        "required input {index} ('{name}') is absent during workspace preparation"
++                    ))
++                })
++        };
++        let input = required(0, "input")?;
++        if !matches!(
++            input.dtype,
++            DataType::Float32 | DataType::Float16 | DataType::BFloat16
++        ) {
++            return Err(error(format!(
++                "input 0 requires Float32, Float16, or BFloat16, got {:?}",
++                input.dtype
++            )));
++        }
++        let fc2 = required(4, "fc2_experts_weights")?;
++        require_shape("fc2_experts_weights", fc2.shape, 3)?;
++        Ok(WorkspaceRequirement {
++            bytes: self
++                .workspace_layout(
++                    input.shape,
++                    fc2.shape[2],
++                    inputs.get(6).is_some_and(|v| v.present),
++                )?
++                .bytes() as u64,
++            alignment: std::mem::align_of::<f32>(),
++            ..WorkspaceRequirement::NONE
++        })
++    }
++
++    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
++        self.execute_with_workspace(inputs, outputs, None)
++    }
++
++    fn execute_with_workspace(
++        &self,
++        inputs: &[TensorView],
++        outputs: &mut [TensorMut],
++        workspace: Option<WorkspaceView>,
++    ) -> Result<()> {
++        check_arity("MoE", inputs, outputs, 5, 8, 1)?;
++        if outputs.len() != 1 {
++            return Err(error(format!(
++                "expected exactly 1 output, got {}",
++                outputs.len()
++            )));
++        }
++
++        for (index, name) in [
++            (0, "input"),
++            (1, "router_probs"),
++            (2, "fc1_experts_weights"),
++            (4, "fc2_experts_weights"),
++        ] {
++            if inputs[index].is_absent() {
++                return Err(error(format!(
++                    "required input {index} ('{name}') is absent"
++                )));
++            }
++        }
++        for (index, input) in inputs.iter().enumerate().filter(|(_, v)| !v.is_absent()) {
++            if !matches!(
++                input.dtype,
++                DataType::Float32 | DataType::Float16 | DataType::BFloat16
++            ) {
++                return Err(error(format!(
++                    "input {index} requires Float32, Float16, or BFloat16, got {:?}",
++                    input.dtype
++                )));
++            }
++            if input.dtype != inputs[0].dtype {
++                return Err(error(format!(
++                    "input {index} dtype {:?} must match input 0 dtype {:?}",
++                    input.dtype, inputs[0].dtype
++                )));
++            }
++        }
++        if !matches!(
++            outputs[0].dtype,
++            DataType::Float32 | DataType::Float16 | DataType::BFloat16
++        ) {
++            return Err(error(format!(
++                "output requires Float32, Float16, or BFloat16, got {:?}",
++                outputs[0].dtype
++            )));
++        }
++
++        let x_shape = inputs[0].shape;
++        if !matches!(x_shape.len(), 2 | 3) {
++            return Err(error(format!(
++                "input must be 2-D [rows, hidden] or 3-D [batch, sequence, hidden], got {x_shape:?}"
++            )));
++        }
++        if outputs[0].shape != x_shape {
++            return Err(error(format!(
++                "output shape {:?} must equal input shape {x_shape:?}",
++                outputs[0].shape
++            )));
++        }
++        let hidden = *x_shape.last().unwrap();
++        let rows = x_shape[..x_shape.len() - 1]
++            .iter()
++            .try_fold(1usize, |n, &d| n.checked_mul(d))
++            .ok_or_else(|| {
++                error(format!(
++                    "flattened input row count overflows for {x_shape:?}; reduce batch dimensions"
++                ))
++            })?;
++        require_shape("router_probs", inputs[1].shape, 2)?;
++        if inputs[1].shape[0] != rows {
++            return Err(error(format!(
++                "router_probs rows {} must equal flattened input rows {rows}",
++                inputs[1].shape[0]
++            )));
++        }
++        let experts = inputs[1].shape[1];
++        if self.attributes.k > experts {
++            return Err(error(format!(
++                "requires 0 < k <= num_experts, got k={} and num_experts={experts}",
++                self.attributes.k
++            )));
++        }
++
++        require_shape("fc1_experts_weights", inputs[2].shape, 3)?;
++        require_shape("fc2_experts_weights", inputs[4].shape, 3)?;
++        if inputs[2].shape[0] != experts || inputs[4].shape[0] != experts {
++            return Err(error(format!(
++                "expert weight counts must equal router num_experts {experts}"
++            )));
++        }
++        if inputs[2].shape[2] != hidden {
++            return Err(error(format!(
++                "fc1_experts_weights must have canonical shape [experts, fc1_size, hidden={hidden}], got {:?}",
++                inputs[2].shape
++            )));
++        }
++        if inputs[4].shape[1] != hidden {
++            return Err(error(format!(
++                "fc2_experts_weights must have canonical shape [experts, hidden={hidden}, inter_size], got {:?}",
++                inputs[4].shape
++            )));
++        }
++        let inter = inputs[4].shape[2];
++        let expected_fc1 = self.attributes.checked_fc1_size(inter, "MoE")?;
++        if inputs[2].shape[1] != expected_fc1 {
++            return Err(error(format!(
++                "fc1_experts_weights dimension 1 must be {expected_fc1}, got {}",
++                inputs[2].shape[1]
++            )));
++        }
++
++        let fc1_bias = optional_dense(inputs, 3)?;
++        let fc2_bias = optional_dense(inputs, 5)?;
++        validate_bias("fc1_experts_bias", inputs, 3, experts, expected_fc1)?;
++        validate_bias("fc2_experts_bias", inputs, 5, experts, hidden)?;
++
++        let has_fc3 = inputs.get(6).is_some_and(|v| !v.is_absent());
++        let uses_separate_gate = self.attributes.uses_separate_gate(has_fc3);
++        let (fc3, fc3_bias) = if uses_separate_gate {
++            let view = inputs
++                .get(6)
++                .filter(|v| !v.is_absent())
++                .ok_or_else(|| error("unfused swiglu requires input 6 fc3_experts_weights"))?;
++            require_exact_shape("fc3_experts_weights", view.shape, &[experts, inter, hidden])?;
++            validate_bias("fc3_experts_bias", inputs, 7, experts, inter)?;
++            (
++                Some(to_dense_f32_widen("MoE", view)?),
++                optional_dense(inputs, 7)?,
++            )
++        } else {
++            if has_fc3 {
++                return Err(error(
++                    "fc3_experts_weights is only valid for unfused swiglu or silu gated-GLU",
++                ));
++            }
++            if inputs.get(7).is_some_and(|v| !v.is_absent()) {
++                return Err(error(
++                    "fc3_experts_bias requires fc3_experts_weights in unfused swiglu or silu gated-GLU",
++                ));
++            }
++            (None, None)
++        };
++
++        let layout = self.workspace_layout(x_shape, inter, has_fc3)?;
++        // SAFETY: exclusive Host backing lives through this synchronous call.
++        let [input, projection, mut accumulator] = unsafe {
++            ProjectionScratch::bind_layout("MoE execution workspace", layout, workspace)?
++        };
++        let mut scratch = MoeWorkspace { input, projection };
++
++        // Borrow rather than `into_owned()`. Expert weights are the largest
++        // tensors in the graph - a Mixtral-shaped `fc1` + `fc2` pair is 352 MiB
++        // - and they are contiguous f32 initializers in every real model, so
++        // owning them copied a third of a gigabyte on every single forward.
++        // `to_dense_f32_widen` still allocates for half-precision or strided
++        // sources, which is the only case that actually needs a copy.
++        let x = to_dense_f32_widen("MoE", &inputs[0])?;
++        let router = to_dense_f32_widen("MoE", &inputs[1])?;
++        let fc1 = to_dense_f32_widen("MoE", &inputs[2])?;
++        let fc2 = to_dense_f32_widen("MoE", &inputs[4])?;
++        let mut plan = RoutingPlan::build(
++            &router,
++            rows,
++            experts,
++            self.attributes.k,
++            self.attributes.normalize_routing_weights,
++        );
++        let driver =
++            if use_grouped_driver(&plan, expected_fc1, hidden, inter, self.grouped_min_work) {
++                plan.build_row_slots();
++                run_moe_grouped
++            } else {
++                run_moe_per_expert
++            };
++        let output = driver(
++            &plan,
++            &x,
++            &fc1,
++            fc1_bias.as_deref(),
++            &fc2,
++            fc2_bias.as_deref(),
++            fc3.as_deref(),
++            fc3_bias.as_deref(),
++            expected_fc1,
++            hidden,
++            inter,
++            &self.attributes,
++            &mut scratch,
++            &mut accumulator,
++        )?;
++        write_dense_f32_narrow("MoE", &mut outputs[0], output)
++    }
++
++    fn supports_strided_input(&self, _input_idx: usize) -> bool {
++        true
++    }
++}
++
++impl MoeAttributes {
++    pub(super) fn checked_fc1_size(&self, inter: usize, op: &str) -> Result<usize> {
++        if self.activation == Activation::Swiglu && self.swiglu_fusion != 0 {
++            inter.checked_mul(2).ok_or_else(|| {
++                EpError::KernelFailed(format!(
++                    "{op}: fused SwiGLU FC1 width overflow for inter_size {inter}"
++                ))
++            })
++        } else {
++            Ok(inter)
++        }
++    }
++
++    fn is_gated(&self, has_fc3: bool) -> bool {
++        self.activation == Activation::Swiglu || (self.activation == Activation::Silu && has_fc3)
++    }
++
++    fn gated_pair_indices(&self, index: usize, inter: usize, separate: bool) -> (usize, usize) {
++        if separate {
++            (index, index)
++        } else if self.swiglu_fusion == 1 {
++            (2 * index, 2 * index + 1)
++        } else {
++            (index, inter + index)
++        }
++    }
++
++    pub(super) fn uses_separate_gate(&self, has_fc3: bool) -> bool {
++        (self.activation == Activation::Swiglu && self.swiglu_fusion == 0)
++            || (self.activation == Activation::Silu && has_fc3)
++    }
++}
++
++/// Rows below this many elements stay on the calling thread: a `rayon`
++/// fan-out costs more than a few thousand floats of memcpy or activation.
++const MIN_PARALLEL_MOE_ELEMENTS: usize = 16 * 1024;
++
++/// Apply `f` to every `width`-wide row of `data`, in parallel once the pass is
++/// large enough to pay for the fan-out.
++///
++/// Every stage between the two expert GEMMs - the gather, the bias adds, the
++/// activation and the weighted scatter - is a row-wise map, and each was a
++/// serial scalar loop before. On a 512-token Mixtral-shaped forward those
++/// stages touch more bytes than the GEMMs do, so leaving them serial capped
++/// the whole operator's thread scaling regardless of how well MLAS threaded
++/// the GEMMs themselves.
++fn for_each_row<F>(data: &mut [f32], width: usize, f: F)
++where
++    F: Fn(usize, &mut [f32]) + Send + Sync,
++{
++    if width == 0 {
++        return;
++    }
++    let rows = data.len() / width;
++    match parallel_rows_per_task(rows, width) {
++        Some(rows_per_task) => {
++            use rayon::prelude::*;
++            data.par_chunks_mut(rows_per_task * width)
++                .enumerate()
++                .for_each(|(chunk, block)| {
++                    let base = chunk * rows_per_task;
++                    for (offset, row) in block.chunks_mut(width).enumerate() {
++                        f(base + offset, row);
++                    }
++                });
++        }
++        None => {
++            for (index, row) in data.chunks_mut(width).enumerate() {
++                f(index, row);
++            }
++        }
++    }
++}
++
++/// Whole rows per `rayon` task, or `None` to stay on the calling thread.
++///
++/// The task count is capped at the width the GEMMs themselves will use, not at
++/// `rayon`'s global pool size. `ONNX_GENAI_CPU_DECODE_THREADS` bounds MLAS but
++/// not `rayon`, so fanning these passes out to every logical CPU would run the
++/// operator wider than the caller asked for - and, measured against a real ORT
++/// session configured with the same width, would not be a like-for-like
++/// comparison.
++fn parallel_rows_per_task(rows: usize, width: usize) -> Option<usize> {
++    if rows < 2 || rows.saturating_mul(width) < MIN_PARALLEL_MOE_ELEMENTS {
++        return None;
++    }
++    let workers = moe_worker_budget().min(rows);
++    if workers < 2 {
++        return None;
++    }
++    Some(rows.div_ceil(workers).max(1))
++}
++
++fn moe_worker_budget() -> usize {
++    let rayon_workers = rayon::current_num_threads().max(1);
++    #[cfg(feature = "mlas")]
++    {
++        rayon_workers.min(mlas_sys::configured_pool_threads())
++    }
++    #[cfg(not(feature = "mlas"))]
++    {
++        rayon_workers
++    }
++}
++
++/// One contiguous run of routed rows that share an expert.
++#[derive(Clone, Copy, Debug)]
++struct ExpertGroup {
++    expert: usize,
++    /// First slot of the run in the routed-row ordering.
++    start: usize,
++    /// Number of routed rows in the run.
++    len: usize,
++}
++
++/// Top-k routing flattened into a slot ordering: all rows routed to the lowest
++/// active expert first, then the next, and so on.
++///
++/// Laying the routed rows out this way is what lets every later stage be a flat
++/// row-wise map over one buffer, and it makes each expert's GEMM operand a
++/// contiguous window - the precondition for handing several experts to MLAS as
++/// a single batched GEMM.
++struct RoutingPlan {
++    rows: usize,
++    k: usize,
++    /// Source row for each slot.
++    slot_row: Vec<u32>,
++    /// Expert serving each slot, for the per-expert bias lookup.
++    slot_expert: Vec<u32>,
++    /// Routing weight for each slot.
++    slot_weight: Vec<f32>,
++    /// Slots serving each row, `k` entries per row, ascending by expert.
++    /// `u32::MAX` marks an unused entry.
++    row_slots: Vec<u32>,
++    groups: Vec<ExpertGroup>,
++}
++
++impl RoutingPlan {
++    fn build(router: &[f32], rows: usize, experts: usize, k: usize, normalize: bool) -> Self {
++        let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); experts];
++        for row in 0..rows {
++            for (expert, weight) in routing_weights(
++                &router[row * experts..(row + 1) * experts],
++                None,
++                k,
++                normalize,
++            ) {
++                per_expert[expert].push((row as u32, weight));
++            }
++        }
++        let total = per_expert.iter().map(Vec::len).sum::<usize>();
++        let mut slot_row = Vec::with_capacity(total);
++        let mut slot_expert = Vec::with_capacity(total);
++        let mut slot_weight = Vec::with_capacity(total);
++        let mut groups = Vec::new();
++        for (expert, assigned) in per_expert.iter().enumerate() {
++            if assigned.is_empty() {
++                continue;
++            }
++            groups.push(ExpertGroup {
++                expert,
++                start: slot_row.len(),
++                len: assigned.len(),
++            });
++            for &(row, weight) in assigned {
++                slot_row.push(row);
++                slot_expert.push(expert as u32);
++                slot_weight.push(weight);
++            }
++        }
++        Self {
++            rows,
++            k,
++            slot_row,
++            slot_expert,
++            slot_weight,
++            row_slots: Vec::new(),
++            groups,
++        }
++    }
++
++    /// Invert the layout so the final scatter can be a parallel map over
++    /// *output* rows: two experts share an output row, so scattering by expert
++    /// would race.
++    ///
++    /// Only the grouped driver scatters that way, and this is an `rows * k`
++    /// allocation, so the per-expert driver does not pay for it.
++    fn build_row_slots(&mut self) {
++        self.row_slots = vec![u32::MAX; self.rows * self.k];
++        let mut filled = vec![0usize; self.rows];
++        for (slot, &row) in self.slot_row.iter().enumerate() {
++            let row = row as usize;
++            self.row_slots[row * self.k + filled[row]] = slot as u32;
++            filled[row] += 1;
++        }
++    }
++
++    fn slots(&self) -> usize {
++        self.slot_row.len()
++    }
++}
++
++/// `output[slot, out_features] = input[slot, in_features] * weights[expert]ᵀ`
++/// for every routed slot.
++///
++/// Experts whose groups hold the same number of rows are issued as one batched
++/// MLAS GEMM. A decode step is the extreme case: `k` groups of exactly one row
++/// each, which individually look far too small for MLAS to thread and pay a
++/// full dispatch each.
++///
++/// The per-expert bias is deliberately **not** applied here. Both biases fold
++/// into a pass that already reads the result - FC1's into the activation,
++/// FC2's into the weighted scatter - which removes two full read-modify-write
++/// passes over the largest intermediates in the operator.
++fn grouped_linear(
++    input: &[f32],
++    plan: &RoutingPlan,
++    weights: &[f32],
++    out_features: usize,
++    in_features: usize,
++    output: &mut [f32],
++) -> Result<()> {
++    let expert_stride = out_features * in_features;
++    #[cfg(feature = "mlas")]
++    {
++        let mut by_len: BTreeMap<usize, Vec<&ExpertGroup>> = BTreeMap::new();
++        for group in &plan.groups {
++            by_len.entry(group.len).or_default().push(group);
++        }
++        for (len, groups) in by_len {
++            if len == 0 || out_features == 0 || in_features == 0 {
++                continue;
++            }
++            let items: Vec<mlas_sys::SgemmBatchItem<'_>> = groups
++                .iter()
++                .map(|group| mlas_sys::SgemmBatchItem {
++                    a: &input[group.start * in_features..],
++                    b: &weights[group.expert * expert_stride..(group.expert + 1) * expert_stride],
++                    c_offset: group.start * out_features,
++                })
++                .collect();
++            mlas_sys::sgemm_batch(
++                false,
++                true,
++                len,
++                out_features,
++                in_features,
++                1.0,
++                &items,
++                in_features,
++                in_features,
++                0.0,
++                output,
++                out_features,
++            );
++        }
++    }
++    #[cfg(not(feature = "mlas"))]
++    {
++        for group in &plan.groups {
++            let expert = &weights[group.expert * expert_stride..(group.expert + 1) * expert_stride];
++            gemm_bt(
++                &input[group.start * in_features..(group.start + group.len) * in_features],
++                expert,
++                &mut output[group.start * out_features..(group.start + group.len) * out_features],
++                group.len,
++                in_features,
++                out_features,
++            )?;
++        }
++    }
++    Ok(())
++}
++
++/// Average GEMM work per expert group, in multiply-accumulates, below which
++/// the grouped driver is *not* used.
++///
++/// Measured, not derived. Against a real ORT CPU session on 9 synthetic
++/// production-shaped MoE graphs x 3 thread counts, the grouped driver wins
++/// decisively once each expert's own GEMMs are large (1.35x-1.57x less native
++/// time at 512 tokens) and loses by 5-16% when they are small: at that size
++/// MLAS's per-GEMM threading is already the limit, and the extra gather and
++/// scatter buffers cost more than parallelising the elementwise stages saves.
++/// The measured separation was 7.6e7 (losing) to 6.3e8 (winning) work units,
++/// so the floor sits near the geometric mean of that band.
++///
++/// This is a one-host calibration on an AMD EPYC 9V74 (16C/32T, 32 MiB L3).
++/// `ONNX_GENAI_MOE_GROUPED_MIN_WORK` overrides it; `0` forces the grouped
++/// driver on for every shape with multiple workers. Read at kernel creation.
++const MOE_GROUPED_MIN_WORK: u64 = 300_000_000;
++
++/// Whether the grouped/batched driver is expected to beat the per-expert loop.
++///
++/// The discriminator is the work in *one* expert's GEMMs, not the total: the
++/// grouped driver's win comes from parallelising the gather, activation and
++/// scatter, which only matters once MLAS is already saturating the machine
++/// inside each expert's GEMM. The largest group determines that opportunity;
++/// `fc1_size + inter` counts both the FC1(+FC3) and FC2 passes.
++fn use_grouped_driver(
++    plan: &RoutingPlan,
++    fc1_size: usize,
++    hidden: usize,
++    inter: usize,
++    min_work: u64,
++) -> bool {
++    let groups = plan.groups.len();
++    if groups == 0 {
++        return true;
++    }
++    if moe_worker_budget() < 2 {
++        // Single-threaded: the two drivers measured identically, so prefer the
++        // one with fewer intermediate buffers.
++        return false;
++    }
++    grouped_work_units(plan, fc1_size, hidden, inter) >= min_work
++}
++
++/// The gate's work estimate, split out so it can be pinned by a test on a
++/// machine of any width.
++///
++/// The largest group rather than the mean: a collapsed router that sends most
++/// of its rows to one expert still has one large GEMM to hide the elementwise
++/// stages behind, and the mean would hide it.
++fn grouped_work_units(plan: &RoutingPlan, fc1_size: usize, hidden: usize, inter: usize) -> u64 {
++    let rows_per_group = plan.groups.iter().map(|group| group.len).max().unwrap_or(0);
++    projection_work_units(rows_per_group, fc1_size, hidden, inter)
++}
++
++fn projection_work_units(rows: usize, fc1_size: usize, hidden: usize, inter: usize) -> u64 {
++    (rows as u64)
++        .saturating_mul(hidden as u64)
++        .saturating_mul((fc1_size as u64).saturating_add(inter as u64))
++}
++
++fn grouped_min_work() -> u64 {
++    // Read once per kernel, never process-global: later environment changes
++    // apply to newly created kernels, not already prepared workspace plans.
++    std::env::var("ONNX_GENAI_MOE_GROUPED_MIN_WORK")
++        .ok()
++        .and_then(|v| v.trim().parse::<u64>().ok())
++        .unwrap_or(MOE_GROUPED_MIN_WORK)
++}
++
++/// The per-expert driver: gather each expert's rows into the shared lane, run
++/// the pair of expert GEMMs, then accumulate the weighted result.
++///
++/// Kept as the small-shape path: compute one expert at a time, retaining the
++/// serial gather, activation and scatter policy. Both scratch banks are reused
++/// by every expert rather than allocating intermediate matrices per group.
++///
++/// Iterating `plan.groups` reproduces the ascending-expert order, and slots
++/// inside a group are in ascending row order, so this is **bit-identical** to
++/// the grouped driver rather than merely close.
++#[allow(clippy::too_many_arguments)]
++fn run_moe_per_expert<'out>(
++    plan: &RoutingPlan,
++    x: &[f32],
++    fc1_weights: &[f32],
++    fc1_bias: Option<&[f32]>,
++    fc2_weights: &[f32],
++    fc2_bias: Option<&[f32]>,
++    fc3_weights: Option<&[f32]>,
++    fc3_bias: Option<&[f32]>,
++    fc1_size: usize,
++    hidden: usize,
++    inter: usize,
++    attributes: &MoeAttributes,
++    scratch: &mut MoeWorkspace<'_>,
++    accumulator: &'out mut ProjectionScratch<'_>,
++) -> Result<&'out [f32]> {
++    let output = accumulator.zeroed_prefix(plan.rows * hidden)?;
++    if plan.slots() == 0 || hidden == 0 {
++        return Ok(output);
++    }
++    for group in &plan.groups {
++        let expert = group.expert;
++        let slots = group.start..group.start + group.len;
++        let expert_out = scratch.run_dense_expert(
++            x,
++            &plan.slot_row[slots.clone()],
++            DenseExpertWeights {
++                fc1: &fc1_weights[expert * fc1_size * hidden..(expert + 1) * fc1_size * hidden],
++                fc1_bias: fc1_bias.map(|b| &b[expert * fc1_size..(expert + 1) * fc1_size]),
++                fc2: &fc2_weights[expert * hidden * inter..(expert + 1) * hidden * inter],
++                fc2_bias: fc2_bias.map(|b| &b[expert * hidden..(expert + 1) * hidden]),
++                fc3: fc3_weights
++                    .map(|w| &w[expert * inter * hidden..(expert + 1) * inter * hidden]),
++                fc3_bias: fc3_bias.map(|b| &b[expert * inter..(expert + 1) * inter]),
++            },
++            fc1_size,
++            hidden,
++            inter,
++            attributes,
++        )?;
++        for (local, slot) in slots.enumerate() {
++            let row = plan.slot_row[slot] as usize;
++            let weight = plan.slot_weight[slot];
++            let src = &expert_out[local * hidden..(local + 1) * hidden];
++            let dst = &mut output[row * hidden..(row + 1) * hidden];
++            for (out, &value) in dst.iter_mut().zip(src) {
++                *out += weight * value;
++            }
++        }
++    }
++    Ok(output)
++}
++
++/// Run every routed row through its expert and scatter the weighted results
++/// back onto the output rows.
++///
++/// This is the whole operator between routing and the output write: gather,
++/// FC1 (+ optional FC3 gate), activation, FC2, weighted accumulation. Each
++/// stage is one pass over one buffer, so the only serial work left is the
++/// routing itself.
++#[allow(clippy::too_many_arguments)]
++fn run_moe_grouped<'out>(
++    plan: &RoutingPlan,
++    x: &[f32],
++    fc1_weights: &[f32],
++    fc1_bias: Option<&[f32]>,
++    fc2_weights: &[f32],
++    fc2_bias: Option<&[f32]>,
++    fc3_weights: Option<&[f32]>,
++    fc3_bias: Option<&[f32]>,
++    fc1_size: usize,
++    hidden: usize,
++    inter: usize,
++    attributes: &MoeAttributes,
++    scratch: &mut MoeWorkspace<'_>,
++    accumulator: &'out mut ProjectionScratch<'_>,
++) -> Result<&'out [f32]> {
++    let slots = plan.slots();
++    let output = accumulator.zeroed_prefix(plan.rows * hidden)?;
++    if slots == 0 || hidden == 0 {
++        return Ok(output);
++    }
++    debug_assert_eq!(
++        plan.row_slots.len(),
++        plan.rows * plan.k,
++        "run_moe_grouped needs the row->slot inversion; call build_row_slots first"
++    );
++
++    let gathered = match parallel_rows_per_task(slots, hidden) {
++        Some(rows_per_task) => scratch.input.gather_rows_parallel(
++            x,
++            hidden,
++            &plan.slot_row,
++            std::num::NonZeroUsize::new(rows_per_task).expect("parallel row tasks are nonempty"),
++        )?,
++        None => {
++            scratch
++                .input
++                .gather_rows(x, hidden, plan.slot_row.iter().map(|&row| row as usize))?
++        }
++    };
++    let separate = attributes.uses_separate_gate(fc3_weights.is_some());
++    let projections = scratch
++        .projection
++        .zeroed_prefix(slots * (fc1_size + if separate { inter } else { 0 }))?;
++    let (fc1_out, gate) = projections.split_at_mut(slots * fc1_size);
++    grouped_linear(gathered, plan, fc1_weights, fc1_size, hidden, fc1_out)?;
++    let gate = if separate {
++        grouped_linear(
++            gathered,
++            plan,
++            fc3_weights.expect("validated separate gate FC3"),
++            inter,
++            hidden,
++            gate,
++        )?;
++        Some(&*gate)
++    } else {
++        None
++    };
++    let expert_out = if attributes.is_gated(fc3_weights.is_some()) {
++        let activated = scratch.input.zeroed_prefix(slots * inter)?;
++        apply_gated_activation(
++            fc1_out, gate, plan, fc1_bias, fc3_bias, fc1_size, inter, attributes, activated,
++        );
++        let expert_out = scratch.projection.zeroed_prefix(slots * hidden)?;
++        grouped_linear(activated, plan, fc2_weights, hidden, inter, expert_out)?;
++        expert_out
++    } else {
++        for_each_row(fc1_out, fc1_size, |slot, row| {
++            let bias = expert_bias(fc1_bias, &plan.slot_expert, slot, fc1_size);
++            for (index, value) in row.iter_mut().enumerate() {
++                *value = activate(
++                    attributes.activation,
++                    *value + bias.map_or(0.0, |bias| bias[index]),
++                );
++            }
++        });
++        let expert_out = scratch.input.zeroed_prefix(slots * hidden)?;
++        grouped_linear(fc1_out, plan, fc2_weights, hidden, inter, expert_out)?;
++        expert_out
++    };
++
++    let (row_slots, slot_weight, slot_expert, k) = (
++        &plan.row_slots,
++        &plan.slot_weight,
++        &plan.slot_expert,
++        plan.k,
++    );
++    for_each_row(output, hidden, |row, destination| {
++        for &slot in &row_slots[row * k..(row + 1) * k] {
++            if slot == u32::MAX {
++                continue;
++            }
++            let slot = slot as usize;
++            let weight = slot_weight[slot];
++            let contribution = &expert_out[slot * hidden..(slot + 1) * hidden];
++            match fc2_bias {
++                Some(bias) => {
++                    let expert = slot_expert[slot] as usize;
++                    let bias = &bias[expert * hidden..(expert + 1) * hidden];
++                    for ((value, &source), &bias) in
++                        destination.iter_mut().zip(contribution).zip(bias)
++                    {
++                        *value += weight * (source + bias);
++                    }
++                }
++                None => {
++                    for (value, &source) in destination.iter_mut().zip(contribution) {
++                        *value += weight * source;
++                    }
++                }
++            }
++        }
++    });
++    Ok(output)
++}
++
++fn expert_bias<'a>(
++    bias: Option<&'a [f32]>,
++    slot_expert: &[u32],
++    slot: usize,
++    width: usize,
++) -> Option<&'a [f32]> {
++    bias.map(|bias| {
++        let expert = slot_expert[slot] as usize;
++        &bias[expert * width..(expert + 1) * width]
++    })
++}
++
++/// Per-expert projections have already added bias; grouped projections add it
++/// here, including their existing +0 operation when an optional bias is absent.
++#[derive(Clone, Copy)]
++enum ActivationBias<'a> {
++    Applied,
++    Pending {
++        fc1: Option<&'a [f32]>,
++        linear: Option<&'a [f32]>,
++    },
++}
++impl ActivationBias<'_> {
++    fn value(self, linear: bool, index: usize, value: f32) -> f32 {
++        match self {
++            Self::Applied => value,
++            Self::Pending {
++                fc1,
++                linear: linear_bias,
++            } => value + if linear { linear_bias } else { fc1 }.map_or(0.0, |bias| bias[index]),
++        }
++    }
++}
++
++fn gated_activation_row(
++    output: &mut [f32],
++    fc1: &[f32],
++    fc3: Option<&[f32]>,
++    inter: usize,
++    attributes: &MoeAttributes,
++    bias: ActivationBias<'_>,
++) {
++    let linear = fc3.unwrap_or(fc1);
++    for (index, value) in output.iter_mut().enumerate() {
++        let (g, l) = attributes.gated_pair_indices(index, inter, fc3.is_some());
++        *value = attributes.swiglu(bias.value(false, g, fc1[g]), bias.value(true, l, linear[l]));
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++fn apply_gated_activation(
++    fc1_out: &[f32],
++    gate_source: Option<&[f32]>,
++    plan: &RoutingPlan,
++    fc1_bias: Option<&[f32]>,
++    fc3_bias: Option<&[f32]>,
++    fc1_size: usize,
++    inter: usize,
++    attributes: &MoeAttributes,
++    activated: &mut [f32],
++) {
++    for_each_row(activated, inter, |slot, row| {
++        let fc1 = &fc1_out[slot * fc1_size..(slot + 1) * fc1_size];
++        let fc3 = gate_source.map(|gate| &gate[slot * inter..(slot + 1) * inter]);
++        let fc1_bias = expert_bias(fc1_bias, &plan.slot_expert, slot, fc1_size);
++        let linear_bias = if fc3.is_some() {
++            expert_bias(fc3_bias, &plan.slot_expert, slot, inter)
++        } else {
++            fc1_bias
++        };
++        gated_activation_row(
++            row,
++            fc1,
++            fc3,
++            inter,
++            attributes,
++            ActivationBias::Pending {
++                fc1: fc1_bias,
++                linear: linear_bias,
++            },
++        );
++    });
++}
++
++/// Two exclusive banks, reused only after the previous phase's final read.
++struct MoeWorkspace<'a> {
++    input: ProjectionScratch<'a>,
++    projection: ProjectionScratch<'a>,
++}
++struct DenseExpertWeights<'a> {
++    fc1: &'a [f32],
++    fc1_bias: Option<&'a [f32]>,
++    fc2: &'a [f32],
++    fc2_bias: Option<&'a [f32]>,
++    fc3: Option<&'a [f32]>,
++    fc3_bias: Option<&'a [f32]>,
++}
++impl MoeWorkspace<'_> {
++    #[allow(clippy::too_many_arguments)]
++    fn run_dense_expert(
++        &mut self,
++        x: &[f32],
++        row_indices: &[u32],
++        weights: DenseExpertWeights<'_>,
++        fc1_size: usize,
++        hidden: usize,
++        inter: usize,
++        attributes: &MoeAttributes,
++    ) -> Result<&[f32]> {
++        let rows = row_indices.len();
++        let input = if rows == 1 {
++            let start = row_indices[0] as usize * hidden;
++            &x[start..start + hidden]
++        } else {
++            self.input
++                .gather_rows(x, hidden, row_indices.iter().map(|&row| row as usize))?
++        };
++        let separate = attributes.uses_separate_gate(weights.fc3.is_some());
++        let projections = self
++            .projection
++            .zeroed_prefix(rows * (fc1_size + if separate { inter } else { 0 }))?;
++        let (fc1, fc3) = projections.split_at_mut(rows * fc1_size);
++        linear_grouped_into(
++            input,
++            rows,
++            weights.fc1,
++            weights.fc1_bias,
++            fc1_size,
++            hidden,
++            fc1,
++        )?;
++        let fc3 = if separate {
++            linear_grouped_into(
++                input,
++                rows,
++                weights.fc3.expect("validated separate FC3"),
++                weights.fc3_bias,
++                inter,
++                hidden,
++                fc3,
++            )?;
++            Some(&*fc3)
++        } else {
++            None
++        };
++        if attributes.is_gated(weights.fc3.is_some()) {
++            let activated = self.input.zeroed_prefix(rows * inter)?;
++            // Keep the per-expert activation serial, as before.
++            if inter != 0 {
++                for (row, target) in activated.chunks_mut(inter).enumerate() {
++                    gated_activation_row(
++                        target,
++                        &fc1[row * fc1_size..(row + 1) * fc1_size],
++                        fc3.map(|linear| &linear[row * inter..(row + 1) * inter]),
++                        inter,
++                        attributes,
++                        ActivationBias::Applied,
++                    );
++                }
++            }
++            let output = self.projection.zeroed_prefix(rows * hidden)?;
++            linear_grouped_into(
++                activated,
++                rows,
++                weights.fc2,
++                weights.fc2_bias,
++                hidden,
++                inter,
++                output,
++            )?;
++            Ok(output)
++        } else {
++            for value in fc1.iter_mut() {
++                *value = activate(attributes.activation, *value);
++            }
++            let output = self.input.zeroed_prefix(rows * hidden)?;
++            linear_grouped_into(
++                fc1,
++                rows,
++                weights.fc2,
++                weights.fc2_bias,
++                hidden,
++                inter,
++                output,
++            )?;
++            Ok(output)
++        }
++    }
++}
++
++/// Portable single-token reference expert: plain scalar dot products, no GEMM,
++/// no transposes. Production uses grouped GEMM projections at every row count;
++/// this is kept as the independent oracle the tests compare against.
++#[cfg(test)]
++pub(super) fn run_expert(
++    input: &[f32],
++    fc1_weights: &[f32],
++    fc1_bias: Option<&[f32]>,
++    fc2_weights: &[f32],
++    fc2_bias: Option<&[f32]>,
++    fc3_weights: Option<&[f32]>,
++    fc3_bias: Option<&[f32]>,
++    fc1_size: usize,
++    hidden: usize,
++    inter: usize,
++    attributes: &MoeAttributes,
++) -> Vec<f32> {
++    let mut fc1_out = linear(input, fc1_weights, fc1_bias, fc1_size, hidden);
++    let activated = match attributes.activation {
++        Activation::Swiglu => {
++            let linear_part;
++            let gate_part;
++            if attributes.swiglu_fusion == 0 {
++                gate_part = fc1_out;
++                linear_part = linear(
++                    input,
++                    fc3_weights.expect("validated unfused swiglu FC3"),
++                    fc3_bias,
++                    inter,
++                    hidden,
++                );
++            } else if attributes.swiglu_fusion == 1 {
++                let mut gate = Vec::with_capacity(inter);
++                let mut linear = Vec::with_capacity(inter);
++                for pair in fc1_out.as_chunks::<2>().0 {
++                    gate.push(pair[0]);
++                    linear.push(pair[1]);
++                }
++                gate_part = gate;
++                linear_part = linear;
++            } else {
++                linear_part = fc1_out.split_off(inter);
++                gate_part = fc1_out;
++            }
++            gate_part
++                .into_iter()
++                .zip(linear_part)
++                .map(|(g, l)| attributes.swiglu(g, l))
++                .collect()
++        }
++        Activation::Silu if fc3_weights.is_some() => {
++            let linear_part = linear(
++                input,
++                fc3_weights.expect("validated SiLU gated FC3"),
++                fc3_bias,
++                inter,
++                hidden,
++            );
++            fc1_out
++                .into_iter()
++                .zip(linear_part)
++                .map(|(g, l)| attributes.swiglu(g, l))
++                .collect()
++        }
++        activation => {
++            for value in &mut fc1_out {
++                *value = activate(activation, *value);
++            }
++            fc1_out
++        }
++    };
++    linear(&activated, fc2_weights, fc2_bias, hidden, inter)
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(super) fn run_expert_grouped(
++    input: &[f32],
++    rows: usize,
++    fc1_weights: &[f32],
++    fc1_bias: Option<&[f32]>,
++    fc2_weights: &[f32],
++    fc2_bias: Option<&[f32]>,
++    fc3_weights: Option<&[f32]>,
++    fc3_bias: Option<&[f32]>,
++    fc1_size: usize,
++    hidden: usize,
++    inter: usize,
++    attributes: &MoeAttributes,
++) -> Result<Vec<f32>> {
++    let fc1 = DenseExpertProjection {
++        weights: fc1_weights,
++        out_features: fc1_size,
++        in_features: hidden,
++    };
++    let fc2 = DenseExpertProjection {
++        weights: fc2_weights,
++        out_features: hidden,
++        in_features: inter,
++    };
++    let fc3 = fc3_weights.map(|weights| DenseExpertProjection {
++        weights,
++        out_features: inter,
++        in_features: hidden,
++    });
++    run_expert_projections(
++        input,
++        rows,
++        &fc1,
++        fc1_bias,
++        &fc2,
++        fc2_bias,
++        fc3.as_ref(),
++        fc3_bias,
++        attributes,
++        |projection, input, rows, bias| projection.apply(input, rows, bias),
++    )
++}
++
++/// Projection geometry shared by dense and compressed expert execution.
++/// The sequential apply callback may borrow one exclusive scratch buffer; each
++/// result remains owned while subsequent projections overwrite that scratch.
++pub(super) trait ExpertProjection {
++    fn out_features(&self) -> usize;
++    fn in_features(&self) -> usize;
++}
++struct DenseExpertProjection<'a> {
++    weights: &'a [f32],
++    out_features: usize,
++    in_features: usize,
++}
++impl ExpertProjection for DenseExpertProjection<'_> {
++    fn out_features(&self) -> usize {
++        self.out_features
++    }
++    fn in_features(&self) -> usize {
++        self.in_features
++    }
++}
++impl DenseExpertProjection<'_> {
++    fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
++        linear_grouped(
++            input,
++            rows,
++            self.weights,
++            bias,
++            self.out_features,
++            self.in_features,
++        )
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(super) fn run_expert_projections<P: ExpertProjection>(
++    input: &[f32],
++    rows: usize,
++    fc1: &P,
++    fc1_bias: Option<&[f32]>,
++    fc2: &P,
++    fc2_bias: Option<&[f32]>,
++    fc3: Option<&P>,
++    fc3_bias: Option<&[f32]>,
++    attributes: &MoeAttributes,
++    mut apply: impl FnMut(&P, &[f32], usize, Option<&[f32]>) -> Result<Vec<f32>>,
++) -> Result<Vec<f32>> {
++    let fc1_size = fc1.out_features();
++    let inter = fc2.in_features();
++    // A single routed token used to fall through to `run_expert`'s scalar dot
++    // loop. That loop is ~50x slower per MAC than the GEMM, and decode - one
++    // token, top-k experts - is the shape that matters most, so the grouped
++    // path now serves `rows == 1` too. `run_expert` is retained as the
++    // portable reference the tests compare against.
++    let mut fc1_out = apply(fc1, input, rows, fc1_bias)?;
++    let activated = match attributes.activation {
++        Activation::Swiglu => {
++            let (gate_part, linear_part) = if attributes.swiglu_fusion == 0 {
++                let linear = apply(
++                    fc3.expect("validated unfused swiglu FC3"),
++                    input,
++                    rows,
++                    fc3_bias,
++                )?;
++                (fc1_out, linear)
++            } else {
++                let mut gate = Vec::with_capacity(rows * inter);
++                let mut linear = Vec::with_capacity(rows * inter);
++                for row in fc1_out.chunks_exact(fc1_size) {
++                    if attributes.swiglu_fusion == 1 {
++                        for pair in row.as_chunks::<2>().0 {
++                            gate.push(pair[0]);
++                            linear.push(pair[1]);
++                        }
++                    } else {
++                        gate.extend_from_slice(&row[..inter]);
++                        linear.extend_from_slice(&row[inter..]);
++                    }
++                }
++                (gate, linear)
++            };
++            gate_part
++                .into_iter()
++                .zip(linear_part)
++                .map(|(g, l)| attributes.swiglu(g, l))
++                .collect()
++        }
++        Activation::Silu if fc3.is_some() => {
++            let linear_part = apply(
++                fc3.expect("validated SiLU gated FC3"),
++                input,
++                rows,
++                fc3_bias,
++            )?;
++            fc1_out
++                .into_iter()
++                .zip(linear_part)
++                .map(|(g, l)| attributes.swiglu(g, l))
++                .collect()
++        }
++        activation => {
++            for value in &mut fc1_out {
++                *value = activate(activation, *value);
++            }
++            fc1_out
++        }
++    };
++    apply(fc2, &activated, rows, fc2_bias)
++}
++
++/// `output[rows, out_features] = input[rows, in_features] * weightsᵀ (+ bias)`.
++///
++/// Expert weights arrive as `[out_features, in_features]`, i.e. already
++/// transposed relative to what a plain `A*B` GEMM wants. Both arms consume that
++/// native `[n][k]` layout directly: MLAS via its `transB` flag, and the portable
++/// path via [`gemm_bt`], whose dot-product inner loop is *contiguous along `k`*
++/// for both operands. Neither materializes the `[in_features, out_features]`
++/// copy the old portable path built - a 29 MiB strided scatter per call for a
++/// Mixtral-sized expert, previously the single largest term in the operator.
++fn linear_grouped(
++    input: &[f32],
++    rows: usize,
++    weights_nk: &[f32],
++    bias: Option<&[f32]>,
++    out_features: usize,
++    in_features: usize,
++) -> Result<Vec<f32>> {
++    let mut output = vec![0.0f32; rows * out_features];
++    linear_grouped_into(
++        input,
++        rows,
++        weights_nk,
++        bias,
++        out_features,
++        in_features,
++        &mut output,
++    )?;
++    Ok(output)
++}
++
++/// The destination is an initialized zeroed prefix, including for a zero-K
++/// projection. Both owned and workspace callers establish that invariant.
++#[allow(clippy::too_many_arguments)]
++fn linear_grouped_into(
++    input: &[f32],
++    rows: usize,
++    weights_nk: &[f32],
++    bias: Option<&[f32]>,
++    out_features: usize,
++    in_features: usize,
++    output: &mut [f32],
++) -> Result<()> {
++    #[cfg(feature = "mlas")]
++    {
++        if rows > 0 && out_features > 0 && in_features > 0 {
++            mlas_sys::sgemm(
++                false,
++                true,
++                rows,
++                out_features,
++                in_features,
++                1.0,
++                input,
++                in_features,
++                weights_nk,
++                in_features,
++                0.0,
++                output,
++                out_features,
++                true,
++            );
++        }
++    }
++    #[cfg(not(feature = "mlas"))]
++    {
++        gemm_bt(input, weights_nk, output, rows, in_features, out_features)?;
++    }
++    if let Some(bias) = bias.filter(|_| out_features != 0) {
++        for row in output.chunks_exact_mut(out_features) {
++            for (value, bias) in row.iter_mut().zip(bias) {
++                *value += bias;
++            }
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++fn linear(
++    input: &[f32],
++    weights: &[f32],
++    bias: Option<&[f32]>,
++    out_features: usize,
++    in_features: usize,
++) -> Vec<f32> {
++    let mut output = vec![0.0; out_features];
++    for o in 0..out_features {
++        let mut sum = bias.map_or(0.0, |b| b[o]);
++        for i in 0..in_features {
++            sum += input[i] * weights[o * in_features + i];
++        }
++        output[o] = sum;
++    }
++    output
++}
++
++pub(super) fn routing_weights(
++    logits: &[f32],
++    aggregation_weights: Option<&[f32]>,
++    k: usize,
++    normalize: bool,
++) -> Vec<(usize, f32)> {
++    let mut indices: Vec<usize> = (0..logits.len()).collect();
++    indices.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then_with(|| a.cmp(&b)));
++    indices.truncate(k);
++    if let Some(weights) = aggregation_weights {
++        let denominator = if normalize {
++            indices.iter().map(|&i| weights[i]).sum()
++        } else {
++            1.0
++        };
++        return indices
++            .into_iter()
++            .map(|i| {
++                let weight = if denominator == 0.0 {
++                    0.0
++                } else {
++                    weights[i] / denominator
++                };
++                (i, weight)
++            })
++            .collect();
++    }
++
++    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
++    let exponentials: Vec<f32> = logits.iter().map(|&v| (v - max).exp()).collect();
++    let all_sum: f32 = exponentials.iter().sum();
++    let denominator = if normalize {
++        indices.iter().map(|&i| exponentials[i]).sum()
++    } else {
++        all_sum
++    };
++    indices
++        .into_iter()
++        .map(|i| (i, exponentials[i] / denominator))
++        .collect()
++}
++
++fn activate(activation: Activation, value: f32) -> f32 {
++    match activation {
++        Activation::Relu => value.max(0.0),
++        Activation::Gelu => tanh_gelu(value),
++        Activation::Silu => value * sigmoid(value),
++        Activation::Identity => value,
++        Activation::Swiglu => unreachable!(),
++    }
++}
++
++fn sigmoid(value: f32) -> f32 {
++    if value >= 0.0 {
++        1.0 / (1.0 + (-value).exp())
++    } else {
++        let exp = value.exp();
++        exp / (1.0 + exp)
++    }
++}
++
++fn int_attr(node: &Node, name: &str, default: i64) -> Result<i64> {
++    match node.attr(name) {
++        Some(attr) => attr
++            .as_int()
++            .ok_or_else(|| error(format!("attribute {name} must be an integer"))),
++        None => Ok(default),
++    }
++}
++
++fn bool_attr(node: &Node, name: &str, default: bool) -> Result<bool> {
++    match int_attr(node, name, i64::from(default))? {
++        0 => Ok(false),
++        1 => Ok(true),
++        value => Err(error(format!(
++            "attribute {name} must be 0 or 1, got {value}"
++        ))),
++    }
++}
++
++fn float_attr(node: &Node, name: &str, default: f32) -> Result<f32> {
++    match node.attr(name) {
++        Some(attr) => attr
++            .as_float()
++            .ok_or_else(|| error(format!("attribute {name} must be a float"))),
++        None => Ok(default),
++    }
++}
++
++fn optional_dense(inputs: &[TensorView], index: usize) -> Result<Option<Vec<f32>>> {
++    inputs
++        .get(index)
++        .filter(|v| !v.is_absent())
++        .map(|v| to_dense_f32_widen("MoE", v).map(|c| c.into_owned()))
++        .transpose()
++}
++
++fn validate_bias(
++    name: &str,
++    inputs: &[TensorView],
++    index: usize,
++    experts: usize,
++    width: usize,
++) -> Result<()> {
++    if let Some(view) = inputs.get(index).filter(|v| !v.is_absent()) {
++        require_exact_shape(name, view.shape, &[experts, width])?;
++    }
++    Ok(())
++}
++
++fn require_shape(name: &str, shape: &[usize], rank: usize) -> Result<()> {
++    if shape.len() != rank {
++        return Err(error(format!(
++            "{name} must be {rank}-D, got shape {shape:?}"
++        )));
++    }
++    Ok(())
++}
++
++fn require_exact_shape(name: &str, got: &[usize], expected: &[usize]) -> Result<()> {
++    if got != expected {
++        return Err(error(format!(
++            "{name} must have shape {expected:?}, got {got:?}"
++        )));
++    }
++    Ok(())
++}
++
++fn error(message: impl Into<String>) -> EpError {
++    EpError::KernelFailed(format!("MoE: {}", message.into()))
++}
++
++#[cfg(test)]
++mod activation_validation_tests {
++    use super::*;
++
++    #[test]
++    fn shared_activation_validator_covers_every_activation_fusion_pair() {
++        for activation in ["relu", "gelu", "silu", "swiglu", "identity"] {
++            validate_moe_activation_attributes(activation, 0, 1.0, 0.0, f32::MAX)
++                .unwrap_or_else(|error| panic!("{activation}/fusion=0 rejected: {error}"));
++            for fusion in [1, 2] {
++                let result =
++                    validate_moe_activation_attributes(activation, fusion, 1.0, 0.0, f32::MAX);
++                assert_eq!(
++                    result.is_ok(),
++                    activation == "swiglu",
++                    "activation={activation} fusion={fusion}: {result:?}"
++                );
++            }
++        }
++        assert!(validate_moe_activation_attributes("unknown", 0, 1.0, 0.0, f32::MAX).is_err());
++        for fusion in [-1, 3] {
++            assert!(validate_moe_activation_attributes("swiglu", fusion, 1.0, 0.0, 1.0).is_err());
++        }
++    }
++
++    #[test]
++    fn shared_activation_validator_rejects_every_non_finite_or_non_positive_value() {
++        for (name, alpha, beta, limit) in [
++            ("activation_alpha NaN", f32::NAN, 0.0, 1.0),
++            ("activation_alpha +Inf", f32::INFINITY, 0.0, 1.0),
++            ("activation_alpha -Inf", f32::NEG_INFINITY, 0.0, 1.0),
++            ("activation_beta NaN", 1.0, f32::NAN, 1.0),
++            ("activation_beta +Inf", 1.0, f32::INFINITY, 1.0),
++            ("activation_beta -Inf", 1.0, f32::NEG_INFINITY, 1.0),
++            ("swiglu_limit NaN", 1.0, 0.0, f32::NAN),
++            ("swiglu_limit +Inf", 1.0, 0.0, f32::INFINITY),
++            ("swiglu_limit -Inf", 1.0, 0.0, f32::NEG_INFINITY),
++            ("swiglu_limit zero", 1.0, 0.0, 0.0),
++            ("swiglu_limit negative", 1.0, 0.0, -1.0),
++        ] {
++            assert!(
++                validate_moe_activation_attributes("swiglu", 1, alpha, beta, limit).is_err(),
++                "{name} must fail closed"
++            );
++        }
++    }
++}

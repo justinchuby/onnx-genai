@@ -1,0 +1,47 @@
+{
+  "hypothesis": "Does requesting 128-byte backing alignment change the streamed shared-bank regression? Default backing may already be aligned; actual address modulus is recorded. This does not prove hardware false-sharing counters.",
+  "shapes": [
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      1,
+      2,
+      "block"
+    ]
+  ],
+  "arms": [
+    "before",
+    "banked",
+    "null",
+    "before128",
+    "banked128"
+  ],
+  "processes_per_case": 5,
+  "construction_and_batch_start_rotations": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "batches": 10,
+  "target_cpu_ms": 250,
+  "pilot_minimum_cpu_ms": 50,
+  "duration_gate_ms": 20,
+  "cpu_wall_minimum": 0.9,
+  "control_and_AA_gate_percent": 5,
+  "attempts": 1,
+  "scope": "native Apple M1 Max, synthetic public strict prepare/run/output drop, one executable and CPU crate, separate books and funded owners; no model/CUDA/RSS claim",
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock"
+}
