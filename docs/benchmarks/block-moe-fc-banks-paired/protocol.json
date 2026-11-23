@@ -1,0 +1,92 @@
+{
+  "shapes": [
+    [
+      1,
+      32,
+      64,
+      1,
+      0,
+      0,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      1,
+      0,
+      0,
+      "block"
+    ],
+    [
+      1,
+      64,
+      128,
+      1,
+      1,
+      0,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      1,
+      2,
+      "block"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      3,
+      "block"
+    ],
+    [
+      1,
+      64,
+      128,
+      1,
+      0,
+      0,
+      "float"
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      "float"
+    ]
+  ],
+  "processes_per_case": 3,
+  "batches_per_arm_process": 9,
+  "process_construction_and_batch_start_rotation": [
+    0,
+    1,
+    2
+  ],
+  "target_cpu_ms": 250,
+  "excluded_pilot_minimum_cpu_ms": 50,
+  "minimum_batch_cpu_ms": 20,
+  "minimum_cpu_wall_ratio": 0.9,
+  "control_and_AA_max_deviation_percent": 5,
+  "attempts": 1,
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "scope": "same process, same CPU crate, separate public sessions/providers/books per arm; strict prepare+run+output drop; no model throughput claim",
+  "limitations": "same-process pairing does not pin a CPU core or remove scheduler/DVFS effects; allocator placement and ASLR remain process-dependent"
+}

@@ -1,0 +1,14 @@
+{
+  "moe": {
+    "original_sha256": "074d4ed5d0c7cf61921b2ea192beeaf4e51ab294a4eb804d5b4688743898b4d6",
+    "copied_sha256": "9fb73aeb3ae75c73dede5792bf38292e8828fc82e9694c642bf9c63ef4ec0898",
+    "only_import_redirect": false,
+    "tests_module_omitted": true
+  },
+  "block_quantized_moe": {
+    "original_sha256": "c285e9499cf0821837597ccdf318175bdc53fe8bfe2c83ed90660ceb22db68dd",
+    "copied_sha256": "8b4467047d5000874ed2c940a8a76f244836504d75c5535043591ebacc81fdd9",
+    "only_import_redirect": true,
+    "tests_module_omitted": true
+  }
+}

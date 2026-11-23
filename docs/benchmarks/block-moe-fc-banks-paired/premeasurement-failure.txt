@@ -1,0 +1,4 @@
+The first sweep invocation completed its build, then stopped before launching any measured process.
+subprocess.check_output(['ps','-Ao','pid=,pcpu=,comm=']) raised PermissionError: [Errno 1] Operation not permitted: 'ps'.
+The failed process handle exited 1. Read-only host process observation was subsequently permitted through sandbox escalation, and the same prepared sweep was launched once. No measured cells existed to discard or rerun.
+Smoke validation ran separately and passed all eight shapes with reps=1; those timings are explicitly excluded from performance evidence.

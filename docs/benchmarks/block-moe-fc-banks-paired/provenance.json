@@ -1,0 +1,18 @@
+{
+  "base": "71b105629d3bb65e8c11a4eaba9f5e804143b92b",
+  "baseline": "509144567bc6f74d899385aacee5717d20811cc0",
+  "binary_sha256": "4985947bbc7be07224093fb180a8e59e38316a28343354d20d2df6282e6968a5",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/Cargo.toml": "70c4ec0649517c90f3d1157b58d209ca8813b4af0fedd3b2e95a0b7a134cf32f",
+    "crates/onnx-runtime-ep-cpu/src/kernels/mod.rs": "5260193880e6aad4e4d46ae663e4e6e93036e0f23e56caf7760682c3bbe8ed26",
+    "crates/onnx-runtime-ep-cpu/src/lib.rs": "438c9597327b2ad35d9c9a168c720999ca1f2fa49e2cd96276fc54d4a83ee64e",
+    "crates/onnx-runtime-ep-cpu/src/provider.rs": "4cc78be23f378882275a6415b687451b0d7ee0cd1f92ff2321242a16ac046268",
+    "crates/onnx-runtime-ep-cpu/src/kernels/expert_bank_probe.rs": "9be38ad32677b03491d5d2abea6c94f439e45cf8adaf37de52eeb3b1854c5c8e",
+    "crates/onnx-runtime-ep-cpu/src/kernels/probe_before_block_quantized_moe.rs": "f189d26595cd339cdf2656e1b8a575b3823146be9dc5df2c5caafb851aacd4a1",
+    "crates/onnx-runtime-ep-cpu/src/kernels/probe_before_moe.rs": "e900c90321aa0d4731d67576511b7d11589ff45a925a1478dbc97a9038b11a75"
+  },
+  "probe_sha256": "36c20de1d49a48ab1ff5d84c1892f412f3c912895c43c0bc2223aa5acaf0b01e",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "symbol_count": 25529,
+  "no_mlas_symbols": true
+}
