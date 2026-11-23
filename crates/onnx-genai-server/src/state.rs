@@ -1,3 +1,4 @@
+use onnx_genai_engine::response_template;
 use std::{
     collections::HashMap,
     path::Path,
@@ -632,7 +633,7 @@ fn infer_model_id(model_dir: &Path) -> String {
 
 struct LoadedPromptContracts {
     chat_template: Option<ChatTemplate>,
-    response_template: Option<Arc<crate::response_template::ResponseTemplate>>,
+    response_template: Option<Arc<response_template::ResponseTemplate>>,
 }
 
 fn load_prompt_contracts(model_dir: &Path) -> anyhow::Result<LoadedPromptContracts> {
@@ -662,7 +663,7 @@ fn load_prompt_contracts(model_dir: &Path) -> anyhow::Result<LoadedPromptContrac
         .as_ref()
         .and_then(|value| value.get("response_template"))
         .filter(|value| !value.is_null())
-        .map(crate::response_template::ResponseTemplate::compile)
+        .map(response_template::ResponseTemplate::compile)
         .transpose()
         .with_context(|| {
             format!(

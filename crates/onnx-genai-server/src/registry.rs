@@ -1,3 +1,4 @@
+use onnx_genai_engine::response_template;
 use std::{
     collections::HashMap,
     fmt,
@@ -64,7 +65,7 @@ pub(crate) struct ModelHandle {
     pub(crate) multimodal: Option<MultimodalSpecs>,
     pub(crate) speech: Option<crate::speech::SpeechCapability>,
     pub(crate) image_pipeline: Option<ImagePipelineSpec>,
-    pub(crate) response_template: Option<Arc<crate::response_template::ResponseTemplate>>,
+    pub(crate) response_template: Option<Arc<response_template::ResponseTemplate>>,
     /// Epoch-millisecond timestamp of the last call to `ModelRegistry::resolve`.
     /// Initialised to construction time; updated on every resolve for LRU eviction.
     pub(crate) last_request_at: AtomicU64,
@@ -82,7 +83,7 @@ pub(crate) struct ModelHandleParts {
     pub(crate) engine: EngineDriver,
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
-    pub(crate) response_template: Option<Arc<crate::response_template::ResponseTemplate>>,
+    pub(crate) response_template: Option<Arc<response_template::ResponseTemplate>>,
     pub(crate) tool_protocol: Option<ToolProtocol>,
     pub(crate) tool_protocol_metadata_path: Option<PathBuf>,
     pub(crate) model_max_context: Option<usize>,

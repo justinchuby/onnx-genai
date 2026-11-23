@@ -847,3 +847,27 @@ unit cases passed. The real JSON-continuation regression passed with its updated
 generic grammar-prefix repair guidance. Strict default/native engine all-target
 and server all-target Clippy passed. The first HTTP filter selected zero tests;
 it is not counted as coverage and was replaced by the verified 3-case filter.
+
+Shared response-classifier milestone: the declared response template compiler,
+channel state and text projection now live in `onnx-genai-engine::response_template`.
+Server loading, continuation validation and buffered/live/logprob output consume
+that public engine implementation directly; the former server module is removed.
+Private boundary internals remain private. Regex dependencies move with their
+owner, with no new package versions introduced.
+
+Regions now store ranges into the request's raw buffer instead of duplicating
+body strings. Trimming and omitted-prefix offsets operate on those same bytes;
+closed/reopened fields and opaque regions retain the existing matching policy.
+This supplies one classifier for subsequent constrained sampling without adding
+a second channel grammar or claiming that reasoning+JSON is already enabled.
+
+Validation: all 12 moved classifier cases passed under default features. Full
+server library: 403 passed / 2 inherited ignores; the previous 415 count included
+the 12 cases now owned by the engine. Coverage still includes actual ONNX normal
+prefill/continuation, buffered/SSE/logprobs, stops, named templates and alternate
+protocol adapters. No performance claim is made for the storage representation.
+
+Final shared-parser validation: the same 12 cases passed with native-backend;
+strict native-engine all-target and server all-target Clippy passed after the
+unnecessary lazy region-construction closure was simplified. There are no
+remaining duplicate server parser definitions or compatibility aliases.

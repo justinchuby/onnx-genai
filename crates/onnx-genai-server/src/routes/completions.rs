@@ -1,5 +1,6 @@
 use super::*;
 use crate::tool_protocol::{self, ToolOutputConstraint, ToolProtocol};
+use onnx_genai_engine::response_template;
 
 pub(crate) async fn completions(
     State(state): State<AppState>,
@@ -2029,7 +2030,7 @@ fn positional_image_placeholder(
 /// fail, so they are passed as one value instead of four positional arguments.
 struct PromptContext<'a> {
     chat_template: Option<&'a ChatTemplate>,
-    response_template: Option<&'a Arc<crate::response_template::ResponseTemplate>>,
+    response_template: Option<&'a Arc<response_template::ResponseTemplate>>,
     tool_protocol: Option<&'a ToolProtocol>,
     image_placeholder: Option<&'a str>,
     generation_defaults: Option<&'a GenerationDefaults>,
@@ -2543,10 +2544,10 @@ fn render_prompt(
         let prompt =
             continue_rendered_prompt(request, rendered, context.image_placeholder, boundary)?;
         if let Some(spec) = context.response_template {
-            crate::response_template::ResponseParser::new(
+            response_template::ResponseParser::new(
                 spec.clone(),
                 &prompt,
-                crate::response_template::PrefixOutput::Exclude,
+                response_template::PrefixOutput::Exclude,
                 prompt.len().max(1),
             )?
             .require_open_text_channel(selected_field)?;
@@ -2670,9 +2671,9 @@ fn committed_chat_tool_calls(result: &GenerateResult) -> Option<Vec<ChatMessageT
 /// A resolved declaration plus the exact prompt that was actually rendered.
 #[derive(Clone)]
 struct ChatProjection {
-    template: Option<Arc<crate::response_template::ResponseTemplate>>,
+    template: Option<Arc<response_template::ResponseTemplate>>,
     prefix: Arc<str>,
-    prefix_output: crate::response_template::PrefixOutput,
+    prefix_output: response_template::PrefixOutput,
     max_bytes: usize,
     stop_sequences: Vec<String>,
 }
@@ -2692,9 +2693,9 @@ impl ChatProjection {
             template: handle.response_template.clone(),
             prefix: Arc::from(prefix),
             prefix_output: if request.continue_final_message.is_enabled() {
-                crate::response_template::PrefixOutput::Exclude
+                response_template::PrefixOutput::Exclude
             } else {
-                crate::response_template::PrefixOutput::Include
+                response_template::PrefixOutput::Include
             },
             max_bytes,
             stop_sequences: prepared
@@ -2715,7 +2716,7 @@ impl ChatProjection {
                 .template
                 .as_ref()
                 .map(|template| {
-                    crate::response_template::ResponseParser::new(
+                    response_template::ResponseParser::new(
                         template.clone(),
                         &self.prefix,
                         self.prefix_output,
@@ -2747,7 +2748,7 @@ impl ChatProjection {
                 .decode_with_special_tokens(&result.token_ids)
                 .context("decode generated response with declared protocol markers")?
         };
-        let mut parser = crate::response_template::ResponseParser::new(
+        let mut parser = response_template::ResponseParser::new(
             template.clone(),
             &self.prefix,
             self.prefix_output,
@@ -2766,7 +2767,7 @@ impl ChatProjection {
 
 struct ChannelGate {
     stop_buffer: StopBoundaryBuffer,
-    parser: Option<crate::response_template::ResponseParser>,
+    parser: Option<response_template::ResponseParser>,
     decoder: onnx_genai_engine::tokenization::TokenTextDecoder,
 }
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -3238,24 +3239,22 @@ mod prompt_rendering_tests {
             "A[r]{{ messages[0].reasoning_content }}[/r]{{ messages[0].content }}Z",
         );
         let request:ChatCompletionRequest=serde_json::from_value(json!({"messages":[{"role":"assistant","reasoning_content":"old","content":"answer"}],"continue_final_message":"content"})).unwrap();
-        let spec = crate::response_template::ResponseTemplate::compile(
-            &json!({"start_anchor":"A","fields":{
+        let spec =
+            response_template::ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
                 "reasoning_content":{"open":"[r]","close":"[/r]"},"content":{}
-            }}),
-        )
-        .unwrap();
+            }}))
+            .unwrap();
         let mut context = context(&template, None);
         context.response_template = Some(&spec);
         assert_eq!(
             render_prompt(&request, &context).unwrap(),
             "A[r]old[/r]answer"
         );
-        let mismatched = crate::response_template::ResponseTemplate::compile(
-            &json!({"start_anchor":"A","fields":{
+        let mismatched =
+            response_template::ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
                 "reasoning_content":{"open":"[r]","close":"[/r]"},"content":{"open":"[c]"}
-            }}),
-        )
-        .unwrap();
+            }}))
+            .unwrap();
         context.response_template = Some(&mismatched);
         let error = render_prompt(&request, &context).unwrap_err().to_string();
         assert!(
@@ -3729,7 +3728,7 @@ mod channel_gate_tests {
     use super::*;
     #[test]
     fn declared_channels_use_the_rendered_prefix_and_never_echo_it() {
-        let template = crate::response_template::ResponseTemplate::compile(&serde_json::json!({
+        let template = response_template::ResponseTemplate::compile(&serde_json::json!({
             "start_anchor":"<assistant>",
             "fields": {
                 "reasoning_content":{"open":"<think>","close":"</think>","content":"text"},
@@ -3737,10 +3736,10 @@ mod channel_gate_tests {
             }
         }))
         .unwrap();
-        let mut parser = crate::response_template::ResponseParser::new(
+        let mut parser = response_template::ResponseParser::new(
             template,
             "history<assistant><think>prior",
-            crate::response_template::PrefixOutput::Exclude,
+            response_template::PrefixOutput::Exclude,
             4096,
         )
         .unwrap();
@@ -3762,7 +3761,7 @@ mod channel_gate_tests {
         let projection = ChatProjection {
             template: None,
             prefix: Arc::from(""),
-            prefix_output: crate::response_template::PrefixOutput::Include,
+            prefix_output: response_template::PrefixOutput::Include,
             max_bytes: 4096,
             stop_sequences: Vec::new(),
         };

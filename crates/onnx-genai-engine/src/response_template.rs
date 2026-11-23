@@ -10,7 +10,7 @@ use std::ops::Range;
 const REGEX_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
-pub(crate) struct Boundary {
+struct Boundary {
     regex: Regex,
     literals: Option<Vec<String>>,
     partial: Option<dense::DFA<Vec<u32>>>,
@@ -18,7 +18,7 @@ pub(crate) struct Boundary {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Scan {
+struct Scan {
     pub matched: Option<Range<usize>>,
     pub hold_from: usize,
 }
@@ -181,8 +181,9 @@ struct Field {
     optional: bool,
 }
 
+/// Compiled response channels from a declared tokenizer response template.
 #[derive(Debug)]
-pub(crate) struct ResponseTemplate {
+pub struct ResponseTemplate {
     anchor: Boundary,
     fields: Vec<Field>,
     implicit: Option<usize>,
@@ -409,45 +410,45 @@ impl ResponseTemplate {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Region {
-    text: String,
-    omitted_prefix_bytes: usize,
+    bytes: Range<usize>,
     visible: bool,
 }
 impl Region {
-    fn output<'a>(&'a self, field: &Field) -> &'a str {
+    fn output<'a>(&self, field: &Field, buffer: &'a str, omitted_prefix_end: usize) -> &'a str {
+        let raw = &buffer[self.bytes.clone()];
         let text = if field.strip {
-            self.text
-                .trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+            raw.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
         } else {
-            &self.text
+            raw
         };
-        let start = text.as_ptr() as usize - self.text.as_ptr() as usize;
+        let start = self.bytes.start + (text.as_ptr() as usize - raw.as_ptr() as usize);
         let end = start + text.len();
-        let from = start.max(self.omitted_prefix_bytes);
-        if from >= end {
-            ""
-        } else {
-            &self.text[from..end]
-        }
+        let from = start.max(omitted_prefix_end);
+        if from >= end { "" } else { &buffer[from..end] }
     }
 }
 
+/// Projected chat text, with protocol framing and opaque fields removed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct ChatText {
+pub struct ChatText {
     pub content: String,
     pub reasoning: String,
 }
 
 /// Whether assistant text already rendered by the template belongs to this output.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum PrefixOutput {
+pub enum PrefixOutput {
+    /// Emit template-rendered assistant text along with generated text.
     Include,
+    /// Consume existing text only as parser state for an explicit continuation.
     Exclude,
 }
 
-pub(crate) struct ResponseParser {
+/// Request-local response classification and append-only text publication.
+/// Matching and field visibility are shared by engine and transport consumers.
+pub struct ResponseParser {
     spec: std::sync::Arc<ResponseTemplate>,
     buffer: String,
     omitted_prefix_end: usize,
@@ -501,7 +502,7 @@ impl ResponseParser {
         Ok(parser)
     }
 
-    pub(crate) fn require_open_text_channel(&self, name: &str) -> anyhow::Result<()> {
+    pub fn require_open_text_channel(&self, name: &str) -> anyhow::Result<()> {
         let active = self
             .current
             .map(|field| self.spec.fields[field].name.as_str());
@@ -517,12 +518,11 @@ impl ResponseParser {
             return;
         }
         if let Some(field) = self.current {
-            let region = self.region.get_or_insert_with(Region::default);
-            region.text.push_str(&self.buffer[range.clone()]);
-            region.omitted_prefix_bytes += range
-                .end
-                .min(self.omitted_prefix_end)
-                .saturating_sub(range.start);
+            let region = self.region.get_or_insert(Region {
+                bytes: range.start..range.start,
+                visible: false,
+            });
+            region.bytes.end = range.end;
             region.visible |= range.end > self.omitted_prefix_end;
             self.seen[field] = true;
         }
@@ -585,8 +585,8 @@ impl ResponseParser {
                     self.close();
                     self.current = Some(field);
                     self.region = Some(Region {
+                        bytes: range.end..range.end,
                         visible: range.end > self.omitted_prefix_end,
-                        ..Default::default()
                     });
                     self.seen[field] = true;
                 } else {
@@ -657,7 +657,7 @@ impl ResponseParser {
                     target.push_str(&definition.join);
                 }
                 first = false;
-                target.push_str(region.output(definition));
+                target.push_str(region.output(definition, &self.buffer, self.omitted_prefix_end));
             }
         }
         output
