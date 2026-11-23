@@ -559,13 +559,26 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
-        ("DequantizePackedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => {
-            onnx_runtime_ir::dequantize_packed::DTYPES
-        }
+        ("DequantizePackedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => &[
+            DataType::Uint8,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float64,
+        ],
         (
-            "PackedGroupedMatMul" | "AffineQuantizedGroupedMatMul" | "AffineQuantizedGather",
+            "PackedGroupedMatMul" | "AffineQuantizedGroupedMatMul",
             onnx_runtime_ir::RUNTIME_DOMAIN,
-        ) => &[DataType::Float32],
+        ) => &[DataType::Float32, DataType::Uint8, DataType::Int32, DataType::Int64],
+        ("AffineQuantizedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => &[
+            DataType::Float32,
+            DataType::Int8,
+            DataType::Uint8,
+            DataType::Int32,
+            DataType::Int64,
+        ],
         ("Pack", "") => &[DataType::Uint8],
         ("Unpack", "") => onnx_runtime_ir::packed_routed::WORD_DTYPES,
         ("GroupedMatMul", "") => onnx_runtime_ir::standard_math::DTYPES,
