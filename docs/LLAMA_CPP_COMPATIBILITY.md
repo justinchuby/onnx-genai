@@ -189,10 +189,13 @@ template is declared. The actual rendered prefill seeds the parser, and model
 token candidates constrain only projected content while reasoning remains free.
 This applies to implicit prefill and explicit reasoning continuation, with the
 same projection for buffered, SSE and logprob output. Capabilities are checked
-before generation/SSE admission. Supported combinations currently require literal
-field boundaries and root ByteLevel/ByteFallback or canonical non-byte decoders;
-regex boundaries, contextual byte-decoder sequences and incomplete Unicode escape
-spelling remain open compatibility work. Forced tool/Lark output policies during
+before generation/SSE admission. Supported combinations currently use literal
+boundaries or regex boundaries with a resolved byte DFA, plus root
+ByteLevel/ByteFallback or canonical non-byte decoders. Pending Unicode bytes,
+regex priority, greedy/lazy continuations and EOF assertions share the publication
+parser's boundary rules. Regexes requiring unsupported DFA look assertions,
+contextual byte-decoder sequences and incomplete Unicode escape spelling remain
+open compatibility work. Forced tool/Lark output policies during
 reasoning continuation and thinking-budget controls also remain unsupported.
 
 Without explicit continuation, declared content/reasoning text in the template

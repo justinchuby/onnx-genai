@@ -147,7 +147,7 @@ impl ResponseJsonConstraint {
             view.grammar_json_content()
         };
         let canonical = canonical_json_prefix(&grammar)?;
-        let pending = view.pending_json_bytes().unwrap_or_default();
+        let pending = view.pending_json_bytes()?.unwrap_or_default();
         let combined;
         let bytes = if pending.is_empty() {
             canonical.as_bytes()
@@ -489,24 +489,31 @@ mod tests {
     }
 
     #[test]
-    fn response_json_processor_resolves_overlapping_literal_closers_before_partial_unicode() {
+    fn response_json_processor_resolves_overlapping_closers_before_partial_unicode() {
         let tokenizer = byte_tokenizer(false, &[(4, "Ã"), (5, "©"), (22, "{\"n\":1}"), (23, "X")]);
-        let mut options = options();
-        if let Some(GenerateConstraint::ResponseJson {
-            template, prefix, ..
-        }) = &mut options.constraint
-        {
-            *template = ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
-                "content":{"open":"<c>","close":["X","X終"]}
-            }}))
-            .unwrap();
-            *prefix = "A<c>".into();
+        for regex in [false, true] {
+            let mut options = options();
+            if let Some(GenerateConstraint::ResponseJson {
+                template, prefix, ..
+            }) = &mut options.constraint
+            {
+                let field = if regex {
+                    json!({"open_pattern":"<c>","close_pattern":"X終|X"})
+                } else {
+                    json!({"open":"<c>","close":["X","X終"]})
+                };
+                *template = ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
+                    "content":field
+                }}))
+                .unwrap();
+                *prefix = "A<c>".into();
+            }
+            let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+            // C3 cannot extend X終, so the complete X closes content before it.
+            assert!(mask(&chain, &[22, 23])[4].is_finite());
+            assert!(mask(&chain, &[22, 23, 4])[5].is_finite());
+            assert!(mask(&chain, &[22, 23, 4, 5])[3].is_finite());
         }
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
-        // C3 cannot extend X終, so the complete X closes content before it.
-        assert!(mask(&chain, &[22, 23])[4].is_finite());
-        assert!(mask(&chain, &[22, 23, 4])[5].is_finite());
-        assert!(mask(&chain, &[22, 23, 4, 5])[3].is_finite());
     }
 
     #[test]
@@ -541,24 +548,39 @@ mod tests {
     fn response_json_processor_masks_projected_content_and_actual_eos() {
         for byte_level in [false, true] {
             let tokenizer = tokenizer(byte_level);
-            let chain = build_processor_chain(&options(), Some(&tokenizer), false).unwrap();
-            let mut logits = vec![0.0; 34];
-            chain
-                .process(&mut logits, &ProcessorContext::default())
-                .unwrap();
-            assert!(logits[22].is_finite() && logits[25].is_finite());
-            assert!(!logits[23].is_finite() && !logits[24].is_finite() && !logits[3].is_finite());
-            assert!(!logits[32].is_finite() && !logits[33].is_finite());
-            let context = ProcessorContext {
-                generated_tokens: vec![22],
-                ..Default::default()
-            };
-            let mut logits = vec![0.0; 34];
-            chain.process(&mut logits, &context).unwrap();
-            assert!(
-                logits[3].is_finite(),
-                "EOS must project its declared closing marker"
-            );
+            for regex in [false, true] {
+                let mut options = options();
+                if regex
+                    && let Some(GenerateConstraint::ResponseJson { template, .. }) =
+                        &mut options.constraint
+                {
+                    *template = ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
+                        "reasoning_content":{"open_pattern":r"\[r\]","close_pattern":r"\[/r\]\s*"},
+                        "content":{"close_pattern":"<eos>"}
+                    }}))
+                    .unwrap();
+                }
+                let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+                let mut logits = vec![0.0; 34];
+                chain
+                    .process(&mut logits, &ProcessorContext::default())
+                    .unwrap();
+                assert!(logits[22].is_finite() && logits[25].is_finite());
+                assert!(
+                    !logits[23].is_finite() && !logits[24].is_finite() && !logits[3].is_finite()
+                );
+                assert!(!logits[32].is_finite() && !logits[33].is_finite());
+                let context = ProcessorContext {
+                    generated_tokens: vec![22],
+                    ..Default::default()
+                };
+                let mut logits = vec![0.0; 34];
+                chain.process(&mut logits, &context).unwrap();
+                assert!(
+                    logits[3].is_finite(),
+                    "EOS must project its declared closing marker"
+                );
+            }
         }
     }
 

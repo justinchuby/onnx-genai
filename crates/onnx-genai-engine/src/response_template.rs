@@ -1,9 +1,9 @@
 //! Declared response boundaries. No model identity determines a delimiter.
 use anyhow::{Context, ensure};
-use regex::{Regex, RegexBuilder};
 use regex_automata::{
     Anchored, Input,
     dfa::{Automaton, StartKind, dense},
+    meta,
 };
 use std::ops::Range;
 
@@ -11,10 +11,193 @@ const REGEX_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 struct Boundary {
-    regex: Regex,
-    literals: Option<Vec<String>>,
-    partial: Option<dense::DFA<Vec<u32>>>,
+    regex: meta::Regex,
+    partial: PartialBoundary,
     minimum_bytes: Option<usize>,
+}
+
+#[derive(Debug)]
+struct JsonBoundaryRefusal {
+    field: String,
+    cause: std::sync::Arc<anyhow::Error>,
+}
+impl std::fmt::Display for JsonBoundaryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "response_template field {:?} cannot resolve its regex byte-prefix boundary for JSON sampling: {:#}; simplify the regex or remove unsupported look assertions",
+            self.field, self.cause
+        )
+    }
+}
+impl std::error::Error for JsonBoundaryRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref().as_ref())
+    }
+}
+
+/// Reachability is computed once from the actual anchored DFA, including every
+/// look-behind class. A delayed accepting state alone does not keep a boundary
+/// open: only a possible later acceptance or an EOF-dependent match does.
+#[derive(Debug)]
+struct ByteBoundary {
+    dfa: dense::DFA<Vec<u32>>,
+    live: Vec<bool>,
+}
+
+#[derive(Debug)]
+enum PartialBoundary {
+    Literal(Vec<String>),
+    Exact(Box<ByteBoundary>),
+    Buffered(std::sync::Arc<anyhow::Error>),
+}
+
+impl ByteBoundary {
+    fn new(dfa: dense::DFA<Vec<u32>>) -> anyhow::Result<Self> {
+        use regex_automata::util::{primitives::StateID, start};
+        // State IDs are documented premultiplied transition-table offsets.
+        let slots = dfa.memory_usage() / (dfa.stride() * size_of::<u32>()) + 1;
+        let alphabet = dfa
+            .byte_classes()
+            .representatives(..)
+            .filter_map(|unit| unit.as_u8())
+            .collect::<Vec<_>>();
+        let edge_limit = slots
+            .checked_mul(alphabet.len())
+            .context("response boundary transition count overflow")?;
+        let bytes = slots
+            .checked_mul(2 * size_of::<usize>() + 3 + size_of::<StateID>())
+            .and_then(|base| {
+                edge_limit
+                    .checked_mul(2 * size_of::<usize>())
+                    .and_then(|edges| base.checked_add(edges))
+            })
+            .context("response boundary reachability budget overflow")?;
+        ensure!(
+            bytes <= 8 * REGEX_BYTES,
+            "response boundary reachability needs {bytes} bytes, exceeding its {}-byte analysis budget; simplify the boundary regex",
+            8 * REGEX_BYTES
+        );
+        let index = |state: StateID| state.as_usize() >> dfa.stride2();
+        let mut seen = vec![false; slots];
+        let mut states = Vec::with_capacity(slots);
+        for previous in std::iter::once(None).chain((0..=u8::MAX).map(Some)) {
+            let state = dfa
+                .start_state(
+                    &start::Config::new()
+                        .anchored(Anchored::Yes)
+                        .look_behind(previous),
+                )
+                .context("resolve anchored response boundary look-behind")?;
+            ensure!(
+                index(state) < slots,
+                "response boundary start state exceeds its transition table"
+            );
+            if !seen[index(state)] {
+                seen[index(state)] = true;
+                states.push(state);
+            }
+        }
+        let mut heads = vec![usize::MAX; slots];
+        let mut parents = Vec::with_capacity(edge_limit);
+        let mut at = 0;
+        while at < states.len() {
+            let state = states[at];
+            at += 1;
+            ensure!(
+                !dfa.is_quit_state(state),
+                "response boundary DFA cannot resolve this byte context; use a regex without unsupported look assertions"
+            );
+            if dfa.is_dead_state(state) {
+                continue;
+            }
+            for &byte in &alphabet {
+                let next = dfa.next_state(state, byte);
+                ensure!(
+                    !dfa.is_quit_state(next),
+                    "response boundary DFA cannot resolve byte {byte:#04x}; use a regex without unsupported look assertions"
+                );
+                if dfa.is_dead_state(next) {
+                    continue;
+                }
+                let dest = index(next);
+                ensure!(
+                    dest < slots && parents.len() < edge_limit,
+                    "response boundary transitions exceed their resolved analysis capacity"
+                );
+                parents.push((index(state), heads[dest]));
+                heads[dest] = parents.len() - 1;
+                if !seen[dest] {
+                    seen[dest] = true;
+                    states.push(next);
+                }
+            }
+        }
+        let mut finish = vec![false; slots];
+        let mut queue = Vec::with_capacity(states.len());
+        for &state in &states {
+            let ending = dfa.next_eoi_state(state);
+            ensure!(
+                !dfa.is_quit_state(ending),
+                "response boundary DFA cannot resolve EOF in this context; simplify the boundary look assertions"
+            );
+            if dfa.is_match_state(state) || dfa.is_match_state(ending) {
+                finish[index(state)] = true;
+                queue.push(index(state));
+            }
+        }
+        let mut at = 0;
+        while at < queue.len() {
+            let mut edge = heads[queue[at]];
+            at += 1;
+            while edge != usize::MAX {
+                let (parent, next) = parents[edge];
+                if !finish[parent] {
+                    finish[parent] = true;
+                    queue.push(parent);
+                }
+                edge = next;
+            }
+        }
+        let mut live = vec![false; slots];
+        for &state in &states {
+            live[index(state)] = dfa.is_match_state(dfa.next_eoi_state(state))
+                || alphabet
+                    .iter()
+                    .any(|&byte| finish[index(dfa.next_state(state, byte))]);
+        }
+        Ok(Self { dfa, live })
+    }
+
+    fn holds(&self, input: &str, pending: &[u8], from: usize) -> anyhow::Result<Option<usize>> {
+        for start in input[from..]
+            .char_indices()
+            .map(|(at, _)| from + at)
+            .chain(std::iter::once(input.len()))
+        {
+            let query = Input::new(input)
+                .span(start..input.len())
+                .anchored(Anchored::Yes);
+            let mut state = self
+                .dfa
+                .start_state_forward(&query)
+                .context("start response boundary byte-prefix scan")?;
+            for &byte in input.as_bytes()[start..].iter().chain(pending) {
+                state = self.dfa.next_state(state, byte);
+                ensure!(
+                    !self.dfa.is_quit_state(state),
+                    "response boundary byte-prefix scan reached an unresolved DFA state"
+                );
+                if self.dfa.is_dead_state(state) {
+                    break;
+                }
+            }
+            if self.live[state.as_usize() >> self.dfa.stride2()] {
+                return Ok(Some(start));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -37,15 +220,26 @@ impl Boundary {
             .map(|literal| regex::escape(literal))
             .collect::<Vec<_>>()
             .join("|");
-        let mut boundary = Self::pattern(&pattern, field)?;
-        boundary.literals = Some(literals);
-        Ok(boundary)
+        let minimum_bytes = literals.iter().map(String::len).min();
+        Ok(Self {
+            regex: Self::regex(&pattern, field)?,
+            partial: PartialBoundary::Literal(literals),
+            minimum_bytes,
+        })
+    }
+
+    fn regex(pattern: &str, field: &str) -> anyhow::Result<meta::Regex> {
+        meta::Regex::builder()
+            .configure(meta::Config::new().nfa_size_limit(Some(REGEX_BYTES))
+                .dfa_size_limit(Some(REGEX_BYTES)).hybrid_cache_capacity(REGEX_BYTES))
+            .syntax(regex_automata::util::syntax::Config::new()
+                .dot_matches_new_line(true).multi_line(false))
+            .build(pattern)
+            .with_context(|| format!("{field} regex is unsupported; repair the pattern using Unicode-aware regular expressions without lookaround or backreferences"))
     }
 
     pub fn pattern(pattern: &str, field: &str) -> anyhow::Result<Self> {
-        let regex=RegexBuilder::new(pattern).dot_matches_new_line(true).multi_line(false)
-            .size_limit(REGEX_BYTES).dfa_size_limit(REGEX_BYTES).build()
-            .with_context(||format!("{field} regex is unsupported; repair the pattern using Unicode-aware regular expressions without lookaround or backreferences"))?;
+        let regex = Self::regex(pattern, field)?;
         let hir = regex_syntax::ParserBuilder::new()
             .dot_matches_new_line(true)
             .multi_line(false)
@@ -64,10 +258,14 @@ impl Boundary {
                     .multi_line(false),
             )
             .build(pattern)
-            .ok();
+            .map_err(anyhow::Error::new)
+            .and_then(ByteBoundary::new);
+        let partial = match partial {
+            Ok(matcher) => PartialBoundary::Exact(Box::new(matcher)),
+            Err(error) => PartialBoundary::Buffered(std::sync::Arc::new(error)),
+        };
         Ok(Self {
             regex,
-            literals: None,
             partial,
             minimum_bytes: hir.properties().minimum_len(),
         })
@@ -101,6 +299,16 @@ impl Boundary {
             })
     }
 
+    fn hold(&self, input: &str, pending: &[u8], from: usize) -> anyhow::Result<Option<usize>> {
+        match &self.partial {
+            PartialBoundary::Literal(literals) => {
+                Ok(self.literal_hold(input, pending, from, literals))
+            }
+            PartialBoundary::Exact(matcher) => matcher.holds(input, pending, from),
+            PartialBoundary::Buffered(_) => Ok(Some(from)),
+        }
+    }
+
     fn scan_pending(
         &self,
         input: &str,
@@ -108,106 +316,42 @@ impl Boundary {
         from: usize,
         final_chunk: bool,
     ) -> anyhow::Result<Scan> {
-        if pending.is_empty() || final_chunk || self.literals.is_none() {
-            return self.scan(input, from, final_chunk);
-        }
-        let literals = self
-            .literals
-            .as_ref()
-            .context("literal response boundary lost its declaration")?;
-        let found = self.regex.find_at(input, from).map(|m| m.range());
-        let hold = self
-            .literal_hold(input, pending, from, literals)
-            .unwrap_or(input.len());
-        Ok(Scan {
-            matched: found.filter(|range| range.start < hold),
-            hold_from: hold,
-        })
-    }
-
-    pub fn scan(&self, input: &str, from: usize, final_chunk: bool) -> anyhow::Result<Scan> {
         ensure!(
             input.is_char_boundary(from),
             "response parser cursor {from} is outside a UTF-8 boundary; restart this response parser"
         );
-        let found = self.regex.find_at(input, from).map(|m| m.range());
+        let bytes = if pending.is_empty() {
+            std::borrow::Cow::Borrowed(input.as_bytes())
+        } else {
+            std::borrow::Cow::Owned([input.as_bytes(), pending].concat())
+        };
+        // EOF/look assertions must see pending bytes too, even though those
+        // bytes cannot yet be published as a complete Unicode scalar.
+        let found = self
+            .regex
+            .find(Input::new(bytes.as_ref()).span(from..bytes.len()))
+            .map(|matched| matched.range())
+            .filter(|range| {
+                range.end <= input.len()
+                    && input.is_char_boundary(range.start)
+                    && input.is_char_boundary(range.end)
+            });
         if final_chunk {
             return Ok(Scan {
                 matched: found,
                 hold_from: input.len(),
             });
         }
-        if let Some(literals) = &self.literals {
-            let hold = self
-                .literal_hold(input, &[], from, literals)
-                .unwrap_or(input.len());
-            if let Some(found) = found {
-                // A longer literal at the same start can still win after the
-                // next chunk. Never commit a shorter complete alternative yet.
-                if hold <= found.start {
-                    return Ok(Scan {
-                        matched: None,
-                        hold_from: hold.min(found.start),
-                    });
-                }
-                return Ok(Scan {
-                    matched: Some(found),
-                    hold_from: input.len(),
-                });
-            }
-            return Ok(Scan {
-                matched: None,
-                hold_from: hold,
-            });
-        }
-        let Some(dfa) = &self.partial else {
-            return Ok(Scan {
-                matched: None,
-                hold_from: from,
-            });
-        };
-        for start in input[from..]
-            .char_indices()
-            .map(|(offset, _)| from + offset)
-            .chain(std::iter::once(input.len()))
-        {
-            let query = Input::new(input)
-                .span(start..input.len())
-                .anchored(Anchored::Yes);
-            let Ok(mut state) = dfa.start_state_forward(&query) else {
-                return Ok(Scan {
-                    matched: None,
-                    hold_from: start,
-                });
-            };
-            let mut unknown = false;
-            for &byte in &input.as_bytes()[start..] {
-                state = dfa.next_state(state, byte);
-                if dfa.is_quit_state(state) {
-                    unknown = true;
-                    break;
-                }
-                if dfa.is_dead_state(state) {
-                    break;
-                }
-            }
-            if unknown || !dfa.is_dead_state(state) {
-                return Ok(Scan {
-                    matched: None,
-                    hold_from: start,
-                });
-            }
-            if found.as_ref().is_some_and(|found| found.start == start) {
-                return Ok(Scan {
-                    matched: found,
-                    hold_from: input.len(),
-                });
-            }
-        }
+        let hold = self.hold(input, pending, from)?.unwrap_or(input.len());
         Ok(Scan {
-            matched: None,
-            hold_from: input.len(),
+            matched: found.filter(|range| range.start < hold),
+            hold_from: hold,
         })
+    }
+
+    #[cfg(test)]
+    fn scan_text(&self, input: &str, from: usize, final_chunk: bool) -> anyhow::Result<Scan> {
+        self.scan_pending(input, &[], from, final_chunk)
     }
 }
 
@@ -347,11 +491,13 @@ impl ResponseTemplate {
     pub(crate) fn require_json_boundaries(&self) -> anyhow::Result<()> {
         for field in &self.fields {
             for boundary in [&field.open, &field.close].into_iter().flatten() {
-                ensure!(
-                    boundary.literals.is_some(),
-                    "response_template field {:?} uses a regex boundary that cannot yet be resolved for projected JSON sampling; this combination requires a byte-prefix boundary implementation",
-                    field.name
-                );
+                if let PartialBoundary::Buffered(reason) = &boundary.partial {
+                    return Err(JsonBoundaryRefusal {
+                        field: field.name.clone(),
+                        cause: reason.clone(),
+                    }
+                    .into());
+                }
             }
         }
         Ok(())
@@ -1048,30 +1194,21 @@ impl ResponseParser {
             .any(|c| c.as_bytes().starts_with(pending))
     }
 
-    pub(crate) fn pending_json_bytes(&self) -> Option<&[u8]> {
+    pub(crate) fn pending_json_bytes(&self) -> anyhow::Result<Option<&[u8]>> {
         let pending = self.utf8_tail.bytes();
         if pending.is_empty()
             || self
                 .current
                 .is_none_or(|field| self.spec.fields[field].name != "content")
         {
-            return None;
+            return Ok(None);
         }
-        if self
-            .spec
-            .watched(self.current)
-            .iter()
-            .any(|(_, _, boundary)| {
-                boundary.literals.as_ref().is_some_and(|literals| {
-                    boundary
-                        .literal_hold(&self.buffer, pending, self.pos, literals)
-                        .is_some()
-                })
-            })
-        {
-            return None;
+        for (_, _, boundary) in self.spec.watched(self.current) {
+            if boundary.hold(&self.buffer, pending, self.pos)?.is_some() {
+                return Ok(None);
+            }
         }
-        Some(pending)
+        Ok(Some(pending))
     }
 
     pub fn feed(&mut self, text: &str) -> anyhow::Result<ChatText> {
@@ -1396,7 +1533,7 @@ mod tests {
         let tokenizer = onnx_genai_ort::Tokenizer::from_file(path).unwrap();
         let pieces = crate::tokenization::token_pieces(&tokenizer, &[4, 5, 16, 17]).unwrap();
         assert_eq!(pieces.concat(), "終{\"n\":1}".as_bytes());
-        let spec = ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
+        let spec = ResponseTemplate::compile(&serde_json::json!({"start_anchor":"A","fields":{
             "reasoning_content":{"open":"[r]","close":"終"}, "content":{}
         }}))
         .unwrap();
@@ -1714,13 +1851,13 @@ mod tests {
             ),
         ];
         for (boundary, input) in cases {
-            let expected = boundary.scan(input, 0, true).unwrap().matched.unwrap();
+            let expected = boundary.scan_text(input, 0, true).unwrap().matched.unwrap();
             for split in input
                 .char_indices()
                 .map(|(at, _)| at)
                 .chain(std::iter::once(input.len()))
             {
-                let scan = boundary.scan(&input[..split], 0, false).unwrap();
+                let scan = boundary.scan_text(&input[..split], 0, false).unwrap();
                 match scan.matched {
                     Some(found) => assert_eq!(
                         found, expected,
@@ -1741,7 +1878,7 @@ mod tests {
         for suffix in ["<", "</", "</思", "</思考"] {
             let text = format!("thought{suffix}");
             assert_eq!(
-                boundary.scan(&text, 0, false).unwrap(),
+                boundary.scan_text(&text, 0, false).unwrap(),
                 Scan {
                     matched: None,
                     hold_from: 7
@@ -1749,65 +1886,230 @@ mod tests {
             );
         }
         assert_eq!(
-            boundary.scan("thought</思考>", 0, false).unwrap().matched,
+            boundary
+                .scan_text("thought</思考>", 0, false)
+                .unwrap()
+                .matched,
             Some(7..16)
         );
         let overlap = Boundary::literal(vec!["a".into(), "abcd".into()], "close").unwrap();
-        assert_eq!(overlap.scan("a", 0, false).unwrap().hold_from, 0);
-        assert_eq!(overlap.scan("ab", 0, false).unwrap().matched, None);
-        assert_eq!(overlap.scan("abcd", 0, false).unwrap().matched, Some(0..4));
-        assert_eq!(overlap.scan("ax", 0, false).unwrap().matched, Some(0..1));
-        assert!(boundary.literals.is_some() || boundary.partial.is_some());
+        assert_eq!(overlap.scan_text("a", 0, false).unwrap().hold_from, 0);
+        assert_eq!(overlap.scan_text("ab", 0, false).unwrap().matched, None);
+        assert_eq!(
+            overlap.scan_text("abcd", 0, false).unwrap().matched,
+            Some(0..4)
+        );
+        assert_eq!(
+            overlap.scan_text("ax", 0, false).unwrap().matched,
+            Some(0..1)
+        );
+        assert!(matches!(
+            boundary.partial,
+            PartialBoundary::Literal(_) | PartialBoundary::Exact(_)
+        ));
         assert!(!boundary.can_match_empty());
     }
+    #[test]
+    fn response_template_identity_matches_canonical_boundary_tie_order() {
+        let declaration = serde_json::json!({"start_anchor":"A","fields":{
+            "content":{"open":"X","close":"END"},
+            "reasoning_content":{"open":"X","close":"END"}
+        }});
+        let first = ResponseTemplate::compile(&declaration).unwrap();
+        let second = ResponseTemplate::compile(&serde_json::json!({"start_anchor":"A","fields":{
+            "reasoning_content":{"open":"X","close":"END"},
+            "content":{"open":"X","close":"END"}
+        }}))
+        .unwrap();
+        let project = |spec| {
+            ResponseParser::new(spec, "A", PrefixOutput::Include, 1024)
+                .unwrap()
+                .preview("XhelloEND", true)
+                .unwrap()
+        };
+        assert_eq!(project(first.clone()).content, "hello");
+        assert_eq!(project(second.clone()).content, "hello");
+        assert_eq!(project(first.clone()), project(second.clone()));
+        assert_eq!(
+            first, second,
+            "field names determine canonical tie priority independently of JSON object order"
+        );
+        assert_eq!(first, ResponseTemplate::compile(&declaration).unwrap());
+    }
+
+    #[test]
+    fn byte_regex_boundaries_distinguish_delayed_matches_and_unicode_continuations() {
+        let boundary = Boundary::pattern("X終|X", "content.close_pattern").unwrap();
+        assert_eq!(
+            boundary
+                .scan_pending("{}X", &[0xe7], 0, false)
+                .unwrap()
+                .matched,
+            None
+        );
+        assert_eq!(
+            boundary
+                .scan_pending("{}X", &[0xc3], 0, false)
+                .unwrap()
+                .matched,
+            Some(2..3)
+        );
+        assert_eq!(
+            boundary.scan_text("{}Xé", 0, false).unwrap().matched,
+            Some(2..3)
+        );
+        for pattern in ["X|X終", "X.*?"] {
+            let first = Boundary::pattern(pattern, "content.close_pattern").unwrap();
+            assert_eq!(
+                first
+                    .scan_pending("{}X", &[0xe7], 0, false)
+                    .unwrap()
+                    .matched,
+                Some(2..3)
+            );
+        }
+        let greedy_unicode = Boundary::pattern("X.*", "content.close_pattern").unwrap();
+        assert_eq!(
+            greedy_unicode
+                .scan_pending("{}X", &[0xc3], 0, false)
+                .unwrap()
+                .matched,
+            None
+        );
+        let greedy = Boundary::pattern(r"</think>\s*", "reasoning_content.close_pattern").unwrap();
+        assert_eq!(
+            greedy
+                .scan_pending("x</think> ", &[0xc2], 0, false)
+                .unwrap()
+                .matched,
+            None
+        );
+        assert_eq!(
+            greedy
+                .scan_pending("x</think> ", &[0xc3], 0, false)
+                .unwrap()
+                .matched,
+            Some(1..10)
+        );
+    }
+
+    #[test]
+    fn regex_json_capability_refusal_preserves_the_backend_cause() {
+        let spec = ResponseTemplate::compile(&serde_json::json!({"start_anchor":"A","fields":{
+            "content":{"close_pattern":r"\bEND\b"}
+        }}))
+        .unwrap();
+        let error = spec.require_json_boundaries().unwrap_err();
+        let refusal = error
+            .downcast_ref::<JsonBoundaryRefusal>()
+            .expect("typed capability refusal");
+        assert_eq!(refusal.field, "content");
+        assert!(std::error::Error::source(refusal).is_some());
+        let mut parser = ResponseParser::new(spec, "A", PrefixOutput::Include, 1024).unwrap();
+        assert!(parser.feed("éEND").unwrap().content.is_empty());
+        assert_eq!(parser.finish().unwrap().content, "éEND");
+    }
+
+    #[test]
+    fn byte_regex_boundaries_observe_pending_bytes_for_eof_and_look_behind() {
+        let boundary = Boundary::pattern(r"(?-u)\bX\z", "content.close_pattern").unwrap();
+        assert_eq!(boundary.scan_text(" X", 1, false).unwrap().matched, None);
+        assert_eq!(
+            boundary.scan_text(" X", 1, true).unwrap().matched,
+            Some(1..2)
+        );
+        assert_eq!(
+            boundary
+                .scan_pending(" X", &[0xc3], 1, false)
+                .unwrap()
+                .matched,
+            None
+        );
+        assert_eq!(boundary.scan_text("AX", 1, true).unwrap().matched, None);
+        assert_eq!(
+            boundary
+                .scan_pending(" X", &[0xc3], 1, false)
+                .unwrap()
+                .hold_from,
+            2
+        );
+    }
+
     #[test]
     fn response_template_regex_holds_split_delimiters_and_greedy_trailing_whitespace() {
         let boundary =
             Boundary::pattern(r"</think>\s*", "reasoning_content.close_pattern").unwrap();
         assert_eq!(
-            boundary.scan("thought</thi", 0, false).unwrap().hold_from,
+            boundary
+                .scan_text("thought</thi", 0, false)
+                .unwrap()
+                .hold_from,
             7
         );
         assert_eq!(
             boundary
-                .scan("thought</think> \n", 0, false)
+                .scan_text("thought</think> \n", 0, false)
                 .unwrap()
                 .hold_from,
             7
         );
         let complete = "thought</think> \nanswer";
         assert_eq!(
-            boundary.scan(complete, 0, false).unwrap().matched,
+            boundary.scan_text(complete, 0, false).unwrap().matched,
             Some(7..17)
         );
         assert_eq!(
-            boundary.scan("thought</think>", 0, true).unwrap().matched,
+            boundary
+                .scan_text("thought</think>", 0, true)
+                .unwrap()
+                .matched,
             Some(7..15)
         );
-        assert!(boundary.literals.is_some() || boundary.partial.is_some());
+        assert!(matches!(
+            boundary.partial,
+            PartialBoundary::Literal(_) | PartialBoundary::Exact(_)
+        ));
     }
     #[test]
     fn response_template_empty_literals_are_invalid_and_zero_width_close_waits_for_eos() {
         assert!(Boundary::literal(vec![String::new()], "close").is_err());
         let boundary = Boundary::pattern("$", "content.close_pattern").unwrap();
         assert!(boundary.can_match_empty());
-        assert_eq!(boundary.scan("", 0, false).unwrap().matched, None);
-        assert_eq!(boundary.scan("", 0, true).unwrap().matched, Some(0..0));
-        assert_eq!(boundary.scan("x", 0, false).unwrap().matched, None);
-        assert_eq!(boundary.scan("x", 0, true).unwrap().matched, Some(1..1));
+        assert_eq!(boundary.scan_text("", 0, false).unwrap().matched, None);
+        assert_eq!(boundary.scan_text("", 0, true).unwrap().matched, Some(0..0));
+        assert_eq!(boundary.scan_text("x", 0, false).unwrap().matched, None);
+        assert_eq!(
+            boundary.scan_text("x", 0, true).unwrap().matched,
+            Some(1..1)
+        );
     }
 
     #[test]
     fn response_template_regex_uses_global_anchors_unicode_and_explicit_finalization() {
         let anchored = Boundary::pattern(r"^α.+Ω$", "content.close_pattern").unwrap();
-        assert!(anchored.scan("α\nΩ", 0, false).unwrap().matched.is_none());
-        assert_eq!(anchored.scan("α\nΩ", 0, true).unwrap().matched, Some(0..5));
-        assert!(anchored.scan("xα\nΩ", 1, true).unwrap().matched.is_none());
+        assert!(
+            anchored
+                .scan_text("α\nΩ", 0, false)
+                .unwrap()
+                .matched
+                .is_none()
+        );
+        assert_eq!(
+            anchored.scan_text("α\nΩ", 0, true).unwrap().matched,
+            Some(0..5)
+        );
+        assert!(
+            anchored
+                .scan_text("xα\nΩ", 1, true)
+                .unwrap()
+                .matched
+                .is_none()
+        );
         assert!(
             Boundary::pattern(r"$", "close_pattern")
                 .unwrap()
                 .can_match_empty()
         );
-        assert!(anchored.scan("α\nΩ", 1, false).is_err());
+        assert!(anchored.scan_text("α\nΩ", 1, false).is_err());
     }
 }
