@@ -438,6 +438,16 @@ impl<'a> From<Cow<'a, [f32]>> for DenseOperand<'a> {
 }
 
 impl<'a> DenseOperand<'a> {
+    pub(super) fn scratch_bytes(&self) -> Option<usize> {
+        match &self.0 {
+            DenseOperandStorage::Direct(Cow::Owned(values)) => {
+                values.len().checked_mul(std::mem::size_of::<f32>())
+            }
+            DenseOperandStorage::Direct(Cow::Borrowed(_)) | DenseOperandStorage::Funded(_) => {
+                Some(0)
+            }
+        }
+    }
     pub(super) fn borrowed(values: &'a [f32]) -> Self {
         Self(DenseOperandStorage::Direct(Cow::Borrowed(values)))
     }
@@ -792,6 +802,9 @@ impl MatMulPrepack {
                 .map(|values| DenseOperand(DenseOperandStorage::Direct(values)));
         }
         validate_f32_widen_input("MatMul constant operand", view)?;
+        if view.shape.contains(&0) {
+            return Ok(DenseOperand::borrowed(&[]));
+        }
         let key = MatMulCopyKey::<4>::from_view(view);
         if self.retain_caches
             && let Some(hit) = self.weights.dense[index].get(&key)
@@ -1303,10 +1316,7 @@ impl KernelFactory for MatMulFactory {
             (Some(a), Some(b)) => super::flops::matmul_flops(a, b),
             _ => None,
         };
-        Ok(Box::new(MatMulKernel {
-            flops,
-            prepack: MatMulPrepack::new(self.resources.clone()),
-        }))
+        Ok(Box::new(MatMulKernel::new(self.resources.clone(), flops)))
     }
 }
 
@@ -2739,15 +2749,81 @@ impl Kernel for MatMulKernel {
 }
 
 impl MatMulKernel {
-    pub(crate) fn with_cache_retention(retain_caches: bool) -> Self {
+    pub(crate) fn new(resources: CpuMemoryResources, flops: Option<u64>) -> Self {
         Self {
-            prepack: MatMulPrepack::new(
-                CpuMemoryResources::default()
-                    .with_cache_retention(crate::CpuCacheRetention::new(retain_caches)),
-            ),
-            flops: None,
+            prepack: MatMulPrepack::new(resources),
+            flops,
         }
     }
+
+    pub(super) fn prepare_operand<'a>(
+        &self,
+        index: usize,
+        original: &'a TensorView<'_>,
+    ) -> Result<DenseOperand<'a>> {
+        if index >= 2 {
+            return Err(EpError::KernelFailed(format!(
+                "MatMul operand preparation received slot {index}; use A=0 or B=1"
+            )));
+        }
+        self.prepack.dense(index, original)
+    }
+
+    /// Consume prepared row-major f32 storage without erasing its grant identity.
+    /// Source readers remain alive through optional packing and execution.
+    pub(super) fn execute_prepared_operands(
+        &self,
+        a: &DenseOperand<'_>,
+        a_shape: &[usize],
+        b: &DenseOperand<'_>,
+        b_shape: &[usize],
+        output: &mut [f32],
+    ) -> Result<()> {
+        self.execute_prepared_operands_with_backend(
+            a,
+            a_shape,
+            b,
+            b_shape,
+            output,
+            CpuBackend::auto_detect(),
+        )
+    }
+
+    fn execute_prepared_operands_with_backend(
+        &self,
+        a: &DenseOperand<'_>,
+        a_shape: &[usize],
+        b: &DenseOperand<'_>,
+        b_shape: &[usize],
+        output: &mut [f32],
+        backend: CpuBackend,
+    ) -> Result<()> {
+        for (name, values, shape) in [("A", a, a_shape), ("B", b, b_shape)] {
+            let expected = checked_matmul_numel(shape, name)?;
+            std::alloc::Layout::array::<f32>(expected).map_err(|_| EpError::KernelFailed(format!("MatMul prepared {name} shape {shape:?} exceeds addressable f32 storage; reduce the dimensions")))?;
+            if values.len() != expected {
+                return Err(EpError::KernelFailed(format!(
+                    "MatMul prepared {name} has {} elements but shape {shape:?} requires {expected}; preserve the complete prepared operand",
+                    values.len()
+                )));
+            }
+        }
+        let geometry = matmul_geometry_from_shapes(a_shape, b_shape)?;
+        std::alloc::Layout::array::<f32>(geometry.result_len).map_err(|_| EpError::KernelFailed(format!("MatMul prepared output needs {} f32 elements, exceeding addressable storage; reduce the broadcast dimensions",geometry.result_len)))?;
+        #[cfg(feature = "mlas")]
+        let right = b;
+        #[cfg(not(feature = "mlas"))]
+        let right = b.as_ref();
+        matmul_dense_into_with_backend(
+            a.as_ref(),
+            right,
+            &geometry,
+            backend,
+            Some(&self.prepack),
+            output,
+        )
+    }
+
     fn execute_with_backend(
         &self,
         inputs: &[TensorView],
@@ -4042,10 +4118,19 @@ pub(crate) struct MatMulGeometry {
 /// Derive [`MatMulGeometry`] from the two operand views (numpy matmul
 /// semantics: 1-D promotion, inner-dim check, broadcast leading dims).
 pub(crate) fn matmul_geometry(a: &TensorView, b: &TensorView) -> Result<MatMulGeometry> {
+    matmul_geometry_from_shapes(a.shape, b.shape)
+}
+
+fn checked_matmul_numel(shape: &[usize], operand: &str) -> Result<usize> {
+    if shape.contains(&0) {
+        return Ok(0);
+    }
+    shape.iter().try_fold(1usize,|elements,&extent|elements.checked_mul(extent)).ok_or_else(|| EpError::KernelFailed(format!("MatMul {operand} shape {shape:?} element count overflowed usize; reduce the dimensions")))
+}
+
+fn matmul_geometry_from_shapes(a_raw: &[usize], b_raw: &[usize]) -> Result<MatMulGeometry> {
     // Promote 1-D operands per numpy matmul: a [K] -> [1,K] (drop row after),
     // b [K] -> [K,1] (drop col after).
-    let a_raw = a.shape;
-    let b_raw = b.shape;
     let a_1d = a_raw.len() == 1;
     let b_1d = b_raw.len() == 1;
     let a_shape: Vec<usize> = if a_1d {
@@ -4079,13 +4164,33 @@ pub(crate) fn matmul_geometry(a: &TensorView, b: &TensorView) -> Result<MatMulGe
     let a_batch = a_shape[..a_shape.len() - 2].to_vec();
     let b_batch = b_shape[..b_shape.len() - 2].to_vec();
     let batch_shape = broadcast_shapes(&a_batch, &b_batch)?;
-    let batch_count = numel(&batch_shape);
-
+    let batch_count = checked_matmul_numel(&batch_shape, "batch")?;
+    // Empty results never use matrix offsets or batch strides. Do not reject
+    // or overflow irrelevant large extents before the no-op can return.
+    if batch_count == 0 || m == 0 || n == 0 {
+        return Ok(MatMulGeometry {
+            m,
+            k,
+            n,
+            a_mat: 0,
+            b_mat: 0,
+            c_mat: 0,
+            a_batch_strides: vec![0; a_batch.len()],
+            b_batch_strides: vec![0; b_batch.len()],
+            a_batch,
+            b_batch,
+            batch_shape,
+            b_promoted_rank: b_shape.len(),
+            result_len: 0,
+        });
+    }
+    i64::try_from(batch_count).map_err(|_| EpError::KernelFailed(format!("MatMul batch shape {batch_shape:?} exceeds signed-stride addressability; reduce the batch dimensions")))?;
+    let a_mat = checked_matmul_numel(&[m, k], "A matrix")?;
+    let b_mat = checked_matmul_numel(&[k, n], "B matrix")?;
+    let c_mat = checked_matmul_numel(&[m, n], "output matrix")?;
+    let result_len = batch_count.checked_mul(c_mat).ok_or_else(|| EpError::KernelFailed(format!("MatMul broadcast result {batch_shape:?} x [{m}, {n}] element count overflowed usize; reduce the dimensions")))?;
     let a_batch_strides = compute_contiguous_strides(&a_batch);
     let b_batch_strides = compute_contiguous_strides(&b_batch);
-    let a_mat = m * k;
-    let b_mat = k * n;
-    let c_mat = m * n;
 
     Ok(MatMulGeometry {
         m,
@@ -4100,7 +4205,7 @@ pub(crate) fn matmul_geometry(a: &TensorView, b: &TensorView) -> Result<MatMulGe
         b_batch_strides,
         batch_shape,
         b_promoted_rank: b_shape.len(),
-        result_len: batch_count * c_mat,
+        result_len,
     })
 }
 
@@ -4121,7 +4226,7 @@ fn matmul_dense_into_with_backend(
     let b_dense = b_operand.as_ref();
     if out.len() != geom.result_len {
         return Err(EpError::KernelFailed(format!(
-            "MatMul: output buffer length {} does not match result length {}",
+            "MatMul: output buffer length {} does not match result length {}; supply the complete result buffer",
             out.len(),
             geom.result_len
         )));
@@ -4132,6 +4237,11 @@ fn matmul_dense_into_with_backend(
     // otherwise runs once even for a zero-sized batch (a `loop { … } while`) and
     // would index into empty operand slices.
     if out.is_empty() {
+        return Ok(());
+    }
+
+    if geom.k == 0 {
+        out.fill(0.0);
         return Ok(());
     }
 
@@ -4257,7 +4367,7 @@ mod tests {
         use onnx_runtime_memory_api::Tier;
         use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
         let panel_bytes = sgemm_pack_plan(3, 2).unwrap().owned_heap_bytes() as u64;
-        let books = LedgerGovernor::new(LeaseLedger::new(0, 2 * panel_bytes + 72, 0));
+        let books = LedgerGovernor::new(LeaseLedger::new(0, 3 * panel_bytes + 72, 0));
         let resources = CpuMemoryResources::new(
             crate::DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap(),
             Default::default(),
@@ -4323,7 +4433,29 @@ mod tests {
         assert_eq!(prepack.weights.packed_b.activity().1, 2);
         assert_eq!(books.used(Tier::Host), 24 + 2 * panel_bytes);
         drop(warm);
-        drop(prepack);
+        let kernel = MatMulKernel {
+            prepack,
+            flops: None,
+        };
+        let mut integrated = [73.; 4];
+        kernel
+            .execute_prepared_operands_with_backend(
+                &DenseOperand::borrowed(&[0.25; 6]),
+                &[2, 3],
+                &second,
+                &[3, 2],
+                &mut integrated,
+                CpuBackend::Mlas,
+            )
+            .unwrap();
+        assert_eq!(integrated, [1.125; 4]);
+        assert_eq!(
+            kernel.prepack.weights.packed_b.activity().1,
+            2,
+            "typed compute must preserve the funded identity and reuse its existing panel"
+        );
+        assert_eq!(books.used(Tier::Host), 24 + 2 * panel_bytes);
+        drop(kernel);
         assert_eq!(books.used(Tier::Host), 24 + 2 * panel_bytes);
         drop(second);
         assert_eq!(
@@ -5552,6 +5684,236 @@ mod tests {
     }
 
     #[test]
+    fn prepared_operands_keep_funded_readers_and_pack_identity_through_concurrent_compute() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let backends = vec![CpuBackend::Generic, CpuBackend::auto_detect()];
+        #[cfg(feature = "mlas")]
+        let backends = {
+            let mut values = backends;
+            values.push(CpuBackend::Mlas);
+            values
+        };
+        for backend in backends {
+            const CAP: u64 = 1 << 20;
+            let books = RecordingGovernor::new_host(CAP);
+            let resources =
+                CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                    .unwrap();
+            let mut kernel = MatMulKernel::new(resources, None);
+            kernel.set_constant_inputs(&[false, true]);
+            let a_values = [1f32; 85];
+            let a = DenseOperand::borrowed(&a_values);
+            let scratch = DenseOperand(DenseOperandStorage::Direct(Cow::Owned(vec![1.; 153])));
+            assert_eq!(scratch.scratch_bytes(), Some(612));
+            let before = (books.claims(), books.releases());
+            let mut output = vec![73.; 45];
+            kernel
+                .execute_prepared_operands_with_backend(
+                    &a,
+                    &[5, 17],
+                    &scratch,
+                    &[17, 9],
+                    &mut output,
+                    backend,
+                )
+                .unwrap();
+            assert_eq!(output, [17.; 45]);
+            assert_eq!(
+                (books.claims(), books.releases()),
+                before,
+                "unfunded scratch has no immutable packing identity"
+            );
+            let b1 = Owned::f32(&[9, 17], &[1.; 153]).with_view(&[17, 9], &[1, 17]);
+            let view1 = b1.view();
+            let b2 = Owned::f32(&[9, 17], &[2.; 153]).with_view(&[17, 9], &[1, 17]);
+            let view2 = b2.view();
+            let first = kernel.prepare_operand(1, &view1).unwrap();
+            let second = kernel.prepare_operand(1, &view2).unwrap();
+            assert_eq!(first.scratch_bytes(), Some(0));
+            assert_eq!(second.scratch_bytes(), Some(0));
+            for (b, expected) in [(&first, 17.), (&second, 34.)] {
+                kernel
+                    .execute_prepared_operands_with_backend(
+                        &a,
+                        &[5, 17],
+                        b,
+                        &[17, 9],
+                        &mut output,
+                        backend,
+                    )
+                    .unwrap();
+                assert_eq!(output, [expected; 45]);
+            }
+            #[cfg(feature = "mlas")]
+            if backend == CpuBackend::Mlas {
+                assert_eq!(
+                    kernel.prepack.weights.packed_b.stats().0,
+                    2,
+                    "forced MLAS must retain two distinct funded identities"
+                );
+            }
+            let held = books.used(Tier::Host);
+            let calls = (books.claims(), books.releases());
+            let entered = std::sync::Barrier::new(3);
+            std::thread::scope(|scope| {
+                for (b, expected) in [(&first, 17.), (&second, 34.)] {
+                    let (kernel, a, entered) = (&kernel, &a, &entered);
+                    scope.spawn(move || {
+                        let mut output = [73.; 45];
+                        entered.wait();
+                        for _ in 0..64 {
+                            kernel
+                                .execute_prepared_operands_with_backend(
+                                    a,
+                                    &[5, 17],
+                                    b,
+                                    &[17, 9],
+                                    &mut output,
+                                    backend,
+                                )
+                                .unwrap();
+                            assert_eq!(output, [expected; 45]);
+                        }
+                    });
+                }
+                entered.wait();
+            });
+            assert_eq!(books.used(Tier::Host), held);
+            assert_eq!((books.claims(), books.releases()), calls);
+            assert!(
+                books
+                    .reserve(Tier::Host, CAP, MemoryRole::KvCache, HolderId::new(7))
+                    .is_err(),
+                "active prepared readers cannot be revoked by pressure"
+            );
+            assert_eq!(
+                books.used(Tier::Host),
+                1224,
+                "both active converted payloads keep their grants after cache eviction"
+            );
+            kernel
+                .execute_prepared_operands_with_backend(
+                    &a,
+                    &[5, 17],
+                    &first,
+                    &[17, 9],
+                    &mut output,
+                    backend,
+                )
+                .unwrap();
+            assert_eq!(output, [17.; 45]);
+            drop(first);
+            drop(second);
+            let pressure = books
+                .reserve(Tier::Host, CAP, MemoryRole::KvCache, HolderId::new(7))
+                .unwrap();
+            drop(pressure);
+            assert_eq!(books.used(Tier::Host), 0);
+            let rebuilt = kernel.prepare_operand(1, &view2).unwrap();
+            kernel
+                .execute_prepared_operands_with_backend(
+                    &a,
+                    &[5, 17],
+                    &rebuilt,
+                    &[17, 9],
+                    &mut output,
+                    backend,
+                )
+                .unwrap();
+            assert_eq!(output, [34.; 45]);
+            drop(rebuilt);
+            drop(kernel);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+    }
+
+    #[test]
+    fn prepared_operands_validate_spans_and_empty_products_before_compute() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_governor::HolderId;
+        let books = RecordingGovernor::new_host(0);
+        let resources =
+            CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                .unwrap();
+        let mut kernel = MatMulKernel::new(resources, None);
+        kernel.set_constant_inputs(&[false, true]);
+        let empty = DenseOperand::borrowed(&[]);
+        let b = DenseOperand::borrowed(&[1.; 153]);
+        let calls = (books.claims(), books.releases());
+        kernel
+            .execute_prepared_operands(&empty, &[0, 5, 17], &b, &[1, 17, 9], &mut [])
+            .unwrap();
+        kernel
+            .execute_prepared_operands(
+                &empty,
+                &[0, usize::MAX, usize::MAX],
+                &empty,
+                &[1, usize::MAX, 0],
+                &mut [],
+            )
+            .unwrap();
+        let mut output = [73.; 10];
+        kernel
+            .execute_prepared_operands(&empty, &[5, 0], &empty, &[0, 2], &mut output)
+            .unwrap();
+        assert_eq!(output, [0.; 10]);
+        assert_eq!(
+            (books.claims(), books.releases()),
+            calls,
+            "empty and zero-K compute must not pack or issue zero-byte grants"
+        );
+        let a = DenseOperand::borrowed(&[1.; 3]);
+        let right = DenseOperand::borrowed(&[1.; 6]);
+        let mut output = [73.; 2];
+        for (a_shape, b_shape) in [
+            (&[2, 3][..], &[3, 2][..]),
+            (&[usize::MAX, 2][..], &[2, 1][..]),
+            (&[usize::MAX / 4, 1][..], &[1, 2][..]),
+        ] {
+            let error = kernel
+                .execute_prepared_operands(&a, a_shape, &right, b_shape, &mut output)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("MatMul")
+                    && (error.contains("dimensions")
+                        || error.contains("complete prepared operand")),
+                "{error}"
+            );
+            assert_eq!(output, [73.; 2]);
+        }
+        let error = kernel
+            .execute_prepared_operands(&a, &[1, 3], &right, &[3, 2], &mut [73.])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("output") && error.contains("complete result buffer"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn matmul_geometry_checks_cross_broadcast_and_matrix_overflow() {
+        for (a, b) in [
+            (vec![usize::MAX, 2], vec![2, 1]),
+            (vec![1, 2], vec![2, usize::MAX]),
+            (vec![usize::MAX / 2, 1], vec![1, 3]),
+            (vec![usize::MAX / 2, 1, 1, 1], vec![1, usize::MAX / 2, 1, 1]),
+        ] {
+            let error = match matmul_geometry_from_shapes(&a, &b) {
+                Ok(_) => panic!("overflowed geometry must be rejected: {a:?} {b:?}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("overflow") && error.contains("reduce"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn matmul_shared_weights_reject_foreign_sources_and_constant_flags() {
         use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor};
         let books = LedgerGovernor::new(LeaseLedger::new(0, 1024, 0));
@@ -6433,7 +6795,11 @@ mod tests {
             let a = Owned::f32(&[m, k], &a_data);
             let b = Owned::f16(&[k, n], &b_data);
             let mut out = Owned::zeros_f32(&[m, n]);
-            let mut kernel = MatMulKernel::with_cache_retention(enabled);
+            let mut kernel = MatMulKernel::new(
+                CpuMemoryResources::default()
+                    .with_cache_retention(crate::CpuCacheRetention::new(enabled)),
+                None,
+            );
             kernel.set_constant_inputs(&[false, true]);
             kernel
                 .execute(&[a.view(), b.view()], &mut [out.view_mut()])
@@ -8293,7 +8659,11 @@ mod tests {
             _ => unreachable!("this fixture exercises the two MLAS packing sources"),
         };
         for admitted in [false, true] {
-            let mut kernel = MatMulKernel::with_cache_retention(admitted);
+            let mut kernel = MatMulKernel::new(
+                CpuMemoryResources::default()
+                    .with_cache_retention(crate::CpuCacheRetention::new(admitted)),
+                None,
+            );
             kernel.set_constant_inputs(&[false, true]);
             for step in 0..3 {
                 let values: Vec<f32> = (0..m * k).map(|i| ((i + step) % 7) as f32 / 16.).collect();

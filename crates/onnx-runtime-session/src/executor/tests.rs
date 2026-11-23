@@ -13342,6 +13342,152 @@ fn executor_pin_fixed_capacity_kv_admits_gqa() {
 // resolution logic directly on synthetic graphs whose `::Attention` input has a
 // runtime-dependent context axis (the reported `v_model.Unsqueeze_16` shape).
 
+#[test]
+fn einsum_lowered_weight_owner_is_shared_by_shapes_and_isolated_by_sessions() {
+    use onnx_runtime_memory_api::{DeviceKey, Tier};
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
+    let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+        DeviceKey::HOST,
+        0,
+        1 << 20,
+        0,
+    )));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13))
+            .unwrap(),
+        Default::default(),
+    )
+    .unwrap()
+    .with_workspace_pool(pool.clone())
+    .unwrap();
+    let provider: Arc<dyn ExecutionProvider> =
+        Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let rows = graph.create_symbol(None);
+    let a = graph.create_named_value(
+        "a",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(3)],
+    );
+    let b = graph.create_named_value("b", DataType::Float32, static_shape([2, 3]));
+    graph.set_initializer(
+        b,
+        WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+            DataType::Float32,
+            vec![2, 3],
+            [1f32, 2., 3., 4., 5., 6.]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        )),
+    );
+    let y = graph.create_named_value(
+        "y",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(2)],
+    );
+    graph.add_input(a);
+    graph.add_output(y);
+    let mut node = Node::new(NodeId(0), "Einsum", vec![Some(a), Some(b)], vec![y]);
+    node.attributes
+        .insert("equation".into(), Attribute::String(b"ik,jk->ij".to_vec()));
+    graph.insert_node(node);
+    let mut first = Executor::build(
+        graph.clone(),
+        Arc::new(WeightStore::new()),
+        provider.clone(),
+        None,
+    )
+    .unwrap();
+    assert!(
+        first
+            .graph
+            .nodes
+            .values()
+            .any(|node| node.op_type == "Einsum"),
+        "regression must exercise the native Einsum lowering"
+    );
+    let mut weight_bytes = 0;
+    for rows in [2, 4, 6, 4, 2] {
+        let input = Tensor::from_raw(
+            DataType::Float32,
+            vec![rows, 3],
+            &vec![1f32.to_le_bytes(); rows * 3].concat(),
+        )
+        .unwrap();
+        let output = first.run(&[("a", &input)]).unwrap();
+        assert_eq!(
+            output[0].try_as_slice_f32().unwrap(),
+            [6., 15.].repeat(rows)
+        );
+        let actual = books.used(Tier::Host) - manager.process_used(Tier::Host);
+        if weight_bytes == 0 {
+            weight_bytes = actual;
+            assert!(
+                weight_bytes >= 24,
+                "real lowering must retain a funded strided-weight materialization"
+            );
+        }
+        assert_eq!(
+            actual, weight_bytes,
+            "activation shape changes must share one node's derived weights"
+        );
+    }
+    let run = |executor: &mut Executor, rows| {
+        let input = Tensor::from_raw(
+            DataType::Float32,
+            vec![rows, 3],
+            &vec![1f32.to_le_bytes(); rows * 3].concat(),
+        )
+        .unwrap();
+        let output = executor.run(&[("a", &input)]).unwrap();
+        assert_eq!(
+            output[0].try_as_slice_f32().unwrap(),
+            [6., 15.].repeat(rows)
+        );
+    };
+    // Decode may legitimately prepare another representation (e.g. a GEMV
+    // transpose). It must be node-owned too, rather than repeated per shape.
+    run(&mut first, 1);
+    let all_weight_bytes = books.used(Tier::Host) - manager.process_used(Tier::Host);
+    assert!(all_weight_bytes >= weight_bytes);
+    for rows in [1, 2, 4, 6, 1, 2] {
+        run(&mut first, rows);
+        assert_eq!(
+            books.used(Tier::Host) - manager.process_used(Tier::Host),
+            all_weight_bytes
+        );
+    }
+    assert!(
+        first.cache.stats().entries >= 4,
+        "test must compile decode and multiple prefill variants"
+    );
+    let mut second = Executor::build(graph, Arc::new(WeightStore::new()), provider, None).unwrap();
+    for rows in [2, 1] {
+        run(&mut second, rows);
+    }
+    assert_eq!(
+        books.used(Tier::Host) - manager.process_used(Tier::Host),
+        2 * all_weight_bytes,
+        "independent sessions must own independent representations"
+    );
+    drop(second);
+    assert_eq!(
+        books.used(Tier::Host) - manager.process_used(Tier::Host),
+        all_weight_bytes
+    );
+    drop(first);
+    assert_eq!(books.used(Tier::Host), manager.process_used(Tier::Host));
+    pool.trim_idle(u64::MAX).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
 #[cfg(test)]
 mod einsum_workspace_tests {
     use super::*;

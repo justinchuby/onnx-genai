@@ -25,7 +25,9 @@ use onnx_runtime_ir::{
 use rayon::prelude::*;
 
 use super::{check_arity, matmul::MatMulKernel, to_dense_bytes, write_dense_bytes};
+#[cfg(test)]
 use crate::CpuCacheRetention;
+use crate::CpuMemoryResources;
 use crate::dtype::{
     ComputeDomain, NumericElem, to_dense_f32_widen, write_dense, write_dense_f32_narrow,
 };
@@ -479,14 +481,14 @@ pub struct EinsumKernel {
 
 /// Factory for [`EinsumKernel`].
 pub struct EinsumFactory {
-    cache_retention: CpuCacheRetention,
+    resources: CpuMemoryResources,
     mode: Option<EinsumExecutionMode>,
 }
 
 impl EinsumFactory {
-    pub fn new(cache_retention: CpuCacheRetention) -> Self {
+    pub fn new(resources: CpuMemoryResources) -> Self {
         Self {
-            cache_retention,
+            resources,
             mode: None,
         }
     }
@@ -496,12 +498,9 @@ impl EinsumFactory {
     /// This avoids process-global environment mutation in conformance and
     /// benchmark adapters while keeping the ordinary provider configuration
     /// compatible with [`EINSUM_MODE_ENV`].
-    pub fn with_execution_mode(
-        cache_retention: CpuCacheRetention,
-        mode: EinsumExecutionMode,
-    ) -> Self {
+    pub fn with_execution_mode(resources: CpuMemoryResources, mode: EinsumExecutionMode) -> Self {
         Self {
-            cache_retention,
+            resources,
             mode: Some(mode),
         }
     }
@@ -509,7 +508,7 @@ impl EinsumFactory {
 
 impl Default for EinsumFactory {
     fn default() -> Self {
-        Self::new(CpuCacheRetention::default())
+        Self::new(CpuMemoryResources::default())
     }
 }
 
@@ -533,7 +532,7 @@ impl KernelFactory for EinsumFactory {
         };
         Ok(Box::new(EinsumKernel::new(
             plan,
-            MatMulKernel::with_cache_retention(self.cache_retention.is_admitted()),
+            MatMulKernel::new(self.resources.clone(), None),
             mode,
             &input_shape_refs,
             flops,
@@ -621,6 +620,22 @@ pub fn unsupported_reason_for_opset(
 impl Kernel for EinsumKernel {
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
         self.matmul.set_constant_inputs(constant_inputs);
+    }
+
+    fn shareable_constant_state(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.matmul.shareable_constant_state()
+    }
+
+    fn adopt_shareable_constant_state(
+        &mut self,
+        state: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<bool> {
+        self.matmul
+            .adopt_shareable_constant_state(state)
+            .map_err(|source| EpError::Backend {
+                operation: "Einsum lowered MatMul constant-state adoption",
+                source: Box::new(source),
+            })
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -1640,6 +1655,9 @@ impl EinsumKernel {
         workspace: Option<WorkspaceView>,
         gemm: &EinsumContractionPlan,
     ) -> Result<EinsumRoute> {
+        if self.output_len == 0 {
+            return Ok(EinsumRoute::MatMulDirect);
+        }
         let geometry = self
             .plan
             .resolve_concrete_gemm_geometry(
@@ -1691,7 +1709,8 @@ impl EinsumKernel {
                 &left.strides,
                 inputs[0].device,
             )
-            .with_byte_offset(inputs[0].byte_offset);
+            .with_byte_offset(inputs[0].byte_offset)
+            .with_backing(inputs[0].backing);
             let right_view = TensorView::new(
                 inputs[1].data,
                 inputs[1].dtype,
@@ -1699,7 +1718,8 @@ impl EinsumKernel {
                 &right.strides,
                 inputs[1].device,
             )
-            .with_byte_offset(inputs[1].byte_offset);
+            .with_byte_offset(inputs[1].byte_offset)
+            .with_backing(inputs[1].backing);
             let output_view = TensorMut::new(
                 outputs[0].data,
                 outputs[0].dtype,
@@ -1720,7 +1740,8 @@ impl EinsumKernel {
             &left_ordered.strides,
             inputs[0].device,
         )
-        .with_byte_offset(inputs[0].byte_offset);
+        .with_byte_offset(inputs[0].byte_offset)
+        .with_backing(inputs[0].backing);
         let right_view = TensorView::new(
             inputs[1].data,
             inputs[1].dtype,
@@ -1728,15 +1749,13 @@ impl EinsumKernel {
             &right_ordered.strides,
             inputs[1].device,
         )
-        .with_byte_offset(inputs[1].byte_offset);
-        let left_dense = to_dense_f32_widen("Einsum", &left_view)?;
-        let right_dense = to_dense_f32_widen("Einsum", &right_view)?;
+        .with_byte_offset(inputs[1].byte_offset)
+        .with_backing(inputs[1].backing);
+        let left_dense = self.matmul.prepare_operand(0, &left_view)?;
+        let right_dense = self.matmul.prepare_operand(1, &right_view)?;
         let materialized_input_bytes = [&left_dense, &right_dense]
             .into_iter()
-            .map(|data| match data {
-                Cow::Borrowed(_) => Some(0),
-                Cow::Owned(data) => data.len().checked_mul(std::mem::size_of::<f32>()),
-            })
+            .map(|data| data.scratch_bytes())
             .try_fold(0usize, |total, bytes| {
                 bytes.and_then(|bytes| total.checked_add(bytes))
             })
@@ -1752,25 +1771,8 @@ impl EinsumKernel {
             geometry.k(),
             geometry.n(),
         );
-        let left_strides = compute_contiguous_strides(&left_shape);
-        let right_strides = compute_contiguous_strides(&right_shape);
-        let left_f32 = TensorView::new(
-            onnx_runtime_ep_api::DevicePtr(left_dense.as_ptr().cast()),
-            DataType::Float32,
-            &left_shape,
-            &left_strides,
-            onnx_runtime_ir::DeviceId::cpu(),
-        );
-        let right_f32 = TensorView::new(
-            onnx_runtime_ep_api::DevicePtr(right_dense.as_ptr().cast()),
-            DataType::Float32,
-            &right_shape,
-            &right_strides,
-            onnx_runtime_ir::DeviceId::cpu(),
-        );
         let canonical_shape =
             flattened_gemm_shape(geometry.batch_shape(), geometry.m(), geometry.n());
-        let canonical_strides = compute_contiguous_strides(&canonical_shape);
         let canonical_len = checked_numel("GEMM output", &canonical_shape)?;
         let workspace_bytes = canonical_len
             .checked_mul(std::mem::size_of::<f32>())
@@ -1783,15 +1785,13 @@ impl EinsumKernel {
         // f32 references, so its destination must be initialized before entry.
         unsafe {
             with_zeroed_accumulator::<f32, _>(workspace, canonical_len, |f32_output| {
-                let canonical_output = TensorMut::new(
-                    onnx_runtime_ep_api::DevicePtrMut(f32_output.as_mut_ptr().cast()),
-                    DataType::Float32,
-                    &canonical_shape,
-                    &canonical_strides,
-                    onnx_runtime_ir::DeviceId::cpu(),
-                );
-                self.matmul
-                    .execute(&[left_f32, right_f32], &mut [canonical_output])?;
+                self.matmul.execute_prepared_operands(
+                    &left_dense,
+                    &left_shape,
+                    &right_dense,
+                    &right_shape,
+                    f32_output,
+                )?;
                 write_canonical_output(&self.plan, gemm, f32_output, &mut outputs[0])
             })
         }?;
@@ -3026,7 +3026,10 @@ mod tests {
         Box::new(
             EinsumKernel::new(
                 plan,
-                MatMulKernel::with_cache_retention(cache_retention.is_admitted()),
+                MatMulKernel::new(
+                    CpuMemoryResources::default().with_cache_retention(cache_retention),
+                    None,
+                ),
                 mode,
                 &input_shape_refs,
                 None,
@@ -3051,7 +3054,7 @@ mod tests {
             "equation".into(),
             Attribute::String(equation.as_bytes().to_vec()),
         );
-        EinsumFactory::with_execution_mode(CpuCacheRetention::default(), mode)
+        EinsumFactory::with_execution_mode(CpuMemoryResources::default(), mode)
             .create(&node, shapes)
             .unwrap()
     }
@@ -3291,6 +3294,233 @@ mod tests {
         drop(providers);
         pool.trim_idle(16).unwrap();
         assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn lowered_matmul_shares_funded_weights_across_variants_and_reclaims_under_pressure() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_api::{MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        const CAPACITY: u64 = 1 << 20;
+        let books = RecordingGovernor::new_host(CAPACITY);
+        let resources =
+            CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                .unwrap();
+        let provider = crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+        let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
+        node.attributes
+            .insert("equation".into(), Attribute::String(b"ik,jk->ij".to_vec()));
+        let mut first = provider
+            .get_kernel(&node, &[vec![2, 3], vec![2, 3]], 12)
+            .unwrap();
+        first.set_constant_inputs(&[false, true]);
+        let b = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let run = |kernel: &dyn Kernel, rows| {
+            let a = Owned::f32(&[rows, 3], &vec![1.; rows * 3]);
+            let mut output = Owned::zeros_f32(&[rows, 2]);
+            kernel
+                .execute_prepared(&[a.view(), b.view()], &mut [output.view_mut()])
+                .unwrap();
+            assert_eq!(output.to_f32(), [6., 15.].repeat(rows));
+        };
+        run(first.as_ref(), 2);
+        let bytes = books.used(Tier::Host);
+        assert!(
+            bytes >= 24,
+            "the lowered strided constant must own a real Host grant"
+        );
+        let mut peer = provider
+            .get_kernel(&node, &[vec![4, 3], vec![2, 3]], 12)
+            .unwrap();
+        peer.set_constant_inputs(&[false, true]);
+        assert!(
+            peer.adopt_shareable_constant_state(first.shareable_constant_state().unwrap())
+                .unwrap()
+        );
+        let calls = (books.claims(), books.releases());
+        for iteration in 0..4096 {
+            if iteration % 2 == 0 {
+                run(first.as_ref(), 2);
+            } else {
+                run(peer.as_ref(), 4);
+            }
+        }
+        assert_eq!(
+            books.used(Tier::Host),
+            bytes,
+            "shape variants must share the same payload"
+        );
+        assert_eq!(
+            (books.claims(), books.releases()),
+            calls,
+            "warm lowered weights must not call the issuer"
+        );
+        let pressure = books
+            .reserve(Tier::Host, CAPACITY, MemoryRole::KvCache, HolderId::new(7))
+            .unwrap();
+        assert_eq!(
+            books.used(Tier::Host),
+            CAPACITY,
+            "idle derived weights must yield to real Host pressure"
+        );
+        drop(pressure);
+        assert_eq!(books.used(Tier::Host), 0);
+        run(peer.as_ref(), 4);
+        assert_eq!(books.used(Tier::Host), bytes);
+        assert!(
+            books.claims() > calls.0,
+            "execution must re-admit reclaimed backing"
+        );
+        drop(first);
+        assert_eq!(
+            books.used(Tier::Host),
+            bytes,
+            "a surviving variant still owns the node preparation"
+        );
+        drop(peer);
+        drop(provider);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn lowered_matmul_rejects_actual_quota_refusal_and_foreign_constant_state() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let books = RecordingGovernor::new_host(0);
+        let resources =
+            CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                .unwrap();
+        let provider =
+            crate::CpuExecutionProvider::initialized_with_resources(resources.clone()).unwrap();
+        let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
+        node.attributes
+            .insert("equation".into(), Attribute::String(b"ik,jk->ij".to_vec()));
+        let mut kernel = provider
+            .get_kernel(&node, &[vec![2, 3], vec![2, 3]], 12)
+            .unwrap();
+        kernel.set_constant_inputs(&[false, true]);
+        let a = Owned::f32(&[2, 3], &[1.; 6]);
+        let b = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let mut output = Owned::f32(&[2, 2], &[73.; 4]);
+        let error = kernel
+            .execute_prepared(&[a.view(), b.view()], &mut [output.view_mut()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("MatMul constant B widening admission") && error.contains("host"),
+            "{error}"
+        );
+        assert_eq!(output.to_f32(), [73.; 4]);
+        assert!(books.claims() > 0);
+        assert_eq!(books.used(Tier::Host), 0);
+        let state = kernel.shareable_constant_state().unwrap();
+        let mut wrong_flags = EinsumFactory::new(resources)
+            .create(&node, &[vec![2, 3], vec![2, 3]])
+            .unwrap();
+        wrong_flags.set_constant_inputs(&[true, false]);
+        assert!(
+            wrong_flags
+                .adopt_shareable_constant_state(state.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("constant flags")
+        );
+        let foreign =
+            CpuMemoryResources::new(books.weight_memory(HolderId::new(14)), Default::default())
+                .unwrap();
+        let mut foreign = EinsumFactory::new(foreign)
+            .create(&node, &[vec![2, 3], vec![2, 3]])
+            .unwrap();
+        foreign.set_constant_inputs(&[false, true]);
+        let error = foreign
+            .adopt_shareable_constant_state(state)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Einsum lowered MatMul")
+                && error.contains("different derived-weight grant source"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn lowered_matmul_reuses_funded_original_view_materializations() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let books = RecordingGovernor::new_host(1 << 20);
+        let resources =
+            CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                .unwrap();
+        let provider = crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+        let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
+        node.attributes.insert(
+            "equation".into(),
+            Attribute::String(b"abxy,cdxy->dcab".to_vec()),
+        );
+        let shapes = [vec![2, 2, 3, 3], vec![2, 2, 3, 3]];
+        let mut kernel = provider.get_kernel(&node, &shapes, 12).unwrap();
+        kernel.set_constant_inputs(&[false, true]);
+        let a = Owned::f32(&shapes[0], &[1.; 36]);
+        let b = Owned::f32(&shapes[1], &[1.; 36]);
+        let mut output = Owned::zeros_f32(&[2, 2, 2, 2]);
+        kernel
+            .execute_prepared(&[a.view(), b.view()], &mut [output.view_mut()])
+            .unwrap();
+        let held = books.used(Tier::Host);
+        assert!(
+            held >= 144,
+            "the original constant conversion must carry a real grant"
+        );
+        let calls = (books.claims(), books.releases());
+        for _ in 0..4096 {
+            kernel
+                .execute_prepared(&[a.view(), b.view()], &mut [output.view_mut()])
+                .unwrap();
+        }
+        assert_eq!(output.to_f32(), [9.; 16]);
+        assert_eq!(
+            route(kernel.as_ref()),
+            7,
+            "this must execute the materialized route"
+        );
+        assert_eq!(
+            (books.claims(), books.releases()),
+            calls,
+            "warm preparation must reuse its original-view owner without grant churn"
+        );
+        assert_eq!(books.used(Tier::Host), held);
+        drop(kernel);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn empty_lowered_matmul_never_prepares_weights_or_issues_quota_calls() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_governor::HolderId;
+        let books = RecordingGovernor::new_host(0);
+        let resources =
+            CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
+                .unwrap();
+        let provider = crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+        let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
+        node.attributes
+            .insert("equation".into(), Attribute::String(b"ik,jk->ij".to_vec()));
+        for dtype in [DataType::Float16, DataType::Float32] {
+            let mut kernel = provider
+                .get_kernel(&node, &[vec![0, 3], vec![2, 3]], 12)
+                .unwrap();
+            kernel.set_constant_inputs(&[false, true]);
+            let a = Owned::zeros(dtype, &[0, 3]);
+            let b = Owned::zeros(dtype, &[2, 3]);
+            let mut output = Owned::zeros(dtype, &[0, 2]);
+            let calls = (books.claims(), books.releases());
+            kernel
+                .execute(&[a.view(), b.view()], &mut [output.view_mut()])
+                .unwrap();
+            assert_eq!((books.claims(), books.releases()), calls);
+        }
     }
 
     #[test]
@@ -3939,7 +4169,7 @@ mod tests {
         let dtypes = vec![DataType::Float32; arity];
         assert!(unsupported_reason_for_opset(&large, 12, &shapes, &dtypes).is_none());
         let kernel = EinsumFactory::with_execution_mode(
-            CpuCacheRetention::default(),
+            CpuMemoryResources::default(),
             EinsumExecutionMode::Optimized,
         )
         .create(&large, &vec![vec![1]; arity])

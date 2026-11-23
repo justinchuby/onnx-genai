@@ -1598,9 +1598,9 @@ the enclosing 8-byte peak rather than reserving a second lane.
 
 This removes the retained accumulator pool, not every Einsum allocation.
 Contraction-tree/scalar-GEMM intermediates, operand materializations and layout /
-coordinate vectors still use their existing allocations. Their migration and
-resource propagation into lowered child MatMul remain separate work; no claim
-is made that all Einsum transient bytes are already governed.
+coordinate vectors still use their existing allocations. Those transient allocations remain separate work. The following resource
+propagation section addresses the lowered child MatMul source; no claim is
+made that all Einsum transient bytes are already governed.
 
 Validation: 1,986 native CPU and 284 native session tests, 2,027 optional-MLAS CPU
 and 286 optional-MLAS session tests pass. Each configuration also passes all
@@ -1644,3 +1644,122 @@ a material larger-case regression here. Tiny session run still costs roughly
 sampling details, drivers, source/binary hashes and summaries remain under
 `/tmp/nxrt-einsum-*`. Consumed probe binaries, one-shot generators and baseline
 worktree are removed after provenance is recorded.
+
+
+### Lowered MatMul keeps prepared ownership and the parent resource source
+
+EinsumFactory now accepts CpuMemoryResources instead of only a cache-retention
+boolean. Its child MatMul clones that source and policy, using the same
+constructor as ordinary MatMul. It no longer creates a default, unattributed
+domain inside a governed provider. The old boolean-only constructor is removed
+and all callers are updated. Constant-state sharing/adoption delegates to the
+existing MatMul node owner, retaining source and immutable-flag checks. Raw
+constant bytes are not blindly forwarded to preparation with the wrong lowered
+geometry.
+
+Materialized lowering now passes the original ordered view to the existing
+MatMul operand preparer, then keeps the returned DenseOperand until GEMM and
+output publication finish. Immutable conversions reuse their node-owned grant
+and complete original-view key. Optional MLAS packing consumes that same typed
+operand: Funded retains its WeightIdentity, Borrowed retains the original view
+identity, and call-owned conversion scratch has no retained packing identity.
+The lowering no longer erases a granted operand into a raw f32 TensorView.
+There is no second cache, scoped retention mask, policy clone or issuer protocol.
+Dynamic input eligibility still comes from the immutable node flags and cannot
+be promoted by the storage representation.
+
+This also removes repeated immutable conversion work. Funded conversions remain
+in the weight ledger instead of being counted again as scratch telemetry. An
+explicitly declined retention policy continues to use the existing real
+transient-grant semantics for constant conversion; that configuration is not a
+zero-callback warm-retention claim. Activation conversion vectors still follow
+their existing scratch path.
+
+The typed dense entry checks complete input counts, f32 addressable spans,
+checked matrix/batch/result products and output length before computation.
+Empty results return before unused batch strides or packing; zero-K fills the
+initialized output directly without packing or FFI. Empty Einsum GEMM also
+returns before weight preparation. Original direct-view routes keep their
+native preparation and backing metadata.
+
+Real-source regressions require an owned lowered B materialization to obtain a
+Host grant, preserve outputs on quota refusal and reject foreign-source or
+constant-flag adoption. Explicit shape variants share preparation through
+4,096 warm calls with zero issuer callbacks, yield idle cache to Host-budget
+pressure and re-admit before reuse. The public session test covers several
+prefill shapes and M=1 decode, whose GEMV transpose may legitimately add another
+representation. Representations remain node-owned and stable across subsequent
+shapes; independent sessions own independent preparations.
+
+Prepared-reader tests exercise Generic, the host-selected backend and explicitly
+forced MLAS when compiled. Concurrent readers preserve distinct values, active
+grants survive cache pressure, and idle owners release all bytes. The recycled
+conversion-address regression also invokes the new typed compute entry and
+requires reuse of the existing funded pack identity. Malformed counts, byte
+spans, broadcast overflow, empty and zero-K cases fail or return before packing.
+
+This fixes actual resource propagation and prepared ownership. Other transient
+vectors still need workspace migration, and advisory forecasts do not describe
+every lowered weight artifact. Future forecasting should consume compiled
+preparation facts rather than append operation-name exceptions to prediction
+lists.
+
+The resource-design review keeps the EP contract coarse: metadata declares a
+workspace layout, the executor owns admission and checkout/return, and kernels
+borrow slices. Immutable derived weights reuse the existing node owner and
+source. Lowering passes that owner through instead of adding another cache or
+per-operation quota interface. A shape variant shares immutable preparation,
+while its mutable execution workspace remains exclusive to its admitted lane.
+
+Validation of this stage: native CPU 1,993 and session 285 tests pass; optional
+MLAS CPU 2,034 and session 287 pass. Both shared legal corpus/public-contract
+suites pass (3 + 2 each). Strict all-target Clippy passes for CPU/session/engine
+in both configurations and the optional reference adapter. Release-mode
+prepared-operand tests (2) and geometry overflow/empty guards (1) pass. This is
+CPU-only validation; CUDA behavior is untested.
+
+Final paired release controls compare commit 1887ca137 with this stage on Apple
+M1 Max / ARM64 / macOS 27. Native selects Accelerate; the optional MLAS sweep
+explicitly forces MLAS. Both arms use the same 128 MiB Host cap, actual governed
+source and funded workspace outside raw-kernel timing. The previous version's
+zero attributed weight bytes do not mean zero physical allocation: its lowered
+child used an unrelated default source. All constant controls declare B
+immutable; the dynamic control declares neither input immutable.
+
+Each mode runs in an isolated process, with 15 batches and the median of three
+process medians per arm, ordered before/after/after/before/before/after. Small
+controls warm 1,000 calls; large controls warm 20. Thread environment variables
+are identical at 1, without claiming a measured backend worker count. The shared
+stable host flock excludes the llama.cpp workload. Route counters and numeric
+outputs are checked. These are warm CPU controls, not model/CUDA throughput or
+cold-start measurements.
+
+| Mode (all materialized outputs use dcab) | Native before → after (us) | Forced MLAS before → after (us) |
+| --- | --- | --- |
+| Dynamic direct (16×64×16) | 1.638 → 1.701 | 1.681 → 1.669 |
+| Strided constant direct (16×64×16) | 1.785 → 1.812 | 1.676 → 1.690 |
+| abxy,xycd (4,4,8,8 × 8,8,4,4) | 6.956 → 3.276 | 6.204 → 2.930 |
+| abxy,cdxy (4,4,8,8 each) | 6.968 → 3.278 | 6.223 → 2.928 |
+| abxy,cdxy (8,8,16,16 each) | 65.790 → 18.832 | 65.889 → 19.378 |
+| abxy,xycd (2,2,32,64 × 32,64,64,64) | 23476.383 → 3350.467 | 22677.867 → 331.650 |
+| abxy,cdxy (2,2,32,64 × 64,64,32,64) | 54751.950 → 3284.158 | 54419.042 → 323.383 |
+| Tiny Einsum public session run | 3.444 → 3.453 | 3.745 → 3.766 |
+| Tiny public session prepare + run | 3.652 → 3.685 | 3.953 → 3.920 |
+
+Retaining original-view conversion and packing removes repeated constant work.
+The larger native controls retain 32 MiB of attributed weights; forced MLAS
+retains 64 MiB (conversion plus pack), in addition to the 64 KiB output
+workspace. The 128 MiB cap admits this real combined peak in both arms. Small
+materialized controls retain 4/8 KiB native/MLAS; the 8,8,16,16 case retains
+64/128 KiB. This is an explicit memory-for-reuse tradeoff; real-pressure tests
+verify reclaim and re-admission. Internal probe labels such as borrowed/owned
+are case identifiers, not assertions about the returned storage ownership.
+
+The earlier scoped-policy experiment regressed one forced-MLAS prefill control
+by about 13%; it was discarded. The final typed pipeline reduces that control
+from 65.889 to 19.378 us. Tiny direct controls still add about 14–62 ns depending
+on backend/case. Tiny public run adds 9 ns native and 21 ns forced MLAS; prepare
++ run changes by +33/-33 ns. Zero warm issuer callbacks therefore do not imply
+literally zero runtime overhead. Raw rounds, source/driver/binary hashes and
+summaries remain under `/tmp/nxrt-einsum-weight-prepared-*`; the superseded
+experiment is separately labeled under `/tmp/nxrt-einsum-weight-*`.
