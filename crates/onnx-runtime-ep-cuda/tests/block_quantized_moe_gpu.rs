@@ -500,7 +500,24 @@ fn run_cpu_node(
         &output_strides,
         DeviceId::cpu(),
     );
-    kernel.execute(&views, &mut [output_view]).unwrap();
+    let metadata: Vec<_> = views
+        .iter()
+        .map(|input| {
+            onnx_runtime_ep_api::TensorMetadata::new(input.dtype, input.shape, !input.is_absent())
+        })
+        .collect();
+    let req = kernel.workspace_requirement(&metadata).unwrap();
+    assert!(req.alignment <= std::mem::align_of::<u128>());
+    let mut scratch = vec![0u128; usize::try_from(req.bytes).unwrap().div_ceil(16)];
+    let workspace = (!scratch.is_empty()).then(|| {
+        onnx_runtime_ep_api::WorkspaceView::new(
+            DevicePtrMut(scratch.as_mut_ptr().cast()),
+            scratch.len() * 16,
+        )
+    });
+    kernel
+        .execute_with_workspace(&views, &mut [output_view], workspace)
+        .unwrap();
     output
         .chunks_exact(4)
         .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))

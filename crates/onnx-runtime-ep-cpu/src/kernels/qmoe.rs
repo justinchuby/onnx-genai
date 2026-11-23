@@ -1680,6 +1680,7 @@ fn write_grouped_contributions(
                 fc3.as_ref(),
                 fc3_bias.map(|bias| &bias[fc3_bias_range]),
                 attributes,
+                |projection, input, rows, bias| projection.apply(input, rows, bias),
             )?
         }
     };
@@ -1988,6 +1989,8 @@ impl ExpertProjection for QuantizedExpertProjection<'_, '_> {
     fn in_features(&self) -> usize {
         self.source.in_features
     }
+}
+impl QuantizedExpertProjection<'_, '_> {
     fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
         super::decoded_projection::linear_decoded_grouped::<1, _>(
             "QMoE NBits expert",

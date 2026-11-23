@@ -9,6 +9,50 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{Attribute, DataType, DeviceId, Node, NodeId, compute_contiguous_strides};
 
+/// Benchmark-owned workspace, prepared outside timed loops. Exclusive mutable
+/// access keeps repeated calls on one lane without locks or unsafe Sync claims.
+pub struct PreparedKernel {
+    kernel: Box<dyn Kernel>,
+    scratch: Vec<u128>,
+}
+impl PreparedKernel {
+    pub fn new(kernel: Box<dyn Kernel>, inputs: &[TensorView]) -> Self {
+        let metadata: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                onnx_runtime_ep_api::TensorMetadata::new(
+                    input.dtype,
+                    input.shape,
+                    !input.is_absent(),
+                )
+            })
+            .collect();
+        let req = kernel
+            .workspace_requirement_for_execution(inputs, &metadata)
+            .expect("benchmark workspace planning must succeed");
+        assert!(req.alignment <= std::mem::align_of::<u128>());
+        let bytes = usize::try_from(req.bytes).expect("benchmark workspace must be addressable");
+        Self {
+            kernel,
+            scratch: vec![0; bytes.div_ceil(16)],
+        }
+    }
+    pub fn execute(
+        &mut self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let workspace = (!self.scratch.is_empty()).then(|| {
+            onnx_runtime_ep_api::WorkspaceView::new(
+                DevicePtrMut(self.scratch.as_mut_ptr().cast()),
+                self.scratch.len() * 16,
+            )
+        });
+        self.kernel
+            .execute_with_workspace(inputs, outputs, workspace)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum FloatDType {
     F32,

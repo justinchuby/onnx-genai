@@ -1052,7 +1052,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(block_quantized_moe::BlockQuantizedMoEFactory::new(
             derived_weights.clone(),
             dense_weight_cache_bytes,
@@ -2384,7 +2384,11 @@ pub(crate) mod testutil {
             let metadata = inputs
                 .iter()
                 .map(|input| {
-                    onnx_runtime_ep_api::TensorMetadata::new(input.dtype, input.shape, true)
+                    onnx_runtime_ep_api::TensorMetadata::new(
+                        input.dtype,
+                        input.shape,
+                        !input.is_absent(),
+                    )
                 })
                 .collect::<Vec<_>>();
             let requirement = self.workspace_requirement_for_execution(inputs, &metadata)?;

@@ -15968,6 +15968,139 @@ fn streamed_projection_strict_prepare_and_run_use_the_declared_step_workspace() 
     assert_eq!(books.used(Tier::Host), 0);
 }
 
+#[test]
+fn streamed_moe_strict_prepare_funds_one_reused_workspace_across_shapes() {
+    use onnx_runtime_ir::{Attribute, TensorData};
+    use onnx_runtime_memory_api::{DeviceKey, Tier};
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 24);
+    graph
+        .opset_imports
+        .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+    let rows = graph.create_symbol(None);
+    let a = graph.create_named_value(
+        "a",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(32)],
+    );
+    let router = graph.create_named_value(
+        "router",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(4)],
+    );
+    let y = graph.create_named_value(
+        "y",
+        DataType::Float32,
+        vec![Dim::Symbolic(rows), Dim::Static(32)],
+    );
+    let mut weight = |name: &str| {
+        let id = graph.create_named_value(name, DataType::Uint8, static_shape([4, 32, 1, 17]));
+        let mut bytes = vec![0x22; 4 * 32 * 17];
+        for block in bytes.chunks_exact_mut(17) {
+            block[0] = 127;
+        }
+        graph.set_initializer(
+            id,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Uint8,
+                vec![4, 32, 1, 17],
+                bytes,
+            )),
+        );
+        id
+    };
+    let fc1 = weight("fc1");
+    let fc2 = weight("fc2");
+    let mut node = Node::new(
+        NodeId(0),
+        "BlockQuantizedMoE",
+        vec![Some(a), Some(router), Some(fc1), None, Some(fc2)],
+        vec![y],
+    );
+    node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    for (name, value) in [
+        ("fc1_format", Attribute::String(b"mxfp4".to_vec())),
+        ("fc2_format", Attribute::String(b"mxfp4".to_vec())),
+        ("block_layout_version", Attribute::Int(1)),
+        ("activation_type", Attribute::String(b"identity".to_vec())),
+        ("k", Attribute::Int(2)),
+        ("normalize_routing_weights", Attribute::Int(1)),
+    ] {
+        node.attributes.insert(name.into(), value);
+    }
+    graph.add_input(a);
+    graph.add_input(router);
+    graph.add_output(y);
+    graph.insert_node(node);
+    let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+        DeviceKey::HOST,
+        0,
+        1 << 20,
+        0,
+    )));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let memory =
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13))
+            .unwrap();
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+        memory,
+        onnx_runtime_ep_cpu::CpuWeightCacheLimits {
+            dense_bytes: 0,
+            expert_bytes: 0,
+        },
+    )
+    .unwrap()
+    .with_workspace_pool(pool.clone())
+    .unwrap();
+    let cpu = Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), cpu, None).unwrap();
+    assert_eq!(
+        executor.plan[0].workspace_planning,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata
+    );
+    assert!(
+        executor
+            .workspace_node_locations()
+            .iter()
+            .any(|location| location.contains("BlockQuantizedMoE"))
+    );
+    for rows in [1, 3, 1, 3] {
+        let input = Tensor::from_f32(&[rows, 32], &vec![0.25; rows * 32]).unwrap();
+        // Both chosen experts receive every row. Equal top-two logits make the
+        // normalized route weights exactly 0.5, preserving an exact oracle.
+        let router = Tensor::from_f32(&[rows, 4], &[4., 4., -4., -5.].repeat(rows)).unwrap();
+        let inputs = [("a", &input), ("router", &router)];
+        let req = executor
+            .prepare_with_device_bindings(&inputs, &mut [])
+            .unwrap();
+        assert!(req.bytes > 0);
+        assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
+        let funded = books.used(Tier::Host);
+        for _ in 0..8 {
+            let output = executor.run(&inputs).unwrap();
+            assert_eq!(output[0].shape, [rows, 32]);
+            assert_eq!(
+                output[0].as_bytes(),
+                &[256.0f32.to_le_bytes(); 32].repeat(rows).concat()
+            );
+            assert_eq!(books.used(Tier::Host), funded);
+            assert_eq!(
+                books.used(Tier::Host),
+                manager.process_used(Tier::Host),
+                "zero retention funds only workspace backing"
+            );
+        }
+    }
+    drop(executor);
+    pool.trim_idle(u64::MAX).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
 struct WorkspaceDeclarationEp {
     capability_queries: AtomicUsize,
     cpu: CpuExecutionProvider,

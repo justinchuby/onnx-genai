@@ -853,7 +853,7 @@ pub(super) fn dequantize_weight_kn(
     Ok(output)
 }
 
-fn projection_plan() -> super::decoded_projection::DecodedProjectionPlan {
+pub(super) fn projection_plan() -> super::decoded_projection::DecodedProjectionPlan {
     super::decoded_projection::DecodedProjectionPlan::for_current_pool(
         std::num::NonZeroUsize::new(if super::matmul::serial_projection_is_portable() {
             4
@@ -865,7 +865,7 @@ fn projection_plan() -> super::decoded_projection::DecodedProjectionPlan {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn linear_packed_prepared(
+pub(super) fn linear_packed_prepared(
     format: BlockFormat,
     packed: &[u8],
     input: &[f32],
@@ -904,7 +904,8 @@ fn linear_packed_prepared(
 /// Apply canonical compressed rows without materializing the full f32 weight
 /// matrix. Portable compute keeps at most four decoded rows per worker;
 /// reference/AVX2 routes retain one row. Every tile is reused across tokens.
-pub(super) fn linear_packed_grouped(
+#[cfg(test)]
+fn linear_packed_grouped(
     format: BlockFormat,
     packed: &[u8],
     input: &[f32],
@@ -997,7 +998,7 @@ fn linear_packed_tiled<const FEATURE_TILE: usize>(
     if let Some((plan, workspace)) = prepared {
         let layout = plan.layout(rows, in_features, out_features)?;
         let regions = layout.bind(workspace).map_err(|source| EpError::Backend {
-            operation: "BlockQuantizedMatMul streamed workspace binding",
+            operation: "block-quantized streamed workspace binding",
             source: Box::new(source),
         })?;
         let [columns, decoded] = regions.map(|region| -> &mut [f32] {
