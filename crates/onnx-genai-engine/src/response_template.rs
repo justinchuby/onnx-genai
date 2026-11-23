@@ -446,11 +446,43 @@ pub enum PrefixOutput {
     Exclude,
 }
 
+// A valid UTF-8 prefix can end with at most three incomplete bytes.
+#[derive(Debug, Clone, Copy, Default)]
+enum Utf8Tail {
+    #[default]
+    Empty,
+    One([u8; 1]),
+    Two([u8; 2]),
+    Three([u8; 3]),
+}
+impl Utf8Tail {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Empty => &[],
+            Self::One(bytes) => bytes,
+            Self::Two(bytes) => bytes,
+            Self::Three(bytes) => bytes,
+        }
+    }
+    fn from_incomplete(bytes: &[u8]) -> anyhow::Result<Self> {
+        match bytes {
+            [] => Ok(Self::Empty),
+            [a] => Ok(Self::One([*a])),
+            [a, b] => Ok(Self::Two([*a, *b])),
+            [a, b, c] => Ok(Self::Three([*a, *b, *c])),
+            _ => anyhow::bail!(
+                "response UTF-8 decoder retained more than three incomplete bytes; restart this parser and report the invalid decoder state"
+            ),
+        }
+    }
+}
+
 /// Request-local response classification and append-only text publication.
 /// Matching and field visibility are shared by engine and transport consumers.
 pub struct ResponseParser {
     spec: std::sync::Arc<ResponseTemplate>,
     buffer: String,
+    utf8_tail: Utf8Tail,
     omitted_prefix_end: usize,
     pos: usize,
     current: Option<usize>,
@@ -491,6 +523,7 @@ impl ResponseParser {
             current: spec.implicit,
             spec,
             buffer: prefix.into(),
+            utf8_tail: Utf8Tail::Empty,
             omitted_prefix_end: match prefix_output {
                 PrefixOutput::Include => 0,
                 PrefixOutput::Exclude => prefix.len(),
@@ -697,16 +730,50 @@ impl ResponseParser {
             reasoning: reasoning.unwrap_or_default(),
         })
     }
-    fn append(&mut self, text: &str) -> anyhow::Result<()> {
+    fn append_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        let pending = self.utf8_tail.bytes();
         ensure!(
             self.buffer
                 .len()
-                .checked_add(text.len())
+                .checked_add(pending.len())
+                .and_then(|size| size.checked_add(bytes.len()))
                 .is_some_and(|size| size <= self.max_bytes),
-            "response parser buffer would exceed {} bytes; shorten the assistant prefix or reduce max_tokens",
+            "response parser buffer would exceed {} bytes, including incomplete UTF-8; shorten the assistant prefix or reduce max_tokens",
             self.max_bytes
         );
+        let input = if pending.is_empty() {
+            std::borrow::Cow::Borrowed(bytes)
+        } else {
+            let mut combined = Vec::with_capacity(pending.len() + bytes.len());
+            combined.extend_from_slice(pending);
+            combined.extend_from_slice(bytes);
+            std::borrow::Cow::Owned(combined)
+        };
+        let (text, tail) = match std::str::from_utf8(&input) {
+            Ok(text) => (text, Utf8Tail::Empty),
+            Err(error) if error.error_len().is_none() => {
+                let at = error.valid_up_to();
+                let text = std::str::from_utf8(&input[..at])
+                    .context("decode the validated response UTF-8 prefix")?;
+                (text, Utf8Tail::from_incomplete(&input[at..])?)
+            }
+            Err(error) => return Err(anyhow::Error::new(error).context(format!(
+                "response byte input contains invalid UTF-8 at raw offset {}; supply a valid UTF-8 byte sequence or decode malformed pieces before response projection",
+                self.buffer.len() + error.valid_up_to()
+            ))),
+        };
         self.buffer.push_str(text);
+        self.utf8_tail = tail;
+        Ok(())
+    }
+
+    fn require_complete_utf8(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.utf8_tail.bytes().is_empty(),
+            "response ends with {} incomplete UTF-8 bytes at raw offset {}; supply their continuation bytes before finishing the response",
+            self.utf8_tail.bytes().len(),
+            self.buffer.len()
+        );
         Ok(())
     }
 
@@ -715,8 +782,17 @@ impl ResponseParser {
     /// Final candidates also resolve pending boundaries, defaults and required fields.
     /// The original parser state is restored on both success and failure.
     pub fn preview(&mut self, text: &str, final_chunk: bool) -> anyhow::Result<ChatText> {
+        self.preview_bytes(text.as_bytes(), final_chunk)
+    }
+
+    /// Inspect lossless byte pieces; partial UTF-8 is retained only within the trial.
+    /// Final candidates must end on a complete UTF-8 scalar.
+    pub fn preview_bytes(&mut self, bytes: &[u8], final_chunk: bool) -> anyhow::Result<ChatText> {
         let trial = ResponseTrial::new(self);
-        trial.parser.append(text)?;
+        trial.parser.append_bytes(bytes)?;
+        if final_chunk {
+            trial.parser.require_complete_utf8()?;
+        }
         trial.parser.process(final_chunk)?;
         if final_chunk {
             trial.parser.validate_required()?;
@@ -725,7 +801,13 @@ impl ResponseParser {
     }
 
     pub fn feed(&mut self, text: &str) -> anyhow::Result<ChatText> {
-        self.append(text)?;
+        self.feed_bytes(text.as_bytes())
+    }
+
+    /// Consume strict UTF-8 byte pieces, retaining incomplete scalars between calls.
+    /// Invalid sequences fail without appending any bytes from the rejected piece.
+    pub fn feed_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<ChatText> {
+        self.append_bytes(bytes)?;
         self.process(false)?;
         self.delta(false)
     }
@@ -744,6 +826,7 @@ impl ResponseParser {
     }
 
     pub fn finish(mut self) -> anyhow::Result<ChatText> {
+        self.require_complete_utf8()?;
         self.process(true)?;
         self.validate_required()?;
         self.delta(true)
@@ -752,6 +835,7 @@ impl ResponseParser {
 
 struct ResponseCheckpoint {
     buffer_len: usize,
+    utf8_tail: Utf8Tail,
     pos: usize,
     current: Option<usize>,
     region: Option<Region>,
@@ -768,6 +852,7 @@ impl<'a> ResponseTrial<'a> {
     fn new(parser: &'a mut ResponseParser) -> Self {
         let checkpoint = ResponseCheckpoint {
             buffer_len: parser.buffer.len(),
+            utf8_tail: parser.utf8_tail,
             pos: parser.pos,
             current: parser.current,
             region: parser.region.clone(),
@@ -782,6 +867,7 @@ impl Drop for ResponseTrial<'_> {
     fn drop(&mut self) {
         let saved = &mut self.checkpoint;
         self.parser.buffer.truncate(saved.buffer_len);
+        self.parser.utf8_tail = saved.utf8_tail;
         self.parser.pos = saved.pos;
         self.parser.current = saved.current;
         self.parser.region = saved.region.take();
@@ -821,6 +907,155 @@ mod tests {
         output.reasoning.push_str(&delta.reasoning);
         Ok(output)
     }
+    #[test]
+    fn byte_response_every_split_matches_text_projection_across_unicode_boundaries() {
+        let spec = ResponseTemplate::compile(&serde_json::json!({
+            "start_anchor":"A", "fields":{
+                "reasoning_content":{"open":"[r]","close_pattern":"終\\s*"}, "content":{}
+            }
+        }))
+        .unwrap();
+        let suffix = "新🙂終 \n{\"n\":1}";
+        let expected = collected(spec.clone(), "A[r]既存", &[suffix]).unwrap();
+        assert_eq!(expected.content, "{\"n\":1}");
+        assert_eq!(expected.reasoning, "新🙂");
+        for split in 0..=suffix.len() {
+            let mut parser =
+                ResponseParser::new(spec.clone(), "A[r]既存", PrefixOutput::Exclude, 1024).unwrap();
+            let mut output = parser.feed_bytes(&suffix.as_bytes()[..split]).unwrap();
+            for delta in [
+                parser.feed_bytes(&suffix.as_bytes()[split..]).unwrap(),
+                parser.finish().unwrap(),
+            ] {
+                output.content.push_str(&delta.content);
+                output.reasoning.push_str(&delta.reasoning);
+            }
+            assert_eq!(output, expected, "byte split={split}");
+        }
+    }
+
+    #[test]
+    fn byte_response_pending_scalars_obey_budget_and_preview_rollback() {
+        let spec = ResponseTemplate::compile(
+            &serde_json::json!({"start_anchor":"A","fields":{"content":{}}}),
+        )
+        .unwrap();
+        let mut parser = ResponseParser::new(spec.clone(), "A", PrefixOutput::Include, 4).unwrap();
+        assert_eq!(parser.feed_bytes(&[0xf0]).unwrap(), ChatText::default());
+        assert_eq!(
+            parser.preview_bytes(&[0x9f, 0x92], false).unwrap(),
+            ChatText::default()
+        );
+        assert_eq!(parser.utf8_tail.bytes(), [0xf0]);
+        let error = parser.preview_bytes(&[0x9f, 0x92], true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("3 incomplete UTF-8 bytes at raw offset 0"),
+            "{error:#}"
+        );
+        assert_eq!(parser.utf8_tail.bytes(), [0xf0]);
+        parser.feed_bytes(&[0x9f, 0x92]).unwrap();
+        assert!(
+            parser
+                .feed_bytes(b" ")
+                .unwrap_err()
+                .is::<std::str::Utf8Error>()
+        );
+        assert_eq!(parser.utf8_tail.bytes(), [0xf0, 0x9f, 0x92]);
+        assert!(
+            parser
+                .preview_bytes(&[0xa9, b'x'], false)
+                .unwrap_err()
+                .to_string()
+                .contains("buffer")
+        );
+        assert_eq!(parser.feed_bytes(&[0xa9]).unwrap().content, "💩");
+        assert_eq!(parser.finish().unwrap(), ChatText::default());
+        let mut parser = ResponseParser::new(spec, "A", PrefixOutput::Include, 4).unwrap();
+        parser.feed_bytes(&[0xe7, 0xb5]).unwrap();
+        assert!(
+            parser
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("2 incomplete UTF-8 bytes")
+        );
+    }
+
+    #[test]
+    fn byte_response_invalid_sequences_preserve_state_and_utf8_error_causes() {
+        let spec = ResponseTemplate::compile(
+            &serde_json::json!({"start_anchor":"A","fields":{"content":{}}}),
+        )
+        .unwrap();
+        for invalid in [
+            &[0xc0, 0xaf][..],
+            &[0xe0, 0x80, 0x80],
+            &[0xed, 0xa0, 0x80],
+            &[0xf4, 0x90, 0x80, 0x80],
+            &[0x80],
+            &[0xff],
+        ] {
+            let mut parser =
+                ResponseParser::new(spec.clone(), "A", PrefixOutput::Include, 1024).unwrap();
+            parser.feed("先").unwrap();
+            let bytes = [b"ok".as_slice(), invalid].concat();
+            let error = parser.feed_bytes(&bytes).unwrap_err();
+            assert!(error.is::<std::str::Utf8Error>(), "{error:#}");
+            assert!(error.to_string().contains("raw offset 5"), "{error:#}");
+            assert_eq!(parser.buffer, "先");
+            assert!(parser.utf8_tail.bytes().is_empty());
+            assert_eq!(parser.feed("後").unwrap().content, "後");
+        }
+    }
+
+    #[test]
+    fn byte_response_consumes_real_byte_fallback_pieces_without_replacement_characters() {
+        use serde_json::{Value, json};
+        let mut value: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/tiny-llm/tokenizer.json"
+        )))
+        .unwrap();
+        let mut vocab = value["model"]["vocab"].as_object().unwrap().clone();
+        for (old, replacement, id) in [
+            ("hello", "<0xE7>", 4),
+            ("world", "<0xB5>", 5),
+            ("tok16", "<0x82>", 16),
+            ("tok17", "{\"n\":1}", 17),
+        ] {
+            vocab.remove(old);
+            vocab.insert(replacement.into(), json!(id));
+        }
+        value["model"] = json!({"type":"BPE","unk_token":"<unk>","byte_fallback":true,"vocab":vocab,"merges":[]});
+        value["decoder"] = json!({"type":"ByteFallback"});
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = onnx_genai_ort::Tokenizer::from_file(path).unwrap();
+        let pieces = crate::tokenization::token_pieces(&tokenizer, &[4, 5, 16, 17]).unwrap();
+        assert_eq!(pieces.concat(), "終{\"n\":1}".as_bytes());
+        let spec = ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
+            "reasoning_content":{"open":"[r]","close":"終"}, "content":{}
+        }}))
+        .unwrap();
+        let mut parser =
+            ResponseParser::new(spec, "A[r]既存", PrefixOutput::Exclude, 1024).unwrap();
+        assert_eq!(parser.feed("新").unwrap().reasoning, "新");
+        let mut output = ChatText::default();
+        for piece in pieces {
+            let delta = parser.feed_bytes(&piece).unwrap();
+            output.content.push_str(&delta.content);
+            output.reasoning.push_str(&delta.reasoning);
+        }
+        let tail = parser.finish().unwrap();
+        output.content.push_str(&tail.content);
+        output.reasoning.push_str(&tail.reasoning);
+        assert_eq!(output.content, "{\"n\":1}");
+        assert!(output.reasoning.is_empty());
+    }
+
     #[test]
     fn preview_restores_replaced_repeated_regions_and_the_published_baseline() {
         for repeats in [false, true] {
@@ -878,7 +1113,7 @@ mod tests {
         );
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let trial = ResponseTrial::new(&mut parser);
-            trial.parser.append("<c>discard</c>").unwrap();
+            trial.parser.append_bytes(b"<c>discard</c>").unwrap();
             trial.parser.process(true).unwrap();
             panic!("inject speculative parser unwind");
         }));

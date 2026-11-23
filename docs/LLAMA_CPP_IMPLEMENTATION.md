@@ -897,3 +897,24 @@ Strict native-engine all-target and server all-target Clippy passed on the final
 candidate-preview implementation. The HTTP reasoning+JSON admission guard remains
 in place until candidate token decoding and JSON recognizer composition are wired
 and verified; no compatibility ledger row is closed by this prerequisite alone.
+
+Byte-candidate prerequisite: response classification now accepts strict UTF-8
+byte pieces through `feed_bytes` and `preview_bytes`; text entry points share the
+same ingestion path. A typed zero/one/two/three-byte tail retains incomplete
+scalars between pieces. Pending bytes count against the existing raw buffer
+budget. Invalid sequences preserve the original UTF-8 error and name their raw
+offset; a rejected piece appends none of its valid prefix. Final projection
+requires a complete scalar. Candidate checkpoints also restore pending bytes.
+
+Four new cases cover every byte split of Unicode reasoning and a regex closer,
+three-byte pending tails and budget limits, invalid/overlong/surrogate/out-of-range
+encodings with unchanged state, final incomplete sequences, and real ByteFallback
+vocabulary pieces forming a Chinese channel delimiter plus JSON text. All four
+passed under default features; all 19 classifier cases passed with native-backend.
+The channel-to-JSON sampling composition and contextual decoder agreement remain
+open; accepting byte pieces alone does not enable reasoning+JSON requests.
+
+Final byte-input validation: full server library 404 passed / 2 inherited ignores;
+strict native-engine all-target and server all-target Clippy passed. Existing
+text projection, normal prefill, explicit continuation and stop behavior remain
+covered by that server run. Reasoning+JSON admission remains unchanged.
