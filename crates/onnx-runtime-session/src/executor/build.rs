@@ -1194,6 +1194,7 @@ impl Executor {
             pin_step_workspace: false,
             inherited_workspace: InheritedWorkspaces::default(),
             workspace_preparation_required: false,
+            workspace_preparation_memo: None,
         };
 
         // Constant preparation depends only on immutable operand metadata.

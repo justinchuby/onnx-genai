@@ -78,7 +78,9 @@ pub use optimizer::{
     cpu_optimization_passes,
 };
 pub use provider::CpuExecutionProvider;
-pub use resources::{CpuMemoryResources, CpuWeightCacheLimits, DerivedWeightMemory};
+pub use resources::{
+    CpuCacheRetention, CpuMemoryResources, CpuWeightCacheLimits, DerivedWeightMemory,
+};
 pub use weight_offload::placement::{
     GpuLayersOverrideReport, HostFallbackReason, IqFormat, LayerPlacement, LayerWeightRegions,
     Placement, PlacementError, PlacementPlan, QuantTileFormat, RegionPlacement, SnappedTileSize,
@@ -92,14 +94,6 @@ pub use weight_offload::{
 pub use kernels::selection::non_max_suppression;
 pub use kernels::slice::{SliceAxisPlan, slice_axes_steps, slice_plan};
 
-// Einsum accumulator workspace is typed to its precision policy and parked per
-// execution thread, so a per-buffer cap alone would multiply by the pool width.
-// Each provider/session owns an immutable retention verdict; all admitted
-// sessions share only the governed process byte ceiling and live-byte accounting.
-pub use kernels::einsum::{
-    CpuCacheRetention, einsum_scratch_budget_predicted_bytes, einsum_scratch_live_bytes,
-    einsum_scratch_process_cap_bytes,
-};
 pub use kernels::group_query_attention::{present_inplace_count, present_inplace_half_count};
 pub use kernels::matmul_nbits::bound_process_to_decode_budget;
 pub use kernels::matmul_nbits::set_decode_thread_budget;
@@ -116,18 +110,9 @@ pub use kernels::matmul::weight_transpose_cache_predicted_bytes;
 // CpuCacheRetention (kernels then widen per call and retain
 // nothing, byte-identical output).
 pub use kernels::matmul::matmul_dense_cache_predicted_bytes;
-// #1133: the QLinearMatMul per-thread `i32` accumulator scratch was bounded by a
-// per-buffer constant but parked on every worker thread, so the real ceiling was
-// `32 MiB x threads`. It is now a process-wide, declinable budget: the plan
-// budgets `qlinear_accumulator_budget_predicted_bytes` and declines it via
-// CpuCacheRetention (kernels then reallocate per call,
-// byte-identical). The constant-`B` MLAS pre-pack (`packed_b`, ungoverned since
-// `ac394fd6`) is the second buffer in the same kernel brought under the plan.
-pub use kernels::qlinear_matmul::{
-    qlinear_accumulator_budget_predicted_bytes, qlinear_accumulator_live_bytes,
-    qlinear_accumulator_process_cap_bytes, qlinear_packed_b_live_bytes,
-    qlinear_packed_b_predicted_bytes, set_qlinear_accumulator_process_cap_bytes,
-};
+// Immutable reference packs remain node-owned; accumulator scratch belongs to
+// the shared execution workspace, not a process-global retention budget.
+pub use kernels::qlinear_matmul::{qlinear_packed_b_live_bytes, qlinear_packed_b_predicted_bytes};
 
 #[cfg(test)]
 mod feature_default_guard {

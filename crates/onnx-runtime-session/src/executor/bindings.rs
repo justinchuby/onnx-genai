@@ -23,7 +23,14 @@ pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
     (node.domain.is_empty()
         && matches!(
             node.op_type.as_str(),
-            "MatMul" | "Gemm" | "Attention" | "Conv" | "ReduceSum" | "ReduceMean"
+            "MatMul"
+                | "Gemm"
+                | "QLinearMatMul"
+                | "Einsum"
+                | "Attention"
+                | "Conv"
+                | "ReduceSum"
+                | "ReduceMean"
         ))
         || (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare"))
@@ -96,12 +103,15 @@ impl PlannedInputShape {
 
 /// Merge a per-node workspace requirement into the running peak for its
 /// lifetime class, keeping the largest byte count and the strictest alignment.
-fn merge_workspace_peak(peak: &mut WorkspaceRequirement, requirement: WorkspaceRequirement) {
+pub(super) fn merge_workspace_peak(
+    peak: &mut WorkspaceRequirement,
+    requirement: WorkspaceRequirement,
+) {
+    let alignment = peak.alignment.max(requirement.alignment);
     if requirement.bytes > peak.bytes {
         *peak = requirement;
-    } else if requirement.bytes == peak.bytes {
-        peak.alignment = peak.alignment.max(requirement.alignment);
     }
+    peak.alignment = alignment;
 }
 
 impl Executor {
@@ -558,6 +568,22 @@ impl Executor {
         self.workspace_preparation_required = true;
         let external = self.prepare_external_bindings_mode(bindings, true)?;
         let symbols = self.bind_symbols(inputs, &external)?;
+        let stats = self.cache.stats();
+        // Input/external-binding validation above always runs. The immutable
+        // graph and weights plus this exact symbol map determine every planned
+        // shape (including nested shapes and capacity bounds). New/evicted
+        // specializations conservatively invalidate the metadata-only plan.
+        if let Some(memo) = &self.workspace_preparation_memo
+            && memo.symbols == symbols
+            && memo.growing_symbols == self.capture_growing_symbols
+            && memo.artifacts == self.artifact_config
+            && memo.kernel_misses == stats.misses
+            && memo.kernel_evictions == stats.evictions
+            && std::env::var_os("ONNX_GENAI_LOG_WORKSPACE_BOUND").is_none()
+        {
+            let (persistent, step) = (memo.persistent, memo.step);
+            return self.reserve_prepared_workspaces(persistent, step);
+        }
         // Track one peak per lifetime class: session-persistent and step-scoped
         // scratch live in separate executor slots, so a single peak cannot stand
         // in for both when a graph mixes governed ops (e.g. QMoE + Attention).
@@ -596,65 +622,82 @@ impl Executor {
                 .into_iter()
                 .map(PlannedInputShape::into_dims)
                 .collect::<Vec<_>>();
-            let constant_inputs = self.plan[pi]
-                .inputs
-                .iter()
-                .map(|input| {
-                    input.is_some_and(|value| is_immutable_initializer(&self.graph, value))
-                })
-                .collect::<Vec<_>>();
-            let constant_values = resolve_kernel_constant_inputs(
-                &self.graph,
-                &self.weights,
-                &self.plan[pi].inputs,
-                &input_shapes,
-            )?;
-            let opset = effective_opset(&self.graph, node);
-            // Must match what dispatch computes for this node, or prepare-only
-            // planning would key a different kernel than execution uses.
-            let seq_independent =
-                node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
-            let graph_tokens = std::array::from_fn(|index| {
-                let capture = &self.slot_capture[index];
-                capture
-                    .capture_schedule
-                    .as_ref()
-                    .is_some_and(|schedule| {
-                        schedule.segments.iter().any(|segment| {
-                            segment.captured && (segment.start..segment.end).contains(&pi)
-                        })
+            // Preparation uses the same specialization binding as dispatch.
+            // Reuse it before resolving constants or constructing a cache key:
+            // both are cold-path work when concrete metadata has not changed.
+            let prebound = self.kernel_bindings[pi]
+                .as_ref()
+                .is_some_and(|binding| self.cache.has_prebound(binding, &input_shapes));
+            if !prebound {
+                let constant_inputs = self.plan[pi]
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        input.is_some_and(|value| is_immutable_initializer(&self.graph, value))
                     })
-                    .then_some(capture.device_graph_token)
-                    .flatten()
-            });
-            let (kernel, key) = self.cache.get_or_create(
-                node_id,
-                node,
-                &input_shapes,
-                &self.plan[pi].input_dtypes,
-                &constant_inputs,
-                &constant_values,
-                opset,
-                seq_independent,
-                self.artifact_config,
-                &mut self.provider_artifact_readiness,
-                self.ep.as_ref(),
-                graph_tokens,
-                self.plan[pi]
-                    .graph_kernel
-                    .then_some(onnx_runtime_ep_api::GraphKernelRequest {
-                        scope: onnx_runtime_ep_api::GraphKernelScope::Executor {
-                            provider: self.artifact_config.provider(),
-                            executor: self.artifact_config.executor(),
-                            generation: self.artifact_config.generation(),
-                        },
+                    .collect::<Vec<_>>();
+                let constant_values = resolve_kernel_constant_inputs(
+                    &self.graph,
+                    &self.weights,
+                    &self.plan[pi].inputs,
+                    &input_shapes,
+                )?;
+                let opset = effective_opset(&self.graph, node);
+                // Must match what dispatch computes for this node, or prepare-only
+                // planning would key a different kernel than execution uses.
+                let seq_independent =
+                    node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
+                let graph_tokens = std::array::from_fn(|index| {
+                    let capture = &self.slot_capture[index];
+                    capture
+                        .capture_schedule
+                        .as_ref()
+                        .is_some_and(|schedule| {
+                            schedule.segments.iter().any(|segment| {
+                                segment.captured && (segment.start..segment.end).contains(&pi)
+                            })
+                        })
+                        .then_some(capture.device_graph_token)
+                        .flatten()
+                });
+                let (_, key) = self.cache.get_or_create(
+                    node_id,
+                    node,
+                    &input_shapes,
+                    &self.plan[pi].input_dtypes,
+                    &constant_inputs,
+                    &constant_values,
+                    opset,
+                    seq_independent,
+                    self.artifact_config,
+                    &mut self.provider_artifact_readiness,
+                    self.ep.as_ref(),
+                    graph_tokens,
+                    self.plan[pi]
+                        .graph_kernel
+                        .then_some(onnx_runtime_ep_api::GraphKernelRequest {
+                            scope: onnx_runtime_ep_api::GraphKernelScope::Executor {
+                                provider: self.artifact_config.provider(),
+                                executor: self.artifact_config.executor(),
+                                generation: self.artifact_config.generation(),
+                            },
 
-                        graph: &self.graph,
-                        node,
-                        inputs: &self.plan[pi].inputs,
-                    }),
-            )?;
-            self.kernel_bindings[pi] = Some(key);
+                            graph: &self.graph,
+                            node,
+                            inputs: &self.plan[pi].inputs,
+                        }),
+                )?;
+                self.kernel_bindings[pi] = Some(key);
+            }
+            let kernel = self
+                .cache
+                .get_prebound(
+                    self.kernel_bindings[pi]
+                        .as_ref()
+                        .expect("workspace kernel binding installed"),
+                    &input_shapes,
+                )
+                .expect("workspace kernel resolved immediately before lookup");
             let metadata = input_shapes
                 .iter()
                 .zip(&self.plan[pi].input_dtypes)
@@ -693,6 +736,27 @@ impl Executor {
             )?;
         }
 
+        // Publish only a fully successful plan and reservation. A failed
+        // attempt leaves the previous signature intact and cannot become a hit.
+        let result = self.reserve_prepared_workspaces(peak_persistent, peak_step)?;
+        let stats = self.cache.stats();
+        self.workspace_preparation_memo = Some(WorkspacePreparationMemo {
+            symbols,
+            growing_symbols: self.capture_growing_symbols.clone(),
+            artifacts: self.artifact_config,
+            kernel_misses: stats.misses,
+            kernel_evictions: stats.evictions,
+            persistent: peak_persistent,
+            step: peak_step,
+        });
+        Ok(result)
+    }
+
+    fn reserve_prepared_workspaces(
+        &mut self,
+        peak_persistent: WorkspaceRequirement,
+        peak_step: WorkspaceRequirement,
+    ) -> Result<WorkspaceRequirement> {
         Self::reserve_prepared_workspace(
             self.ep.as_ref(),
             &mut self.persistent_workspace,
@@ -1709,6 +1773,8 @@ mod planned_workspace_node_tests {
         for (domain, op_type) in [
             ("", "MatMul"),
             ("", "Gemm"),
+            ("", "QLinearMatMul"),
+            ("", "Einsum"),
             ("", "Attention"),
             ("", "Conv"),
             ("", "ReduceSum"),

@@ -3,17 +3,17 @@
 use std::{marker::PhantomData, rc::Rc};
 
 use onnx_runtime_ep_cpu::dtype::{ComputeDomain, NumericElem};
-use onnx_runtime_ep_cpu::kernels::einsum::{unsupported_reason, unsupported_reason_for_opset};
+use onnx_runtime_ep_cpu::kernels::einsum::unsupported_reason_for_opset;
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, static_shape};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct CompatAccumulator<'a> {
+struct BorrowedAccumulator<'a> {
     value: u8,
     lifetime: PhantomData<&'a ()>,
     not_send_or_sync: PhantomData<Rc<()>>,
 }
 
-impl ComputeDomain for CompatAccumulator<'_> {
+impl ComputeDomain for BorrowedAccumulator<'_> {
     fn c_add(self, other: Self) -> Self {
         Self {
             value: self.value.wrapping_add(other.value),
@@ -73,18 +73,18 @@ impl ComputeDomain for CompatAccumulator<'_> {
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-struct CompatElem<'a> {
+struct BorrowedElem<'a> {
     value: u8,
     lifetime: PhantomData<&'a ()>,
     not_send_or_sync: PhantomData<Rc<()>>,
 }
 
-impl<'a> NumericElem for CompatElem<'a> {
+impl<'a> NumericElem for BorrowedElem<'a> {
     const DTYPE: DataType = DataType::Uint8;
-    type Acc = CompatAccumulator<'a>;
+    type Acc = BorrowedAccumulator<'a>;
 
     fn to_acc(self) -> Self::Acc {
-        CompatAccumulator {
+        BorrowedAccumulator {
             value: self.value,
             lifetime: self.lifetime,
             not_send_or_sync: self.not_send_or_sync,
@@ -116,17 +116,17 @@ fn einsum_node() -> Node {
 }
 
 #[test]
-fn downstream_numeric_elem_keeps_the_pre_einsum_accumulator_contract() {
+fn numeric_elem_accepts_borrowed_non_thread_safe_accumulators() {
     fn compile_with_borrowed_non_thread_safe_accumulator<'a>(_borrow: &'a ()) {
-        let element = CompatElem {
+        let element = BorrowedElem {
             value: 6,
             lifetime: PhantomData::<&'a ()>,
             not_send_or_sync: PhantomData,
         };
         let sum = element
             .to_acc()
-            .c_add(CompatElem::from_f32_scalar(7.0).to_acc());
-        let round_trip = CompatElem::from_acc(sum);
+            .c_add(BorrowedElem::from_f32_scalar(7.0).to_acc());
+        let round_trip = BorrowedElem::from_acc(sum);
 
         assert_eq!(round_trip.value, 13);
         assert_eq!(std::mem::size_of_val(&round_trip), 1);
@@ -134,15 +134,6 @@ fn downstream_numeric_elem_keeps_the_pre_einsum_accumulator_contract() {
 
     let borrowed = ();
     compile_with_borrowed_non_thread_safe_accumulator(&borrowed);
-}
-
-#[test]
-fn legacy_cpu_helper_keeps_its_einsum_12_signature_and_semantics() {
-    let reason: Option<String> =
-        unsupported_reason(&einsum_node(), &[static_shape([2])], &[DataType::BFloat16]);
-    let reason = reason.expect("the legacy helper must apply the Einsum-12 schema");
-
-    assert!(reason.contains("not admitted by Einsum-12"), "{reason}");
 }
 
 #[test]

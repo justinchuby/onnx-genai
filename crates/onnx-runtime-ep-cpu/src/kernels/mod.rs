@@ -591,7 +591,6 @@ mod half_gemm;
 // The GEMV is an F16C/AVX2 kernel with no portable body: off x86 the decode
 // path is unchanged, so the module is not compiled at all rather than left as
 // dead code.
-pub mod governed_accumulator_budget;
 pub mod governed_weight_cache;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod half_gemv;
@@ -2022,6 +2021,32 @@ pub(crate) mod testutil {
 
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
     use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
+
+    pub trait PreparedTestKernel: onnx_runtime_ep_api::Kernel {
+        fn execute_prepared(
+            &self,
+            inputs: &[onnx_runtime_ep_api::TensorView],
+            outputs: &mut [onnx_runtime_ep_api::TensorMut],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            let metadata = inputs
+                .iter()
+                .map(|input| {
+                    onnx_runtime_ep_api::TensorMetadata::new(input.dtype, input.shape, true)
+                })
+                .collect::<Vec<_>>();
+            let requirement = self.workspace_requirement_for_execution(inputs, &metadata)?;
+            assert!(requirement.alignment <= std::mem::align_of::<u128>());
+            let mut backing = vec![0u128; (requirement.bytes as usize).div_ceil(16)];
+            let workspace = (!backing.is_empty()).then(|| {
+                onnx_runtime_ep_api::WorkspaceView::new(
+                    onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+                    backing.len() * 16,
+                )
+            });
+            self.execute_with_workspace(inputs, outputs, workspace)
+        }
+    }
+    impl<T: onnx_runtime_ep_api::Kernel + ?Sized> PreparedTestKernel for T {}
 
     /// Observe real issuer callbacks, including zero-byte requests, while
     /// keeping the ledger's pressure/retry protocol intact.

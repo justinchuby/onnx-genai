@@ -1,19 +1,24 @@
 //! `QLinearMatMul`: integer matrix multiplication with linear quantization.
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{
-    DataType, Dim, Graph, Node, Shape, broadcast_shapes, compute_contiguous_strides,
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView, WorkspaceLayout,
+    WorkspaceRequirement, WorkspaceView,
 };
+use onnx_runtime_ir::{DataType, Dim, Graph, Node, Shape, broadcast_shapes};
 use rayon::prelude::*;
 
 use super::{check_arity, qgemm_native, to_dense_bytes, write_dense_bytes};
 use crate::DerivedWeightMemory;
+#[cfg(test)]
+use crate::kernels::testutil::PreparedTestKernel;
 #[cfg(feature = "mlas")]
 use crate::resources::{DerivedWeightGrant, IdleWeightCache, WeightAdmission};
 use crate::strided::numel;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 #[cfg(feature = "mlas")]
 use std::sync::{Arc, Mutex};
+use std::{alloc::Layout, mem::MaybeUninit};
 
 /// The payload is dropped before its Host grant, including after cache eviction.
 #[cfg(feature = "mlas")]
@@ -111,120 +116,6 @@ fn dense_bytes<'a>(view: &TensorView<'a>) -> Result<Cow<'a, [u8]>> {
     to_dense_bytes(view).map(Cow::Owned)
 }
 
-/// Largest accumulator a single thread keeps between calls, in bytes.
-///
-/// 32 MiB covers every accumulator up to an 8M-element result -- a 2048x4096
-/// output and everything smaller -- which is the range where the per-call
-/// allocation actually hurts. Anything larger is released rather than parked on
-/// a thread for the life of the process: at that size the GEMM itself dwarfs
-/// the allocation, so retaining it would trade real memory for nothing.
-///
-/// This is a **per-thread** figure. The buffer is parked on every worker thread
-/// that ever runs the kernel, so the naive process-wide exposure would be
-/// `MAX_RETAINED_ACCUMULATOR_BYTES x threads` -- 1 GiB on a 32-vCPU box, 4 GiB
-/// on a 128-vCPU server. That multiplier (the thread count) is precisely the
-/// variable the reuse optimisation scales with, so it must not be left out of
-/// the ceiling. See [`MAX_PROCESS_ACCUMULATOR_BYTES`].
-const MAX_RETAINED_ACCUMULATOR_BYTES: usize =
-    crate::kernels::governed_accumulator_budget::DEFAULT_PER_THREAD_ACCUMULATOR_BYTES as usize;
-
-/// Hard ceiling on the accumulator scratch summed across **all** worker
-/// threads.
-///
-/// The per-thread cap above bounds one buffer; this bounds the sum, so the
-/// process-wide exposure is `min(128 MiB, 32 MiB x threads)` -- a flat 128 MiB
-/// once four or more threads park a full buffer, and it does *not* grow with the
-/// vCPU count. Arithmetic, stated explicitly rather than left implicit:
-///
-/// * 4-vCPU box:  4 x 32 MiB = 128 MiB (at the cap)
-/// * 20-vCPU box: min(128 MiB, 640 MiB) = **128 MiB** (was 640 MiB)
-/// * 32-vCPU box: min(128 MiB, 1 GiB)   = **128 MiB** (was 1 GiB)
-/// * 128-vCPU box: min(128 MiB, 4 GiB)  = **128 MiB** (was 4 GiB)
-///
-/// Threads beyond the fourth that want to park a full 32 MiB buffer are refused
-/// and recompute the buffer per call (byte-identical output, only slower). 128
-/// MiB of transient integer-GEMM scratch is defensible independent of model
-/// size and vCPU count, which is the property the per-thread-only bound lacked.
-const MAX_PROCESS_ACCUMULATOR_BYTES: usize =
-    crate::kernels::governed_accumulator_budget::DEFAULT_PROCESS_ACCUMULATOR_BYTES as usize;
-
-/// Process-wide byte budget governing the parked accumulator scratch across
-/// every worker thread (#1056). The adjacent admission flag decides whether
-/// this scratch family may retain at all. `live_bytes()` reports the sum
-/// actually parked, so a wrong ceiling is detectable in one run rather than
-/// argued from a formula -- and a single-thread test cannot move it past one
-/// buffer, which is why the test that defends it drives multiple threads.
-pub(crate) static ACCUMULATOR_BUDGET:
-    crate::kernels::governed_accumulator_budget::GovernedAccumulatorBudget =
-    crate::kernels::governed_accumulator_budget::GovernedAccumulatorBudget::new(
-        MAX_RETAINED_ACCUMULATOR_BYTES as u64,
-        MAX_PROCESS_ACCUMULATOR_BYTES as u64,
-    );
-
-thread_local! {
-    /// Per-thread scratch for the `i32` accumulator that the integer GEMM writes
-    /// before the values are requantized down to the output dtype.
-    ///
-    /// The accumulator is `m * n` i32 -- 1 MiB at a 128x2048 prefill -- and MLAS
-    /// first-touches every page of it from every worker thread. Allocating it per
-    /// call therefore buys a fresh mapping, a page fault per page, and on free a
-    /// TLB shootdown to every core the process is running on. Measured on a
-    /// 32-vCPU EPYC 9V74 at K=N=2048, M=128: re-allocating it per call cost
-    /// **301 us** with a 16-thread pool and nothing measurable with one thread,
-    /// which is why this only started to matter once the GEMM itself scaled.
-    ///
-    /// Thread-local rather than shared: `execute` takes `&self` and the executor
-    /// may run the same kernel on several threads at once, so a shared buffer would
-    /// need a lock that serialises exactly the calls this exists to speed up.
-    /// Retention is still bounded process-wide, not just per thread: parking is
-    /// admitted through [`ACCUMULATOR_BUDGET`], which caps the sum across all
-    /// threads (see [`MAX_PROCESS_ACCUMULATOR_BYTES`]).
-    static ACCUMULATOR: std::cell::RefCell<Vec<i32>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Bytes the parked accumulator scratch currently holds, summed across every
-/// worker thread. This is the figure a predicted ceiling is checked against
-/// (#1056); a single-thread run cannot move it past one buffer.
-pub fn qlinear_accumulator_live_bytes() -> u64 {
-    ACCUMULATOR_BUDGET.live_bytes()
-}
-
-/// Retune the process-wide accumulator scratch ceiling. Exposed for deployment
-/// tuning and for the RSS measurement harness, which contrasts the bounded
-/// ceiling against the pre-fix per-thread-only behaviour (`u64::MAX`).
-pub fn set_qlinear_accumulator_process_cap_bytes(bytes: u64) {
-    ACCUMULATOR_BUDGET.set_process_cap_bytes(bytes);
-}
-
-/// The process-wide accumulator scratch ceiling currently in force.
-pub fn qlinear_accumulator_process_cap_bytes() -> u64 {
-    ACCUMULATOR_BUDGET.process_cap_bytes()
-}
-
-/// Predicted resident bytes the accumulator scratch budget will hold for
-/// `graph`, for the memory plan to fold into its resident total.
-///
-/// The budget is a **fixed** process-wide pool ([`MAX_PROCESS_ACCUMULATOR_BYTES`]),
-/// not a per-weight cache, so its ceiling does not scale with the number of
-/// `QLinearMatMul` nodes: one node that reaches the parking path can fill the
-/// whole pool across the thread count, and more nodes share the same pool. The
-/// prediction is therefore the flat process cap when the graph contains any
-/// `QLinearMatMul`, and zero otherwise (a model with none never parks). This is
-/// the honest ceiling -- the process exposure, not a per-buffer figure silent
-/// about the thread multiplier.
-pub fn qlinear_accumulator_budget_predicted_bytes(graph: &Graph) -> u64 {
-    let has_qlinear_matmul = graph
-        .nodes
-        .values()
-        .any(|node| node.is_default_domain() && node.op_type == "QLinearMatMul");
-    if has_qlinear_matmul {
-        MAX_PROCESS_ACCUMULATOR_BYTES as u64
-    } else {
-        0
-    }
-}
-
 /// Heap bytes the constant-`B` pre-packs currently hold across all kernels --
 /// the figure the [`qlinear_packed_b_predicted_bytes`] prediction is checked
 /// against (#1056). Zero without the `mlas` feature (nothing is ever packed).
@@ -310,6 +201,7 @@ thread_local! {
     /// Thread-local rather than global: the test harness gives each test its own
     /// thread, so a count read here is this test's own calls and cannot be
     /// perturbed by whatever else is running in parallel.
+    static PRODUCT_INITIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static DIRECT_OUTPUT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static STAGED_OUTPUT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Counts the calls where `dense_bytes` handed back a borrow of the caller's
@@ -374,6 +266,7 @@ struct QgemmPackKey {
 }
 
 pub struct QLinearMatMulKernel {
+    #[cfg(feature = "mlas")]
     retain_caches: bool,
     /// Which operands the graph guarantees are constant initializers. Only
     /// index 3 (`B`) is consulted; the rest are carried so the array lines up
@@ -421,9 +314,16 @@ impl KernelFactory for QLinearMatMulFactory {
 }
 
 impl QLinearMatMulKernel {
+    fn accumulator_layout(geometry: &Geometry) -> Result<WorkspaceLayout<1>> {
+        let layout = Layout::array::<i32>(geometry.tile_len).map_err(|_| EpError::KernelFailed(format!(
+            "QLinearMatMul accumulator [{}, {}] exceeds addressable i32 workspace; reduce the matrix dimensions", geometry.m, geometry.n
+        )))?;
+        WorkspaceLayout::new([layout])
+    }
+
     fn new(retain_caches: bool, weight_memory: DerivedWeightMemory) -> Self {
         #[cfg(not(feature = "mlas"))]
-        let _ = weight_memory;
+        let _ = (retain_caches, weight_memory);
         #[cfg(feature = "mlas")]
         let packed_b = Arc::new(QgemmPackCache::default());
         #[cfg(feature = "mlas")]
@@ -431,6 +331,7 @@ impl QLinearMatMulKernel {
             weight_memory.register_idle_cache(&packed_b);
         }
         Self {
+            #[cfg(feature = "mlas")]
             retain_caches,
             constant_inputs: [false; 8],
             #[cfg(feature = "mlas")]
@@ -751,7 +652,47 @@ impl Kernel for QLinearMatMulKernel {
         Ok(true)
     }
 
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        if inputs.len() != 8 || !inputs[0].present || !inputs[3].present {
+            return Err(EpError::KernelFailed("QLinearMatMul workspace needs eight input slots with present A (0) and B (3); provide complete quantized-matmul metadata".into()));
+        }
+        let geometry = Geometry::new(inputs[0].shape, inputs[3].shape)?;
+        if geometry.tile_len == 0 {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let layout = Self::accumulator_layout(&geometry)?;
+        Ok(WorkspaceRequirement {
+            bytes: layout.bytes() as u64,
+            alignment: layout.alignment(),
+            ..WorkspaceRequirement::NONE
+        })
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
+    }
+}
+
+impl QLinearMatMulKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         check_arity("QLinearMatMul", inputs, outputs, 8, 8, 1)?;
         let a = &inputs[0];
         let b = &inputs[3];
@@ -779,15 +720,32 @@ impl Kernel for QLinearMatMulKernel {
         }
 
         let geometry = Geometry::new(a.shape, b.shape)?;
-        if outputs[0].shape != geometry.output_shape {
+        if outputs[0].shape != geometry.output_shape.as_slice() {
             return Err(EpError::KernelFailed(format!(
                 "QLinearMatMul: output shape {:?} must be {:?}",
                 outputs[0].shape, geometry.output_shape
             )));
         }
+        let [region] = Self::accumulator_layout(&geometry)?.bind(workspace)?;
+        let products_storage: &mut [MaybeUninit<i32>] = if region.bytes() == 0 {
+            &mut []
+        } else {
+            // SAFETY: the executor exclusively lends complete, live Host scratch
+            // through this synchronous call. Binding checked capacity/alignment;
+            // fresh bytes are not assumed initialized until the selected route fills them.
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    region.ptr().as_ptr::<MaybeUninit<i32>>(),
+                    geometry.tile_len,
+                )
+            }
+        };
         let a_quant = QuantParams::load("a", &inputs[1], &inputs[2], a.shape, QuantAxis::Row)?;
         let b_quant = QuantParams::load("b", &inputs[4], &inputs[5], b.shape, QuantAxis::Column)?;
         let (y_scale, y_zero_point) = output_quant_params(&inputs[6], &inputs[7])?;
+        if geometry.result_len == 0 {
+            return Ok(());
+        }
 
         let a_signed = inputs[0].dtype == DataType::Int8;
         let b_signed = inputs[3].dtype == DataType::Int8;
@@ -797,7 +755,7 @@ impl Kernel for QLinearMatMulKernel {
         // and reads `B` straight out of the caller's buffer.
         // A constant B is packed once. After that its dense bytes are dead --
         // they exist only to feed the packer -- so skip the copy, which is
-        // `k * n` bytes on every call and dominates decode at large K and N.
+        // `geometry.b_matrix_len` bytes on every call and dominates decode at large K and N.
         #[cfg(feature = "mlas")]
         let pack_key = qgemm
             .as_ref()
@@ -878,17 +836,6 @@ impl Kernel for QLinearMatMulKernel {
         let mut batch_index = vec![0; geometry.batch_shape.len()];
         // Hoisted out of the batch loop: both are re-filled per batch, so a
         // many-batch call allocates once rather than once per batch.
-        // The accumulator is borrowed from this thread's scratch, so a repeated
-        // shape reuses one already-faulted mapping instead of buying a new one.
-        // Taking it out of the thread-local returns its reservation to the
-        // process-wide budget; it is re-reserved at the end iff it still fits.
-        let mut products: Vec<i32> = if self.retain_caches {
-            ACCUMULATOR.with(|cell| cell.take())
-        } else {
-            Vec::new()
-        };
-        let _ =
-            ACCUMULATOR_BUDGET.release((products.capacity() * std::mem::size_of::<i32>()) as u64);
         let mut b_zero_points: Vec<i32> = Vec::new();
         let mut a_zero_points: Vec<i32> = Vec::new();
         let mut b_scales: Vec<f32> = Vec::new();
@@ -897,8 +844,8 @@ impl Kernel for QLinearMatMulKernel {
         for batch in 0..geometry.batch_count {
             let a_batch = geometry.a_batch_offset(&batch_index);
             let b_batch = geometry.b_batch_offset(&batch_index);
-            let a_offset = a_batch * m * k;
-            let b_offset = b_batch * k * n;
+            let a_offset = a_batch * geometry.a_matrix_len;
+            let b_offset = b_batch * geometry.b_matrix_len;
             // `n == 0` produces no output for this batch, and both
             // `par_chunks_mut(0)` and `chunks_exact(0)` panic, so leave early.
             if n == 0 {
@@ -924,21 +871,6 @@ impl Kernel for QLinearMatMulKernel {
                 Some(_) => fused_scale(&a_quant, a_batch, &b_scales, y_scale, &mut combined_scales),
                 None => None,
             };
-            #[cfg(not(feature = "mlas"))]
-            let fused: Option<()> = None;
-
-            if fused.is_some() {
-                // Only the length matters here. Growing through `vec![0; len]`
-                // reaches `alloc_zeroed`, which the allocator serves with fresh
-                // zero pages instead of a `memset` at these sizes; re-running
-                // the same shape reuses the buffer untouched.
-                if products.len() != m * n {
-                    products = vec![0i32; m * n];
-                }
-            } else {
-                products.clear();
-                products.resize(m * n, 0);
-            }
 
             if let Some(plan) = &qgemm {
                 // Requantize inside MLAS when the combined scale allows it, so
@@ -948,16 +880,16 @@ impl Kernel for QLinearMatMulKernel {
                 // maps it to the zero point -- keeps a call off this path.
                 #[cfg(feature = "mlas")]
                 if let Some(scale) = fused {
-                    let region = sink.region(batch * m * n, m * n);
+                    let region = sink.region(batch * geometry.tile_len, geometry.tile_len);
                     plan.run_requantized(
                         m,
                         n,
                         k,
-                        &a_bytes[a_offset..a_offset + m * k],
+                        &a_bytes[a_offset..a_offset + geometry.a_matrix_len],
                         match packed {
                             Some(packed) => mlas_sys::QgemmWeights::Packed(packed),
                             None => mlas_sys::QgemmWeights::Dense {
-                                bytes: &b_bytes[b_offset..b_offset + k * n],
+                                bytes: &b_bytes[b_offset..b_offset + geometry.b_matrix_len],
                                 signed: plan.b_signed,
                             },
                         },
@@ -966,35 +898,36 @@ impl Kernel for QLinearMatMulKernel {
                         region,
                         out_dtype == DataType::Int8,
                         y_zero_point,
-                        &mut products,
+                        products_storage,
                     )?;
                     if batch + 1 < geometry.batch_count {
                         next_index(&geometry.batch_shape, &mut batch_index);
                     }
                     continue;
                 }
+                let products = initialize_products(products_storage);
                 match packed {
                     Some(packed) => plan.run_packed(
                         m,
                         n,
                         k,
-                        &a_bytes[a_offset..a_offset + m * k],
+                        &a_bytes[a_offset..a_offset + geometry.a_matrix_len],
                         packed,
                         &b_zero_points,
-                        &mut products,
+                        products,
                     )?,
                     None => plan.run(
                         m,
                         n,
                         k,
-                        &a_bytes[a_offset..a_offset + m * k],
-                        &b_bytes[b_offset..b_offset + k * n],
+                        &a_bytes[a_offset..a_offset + geometry.a_matrix_len],
+                        &b_bytes[b_offset..b_offset + geometry.b_matrix_len],
                         &b_zero_points,
-                        &mut products,
+                        products,
                     )?,
                 }
                 requantize_rows(
-                    &products,
+                    products,
                     &a_quant,
                     a_batch,
                     &b_scales,
@@ -1002,7 +935,7 @@ impl Kernel for QLinearMatMulKernel {
                     y_scale,
                     y_zero_point,
                     out_dtype,
-                    sink.region(batch * m * n, m * n),
+                    sink.region(batch * geometry.tile_len, geometry.tile_len),
                 )?;
                 if batch + 1 < geometry.batch_count {
                     next_index(&geometry.batch_shape, &mut batch_index);
@@ -1020,13 +953,14 @@ impl Kernel for QLinearMatMulKernel {
             // same `i32`. Wrapping addition is associative and commutative, so
             // the kernel's blocking and its thread count are likewise unable to
             // change a single output bit, on overflow included.
+            let products = initialize_products(products_storage);
             qgemm_native::qgemm(
                 qgemm_native::Operand {
-                    bytes: &a_bytes[a_offset..a_offset + m * k],
+                    bytes: &a_bytes[a_offset..a_offset + geometry.a_matrix_len],
                     signed: a_signed,
                 },
                 qgemm_native::Operand {
-                    bytes: &b_bytes[b_offset..b_offset + k * n],
+                    bytes: &b_bytes[b_offset..b_offset + geometry.b_matrix_len],
                     signed: b_signed,
                 },
                 &a_zero_points,
@@ -1034,11 +968,11 @@ impl Kernel for QLinearMatMulKernel {
                 m,
                 k,
                 n,
-                &mut products,
+                products,
             );
 
             requantize_rows(
-                &products,
+                products,
                 &a_quant,
                 a_batch,
                 &b_scales,
@@ -1046,27 +980,11 @@ impl Kernel for QLinearMatMulKernel {
                 y_scale,
                 y_zero_point,
                 out_dtype,
-                sink.region(batch * m * n, m * n),
+                sink.region(batch * geometry.tile_len, geometry.tile_len),
             )?;
             if batch + 1 < geometry.batch_count {
                 next_index(&geometry.batch_shape, &mut batch_index);
             }
-        }
-        // Park the accumulator for the next call on this thread. An early
-        // error return skips this and simply drops it, which costs the next
-        // call one allocation and cannot affect a result.
-        //
-        // Parking is admitted through the process-wide budget, not a per-thread
-        // constant: it succeeds only when this buffer is within the per-thread
-        // cap *and* the sum parked across every worker thread stays within
-        // `MAX_PROCESS_ACCUMULATOR_BYTES`. A refused buffer is dropped and
-        // recomputed next call (byte-identical), so the process footprint no
-        // longer scales with the thread count.
-        if self.retain_caches
-            && ACCUMULATOR_BUDGET
-                .try_park((products.capacity() * std::mem::size_of::<i32>()) as u64)
-        {
-            ACCUMULATOR.with(|cell| cell.replace(products));
         }
         match sink {
             // The direct sink already wrote every byte the caller asked for.
@@ -1074,10 +992,16 @@ impl Kernel for QLinearMatMulKernel {
             OutputSink::Staged(bytes) => write_dense_bytes(&mut outputs[0], &bytes),
         }
     }
+}
 
-    fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        true
+fn initialize_products(storage: &mut [MaybeUninit<i32>]) -> &mut [i32] {
+    #[cfg(test)]
+    PRODUCT_INITIALIZATIONS.with(|count| count.set(count.get() + 1));
+    for element in storage.iter_mut() {
+        element.write(0);
     }
+    // SAFETY: every element was initialized to a valid i32 above.
+    unsafe { std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast(), storage.len()) }
 }
 
 fn is_quantized(dtype: DataType) -> bool {
@@ -1403,7 +1327,7 @@ impl QgemmPlan {
         output: &mut [u8],
         output_signed: bool,
         output_zero_point: i32,
-        products: &mut [i32],
+        products: &mut [MaybeUninit<i32>],
     ) -> Result<()> {
         self.b_zero_point_bytes(b_zero_points, n)?;
         let bytes = self.b_zero_point_bytes.borrow();
@@ -1904,41 +1828,73 @@ struct Geometry {
     m: usize,
     k: usize,
     n: usize,
-    a_batch: Vec<usize>,
-    b_batch: Vec<usize>,
-    a_batch_strides: Vec<i64>,
-    b_batch_strides: Vec<i64>,
+    a_matrix_len: usize,
+    b_matrix_len: usize,
+    tile_len: usize,
+    a_batch: SmallVec<[usize; 4]>,
+    b_batch: SmallVec<[usize; 4]>,
     batch_shape: Vec<usize>,
     batch_count: usize,
     result_len: usize,
-    output_shape: Vec<usize>,
+    output_shape: SmallVec<[usize; 4]>,
+}
+
+fn checked_elements(shape: &[usize], name: &str) -> Result<usize> {
+    if shape.contains(&0) {
+        return Ok(0);
+    }
+    shape.iter().try_fold(1usize, |count, &dimension| count.checked_mul(dimension))
+        .filter(|&count| count <= isize::MAX as usize)
+        .ok_or_else(|| EpError::KernelFailed(format!("QLinearMatMul {name} shape {shape:?} exceeds addressable element storage; reduce its dimensions")))
 }
 
 impl Geometry {
     fn new(a: &[usize], b: &[usize]) -> Result<Self> {
-        let a_1d = a.len() == 1;
-        let b_1d = b.len() == 1;
-        let a = if a_1d { vec![1, a[0]] } else { a.to_vec() };
-        let b = if b_1d { vec![b[0], 1] } else { b.to_vec() };
-        if a.len() < 2 || b.len() < 2 {
+        if a.is_empty() || b.is_empty() {
             return Err(EpError::KernelFailed(
                 "QLinearMatMul: operands must be at least 1-D".into(),
             ));
         }
-        let m = a[a.len() - 2];
+        checked_elements(a, "A")?;
+        checked_elements(b, "B")?;
+        let a_1d = a.len() == 1;
+        let b_1d = b.len() == 1;
+        let m = if a_1d { 1 } else { a[a.len() - 2] };
         let k = a[a.len() - 1];
-        let b_k = b[b.len() - 2];
-        let n = b[b.len() - 1];
+        let b_k = if b_1d { b[0] } else { b[b.len() - 2] };
+        let n = if b_1d { 1 } else { b[b.len() - 1] };
         if k != b_k {
             return Err(EpError::KernelFailed(format!(
                 "QLinearMatMul: inner dims disagree ({k} vs {b_k})"
             )));
         }
-        let a_batch = a[..a.len() - 2].to_vec();
-        let b_batch = b[..b.len() - 2].to_vec();
+        let a_batch: SmallVec<[usize; 4]> =
+            a[..a.len().saturating_sub(2)].iter().copied().collect();
+        let b_batch: SmallVec<[usize; 4]> =
+            b[..b.len().saturating_sub(2)].iter().copied().collect();
         let batch_shape = broadcast_shapes(&a_batch, &b_batch)?;
-        let batch_count = numel(&batch_shape);
-        let mut output_shape = batch_shape.clone();
+        let batch_count = if m == 0 || n == 0 {
+            0
+        } else {
+            checked_elements(&batch_shape, "broadcast batch")?
+        };
+        let tile_len = if batch_count == 0 {
+            0
+        } else {
+            checked_elements(&[m, n], "accumulator")?
+        };
+        let result_len = checked_elements(&[batch_count, tile_len], "output")?;
+        let a_matrix_len = if batch_count == 0 {
+            0
+        } else {
+            checked_elements(&[m, k], "A matrix")?
+        };
+        let b_matrix_len = if batch_count == 0 {
+            0
+        } else {
+            checked_elements(&[k, n], "B matrix")?
+        };
+        let mut output_shape: SmallVec<[usize; 4]> = batch_shape.iter().copied().collect();
         if !a_1d {
             output_shape.push(m);
         }
@@ -1949,40 +1905,38 @@ impl Geometry {
             m,
             k,
             n,
-            a_batch_strides: compute_contiguous_strides(&a_batch),
-            b_batch_strides: compute_contiguous_strides(&b_batch),
+            a_matrix_len,
+            b_matrix_len,
+            tile_len,
             a_batch,
             b_batch,
             batch_shape,
             batch_count,
-            result_len: batch_count * m * n,
+            result_len,
             output_shape,
         })
     }
-
     fn a_batch_offset(&self, batch_index: &[usize]) -> usize {
-        broadcast_offset(batch_index, &self.a_batch, &self.a_batch_strides)
+        broadcast_offset(batch_index, &self.a_batch)
     }
-
     fn b_batch_offset(&self, batch_index: &[usize]) -> usize {
-        broadcast_offset(batch_index, &self.b_batch, &self.b_batch_strides)
+        broadcast_offset(batch_index, &self.b_batch)
     }
 }
 
-fn broadcast_offset(batch_index: &[usize], shape: &[usize], strides: &[i64]) -> usize {
+fn broadcast_offset(batch_index: &[usize], shape: &[usize]) -> usize {
     let leading = batch_index.len() - shape.len();
     shape
         .iter()
-        .zip(strides)
         .enumerate()
-        .map(|(index, (&dimension, &stride))| {
-            if dimension == 1 {
-                0
-            } else {
-                batch_index[leading + index] * stride as usize
-            }
+        .fold(0, |offset, (index, &dimension)| {
+            offset * dimension
+                + if dimension == 1 {
+                    0
+                } else {
+                    batch_index[leading + index]
+                }
         })
-        .sum()
 }
 
 fn next_index(shape: &[usize], index: &mut [usize]) {
@@ -2643,171 +2597,326 @@ mod tests {
     fn execute(inputs: [&Owned; 8], output_dtype: DataType, output_shape: &[usize]) -> Owned {
         let mut output = Owned::zeros(output_dtype, output_shape);
         QLinearMatMulKernel::default()
-            .execute(&inputs.map(|input| input.view()), &mut [output.view_mut()])
+            .execute_prepared(&inputs.map(|input| input.view()), &mut [output.view_mut()])
             .unwrap();
         output
     }
 
-    #[test]
-    fn provider_cache_retention_decline_preserves_peer_parked_scratch() {
-        use onnx_runtime_ep_api::ExecutionProvider;
-        std::thread::spawn(|| {
-            let (a, b) = (
-                Owned::u8(&[2, 3], &[130, 132, 134, 136, 138, 140]),
-                Owned::u8(&[3, 2], &[120, 121, 122, 123, 124, 125]),
-            );
-            let (a_scale, a_zero) = (Owned::f32(&[], &[0.5]), Owned::u8(&[], &[128]));
-            let (b_scale, b_zero) = (Owned::f32(&[], &[0.25]), Owned::u8(&[], &[127]));
-            let (y_scale, y_zero) = (Owned::f32(&[], &[64.0]), Owned::u8(&[], &[100]));
-            let inputs = [
-                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
-            ]
-            .map(|value| value.view());
-            let node = Node::new(onnx_runtime_ir::NodeId(0), "QLinearMatMul", vec![], vec![]);
-            for admitted_first in [true, false] {
-                let make = |admitted| {
-                    crate::CpuExecutionProvider::with_resources(
-                        crate::CpuMemoryResources::default()
-                            .with_cache_retention(crate::CpuCacheRetention::new(admitted)),
-                    )
-                };
-                let first = make(admitted_first);
-                let second = make(!admitted_first);
-                let (admitted, declined) = if admitted_first {
-                    (&first, &second)
-                } else {
-                    (&second, &first)
-                };
-                let admitted = admitted
-                    .get_kernel(&node, &[vec![2, 3], vec![], vec![], vec![3, 2]], 10)
-                    .unwrap();
-                let declined = declined
-                    .get_kernel(&node, &[vec![2, 3], vec![], vec![], vec![3, 2]], 10)
-                    .unwrap();
-                let mut expected = Owned::zeros(DataType::Uint8, &[2, 2]);
-                admitted
-                    .execute(&inputs, &mut [expected.view_mut()])
-                    .unwrap();
-                let parked = ACCUMULATOR.with(|slot| {
-                    let slot = slot.borrow();
-                    (slot.as_ptr(), slot.capacity())
-                });
-                assert!(parked.1 >= 4);
-                let mut actual = Owned::zeros(DataType::Uint8, &[2, 2]);
-                declined.execute(&inputs, &mut [actual.view_mut()]).unwrap();
-                assert_eq!(actual.bytes, expected.bytes);
-                assert_eq!(
-                    ACCUMULATOR.with(|slot| {
-                        let slot = slot.borrow();
-                        (slot.as_ptr(), slot.capacity())
-                    }),
-                    parked,
-                    "declined provider must neither consume nor replace a peer's parked scratch"
-                );
-            }
-            // This dedicated worker exits with no parked reservation.
-            ACCUMULATOR.with(|slot| {
-                let buffer = slot.take();
-                ACCUMULATOR_BUDGET.release((buffer.capacity() * std::mem::size_of::<i32>()) as u64);
-            });
-        })
-        .join()
-        .unwrap();
+    fn workspace_inputs(batches: usize) -> [Owned; 8] {
+        let values: Vec<u8> = (0..batches * 6)
+            .map(|i| (1 + i % 6 + i / 6) as u8)
+            .collect();
+        [
+            Owned::u8(&[batches, 2, 3], &values),
+            Owned::f32(&[], &[1.]),
+            Owned::u8(&[], &[0]),
+            Owned::u8(&[3, 2], &[1, 0, 0, 1, 1, 1]),
+            Owned::f32(&[], &[1.]),
+            Owned::u8(&[], &[0]),
+            Owned::f32(&[], &[1.]),
+            Owned::u8(&[], &[0]),
+        ]
     }
 
-    /// The parked accumulator scratch must be bounded across the **whole
-    /// process**, not per thread. This is the defect the review named: a per-
-    /// thread cap is silent about the `x threads` multiplier, so the real
-    /// ceiling was `32 MiB x threads` (1 GiB on a 32-vCPU box).
-    ///
-    /// A single-instantiation test structurally cannot observe that multiplier
-    /// -- that is exactly how #1100 slipped through -- so this drives the kernel
-    /// from **many worker threads at once** and checks the summed retention.
-    ///
-    /// # How to falsify it
-    ///
-    /// The assertion that fails when the fix is reverted is the process-cap one:
-    /// make `GovernedAccumulatorBudget::try_park` ignore `process_cap_bytes`
-    /// (the per-thread-only bound the PR replaced) and every one of the N worker
-    /// threads parks a full buffer, so `qlinear_accumulator_live_bytes()` climbs
-    /// to `N x per_thread_buffer` -- far over the process cap -- and the upper-
-    /// bound assertion below fails. Restored, the sum is capped and it passes.
     #[test]
-    fn the_parked_accumulator_is_bounded_process_wide_not_per_thread() {
-        use std::sync::Mutex;
-        // Serialise against any other test that also drives large parked
-        // buffers so the reset below opens a clean window; the *upper*-bound
-        // assertion holds regardless, being enforced inside `try_park`.
-        static SERIALISE: Mutex<()> = Mutex::new(());
-        let _guard = SERIALISE
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
-        // `m * n` just under the 32 MiB per-thread cap so a full buffer is
-        // admitted (a buffer *over* the cap is released -- tested separately),
-        // while four of them saturate the 128 MiB process cap.
-        let (m, k, n) = (2000usize, 64usize, 4096usize);
-        let buffer_bytes = (m * n * std::mem::size_of::<i32>()) as u64;
-        assert!(
-            buffer_bytes < MAX_RETAINED_ACCUMULATOR_BYTES as u64,
-            "a single buffer must fit the per-thread cap or nothing parks"
-        );
-
-        let threads = 8usize;
-        assert!(
-            (threads as u64) * buffer_bytes > MAX_PROCESS_ACCUMULATOR_BYTES as u64,
-            "the pool must want to park more than the process cap allows, or \
-             the bound is never exercised"
-        );
-
-        let a = Owned::u8(&[m, k], &vec![130u8; m * k]);
-        let a_scale = Owned::f32(&[], &[0.5]);
-        let a_zero = Owned::u8(&[], &[128]);
-        let b = Owned::u8(&[k, n], &vec![120u8; k * n]);
-        let b_scale = Owned::f32(&[], &[0.25]);
-        let b_zero = Owned::u8(&[], &[127]);
-        let y_scale = Owned::f32(&[], &[64.0]);
-        let y_zero = Owned::u8(&[], &[100]);
-        let inputs = [
-            &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
-        ];
-
-        ACCUMULATOR_BUDGET.reset_for_test();
-
+    fn workspace_bounds_are_checked_and_do_not_multiply_by_batch_count() {
         let kernel = QLinearMatMulKernel::default();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("build a dedicated pool");
-        // `broadcast` runs the closure once on every worker thread, so each of
-        // the `threads` workers runs a full `execute` and parks its own
-        // thread-local accumulator -- the multi-thread drive the bound needs.
-        pool.broadcast(|_| {
-            let mut output = Owned::zeros(DataType::Uint8, &[m, n]);
+        let requirement = |a: &[usize], b: &[usize]| {
+            let mut metadata = [TensorMetadata::new(DataType::Uint8, &[], true); 8];
+            metadata[0].shape = a;
+            metadata[3].shape = b;
+            kernel.workspace_requirement(&metadata)
+        };
+        for batches in [1, 2, 64] {
+            assert_eq!(requirement(&[batches, 2, 3], &[3, 4]).unwrap().bytes, 32);
+        }
+        for (a, b) in [
+            (vec![0, 2, 3], vec![3, 4]),
+            (vec![0, 3], vec![3, 4]),
+            (vec![2, 3], vec![3, 0]),
+            (
+                vec![0, usize::MAX, usize::MAX],
+                vec![0, usize::MAX, usize::MAX],
+            ),
+        ] {
+            assert_eq!(requirement(&a, &b).unwrap(), WorkspaceRequirement::NONE);
+        }
+        assert_eq!(requirement(&[2, 0], &[0, 3]).unwrap().bytes, 24);
+        assert_eq!(requirement(&[3], &[3]).unwrap().bytes, 4);
+        for (a, b) in [
+            (vec![usize::MAX, 2], vec![2, 3]),
+            (vec![isize::MAX as usize, 2, 0], vec![0, 2]),
+            (vec![isize::MAX as usize / 4 + 1, 0], vec![0, 1]),
+        ] {
+            let error = requirement(&a, &b).unwrap_err().to_string();
+            assert!(
+                error.contains("QLinearMatMul") && error.contains("reduce"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_workspace_preserves_output_and_batches_refill_one_accumulator() {
+        let data = workspace_inputs(2);
+        let inputs = data.each_ref().map(|value| value.view());
+        let kernel = QLinearMatMulKernel::default();
+        let mut output = Owned::u8(&[2, 2, 2], &[73; 8]);
+        let error = kernel
+            .execute(&inputs, &mut [output.view_mut()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("16 bytes") && error.contains("prepare and pass"),
+            "{error}"
+        );
+        assert_eq!(output.bytes, [73; 8]);
+        kernel
+            .execute_prepared(&inputs, &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(output.bytes, [4, 5, 10, 11, 6, 7, 12, 13]);
+    }
+
+    #[test]
+    fn governed_accumulator_reuses_real_backing_without_warm_issuer_calls() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{
+            HolderId, HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
+        };
+        use std::sync::Arc;
+        let books = Arc::new(RecordingGovernor::new_host(1 << 20));
+        let manager = ProcessMemoryManager::new().unwrap();
+        let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+        let resources = crate::CpuMemoryResources::new(
+            books.weight_memory(HolderId::new(13)),
+            Default::default(),
+        )
+        .unwrap()
+        .with_workspace_pool(pool.clone())
+        .unwrap();
+        let provider = crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+        let mut kernel = provider
+            .get_kernel(
+                &Node::new(onnx_runtime_ir::NodeId(0), "QLinearMatMul", vec![], vec![]),
+                &[],
+                10,
+            )
+            .unwrap();
+        kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+        let data = workspace_inputs(2);
+        let inputs = data.each_ref().map(|value| value.view());
+        let metadata = inputs.map(|input| TensorMetadata::new(input.dtype, input.shape, true));
+        let request = kernel.workspace_requirement(&metadata).unwrap();
+        assert_eq!(request.bytes, 16);
+        let mut allocation = provider
+            .allocate_workspace(16, request.alignment, request.role)
+            .unwrap();
+        let identity = allocation.managed_owner().unwrap().identity();
+        let mut output = Owned::zeros(DataType::Uint8, &[2, 2, 2]);
+        let workspace = WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(allocation.as_mut_ptr()),
+            allocation.len(),
+        );
+        kernel
+            .execute_with_workspace(&inputs, &mut [output.view_mut()], Some(workspace))
+            .unwrap();
+        provider.deallocate_workspace(allocation).unwrap();
+        let packed_bytes = books.used(Tier::Host) - manager.process_used(Tier::Host);
+        #[cfg(feature = "mlas")]
+        if mlas_sys::qgemm_pack_b_size(2, 3, false, false).is_some() {
+            assert!(
+                packed_bytes > 0,
+                "the retained-pack arm must actually prepare a weight"
+            );
+        }
+        let calls = (books.claims(), books.releases());
+        for _ in 0..4096 {
+            let mut allocation = provider
+                .allocate_workspace(16, request.alignment, request.role)
+                .unwrap();
+            assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
+            let workspace = WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(allocation.as_mut_ptr()),
+                allocation.len(),
+            );
             kernel
-                .execute(&inputs.map(|input| input.view()), &mut [output.view_mut()])
-                .expect("kernel runs");
+                .execute_with_workspace(&inputs, &mut [output.view_mut()], Some(workspace))
+                .unwrap();
+            provider.deallocate_workspace(allocation).unwrap();
+        }
+        assert_eq!(output.bytes, [4, 5, 10, 11, 6, 7, 12, 13]);
+        assert_eq!((books.claims(), books.releases()), calls);
+        assert_eq!(books.used(Tier::Host), 16 + packed_bytes);
+        assert_eq!(manager.process_used(Tier::Host), 16);
+        drop(kernel);
+        assert_eq!(books.used(Tier::Host), 16);
+        pool.trim_idle(16).unwrap();
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn empty_output_needs_no_workspace_and_zero_k_requantizes_zero() {
+        let kernel = QLinearMatMulKernel::default();
+        for (a_shape, b_shape, output_shape, bytes) in [
+            (vec![0, 2, 3], vec![3, 2], vec![0, 2, 2], 0),
+            (vec![0, 3], vec![3, 2], vec![0, 2], 0),
+            (vec![2, 3], vec![3, 0], vec![2, 0], 0),
+            (vec![2, 0], vec![0, 3], vec![2, 3], 6),
+        ] {
+            let mut data = workspace_inputs(1);
+            data[0] = Owned::u8(&a_shape, &vec![1; a_shape.iter().product()]);
+            data[3] = Owned::u8(&b_shape, &vec![1; b_shape.iter().product()]);
+            data[7] = Owned::u8(&[], &[100]);
+            let mut output = Owned::zeros(DataType::Uint8, &output_shape);
+            let inputs = data.each_ref().map(|value| value.view());
+            if bytes == 0 {
+                kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
+            } else {
+                kernel
+                    .execute_prepared(&inputs, &mut [output.view_mut()])
+                    .unwrap();
+            }
+            assert_eq!(output.bytes, vec![100; bytes]);
+        }
+    }
+
+    #[test]
+    fn concurrent_accumulators_are_funded_and_exclusive_until_completion() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{
+            HolderId, HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
+        };
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let books = Arc::new(RecordingGovernor::new_host(48));
+        let manager = ProcessMemoryManager::new().unwrap();
+        let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+        let resources = crate::CpuMemoryResources::new(
+            books.weight_memory(HolderId::new(13)),
+            Default::default(),
+        )
+        .unwrap()
+        .with_workspace_pool(pool.clone())
+        .unwrap();
+        let provider = crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+        let kernel = QLinearMatMulKernel::default();
+        let data = workspace_inputs(2);
+        let ready = Barrier::new(5);
+        let release = Barrier::new(5);
+        let refused = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let (provider, kernel, data, ready, release, refused) =
+                    (&provider, &kernel, &data, &ready, &release, &refused);
+                scope.spawn(move || {
+                    let request = WorkspaceRequirement {
+                        bytes: 16,
+                        alignment: 4,
+                        ..WorkspaceRequirement::NONE
+                    };
+                    let allocation = provider.allocate_workspace(16, 4, request.role);
+                    if allocation.is_err() {
+                        refused.fetch_add(1, Ordering::Relaxed);
+                    }
+                    ready.wait();
+                    release.wait();
+                    if let Ok(mut allocation) = allocation {
+                        let workspace = WorkspaceView::new(
+                            onnx_runtime_ep_api::DevicePtrMut(allocation.as_mut_ptr()),
+                            allocation.len(),
+                        );
+                        let mut output = Owned::zeros(DataType::Uint8, &[2, 2, 2]);
+                        kernel
+                            .execute_with_workspace(
+                                &data.each_ref().map(|value| value.view()),
+                                &mut [output.view_mut()],
+                                Some(workspace),
+                            )
+                            .unwrap();
+                        assert_eq!(output.bytes, [4, 5, 10, 11, 6, 7, 12, 13]);
+                        provider.deallocate_workspace(allocation).unwrap();
+                    }
+                });
+            }
+            ready.wait();
+            let refused_now = refused.load(Ordering::Relaxed);
+            let used_now = (books.used(Tier::Host), manager.process_used(Tier::Host));
+            let snapshot = manager.snapshot();
+            release.wait();
+            assert_eq!(
+                refused_now, 1,
+                "only three 16-byte active lanes fit real Host quota"
+            );
+            assert_eq!(used_now, (48, 48));
+            let allocations = snapshot.unwrap().allocations;
+            assert_eq!(allocations.len(), 3);
+            let identities = allocations
+                .iter()
+                .map(|allocation| allocation.identity)
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                identities.len(),
+                3,
+                "concurrent calls never alias one mutable lane"
+            );
         });
+        pool.trim_idle(48).unwrap();
+        assert_eq!(books.used(Tier::Host), 0);
+    }
 
-        let live = qlinear_accumulator_live_bytes();
-
-        // The fix: the sum parked across all worker threads is bounded by the
-        // process cap, not `threads x per_thread_buffer`.
-        assert!(
-            live <= MAX_PROCESS_ACCUMULATOR_BYTES as u64,
-            "parked accumulator bytes {live} exceeded the process cap {MAX_PROCESS_ACCUMULATOR_BYTES} \
-             -- the per-thread bound multiplied by the thread count"
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn fused_uninitialized_scratch_and_native_accumulation_reuse_safely() {
+        let mut data = workspace_inputs(3);
+        data[0] = Owned::u8(&[3, 2, 3], &[0; 18]);
+        data[1] = Owned::f32(&[], &[1e30]);
+        data[3] = Owned::u8(&[3, 3, 2], &[1; 18]);
+        data[4] = Owned::f32(&[3, 1, 2], &[1e-30, 1e-30, 1e30, 1e30, 1e-30, 1e-30]);
+        data[5] = Owned::u8(&[3, 1, 2], &[0; 6]);
+        data[7] = Owned::u8(&[], &[100]);
+        let kernel = QLinearMatMulKernel::default();
+        let mut output = Owned::zeros(DataType::Uint8, &[3, 2, 2]);
+        let mut scratch = [MaybeUninit::<i32>::uninit(); 4];
+        let workspace = WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(scratch.as_mut_ptr().cast()),
+            16,
         );
-        // Non-vacuity: more than one thread parked, so this genuinely observed
-        // the multiplier a single-instantiation test cannot. If the kernel ever
-        // stopped parking, this catches it too.
-        assert!(
-            live >= 2 * buffer_bytes,
-            "expected several threads to have parked ({buffer_bytes} bytes each), saw only \
-             {live} -- the test is not exercising multi-thread retention"
+        PRODUCT_INITIALIZATIONS.with(|count| count.set(0));
+        kernel
+            .execute_with_workspace(
+                &data.each_ref().map(|value| value.view()),
+                &mut [output.view_mut()],
+                Some(workspace),
+            )
+            .unwrap();
+        assert_eq!(output.bytes, [100; 12]);
+        assert_eq!(
+            PRODUCT_INITIALIZATIONS.with(|count| count.get()),
+            1,
+            "fused batches do not add a memset"
         );
-
-        ACCUMULATOR_BUDGET.reset_for_test();
+        data[1] = Owned::f32(&[3, 2, 1], &[1.; 6]);
+        data[2] = Owned::u8(&[3, 2, 1], &[0; 6]);
+        PRODUCT_INITIALIZATIONS.with(|count| count.set(0));
+        kernel
+            .execute_with_workspace(
+                &data.each_ref().map(|value| value.view()),
+                &mut [output.view_mut()],
+                Some(workspace),
+            )
+            .unwrap();
+        assert_eq!(output.bytes, [100; 12]);
+        assert_eq!(
+            PRODUCT_INITIALIZATIONS.with(|count| count.get()),
+            3,
+            "native batches reset scratch after fused use"
+        );
     }
 
     /// A contiguous output must be requantized straight into the caller's
@@ -2857,7 +2966,7 @@ mod tests {
                 DeviceId::cpu(),
             );
             QLinearMatMulKernel::default()
-                .execute(&inputs.map(|input| input.view()), &mut [out])
+                .execute_prepared(&inputs.map(|input| input.view()), &mut [out])
                 .unwrap();
         }
         assert_eq!(
@@ -3549,7 +3658,7 @@ mod tests {
         let y_zero = Owned::u8(&[], &[0]);
         let mut out = Owned::zeros(DataType::Uint8, &[2, 1]);
         let error = QLinearMatMulKernel::default()
-            .execute(
+            .execute_prepared(
                 &[
                     a.view(),
                     a_scale.view(),
@@ -3825,10 +3934,15 @@ mod tests {
         }
     }
 
-    /// Run the kernel into a caller-owned output, so a benchmark can separate
-    /// the kernel's cost from the cost of allocating its result.
+    /// Run into caller-owned output/workspace to exclude their allocation
+    /// from the steady execution diagnostic.
     #[cfg(feature = "mlas")]
-    fn run_into(kernel: &QLinearMatMulKernel, fixture: &PackFixture, output: &mut Owned) {
+    fn run_into(
+        kernel: &QLinearMatMulKernel,
+        fixture: &PackFixture,
+        output: &mut Owned,
+        workspace: Option<WorkspaceView>,
+    ) {
         let (a_scale, a_zero) = (Owned::f32(&[], &[0.02]), Owned::u8(&[], &[128]));
         let (b_scale, b_zero) = (Owned::f32(&[], &[0.01]), Owned::u8(&[], &[127]));
         let (y_scale, y_zero) = (Owned::f32(&[], &[0.05]), Owned::u8(&[], &[120]));
@@ -3842,7 +3956,9 @@ mod tests {
             y_scale.view(),
             y_zero.view(),
         ];
-        kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
+        kernel
+            .execute_with_workspace(&inputs, &mut [output.view_mut()], workspace)
+            .unwrap();
     }
 
     #[cfg(feature = "mlas")]
@@ -3861,7 +3977,9 @@ mod tests {
             y_scale.view(),
             y_zero.view(),
         ];
-        kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
+        kernel
+            .execute_prepared(&inputs, &mut [output.view_mut()])
+            .unwrap();
         output
     }
 
@@ -4350,9 +4468,19 @@ mod tests {
                 .unwrap()
                 .output_shape;
             let mut output = Owned::zeros(DataType::Uint8, &output_shape);
-            run_into(&kernel, &fixture, &mut output);
+            let mut scratch = vec![MaybeUninit::<i32>::uninit(); output.bytes.len()];
+            let workspace = WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(scratch.as_mut_ptr().cast()),
+                scratch.len() * 4,
+            );
+            run_into(&kernel, &fixture, &mut output, Some(workspace));
             let mut reference = Owned::zeros(DataType::Uint8, &output_shape);
-            run_into(&QLinearMatMulKernel::default(), &fixture, &mut reference);
+            run_into(
+                &QLinearMatMulKernel::default(),
+                &fixture,
+                &mut reference,
+                Some(workspace),
+            );
             assert_eq!(output.bytes, reference.bytes);
             let actual = governor.used(Tier::Host);
             assert!(
@@ -4457,14 +4585,18 @@ mod tests {
             }
             let whole = start.elapsed() / reps;
 
-            // Same kernel call, but the caller's output tensor is allocated
-            // once and reused. `whole - whole_reused` is what per-call
-            // allocation of the result costs, which is the part a real session
-            // pays through ORT's arena rather than through `Owned::zeros`.
+            // Reuse both output and workspace. The fresh-buffer control above
+            // allocates both per call; their difference measures that combined
+            // lifecycle, not just result allocation.
             let mut reused = Owned::zeros(DataType::Uint8, &[m, n]);
+            let mut scratch = vec![MaybeUninit::<i32>::uninit(); m * n];
+            let workspace = WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(scratch.as_mut_ptr().cast()),
+                scratch.len() * 4,
+            );
             let start = std::time::Instant::now();
             for _ in 0..reps {
-                run_into(&kernel, &fixture, &mut reused);
+                run_into(&kernel, &fixture, &mut reused, Some(workspace));
             }
             let whole_reused = start.elapsed() / reps;
 
@@ -4526,6 +4658,7 @@ mod tests {
             // two are indistinguishable and a wrapper cost looks like a slow
             // kernel.
             let mut fused_out = vec![0u8; m * n];
+            let mut fused_products = vec![MaybeUninit::<i32>::uninit(); m * n];
             let fused_scales = vec![0.001f32; n];
             for _ in 0..3 {
                 mlas_sys::qgemm_requantize(
@@ -4541,7 +4674,7 @@ mod tests {
                     &mut fused_out,
                     false,
                     120,
-                    &mut products,
+                    &mut fused_products,
                 );
             }
             let start = std::time::Instant::now();
@@ -4559,7 +4692,7 @@ mod tests {
                     &mut fused_out,
                     false,
                     120,
-                    &mut products,
+                    &mut fused_products,
                 );
             }
             let fused = start.elapsed() / reps;
@@ -4583,18 +4716,17 @@ mod tests {
                     &mut fused_out,
                     false,
                     120,
-                    &mut products,
+                    &mut fused_products,
                 );
             }
             let fused_fresh_a = start.elapsed() / reps;
 
             // Same call, but the i32 accumulator is re-allocated per iteration
-            // the way `execute` re-allocates it. MLAS first-touches every page
-            // of it from every worker thread, so this is the other per-call
-            // buffer whose cost scales with the pool.
+            // as an explicit forced-cold control. The kernel now borrows its
+            // accumulator workspace, so this allocation is outside that path.
             let start = std::time::Instant::now();
             for _ in 0..reps {
-                let mut fresh_c = vec![0i32; m * n];
+                let mut fresh_c = vec![MaybeUninit::<i32>::uninit(); m * n];
                 mlas_sys::qgemm_requantize(
                     m,
                     n,
@@ -4809,7 +4941,7 @@ mod tests {
         let (b_scale, b_zero) = (Owned::f32(&[], &[0.01]), Owned::u8(&[], &[127]));
         let (y_scale, y_zero) = (Owned::f32(&[], &[0.05]), Owned::u8(&[], &[120]));
         kernel
-            .execute(
+            .execute_prepared(
                 &[
                     a.view(),
                     a_scale.view(),
@@ -4832,7 +4964,7 @@ mod tests {
         unpacked.set_constant_inputs(&[false; 8]);
         let mut expected = Owned::zeros(DataType::Uint8, &[batches, m, n]);
         unpacked
-            .execute(
+            .execute_prepared(
                 &[
                     a.view(),
                     a_scale.view(),

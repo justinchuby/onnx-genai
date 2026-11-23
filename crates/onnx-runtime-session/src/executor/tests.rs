@@ -13342,6 +13342,364 @@ fn executor_pin_fixed_capacity_kv_admits_gqa() {
 // resolution logic directly on synthetic graphs whose `::Attention` input has a
 // runtime-dependent context axis (the reported `v_model.Unsqueeze_16` shape).
 
+#[cfg(test)]
+mod einsum_workspace_tests {
+    use super::*;
+    use onnx_runtime_memory_api::{DeviceKey, Tier};
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
+    struct Fixture {
+        books: Arc<LedgerGovernor>,
+        manager: ProcessMemoryManager,
+        pool: HostWorkspacePool,
+        provider: Arc<dyn ExecutionProvider>,
+    }
+    impl Fixture {
+        fn new(capacity: u64) -> Self {
+            let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+                DeviceKey::HOST,
+                0,
+                capacity,
+                0,
+            )));
+            let manager = ProcessMemoryManager::new().unwrap();
+            let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+            let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+                onnx_runtime_ep_cpu::DerivedWeightMemory::governed(
+                    books.as_ref(),
+                    HolderId::new(13),
+                )
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap()
+            .with_cache_retention(onnx_runtime_ep_cpu::CpuCacheRetention::new(false))
+            .with_workspace_pool(pool.clone())
+            .unwrap();
+            let provider =
+                Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+            Self {
+                books,
+                manager,
+                pool,
+                provider,
+            }
+        }
+    }
+    fn einsum(id: u32, input: ValueId, output: ValueId, equation: &str) -> Node {
+        let mut node = Node::new(NodeId(id), "Einsum", vec![Some(input)], vec![output]);
+        node.attributes.insert(
+            "equation".into(),
+            Attribute::String(equation.as_bytes().to_vec()),
+        );
+        node
+    }
+    #[test]
+    fn sequential_reductions_use_one_prepared_peak_without_weight_retention() {
+        let fixture = Fixture::new(24);
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let input = graph.create_named_value("input", DataType::Float32, static_shape([2, 3, 4]));
+        let middle = graph.create_named_value("middle", DataType::Float32, static_shape([2, 3]));
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+        graph.add_input(input);
+        graph.add_output(output);
+        graph.insert_node(einsum(0, input, middle, "ijk->ij"));
+        graph.insert_node(einsum(1, middle, output, "ij->i"));
+        let mut executor = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            fixture.provider.clone(),
+            None,
+        )
+        .unwrap();
+        let input = Tensor::from_raw(
+            DataType::Float32,
+            vec![2, 3, 4],
+            &[1f32.to_le_bytes(); 24].concat(),
+        )
+        .unwrap();
+        let mut identity = None;
+        for _ in 0..8 {
+            let requirement = executor
+                .prepare_with_device_bindings(&[("input", &input)], &mut [])
+                .unwrap();
+            assert_eq!(
+                requirement.bytes, 24,
+                "max(24,8), never a sum or a fixed process budget"
+            );
+            let output = executor.run(&[("input", &input)]).unwrap();
+            assert_eq!(output[0].try_as_slice_f32().unwrap(), &[12.; 2]);
+            let allocations = fixture.manager.snapshot().unwrap().allocations;
+            assert_eq!(allocations.len(), 1);
+            let expected = identity.get_or_insert(allocations[0].identity);
+            assert_eq!(*expected, allocations[0].identity);
+            assert_eq!(fixture.books.used(Tier::Host), 24);
+        }
+        drop(executor);
+        fixture.pool.trim_idle(24).unwrap();
+        assert_eq!(fixture.books.used(Tier::Host), 0);
+    }
+    #[test]
+    fn if_reductions_borrow_the_enclosing_workspace() {
+        let fixture = Fixture::new(8);
+        let mut branch = Graph::new();
+        let input = branch.create_named_value("data", DataType::Float32, static_shape([3, 2]));
+        branch.set_initializer(
+            input,
+            WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Float32,
+                vec![3, 2],
+                [1f32.to_le_bytes(); 6].concat(),
+            )),
+        );
+        let output = branch.create_named_value("result", DataType::Float32, static_shape([2]));
+        branch.add_output(output);
+        branch.insert_node(einsum(0, input, output, "ij->j"));
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let cond = graph.create_named_value("cond", DataType::Bool, static_shape([]));
+        graph.add_input(cond);
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+        graph.add_output(output);
+        graph.insert_node(Node::new(NodeId(0), "If", vec![Some(cond)], vec![output]));
+        graph
+            .subgraphs
+            .insert((NodeId(0), "then_branch".into()), branch.clone());
+        graph
+            .subgraphs
+            .insert((NodeId(0), "else_branch".into()), branch);
+        let mut executor = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            fixture.provider.clone(),
+            None,
+        )
+        .unwrap();
+        for cond in [true, false, true] {
+            let cond = Tensor::from_raw(DataType::Bool, vec![], &[u8::from(cond)]).unwrap();
+            assert_eq!(
+                executor
+                    .prepare_with_device_bindings(&[("cond", &cond)], &mut [])
+                    .unwrap()
+                    .bytes,
+                8
+            );
+            assert_eq!(
+                executor.run(&[("cond", &cond)]).unwrap()[0]
+                    .try_as_slice_f32()
+                    .unwrap(),
+                &[3.; 2]
+            );
+            assert_eq!(
+                fixture.manager.snapshot().unwrap().allocations.len(),
+                1,
+                "child must borrow the parent's funded peak"
+            );
+            assert_eq!(fixture.books.used(Tier::Host), 8);
+        }
+        drop(executor);
+        fixture.pool.trim_idle(8).unwrap();
+        assert_eq!(fixture.books.used(Tier::Host), 0);
+    }
+}
+
+#[test]
+fn workspace_peak_preserves_alignment_of_smaller_nodes_in_either_order() {
+    let small = WorkspaceRequirement {
+        bytes: 16,
+        alignment: 64,
+        ..WorkspaceRequirement::NONE
+    };
+    let large = WorkspaceRequirement {
+        bytes: 24,
+        alignment: 4,
+        ..WorkspaceRequirement::NONE
+    };
+    for requirements in [[small, large], [large, small]] {
+        let mut peak = WorkspaceRequirement::NONE;
+        for requirement in requirements {
+            super::bindings::merge_workspace_peak(&mut peak, requirement);
+        }
+        assert_eq!((peak.bytes, peak.alignment), (24, 64));
+    }
+}
+
+#[test]
+fn qlinear_accumulators_share_the_prepared_graph_peak() {
+    use onnx_runtime_memory_api::{DeviceKey, Tier};
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
+    let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+        DeviceKey::HOST,
+        0,
+        24,
+        0,
+    )));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13))
+            .unwrap(),
+        Default::default(),
+    )
+    .unwrap()
+    .with_cache_retention(onnx_runtime_ep_cpu::CpuCacheRetention::new(false))
+    .with_workspace_pool(pool.clone())
+    .unwrap();
+    let provider = Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let rows = graph.create_symbol(None);
+    let row_shape = |width| vec![Dim::Symbolic(rows), Dim::Static(width)];
+    let a = graph.create_named_value("a", DataType::Uint8, row_shape(3));
+    graph.add_input(a);
+    let scale = graph.create_named_value("scale", DataType::Float32, static_shape([]));
+    graph.set_initializer(
+        scale,
+        onnx_runtime_ir::WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+            DataType::Float32,
+            vec![],
+            1f32.to_le_bytes().to_vec(),
+        )),
+    );
+    let zero = graph.create_named_value("zero", DataType::Uint8, static_shape([]));
+    graph.set_initializer(
+        zero,
+        onnx_runtime_ir::WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+            DataType::Uint8,
+            vec![],
+            vec![0],
+        )),
+    );
+    let b = graph.create_named_value("b", DataType::Uint8, static_shape([3, 2]));
+    let c = graph.create_named_value("c", DataType::Uint8, row_shape(3));
+    for (value, shape) in [(b, vec![3, 2]), (c, vec![2, 3])] {
+        graph.set_initializer(
+            value,
+            onnx_runtime_ir::WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Uint8,
+                shape,
+                vec![1; 6],
+            )),
+        );
+    }
+    let intermediate = graph.create_named_value("intermediate", DataType::Uint8, row_shape(2));
+    let output = graph.create_named_value("output", DataType::Uint8, row_shape(3));
+    graph.add_output(output);
+    for (id, lhs, rhs, result) in [(0, a, b, intermediate), (1, intermediate, c, output)] {
+        graph.insert_node(Node::new(
+            NodeId(id),
+            "QLinearMatMul",
+            vec![
+                Some(lhs),
+                Some(scale),
+                Some(zero),
+                Some(rhs),
+                Some(scale),
+                Some(zero),
+                Some(scale),
+                Some(zero),
+            ],
+            vec![result],
+        ));
+    }
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), provider, None).unwrap();
+    let input = Tensor::from_raw(DataType::Uint8, vec![2, 3], &[1; 6]).unwrap();
+    let mut identity = None;
+    for iteration in 0..8 {
+        let before = executor.cache.stats();
+        let requirement = executor
+            .prepare_with_device_bindings(&[("a", &input)], &mut [])
+            .unwrap();
+        let after = executor.cache.stats();
+        if iteration > 0 {
+            assert_eq!(
+                after, before,
+                "a successful metadata plan must skip the graph walk"
+            );
+        }
+        assert_eq!(
+            requirement.bytes, 24,
+            "the graph uses max(16,24), never their sum or a fixed process reserve"
+        );
+        let outputs = executor.run(&[("a", &input)]).unwrap();
+        assert_eq!(outputs[0].as_bytes(), &[6; 6]);
+        let allocations = manager.snapshot().unwrap().allocations;
+        assert_eq!(allocations.len(), 1);
+        let expected = identity.get_or_insert(allocations[0].identity);
+        assert_eq!(*expected, allocations[0].identity);
+        assert_eq!(books.used(Tier::Host), 24);
+        assert_eq!(manager.process_used(Tier::Host), 24);
+    }
+    // A memo is not an allocation or quota proof. Reclaim idle backing and
+    // ensure the same signature re-admits real storage before returning.
+    pool.trim_idle(24).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+    assert_eq!(
+        executor
+            .prepare_with_device_bindings(&[("a", &input)], &mut [])
+            .unwrap()
+            .bytes,
+        24
+    );
+    assert_eq!(books.used(Tier::Host), 24);
+    executor.run(&[("a", &input)]).unwrap();
+    let small = Tensor::from_raw(DataType::Uint8, vec![1, 3], &[1; 3]).unwrap();
+    assert_eq!(
+        executor
+            .prepare_with_device_bindings(&[("a", &small)], &mut [])
+            .unwrap()
+            .bytes,
+        12
+    );
+    assert_eq!(
+        executor.run(&[("a", &small)]).unwrap()[0].as_bytes(),
+        &[6; 3]
+    );
+    let oversized = Tensor::from_raw(DataType::Uint8, vec![3, 3], &[1; 9]).unwrap();
+    assert!(
+        executor
+            .prepare_with_device_bindings(&[("a", &oversized)], &mut [])
+            .is_err()
+    );
+    assert_eq!(
+        executor
+            .workspace_preparation_memo
+            .as_ref()
+            .unwrap()
+            .symbols[&rows],
+        1,
+        "failed reservation must not publish the oversized signature"
+    );
+    assert_eq!(
+        executor
+            .prepare_with_device_bindings(&[("a", &input)], &mut [])
+            .unwrap()
+            .bytes,
+        24
+    );
+    assert_eq!(
+        executor.run(&[("a", &input)]).unwrap()[0].as_bytes(),
+        &[6; 6]
+    );
+    let wrong_dtype = Tensor::from_raw(DataType::Int8, vec![2, 3], &[1; 6]).unwrap();
+    assert!(
+        executor
+            .prepare_with_device_bindings(&[("a", &wrong_dtype)], &mut [])
+            .is_err(),
+        "memo hits must still validate input dtype"
+    );
+    drop(executor);
+    pool.trim_idle(24).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
 fn nested_gemm_workspace_graph() -> Graph {
     let mut branch = Graph::new();
     let a = branch.create_named_value("a", DataType::Float32, static_shape([3, 2]));
@@ -14487,8 +14845,11 @@ fn execution_trims_absent_trailing_outputs_without_changing_the_source() {
 #[cfg(feature = "mlas")]
 #[test]
 fn qlinear_shape_variants_share_one_host_pack_within_the_session_node() {
-    use onnx_runtime_memory_api::Tier;
-    use onnx_runtime_memory_governor::{HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor};
+    use onnx_runtime_memory_api::{DeviceKey, Tier};
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 21);
     let rows = graph.create_symbol(None);
@@ -14533,11 +14894,21 @@ fn qlinear_shape_variants_share_one_host_pack_within_the_session_node() {
             .collect(),
         vec![y],
     ));
-    let governor = LedgerGovernor::new(LeaseLedger::new(0, 1 << 20, 0));
+    let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+        DeviceKey::HOST,
+        0,
+        1 << 20,
+        0,
+    )));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, governor.clone()).unwrap();
     let memory =
-        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(&governor, HolderId::new(13)).unwrap();
-    let resources =
-        onnx_runtime_ep_cpu::CpuMemoryResources::new(memory, Default::default()).unwrap();
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(governor.as_ref(), HolderId::new(13))
+            .unwrap();
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(memory, Default::default())
+        .unwrap()
+        .with_workspace_pool(pool.clone())
+        .unwrap();
     let cpu: Arc<dyn ExecutionProvider> =
         Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
     let predicted = onnx_runtime_ep_cpu::qlinear_packed_b_predicted_bytes(&graph);
@@ -14556,7 +14927,7 @@ fn qlinear_shape_variants_share_one_host_pack_within_the_session_node() {
         let output = executor.run(&[("a", &input)]).unwrap();
         assert_eq!(output[0].as_bytes(), &vec![129; rows * 96]);
         if packed_bytes == 0 {
-            packed_bytes = governor.used(Tier::Host);
+            packed_bytes = governor.used(Tier::Host) - manager.process_used(Tier::Host);
         }
         assert!(
             packed_bytes > 0,
@@ -14568,7 +14939,7 @@ fn qlinear_shape_variants_share_one_host_pack_within_the_session_node() {
         );
         assert_eq!(
             governor.used(Tier::Host),
-            packed_bytes,
+            packed_bytes + manager.process_used(Tier::Host),
             "new activation shapes must share one constant B allocation"
         );
     }
@@ -14584,12 +14955,17 @@ fn qlinear_shape_variants_share_one_host_pack_within_the_session_node() {
     );
     assert_eq!(
         governor.used(Tier::Host),
-        2 * packed_bytes,
+        2 * packed_bytes + manager.process_used(Tier::Host),
         "a separate session must own its own node state"
     );
     drop(executor);
-    assert_eq!(governor.used(Tier::Host), packed_bytes);
+    assert_eq!(
+        governor.used(Tier::Host),
+        packed_bytes + manager.process_used(Tier::Host)
+    );
     drop(peer);
+    assert_eq!(governor.used(Tier::Host), manager.process_used(Tier::Host));
+    pool.trim_idle(u64::MAX).unwrap();
     assert_eq!(governor.used(Tier::Host), 0);
 }
 

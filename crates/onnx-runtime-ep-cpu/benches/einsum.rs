@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 
 use common::{FloatDType, Tensor, assert_close, float_values, make_kernel, process_cpu_time};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box};
-use onnx_runtime_ep_api::{Kernel, KernelFactory};
+use onnx_runtime_ep_api::{
+    DevicePtrMut, Kernel, KernelFactory, TensorMetadata, TensorMut, TensorView, WorkspaceView,
+};
 use onnx_runtime_ep_cpu::kernels::einsum::{
     EINSUM_MODE_ENV, EinsumFactory, benchmark_execute_route, benchmark_last_workspace_bytes,
-    benchmark_scratch_capacity_bytes,
 };
 use onnx_runtime_hostmon::{AllowedCpus, Contention};
 use onnx_runtime_ir::{Attribute, Node, NodeId};
@@ -205,7 +206,70 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-fn kernel_with_mode(case: &Case, mode: &str) -> (Box<dyn Kernel>, Duration) {
+// Benchmark-owned scratch is prepared once, outside every timed loop.
+// &mut self makes the one lane exclusive without locks or unsafe Sync claims.
+struct PreparedKernel {
+    kernel: Box<dyn Kernel>,
+    scratch: Vec<u64>,
+    bytes: usize,
+}
+impl std::ops::Deref for PreparedKernel {
+    type Target = dyn Kernel;
+    fn deref(&self) -> &Self::Target {
+        self.kernel.as_ref()
+    }
+}
+impl PreparedKernel {
+    fn new(kernel: Box<dyn Kernel>, case: &Case) -> Self {
+        let dtype = match case.dtype {
+            FloatDType::F32 => onnx_runtime_ir::DataType::Float32,
+            FloatDType::F16 => onnx_runtime_ir::DataType::Float16,
+            FloatDType::Bf16 => onnx_runtime_ir::DataType::BFloat16,
+        };
+        let metadata = case
+            .input_shapes
+            .iter()
+            .map(|shape| TensorMetadata::new(dtype, shape, true))
+            .collect::<Vec<_>>();
+        let request = kernel
+            .workspace_requirement(&metadata)
+            .expect("benchmark workspace planning must succeed");
+        assert!(request.alignment <= std::mem::align_of::<u64>());
+        let bytes = usize::try_from(request.bytes).expect("benchmark workspace is addressable");
+        Self {
+            kernel,
+            scratch: vec![0; bytes.div_ceil(8)],
+            bytes,
+        }
+    }
+    fn workspace(&mut self) -> Option<WorkspaceView> {
+        (self.bytes != 0).then(|| {
+            WorkspaceView::new(
+                DevicePtrMut(self.scratch.as_mut_ptr().cast()),
+                self.scratch.len() * 8,
+            )
+        })
+    }
+    fn execute(
+        &mut self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let workspace = self.workspace();
+        self.kernel
+            .execute_with_workspace(inputs, outputs, workspace)
+    }
+    fn execute_route(
+        &mut self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<Option<&'static str>> {
+        let workspace = self.workspace();
+        benchmark_execute_route(self.kernel.as_ref(), inputs, outputs, workspace)
+    }
+}
+
+fn kernel_with_mode(case: &Case, mode: &str) -> (PreparedKernel, Duration) {
     struct EnvGuard(Option<OsString>);
     impl Drop for EnvGuard {
         fn drop(&mut self) {
@@ -231,7 +295,7 @@ fn kernel_with_mode(case: &Case, mode: &str) -> (Box<dyn Kernel>, Duration) {
         .expect("Einsum kernel construction must succeed");
     let elapsed = start.elapsed();
     drop(guard);
-    (kernel, elapsed)
+    (PreparedKernel::new(kernel, case), elapsed)
 }
 
 fn inputs(case: &Case) -> Vec<Tensor> {
@@ -276,19 +340,21 @@ fn hash_values(values: &[f32]) -> u64 {
 
 fn validate_case(
     case: &Case,
-    optimized: &dyn Kernel,
-    generic: &dyn Kernel,
-    oracle_kernel: &dyn Kernel,
+    optimized: &mut PreparedKernel,
+    generic: &mut PreparedKernel,
+    oracle_kernel: &mut PreparedKernel,
     tensors: &[Tensor],
 ) {
     let views = tensors.iter().map(Tensor::view).collect::<Vec<_>>();
     let mut fast = Tensor::zeros(case.dtype, &case.output_shape);
     let mut generic_output = Tensor::zeros(case.dtype, &case.output_shape);
     let mut oracle_output = Tensor::zeros(case.dtype, &case.output_shape);
-    let route = benchmark_execute_route(optimized, &views, &mut [fast.view_mut()])
+    let route = optimized
+        .execute_route(&views, &mut [fast.view_mut()])
         .expect("optimized Einsum route probe must execute")
         .expect("route probe must receive an Einsum kernel");
-    let generic_route = benchmark_execute_route(generic, &views, &mut [generic_output.view_mut()])
+    let generic_route = generic
+        .execute_route(&views, &mut [generic_output.view_mut()])
         .expect("GenericNative Einsum route probe must execute")
         .expect("route probe must receive an Einsum kernel");
     oracle_kernel
@@ -763,7 +829,7 @@ fn report_summary(phase: &str, name: &str, values: &[f64], max_range_pct: f64) -
 
 fn absolute_evidence(
     case: &Case,
-    kernel: &dyn Kernel,
+    kernel: &mut PreparedKernel,
     views: &[onnx_runtime_ep_api::TensorView<'_>],
     output: &mut Tensor,
     allowed: &AllowedCpus,
@@ -804,13 +870,14 @@ fn interleaved_comparison(allowed: &AllowedCpus) {
         .expect("friendly GEMM case exists");
     let tensors = inputs(&case);
     let views = tensors.iter().map(Tensor::view).collect::<Vec<_>>();
-    let (einsum, einsum_setup) = kernel_with_mode(&case, "optimized");
+    let (mut einsum, einsum_setup) = kernel_with_mode(&case, "optimized");
     let matmul_start = Instant::now();
     let matmul = make_kernel("MatMul", [], &case.input_shapes, 24);
     let matmul_setup = matmul_start.elapsed();
     let mut einsum_output = Tensor::zeros(case.dtype, &case.output_shape);
     let mut matmul_output = Tensor::zeros(case.dtype, &case.output_shape);
-    let route = benchmark_execute_route(&*einsum, &views, &mut [einsum_output.view_mut()])
+    let route = einsum
+        .execute_route(&views, &mut [einsum_output.view_mut()])
         .expect("comparison Einsum route probe must execute")
         .expect("comparison route probe must receive Einsum");
     matmul
@@ -835,7 +902,8 @@ fn interleaved_comparison(allowed: &AllowedCpus) {
     );
 
     reset_allocations();
-    benchmark_execute_route(&*einsum, &views, &mut [einsum_output.view_mut()])
+    einsum
+        .execute_route(&views, &mut [einsum_output.view_mut()])
         .expect("comparison Einsum allocation probe must execute");
     let einsum_allocations = allocations();
     reset_allocations();
@@ -1011,21 +1079,18 @@ fn bench_einsum(c: &mut Criterion, allowed: &AllowedCpus, emit_evidence: bool) {
     for case in cases() {
         let tensors = inputs(&case);
         let views = tensors.iter().map(Tensor::view).collect::<Vec<_>>();
-        let (optimized, optimized_setup) = kernel_with_mode(&case, "optimized");
-        let (generic, generic_setup) = kernel_with_mode(&case, "generic-native");
-        let (oracle, oracle_setup) = kernel_with_mode(&case, "oracle");
-        validate_case(&case, &*optimized, &*generic, &*oracle, &tensors);
+        let (mut optimized, optimized_setup) = kernel_with_mode(&case, "optimized");
+        let (mut generic, generic_setup) = kernel_with_mode(&case, "generic-native");
+        let (mut oracle, oracle_setup) = kernel_with_mode(&case, "oracle");
+        validate_case(&case, &mut optimized, &mut generic, &mut oracle, &tensors);
         let mut allocation_probe_output = Tensor::zeros(case.dtype, &case.output_shape);
         reset_allocations();
-        let route = benchmark_execute_route(
-            &*optimized,
-            &views,
-            &mut [allocation_probe_output.view_mut()],
-        )
-        .expect("allocation route probe must execute")
-        .expect("allocation route probe must receive Einsum");
+        let route = optimized
+            .execute_route(&views, &mut [allocation_probe_output.view_mut()])
+            .expect("allocation route probe must execute")
+            .expect("allocation route probe must receive Einsum");
         let (allocation_calls, allocated_bytes) = allocations();
-        let workspace = benchmark_scratch_capacity_bytes(&*optimized).unwrap_or(0);
+        let workspace = optimized.scratch.len() * 8;
         let dispatch_workspace = benchmark_last_workspace_bytes(&*optimized).unwrap_or(0);
         println!(
             "EINSUM_SETUP case={} native_us={:.3} generic_us={:.3} oracle_us={:.3} route={} \
@@ -1041,7 +1106,7 @@ fn bench_einsum(c: &mut Criterion, allowed: &AllowedCpus, emit_evidence: bool) {
         if emit_evidence {
             absolute_evidence(
                 &case,
-                &*optimized,
+                &mut optimized,
                 &views,
                 &mut allocation_probe_output,
                 allowed,

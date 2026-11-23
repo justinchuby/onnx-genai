@@ -923,7 +923,10 @@ pub trait Kernel: Send + KernelType {
     }
 
     /// Report a safe owned-scratch bound for these concrete metadata inputs.
-    /// Runtime layout facts may refine this bound before dispatch.
+    /// Runtime layout facts may refine this bound before dispatch. For a fixed
+    /// compiled kernel and metadata this is a stable upper bound: executors may
+    /// memoize it. It must cover both cold and warm cache residency; values or
+    /// layouts that refine the bound belong in the execution-time hook below.
     fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
         let _ = inputs;
         Ok(WorkspaceRequirement::NONE)

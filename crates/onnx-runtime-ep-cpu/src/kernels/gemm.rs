@@ -543,26 +543,7 @@ fn reset_half_decode_gemv_calls() {
 }
 
 #[cfg(test)]
-trait PreparedTestKernel: Kernel {
-    fn execute_prepared(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let metadata = inputs
-            .iter()
-            .map(|input| TensorMetadata::new(input.dtype, input.shape, true))
-            .collect::<Vec<_>>();
-        let requirement = self.workspace_requirement_for_execution(inputs, &metadata)?;
-        assert!(requirement.alignment <= std::mem::align_of::<u128>());
-        let mut backing = vec![0u128; (requirement.bytes as usize).div_ceil(16)];
-        let workspace = (!backing.is_empty()).then(|| {
-            WorkspaceView::new(
-                onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
-                backing.len() * 16,
-            )
-        });
-        self.execute_with_workspace(inputs, outputs, workspace)
-    }
-}
-#[cfg(test)]
-impl<T: Kernel + ?Sized> PreparedTestKernel for T {}
+use crate::kernels::testutil::PreparedTestKernel;
 
 #[cfg(test)]
 mod tests {

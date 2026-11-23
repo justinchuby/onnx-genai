@@ -9,8 +9,29 @@ use onnx_runtime_memory_governor::{
     PressureResponder,
 };
 
-use crate::CpuCacheRetention;
 use crate::kernels::qmoe::WeightOffloadHostCache;
+
+/// Immutable eligibility policy for CPU derived-weight retention.
+/// This verdict owns no scratch, physical storage or allocation grant.
+#[derive(Clone, Debug)]
+pub struct CpuCacheRetention {
+    admitted: bool,
+}
+
+impl CpuCacheRetention {
+    pub fn new(admitted: bool) -> Self {
+        Self { admitted }
+    }
+    pub fn is_admitted(&self) -> bool {
+        self.admitted
+    }
+}
+
+impl Default for CpuCacheRetention {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
 
 /// Retention ceilings, separate from the Host grants that fund actual payloads.
 #[derive(Clone, Copy, Debug)]
