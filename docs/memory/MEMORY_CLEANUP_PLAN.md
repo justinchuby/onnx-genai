@@ -2409,3 +2409,26 @@ legal trailing optional inputs leaves the source node and EP metadata with
 different positional cardinalities. The performance probe uses the equivalent
 omitted-tail form; this unrelated runtime inconsistency requires a separate
 plan fix and public-session regression without relaxing EP validation.
+
+
+### Caller-owned packed projection destinations
+
+The private prepared packed-projection primitive now writes into an initialized
+caller destination and returns `Result<()>`. Standalone BlockQuantizedMatMul and
+the owned expert driver retain their existing staging allocations and publish
+actual tensor outputs only after success. This separates projection arithmetic
+from output storage so the shared expert-bank driver can supply admitted regions
+next; this step alone does not complete FC intermediate accounting or claim
+memory/performance savings.
+
+Packed extents and the canonical decoder resolve through one immutable row view;
+prepared production storage and the dynamic test oracle share that representation
+and GEMM operand/K order. Destination and scratch extents are validated before
+computation. Invalid geometry leaves staging untouched; later compute failures
+may modify staging but cannot publish a partial tensor through these callers.
+There is no old-signature alias, new public EP interface, pool or issuer call.
+Native and MLAS-reference block MatMul tests pass (38 each, one pre-existing
+ignored per configuration), as do block MoE tests (29 each) and strict all-target
+CPU Clippy in both configurations. Caller-owned poisoned targets, separate prior
+outputs, guard regions, short/oversized destinations, malformed input/packed/bias
+spans, short scratch, empty axes and partial blocks are covered.

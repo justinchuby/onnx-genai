@@ -500,6 +500,12 @@ impl BlockQuantizedMoEKernel {
                         .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
                     &self.attributes,
                     |projection, input, rows, bias| {
+                        let elements = rows.checked_mul(projection.out_features).ok_or_else(|| error("expert projection output element count overflows; reduce batch or expert dimensions"))?;
+                        let mut output = super::decoded_projection::zeroed_f32(
+                            OP,
+                            "expert projection output staging",
+                            elements,
+                        )?;
                         linear_packed_prepared(
                             projection.format,
                             &projection.bytes,
@@ -510,7 +516,9 @@ impl BlockQuantizedMoEKernel {
                             bias,
                             self.projection_plan,
                             scratch.initialized(),
-                        )
+                            &mut output,
+                        )?;
+                        Ok(output)
                     },
                 )?
             };
