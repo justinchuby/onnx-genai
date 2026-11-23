@@ -1,0 +1,9 @@
+{
+  "base": "911fcbd78ee1eb0a82b471b164aa02cff2d33c32",
+  "measured_head": "077746f0329a410f862245701816fb8f4acdc0c8",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs": "677aad997e0ae7aa464cd02d701570a22e9e599ae8d51ff54516a38919baec87",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_neon.rs": "66461a50207729a93baccfedbb6b749483801e2fb4bbfe4754cdd99ffded15a7"
+  },
+  "patch_sha256": "6a36b24667f8a9dbac5911cdaf97a2e18c370adbf7bbe41143833f1d55bcc3b9"
+}

@@ -13787,6 +13787,15 @@ fn workspace_peak_preserves_alignment_of_smaller_nodes_in_either_order() {
 
 #[test]
 fn qlinear_accumulators_share_the_prepared_graph_peak() {
+    check_qlinear_prepared_graph_peak(false);
+}
+
+#[test]
+fn plugin_cpu_fallback_accumulators_share_the_prepared_graph_peak() {
+    check_qlinear_prepared_graph_peak(true);
+}
+
+fn check_qlinear_prepared_graph_peak(plugin_fallback: bool) {
     use onnx_runtime_memory_api::{DeviceKey, Tier};
     use onnx_runtime_memory_governor::{
         HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
@@ -13809,7 +13818,22 @@ fn qlinear_accumulators_share_the_prepared_graph_peak() {
     .with_cache_retention(onnx_runtime_ep_cpu::CpuCacheRetention::new(false))
     .with_workspace_pool(pool.clone())
     .unwrap();
-    let provider = Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+    let cpu: Arc<dyn ExecutionProvider> =
+        Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+    let provider = if plugin_fallback {
+        Arc::new(
+            crate::PluginExecutionProvider::new(
+                "unused-plugin-library".into(),
+                None,
+                "test-plugin",
+                "cpu",
+                cpu.clone(),
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionProvider>
+    } else {
+        cpu.clone()
+    };
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 17);
     let rows = graph.create_symbol(None);
@@ -13866,8 +13890,10 @@ fn qlinear_accumulators_share_the_prepared_graph_peak() {
             vec![result],
         ));
     }
-    let mut executor =
-        Executor::build(graph, Arc::new(WeightStore::new()), provider, None).unwrap();
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), cpu, None).unwrap();
+    // No plugin compiler is needed for an unclaimed graph. Exercise the actual
+    // bridge for all metadata planning, workspace ownership and CPU dispatch.
+    executor.ep = provider;
     let input = Tensor::from_raw(DataType::Uint8, vec![2, 3], &[1; 6]).unwrap();
     let mut identity = None;
     for iteration in 0..8 {
