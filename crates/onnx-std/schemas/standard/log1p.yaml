@@ -1,0 +1,8 @@
+domain: ""
+name: Log1p
+since_version: 29
+doc: Elementwise natural logarithm of one plus the input, preserving small nonzero values.
+inputs: [{ name: input, type_str: T }]
+outputs: [{ name: output, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

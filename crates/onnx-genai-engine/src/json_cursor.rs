@@ -234,7 +234,7 @@ impl JsonByteCursor {
         self.failure = None;
     }
 
-    fn empty_fork(&self) -> anyhow::Result<Self> {
+    pub(crate) fn empty_fork(&self) -> anyhow::Result<Self> {
         if let Some(failure) = &self.failure {
             return Err(failure.clone().into());
         }

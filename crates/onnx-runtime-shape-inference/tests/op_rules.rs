@@ -270,6 +270,124 @@ fn out_dtype(outs: &[NodeIo]) -> DataType {
     outs[0].type_info.as_ref().unwrap().dtype
 }
 
+#[test]
+fn standard_math_opset_gate_and_shape_contracts() {
+    for (name, since) in onnx_runtime_ir::standard_math::OPS {
+        let arity = if ["SwiGLU", "GeGLU"].contains(&name) {
+            2
+        } else {
+            1
+        };
+        let n = node(name, arity, 1);
+        let inputs = || vec![tin(DataType::Float64, vec![c(2), c(3)]); arity];
+        assert!(
+            run(&n, inputs(), since - 1)[0].type_info.is_none(),
+            "{name}"
+        );
+        let y = run(&n, inputs(), since);
+        assert_eq!(out_dtype(&y), DataType::Float64);
+        assert_eq!(out_shape(&y), vec![c(2), c(3)]);
+    }
+    let geglu = node("GeGLU", 2, 1);
+    let named = DimExpr::symbol(SymbolId(7));
+    let anonymous = DimExpr::symbol(SymbolId(0x8000_0000));
+    let y = InferenceRegistry::default_registry()
+        .infer_node(
+            &geglu,
+            &HashMap::from([(String::new(), 29)]),
+            vec![
+                f32in(vec![anonymous, c(3)]),
+                f32in(vec![named.clone(), c(3)]),
+            ],
+            MergePolicy::Permissive,
+            &mut SymbolInterner::new(0x8000_0001),
+        )
+        .unwrap();
+    assert_eq!(out_shape(&y), vec![named, c(3)]);
+    assert_invalid(
+        try_run(
+            &geglu,
+            vec![f32in(vec![c(2), c(3)]), f32in(vec![c(1), c(3)])],
+            29,
+        )
+        .unwrap_err(),
+        "GeGLU",
+        "no broadcasting",
+    );
+    assert_invalid(
+        try_run(
+            &with_attr(geglu, "approximate", Attribute::String(b"fast".to_vec())),
+            vec![f32in(vec![]), f32in(vec![])],
+            29,
+        )
+        .unwrap_err(),
+        "GeGLU",
+        "'none' or 'tanh'",
+    );
+    assert_invalid(
+        try_run(&node("LogCumSumExp", 1, 1), vec![f32in(vec![])], 29).unwrap_err(),
+        "LogCumSumExp",
+        "axis 0 is out of range",
+    );
+}
+
+#[test]
+fn packed_routed_opset_gate_and_shape_contracts() {
+    let pack = with_attr(
+        with_attr(
+            with_attr(node("Pack", 1, 1), "bits", Attribute::Int(5)),
+            "axis",
+            Attribute::Int(0),
+        ),
+        "output_type",
+        Attribute::Int(12),
+    );
+    let values = || vec![tin(DataType::Uint8, vec![c(7), sym(0)])];
+    assert!(run(&pack, values(), 28)[0].type_info.is_none());
+    let out = run(&pack, values(), 29);
+    assert_eq!(out_dtype(&out), DataType::Uint32);
+    assert_eq!(out_shape(&out), vec![c(2), sym(0)]);
+
+    let unpack = with_attr(node("Unpack", 2, 1), "bits", Attribute::Int(5));
+    let packed = tin(DataType::Uint8, vec![sym(0), c(3)]);
+    let count = NodeIo {
+        type_info: Some(TypeInfo::new(DataType::Int64, vec![])),
+        shape_data: Some(ShapeData::scalar(DataType::Int64, c(4))),
+        value_type: None,
+    };
+    let out = run(&unpack, vec![packed.clone(), count.clone()], 29);
+    assert_eq!(out_shape(&out), vec![sym(0), c(4)]);
+    let out = run(&unpack, vec![packed, tin(DataType::Int64, vec![])], 29);
+    assert_symbolic(&out_shape(&out)[1]);
+    assert_invalid(
+        try_run(&unpack, vec![tin(DataType::Uint8, vec![c(2)]), count], 29).unwrap_err(),
+        "Unpack",
+        "exactly 3 words",
+    );
+
+    let routed = with_attr(node("GroupedMatMul", 4, 1), "transB", Attribute::Int(-1));
+    let inputs = || {
+        vec![
+            f32in(vec![sym(0), c(3)]),
+            f32in(vec![c(4), c(7), c(3)]),
+            tin(DataType::Int32, vec![sym(0), c(2)]),
+            f32in(vec![c(4), c(7)]),
+        ]
+    };
+    assert!(run(&routed, inputs(), 28)[0].type_info.is_none());
+    assert_eq!(
+        out_shape(&run(&routed, inputs(), 29)),
+        vec![sym(0), c(2), c(7)]
+    );
+    let mut invalid = inputs();
+    invalid[3] = f32in(vec![c(4), c(6)]);
+    assert_invalid(
+        try_run(&routed, invalid, 29).unwrap_err(),
+        "GroupedMatMul",
+        "bias output width",
+    );
+}
+
 fn assert_symbolic(dim: &DimExpr) {
     assert!(
         dim.as_const().is_none(),
@@ -286,7 +404,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        221,
+        226,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -295,7 +413,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        266,
+        271,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -6852,6 +6970,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Erf", 1),
     ("", "Exp", 1),
     ("", "Expand", 8),
+    ("", "Expm1", 29),
     ("", "EyeLike", 9),
     ("", "Flatten", 1),
     ("", "Floor", 1),
@@ -6862,6 +6981,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "GatherND", 11),
     ("", "GatherND", 12),
     ("", "GatherND", 13),
+    ("", "GeGLU", 29),
     ("", "Gelu", 20),
     ("", "Gemm", 1),
     ("", "GlobalAveragePool", 1),
@@ -6890,6 +7010,8 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "LessOrEqual", 12),
     ("", "LinearAttention", 1),
     ("", "Log", 1),
+    ("", "Log1p", 29),
+    ("", "LogCumSumExp", 29),
     ("", "LogSoftmax", 1),
     ("", "LpNormalization", 1),
     ("", "LpPool", 1),
@@ -6990,6 +7112,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "StringNormalizer", 10),
     ("", "Sub", 1),
     ("", "Sum", 1),
+    ("", "SwiGLU", 28),
     ("", "Swish", 24),
     ("", "Tan", 7),
     ("", "Tanh", 1),

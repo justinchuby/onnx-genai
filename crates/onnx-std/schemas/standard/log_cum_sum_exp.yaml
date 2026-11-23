@@ -1,0 +1,10 @@
+domain: ""
+name: LogCumSumExp
+since_version: 29
+doc: Inclusive forward cumulative log-sum-exp along an axis.
+attributes:
+  - { name: axis, type: int, default: 0 }
+inputs: [{ name: X, type_str: T }]
+outputs: [{ name: Y, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

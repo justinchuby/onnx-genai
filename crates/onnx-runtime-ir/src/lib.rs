@@ -57,7 +57,9 @@ mod graph_view;
 mod layout;
 mod node;
 pub mod onnx;
+pub mod packed_routed;
 pub mod pattern;
+pub mod standard_math;
 
 /// Descriptor for the same vendored schema that defines [`onnx`].
 pub const ONNX_FILE_DESCRIPTOR_SET: &[u8] =

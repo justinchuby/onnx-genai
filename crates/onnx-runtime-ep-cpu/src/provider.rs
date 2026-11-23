@@ -462,6 +462,16 @@ impl ExecutionProvider for CpuExecutionProvider {
                 opset
             );
         }
+        if let Some(reason) =
+            onnx_runtime_ep_api::packed_routed::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if let Some(reason) =
+            onnx_runtime_ep_api::standard_math::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "CompressedSparseAttention"
             && op.domain == "pkg.nxrt"
             && let Some(reason) = crate::kernels::compressed_sparse_attention::unsupported_reason(

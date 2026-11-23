@@ -153,6 +153,7 @@ impl Drop for HostRegistration {
 struct PoolInner {
     manager: ProcessMemoryManager,
     binding: ScopedMemoryBinding,
+    context_scope: crate::MemoryContextScope,
     holder: RegisteredMemoryHolder,
     authority: RegisteredMemoryAuthority,
     idle: Arc<IdleSlots>,
@@ -199,9 +200,11 @@ impl HostWorkspacePool {
         let pressure = Arc::new(IdlePressure(Arc::downgrade(&idle)));
         let holder =
             manager.register_holder(authority, "execution workspace", Some(pressure.clone()))?;
+        let context_scope = binding.context_scope();
         Ok(Self(Arc::new(PoolInner {
             manager: manager.clone(),
             binding,
+            context_scope,
             holder,
             authority: authority.clone(),
             idle,
@@ -298,7 +301,7 @@ impl HostWorkspacePool {
                 role,
             });
         }
-        let _operation = self.0.binding.context_scope().enter()?;
+        let _operation = self.0.context_scope.enter()?;
         let replacement = {
             let mut slots = self
                 .0

@@ -1,0 +1,67 @@
+   Compiling onnx-runtime-ep-api v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-api)
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.73s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-ef1e92e03ca65d7a)
+
+running 58 tests
+test kernels::qmoe::tests::grouped_input_workspace_metadata_checks_presence_rank_dtype_and_overflow ... ok
+test kernels::qmoe::tests::grouped_int4_qmoe_matches_per_token_dense_fallback_for_eight_experts_top2 ... ok
+test kernels::qmoe::tests::cached_and_uncached_routes_and_logits_are_bit_identical ... ok
+test kernels::qmoe::tests::concurrent_cold_references_publish_one_payload_and_one_grant ... ok
+test kernels::qmoe::tests::grouped_input_uses_one_peak_lane_without_warm_workspace_issuer_calls ... ok
+test kernels::qmoe::tests::admission_history_skips_uncacheable_keys_and_expires_churn ... ok
+test kernels::qmoe::tests::prefetch_ab_benchmark ... ignored, timing benchmark; run explicitly with --ignored --nocapture
+test kernels::qmoe::tests::foreign_bank_invalidates_layer_only_prefetch_capacity_proof ... ok
+test kernels::qmoe::tests::active_host_cache_lease_blocks_eviction_until_drop ... ok
+test kernels::qmoe::tests::prefetch_guard_holds_stats_in_gaff_divergent_regime ... ok
+test kernels::qmoe::tests::flag_off_preserves_legacy_path_and_counters ... ok
+test kernels::qmoe::tests::governed_retention_reserves_only_live_payloads_and_active_arcs_keep_grants ... ok
+test kernels::qmoe::tests::process_metrics_aggregate_live_cache_residency_and_release_on_drop ... ok
+test kernels::qmoe::tests::qmoe_int1_single_block_matches_float_moe ... ok
+test kernels::qmoe::tests::qmoe_int2_single_block_matches_float_moe ... ok
+test kernels::qmoe::tests::interleaved_expert_layout_falls_back_without_error ... ok
+test kernels::qmoe::tests::metrics_guard_retires_thread_local_residency_before_unlock ... ok
+test kernels::qmoe::tests::qmoe_int4_multiple_blocks_affine_matches_float_moe ... ok
+test kernels::qmoe::tests::qmoe_rejects_flattened_rows_overflow_before_allocation ... ok
+test kernels::qmoe::tests::qmoe_int4_odd_blocks_affine_matches_float_moe ... ok
+test kernels::qmoe::tests::qmoe_rejects_isize_max_exceeding_byte_count_before_allocation ... ok
+test kernels::qmoe::tests::qmoe_int8_matches_float_moe ... ok
+test kernels::qmoe::tests::qmoe_int4_single_block_matches_float_moe ... ok
+test kernels::qmoe::tests::qmoe_rejects_quantized_expert_layout_overflow_before_allocation ... ok
+test kernels::qmoe::tests::qmoe_rejects_unsupported_block_size ... ok
+test kernels::qmoe::tests::qmoe_rejects_zero_masked_tensor_overflow_before_allocation ... ok
+test kernels::qmoe::tests::qmoe_rejects_unsupported_weight_bits ... ok
+test kernels::qmoe::tests::qmoe_swiglu_default_clip_attrs_match_reference_formula ... ok
+test kernels::qmoe::tests::one_off_rare_route_does_not_evict_pinned_hot_expert ... ok
+test kernels::qmoe::tests::qmoe_swiglu_non_default_clip_attrs_match_reference_formula ... ok
+test kernels::qmoe::tests::qmoe_swiglu_non_default_clip_attrs_change_output_vs_defaults ... ok
+test kernels::qmoe::tests::quantized_inputs_refuse_nonhost_operands_before_reading_storage ... ok
+test kernels::qmoe::tests::qmoe_rejects_non_finite_clip_attrs ... ok
+test kernels::qmoe::tests::qmoe_top2_normalized_matches_float_moe ... ok
+test kernels::qmoe::tests::quantized_inputs_borrow_each_contiguous_operand_independently_of_paging ... ok
+test kernels::qmoe::tests::qmoe_sub4_odd_blocks_affine_match_float_moe ... ok
+test kernels::qmoe::tests::prefetch_matches_serial_across_routing_and_budget_sweep ... ok
+test kernels::qmoe::tests::prefetch_pipeline_is_byte_and_stat_identical_to_serial ... ok
+test kernels::qmoe::tests::prefetch_pipeline_survives_cache_smaller_than_working_set ... ok
+test kernels::qmoe::tests::host_cache_enforces_expanded_byte_cap_for_oversubscribed_working_set ... ok
+test kernels::qmoe::tests::governed_retention_competes_with_real_host_kv_without_idle_entitlement ... ok
+test kernels::qmoe::tests::repeated_routing_working_set_converges_to_host_cache_hits ... ok
+test kernels::qmoe::tests::retained_grant_callbacks_observe_unlocked_payloads_and_hard_failures_are_transactional ... ok
+test kernels::qmoe::tests::route_first_bounds_dequantized_residency_when_all_experts_are_selected ... ok
+test kernels::qmoe::tests::route_first_mmap_matches_full_dequant_on_pseudorandom_inputs ... ok
+test kernels::qmoe::tests::route_first_preserves_exact_accumulation_order_for_top_k ... ok
+test kernels::qmoe::tests::route_first_reads_only_unique_selected_expert_ranges ... ok
+test kernels::qmoe::tests::selected_prefetch_grants_refund_each_retained_payload_independently ... ok
+test kernels::qmoe::tests::shared_bank_prefetch_proof_counts_retained_foreign_payloads ... ok
+test kernels::qmoe::tests::shared_bank_prefetch_proof_freezes_new_registrations_but_not_worker_leases ... ok
+test kernels::qmoe::tests::shared_bank_registry_prunes_dead_sources_and_retains_live_entries ... ok
+test kernels::qmoe::tests::shared_bank_rejects_inconsistent_expanded_size_with_source_context ... ok
+test kernels::qmoe::tests::shared_pressure_expert_and_dense_caches_reclaim_each_others_idle_payloads ... ok
+test kernels::qmoe::tests::transient_expert_grants_cover_complete_sets_and_stream_all_gates ... ok
+test kernels::qmoe::tests::transient_mmap_grants_preserve_prefetch_outputs_and_cache_policy ... ok
+test kernels::qmoe::tests::two_engine_cache_partitions_respect_independent_budgets ... ok
+test kernels::qmoe::tests::zero_budget_prefetch_needs_no_bank_registry_lock ... ok
+test kernels::qmoe::tests::zero_byte_host_cache_matches_phase1_direct_mmap ... ok
+
+test result: ok. 57 passed; 0 failed; 1 ignored; 0 measured; 1990 filtered out; finished in 6.85s
+

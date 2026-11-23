@@ -1,8 +1,8 @@
 # llama.cpp compatibility implementation ledger
 
 Goal: maximize protocol and official-frontend compatibility, implement missing
-server features with real runtime semantics, remove the terminal REPL, then
-self-review and merge PR #2427.
+server features with real runtime semantics and remove the terminal REPL.
+Self-review and merge tested increments until all acceptance items are complete.
 
 The upstream baseline is pinned in `vendor/llama-chat/UPSTREAM`. A matching route
 name or a successful empty response is not an implemented capability.
@@ -1108,3 +1108,29 @@ higher-scoring invalid value. Final 25 classifier cases, seven processor cases a
 all-target Clippy pass. Literal boundaries use a distinct resolved matcher and do
 not construct unused DFA analyses. Unicode word assertions, decoder sequences,
 escaped JSON generation and all other unchecked delivery items remain open.
+
+## Projected JSON Unicode escape continuation
+
+Projected schema recognition now treats unfinished JSON string escapes as a
+bounded domain of possible Unicode scalars. Each domain is checked against the
+compiled byte grammar, including `const`, known property names, patterns and
+scalar string-length limits. UTF-8 prefix intervals prune impossible scalar
+ranges; escaped ASCII uses individual leaves because its byte order differs.
+Surrogate halves must pair correctly. Pending escapes never permit EOF, and a
+budget rejection in one search branch does not abort other candidates.
+
+A shared normalizer replaces the old completed-prefill-only helper. Response
+sampling, prefill and history replay consume its stable canonical spelling;
+actual prompt/output bytes keep their original spelling. Malformed candidate
+escapes are masked with typed, byte-offset errors rather than aborting unrelated
+candidates. Existing plain token-trie prefills share completed normalization.
+Plain token-trie generated escapes remain open work, as do escaped DEL property
+names declared by a schema. Raw literal property names preserve existing behavior;
+no key-versus-value spelling heuristic is used.
+
+Validation before the final raw-key preservation adjustment: full default engine
+722 passed / 1 inherited ignore; full server 405 passed / 2 inherited ignores.
+The real ONNX HTTP test covers scalar constants, known keys and surrogate pairs
+in buffered and logprob SSE requests with a higher-biased invalid suffix. After the final adjustment, all 5 Unicode prefix cases, 3 existing schema-prefill
+cases, 8 production processor cases and strict engine/server all-target Clippy
+passed. This increment does not close the unchecked delivery items.
