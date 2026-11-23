@@ -33,6 +33,7 @@ mod lease;
 mod metrics;
 mod models_config;
 pub mod multimodal;
+mod reasoning_request;
 mod registry;
 mod replay;
 mod routes;

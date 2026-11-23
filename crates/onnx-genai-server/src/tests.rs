@@ -7117,7 +7117,7 @@ mod llama_compat {
             "messages": [{"role": "user", "content": "hello"}],
             "max_tokens": 2, "seed": -1, "repeat_penalty": 1.0,
             "repeat_last_n": -1, "typ_p": 1.0,
-            "reasoning_format": "auto", "reasoning_control": true,
+            "reasoning_format": "auto", "reasoning_control": true, "thinking_budget_tokens": 32,
             "return_progress": true, "sse_ping_interval": 1,
             "dynatemp_range": 0.0, "dynatemp_exponent": 1.0,
             "stream": true, "stream_options": {"include_usage": true},
@@ -7149,7 +7149,7 @@ mod llama_compat {
         for (key, value) in [
             ("dynatemp_range", json!(-0.2)),
             ("samplers", json!(["unknown"])),
-            ("thinking_budget_tokens", json!(32)),
+            ("thinking_budget_tokens", json!(-2)),
         ] {
             let mut body = json!({"messages": [{"role": "user", "content": "hello"}]});
             body[key] = value;

@@ -1652,7 +1652,8 @@ impl WorkflowRuntime {
                     && options.dry.is_none()
                     && options.mirostat.is_none()
                     && options.xtc.is_none()
-                    && options.constraint.is_none(),
+                    && options.constraint.is_none()
+                    && options.reasoning_budget.is_none(),
                 "candidate-tree sampling currently preserves the exact declared target \
                  distribution only; temperature/logit processors/grammar require matching \
                  proposer-side transforms and are refused before transaction admission"
@@ -2272,7 +2273,8 @@ impl WorkflowRuntime {
                     && options.dry.is_none()
                     && options.mirostat.is_none()
                     && options.xtc.is_none()
-                    && options.constraint.is_none(),
+                    && options.constraint.is_none()
+                    && options.reasoning_budget.is_none(),
                 "DFlash sampling currently supports the exact unwarped target distribution \
                  only; processors require matching proposal-side transforms and are refused \
                  before transaction admission"
