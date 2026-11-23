@@ -154,23 +154,6 @@ impl Default for ProcessorChain {
     }
 }
 
-fn push_device_transform(
-    transforms: &mut Vec<DeviceSamplingTransform>,
-    transform: DeviceSamplingTransform,
-) {
-    // Positive temperature and top-k commute: rank truncation is invariant to
-    // positive scaling. Probability filters never commute through temperature.
-    if let DeviceSamplingTransform::Temperature(temperature) = transform
-        && temperature > 0.0
-        && let Some(DeviceSamplingTransform::TopK(top_k)) = transforms.last().copied()
-    {
-        *transforms.last_mut().expect("top-k was observed above") = transform;
-        transforms.push(DeviceSamplingTransform::TopK(top_k));
-    } else {
-        transforms.push(transform);
-    }
-}
-
 impl ProcessorChain {
     pub fn new() -> Self {
         Self {
@@ -188,7 +171,7 @@ impl ProcessorChain {
         self.track_candidates |= processor.needs_candidate_count();
         if let Some(transforms) = &mut self.device_transforms {
             if let Some(transform) = processor.device_sampling_transform() {
-                push_device_transform(transforms, transform);
+                transforms.push(transform);
             } else {
                 self.device_transforms = None;
             }
@@ -215,7 +198,7 @@ impl ProcessorChain {
             self.processors
                 .iter()
                 .try_fold(Vec::new(), |mut transforms, processor| {
-                    push_device_transform(&mut transforms, processor.device_sampling_transform()?);
+                    transforms.push(processor.device_sampling_transform()?);
                     Some(transforms)
                 });
         true
@@ -1388,12 +1371,12 @@ impl LogitProcessor for TopKProcessor {
     }
 
     fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
-        let Some(threshold) = top_k_threshold(logits, self.top_k) else {
+        let Some(mut boundary) = top_k_boundary(logits, self.top_k) else {
             return;
         };
 
         for logit in logits.iter_mut() {
-            if logit.is_nan() || *logit < threshold {
+            if !boundary.keeps(*logit) {
                 *logit = f32::NEG_INFINITY;
             }
         }
@@ -1457,23 +1440,19 @@ impl LogitProcessor for TopKTopPProcessor {
     }
 
     fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
-        let Some(threshold) = top_k_threshold(logits, self.top_k) else {
+        let Some(mut boundary) = top_k_boundary(logits, self.top_k) else {
             // No top-k pruning applies, so this degenerates to plain top-p.
             TopPProcessor { top_p: self.top_p }.process(logits, _context);
             return;
         };
 
-        // Collect the survivors once, instead of writing -inf across the whole
-        // vocabulary and reading it back. `top_k` is the common case rather
-        // than a bound: the threshold is the k-th largest value and every entry
-        // `>= threshold` is kept, so a tie at the threshold lets the survivor
-        // set exceed `top_k` and the vector grows. That matches what
-        // `TopKProcessor` keeps, which is the property the fusion must
-        // preserve; the reservation is only sized for the untied case.
+        // Keep exactly k ranked candidates, resolving threshold ties by token
+        // id just like the independent top-k stage. The shared boundary carries
+        // the remaining tie quota, so fusion cannot admit extra tied tokens.
         let mut survivors: Vec<(usize, f32)> = Vec::with_capacity(self.top_k);
         let mut maximum_logit = f32::NEG_INFINITY;
         for (index, logit) in logits.iter_mut().enumerate() {
-            if logit.is_nan() || *logit < threshold {
+            if !boundary.keeps(*logit) {
                 *logit = f32::NEG_INFINITY;
                 continue;
             }
@@ -2073,13 +2052,32 @@ fn nonzero_softmax_probabilities(logits: &[f32]) -> Option<NonzeroProbabilities>
     Some((weights, zero_probability_indices))
 }
 
-fn top_k_threshold(logits: &[f32], top_k: usize) -> Option<f32> {
+/// Exactly-k boundary. Equal logits consume the quota in ascending token order.
+struct TopKBoundary {
+    threshold: f32,
+    remaining_ties: usize,
+}
+
+impl TopKBoundary {
+    fn keeps(&mut self, value: f32) -> bool {
+        if value > self.threshold {
+            true
+        } else if value == self.threshold && self.remaining_ties > 0 {
+            self.remaining_ties -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn top_k_boundary(logits: &[f32], top_k: usize) -> Option<TopKBoundary> {
     if top_k == 0 || top_k >= logits.len() {
         return None;
     }
 
     if top_k <= 256 {
-        return top_k_threshold_bounded_heap(logits, top_k);
+        return top_k_boundary_bounded_heap(logits, top_k);
     }
 
     let mut candidates: Vec<f32> = logits
@@ -2092,13 +2090,16 @@ fn top_k_threshold(logits: &[f32], top_k: usize) -> Option<f32> {
     }
 
     let rank = top_k.saturating_sub(1).min(candidates.len() - 1);
-    let (_, threshold, _) = candidates.select_nth_unstable_by(rank, |left, right| {
+    let (above, threshold, _) = candidates.select_nth_unstable_by(rank, |left, right| {
         right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
     });
-    Some(*threshold)
+    Some(TopKBoundary {
+        threshold: *threshold,
+        remaining_ties: rank + 1 - above.iter().filter(|&&value| value > *threshold).count(),
+    })
 }
 
-fn top_k_threshold_bounded_heap(logits: &[f32], top_k: usize) -> Option<f32> {
+fn top_k_boundary_bounded_heap(logits: &[f32], top_k: usize) -> Option<TopKBoundary> {
     let mut heap = BinaryHeap::with_capacity(top_k);
     for value in logits.iter().copied().filter(|value| !value.is_nan()) {
         if heap.len() < top_k {
@@ -2109,7 +2110,11 @@ fn top_k_threshold_bounded_heap(logits: &[f32], top_k: usize) -> Option<f32> {
             *threshold = std::cmp::Reverse(TopKLogit(value));
         }
     }
-    heap.peek().map(|threshold| threshold.0.0)
+    let threshold = heap.peek()?.0.0;
+    Some(TopKBoundary {
+        threshold,
+        remaining_ties: heap.iter().filter(|value| value.0.0 == threshold).count(),
+    })
 }
 
 fn compare_ranked_probability(left: &(usize, f32), right: &(usize, f32)) -> std::cmp::Ordering {
@@ -2229,11 +2234,28 @@ mod tests {
     }
 
     fn full_sort_top_k(logits: &mut [f32], top_k: usize) {
-        let Some(threshold) = full_sort_top_k_threshold(logits, top_k) else {
+        if top_k == 0 || top_k >= logits.len() {
             return;
-        };
-        for logit in logits {
-            if logit.is_nan() || *logit < threshold {
+        }
+        let mut ranked: Vec<_> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, value)| !value.is_nan())
+            .collect();
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap()
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let mut kept = vec![false; logits.len()];
+        for &(index, _) in ranked.iter().take(top_k) {
+            kept[index] = true;
+        }
+        for (index, logit) in logits.iter_mut().enumerate() {
+            if !kept[index] {
                 *logit = f32::NEG_INFINITY;
             }
         }
@@ -2347,11 +2369,51 @@ mod tests {
     }
 
     #[test]
+    fn top_k_keeps_exactly_k_ties_in_both_selection_algorithms() {
+        for len in [8, 1024] {
+            for k in [1, 3, 256, 257, 512] {
+                if k >= len {
+                    continue;
+                }
+                let mut logits = vec![2.0; len];
+                logits[0] = f32::NAN;
+                logits[len - 1] = 3.0;
+                let mut expected = logits.clone();
+                full_sort_top_k(&mut expected, k);
+                TopKProcessor { top_k: k }.process(&mut logits, &ProcessorContext::default());
+                assert_eq!(logits, expected, "len={len} k={k}");
+                assert_eq!(logits.iter().filter(|value| value.is_finite()).count(), k);
+                assert!(logits[len - 1].is_finite());
+                for p in [0.5, 1.0] {
+                    let mut sequential = expected.clone();
+                    TopPProcessor { top_p: p }
+                        .process(&mut sequential, &ProcessorContext::default());
+                    let mut fused = vec![2.0; len];
+                    fused[0] = f32::NAN;
+                    fused[len - 1] = 3.0;
+                    TopKTopPProcessor { top_k: k, top_p: p }
+                        .process(&mut fused, &ProcessorContext::default());
+                    assert_eq!(fused, sequential, "len={len} k={k} p={p}");
+                }
+            }
+        }
+        for row in [
+            vec![-0.0, 0.0, -0.0],
+            vec![f32::INFINITY, f32::INFINITY, 1.0],
+        ] {
+            let mut actual = row.clone();
+            TopKProcessor { top_k: 1 }.process(&mut actual, &ProcessorContext::default());
+            assert_eq!(actual[0].to_bits(), row[0].to_bits());
+            assert_eq!(actual[1..], [f32::NEG_INFINITY, f32::NEG_INFINITY]);
+        }
+    }
+
+    #[test]
     fn top_k_selection_threshold_matches_full_sort_on_large_vocab() {
         let logits = deterministic_logits(10_000);
         for top_k in [1, 2, 20, 128, 1_024, 9_999] {
             let expected = full_sort_top_k_threshold(&logits, top_k);
-            let actual = top_k_threshold(&logits, top_k);
+            let actual = top_k_boundary(&logits, top_k).map(|boundary| boundary.threshold);
             assert_eq!(actual, expected, "top_k={top_k}");
 
             let mut expected_logits = logits.clone();

@@ -1085,7 +1085,7 @@ mod ordered_sampler_tests {
         assert!(!is_device_portable_chain(&impostor));
     }
     #[test]
-    fn sampler_fusion_respects_only_adjacent_active_stages_and_keeps_commuting_fastpath() {
+    fn sampler_fusion_respects_adjacency_and_temperature_rounding_order() {
         let options = GenerateOptions {
             greedy: false,
             temperature: 2.0,
@@ -1099,6 +1099,28 @@ mod ordered_sampler_tests {
         assert_eq!(chain.names(), vec!["top_k", "temperature"]);
         assert_eq!(
             device_sampling_plan(&chain, &options, false, true, true),
+            DeviceSamplingPlan::Host
+        );
+        // Positive real scaling preserves ranks, but f32 division can merge
+        // unequal logits. Moving temperature ahead of an exactly-k tie quota
+        // would choose token 0 instead of the original maximum at token 1.
+        let mut precision_options = options.clone();
+        precision_options.temperature = f32::MAX;
+        precision_options.top_k = 1;
+        let mut ranked_first = vec![1e-30, 2e-30];
+        build_processor_chain(&precision_options, None, false)
+            .unwrap()
+            .process(&mut ranked_first, &ProcessorContext::default());
+        assert_eq!(ranked_first, vec![f32::NEG_INFINITY, 0.0]);
+        precision_options.sampler_order = Some(
+            SamplerSequence::new(vec![SamplerStage::Temperature, SamplerStage::TopK]).unwrap(),
+        );
+        let mut scaled_first = vec![1e-30, 2e-30];
+        let chain = build_processor_chain(&precision_options, None, false).unwrap();
+        chain.process(&mut scaled_first, &ProcessorContext::default());
+        assert_eq!(scaled_first, vec![0.0, f32::NEG_INFINITY]);
+        assert_eq!(
+            device_sampling_plan(&chain, &precision_options, false, true, true),
             DeviceSamplingPlan::Sampled
         );
         let mut options = options;

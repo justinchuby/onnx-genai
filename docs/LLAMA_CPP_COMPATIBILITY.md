@@ -111,7 +111,10 @@ and stop contracts always remain active. The default ordering follows the pinned
 [upstream sampler pipeline](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/common.h),
 with the optional nxrt `top_a` extension after min-p. Mirostat mode replaces the
 ordered warper list with temperature and Mirostat. `top_n_sigma` uses population
-standard deviation of finite logits; non-positive values disable it.
+standard deviation of finite logits; non-positive values disable it. Top-k caps
+its ranked candidate set at k even when the boundary logits tie. Equal logits
+use ascending token IDs consistently in the host, fused and device paths; the
+upstream implementation does not specify a stable tie order.
 
 A zero-temperature stage creates a point mass where it occurs; preceding stages
 still run. Omitting it does not force greedy selection merely because the
@@ -119,9 +122,10 @@ request's temperature value is zero. `dynatemp_range` and `dynatemp_exponent`
 control entropy-based temperature at that same position. Candidate truncation
 updates its entropy denominator; mask-only stages retain their candidate count.
 The device sampler runs only when cached typed transforms prove the actual
-parameters and stage order equivalent to its fixed pipeline. Positive-temperature
-scaling may commute through top-k, preserving that fast path. Otherwise the
-runtime evaluates the requested stages on host logits.
+parameters and stage order equivalent to its fixed pipeline. Temperature stays
+at its requested position: finite-precision scaling can merge distinct logits,
+so it cannot move across top-k. The matching fixed-order
+device path remains available; other orders execute on host logits.
 
 `/props.nxrt_capabilities.custom_sampler_order` reports the actual executor
 capability. Authored sampler graphs without runtime-owned sampling reject custom

@@ -397,7 +397,7 @@ Top-n-sigma now performs a real finite-logit population-deviation mask.
 
 Device dispatch no longer trusts processor names: a cached typed transform proof
 checks both parameter values and equivalent operation order. Adjacent active
-top-k/top-p still fuse; positive temperature/top-k commutation and rank-preserving
+top-k/top-p still fuse; fixed-order sampled transforms and rank-preserving
 zero-temperature argmax paths remain eligible. A renamed or foreign processor
 cannot obtain a shortcut through its diagnostic name. Dynamic temperature tracks
 logical candidate counts across truncations, mask-only sigma and XTC removal.
@@ -421,3 +421,40 @@ nonzero-offset replay and active refresh during a 16,384-token ONNX generation
 and cancelled replay returning 404. No browser errors were reported.
 Strict non-native engine all-target Clippy also passes after gating the
 native/test-only prefix helper import.
+
+Top-k cardinality follow-up: the ordinary and fused processors share an exactly-k
+boundary with a remaining tie quota. The small-k heap retains its bounded
+allocation; large-k partitioning derives the quota from its partition. CUDA
+uses the same candidate cap, with a token-order tie pass only when the threshold
+would exceed k. Stable token-ID ordering makes host/fused/device choices agree;
+upstream's partial sort does not promise an ordering among equal logits.
+Regression coverage includes heap/partition sizes, high-ranked tokens following
+tied entries, NaN, signed zero, infinity, fusion equivalence, the device algorithm
+CPU oracle and real ONNX HTTP generation with deliberately equal finite logits.
+Adaptive/infill selectors and the other unchecked generation controls remain open.
+
+The strict tie cap also exposes why temperature cannot commute across top-k in
+f32: two distinct logits can round to equal scaled values, changing which token
+survives. Transform proofs now retain exact stage order. The fixed-order device
+path remains available; a reversed order uses the host rather than changing the
+requested distribution. A regression proves the distinct winners on underflow.
+Remaining sampler conformance includes device top-p boundary ties in addition to
+adaptive/infill selectors. Missing CUDA driver/NVRTC libraries now return a
+capability error before cudarc's dynamic-entry panic path.
+
+Device temperature now divides logits directly, matching the host instead of
+forming a reciprocal that can overflow for a finite subnormal temperature.
+CUDA library presence is checked before dynamic calls; missing driver/compiler
+errors identify the device, missing library and remediation. This macOS host
+executes the CPU differential tests and CUDA-feature Rust checks; it cannot prove
+execution of the changed CUDA kernel on actual GPU hardware.
+
+Top-k validation: full native engine library 817 passed / 1 inherited ignore.
+All 8 selected top-k engine tests and the real HTTP equal-logit generation test
+passed. Four selected CUDA-feature ORT cases passed: strict top-k CPU differential,
+broad device-algorithm CPU sweep, subnormal-temperature division, and actionable
+missing-library errors. Actual GPU subcases were unavailable on this host.
+Strict native-engine all-target Clippy passes.
+Strict CUDA-feature ORT and server all-target Clippy also pass. CUDA top-k
+candidate counts use integer reductions, avoiding float rounding in large
+vocabularies; actual GPU execution remains a separate hardware validation gate.

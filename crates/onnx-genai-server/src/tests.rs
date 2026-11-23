@@ -6549,6 +6549,50 @@ mod native_compat {
     }
 
     #[tokio::test]
+    async fn native_top_k_ties_retain_exactly_the_requested_candidates() {
+        let router = app(tiny_state());
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    if id == 5 || id == 6 {
+                        json!(1e20)
+                    } else {
+                        json!(false)
+                    },
+                )
+            })
+            .collect();
+        // The finite bias rounds both model logits to the same f32 value.
+        // With k=1, the second token can never survive; k=2 keeps both.
+        let mut second_selected = false;
+        for k in [1, 2] {
+            for seed in 0..16 {
+                let response = request(
+                    router.clone(),
+                    "/completion",
+                    json!({
+                        "prompt":[5], "max_tokens":1, "samplers":["top_k"],
+                        "top_k":k, "logit_bias":bias, "seed":seed,
+                        "ignore_eos":true, "return_tokens":true
+                    }),
+                )
+                .await;
+                let status = response.status();
+                let value = json_body(response).await;
+                assert_eq!(status, StatusCode::OK, "{value}");
+                if k == 1 {
+                    assert_eq!(value["tokens"], json!([5]), "seed={seed}: {value}");
+                } else {
+                    assert!(value["tokens"] == json!([5]) || value["tokens"] == json!([6]));
+                    second_selected |= value["tokens"] == json!([6]);
+                }
+            }
+        }
+        assert!(second_selected, "k=2 must permit the tied second candidate");
+    }
+
+    #[tokio::test]
     async fn native_sampler_order_changes_actual_generation_across_protocols() {
         let router = app(tiny_state());
         let response = router
