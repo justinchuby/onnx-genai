@@ -128,3 +128,13 @@ Formatting and whitespace checks pass. No CUDA, x86, Linux/Windows ARM64 or
 whole-model generation was tested. The first integration attempt used a Python
 without NumPy; the successful run prepended the existing Miniconda environment
 with NumPy/ONNX. No dependency or project configuration was changed to hide it.
+
+
+After timing, integration with merged plugin/ARM64 work and the reviewed
+single-owner API passes native/MLAS QMoE (57 each, one ignored), native/MLAS
+session (296/298), the GPU-free oracle and strict CPU/CUDA/session all-target
+Clippy. integration-source.json records that checkpoint and all changed Rust
+source hashes; the three measured QMoE files are unchanged. These checks do not
+reinterpret the recorded timings as a fresh post-integration baseline. The parent
+API's quarantine-test teardown also passes all 14 provider tests under local
+Miri with leak checking enabled; no production guard is relaxed.

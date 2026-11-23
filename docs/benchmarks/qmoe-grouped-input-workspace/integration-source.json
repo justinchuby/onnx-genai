@@ -1,0 +1,20 @@
+{
+  "source_head": "4bfb650bd1b3d78e55bf59fbb8ccb82891d31723",
+  "main": "83486784bc2d8218801092dc5efbbb8e9d36c746",
+  "single_owner_parent": "7098283cfd1855738ebc6a14399c522ca379e0ec",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-api/src/abi/host.rs": "7291a461f6059cdb34453d2b30f8cf784c0df76f5483917df4b4a7d66bdb7f45",
+    "crates/onnx-runtime-ep-api/src/provider.rs": "03c30851382194fb0b7db093210cd3105beb4436e7dd26023e8d0cab44ded3d2",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs": "677aad997e0ae7aa464cd02d701570a22e9e599ae8d51ff54516a38919baec87",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_neon.rs": "66461a50207729a93baccfedbb6b749483801e2fb4bbfe4754cdd99ffded15a7",
+    "crates/onnx-runtime-ep-cpu/src/kernels/mod.rs": "6b161640a6b30a456b7eb1f94b5a4dda77ef260da1c4a999176534cdce95e75f",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "2ed1b88bf45674e2c8e5245ce824a233b8953b2e2ff4b66c234e57deeb0fdc30",
+    "crates/onnx-runtime-ep-cpu/src/provider.rs": "9b4317f00e4d5a67e2722dd7ab81757015c6dccdc28a6e10e6cb6ed8e43ae75c",
+    "crates/onnx-runtime-ep-cuda/src/kernel_cache.rs": "54e18a41f965006c79cd21106787d297eea2d1b928ee259a7dc6438e9f5855a8",
+    "crates/onnx-runtime-ep-cuda/src/provider.rs": "983291649ac4ab06bf62910bcba1106e8fb98deb7698bbce75f1e8d0899caed2",
+    "crates/onnx-runtime-ep-cuda/src/runtime.rs": "cdb3b8ea686ce2827da0275b5f11508f643f1686a45340733a66eda550ad0b07",
+    "crates/onnx-runtime-ep-cuda/tests/qmoe_gpu.rs": "35a7271dd3254894de252ed334b3e4b636a7f7a5c74e2f2056120553fbf13db0",
+    "crates/onnx-runtime-session/src/executor/tests.rs": "9647e795689d6f991982d4fd6ed67010f5b01f470f13f5b8d8f4b60d3e5e6bce",
+    "crates/onnx-runtime-session/src/plugin_provider.rs": "ed267d66b6d49423718cb7de7bfc330317dde58f85190c18b3e740db5ec47b70"
+  }
+}
