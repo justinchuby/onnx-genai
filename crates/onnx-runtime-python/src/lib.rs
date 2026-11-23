@@ -50,7 +50,7 @@ mod thread_owned;
 use std::sync::Mutex;
 
 use onnx_runtime_ir::{DataType, DeviceId, Dim, Shape};
-use onnx_runtime_session::{InferenceSession as RtSession, IoMeta, Tensor};
+use onnx_runtime_session::{InferenceSession as RtSession, IoMeta, KeyedWeightFile, Tensor};
 use pyo3::exceptions::{
     PyAttributeError, PyFileNotFoundError, PyIndexError, PyKeyError, PyRuntimeError, PyTypeError,
     PyValueError,
@@ -377,6 +377,12 @@ struct InferenceSession {
     providers: Vec<String>,
 }
 
+type KeyedWeightSpec = (
+    String,
+    std::path::PathBuf,
+    Option<std::collections::BTreeMap<String, String>>,
+);
+
 #[pymethods]
 impl InferenceSession {
     /// Load a model from a filesystem path or raw ONNX model bytes.
@@ -387,12 +393,16 @@ impl InferenceSession {
     ///   requested provider at runtime and executes with the first one. Defaults
     ///   to `["CPUExecutionProvider"]`; unavailable providers raise an error
     ///   rather than being silently dropped.
+    /// * `keyed_weights` — optional list of `(format, path, mapping)` tuples.
+    ///   `format` is `"gguf"` or `"safetensors"`; `mapping` is a dictionary
+    ///   from file keys to ONNX initializer names, or `None`.
     #[new]
-    #[pyo3(signature = (path_or_bytes, providers=None))]
+    #[pyo3(signature = (path_or_bytes, providers=None, *, keyed_weights=None))]
     fn new(
         py: Python<'_>,
         path_or_bytes: &Bound<'_, PyAny>,
         providers: Option<Vec<String>>,
+        keyed_weights: Option<Vec<KeyedWeightSpec>>,
     ) -> PyResult<Self> {
         let providers = providers.unwrap_or_else(|| vec!["CPUExecutionProvider".to_string()]);
         let selected =
@@ -405,17 +415,35 @@ impl InferenceSession {
             SelectedProvider::Cpu => vec!["CPUExecutionProvider".to_string()],
             SelectedProvider::Cuda => vec!["CUDAExecutionProvider".to_string()],
         };
+        let mut builder = RtSession::builder();
+        if let Some(provider) = execution_provider {
+            builder = builder.execution_provider(provider);
+        }
+        for (format, path, mapping) in keyed_weights.unwrap_or_default() {
+            let mut file = match format.as_str() {
+                "gguf" => KeyedWeightFile::gguf(path),
+                "safetensors" => KeyedWeightFile::safetensors(path),
+                _ => {
+                    return Err(PyValueError::new_err(format!(
+                        "keyed_weights file {}: unknown format {format:?}; use 'gguf' or 'safetensors'",
+                        path.display()
+                    )));
+                }
+            };
+            for (key, name) in mapping.unwrap_or_default() {
+                file = file.rename(key, name);
+            }
+            builder = builder.keyed_weight_file(file);
+        }
 
         // Accept raw model bytes directly; otherwise treat the argument as a
         // path (covering str and os.PathLike via Python's str()).
         let session = if let Ok(pybytes) = path_or_bytes.cast::<PyBytes>() {
             let bytes = pybytes.as_bytes();
-            let builder = RtSession::builder().model_bytes(bytes);
-            let result = match execution_provider {
-                Some(provider) => builder.execution_provider(provider).build(),
-                None => builder.build(),
-            };
-            result.map_err(|e| load_error(&format!("<{} bytes>", bytes.len()), e))?
+            builder
+                .model_bytes(bytes)
+                .build()
+                .map_err(|e| load_error(&format!("<{} bytes>", bytes.len()), e))?
         } else {
             let path: String = path_or_bytes
                 .str()
@@ -433,12 +461,10 @@ impl InferenceSession {
                      .onnx file, or pass the serialized model as bytes."
                 )));
             }
-            let builder = RtSession::builder().model(&path);
-            let result = match execution_provider {
-                Some(provider) => builder.execution_provider(provider).build(),
-                None => builder.build(),
-            };
-            result.map_err(|e| load_error(&path, e))?
+            builder
+                .model(&path)
+                .build()
+                .map_err(|e| load_error(&path, e))?
         };
 
         let inputs = session.inputs().to_vec();
