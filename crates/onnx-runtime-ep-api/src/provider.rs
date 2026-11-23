@@ -2735,10 +2735,12 @@ mod tests {
 
     #[test]
     fn workspace_release_keeps_funding_until_physical_completion() {
-        use onnx_runtime_memory_api::{DeviceKey, MemoryRole, Tier};
+        use onnx_runtime_memory_api::{
+            DeviceAllocator, DeviceKey, HostAllocator, MemoryRole, Tier,
+        };
         use onnx_runtime_memory_governor::{
-            HostWorkspacePool, LeaseLedger, LedgerGovernor, ManagedAllocationState, MemoryGovernor,
-            ProcessMemoryManager,
+            AllocationPublication, AllocationRequest, LeaseLedger, LedgerGovernor,
+            ManagedAllocationState, MemoryGovernor, ProcessMemoryManager,
         };
 
         #[derive(Clone, Copy, Debug)]
@@ -2846,13 +2848,51 @@ mod tests {
                 0,
             )));
             let manager = ProcessMemoryManager::new().unwrap();
-            let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
-            let owner = pool
-                .checkout(64, 16, MemoryRole::Workspace { step_scoped: true })
+            let context = manager
+                .register_provider_context(
+                    DeviceKey::HOST,
+                    "test Host context",
+                    std::sync::Arc::new(()),
+                )
                 .unwrap();
+            let authority = manager
+                .register_authority(
+                    DeviceKey::HOST,
+                    "test Host authority",
+                    std::sync::Arc::new(()),
+                    books.clone(),
+                )
+                .unwrap();
+            let holder = manager
+                .register_holder(&authority, "test workspace", None)
+                .unwrap();
+            let mechanism = manager
+                .register_allocator(
+                    &context,
+                    &authority,
+                    "test Host backing",
+                    std::sync::Arc::new(HostAllocator),
+                )
+                .unwrap();
+            let owner = manager
+                .bind_registered(&mechanism)
+                .unwrap()
+                .allocate(
+                    AllocationRequest::managed(
+                        64,
+                        16,
+                        Tier::Host,
+                        MemoryRole::Workspace { step_scoped: true },
+                        holder,
+                        64,
+                    ),
+                    AllocationPublication::exclusive(64, 64, 64),
+                )
+                .unwrap();
+            let raw = owner.as_ptr();
             let identity = owner.identity();
             let workspace = WorkspaceAllocation::new(DeviceBuffer::from_managed_allocation(
-                owner,
+                Box::new(owner),
                 DeviceId::cpu(),
             ));
             assert_eq!(books.used(Tier::Host), 64);
@@ -2874,6 +2914,21 @@ mod tests {
                 let entry = allocations.iter().find(|a| a.identity == identity).unwrap();
                 assert_eq!(entry.state, ManagedAllocationState::Quarantined);
                 assert_eq!(entry.charged_bytes, 64);
+                // Test-only teardown: the dropped owner quarantined rather than
+                // freeing this exact Host allocation. Prove physical release
+                // before confirming termination of this isolated test context.
+                // No synthetic release outcome or early quota refund is used.
+                // SAFETY: raw preserves the original allocation's provenance;
+                // neither the consumed owner nor any view can access it again.
+                unsafe { HostAllocator.deallocate(raw, 64, 16) };
+                assert_eq!(books.used(Tier::Host), 64);
+                manager
+                    .invalidate_device(DeviceKey::HOST, "test backing physically released")
+                    .unwrap();
+                manager.confirm_context_terminated(&context).unwrap();
+                assert_eq!(books.used(Tier::Host), 0);
+                assert_eq!(manager.process_used(Tier::Host), 0);
+                assert!(manager.snapshot().unwrap().allocations.is_empty());
             } else {
                 assert_eq!(
                     books.used(Tier::Host),
