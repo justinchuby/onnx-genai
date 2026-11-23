@@ -191,7 +191,7 @@ fn dequantize_packed_resolves_shape_and_checks_exact_payload() {
             "multiple of 32",
         ),
         (
-            packed("gguf:q5_1", vec![1_i64 << 55, 32]),
+            packed("gguf:q5_1", vec![1_i64 << 57, 32]),
             DataType::Uint8,
             vec![c(0)],
             "byte count",
