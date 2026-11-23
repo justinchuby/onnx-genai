@@ -6235,6 +6235,7 @@ mod llama_compat {
             call(router.clone(), "POST", "/apply-template", body.clone()).await;
         assert_eq!(status, StatusCode::OK, "{rendered}");
         assert_eq!(rendered["prompt"], "<|user|>\nhello\n<|assistant|>\nworld");
+        body["continue_final_message"] = json!("content");
         let (status, count) = call(
             router.clone(),
             "POST",
@@ -6293,6 +6294,13 @@ mod llama_compat {
         );
         for (field, value, expected) in [
             (
+                "continue_final_message",
+                json!("reasoning_content"),
+                "resumable reasoning-parser",
+            ),
+            ("continue_final_message", json!("auto"), "must be null"),
+            ("continue_final_message", json!(1), "must be null"),
+            (
                 "add_generation_prompt",
                 json!(true),
                 "add_generation_prompt=false",
@@ -6326,6 +6334,26 @@ mod llama_compat {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn continuation_public_request_builders_enforce_the_same_mode_validation() {
+        let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+            "messages":[{"role":"assistant","content":"world"}],
+            "continue_final_message":"content","add_generation_prompt":false
+        }))
+        .unwrap();
+        let generated = build_generate_request(&request, &fixture_tokenizer()).unwrap();
+        assert!(
+            matches!(generated.prompt,onnx_genai::GeneratePrompt::Text(ref text) if text=="<|assistant|>\nworld")
+        );
+        request.continue_final_message = crate::ChatContinuation::Reasoning;
+        assert!(
+            build_generate_request(&request, &fixture_tokenizer())
+                .unwrap_err()
+                .to_string()
+                .contains("resumable reasoning-parser")
+        );
     }
 
     #[tokio::test]

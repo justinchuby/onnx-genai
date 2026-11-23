@@ -63,12 +63,13 @@ pub use state::{
 pub use tool_protocol::{ToolProtocol, ToolProtocolError};
 pub use types::{
     AudioSpeechRequest, AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest,
-    ChatCompletionResponse, ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageContentPart,
-    ChatMessageToolCall, ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatToolFunction,
-    ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse,
-    EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat,
-    StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific, Usage,
+    ChatCompletionResponse, ChatContinuation, ChatLogprobs, ChatMessage, ChatMessageContent,
+    ChatMessageContentPart, ChatMessageToolCall, ChatMessageToolCallFunction, ChatTokenLogprob,
+    ChatTool, ChatToolFunction, ChatTopLogprob, CompletionChoice, CompletionLogprobs,
+    CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput,
+    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio,
+    JsonSchemaSpec, ResponseFormat, StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode,
+    ToolChoiceSpecific, Usage,
 };
 
 pub fn app(state: AppState) -> Router {

@@ -158,7 +158,7 @@ error. Ending roles do not imply special-token types: only tokenizer-declared
 special pieces are suppressed during prefix matching.
 The selector requires lossless tokenizer byte pieces and declared ending roles.
 
-Explicit content continuation accepts `continue_final_message=true` with
+Explicit content continuation accepts `continue_final_message=true` or `"content"` with
 `add_generation_prompt=false` and a nonempty final assistant text. The template
 boundary is proven by a second render rather than guessed from an EOS spelling
 or an earlier matching quote; original prefix whitespace is preserved. Template
@@ -171,6 +171,12 @@ assistant prefix as partial JSON and constrains prefix plus new suffix at each
 step. EOS, stop sequences and output-budget completion use that same complete
 value; only newly generated suffix bytes and tokens appear in the response.
 Invalid JSON prefixes are rejected before inference admission.
+Continuation intent follows the pinned upstream wire forms: `false`/`null` disable
+explicit continuation, `true` selects content unless the final message contains
+only reasoning, and `"content"` / `"reasoning_content"` select their named fields.
+Reasoning continuation is recognized but still refused until its parser state can
+be resumed. Unknown values fail with the accepted forms. HTTP rendering/counting/
+generation and the public Rust request builders share continuation validation.
 JSON Schema continuation seeds llguidance from lossless vocabulary bytes and the
 existing assistant prefix. Grammar-only prefix chunks never become model
 candidates or response tokens. Optional leading JSON whitespace remains in the

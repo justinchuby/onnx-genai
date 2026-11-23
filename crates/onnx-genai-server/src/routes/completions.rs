@@ -1879,6 +1879,7 @@ pub fn build_generate_request(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
 ) -> anyhow::Result<GenerateRequest> {
+    request.validate_continuation()?;
     Ok(GenerateRequest {
         prompt: GeneratePrompt::Text(build_prompt(request)),
         options: build_generate_options_with_tokenizer(
@@ -1898,6 +1899,7 @@ pub fn build_generate_request_with_protocol(
     protocol: &ToolProtocol,
     tokenizer: &Tokenizer,
 ) -> anyhow::Result<GenerateRequest> {
+    request.validate_continuation()?;
     let mut options = build_generate_options_with_tokenizer(
         request,
         tokenizer,
@@ -2083,7 +2085,7 @@ fn prepare_generate_request(
     output_budget: usize,
 ) -> anyhow::Result<PreparedGenerateRequest> {
     anyhow::ensure!(
-        !session || !request.continue_final_message,
+        !session || !request.continue_final_message.is_enabled(),
         "continue_final_message cannot append a replayed assistant prefix to a persistent inference session; omit the session header and send the full conversation"
     );
     let prompt = if session && !request.has_tool_context() {
@@ -2280,7 +2282,7 @@ fn validate_sampling_range(value: Option<f32>, field: &str) -> Result<(), ApiErr
 fn response_format_constraint(request: &ChatCompletionRequest) -> Option<GenerateConstraint> {
     match request.response_format.as_ref()? {
         ResponseFormat::JsonObject => Some(GenerateConstraint::Json {
-            prefix: if request.continue_final_message {
+            prefix: if request.continue_final_message.is_enabled() {
                 request
                     .messages
                     .last()
@@ -2295,7 +2297,7 @@ fn response_format_constraint(request: &ChatCompletionRequest) -> Option<Generat
             .ok()
             .map(|schema| GenerateConstraint::JsonSchema {
                 schema,
-                prefix: if request.continue_final_message {
+                prefix: if request.continue_final_message.is_enabled() {
                     request
                         .messages
                         .last()
@@ -2484,6 +2486,7 @@ fn render_prompt(
     request: &ChatCompletionRequest,
     context: &PromptContext<'_>,
 ) -> anyhow::Result<String> {
+    request.validate_continuation()?;
     ChatTemplate::validate_kwargs(&request.chat_template_kwargs)?;
     if let Some(chat_template) = context.chat_template {
         let messages = request
@@ -2513,7 +2516,7 @@ fn render_prompt(
                 .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"))
         };
         let rendered = render(&messages)?;
-        if !request.continue_final_message {
+        if !request.continue_final_message.is_enabled() {
             return Ok(rendered);
         }
         // Prove which occurrence belongs to the final message. Searching just
@@ -2569,7 +2572,7 @@ fn continue_rendered_prompt(
     image_placeholder: Option<&str>,
     boundary: usize,
 ) -> anyhow::Result<String> {
-    if request.continue_final_message {
+    if request.continue_final_message.is_enabled() {
         let content = request
             .messages
             .last()
@@ -2626,7 +2629,7 @@ fn build_prompt_with_tool_prefix(
             prompt
                 .push_str(&serde_json::to_string(tool_calls).unwrap_or_else(|_| "[]".to_string()));
         }
-        if !request.continue_final_message || index + 1 != request.messages.len() {
+        if !request.continue_final_message.is_enabled() || index + 1 != request.messages.len() {
             prompt.push('\n');
         }
     }

@@ -194,10 +194,40 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_true")]
     pub add_generation_prompt: bool,
     #[serde(default)]
-    pub continue_final_message: bool,
+    pub continue_final_message: ChatContinuation,
     /// Retain extensions so unsupported active controls cannot silently disappear.
     #[serde(flatten)]
     pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+/// llama.cpp's explicit final-message continuation intent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChatContinuation {
+    #[default]
+    None,
+    Auto,
+    Content,
+    Reasoning,
+}
+
+impl ChatContinuation {
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+impl<'de> Deserialize<'de> for ChatContinuation {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Null | serde_json::Value::Bool(false) => Ok(Self::None),
+            serde_json::Value::Bool(true) => Ok(Self::Auto),
+            serde_json::Value::String(mode) if mode == "content" => Ok(Self::Content),
+            serde_json::Value::String(mode) if mode == "reasoning_content" => Ok(Self::Reasoning),
+            _ => Err(D::Error::custom(
+                "continue_final_message must be null, a boolean, \"content\" or \"reasoning_content\"; select a supported continuation mode",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -334,6 +364,70 @@ impl ReasoningEffort {
 }
 
 impl ChatCompletionRequest {
+    pub(crate) fn continuation_mode(&self) -> ChatContinuation {
+        match self.continue_final_message {
+            ChatContinuation::Auto => {
+                let reasoning_only = self.messages.last().is_some_and(|last| {
+                    let empty = last.content.as_ref().is_none_or(|content| match content {
+                        ChatMessageContent::Text(text) => text.is_empty(),
+                        ChatMessageContent::Parts(parts) => parts.is_empty(),
+                    });
+                    empty
+                        && last
+                            .reasoning_content
+                            .as_ref()
+                            .is_some_and(|text| !text.is_empty())
+                });
+                if reasoning_only {
+                    ChatContinuation::Reasoning
+                } else {
+                    ChatContinuation::Content
+                }
+            }
+            mode => mode,
+        }
+    }
+
+    pub(crate) fn validate_continuation(&self) -> anyhow::Result<()> {
+        if !self.continue_final_message.is_enabled() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.continuation_mode() != ChatContinuation::Reasoning,
+            "continue_final_message reasoning_content and reasoning-only auto continuation need resumable reasoning-parser state; send a new user turn until that capability is available"
+        );
+        anyhow::ensure!(
+            !self.add_generation_prompt,
+            "continue_final_message requires add_generation_prompt=false; continuing an assistant message cannot open another assistant turn"
+        );
+        let last=self.messages.last().filter(|message|message.role.trim()=="assistant")
+            .ok_or_else(||anyhow::anyhow!("continue_final_message requires a final assistant message; append the assistant text to continue"))?;
+        anyhow::ensure!(
+            !last
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty()),
+            "continue_final_message cannot resume an assistant message containing tool_calls; finish the tool results before continuing"
+        );
+        if self.wants_constrained_json() {
+            let prefix = last
+                .content
+                .as_ref()
+                .map(|content| content.text())
+                .unwrap_or_default();
+            onnx_genai_engine::JsonConstraint::new(prefix).map_err(|error| {
+                anyhow::anyhow!("continue_final_message JSON prefix rejected: {error}")
+            })?;
+        }
+        anyhow::ensure!(
+            last.content
+                .as_ref()
+                .is_some_and(|content| !content.text().trim().is_empty()),
+            "continue_final_message currently requires nonempty final assistant content; reasoning-only continuation needs a resumable reasoning-parser state"
+        );
+        Ok(())
+    }
+
     /// How many tokens this turn may decode, given the server's cap.
     ///
     /// `max_completion_tokens` supersedes `max_tokens`, which OpenAI deprecated
@@ -816,4 +910,72 @@ fn default_mirostat_eta() -> f32 {
 }
 fn default_xtc_threshold() -> f32 {
     0.1
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn continuation_wire_modes_match_upstream_values_and_reject_unknown_forms() {
+        for (wire, expected) in [
+            (json!(null), ChatContinuation::None),
+            (json!(false), ChatContinuation::None),
+            (json!(true), ChatContinuation::Auto),
+            (json!("content"), ChatContinuation::Content),
+            (json!("reasoning_content"), ChatContinuation::Reasoning),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<ChatContinuation>(wire).unwrap(),
+                expected
+            );
+        }
+        for wire in [
+            json!(1),
+            json!([]),
+            json!({}),
+            json!("auto"),
+            json!("CONTENT"),
+        ] {
+            let error = serde_json::from_value::<ChatContinuation>(wire)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("continue_final_message") && error.contains("reasoning_content"),
+                "{error}"
+            );
+        }
+    }
+    #[test]
+    fn continuation_auto_resolves_content_before_reasoning_without_treating_parts_as_empty_text() {
+        let request = |content: serde_json::Value,
+                       mode: serde_json::Value|
+         -> ChatCompletionRequest {
+            serde_json::from_value(json!({"continue_final_message":mode,"messages":[{"role":"assistant","content":content,"reasoning_content":"thought"}]})).unwrap()
+        };
+        assert_eq!(
+            request(json!("answer"), json!(true)).continuation_mode(),
+            ChatContinuation::Content
+        );
+        assert_eq!(
+            request(json!(""), json!(true)).continuation_mode(),
+            ChatContinuation::Reasoning
+        );
+        assert_eq!(
+            request(json!([]), json!(true)).continuation_mode(),
+            ChatContinuation::Reasoning
+        );
+        assert_eq!(
+            request(json!([{"type":"text","text":""}]), json!(true)).continuation_mode(),
+            ChatContinuation::Content
+        );
+        assert_eq!(
+            request(json!(""), json!("content")).continuation_mode(),
+            ChatContinuation::Content
+        );
+        assert_eq!(
+            request(json!("answer"), json!("reasoning_content")).continuation_mode(),
+            ChatContinuation::Reasoning
+        );
+    }
 }

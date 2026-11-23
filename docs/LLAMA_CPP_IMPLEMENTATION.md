@@ -646,3 +646,32 @@ JSON object and JSON Schema suffix generation, streamed schema output, token
 usage and typed HTTP 400 refusal of an undeclared-property prefix. Full server:
 403 passed / 2 inherited ignores. Strict engine/server all-target Clippy passed
 on the final tree, including updated public HTTP integration callers.
+
+Continuation-intent milestone: a typed `ChatContinuation` replaces the old boolean
+field and accepts exactly the pinned upstream boolean/null/content/reasoning forms.
+Auto resolution gives existing answer content precedence over reasoning and tests
+message-part presence rather than flattening an empty text part into an absent
+message. Content-string requests execute the existing proven prompt path;
+reasoning intent receives an explicit capability refusal rather than a misleading
+JSON type error. Invalid values name accepted forms. The request's one validation
+method now serves HTTP extension admission, direct prompt rendering and both public
+Rust generation builders, so direct callers cannot silently generate under a
+rejected reasoning mode. The public field type and all internal callers change
+without a pre-release bool alias. Implicit prefill and reasoning parser resumption
+remain open work.
+
+Continuation-intent validation: all 7 selected continuation tests passed, including
+wire forms, field/part-aware auto resolution, the public Rust builder and real
+HTTP string-content count/generation/SSE paths. Full server library: 406 passed /
+2 inherited ignores. Strict server all-target Clippy passed on the final tree.
+
+Next parser audit: `registry::declares_private_channels` currently checks only
+`response_template.fields.reasoning_content.open_pattern`, while
+`PrivateChannelGate` assumes ATEM addresses. A declared literal `open` is missed,
+and arbitrary declared patterns are not interpreted. Replace this presence flag
+with a validated declared parser and initialize it from the actual rendered
+prompt before admitting reasoning continuation. The upstream
+[response-parsing specification](https://github.com/huggingface/transformers/blob/be48e7a0b63d2ff22ce1ebccbccbd0374c1592ef/docs/source/en/chat_response_parsing.md)
+requires final-turn anchoring and prefix state, with bounded handling of partial
+stream boundaries. This remains an open compatibility requirement, not a
+completed reasoning capability.

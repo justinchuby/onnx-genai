@@ -235,51 +235,9 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
             )));
         }
     }
-    if request.continue_final_message {
-        if request.add_generation_prompt {
-            return Err(ApiError::invalid_request(
-                "continue_final_message=true requires add_generation_prompt=false; continuing an assistant message cannot open another assistant turn",
-            ));
-        }
-        let last = request.messages.last().filter(|m| m.role.trim() == "assistant")
-            .ok_or_else(|| ApiError::invalid_request("continue_final_message=true requires a final assistant message; append the assistant text to continue"))?;
-        if last
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| !calls.is_empty())
-        {
-            return Err(ApiError::invalid_request(
-                "continue_final_message cannot resume an assistant message containing tool_calls; finish the tool results before continuing",
-            ));
-        }
-        if matches!(
-            request.response_format,
-            Some(
-                crate::types::ResponseFormat::JsonObject
-                    | crate::types::ResponseFormat::JsonSchema { .. }
-            )
-        ) {
-            let prefix = last
-                .content
-                .as_ref()
-                .map(|content| content.text())
-                .unwrap_or_default();
-            onnx_genai_engine::JsonConstraint::new(prefix).map_err(|error| {
-                ApiError::invalid_request(format!(
-                    "continue_final_message JSON prefix rejected: {error}"
-                ))
-            })?;
-        }
-        if last
-            .content
-            .as_ref()
-            .is_none_or(|content| content.text().trim().is_empty())
-        {
-            return Err(ApiError::invalid_request(
-                "continue_final_message currently requires nonempty final assistant content; reasoning-only continuation needs a resumable reasoning-parser state",
-            ));
-        }
-    }
+    request
+        .validate_continuation()
+        .map_err(|error| ApiError::invalid_request(error.to_string()))?;
     Ok(())
 }
 
