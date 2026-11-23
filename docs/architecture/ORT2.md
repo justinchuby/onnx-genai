@@ -1622,36 +1622,76 @@ impl WeightStore {
 
 ### 12.2 Format Parsers
 
+Supply GGUF or SafeTensors containers directly to the native Rust session
+builder, or to the Python `nxrt.InferenceSession` constructor:
+
 ```rust
-/// Safetensors format: JSON header + raw tensor data.
-pub fn load_safetensors(path: &Path) -> Result<WeightStore> {
-    // 1. Read first 8 bytes = header_size (u64 LE)
-    // 2. mmap the file
-    // 3. Parse JSON header (offset 8..8+header_size)
-    //    Header maps tensor_name → { dtype, shape, data_offsets: [start, end] }
-    // 4. Each tensor's data is at file offset (8 + header_size + data_offset_start)
-    // 5. Build WeightRef index pointing into the mmap
-    todo!()
-}
+use onnx_runtime_session::{InferenceSession, KeyedWeightFile};
 
-/// GGUF format: metadata + tensor info + tensor data.
-pub fn load_gguf(path: &Path) -> Result<WeightStore> {
-    // 1. Parse GGUF header: magic, version, tensor_count, metadata_kv_count
-    // 2. Parse metadata key-values (model arch, quantization info, etc.)
-    // 3. Parse tensor info array: name, n_dims, dims, type, offset
-    // 4. Tensor data starts at alignment boundary after header
-    // 5. mmap from data start, build WeightRef with quantization type info
-    todo!()
-}
-
-/// ONNX external data: tensor files referenced by protobuf.
-pub fn load_onnx_external(model_path: &Path, data_dir: &Path) -> Result<WeightStore> {
-    // Each initializer in the protobuf has external_data with:
-    //   location (filename), offset, length
-    // mmap each referenced file, build WeightRef
-    todo!()
-}
+let session = InferenceSession::builder()
+    .model("model.onnx")
+    .keyed_weight_file(KeyedWeightFile::gguf("weights.gguf"))
+    .keyed_weight_file(
+        KeyedWeightFile::safetensors("extra.safetensors").rename("file.key", "onnx_name"),
+    )
+    .build()?;
 ```
+
+```python
+session = nxrt.InferenceSession("model.onnx", keyed_weights=[
+    ("gguf", "weights.gguf", None),
+    ("safetensors", "extra.safetensors", {"file.key": "onnx_name"}),
+])
+```
+
+Keyed binding applies only to top-level dense `TensorProto` initializers
+marked `data_location = EXTERNAL` with missing or empty `external_data.location`.
+Omit `offset` (empty or `"0"` is also accepted). Omit `length` or supply the
+exact byte count. Other external-data fields are not supported for keyed
+initializers. A nonempty `location` keeps the standard model-relative ONNX
+behavior, even when keyed files are supplied; without any keyed files a missing
+or empty location is still an error. Paths passed to the keyed API are relative
+to the working directory unless absolute. The loader maps both formats
+read-only and parses only the headers; initializers refer into the original
+mapping, just like standard external data. Do not modify files while a session
+is live. Normal execution-provider placement still applies: the CPU borrows
+aligned mapped weights, an unaligned initializer may require an aligned copy,
+and device execution may upload weights. Sparse and nested initializers
+and other loading frontends such as the C API and GenAI loaders do not use
+this keyed API.
+
+Maps run **from each file's key to an ONNX initializer name**. A renamed key no
+longer participates in same-name matching. An explicit mapping has precedence
+over same-name matches across files. Duplicate keys within files, repeated
+explicit sources or destinations, unknown mapping keys, and mappings to anything
+other than a keyed initializer are rejected. Without an explicit mapping, a
+keyed initializer must have exactly one same-name match across supplied files.
+Unused, unmapped tensors are allowed, but each supplied container must be valid
+and use supported encodings.
+
+* **SafeTensors:** shape is already row-major ONNX order. The initializer's
+  shape and dtype must match exactly. Supports `BOOL`, signed/unsigned
+  8/16/32/64-bit integers, `F16`, `BF16`, `F32`, `F64`, `C64`,
+  `F8_E4M3` (ONNX `FLOAT8E4M3FN`), `F8_E5M2`, their `FNUZ` variants,
+  `F8_E8M0`, and `F4` (ONNX `FLOAT4E2M1`). `F4` uses low-nibble-first
+  packing and must have a whole-byte payload: unlike ONNX, SafeTensors
+  cannot store an odd number of `F4` values by padding the final nibble.
+  Use the logical shape in the SafeTensors header, not the byte shape
+  exposed by PyTorch's `float4_e2m1fn_x2`. ONNX defines FLOAT6 types, but
+  nxrt does not yet represent them internally, so `F6_E2M3` and `F6_E3M2`
+  are rejected rather than being reinterpreted as bytes or another dtype.
+* **GGUF:** accepts little-endian v2 and v3. Dense `F32`, `F16`, `BF16`,
+  `F64`, and `I8`/`I16`/`I32`/`I64` map to their exact ONNX scalar dtype.
+  GGML's first dimension is contiguous; the ONNX shape is the reversed
+  GGUF dimension list, without reordering bytes.
+* **Packed GGUF:** the 27 layouts in the
+  [opset 29 `DequantizePacked` specification](https://github.com/onnx/onnx/blob/622adf94d4e720142950aa8178f7357d52e63db0/docs/DequantizePacked.md)
+  are stored verbatim as rank-one ONNX `UINT8[packed_byte_count]`. The extent
+  is computed per contiguous row from the GGML block geometry and excludes
+  alignment padding. `general.quantization_version` must be `2`. The graph
+  author must provide the correct `format` and reversed logical `shape` on
+  the consuming operator; the loader does not infer or rewrite attributes,
+  convert byte order, cast, transpose, or dequantize.
 
 ### 12.3 Device Upload Strategy
 

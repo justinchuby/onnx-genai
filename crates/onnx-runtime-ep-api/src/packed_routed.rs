@@ -201,10 +201,24 @@ pub struct GroupLayout {
 }
 
 pub fn group_layout(op: Op, x: &[TensorView], y: &TensorMut) -> Result<GroupLayout> {
+    let bias = x
+        .get(3)
+        .filter(|b| b.dtype != DataType::Undefined && !b.is_absent())
+        .map(|b| b.shape);
+    group_layout_shapes(op, x[0].shape, x[1].shape, x[2].shape, bias, y.shape)
+}
+
+fn group_layout_shapes(
+    op: Op,
+    a: &[usize],
+    w: &[usize],
+    idx: &[usize],
+    bias: Option<&[usize]>,
+    out: &[usize],
+) -> Result<GroupLayout> {
     let Op::GroupedMatMul { transposed } = op else {
         unreachable!()
     };
-    let (a, w, idx) = (x[0].shape, x[1].shape, x[2].shape);
     let ([m, k], [groups, w1, w2], [rows, selections]) = (a, w, idx) else {
         return Err(fail(
             op,
@@ -222,22 +236,19 @@ pub fn group_layout(op: Op, x: &[TensorView], y: &TensorMut) -> Result<GroupLayo
             ),
         ));
     }
-    let bias = x
-        .get(3)
-        .filter(|b| b.dtype != DataType::Undefined && !b.is_absent());
     if let Some(b) = bias
-        && b.shape != [*groups, n]
+        && b != [*groups, n]
     {
         return Err(fail(
             op,
-            format!("bias must have shape [{groups}, {n}], got {:?}", b.shape),
+            format!("bias must have shape [{groups}, {n}], got {b:?}"),
         ));
     }
     let expected = [*m, *selections, n];
-    if y.shape != expected {
+    if out != expected {
         return Err(fail(
             op,
-            format!("output must have shape {expected:?}, got {:?}", y.shape),
+            format!("output must have shape {expected:?}, got {out:?}"),
         ));
     }
     Ok(GroupLayout {
@@ -250,4 +261,86 @@ pub fn group_layout(op: Op, x: &[TensorView], y: &TensorMut) -> Result<GroupLayo
         transposed,
         bias: bias.is_some(),
     })
+}
+
+#[derive(Clone, Copy)]
+pub struct AffineGrouped {
+    pub depth: usize,
+    pub block: usize,
+    pub zero: u8,
+}
+
+impl AffineGrouped {
+    pub fn from_node(node: &Node) -> Result<Self> {
+        let attr = |name| {
+            node.attr(name)
+                .and_then(|a| a.as_int())
+                .and_then(|i| usize::try_from(i).ok())
+                .ok_or_else(|| {
+                    EpError::KernelFailed(format!(
+                        "{} requires a nonnegative integer {name}",
+                        node.op_type
+                    ))
+                })
+        };
+        let depth = attr("depth")?;
+        let block = attr("block_size")?;
+        let zero = attr("zero")?;
+        if block == 0 || depth == 0 || !depth.is_multiple_of(block) || zero > 15 {
+            return Err(EpError::KernelFailed(format!(
+                "{} requires positive depth divisible by block_size and a four-bit zero point",
+                node.op_type
+            )));
+        }
+        Ok(Self {
+            depth,
+            block,
+            zero: zero as u8,
+        })
+    }
+
+    pub fn layout(self, x: &[TensorView], y: &[TensorMut]) -> Result<GroupLayout> {
+        let fail =
+            |detail: &str| EpError::KernelFailed(format!("AffineQuantizedGroupedMatMul: {detail}"));
+        let [a, packed, idx, scale, ..] = x else {
+            return Err(fail("expected four or five inputs"));
+        };
+        let [out] = y else {
+            return Err(fail("expected one output"));
+        };
+        let [e, n, words] = packed.shape else {
+            return Err(fail("expected rank-three packed weight bank"));
+        };
+        let blocks = self.depth / self.block;
+        if x.len() > 5
+            || a.dtype != DataType::Float32
+            || out.dtype != DataType::Float32
+            || !matches!(idx.dtype, DataType::Int32 | DataType::Int64)
+            || packed.dtype != DataType::Uint8
+            || scale.dtype != DataType::Float32
+            || *words != self.depth.div_ceil(2)
+            || scale.shape != [*e, *n, blocks]
+            || x.get(4).is_some_and(|z| {
+                z.dtype != DataType::Uint8 || z.shape != [*e, *n, blocks.div_ceil(2)]
+            })
+        {
+            return Err(fail(
+                "packed weights, scales or zero points do not match the expert-bank layout; check depth and block_size",
+            ));
+        }
+        let op = Op::GroupedMatMul { transposed: true };
+        elements(op, &[*e, *n, self.depth])?;
+        for t in x {
+            t.validate()?;
+        }
+        out.validate()?;
+        group_layout_shapes(
+            op,
+            a.shape,
+            &[*e, *n, self.depth],
+            idx.shape,
+            None,
+            out.shape,
+        )
+    }
 }

@@ -1397,14 +1397,34 @@ mod tests {
             } else {
                 Vec::new()
             };
-            if *op == "BitShift" {
-                node.attributes
-                    .insert("direction".into(), Attribute::String(b"RIGHT".to_vec()));
+            match *op {
+                "BitShift" => {
+                    node.attributes
+                        .insert("direction".into(), Attribute::String(b"RIGHT".to_vec()));
+                }
+                "Pack" | "Unpack" => {
+                    node.attributes.insert("bits".into(), Attribute::Int(3));
+                }
+                _ => {}
             }
-            assert!(
-                ep.get_kernel(&node, &shapes, 18).is_ok(),
-                "no kernel for {op}"
-            );
+            let since = ep
+                .registry
+                .earliest_since_version(op, "")
+                .unwrap_or_else(|| panic!("no standard-domain registration for {op}"));
+            // Keep testing opset 18 for the original fixtures, but do not
+            // construct newer operators using an opset that predates them.
+            let opset = 18.max(since);
+            if since > 18 {
+                assert!(
+                    matches!(
+                        ep.get_kernel(&node, &shapes, since - 1),
+                        Err(EpError::NoEpForOp { .. })
+                    ),
+                    "{op} unexpectedly dispatched before opset {since}"
+                );
+            }
+            ep.get_kernel(&node, &shapes, opset)
+                .unwrap_or_else(|err| panic!("cannot construct {op} at opset {opset}: {err}"));
         }
         let bad = Node::new(onnx_runtime_ir::NodeId(99), "UnknownOp", vec![], vec![]);
         assert!(ep.get_kernel(&bad, &[], 17).is_err());

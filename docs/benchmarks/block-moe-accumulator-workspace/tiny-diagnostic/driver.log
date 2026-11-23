@@ -1,0 +1,34 @@
+{"status": "queued", "pid": 22738, "action": "Wait for the peer batch on the shared stable flock; no heavy process has started."}
+{"status": "acquired", "pid": 22738, "command": ["python", "/tmp/nxrt-block-moe-accumulator/tiny-diagnostic/driver.py"]}
+{"stage": "pilots", "reps": {"(1, 32, 64, 1, 0, 0)": 39216, "(1, 64, 128, 1, 1, 0)": 39216}}
+{"stage": "run", "index": 0, "label": "baseline", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.093941248470015}
+{"stage": "run", "index": 0, "label": "after", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.081012851897189}
+{"stage": "run", "index": 0, "label": "null", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.052963076295407}
+{"stage": "run", "index": 0, "label": "baseline", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.451269889840892}
+{"stage": "run", "index": 0, "label": "after", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.431048551611589}
+{"stage": "run", "index": 0, "label": "null", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.44764891880865}
+{"stage": "run", "index": 1, "label": "after", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.17610159118727}
+{"stage": "run", "index": 1, "label": "null", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.164091187270504}
+{"stage": "run", "index": 1, "label": "baseline", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 11.986383108935131}
+{"stage": "run", "index": 1, "label": "after", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.399836801305591}
+{"stage": "run", "index": 1, "label": "null", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.675489596083233}
+{"stage": "run", "index": 1, "label": "baseline", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.451703386372902}
+{"stage": "run", "index": 2, "label": "null", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.266957364341085}
+{"stage": "run", "index": 2, "label": "baseline", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.399658302733577}
+{"stage": "run", "index": 2, "label": "after", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.127447980416159}
+{"stage": "run", "index": 2, "label": "null", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.465447776417788}
+{"stage": "run", "index": 2, "label": "baseline", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.604345165238671}
+{"stage": "run", "index": 2, "label": "after", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.342768257853944}
+{"stage": "run", "index": 3, "label": "baseline", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.089682782537759}
+{"stage": "run", "index": 3, "label": "after", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.282002243982046}
+{"stage": "run", "index": 3, "label": "null", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.44902590779274}
+{"stage": "run", "index": 3, "label": "baseline", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.70869033047735}
+{"stage": "run", "index": 3, "label": "after", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.425744594043246}
+{"stage": "run", "index": 3, "label": "null", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.243395552835556}
+{"stage": "run", "index": 4, "label": "after", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.223582211342306}
+{"stage": "run", "index": 4, "label": "null", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 11.942089963280294}
+{"stage": "run", "index": 4, "label": "baseline", "shape": [1, 32, 64, 1, 0, 0], "cpu_us": 12.258465932272543}
+{"stage": "run", "index": 4, "label": "after", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.417329661362713}
+{"stage": "run", "index": 4, "label": "null", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.494594043247652}
+{"stage": "run", "index": 4, "label": "baseline", "shape": [1, 64, 128, 1, 1, 0], "cpu_us": 12.452646878824979}
+{"stage": "summary", "cells": [{"shape": [1, 32, 64, 1, 0, 0], "full_output_equal": true, "argmax_equal": true, "arms": {"baseline": {"cpu_us_median": 12.093941248470015, "cpu_us_range": [11.986383108935131, 12.399658302733577], "wall_us_median": 12.094183496532029, "wall_us_range": [11.986444741942066, 12.40657512239902], "control_ms_median": 89.55699999999922, "workspace_bytes": [1152]}, "after": {"cpu_us_median": 12.17610159118727, "cpu_us_range": [12.081012851897189, 12.282002243982046], "wall_us_median": 12.179813953488372, "wall_us_range": [12.081002243982047, 12.282040493676051], "control_ms_median": 93.67299999999989, "workspace_bytes": [1280]}, "null": {"cpu_us_median": 12.164091187270504, "cpu_us_range": [11.942089963280294, 12.44902590779274], "wall_us_median": 12.164215498776011, "wall_us_range": [11.942640350877193, 12.46780332007344], "control_ms_median": 91.61300000000061, "workspace_bytes": [1152]}}, "after_over_baseline": 1.0067935126382104, "null_over_baseline": 1.0058004200086026, "control_after_over_baseline": 1.0459595564835882, "control_null_over_baseline": 1.0229574460957982, "minimum_cpu_wall_ratio": 0.985984261450369, "duration_pass": true, "control_5pct_pass": true}, {"shape": [1, 64, 128, 1, 1, 0], "full_output_equal": true, "argmax_equal": true, "arms": {"baseline": {"cpu_us_median": 12.452646878824979, "cpu_us_range": [12.451269889840892, 12.70869033047735], "wall_us_median": 12.452729753161975, "wall_us_range": [12.451705502855978, 12.746683955528356], "control_ms_median": 94.46499999999958, "workspace_bytes": [2304]}, "after": {"cpu_us_median": 12.417329661362713, "cpu_us_range": [12.342768257853944, 12.431048551611589], "wall_us_median": 12.417395527335781, "wall_us_range": [12.345377728478171, 12.43126422888617], "control_ms_median": 94.61700000000039, "workspace_bytes": [2560]}, "null": {"cpu_us_median": 12.465447776417788, "cpu_us_range": [12.243395552835556, 12.675489596083233], "wall_us_median": 12.47329852611179, "wall_us_range": [12.243631425948593, 12.678882139942878], "control_ms_median": 92.04200000000017, "workspace_bytes": [2304]}}, "after_over_baseline": 0.9971638786672478, "null_over_baseline": 1.001027965999307, "control_after_over_baseline": 1.001609061557199, "control_null_over_baseline": 0.9743502884666341, "minimum_cpu_wall_ratio": 0.9878834586049376, "duration_pass": true, "control_5pct_pass": true}]}

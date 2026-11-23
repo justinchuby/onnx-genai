@@ -513,11 +513,14 @@ impl OptimizationLevel {
     }
 }
 
+pub use onnx_runtime_loader::KeyedWeightFile;
+
 /// Builder for advanced session configuration (§20.6).
 #[derive(Default)]
 pub struct SessionBuilder {
     model_path: Option<PathBuf>,
     model_bytes: Option<Vec<u8>>,
+    keyed_weight_files: Vec<KeyedWeightFile>,
     device: DevicePreference,
     execution_provider: Option<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>,
     fallback_execution_provider: Option<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>,
@@ -540,6 +543,13 @@ impl SessionBuilder {
 
     pub fn model_bytes(mut self, bytes: &[u8]) -> Self {
         self.model_bytes = Some(bytes.to_vec());
+        self
+    }
+
+    /// Add a keyed GGUF or SafeTensors file for external initializers with no
+    /// ONNX location. May be called more than once for a sharded weight set.
+    pub fn keyed_weight_file(mut self, file: KeyedWeightFile) -> Self {
+        self.keyed_weight_files.push(file);
         self
     }
 
@@ -746,9 +756,10 @@ impl SessionBuilder {
                         }
                         metadata
                     };
-                    let (g, w) = onnx_runtime_loader::load_model_bytes_with_weights_filtered(
+                    let (g, w) = onnx_runtime_loader::load_model_bytes_with_keyed_weights_filtered(
                         &bytes,
                         &model_dir,
+                        &self.keyed_weight_files,
                         &keep_as_op,
                     )?;
                     (g, w, model_dir, metadata)
@@ -766,9 +777,10 @@ impl SessionBuilder {
                         }
                         metadata
                     };
-                    let (g, w) = onnx_runtime_loader::load_model_bytes_with_weights_filtered(
+                    let (g, w) = onnx_runtime_loader::load_model_bytes_with_keyed_weights_filtered(
                         &bytes,
                         ".",
+                        &self.keyed_weight_files,
                         &keep_as_op,
                     )?;
                     (g, w, PathBuf::from("."), metadata)

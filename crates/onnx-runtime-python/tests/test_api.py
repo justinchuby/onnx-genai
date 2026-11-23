@@ -53,6 +53,33 @@ def test_session_metadata():
     assert sess.get_providers() == ["CPUExecutionProvider"]
 
 
+def test_session_keyed_weights(tmp_path):
+    proto = onnx.load_model_from_string(
+        _single_op_model("Identity", TensorProto.FLOAT, [2])
+    )
+    proto.graph.ClearField("input")
+    weight = proto.graph.initializer.add()
+    weight.name = "X"
+    weight.dims.extend([2])
+    weight.data_type = TensorProto.FLOAT
+    weight.data_location = TensorProto.EXTERNAL
+    for key in ("location", "offset"):
+        weight.external_data.add(key=key, value="")
+
+    header = b'{"file.weight":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}'
+    header += b" " * (-len(header) % 8)
+    expected = np.array([3, -2], dtype="<f4")
+    weights = tmp_path / "weights.safetensors"
+    weights.write_bytes(len(header).to_bytes(8, "little") + header + expected.tobytes())
+    model = proto.SerializeToString()
+    session = nxrt.InferenceSession(
+        model, keyed_weights=[("safetensors", weights, {"file.weight": "X"})]
+    )
+    np.testing.assert_array_equal(session.run(None, {})[0], expected)
+    with pytest.raises(ValueError, match="unknown format"):
+        nxrt.InferenceSession(model, keyed_weights=[("typo", weights, None)])
+
+
 def test_model_metadata():
     model = _single_op_model("Relu", TensorProto.FLOAT, [2, 3])
     proto = onnx.load_model_from_string(model)
