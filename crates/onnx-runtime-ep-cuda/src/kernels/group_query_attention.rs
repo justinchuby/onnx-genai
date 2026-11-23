@@ -829,11 +829,6 @@ DEFINE_GQA_HALF_KERNELS(__nv_bfloat16, bf16)
 const PREP_MODULE: &str = "group_query_attention_prep_v4";
 const PREP_HALF_MODULE: &str = "group_query_attention_prep_half_v4";
 const BLOCK: u32 = 256;
-const WS_TOTALS: usize = 0;
-const WS_PAST_LENGTHS: usize = 1;
-const WS_QUERY_STARTS: usize = 2;
-const WS_COUNT: usize = 3;
-
 /// Device-pointer alignment for the governed GQA session-persistent composite
 /// workspace and every sub-buffer carved from it (packed Q/K/V staging,
 /// BSH↔BNSH transpose scratch, and the f32 reference score matrix, §736).
@@ -1570,7 +1565,7 @@ pub struct GroupQueryAttentionKernel {
 
 #[derive(Debug)]
 struct GqaWarmState {
-    workspace: GqaWorkspace,
+    metadata: GqaMetadataWorkspace,
     capture_signature: Option<GqaCaptureSignature>,
 }
 
@@ -1593,68 +1588,94 @@ struct GqaCaptureSignature {
     backend: GroupQueryAttentionBackend,
 }
 
-#[derive(Clone, Debug, Default)]
-struct WorkspaceSlot {
-    allocation: Option<Arc<GraphDeviceAllocation>>,
-    bytes: usize,
+/// All three metadata arrays are live together and have one capture lifetime.
+/// Their checked regions share one real owner, not three independent slots.
+fn gqa_metadata_layout(batch: usize) -> Result<WorkspaceLayout<3>> {
+    let row = Layout::array::<i32>(batch).map_err(|_| EpError::KernelFailed(format!(
+        "cuda_ep GroupQueryAttention: metadata for batch_size {batch} exceeds addressable capacity; reduce the batch size"
+    )))?;
+    WorkspaceLayout::new([row; 3]).map_err(|error| EpError::KernelFailed(format!(
+        "cuda_ep GroupQueryAttention: cannot lay out totals, past lengths and query starts for batch_size {batch}: {error}"
+    )))
 }
 
 #[derive(Clone, Debug)]
-struct GqaWorkspace {
-    runtime: Arc<CudaRuntime>,
-    slots: [WorkspaceSlot; WS_COUNT],
+struct GqaPreparedMetadata {
+    allocation: Arc<GraphDeviceAllocation>,
+    layout: WorkspaceLayout<3>,
 }
 
-impl GqaWorkspace {
+impl GqaPreparedMetadata {
+    fn views(&self) -> Result<[WorkspaceView; 3]> {
+        self.layout.bind(Some(WorkspaceView::new(
+            DevicePtrMut(self.allocation.ptr() as *mut c_void),
+            self.allocation.bytes(),
+        )))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GqaMetadataWorkspace {
+    runtime: Arc<CudaRuntime>,
+    prepared: Option<GqaPreparedMetadata>,
+}
+
+impl GqaMetadataWorkspace {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
-            slots: std::array::from_fn(|_| WorkspaceSlot::default()),
+            prepared: None,
         }
     }
 
-    fn reserve(&mut self, index: usize, bytes: usize) -> Result<CUdeviceptr> {
-        let bytes = bytes.max(1);
-        let slot = &self.slots[index];
-        if slot.bytes >= bytes
-            && let Some(allocation) = slot.allocation.as_ref()
-        {
-            if self.runtime.is_capturing()? {
-                self.runtime.require_registered_address_capture(
-                    GraphDeviceAllocation::device_graph_resource(allocation).identity(),
-                    "GroupQueryAttention workspace allocation",
-                )?;
+    fn reserve(&mut self, batch: usize) -> Result<[CUdeviceptr; 3]> {
+        let layout = gqa_metadata_layout(batch)?;
+        // Preserve a real owner even for empty metadata windows: callers can
+        // embed its address in capture arguments. Logical zero bytes do not
+        // prove every downstream launch is skipped. Retained capacity is reused.
+        let required = layout.bytes().max(1);
+        let capturing = self.runtime.is_capturing()?;
+        let allocation = match &self.prepared {
+            Some(prepared) if prepared.allocation.bytes() >= required => {
+                if capturing {
+                    self.runtime.require_registered_address_capture(
+                        GraphDeviceAllocation::device_graph_resource(&prepared.allocation)
+                            .identity(),
+                        "GroupQueryAttention metadata allocation",
+                    )?;
+                }
+                Arc::clone(&prepared.allocation)
             }
-            return Ok(allocation.ptr());
-        }
-        if self.runtime.is_capturing()? {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep GroupQueryAttention: workspace slot {index} requires {bytes} bytes during CUDA graph capture; warm the fixed decode shape before capture"
-            )));
-        }
-        if slot.allocation.is_some() {
-            // Dynamic prefill/growing-cache shapes may outgrow a slot. Preserve
-            // the fixed-capacity decode fast path (which never reaches here),
-            // but wait before replacing storage that queued work may still use.
-            self.runtime.drain_for_unmap()?;
-        }
-        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes)?;
-        self.runtime.staged_warm_cache_mutation(&format!(
-            "GroupQueryAttention workspace slot {index} allocation"
-        ))?;
-        let ptr = allocation.ptr();
-        self.slots[index] = WorkspaceSlot {
-            allocation: Some(allocation),
-            bytes,
+            _ => {
+                if capturing {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep GroupQueryAttention: metadata for batch_size {batch} requires {} bytes during CUDA graph capture; warm the exact batch before capture",
+                        layout.bytes()
+                    )));
+                }
+                if self.prepared.is_some() {
+                    // Preserve queued uses and graph pins before replacing the
+                    // current owner; captured graphs retain their own Arc.
+                    self.runtime.drain_for_unmap()?;
+                }
+                let allocation = GraphDeviceAllocation::allocate(&self.runtime, required)?;
+                self.runtime
+                    .staged_warm_cache_mutation("GroupQueryAttention metadata allocation")?;
+                allocation
+            }
         };
-        Ok(ptr)
+        let prepared = GqaPreparedMetadata { allocation, layout };
+        let pointers = prepared
+            .views()?
+            .map(|view| cuptr(view.ptr().0.cast_const()));
+        self.prepared = Some(prepared);
+        Ok(pointers)
     }
 
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.slots
+        self.prepared
             .iter()
-            .filter_map(|slot| slot.allocation.as_ref())
-            .map(GraphDeviceAllocation::device_graph_resource)
+            .map(|prepared| GraphDeviceAllocation::device_graph_resource(&prepared.allocation))
             .collect()
     }
 }
@@ -1827,7 +1848,7 @@ impl GroupQueryAttentionKernel {
         }
         Ok(Self {
             warm_state: Mutex::new(GqaWarmState {
-                workspace: GqaWorkspace::new(runtime.clone()),
+                metadata: GqaMetadataWorkspace::new(runtime.clone()),
                 capture_signature: None,
             }),
             runtime,
@@ -1884,41 +1905,44 @@ impl GroupQueryAttentionKernel {
         let state = self.warm_state.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep GroupQueryAttention: warm-state lock poisoned".into())
         })?;
-        let workspace = &state.workspace;
-        let read_slot = |index: usize| -> Result<Vec<i32>> {
-            let slot = &workspace.slots[index];
-            let bytes_len = batch
-                .checked_mul(std::mem::size_of::<i32>())
-                .ok_or_else(|| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: test metadata size overflow".into(),
-                    )
-                })?;
-            let Some(allocation) = slot.allocation.as_ref() else {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: test metadata workspace is unavailable".into(),
-                ));
-            };
-            if slot.bytes < bytes_len {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: test metadata workspace is unavailable".into(),
-                ));
+        if batch == 0 {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        let prepared = state.metadata.prepared.as_ref().ok_or_else(|| EpError::KernelFailed(
+            "cuda_ep GroupQueryAttention: metadata is unavailable; execute the requested batch before reading its prepared metadata".into()
+        ))?;
+        let views = prepared.views()?;
+        let bytes_len = Layout::array::<i32>(batch)
+            .map_err(|_| {
+                EpError::KernelFailed(
+            "cuda_ep GroupQueryAttention: test metadata size overflow; reduce the batch size".into()
+        )
+            })?
+            .size();
+        let read_region = |view: WorkspaceView| -> Result<Vec<i32>> {
+            if view.bytes() < bytes_len {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep GroupQueryAttention: metadata for batch_size {batch} needs {bytes_len} bytes per array, but the prepared batch provides {}; execute the requested batch before reading it",
+                    view.bytes()
+                )));
             }
             let mut bytes = vec![0u8; bytes_len];
-            // SAFETY: the workspace slot is live and was reserved for at least
-            // `bytes_len` bytes by the most recent successful execution.
+            // SAFETY: the owner is held by warm_state and the checked region
+            // covers the requested prefix of the most recently prepared batch.
             unsafe {
-                self.runtime.dtoh(&mut bytes, allocation.ptr())?;
+                self.runtime
+                    .dtoh(&mut bytes, cuptr(view.ptr().0.cast_const()))?;
             }
             Ok(bytes
                 .chunks_exact(4)
                 .map(|x| i32::from_ne_bytes([x[0], x[1], x[2], x[3]]))
                 .collect())
         };
+        let [totals, past, starts] = views;
         Ok((
-            read_slot(WS_TOTALS)?,
-            read_slot(WS_PAST_LENGTHS)?,
-            read_slot(WS_QUERY_STARTS)?,
+            read_region(totals)?,
+            read_region(past)?,
+            read_region(starts)?,
         ))
     }
 
@@ -1950,7 +1974,7 @@ impl GroupQueryAttentionKernel {
             EpError::KernelFailed("cuda_ep GroupQueryAttention: warm-state lock poisoned".into())
         })?;
         let warmed_signature = warm_state.capture_signature.clone();
-        let mut workspace_candidate = warm_state.workspace.clone();
+        let mut metadata_candidate = warm_state.metadata.clone();
         let capturing = self.runtime.is_capturing()?;
         if !(7..=14).contains(&inputs.len()) || !(1..=3).contains(&outputs.len()) {
             return Err(EpError::KernelFailed(format!(
@@ -2623,11 +2647,7 @@ impl GroupQueryAttentionKernel {
             None
         };
         let input_q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
-        let workspace = &mut workspace_candidate;
-        let metadata_bytes = batch * std::mem::size_of::<i32>();
-        let totals_gpu = workspace.reserve(WS_TOTALS, metadata_bytes)?;
-        let past_lengths_gpu = workspace.reserve(WS_PAST_LENGTHS, metadata_bytes)?;
-        let query_starts_gpu = workspace.reserve(WS_QUERY_STARTS, metadata_bytes)?;
+        let [totals_gpu, past_lengths_gpu, query_starts_gpu] = metadata_candidate.reserve(batch)?;
         let metadata_error_gpu = if capture_candidate.is_some() {
             // Capture-safe decode steps latch any bounds violation into the
             // runtime-shared word so every captured GQA layer poisons the same
@@ -3381,7 +3401,7 @@ impl GroupQueryAttentionKernel {
             );
         }
         if !capturing {
-            warm_state.workspace = workspace_candidate;
+            warm_state.metadata = metadata_candidate;
             warm_state.capture_signature = capture_candidate;
         }
         Ok(())
@@ -3564,7 +3584,7 @@ impl Kernel for GroupQueryAttentionKernel {
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
         self.warm_state
             .lock()
-            .map(|state| state.workspace.device_graph_resources())
+            .map(|state| state.metadata.device_graph_resources())
             .unwrap_or_default()
     }
 
@@ -3881,6 +3901,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn metadata_layout_partitions_only_the_active_batch() {
+        for batch in [0, 1, 3, 17] {
+            let layout = gqa_metadata_layout(batch).unwrap();
+            assert_eq!(layout.bytes(), batch * 3 * std::mem::size_of::<i32>());
+            assert_eq!(layout.alignment(), std::mem::align_of::<i32>());
+            let mut backing = [0i32; 3 * 17];
+            let view = WorkspaceView::new(
+                DevicePtrMut(backing.as_mut_ptr().cast()),
+                std::mem::size_of_val(&backing),
+            );
+            let regions = layout.bind(Some(view)).unwrap();
+            for (index, region) in regions.iter().enumerate() {
+                assert_eq!(region.bytes(), batch * 4);
+                assert_eq!(
+                    region.ptr().0 as usize,
+                    backing.as_ptr() as usize + index * batch * 4
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_layout_rejects_unaddressable_array_and_combined_footprint() {
+        let error = gqa_metadata_layout(usize::MAX).unwrap_err();
+        assert!(error.to_string().contains("reduce the batch size"));
+        // Each row fits independently, but their simultaneous footprint cannot.
+        let error = gqa_metadata_layout(isize::MAX as usize / 8).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("totals, past lengths and query starts")
+        );
+    }
+
+    #[test]
+    fn metadata_layout_requires_the_complete_owner_capacity() {
+        let mut backing = [0i32; 9];
+        let ptr = DevicePtrMut(backing.as_mut_ptr().cast());
+        let layout = gqa_metadata_layout(3).unwrap();
+        assert!(layout.bind(None).is_err());
+        assert!(layout.bind(Some(WorkspaceView::new(ptr, 35))).is_err());
+        let regions = layout.bind(Some(WorkspaceView::new(ptr, 36))).unwrap();
+        assert!(regions.iter().all(|region| region.bytes() == 12));
+        // A smaller invocation uses a new layout on the same retained backing;
+        // it must not inherit the previous row offsets or larger view extents.
+        let regions = gqa_metadata_layout(1)
+            .unwrap()
+            .bind(Some(WorkspaceView::new(ptr, 36)))
+            .unwrap();
+        assert_eq!(regions[1].ptr().0 as usize - regions[0].ptr().0 as usize, 4);
+        assert!(regions.iter().all(|region| region.bytes() == 4));
+    }
+
     fn runtime() -> Option<Arc<CudaRuntime>> {
         crate::test_support::maybe_runtime()
     }
@@ -3892,31 +3966,34 @@ mod tests {
             return;
         };
         let before = runtime.allocation_counts();
-        let mut workspace = GqaWorkspace::new(runtime.clone());
+        let mut workspace = GqaMetadataWorkspace::new(runtime.clone());
 
-        let first = workspace.reserve(WS_TOTALS, 4096).unwrap();
+        let first = workspace.reserve(1024).unwrap();
+        let identity = workspace.device_graph_resources()[0].identity();
+        assert_eq!(workspace.device_graph_resources().len(), 1);
         let allocated = runtime.allocation_counts();
         assert_eq!(allocated.allocations, before.allocations + 1);
         assert_eq!(allocated.frees, before.frees);
 
-        assert_eq!(workspace.reserve(WS_TOTALS, 4096).unwrap(), first);
-        assert_eq!(workspace.reserve(WS_TOTALS, 2048).unwrap(), first);
+        assert_eq!(workspace.reserve(1024).unwrap(), first);
+        assert_eq!(workspace.reserve(512).unwrap()[0], first[0]);
         assert_eq!(runtime.allocation_counts(), allocated);
+        assert_eq!(workspace.device_graph_resources()[0].identity(), identity);
 
         // Growing releases the old block and takes a larger one. `frees` counts
         // *driver* calls, and the runtime's allocation pool retains released
         // blocks rather than returning them to the driver, so the released
-        // 4096-byte block shows up as retained bytes instead of as a `cuMemFree`.
+        // 12288-byte block shows up as retained bytes instead of as a `cuMemFree`.
         // Asserting on the retained total keeps the property this test exists
         // for -- the old block is released, not leaked -- without pinning which
         // side of the pool it ends up on.
-        let grown = workspace.reserve(WS_TOTALS, 8192).unwrap();
+        let grown = workspace.reserve(2048).unwrap();
         assert_ne!(grown, first);
         let grown_counts = runtime.allocation_counts();
         assert_eq!(grown_counts.allocations, before.allocations + 2);
         assert!(
-            runtime.raw_pool_retained_bytes() == 4096 || grown_counts.frees == before.frees + 1,
-            "the 4096-byte block must be released -- retained by the pool or \
+            runtime.raw_pool_retained_bytes() == 12288 || grown_counts.frees == before.frees + 1,
+            "the 12288-byte block must be released -- retained by the pool or \
              returned to the driver, but not held by the workspace"
         );
 
@@ -3924,8 +4001,8 @@ mod tests {
         let after = runtime.allocation_counts();
         assert_eq!(after.allocations, before.allocations + 2);
         assert!(
-            runtime.raw_pool_retained_bytes() == 4096 + 8192 || after.frees == before.frees + 2,
-            "dropping the workspace must release the 8192-byte block too"
+            runtime.raw_pool_retained_bytes() == 12288 + 24576 || after.frees == before.frees + 2,
+            "dropping the workspace must release the 24576-byte block too"
         );
     }
 
@@ -4663,7 +4740,7 @@ mod tests {
 #[cfg(test)]
 mod raw_allocation_guard {
     #[test]
-    fn only_capture_metadata_retains_private_allocation_slots() {
+    fn large_scratch_cannot_regain_private_allocation_slots() {
         let source = include_str!("group_query_attention.rs");
         let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
         for removed in [

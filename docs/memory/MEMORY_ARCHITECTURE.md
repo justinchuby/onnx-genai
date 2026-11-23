@@ -151,9 +151,15 @@ the input-derived length bound funds both. Every region is checked against the
 complete admitted backing before metadata preparation starts. This introduces
 no additional authority, pool, or issuer callback in dispatch.
 
-The three small preparation metadata allocations still own actual graph
-resources. They remain explicit pending migration of that capture ownership;
-a workspace borrow alone cannot replace their pins or prove completion. The
+The three small preparation metadata arrays share one actual graph-resource
+owner. A checked three-region layout derives the current batch offsets and
+extents; physical capacity comes only from that owner. Fitting smaller batches
+keep the same capacity and identity. Growth preserves stream draining, capture
+refusal and the warm-mutation guard, and state is published after successful
+preparation. Empty windows retain a real backing address instead of assuming
+that every downstream launch is skipped. This owner remains explicit pending
+migration of capture ownership; a workspace borrow alone cannot replace its
+pins or prove completion. The
 composite remains SessionPersistent, so this stage does not claim step-scoped
 reuse or CUDA performance validation.
 

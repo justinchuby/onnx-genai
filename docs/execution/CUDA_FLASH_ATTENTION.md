@@ -180,14 +180,18 @@ allocation fallback for these regions. A single visible K or V output fixes the
 physical capacity of its hidden sibling; when both are omitted, both temporary
 caches use the input-derived logical bound. Planning receives actual output facts
 and rejects unresolved visible cache geometry when a hidden sibling needs that
-capacity before admission. Complete backing
-is checked before metadata preparation or attention launches.
+capacity before admission. Complete backing is checked before metadata
+preparation or attention launches.
 
-Three small preparation metadata allocations still retain real graph-resource
-owners. Their capture lifetime is not replaced by a borrowed pointer; the
+The three preparation metadata arrays share one real graph-resource owner,
+partitioned by a checked layout at i32 alignment. Fitting calls reuse that owner
+and its capture identity; a smaller batch changes only the active regions.
+Growth retains capture refusal, stream draining and the warm-mutation guard.
+The capture lifetime is not replaced by borrowed pointers, and this owner is
+still managed by GraphDeviceAllocation rather than the public composite. The
 composite retains its existing lifetime for now.
-The shared Phase-2a engine still retains temporary ownership for MHA pending
-that caller's complete composite migration.
+The separate MHA prepared-composite migration is tracked in
+[PR #2481](https://github.com/justinchuby/onnx-genai/pull/2481).
 
 The fallback retains the existing runtime synchronization policy and capture
 exclusion. The parity tests use the public provider workspace preparation path.
