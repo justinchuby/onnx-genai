@@ -788,7 +788,7 @@ impl LlguidanceConstraint {
 // llguidance's JSON string lexer expects canonical spelling of non-control
 // Unicode. Normalize completed escapes only in the recognizer's existing
 // prefix; the request prompt and newly generated output retain their own bytes.
-fn canonical_json_prefix(prefix: &str) -> anyhow::Result<std::borrow::Cow<'_, str>> {
+pub(crate) fn canonical_json_prefix(prefix: &str) -> anyhow::Result<std::borrow::Cow<'_, str>> {
     let value = prefix.trim_start_matches([' ', '\t', '\r', '\n']);
     let source_offset = prefix.len() - value.len();
     let prefix = value;

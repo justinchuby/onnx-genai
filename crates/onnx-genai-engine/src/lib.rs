@@ -15,6 +15,7 @@ pub(crate) mod decode_loop;
 pub mod embedding;
 pub mod engine;
 pub mod fim;
+pub mod json_cursor;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
 pub mod logits;

@@ -953,3 +953,26 @@ the backend string-value lexer, including DEL which ordinary JSON serialization
 can leave literal. NUL/newline/control/DEL values and an escaped newline property
 name now have actual schema next-token checks. All 3 selected schema-prefill
 cases and strict native-engine all-target Clippy passed after this refinement.
+
+Reusable JSON byte recognition: `JsonByteCursor` compiles a schema once against
+a byte vocabulary independent of model token IDs. Candidate preview rolls back
+accepted bytes after both viable and rejected trials; atomic commit rejects an
+invalid suffix without retaining its accepted prefix. Status distinguishes viable
+partial content, complete grammar EOF and rejection at a logical byte offset.
+Its explicit byte budget is checked before mutating recognizer state. User stops
+and length limits remain independent of grammar completeness.
+
+Backend failures reconstruct the committed logical prefix from the initial
+compiled state and retain their causal errors. If recovery fails, the cursor
+holds both failures and refuses reuse until an explicit reset. Tests exercise
+normal/rejected/terminal trials, split UTF-8, invalid bytes, resource/schema errors,
+backend recovery and sticky failed recovery. The channel-composition test now
+uses one compiled cursor for all candidates, after the same field projection and
+JSON prefix normalization, instead of compiling a grammar for every candidate.
+
+Validation: all 5 cursor cases passed under default and native-backend features;
+all 21 shared classifier cases passed with the compiled-cursor composition.
+Strict native-engine all-target and server all-target Clippy passed. Server
+runtime behavior was not changed or remeasured in this milestone. The HTTP joint
+reasoning+JSON guard remains; model-token decoding, pending-boundary viability
+and actual processor integration still require completion.

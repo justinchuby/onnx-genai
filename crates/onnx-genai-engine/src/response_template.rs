@@ -996,15 +996,16 @@ mod tests {
 
     #[test]
     fn projected_content_schema_checks_use_the_first_declared_channel_boundary() {
-        use crate::logits::{ConstraintPrefixError, GrammarConstraintKind, LlguidanceConstraint};
+        use crate::json_cursor::{JsonByteCursor, JsonCandidate};
+        use crate::logits::canonical_json_prefix;
         let spec = ResponseTemplate::compile(&serde_json::json!({"start_anchor":"A","fields":{
             "reasoning_content":{"open":"[r]","close":"[/r]"}, "content":{}
         }}))
         .unwrap();
         let schema = serde_json::json!({"type":"object","properties":{
             "n":{"const":1}, "x":{"type":"string"}
-        },"required":["n"]})
-        .to_string();
+        },"required":["n"]});
+        let mut json_cursor = JsonByteCursor::new(&schema, 4096).unwrap();
         let mut parser =
             ResponseParser::new(spec, "A[r]existing", PrefixOutput::Exclude, 4096).unwrap();
         for (candidate, expected) in [
@@ -1017,20 +1018,15 @@ mod tests {
             let accepted = parser
                 .with_preview(candidate.as_bytes(), true, |view| {
                     let content = view.field_chunks("content", true).collect::<String>();
-                    match LlguidanceConstraint::from_token_bytes_with_prefix(
-                        GrammarConstraintKind::JsonSchema,
-                        &schema,
-                        vec![b" ".to_vec(), b"<eos>".to_vec()],
-                        &[1],
-                        &content,
-                    ) {
-                        Ok(_) => Ok(true),
-                        Err(error) if error.is::<ConstraintPrefixError>() => Ok(false),
-                        Err(error) => Err(error),
-                    }
+                    let canonical = canonical_json_prefix(&content)?;
+                    Ok(matches!(
+                        json_cursor.preview(canonical.as_bytes())?,
+                        JsonCandidate::Viable { complete: true }
+                    ))
                 })
                 .unwrap();
             assert_eq!(accepted, expected, "candidate={candidate:?}");
+            assert_eq!(json_cursor.committed_bytes(), 0);
             assert_eq!(parser.buffer, "[r]existing");
             parser
                 .require_open_text_channel("reasoning_content")
