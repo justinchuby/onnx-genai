@@ -4431,6 +4431,16 @@ impl ExecutionProvider for CudaExecutionProvider {
         )
     }
 
+    fn workspace_pressure_registry(
+        &self,
+    ) -> Result<Option<onnx_runtime_memory_governor::PressureRegistry>> {
+        self.memory_binding.authority.pressure_registry().map_err(|error| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: workspace authority pressure registry is invalid: {error}; bind workspace backing and its pressure registry to the same physical authority"
+            ))
+        })
+    }
+
     fn allocate_workspace(
         &self,
         size: usize,

@@ -284,7 +284,8 @@ fn run_with_backend(
         .iter()
         .map(|shape| compute_contiguous_strides(shape))
         .collect();
-    {
+    let mut workspace = None;
+    let execution = {
         let output_views: Vec<_> = output_buffers
             .iter_mut()
             .zip(output_shapes)
@@ -299,10 +300,25 @@ fn run_with_backend(
                 )
             })
             .collect();
-        kernel.execute(
+        common::execute_kernel(
+            ep,
+            kernel.as_ref(),
             &input_views,
             &mut output_views.into_iter().collect::<Vec<_>>(),
-        )?;
+            &mut workspace,
+        )
+    };
+    // Retire scratch even when dispatch or the later readback fails. Provider
+    // deferred release preserves queued device uses; output owners stay live.
+    let release = workspace.map_or(Ok(()), |workspace| ep.deallocate_workspace(workspace));
+    match (execution, release) {
+        (Err(error), Err(release)) => {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                "GQA test dispatch failed: {error}; retiring prepared workspace also failed: {release}"
+            )));
+        }
+        (Err(error), _) | (_, Err(error)) => return Err(error),
+        (Ok(()), Ok(())) => {}
     }
 
     let mut results = Vec::with_capacity(output_buffers.len());
@@ -3571,4 +3587,57 @@ fn gqa_gpu_rejected_features_return_clear_errors() {
     let error = run(&ep, &attrs(&[]), &incomplete_inputs, &[vec![1, 1, 8]])
         .expect_err("partially packed QKV must be rejected");
     assert!(format!("{error}").contains("must both be present"));
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn gqa_gpu_prepared_reference_scores_ignore_present_cache_padding() {
+    let ep = require_cuda();
+    let q = [0.0; 16];
+    let k = [0.0; 8];
+    let v = [1., 2., 3., 4., 1., 2., 3., 4.];
+    let past_k = [0.0; 8];
+    let past_v = [1., 2., 1., 2., 3., 4., 3., 4.];
+    let past_shape = [1, 2, 2, 2];
+    let expected_row = [1., 2., 1., 2., 3., 4., 3., 4.];
+    for has_past in [false, true] {
+        let total = if has_past { 4 } else { 2 };
+        let inputs = base_inputs(
+            &[1, 2, 8],
+            &q,
+            &[1, 2, 4],
+            &k,
+            &v,
+            has_past.then_some((&past_shape[..], &past_k[..])),
+            has_past.then_some((&past_shape[..], &past_v[..])),
+            &[total - 1],
+            total,
+        );
+        for capacity in [4, 11] {
+            let outputs = run_with_backend(
+                &ep,
+                &attrs(&[]),
+                &inputs,
+                &[
+                    vec![1, 2, 8],
+                    vec![1, 2, capacity, 2],
+                    vec![1, 2, capacity, 2],
+                ],
+                Some(GroupQueryAttentionBackend::Phase2a),
+            )
+            .unwrap();
+            close(&outputs[0], &expected_row.repeat(2));
+            for head in 0..2 {
+                for position in 0..total as usize {
+                    let offset = (head * capacity + position) * 2;
+                    close(&outputs[1][offset..offset + 2], &[0., 0.]);
+                    let value = if head == 0 { [1., 2.] } else { [3., 4.] };
+                    close(&outputs[2][offset..offset + 2], &value);
+                }
+            }
+        }
+    }
 }

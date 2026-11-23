@@ -274,6 +274,7 @@ extern "C" __global__ void gqa_attention_reference_f32(
     const int query_seq,
     const int head_size,
     const int cache_capacity,
+    const unsigned long long score_stride,
     const int group_size,
     const float scale,
     const int local_window,
@@ -293,7 +294,7 @@ extern "C" __global__ void gqa_attention_reference_f32(
         local_window > 0 && causal_limit + 1 > local_window
             ? causal_limit + 1 - local_window
             : 0;
-    float* row_scores = scores + (long)row * cache_capacity;
+    float* row_scores = scores + (unsigned long long)row * score_stride;
 
     // Learned attention sink (gpt-oss family): a per-head logit that enters the
     // softmax denominator but carries no value vector. Thread 0 folds it into
@@ -856,11 +857,22 @@ fn gqa_reference_scores_path(dtype: DataType, q_seq: usize, head_dim: usize) -> 
     dtype == DataType::Float32 && !gqa_decode::supported(q_seq, head_dim)
 }
 
+/// Device and host metadata validation both require effective past length to
+/// fit the input past cache. Consequently every valid row has at most this
+/// many scores, regardless of padding in the external present-cache outputs.
+fn gqa_score_stride(past_capacity: usize, current_key_length: usize) -> Result<usize> {
+    past_capacity.checked_add(current_key_length).ok_or_else(|| {
+        EpError::KernelFailed(format!(
+            "cuda_ep GroupQueryAttention: past cache capacity {past_capacity} plus current key length {current_key_length} overflows the score workspace bound; reduce the cache extent or key sequence"
+        ))
+    })
+}
+
 /// Byte size of the governed GQA reference score buffer for one concrete
 /// geometry. Prepare-only planning (`Kernel::workspace_requirement`) and
 /// execution (the reference branch of `run`) both size the reservation through
 /// this identical helper so the reserved and consumed byte counts cannot drift.
-/// The buffer holds `batch·num_heads·q_seq·kv_capacity` f32 scores, matching the
+/// The buffer holds `batch·num_heads·q_seq·score_stride` f32 scores, matching the
 /// reference kernel's `score_count · sizeof(f32)` indexing (a degenerate
 /// geometry still reserves one element, as the kernel's `score_count.max(1)`
 /// did).
@@ -868,7 +880,7 @@ fn gqa_reference_scores_bytes(
     batch: usize,
     num_heads: usize,
     q_seq: usize,
-    kv_capacity: usize,
+    score_stride: usize,
 ) -> Result<usize> {
     let rows = batch
         .checked_mul(num_heads)
@@ -878,7 +890,7 @@ fn gqa_reference_scores_bytes(
                 "cuda_ep GroupQueryAttention: attention row count overflow".into(),
             )
         })?;
-    let elements = rows.checked_mul(kv_capacity).ok_or_else(|| {
+    let elements = rows.checked_mul(score_stride).ok_or_else(|| {
         EpError::KernelFailed("cuda_ep GroupQueryAttention: score scratch size overflow".into())
     })?;
     elements
@@ -997,7 +1009,7 @@ fn gqa_workspace_layout(
     want_staging: bool,
     want_q_bnsh: bool,
     want_out_bnsh: bool,
-    scores_kv_capacity: usize,
+    score_stride: usize,
     want_scores: bool,
 ) -> Result<GqaWorkspaceLayout> {
     let mut layout = GqaWorkspaceLayout::default();
@@ -1073,7 +1085,7 @@ fn gqa_workspace_layout(
     // scores buffer starts aligned and the composite total equals exactly the
     // reference score bytes when no staging is present.
     if want_scores {
-        let scores_bytes = gqa_reference_scores_bytes(batch, num_heads, q_seq, scores_kv_capacity)?;
+        let scores_bytes = gqa_reference_scores_bytes(batch, num_heads, q_seq, score_stride)?;
         layout.scores_offset = offset;
         layout.scores_bytes = scores_bytes;
         offset = offset.checked_add(scores_bytes).ok_or_else(|| {
@@ -2309,6 +2321,11 @@ impl GroupQueryAttentionKernel {
         // leaves the (tiny, `q_seq==1`) staging region untouched.
         let transpose_scratch = gqa_transpose_scratch(packed_qkv, self.do_rotary, q_seq);
         let want_scores = gqa_reference_scores_path(q.dtype, q_seq, dim);
+        let score_stride = if want_scores {
+            gqa_score_stride(past_capacity, k_seq)?
+        } else {
+            0
+        };
         let composite_layout = gqa_workspace_layout(
             batch,
             self.num_heads,
@@ -2319,7 +2336,7 @@ impl GroupQueryAttentionKernel {
             packed_qkv,
             transpose_scratch.query,
             transpose_scratch.output,
-            present_capacity,
+            score_stride,
             want_scores,
         )?;
         let input_q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
@@ -2981,12 +2998,16 @@ impl GroupQueryAttentionKernel {
                         "cuda_ep GroupQueryAttention: attention row count overflow".into(),
                     )
                 })?;
-            // The score buffer is `[B, H, Sq, present_capacity]` f32; planning
-            // and execution size it through the same helper so the reserved and
-            // consumed byte counts cannot drift. It occupies the score region of
-            // the governed composite workspace, after the packed QKV staging.
+            // Scores use an input-derived logical bound, independently of the
+            // physical KV output stride. Metadata validation guarantees every
+            // row's total fits this bound, including during captured replay.
             let scores_bytes =
-                gqa_reference_scores_bytes(batch, self.num_heads, q_seq, present_capacity)?;
+                gqa_reference_scores_bytes(batch, self.num_heads, q_seq, score_stride)?;
+            let score_stride_u64 = u64::try_from(score_stride).map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: score workspace stride exceeds uint64".into(),
+                )
+            })?;
             let score_scratch = match prepared {
                 // Governed slice (§736): the executor reserved this
                 // session-persistent composite buffer against the device
@@ -3034,6 +3055,7 @@ impl GroupQueryAttentionKernel {
                 .arg(&q_seq_i)
                 .arg(&dim_i)
                 .arg(&present_capacity_i)
+                .arg(&score_stride_u64)
                 .arg(&group_i)
                 .arg(&scale)
                 .arg(&local_window_i)
@@ -3153,8 +3175,10 @@ impl GroupQueryAttentionKernel {
     /// prompt-dependent, the executor grows it transactionally through a
     /// `MappedGrowthGrant` against the device authority.
     fn composite_workspace_requirement(
-        &self,
         inputs: &[TensorMetadata<'_>],
+        num_heads: usize,
+        kv_num_heads: usize,
+        do_rotary: bool,
     ) -> Result<WorkspaceRequirement> {
         let Some(q) = inputs.first() else {
             return Ok(WorkspaceRequirement::NONE);
@@ -3167,16 +3191,16 @@ impl GroupQueryAttentionKernel {
         let packed_qkv =
             inputs.get(1).is_none_or(|k| !k.present) && inputs.get(2).is_none_or(|v| !v.present);
         let head_dim = if packed_qkv {
-            let packed_heads = self.num_heads + 2 * self.kv_num_heads;
+            let packed_heads = num_heads + 2 * kv_num_heads;
             if packed_heads == 0 || input_hidden == 0 || input_hidden % packed_heads != 0 {
                 return Ok(WorkspaceRequirement::NONE);
             }
             input_hidden / packed_heads
         } else {
-            if self.num_heads == 0 || input_hidden == 0 || input_hidden % self.num_heads != 0 {
+            if num_heads == 0 || input_hidden == 0 || input_hidden % num_heads != 0 {
                 return Ok(WorkspaceRequirement::NONE);
             }
-            input_hidden / self.num_heads
+            input_hidden / num_heads
         };
         if head_dim == 0 {
             return Ok(WorkspaceRequirement::NONE);
@@ -3192,15 +3216,11 @@ impl GroupQueryAttentionKernel {
                 DataType::Float32 | DataType::Float16 | DataType::BFloat16
             );
         let want_scores = gqa_reference_scores_path(q.dtype, q_seq, head_dim);
-        let transpose_scratch = gqa_transpose_scratch(packed_qkv, self.do_rotary, q_seq);
-        // KV-capacity proxy from static input metadata. The reference score
-        // buffer is strided by the present-cache capacity; for GQA's
-        // buffer-shared KV cache that equals the past_key capacity
-        // (`inputs[3].shape[2]`), and on a pure prefill with no past it equals
-        // the incoming key length. Both are static input dims. Execution
-        // re-derives the exact present capacity and refuses deterministically on
-        // any shortfall, so this never silently under-allocates.
-        let scores_kv_capacity = if want_scores {
+        let transpose_scratch = gqa_transpose_scratch(packed_qkv, do_rotary, q_seq);
+        // Use the same validated logical upper bound as execution. External
+        // present outputs may have arbitrary extra capacity; their physical
+        // stride does not determine score scratch consumption.
+        let score_stride = if want_scores {
             let past_capacity = inputs
                 .get(3)
                 .filter(|past| past.present && past.shape.len() == 4)
@@ -3215,21 +3235,21 @@ impl GroupQueryAttentionKernel {
                     .map(|key| key.shape[1])
                     .unwrap_or(0)
             };
-            past_capacity.max(key_length)
+            gqa_score_stride(past_capacity, key_length)?
         } else {
             0
         };
         let layout = gqa_workspace_layout(
             batch,
-            self.num_heads,
+            num_heads,
             q_seq,
-            self.num_heads * head_dim,
-            self.kv_num_heads * head_dim,
+            num_heads * head_dim,
+            kv_num_heads * head_dim,
             element_size,
             want_staging,
             transpose_scratch.query,
             transpose_scratch.output,
-            scores_kv_capacity,
+            score_stride,
             want_scores,
         )?;
         if layout.total_bytes == 0 {
@@ -3255,7 +3275,12 @@ impl Kernel for GroupQueryAttentionKernel {
     }
 
     fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
-        self.composite_workspace_requirement(inputs)
+        Self::composite_workspace_requirement(
+            inputs,
+            self.num_heads,
+            self.kv_num_heads,
+            self.do_rotary,
+        )
     }
 
     fn execute_with_workspace(
@@ -3427,6 +3452,23 @@ mod tests {
     }
 
     #[test]
+    fn reference_score_stride_bounds_valid_rows_without_output_metadata() {
+        for past_capacity in [0, 1, 13, 128] {
+            for key_length in [0, 1, 7] {
+                let stride = gqa_score_stride(past_capacity, key_length).unwrap();
+                for effective_past in 0..=past_capacity {
+                    assert!(effective_past + key_length <= stride);
+                }
+                assert_eq!(stride, past_capacity + key_length);
+            }
+        }
+        let error = gqa_score_stride(usize::MAX, 1).unwrap_err().to_string();
+        assert!(error.contains("past cache capacity"), "{error}");
+        assert!(error.contains("current key length 1"), "{error}");
+        assert!(error.contains("reduce the cache extent"), "{error}");
+    }
+
+    #[test]
     fn reference_scores_bytes_matches_score_count_formula() {
         // Planning and execution size the governed score buffer through this
         // exact helper (§736), so pin its formula: `batch·heads·q_seq·kv` f32
@@ -3469,15 +3511,12 @@ mod tests {
 
     #[test]
     fn workspace_requirement_governs_reference_scores_and_transposes_by_route() {
-        let Some(runtime) = runtime() else {
-            eprintln!("skipping CUDA GQA workspace requirement test: CUDA runtime unavailable");
-            return;
-        };
         let (num_heads, kv_heads, dim) = (4usize, 2usize, 64usize);
-        let kernel = GroupQueryAttentionKernel::new(
-            runtime, num_heads, kv_heads, None, false, false, -1, 0.0,
-        )
-        .expect("kernel");
+        let requirement = |inputs: &[TensorMetadata<'_>]| {
+            GroupQueryAttentionKernel::composite_workspace_requirement(
+                inputs, num_heads, kv_heads, false,
+            )
+        };
         let (batch, q_seq, cache) = (1usize, 8usize, 256usize);
         let q_shape = [batch, q_seq, num_heads * dim];
         let kv_shape = [batch, q_seq, kv_heads * dim];
@@ -3498,13 +3537,11 @@ mod tests {
         ];
         // f32 prefill routes to the reference path: governed, session-persistent,
         // and sized through the shared helper against the cache capacity.
-        let req = kernel
-            .workspace_requirement(&f32_inputs)
-            .expect("requirement");
+        let req = requirement(&f32_inputs).expect("requirement");
         let tensor_bytes = batch * q_seq * num_heads * dim * 4;
         let aligned_tensor = gqa_align_up(tensor_bytes, GQA_SCORES_ALIGN).unwrap();
         let expected = (2 * aligned_tensor
-            + gqa_reference_scores_bytes(batch, num_heads, q_seq, cache).unwrap())
+            + gqa_reference_scores_bytes(batch, num_heads, q_seq, cache + q_seq).unwrap())
             as u64;
         assert_eq!(req.bytes, expected);
         assert_eq!(req.alignment, GQA_SCORES_ALIGN);
@@ -3513,6 +3550,30 @@ mod tests {
             req.role(),
             MemoryRole::Workspace { step_scoped: false }
         ));
+
+        // No past storage means scores need only the incoming key sequence.
+        let mut no_past = f32_inputs;
+        no_past[3] = TensorMetadata::new(DataType::Float32, &[], false);
+        no_past[4] = TensorMetadata::new(DataType::Float32, &[], false);
+        assert_eq!(
+            requirement(&no_past).unwrap().bytes,
+            (2 * aligned_tensor
+                + gqa_reference_scores_bytes(batch, num_heads, q_seq, q_seq).unwrap())
+                as u64,
+        );
+
+        // An unpacked key sequence can differ from the query sequence. The
+        // score bound follows the key length, not the query transpose geometry.
+        let short_key_shape = [batch, 3, kv_heads * dim];
+        let mut different_key_length = f32_inputs;
+        different_key_length[1] = meta(DataType::Float32, &short_key_shape);
+        different_key_length[2] = meta(DataType::Float32, &short_key_shape);
+        assert_eq!(
+            requirement(&different_key_length).unwrap().bytes,
+            (2 * aligned_tensor
+                + gqa_reference_scores_bytes(batch, num_heads, q_seq, cache + 3).unwrap())
+                as u64,
+        );
 
         // The same geometry in fp16 never materializes scores, but multi-token
         // Q/output transpose scratch is still genuinely needed.
@@ -3525,9 +3586,7 @@ mod tests {
             meta(DataType::Int32, &seqlens_shape),
             meta(DataType::Int32, &total_shape),
         ];
-        let f16_req = kernel
-            .workspace_requirement(&f16_inputs)
-            .expect("fp16 requirement");
+        let f16_req = requirement(&f16_inputs).expect("fp16 requirement");
         let f16_tensor = batch * q_seq * num_heads * dim * 2;
         assert_eq!(
             f16_req.bytes,
@@ -3548,9 +3607,7 @@ mod tests {
             meta(DataType::Int32, &seqlens_shape),
             meta(DataType::Int32, &total_shape),
         ];
-        let decode_req = kernel
-            .workspace_requirement(&decode_inputs)
-            .expect("decode requirement");
+        let decode_req = requirement(&decode_inputs).expect("decode requirement");
         assert_eq!(
             decode_req.bytes, 0,
             "unpacked non-RoPE single-token decode uses direct Q/output and gqa_decode scores"
@@ -3726,15 +3783,12 @@ mod tests {
 
     #[test]
     fn workspace_requirement_charges_packed_staging_only_when_packed() {
-        let Some(runtime) = runtime() else {
-            eprintln!("skipping CUDA GQA staging requirement test: CUDA runtime unavailable");
-            return;
-        };
         let (num_heads, kv_heads, dim) = (8usize, 2usize, 64usize);
-        let kernel = GroupQueryAttentionKernel::new(
-            runtime, num_heads, kv_heads, None, false, false, -1, 0.0,
-        )
-        .expect("kernel");
+        let requirement = |inputs: &[TensorMetadata<'_>]| {
+            GroupQueryAttentionKernel::composite_workspace_requirement(
+                inputs, num_heads, kv_heads, false,
+            )
+        };
         let (batch, q_seq, cache) = (1usize, 32usize, 256usize);
         let packed_heads = num_heads + 2 * kv_heads;
         let packed_q_shape = [batch, q_seq, packed_heads * dim];
@@ -3757,9 +3811,7 @@ mod tests {
             meta(DataType::Int32, &seqlens_shape, true),
             meta(DataType::Int32, &total_shape, true),
         ];
-        let req = kernel
-            .workspace_requirement(&f16_packed)
-            .expect("requirement");
+        let req = requirement(&f16_packed).expect("requirement");
         let q_bytes = batch * q_seq * (num_heads * dim) * 2;
         let kv_bytes = batch * q_seq * (kv_heads * dim) * 2;
         let align = |b: usize| b.div_ceil(GQA_SCORES_ALIGN) * GQA_SCORES_ALIGN;
@@ -3785,9 +3837,7 @@ mod tests {
             meta(DataType::Int32, &seqlens_shape, true),
             meta(DataType::Int32, &total_shape, true),
         ];
-        let unpacked_req = kernel
-            .workspace_requirement(&f16_unpacked)
-            .expect("unpacked requirement");
+        let unpacked_req = requirement(&f16_unpacked).expect("unpacked requirement");
         assert_eq!(
             unpacked_req.bytes, transpose_total as u64,
             "unpacked fp16 prefill skips split staging but still needs both transposes"
@@ -3803,12 +3853,10 @@ mod tests {
             meta(DataType::Int32, &seqlens_shape, true),
             meta(DataType::Int32, &total_shape, true),
         ];
-        let f32_req = kernel
-            .workspace_requirement(&f32_packed)
-            .expect("f32 packed requirement");
+        let f32_req = requirement(&f32_packed).expect("f32 packed requirement");
         let f32_staging = align(batch * q_seq * (num_heads * dim) * 4)
             + 2 * align(batch * q_seq * (kv_heads * dim) * 4);
-        let scores = gqa_reference_scores_bytes(batch, num_heads, q_seq, cache).unwrap();
+        let scores = gqa_reference_scores_bytes(batch, num_heads, q_seq, cache + q_seq).unwrap();
         assert_eq!(
             f32_req.bytes,
             (f32_staging + 2 * align(batch * q_seq * (num_heads * dim) * 4) + scores) as u64,
