@@ -2325,3 +2325,30 @@ return have zero recorded issuer callbacks; this is not a claim that existing
 transient weight admission makes no callbacks. The scoped cap is not a full
 process cap. The CUDA parity CPU oracle is also updated to prepare scratch,
 with a real GPU-free f64 regression that caught the missing caller.
+
+### Float MoE gather uses the shared execution lane
+
+Float MoE now follows the same declared-workspace contract as the quantized
+variants. Its per-expert driver reuses one input-sized region; the batched
+route uses one whole-slot region. Metadata excludes batched execution only
+when its largest possible expert group cannot cross the kernel's fixed work
+threshold. The threshold is read at kernel creation, so environment or thread
+pool changes cannot invalidate an already prepared bound. Execution still uses
+actual routing and the original worker-budget/serial-threshold policy.
+
+Singleton per-expert groups borrow the original dense row. All other gathered
+values are copied once into the admitted lane, without preliminary clearing.
+No per-expert admission, mutable kernel pool or additional EP interface is
+introduced. FC intermediates, conversions, routing and the owned result remain
+separate work; this is not complete inference-memory accounting.
+
+The real Host pool regression verifies zero warm workspace issuer callbacks
+across skewed/noncontiguous routing, threshold boundaries and one/four-thread
+pool transitions, with exact output and trim-to-zero checks. Integrated native CPU 2,018,
+session library 296, focused native/MLAS MoE 21 each and projection-layout 10
+checks pass; strict native/MLAS all-target Clippy passes. The shared-lock public
+session comparison covers four geometries and 36 processes, with equal complete
+outputs. Candidate CPU medians change -1.19% to +0.90%, with overlapping ranges
+and all null/control duration gates passing; observed OS activity limits the
+performance evidence. See [the reproducible report](../benchmarks/float-moe-workspace/README.md).
+No CUDA runtime or model throughput conclusion follows.

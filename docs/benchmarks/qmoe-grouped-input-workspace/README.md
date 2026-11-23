@@ -174,3 +174,11 @@ Local validation: 12 island tests and 895 native-backend engine tests pass
 (1 ignored), plus strict native-backend engine all-target Clippy. This is Host
 validation; the corrected Windows execution remains a CI responsibility. QMoE
 and projection production files and historical timing sources are unchanged.
+
+### Integration after Float MoE landed
+
+Merged main `28fad980b` (#2447), retaining both independent MoE progress sections
+in the cleanup plan. QMoE production math is unchanged. Integrated focused QMoE
+57, Float MoE 21, session 296 and the GPU-free CPU oracle 1 tests pass; strict
+CPU/CUDA/session all-target Clippy also passes. Historical timing baselines are
+unchanged; these are integration checks, not another performance measurement.

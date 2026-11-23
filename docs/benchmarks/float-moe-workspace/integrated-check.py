@@ -1,0 +1,1 @@
+exec(open('/tmp/nxrt-float-moe-validation.py').read().replace("out=pathlib.Path('/tmp/nxrt-float-moe-validation')", "out=pathlib.Path('/tmp/nxrt-float-moe-integration')").replace("commands=[", "commands=[('layout',['test','-p','onnx-runtime-ep-cpu','--test','decoded_projection_layout']),"))

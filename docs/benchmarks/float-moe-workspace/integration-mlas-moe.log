@@ -1,0 +1,30 @@
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-workspace/crates/onnx-runtime-ep-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.05s
+     Running unittests src/lib.rs (/tmp/nxrt-erf-nan-target/debug/deps/onnx_runtime_ep_cpu-53b93bd9d65a9d6e)
+
+running 22 tests
+test kernels::moe::tests::grouped_moe_measures_benefit_over_dense_fallback_decode_and_prefill ... ignored, performance characterization; run with --release --ignored --nocapture
+test kernels::moe::tests::linear_grouped_returns_an_empty_result_for_zero_rows ... ok
+test kernels::moe::tests::linear_grouped_matches_a_hand_rolled_transposed_gemm ... ok
+test kernels::moe::tests::grouped_linear_matches_a_hand_rolled_transposed_gemm ... ok
+test kernels::moe::tests::gather_workspace_metadata_checks_empty_singleton_dtype_and_overflow ... ok
+test kernels::moe::tests::moe_swiglu_fused_interleaved ... ok
+test kernels::moe::tests::moe_gelu_top1_biases_selects_different_experts_per_row ... ok
+test kernels::moe::tests::grouped_moe_matches_per_token_dense_fallback_for_eight_experts_top2 ... ok
+test kernels::moe::tests::moe_silu_with_fc3_uses_ort_mixtral_gated_form ... ok
+test kernels::moe::tests::moe_silu_top2_normalized_without_biases_preserves_3d_shape ... ok
+test kernels::moe::tests::moe_defaults_to_top1_relu_when_attributes_are_omitted ... ok
+test kernels::moe::tests::routing_plan_groups_are_contiguous_ascending_and_cover_every_slot ... ok
+test kernels::moe::tests::borrowed_and_copied_expert_weights_agree ... ok
+test kernels::moe::tests::the_gate_reads_the_largest_group_not_the_average ... ok
+test kernels::moe::tests::moe_swiglu_unfused_fc3_with_biases ... ok
+test kernels::moe::tests::single_token_decode_matches_the_scalar_reference ... ok
+test kernels::moe::tests::moe_top1_relu_runs_natively_in_bf16_matching_f32 ... ok
+test kernels::moe::tests::the_driver_gate_matches_the_measured_crossover ... ok
+test kernels::moe::tests::every_swiglu_fusion_mode_matches_the_scalar_reference ... ok
+test kernels::moe::tests::the_two_drivers_are_bit_identical ... ok
+test kernels::moe::tests::gather_workspace_bounds_cover_threshold_skew_and_pool_changes ... ok
+test kernels::moe::tests::grouped_driver_is_bit_identical_to_the_per_expert_loop ... ok
+
+test result: ok. 21 passed; 0 failed; 1 ignored; 0 measured; 2073 filtered out; finished in 0.09s
+

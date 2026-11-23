@@ -1,0 +1,270 @@
+[
+  {
+    "shape": [
+      1,
+      64,
+      64,
+      1,
+      null
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "baseline": {
+        "cpu_us_median": 6.825794032723776,
+        "cpu_us_range": [
+          6.787364223841611,
+          6.835899903753612
+        ],
+        "wall_us_median": 6.826140588477932,
+        "wall_us_range": [
+          6.787604839818507,
+          6.836192080296989
+        ],
+        "control_ms_median": 89.50800000000014,
+        "workspace_bytes": [
+          0
+        ]
+      },
+      "after": {
+        "cpu_us_median": 6.77780833218754,
+        "cpu_us_range": [
+          6.768389935377421,
+          6.963288876667121
+        ],
+        "wall_us_median": 6.778017461845182,
+        "wall_us_range": [
+          6.768644850818094,
+          6.963389179155781
+        ],
+        "control_ms_median": 90.71700000000016,
+        "workspace_bytes": [
+          0
+        ]
+      },
+      "null": {
+        "cpu_us_median": 6.916953114258214,
+        "cpu_us_range": [
+          6.844562078922037,
+          7.040973463495128
+        ],
+        "wall_us_median": 6.938055685411797,
+        "wall_us_range": [
+          6.844751134332463,
+          7.045811563316376
+        ],
+        "control_ms_median": 91.03900000000009,
+        "workspace_bytes": [
+          0
+        ]
+      }
+    },
+    "after_over_baseline": 0.9929699460156304,
+    "null_over_baseline": 1.013355088228184,
+    "control_after_over_baseline": 1.0135071725432365,
+    "control_null_over_baseline": 1.0171046163471416,
+    "duration_pass": true,
+    "control_5pct_pass": true
+  },
+  {
+    "shape": [
+      8,
+      256,
+      256,
+      1,
+      null
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "baseline": {
+        "cpu_us_median": 135.1414835164835,
+        "cpu_us_range": [
+          133.53296703296704,
+          137.89560439560435
+        ],
+        "wall_us_median": 135.1463489010989,
+        "wall_us_range": [
+          133.54452884615384,
+          137.89760714285714
+        ],
+        "control_ms_median": 90.92199999999994,
+        "workspace_bytes": [
+          0
+        ]
+      },
+      "after": {
+        "cpu_us_median": 133.5315934065934,
+        "cpu_us_range": [
+          133.51510989010995,
+          138.06318681318672
+        ],
+        "wall_us_median": 133.53634340659343,
+        "wall_us_range": [
+          133.5216346153846,
+          138.1149848901099
+        ],
+        "control_ms_median": 90.33999999999986,
+        "workspace_bytes": [
+          8192
+        ]
+      },
+      "null": {
+        "cpu_us_median": 133.375,
+        "cpu_us_range": [
+          133.1098901098901,
+          135.91483516483513
+        ],
+        "wall_us_median": 133.3790631868132,
+        "wall_us_range": [
+          133.11057692307693,
+          135.91884203296704
+        ],
+        "control_ms_median": 91.35500000000008,
+        "workspace_bytes": [
+          0
+        ]
+      }
+    },
+    "after_over_baseline": 0.9880873728184748,
+    "null_over_baseline": 0.9869286360448453,
+    "control_after_over_baseline": 0.9935989089549275,
+    "control_null_over_baseline": 1.004762323750029,
+    "duration_pass": true,
+    "control_5pct_pass": true
+  },
+  {
+    "shape": [
+      512,
+      256,
+      256,
+      4,
+      "0"
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "baseline": {
+        "cpu_us_median": 7507.857142857146,
+        "cpu_us_range": [
+          7296.214285714285,
+          7667.857142857146
+        ],
+        "wall_us_median": 2045.5892857142858,
+        "wall_us_range": [
+          1972.6785714285716,
+          2077.389857142857
+        ],
+        "control_ms_median": 88.67899999999995,
+        "workspace_bytes": [
+          0
+        ]
+      },
+      "after": {
+        "cpu_us_median": 7575.642857142854,
+        "cpu_us_range": [
+          7495.642857142857,
+          7866.571428571428
+        ],
+        "wall_us_median": 2106.080357142857,
+        "wall_us_range": [
+          2045.2023571428572,
+          2183.1160714285716
+        ],
+        "control_ms_median": 90.11599999999986,
+        "workspace_bytes": [
+          1048576
+        ]
+      },
+      "null": {
+        "cpu_us_median": 7480.3571428571395,
+        "cpu_us_range": [
+          7337.42857142857,
+          7669.714285714288
+        ],
+        "wall_us_median": 2057.979142857143,
+        "wall_us_range": [
+          2010.7857142857144,
+          2112.392857142857
+        ],
+        "control_ms_median": 88.36500000000002,
+        "workspace_bytes": [
+          0
+        ]
+      }
+    },
+    "after_over_baseline": 1.0090286366663488,
+    "null_over_baseline": 0.9963371705831977,
+    "control_after_over_baseline": 1.0162045129060986,
+    "control_null_over_baseline": 0.9964591391423007,
+    "duration_pass": true,
+    "control_5pct_pass": true
+  },
+  {
+    "shape": [
+      512,
+      1024,
+      1024,
+      4,
+      null
+    ],
+    "full_output_equal": true,
+    "argmax_equal": true,
+    "arms": {
+      "baseline": {
+        "cpu_us_median": 110360.99999999993,
+        "cpu_us_range": [
+          110194.00000000001,
+          110917.99999999985
+        ],
+        "wall_us_median": 28288.208,
+        "wall_us_range": [
+          28083.541,
+          28373.667
+        ],
+        "control_ms_median": 91.74700000000024,
+        "workspace_bytes": [
+          0
+        ]
+      },
+      "after": {
+        "cpu_us_median": 110454.99999999997,
+        "cpu_us_range": [
+          110215.99999999999,
+          111222.99999999996
+        ],
+        "wall_us_median": 28207.791999999998,
+        "wall_us_range": [
+          28097.958,
+          28265.541
+        ],
+        "control_ms_median": 94.20000000000029,
+        "workspace_bytes": [
+          4194304
+        ]
+      },
+      "null": {
+        "cpu_us_median": 110288.99999999997,
+        "cpu_us_range": [
+          109407.00000000004,
+          110690.99999999999
+        ],
+        "wall_us_median": 28097.542,
+        "wall_us_range": [
+          28058.875,
+          28272.083
+        ],
+        "control_ms_median": 91.85699999999963,
+        "workspace_bytes": [
+          0
+        ]
+      }
+    },
+    "after_over_baseline": 1.0008517501653669,
+    "null_over_baseline": 0.9993475956180177,
+    "control_after_over_baseline": 1.0267365690431298,
+    "control_null_over_baseline": 1.0011989492844386,
+    "duration_pass": true,
+    "control_5pct_pass": true
+  }
+]
