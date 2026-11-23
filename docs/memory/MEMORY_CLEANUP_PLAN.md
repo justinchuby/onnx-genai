@@ -1763,3 +1763,124 @@ on backend/case. Tiny public run adds 9 ns native and 21 ns forced MLAS; prepare
 literally zero runtime overhead. Raw rounds, source/driver/binary hashes and
 summaries remain under `/tmp/nxrt-einsum-weight-prepared-*`; the superseded
 experiment is separately labeled under `/tmp/nxrt-einsum-weight-*`.
+
+
+### MatMulNBits half activation conversion borrows the execution lane
+
+All native and optional reference routes consume one read-only f32 activation.
+For f16/bf16 A, that conversion now borrows one StepScoped region through the
+existing WorkspaceLayout/Kernel contract instead of allocating a Vec per call.
+The bound is the checked complete A element count times four bytes, with f32
+alignment; metadata admission precedes conversion and packing. Kernels do not
+call an issuer or retain a private activation pool. Sequential nodes share the
+executor's maximum, while concurrently active lanes need distinct backing.
+
+Contiguous Host f32 still borrows its input and declares NONE. Strided f32
+keeps its existing call-owned gather: shape-only TensorMetadata cannot prove
+its layout, and reserving a complete f32 copy for every ordinary f32 call would
+waste the quota. No runtime-only larger request can undercut strict prepare.
+Missing, short and misaligned workspace fails with MatMulNBits context before
+conversion or output writes. The common widening helper preserves byte offsets,
+negative strides and the existing half conversion semantics. Fresh workspace is
+borrowed as MaybeUninit, initialized inside time_widen and then passed to the
+existing initialized-f32 converter; the phase timer includes initialization,
+matching its old scope. This does not claim to have removed the zero fill.
+
+The empty-output regression also exposed a pre-existing invalid typed slice:
+an empty Vec<u8> need not carry an f32-aligned dangling address. The kernel now
+returns before constructing that output slice or packing. Leading zero extents
+avoid irrelevant row-count products, and nonempty output counts/f32 spans are
+checked before typed output access.
+
+Real Host-cap tests alternate f16 and bf16 and opposite weight-retention
+policies through 4,096 checkout/compute/return cycles with zero warm issuer
+callbacks, including zero-byte callbacks. A second active lane cannot borrow
+the first lane's grant; idle storage yields to actual KV pressure and must
+re-admit before reuse. The executor graph uses max(128,64)=128 bytes for two
+sequential quantized nodes, reuses one allocation across runs, and re-admits
+after trimming. Separate route controls check every measured M/K/N and A dtype
+against actual SQNBit counters in the optional reference build, plus exact
+numeric outputs. The production timing binary has no test-counter overhead.
+
+The output conversion Vec, strided f32 gathers, scale/bias conversion, quantized
+activation tiles and optional reference-private workspace remain separate
+migration work. Those regions can coexist with widened A; future layout plans
+must sum simultaneous regions instead of pretending they are alternative
+lifetimes. No new EP interface, cache, environment policy or MLAS dependency is
+introduced by this change.
+
+
+The cross-platform lane also exposed a missed caller from the earlier QLinear
+workspace migration: the ARM64 compensation-allocation integration test still
+called execute without scratch. It now declares and owns the prepared 108-byte
+accumulator outside its allocation-counting window, then counts the complete
+prepared compute call. The positive allocation control, numeric checks, both
+zero-point cases and equal call counts for 1/2/17 batches remain. The explicit
+108-byte assertion prevents accidentally reserving one tile per batch. This
+changes the test caller, not the arithmetic or its allocation threshold.
+
+Final local validation for this stage: native CPU 1,997 / session 286; optional
+MLAS CPU 2,038 / session 288; all CPU integration targets pass (62 native / 63
+MLAS), including the corrected ARM allocation counter. Strict all-target Clippy
+passes for CPU/session/engine in both configurations, and CPU targets were
+checked again after the integration-caller fix. The four activation-workspace
+controls also pass in release; explicit forced-reference route proofs cover all
+three fixture geometries across all three input dtypes. No CUDA execution is claimed.
+
+
+Paired release controls compare 319323a104 with this stage on M1 Max / ARM64 /
+macOS 27, using the same 64 MiB real Host cap in both arms. All weights are
+standard-layout int4, block 32, accuracy 0, with immutable B/scales. Raw kernel
+controls publish f32 output to isolate activation conversion; the public
+session uses f16 input/output. Workspace backing is held outside raw-kernel
+timing; public run includes checkout/return and prepare + run includes prepare.
+Each mode has 15 batches/process and the median of three isolated process
+medians/arm in before/after/after/before/before/after order. Warmup is 1,000 calls
+for tiny/decode/session, 100 for prefill. Rayon/MLAS/OMP/VECLIB/decode thread
+configuration is identical at 1; these knobs are not a measured worker-count
+claim. The stable host flock excludes the llama.cpp workload throughout.
+
+Separate counter controls establish the fixture routes in both source arms;
+the native baseline proof uses release tests and the reference baseline proof
+uses debug tests, neither is timed. Production release examples have no test
+counter overhead. Reference timing explicitly forces MLAS/SQNBit, checks an
+actual live SQNBit pack, and validates every numeric output. Resident reference
+pack bytes are unchanged before/after: tiny 320, decode 327,680, prefill 163,840.
+Thus the recorded activation charge is not a changed weight-pack policy.
+
+| Mode | Native before → after (us) | Forced MLAS before → after (us) |
+| --- | --- | --- |
+| Tiny f32 (M=1,K=64,N=8) | 0.869 → 0.846 | 0.659 → 0.676 |
+| Tiny f16 (1,64,8) | 0.905 → 0.869 | 0.712 → 0.684 |
+| Tiny bf16 (1,64,8) | 1.043 → 1.053 | 0.865 → 0.851 |
+| Decode f16 (1,2048,256) | 74.412 → 74.457 | 100.027 → 100.063 |
+| Decode bf16 (1,2048,256) | 79.143 → 78.892 | 104.499 → 104.538 |
+| Prefill f32 (32,1024,256) | 1195.621 → 1173.934 | 215.523 → 215.476 |
+| Prefill f16 (32,1024,256) | 1201.039 → 1183.014 | 219.750 → 219.230 |
+| Prefill bf16 (32,1024,256) | 1254.490 → 1263.907 | 291.298 → 292.312 |
+| Tiny half public session run | 3.235 → 3.427 | 2.985 → 3.187 |
+| Tiny half public session prepare + run | 3.449 → 3.628 | 3.214 → 3.356 |
+
+The managed activation charge is 256 bytes tiny, 8 KiB decode and 128 KiB prefill;
+f32 stays zero. Old zero managed bytes mean an unaccounted call-owned Vec, not
+zero physical memory. Raw decode/prefill is broadly flat on these controls;
+tiny raw deltas range from -35 to +17 ns depending on case/backend. The tiny
+public session adds about 0.192 us native / 0.202 us reference (5.9% / 6.8%);
+prepare + run adds 0.179 / 0.142 us. This is a measured residual, not a
+zero-overhead claim. The warm issuer test establishes zero callbacks, not zero
+cost for ownership wrappers, validation or pool synchronization. No whole-model,
+RSS, CUDA or universal throughput claim follows from these controls.
+
+Source inspection identifies a concrete follow-up: DeviceBuffer currently
+boxes a ManagedAllocation on every checkout and unboxes it on return. Preserve
+that existing Box through the pool instead of allocating a new wrapper for each
+loan. The design review recommends changing the ownership seam together, with
+no parallel API, while retaining context retirement, foreign-return, holder/role
+and outstanding-view guards. Verify the Box address across warm cycles and
+measure the public-session effect before attributing any timing to it.
+
+Validated source hashes, exact driver variants, route controls, binary hashes,
+raw rounds, first-failure evidence and summaries remain under
+`/tmp/nxrt-nbits-activation-*`. Consumed build helpers, probe binaries and the
+baseline worktree are removed after recording provenance; source probes and
+reproduction/validation drivers remain.
