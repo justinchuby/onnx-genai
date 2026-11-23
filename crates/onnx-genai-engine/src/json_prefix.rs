@@ -55,6 +55,36 @@ fn scalar_ranges(units: RangeInclusive<u32>) -> Vec<RangeInclusive<u32>> {
 }
 
 impl JsonPrefix {
+    pub(crate) fn has_pending_escape(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Reject an impossible escape continuation without rescanning unrelated
+    /// committed content. The real projection still checks every admitted piece.
+    pub(crate) fn pending_piece_syntax_viable(&self, piece: &[u8]) -> bool {
+        let Some(pending) = &self.pending else {
+            return true;
+        };
+        let text = match std::str::from_utf8(piece) {
+            Ok(text) => text,
+            Err(error) if error.error_len().is_none() && error.valid_up_to() > 0 => {
+                let Ok(text) = std::str::from_utf8(&piece[..error.valid_up_to()]) else {
+                    return false;
+                };
+                text
+            }
+            Err(_) => return false,
+        };
+        let mut probe = String::with_capacity(1 + pending.spelling.len() + text.len());
+        probe.push('"');
+        probe.push_str(&pending.spelling);
+        probe.push_str(text);
+        Self::parse(&probe).is_ok_and(|prefix| {
+            prefix
+                .pending
+                .is_none_or(|escape| !escape.ranges.is_empty())
+        })
+    }
     pub(crate) fn parse(text: &str) -> anyhow::Result<Self> {
         let bytes = text.as_bytes();
         let mut at = 0;

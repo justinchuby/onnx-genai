@@ -56,6 +56,15 @@ pub(crate) async fn completions(
             &state.config,
             handle.model_max_context,
         )?;
+        if prepared.generation.options_mut().constraint.is_some() {
+            prepared
+                .generation
+                .options_mut()
+                .validate_processors(&handle.tokenizer)
+                .map_err(|error| {
+                    ApiError::invalid_request(format!("invalid completion constraint: {error:#}"))
+                })?;
+        }
         Ok(prepared)
     };
     let first_prepared = prepare(&first)?;
@@ -239,6 +248,7 @@ fn admit_completion_output(
     config: &ServerConfig,
     max_context: Option<usize>,
 ) -> Result<(), ApiError> {
+    prepared.generation.options_mut().max_json_bytes = config.replay_buffer_bytes;
     prepared.generation.options_mut().max_new_tokens = admit_output_budget(
         &request.sampling,
         prompt_tokens,
@@ -619,10 +629,11 @@ async fn prepare_chat_input(
         output_budget,
         config.replay_buffer_bytes,
     )
-    .map_err(|err| ApiError::invalid_request(format!("prompt preparation failed: {err}")))?;
+    .map_err(|err| ApiError::invalid_request(format!("prompt preparation failed: {err:#}")))?;
     if !input_audio.is_empty() {
         prepared = prepare_audio_generate_request(request, &handle.tokenizer, output_budget)?;
     }
+    prepared.request.options.max_json_bytes = config.replay_buffer_bytes;
     let pipeline_input = if !image_urls.is_empty() {
         Some(
             preprocess_chat_images(
@@ -2073,6 +2084,7 @@ fn prepare_generate_request(
         .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
     let prompt_tokens = token_ids.len();
     let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget)?;
+    options.max_json_bytes = response_buffer_bytes;
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
     options.resolve_sampling_defaults(
@@ -2096,10 +2108,7 @@ fn prepare_generate_request(
                 schema,
                 template: template.clone(),
                 prefix: prompt.clone(),
-                max_bytes: response_buffer_bytes,
             });
-            options.validate_processors(tokenizer)
-                .map_err(|error| anyhow::anyhow!("resolve response_format against the declared response_template and tokenizer: {error:#}"))?;
         }
     }
     anyhow::ensure!(
@@ -2111,6 +2120,10 @@ fn prepare_generate_request(
             ),
         "reasoning continuation with this constrained output policy requires a channel-aware generation grammar; use response_format with a compatible declared response_template"
     );
+    if options.constraint.is_some() {
+        options.validate_processors(tokenizer)
+            .context("resolve requested output constraint against the model tokenizer and declared response template")?;
+    }
     Ok(PreparedGenerateRequest {
         response_prefix: Some(prompt),
         request: GenerateRequest {

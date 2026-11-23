@@ -1,8 +1,11 @@
 //! Reversible byte-oriented JSON Schema recognition for projected response text.
 use anyhow::{Context, ensure};
 use llguidance::api::TopLevelGrammar;
-use llguidance::toktrie::{ApproximateTokEnv, InferenceCapabilities, TokEnv, TokRxInfo, TokTrie};
-use llguidance::{Matcher, ParserFactory};
+use llguidance::earley::{BiasComputer, ParserRecognizer};
+use llguidance::toktrie::{
+    ApproximateTokEnv, InferenceCapabilities, SimpleVob, TokEnv, TokRxInfo, TokTrie,
+};
+use llguidance::{ParserFactory, TokenParser};
 use std::{fmt, num::NonZeroUsize, sync::Arc};
 
 /// Recognition of a candidate after the committed logical JSON bytes.
@@ -29,11 +32,155 @@ pub(crate) struct JsonByteBudgetExceeded {
 /// and escape normalization belong before this cursor. User stops and length
 /// limits do not require completeness; grammar EOF does.
 pub struct JsonByteCursor {
-    matcher: Matcher,
-    initial: Matcher,
+    matcher: ByteMatcher,
+    initial: ByteMatcher,
     committed: Vec<u32>,
     max_bytes: NonZeroUsize,
     failure: Option<CursorFailure>,
+}
+
+/// A model vocabulary walked against the cursor's already compiled grammar.
+/// Model IDs never enter the byte parser's history or its internal byte mask.
+pub(crate) struct JsonTokenVocabulary(TokTrie);
+
+impl JsonTokenVocabulary {
+    pub(crate) fn new(pieces: &[Vec<u8>]) -> anyhow::Result<Self> {
+        let mut pieces = pieces.to_vec();
+        let eos = u32::try_from(pieces.len()).context("JSON model vocabulary exceeds token IDs")?;
+        pieces.push(b"\xff<json-eos>".to_vec());
+        let info = TokRxInfo {
+            vocab_size: u32::try_from(pieces.len())?,
+            tok_eos: eos,
+            tok_bos: None,
+            tok_pad: None,
+            tok_unk: None,
+            tok_end_of_turn: None,
+        };
+        Ok(Self(TokTrie::from(&info, &pieces)))
+    }
+}
+
+impl BiasComputer for JsonTokenVocabulary {
+    fn compute_bias(&self, recognizer: &mut ParserRecognizer<'_>, start: &[u8]) -> SimpleVob {
+        let mut mask = self.0.alloc_token_set();
+        self.0.add_bias(recognizer, &mut mask, start);
+        mask
+    }
+    fn trie(&self) -> &TokTrie {
+        &self.0
+    }
+}
+
+/// Keeps parser access panic-fenced while permitting a bounded external trie
+/// walk. The public Matcher wrapper does not expose this backend operation.
+enum ByteMatcher {
+    Ready(Box<TokenParser>),
+    Failed(ByteMatcherFailure),
+}
+
+#[derive(Debug, Clone)]
+struct ByteMatcherFailure(Arc<anyhow::Error>);
+impl fmt::Display for ByteMatcherFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "JSON recognizer backend operation failed: {:#}; retry with a fresh cursor",
+            self.0
+        )
+    }
+}
+impl std::error::Error for ByteMatcherFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
+
+impl ByteMatcher {
+    fn new(mut parser: TokenParser) -> Self {
+        parser.start_without_prompt();
+        Self::Ready(Box::new(parser))
+    }
+    fn deep_clone(&self) -> Self {
+        match self {
+            Self::Ready(parser) => Self::Ready(Box::new(parser.deep_clone())),
+            Self::Failed(failure) => Self::Failed(failure.clone()),
+        }
+    }
+    fn get_error(&mut self) -> Option<ByteMatcherFailure> {
+        let _ = self.run(|parser| {
+            if let Some(error) = parser.parser.get_error() {
+                anyhow::bail!("{}", error.message());
+            }
+            Ok(())
+        });
+        match self {
+            Self::Failed(failure) => Some(failure.clone()),
+            Self::Ready(_) => None,
+        }
+    }
+    fn is_stopped(&self) -> bool {
+        match self {
+            Self::Ready(parser) => parser.stopped(),
+            Self::Failed(_) => true,
+        }
+    }
+    fn run<T>(
+        &mut self,
+        operation: impl FnOnce(&mut TokenParser) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let result = match self {
+            Self::Failed(failure) => return Err(failure.clone().into()),
+            Self::Ready(parser) => {
+                llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    operation(parser)
+                }))
+            }
+        };
+        match result {
+            Ok(value) => Ok(value),
+            Err(operation) => {
+                let failure = ByteMatcherFailure(Arc::new(operation));
+                *self = Self::Failed(failure.clone());
+                Err(failure.into())
+            }
+        }
+    }
+    fn try_consume_tokens(&mut self, tokens: &[u32]) -> anyhow::Result<usize> {
+        self.run(|parser| {
+            for (index, &token) in tokens.iter().enumerate() {
+                if !parser.validate_token(token)? { return Ok(index); }
+                let backtrack = parser.consume_token(token)?;
+                parser.check_stop()?;
+                ensure!(backtrack == 0, "JSON byte recognizer requested {backtrack} token backtracks; use a grammar supporting append-only byte recognition");
+            }
+            Ok(tokens.len())
+        })
+    }
+    fn rollback(&mut self, count: usize) -> anyhow::Result<()> {
+        self.run(|parser| parser.rollback(count))
+    }
+    fn is_accepting(&mut self) -> anyhow::Result<bool> {
+        self.run(|parser| Ok(parser.is_accepting()))
+    }
+    fn vocabulary_mask(&mut self, vocabulary: &JsonTokenVocabulary) -> anyhow::Result<SimpleVob> {
+        self.run(|parser| {
+            if parser.stopped() { return Ok(vocabulary.trie().alloc_token_set()); }
+            let forced_prefix = parser.force_bytes();
+            // The backend cache keys grammar state, not vocabulary identity.
+            // Neither model-ID masks nor byte-ID masks may leak across walks.
+            parser.invalidate_bias_cache();
+            let mask = parser.parser.compute_bias(vocabulary, &forced_prefix);
+            parser.invalidate_bias_cache();
+            if let Some(error) = parser.parser.get_error() {
+                anyhow::bail!("JSON vocabulary recognition failed: {}; repair the schema or increase its explicit grammar limits", error.message());
+            }
+            Ok(mask)
+        })
+    }
+    #[cfg(test)]
+    fn test_trigger_lexer_error(&mut self) -> anyhow::Result<()> {
+        self.run(|parser| parser.parser.test_trigger_lexer_error())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +242,7 @@ impl JsonByteCursor {
             .context("initialize JSON byte grammar factory")?;
         let parser = factory.create_parser(TopLevelGrammar::from_json_schema(schema.clone()))
             .context("compile JSON Schema for projected response bytes; repair the schema if unsupported")?;
-        let matcher = Matcher::new(Ok(parser));
+        let matcher = ByteMatcher::new(parser);
         Ok(Self {
             initial: matcher.deep_clone(),
             matcher,
@@ -126,10 +273,10 @@ impl JsonByteCursor {
 
     fn trial(&mut self, bytes: &[u8]) -> anyhow::Result<Trial> {
         if let Some(error) = self.matcher.get_error() {
-            anyhow::bail!(
-                "JSON byte recognizer failed at committed offset {}: {error}; retry with a fresh cursor",
+            return Err(anyhow::Error::new(error).context(format!(
+                "JSON byte recognizer failed at committed offset {}; retry with a fresh cursor",
                 self.committed.len()
-            );
+            )));
         }
         let tokens = bytes.iter().copied().map(u32::from).collect::<Vec<_>>();
         let accepted = if self.matcher.is_stopped() {
@@ -209,6 +356,32 @@ impl JsonByteCursor {
         Ok(trial.status)
     }
 
+    /// Compute canonical byte-piece candidates together. Pending UTF-8 is
+    /// provisional: both this walk and failures preserve the committed prefix.
+    pub(crate) fn vocabulary_mask(
+        &mut self,
+        vocabulary: &JsonTokenVocabulary,
+        pending: &[u8],
+    ) -> anyhow::Result<SimpleVob> {
+        self.check_input(pending)?;
+        let trial = self.trial(pending).map_err(|error| self.recover(error))?;
+        if matches!(trial.status, JsonCandidate::Rejected { .. }) {
+            self.rollback(trial.accepted)?;
+            anyhow::bail!(
+                "committed JSON UTF-8 tail cannot continue the schema; rebuild the projection before computing model candidates"
+            );
+        }
+        match self.matcher.vocabulary_mask(vocabulary) {
+            Ok(mask) => {
+                self.rollback(trial.accepted)?;
+                Ok(mask)
+            }
+            Err(error) => Err(self.recover(
+                error.context("compute model-token mask using the compiled JSON byte grammar"),
+            )),
+        }
+    }
+
     /// Commit an entirely viable prefix atomically. Rejection leaves the prefix intact.
     pub fn commit(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         self.check_input(bytes)?;
@@ -280,6 +453,60 @@ mod tests {
             max_bytes,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn json_byte_cursor_model_masks_keep_vocabulary_ids_and_byte_caches_separate() {
+        let mut pieces = vec![Vec::new(); 300];
+        pieces[255] = b"1".to_vec();
+        pieces[270] = b"2".to_vec();
+        pieces[12] = b"}".to_vec();
+        let first = JsonTokenVocabulary::new(&pieces).unwrap();
+        pieces.swap(255, 270);
+        let second = JsonTokenVocabulary::new(&pieces).unwrap();
+        let mut cursor = JsonByteCursor::new(&json!({"type":"object","properties":{"n":{"const":1}},"required":["n"],"additionalProperties":false}),128).unwrap();
+        cursor.commit(br#"{"n":"#).unwrap();
+        for _ in 0..2 {
+            let mask = cursor.vocabulary_mask(&first, b"").unwrap();
+            assert!(mask.get(255) && !mask.get(270) && !mask.get(12));
+            let mask = cursor.vocabulary_mask(&second, b"").unwrap();
+            assert!(!mask.get(255) && mask.get(270));
+            assert_eq!(
+                cursor.preview(b"1}").unwrap(),
+                JsonCandidate::Viable { complete: true }
+            );
+            assert!(matches!(
+                cursor.preview(b"2}").unwrap(),
+                JsonCandidate::Rejected { .. }
+            ));
+            assert_eq!(cursor.committed_bytes(), 5);
+        }
+        cursor.commit(b"1").unwrap();
+        assert!(cursor.vocabulary_mask(&first, b"").unwrap().get(12));
+        cursor.commit(b"}").unwrap();
+        assert_eq!(
+            cursor.preview(b"").unwrap(),
+            JsonCandidate::Viable { complete: true }
+        );
+    }
+
+    #[test]
+    fn json_byte_cursor_model_masks_restore_pending_utf8_and_backend_failures() {
+        let vocabulary = JsonTokenVocabulary::new(&[vec![0xa9, b'"'], vec![0xa9, b'A']]).unwrap();
+        let mut cursor = JsonByteCursor::new(&json!({"const":"é"}), 32).unwrap();
+        cursor.commit(b"\"").unwrap();
+        for _ in 0..2 {
+            let mask = cursor.vocabulary_mask(&vocabulary, &[0xc3]).unwrap();
+            assert!(mask.get(0) && !mask.get(1));
+            assert_eq!(cursor.committed_bytes(), 1);
+            assert_eq!(
+                cursor.preview(&[0xc3, 0xa9, b'"']).unwrap(),
+                JsonCandidate::Viable { complete: true }
+            );
+        }
+        let _ = cursor.matcher.test_trigger_lexer_error();
+        assert!(cursor.vocabulary_mask(&vocabulary, &[0xc3]).is_err());
+        assert!(cursor.vocabulary_mask(&vocabulary, &[0xc3]).unwrap().get(0));
     }
 
     #[test]
