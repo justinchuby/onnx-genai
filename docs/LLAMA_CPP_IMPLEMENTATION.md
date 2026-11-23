@@ -1194,3 +1194,27 @@ ordered Unicode prefix stripping, rewind, special-marker preservation and actual
 tokenizer panic containment. The full suite on main 332396bcf plus these changes
 passed 734 engine tests (1 inherited ignore) and 405 server tests (2 inherited
 ignores). These are functional checks, with no performance claim.
+
+
+## Optional MCP HTTP transport
+
+The official frontend's GET/POST `/cors-proxy` transport is implemented behind
+an independent opt-in network policy. Target admission checks every resolved
+address and pins those addresses into a client that disables environment proxies
+and automatic redirects. Only explicitly prefixed browser headers are eligible
+for forwarding. Redirects return through admission and strip forwarding headers
+when target origins differ, while preserving representation negotiation.
+Remote headers cannot set inference-origin cookies, CORS grants, storage or
+transport policy; remote documents receive a sandbox CSP.
+
+Request and response bytes and idle wait durations have positive operator
+limits. A bounded response queue propagates backpressure, the response body owns
+the transfer task, and dropping the reader cancels it. Timeout after a stalled
+reader remains an error rather than a successful truncated response. Native
+server tools, local tool execution and the other unchecked compatibility work
+remain separate delivery items. Fourteen new proxy/CLI tests passed, including
+real local SSE delivery before EOF, request/response byte limits, disconnect,
+stalled-reader timeout, cross-origin credential isolation and connection quota
+release and active SSE continuing beyond the idle interval. The full server
+library suite passed 419 tests with 2 inherited ignores. Strict server all-target
+Clippy passed. This increment does not complete the remaining delivery items.

@@ -58,7 +58,8 @@ pub use runtime_args::{
 #[cfg(feature = "native-backend")]
 pub use state::parse_native_device;
 pub use state::{
-    AppState, OrtSessionWorkerCount, ServerConfig, default_node_id, parse_kv_cache_dtype,
+    AppState, McpProxyPolicy, OrtSessionWorkerCount, ServerConfig, default_node_id,
+    parse_kv_cache_dtype,
 };
 pub use tool_protocol::{ToolProtocol, ToolProtocolError};
 pub use types::{
@@ -144,7 +145,7 @@ pub fn app(state: AppState) -> Router {
         )
         .route(
             "/cors-proxy",
-            get(routes::llama::disabled_feature).post(routes::llama::disabled_feature),
+            get(routes::proxy::forward).post(routes::proxy::forward),
         )
         .route("/chat/completions", post(routes::chat_completions))
         .route("/v1/models", get(routes::models))
