@@ -145,7 +145,13 @@ fn check(ep: Option<&CudaExecutionProvider>) {
             close(y[1], -3. * (1. + expected / 2.));
         }
         let y = run("GeGLU", 29, &[1], &[&[-4.], &[2.]], &[]);
-        close(y[0], -0.00025337);
+        // Float32 cancellation in 1 + erf dominates relative tail error.
+        let tolerance = if dtype == DataType::BFloat16 {
+            2e-6
+        } else {
+            3e-7
+        };
+        assert!((y[0] + 0.00025337).abs() < tolerance, "{dtype:?}: {}", y[0]);
         let axis = [("axis", Attribute::Int(-2))];
         // Non-last axis: lanes are interleaved. NaN must override a previous +inf.
         let x = [

@@ -5,6 +5,7 @@
 use crate::context::InferenceContext;
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
+use crate::infer::ANON_SYMBOL_FLOOR;
 use crate::registry::InferenceRegistry;
 use crate::shape_data::ShapeData;
 
@@ -57,7 +58,6 @@ fn standard_math(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
             "A and B must have the same dtype, got {a:?} and {b:?}"
         )));
     }
-    let derived_floor = ctx.interner_mut().initial_floor();
     if let (Some(a), Some(b)) = (ctx.input_shape(0), ctx.input_shape(1)) {
         if a.len() != b.len()
             || a.iter()
@@ -73,8 +73,8 @@ fn standard_math(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
             .zip(b)
             .map(|(x, y)| {
                 if y.as_const().is_some()
-                    || (x.as_symbol().is_some_and(|s| s.0 >= derived_floor)
-                        && y.as_symbol().is_some_and(|s| s.0 < derived_floor))
+                    || (x.as_symbol().is_some_and(|s| s.0 >= ANON_SYMBOL_FLOOR)
+                        && y.as_symbol().is_some_and(|s| s.0 < ANON_SYMBOL_FLOOR))
                 {
                     y.clone()
                 } else {

@@ -100,36 +100,6 @@ impl Kernel for MathKernel {
             return Ok(());
         }
 
-        #[cfg(test)]
-        mod tests {
-            use super::*;
-            use crate::kernels::testutil::Owned;
-
-            #[test]
-            fn scan_preserves_small_prefix_and_handles_interleaved_lanes() {
-                let x = Owned::f32(&[2, 2], &[0., 1000., -30., 1000.]);
-                let mut y = Owned::zeros_f32(&[2, 2]);
-                MathKernel(Math::LogCumSumExp { axis: -2 })
-                    .execute(&[x.view()], &mut [y.view_mut()])
-                    .unwrap();
-                let y = y.to_f32();
-                assert_eq!(&y[..2], &[0., 1000.]);
-                assert!((y[2] - 9.357_623e-14).abs() < 1e-19);
-                assert!((y[3] - 1000.693_2).abs() < 1e-4);
-            }
-
-            #[test]
-            fn gated_activation_rejects_broadcasting_before_writing() {
-                let a = Owned::f32(&[2, 1], &[1., 2.]);
-                let b = Owned::f32(&[1, 2], &[1., 2.]);
-                let mut y = Owned::zeros_f32(&[2, 1]);
-                let err = MathKernel(Math::GeGlu { tanh: false })
-                    .execute(&[a.view(), b.view()], &mut [y.view_mut()])
-                    .unwrap_err();
-                assert!(err.to_string().contains("no broadcasting"), "{err}");
-                assert_eq!(y.to_f32(), &[0., 0.]);
-            }
-        }
         if x.dtype == DataType::Float64 {
             let mut a = to_dense::<f64>(x)?;
             let b = inputs
@@ -157,5 +127,36 @@ impl Kernel for MathKernel {
 
     fn supports_strided_input(&self, _: usize) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+
+    #[test]
+    fn scan_preserves_small_prefix_and_handles_interleaved_lanes() {
+        let x = Owned::f32(&[2, 2], &[0., 1000., -30., 1000.]);
+        let mut y = Owned::zeros_f32(&[2, 2]);
+        MathKernel(Math::LogCumSumExp { axis: -2 })
+            .execute(&[x.view()], &mut [y.view_mut()])
+            .unwrap();
+        let y = y.to_f32();
+        assert_eq!(&y[..2], &[0., 1000.]);
+        assert!((y[2] - 9.357_623e-14).abs() < 1e-19);
+        assert!((y[3] - 1000.693_2).abs() < 1e-4);
+    }
+
+    #[test]
+    fn gated_activation_rejects_broadcasting_before_writing() {
+        let a = Owned::f32(&[2, 1], &[1., 2.]);
+        let b = Owned::f32(&[1, 2], &[1., 2.]);
+        let mut y = Owned::zeros_f32(&[2, 1]);
+        let err = MathKernel(Math::GeGlu { tanh: false })
+            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+            .unwrap_err();
+        assert!(err.to_string().contains("no broadcasting"), "{err}");
+        assert_eq!(y.to_f32(), &[0., 0.]);
     }
 }
