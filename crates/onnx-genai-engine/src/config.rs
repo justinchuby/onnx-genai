@@ -1317,6 +1317,8 @@ impl From<SamplerSequence> for Vec<SamplerStage> {
 pub struct GenerateOptions {
     /// Maximum tokens to produce after the prompt.
     pub max_new_tokens: usize,
+    /// Maximum retained raw and canonical JSON bytes during constrained decoding.
+    pub max_json_bytes: usize,
     /// Temperature at its sampling stage. Zero creates a point mass there.
     pub temperature: f32,
     /// Optional entropy-driven temperature scaling; zero range disables it.
@@ -1406,6 +1408,7 @@ impl Default for GenerateOptions {
     fn default() -> Self {
         Self {
             max_new_tokens: 128,
+            max_json_bytes: 4 * 1024 * 1024,
             temperature: 1.0,
             dynamic_temperature: None,
             sampler_order: None,
@@ -1707,7 +1710,6 @@ pub enum GenerateConstraint {
         template: std::sync::Arc<crate::response_template::ResponseTemplate>,
         /// Actual rendered assistant prefill, including response framing.
         prefix: String,
-        max_bytes: usize,
     },
     /// Constrain output to text matching the provided Rust regular expression.
     Regex(String),
@@ -1725,6 +1727,10 @@ impl GenerateOptions {
         if self.max_new_tokens == 0 {
             anyhow::bail!("max_new_tokens must be greater than zero");
         }
+        anyhow::ensure!(
+            self.max_json_bytes > 0,
+            "max_json_bytes must be greater than zero; configure a positive JSON constraint byte budget"
+        );
         self.adaptive_p.validate()?;
         if !self.temperature.is_finite() || self.temperature < 0.0 {
             anyhow::bail!("temperature must be finite and non-negative");

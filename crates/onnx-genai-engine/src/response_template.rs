@@ -371,8 +371,8 @@ struct Field {
     "response ends with {bytes} incomplete UTF-8 bytes at raw offset {offset}; supply their continuation bytes before finishing the response"
 )]
 pub(crate) struct IncompleteResponseUtf8 {
-    bytes: usize,
-    offset: usize,
+    pub(crate) bytes: usize,
+    pub(crate) offset: usize,
 }
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -386,7 +386,7 @@ pub(crate) struct MissingResponseField {
     "response parser buffer would exceed {limit} bytes, including incomplete UTF-8; shorten the assistant prefix or reduce max_tokens"
 )]
 pub(crate) struct ResponseBufferExceeded {
-    limit: usize,
+    pub(crate) limit: usize,
 }
 
 /// Compiled response channels from a declared tokenizer response template.
