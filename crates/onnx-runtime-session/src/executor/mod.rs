@@ -1111,7 +1111,7 @@ mod build;
 mod capture;
 mod control_flow;
 mod dispatch;
-mod host_strings;
+pub(crate) mod host_strings;
 mod platform;
 mod prefetch;
 mod run;

@@ -255,11 +255,18 @@ fn assign_nodes(graph: &Graph, providers: &[ProviderPlacement]) -> Result<HashMa
         let matches = providers
             .iter()
             .map(|slot| {
-                (
-                    slot,
+                use crate::executor::host_strings::{
+                    MANAGED_STRING_DEVICE_DECLINE, uses_managed_strings,
+                };
+                let capability = if !slot.provider.device_id().is_host_accessible()
+                    && uses_managed_strings(graph, node)
+                {
+                    KernelMatch::unsupported(MANAGED_STRING_DEVICE_DECLINE)
+                } else {
                     slot.provider
-                        .supports_op(node, opset, &shapes, &dtypes, &layouts),
-                )
+                        .supports_op(node, opset, &shapes, &dtypes, &layouts)
+                };
+                (slot, capability)
             })
             .collect::<Vec<_>>();
         let chosen = matches
@@ -819,7 +826,7 @@ fn validate_execution_subset(graph: &Graph) -> Result<()> {
             placement_summary: format!(
                 "the graph contains {} control-flow subgraph body/bodies; the first execution \
                  slice supports only tensor-only acyclic graphs without If/Loop/Scan. Keep \
-                 ONNX_GENAI_HETERO unset until child heterogeneous executors are implemented",
+                 the graph on a single provider until child heterogeneous executors are implemented",
                 graph.subgraphs.len()
             ),
         });
@@ -860,10 +867,14 @@ fn validate_execution_subset(graph: &Graph) -> Result<()> {
         }
     }
     for (value_id, value) in graph.values.iter() {
-        if as_static_shape(&value.shape).is_none() {
+        if value
+            .tensor_shape()
+            .and_then(|shape| as_static_shape(shape))
+            .is_none()
+        {
             return Err(SessionError::HeterogeneousExecutionUnsupported {
                 placement_summary: format!(
-                    "value {} ({}) has symbolic shape {:?}; the first execution slice requires \
+                    "value {} ({}) has unknown rank or symbolic shape {:?}; the first execution slice requires \
                      fully static tensor shapes so all provider kernels and governed boundary \
                      allocations are validated before any node executes",
                     value_id.0,
@@ -878,6 +889,13 @@ fn validate_execution_subset(graph: &Graph) -> Result<()> {
 
 /// Plan a heterogeneous execution of `graph` over `providers` (priority order).
 pub fn plan(graph: &Graph, providers: &[ProviderPlacement]) -> Result<HeterogeneousPlan> {
+    let (graph, legalized) = legalize_for_placement(graph, providers)?;
+    validate_execution_subset(&graph)?;
+    let placement = assign_nodes(&graph, providers)?;
+    plan_assigned(graph, legalized, providers, placement)
+}
+
+fn legalize_for_placement(graph: &Graph, providers: &[ProviderPlacement]) -> Result<(Graph, bool)> {
     if providers.is_empty() {
         return Err(SessionError::Internal(
             "heterogeneous placement requires at least one provider".into(),
@@ -890,12 +908,18 @@ pub fn plan(graph: &Graph, providers: &[ProviderPlacement]) -> Result<Heterogene
     } else {
         false
     };
-    let graph = &planned_graph;
-    validate_execution_subset(graph)?;
+    Ok((planned_graph, legalized))
+}
 
+fn plan_assigned(
+    planned_graph: Graph,
+    legalized: bool,
+    providers: &[ProviderPlacement],
+    node_placement: HashMap<NodeId, EpId>,
+) -> Result<HeterogeneousPlan> {
+    let graph = &planned_graph;
     let cache = GraphViewCache::build(graph)
         .map_err(|e| SessionError::Internal(format!("graph view: {e}")))?;
-    let node_placement = assign_nodes(graph, providers)?;
 
     let mut partitions = Vec::new();
     for slot in providers {
@@ -925,6 +949,22 @@ pub fn plan(graph: &Graph, providers: &[ProviderPlacement]) -> Result<Heterogene
         }
     }
     let transfers = plan_transfers(&partitions, &value_to_partition);
+    for transfer in &transfers {
+        let value = graph.value(transfer.value);
+        if value.tensor_dtype() == Some(DataType::String) {
+            return Err(SessionError::HeterogeneousExecutionUnsupported {
+                placement_summary: format!(
+                    "tensor(string) '{}' (value#{}) crosses EpId({}) -> EpId({}); managed strings \
+                     must stay on one host provider because cross-provider transfers require raw \
+                     tensor storage",
+                    value.name.as_deref().unwrap_or("<unnamed>"),
+                    transfer.value.0,
+                    transfer.from_ep.0,
+                    transfer.to_ep.0,
+                ),
+            });
+        }
+    }
 
     Ok(HeterogeneousPlan {
         partitions,
@@ -949,8 +989,9 @@ pub enum PlacementDecision {
 
 /// Classify `graph` against `providers` (priority order, front = highest).
 ///
-/// Runs the Phase-1 [`plan`] and collapses its result: a graph is homogeneous
-/// iff every node landed on the same provider. (A single provider on a non-host
+/// Classifies node ownership before validating the mixed execution subset: a graph is homogeneous
+/// iff every node landed on the same provider and outputs don't require separate
+/// managed host storage. (A single provider on a non-host
 /// device still needs its inputs staged H2D, so transfer count is not the
 /// signal — a lone provider's input staging is ordinary single-EP behavior, not
 /// a cross-EP split.) Homogeneous graphs return
@@ -960,9 +1001,17 @@ pub fn classify_placement(
     graph: &Graph,
     providers: &[ProviderPlacement],
 ) -> Result<PlacementDecision> {
-    let plan = plan(graph, providers)?;
-    let distinct: HashSet<EpId> = plan.node_placement.values().copied().collect();
-    if distinct.len() <= 1 {
+    let (graph, legalized) = legalize_for_placement(graph, providers)?;
+    let placement = assign_nodes(&graph, providers)?;
+    let distinct: HashSet<EpId> = placement.values().copied().collect();
+    let keeps_host_outputs =
+        distinct.iter().any(|&ep| {
+            provider_by_id(providers, ep)
+                .is_some_and(|slot| !slot.provider.device_id().is_host_accessible())
+        }) && crate::executor::host_strings::producerless_string_outputs(&graph)
+            .next()
+            .is_some();
+    if distinct.len() <= 1 && !keeps_host_outputs {
         // Prefer the actually-assigned EP; an empty graph falls back to the
         // highest-priority provider so the caller always gets a concrete id.
         let ep = distinct
@@ -971,7 +1020,10 @@ pub fn classify_placement(
             .unwrap_or_else(|| providers[0].ep);
         Ok(PlacementDecision::SingleProvider(ep))
     } else {
-        Ok(PlacementDecision::Heterogeneous(Box::new(plan)))
+        validate_execution_subset(&graph)?;
+        Ok(PlacementDecision::Heterogeneous(Box::new(plan_assigned(
+            graph, legalized, providers, placement,
+        )?)))
     }
 }
 
@@ -993,12 +1045,22 @@ pub fn placement_summary(
             .find(|slot| slot.ep == ep)
             .map(|slot| {
                 let device = slot.provider.device_id();
-                format!(
+                let mut report = format!(
                     "{} ({}:{})",
                     slot.provider.name(),
                     device.device_type.trace_name(),
                     device.index
-                )
+                );
+                let host_outputs =
+                    crate::executor::host_strings::producerless_string_outputs(graph).count();
+                if host_outputs != 0 {
+                    use std::fmt::Write as _;
+                    let _ = write!(
+                        report,
+                        "; {host_outputs} producerless string output(s) kept on host"
+                    );
+                }
+                report
             })
             .unwrap_or_else(|| format!("ep#{}", ep.0))
     };
@@ -1224,7 +1286,7 @@ struct PartitionExecutor {
     executor: Executor,
 }
 
-/// Persistent executor for the opt-in, static tensor-only heterogeneous slice.
+/// Persistent executor for the static tensor-only heterogeneous slice.
 ///
 /// Every partition is an ordinary [`Executor`] on its assigned EP. Boundary
 /// storage is allocated through that EP, transferred exactly once per planned
@@ -1325,7 +1387,7 @@ impl HeterogeneousExecutor {
                 return Err(SessionError::HeterogeneousExecutionUnsupported {
                     placement_summary: format!(
                         "node {} ({domain}::{}@{opset}) assigned to provider '{}' has \
-                         kernel-sized outputs ({:?}); the opt-in heterogeneous executor's \
+                         kernel-sized outputs ({:?}); the heterogeneous executor's \
                          current static tensor-DAG slice preallocates declared output shapes and \
                          therefore cannot execute a kernel whose runtime cardinality may differ. \
                          Keep this graph on one provider until heterogeneous dynamic-output \
@@ -1363,10 +1425,12 @@ impl HeterogeneousExecutor {
                 ))
             })?;
             let extraction = extract_subgraph(&graph, partition);
-            let executor = Executor::build(
+            let executor = Executor::build_with_mode(
                 extraction.graph,
                 Arc::clone(weights),
                 Arc::clone(provider),
+                provider.device_type() == DeviceType::Cuda,
+                false,
                 providers
                     .iter()
                     .find(|entry| entry.provider.device_type() == DeviceType::Cpu)
@@ -1550,6 +1614,9 @@ impl HeterogeneousExecutor {
                 weight.dims(),
             )));
         }
+        if metadata.dtype == DataType::String {
+            return crate::executor::host_strings::decode_string_initializer(value, weight);
+        }
         let bytes = self.weights.bytes(weight).ok_or_else(|| {
             SessionError::Internal(format!(
                 "initializer graph output value {} ('{}') could not resolve its canonical weight \
@@ -1603,6 +1670,7 @@ impl HeterogeneousExecutor {
         }
 
         let mut residents: HashMap<(ValueId, EpId), ResidentValue> = HashMap::new();
+        let mut host_strings: HashMap<ValueId, Tensor> = HashMap::new();
         self.last_transfer_count = 0;
         self.last_release_counts.clear();
         for partition_index in 0..self.partitions.len() {
@@ -1612,6 +1680,7 @@ impl HeterogeneousExecutor {
 
             for &(value, _) in &input_feeds {
                 if self.graph.value(value).producer.is_some()
+                    && self.graph.value(value).dtype != DataType::String
                     && self.materialize_on(value, ep, &mut residents)?
                 {
                     self.last_transfer_count += 1;
@@ -1633,12 +1702,23 @@ impl HeterogeneousExecutor {
                             )));
                         }
                     }
+                } else if self.graph.value(*value).dtype == DataType::String {
+                    let tensor = host_strings.get(value).ok_or_else(|| {
+                        SessionError::Internal(format!(
+                            "managed string partition input '{name}' (value#{}) was not produced",
+                            value.0,
+                        ))
+                    })?;
+                    normal_inputs.push((name.as_str(), tensor));
                 }
             }
 
             let mut output_residents = Vec::with_capacity(output_values.len());
             for &value in &output_values {
                 let metadata = self.graph.value(value);
+                if metadata.dtype == DataType::String {
+                    continue;
+                }
                 let shape = as_static_shape(&metadata.shape).expect("validated static shape");
                 let owner = Arc::clone(self.providers.get(&ep).ok_or_else(|| {
                     SessionError::Internal(format!("missing partition EpId({})", ep.0))
@@ -1653,7 +1733,9 @@ impl HeterogeneousExecutor {
             let mut bindings: Vec<DeviceIoBinding> =
                 Vec::with_capacity(input_feeds.len() + output_residents.len());
             for (value, name) in &input_feeds {
-                if self.graph.value(*value).producer.is_none() {
+                if self.graph.value(*value).producer.is_none()
+                    || self.graph.value(*value).dtype == DataType::String
+                {
                     continue;
                 }
                 let resident = residents.get(&(*value, ep)).ok_or_else(|| {
@@ -1691,12 +1773,26 @@ impl HeterogeneousExecutor {
             }
 
             let returned = child.run_with_device_bindings(&normal_inputs, &mut bindings)?;
-            if returned.iter().any(Option::is_some) {
+            drop(bindings);
+            if returned.len() != output_values.len() {
                 return Err(SessionError::Internal(
-                    "heterogeneous partition returned an unbound tensor output".into(),
+                    "heterogeneous partition returned the wrong number of outputs".into(),
                 ));
             }
-            drop(bindings);
+            for (value, output) in output_values.into_iter().zip(returned) {
+                match (self.graph.value(value).dtype, output) {
+                    (DataType::String, Some(tensor)) if tensor.dtype == DataType::String => {
+                        host_strings.insert(value, tensor);
+                    }
+                    (dtype, None) if dtype != DataType::String => {}
+                    _ => {
+                        return Err(SessionError::Internal(format!(
+                            "heterogeneous partition output value#{} did not match its planned storage",
+                            value.0,
+                        )));
+                    }
+                }
+            }
             for (value, resident) in output_residents {
                 residents.insert((value, ep), resident);
             }
@@ -1708,7 +1804,9 @@ impl HeterogeneousExecutor {
                 };
                 *remaining -= 1;
                 if *remaining == 0 && !graph_outputs.contains(&value) {
-                    self.release_value(value, &mut residents)?;
+                    if host_strings.remove(&value).is_none() {
+                        self.release_value(value, &mut residents)?;
+                    }
                 }
             }
         }
@@ -1725,12 +1823,43 @@ impl HeterogeneousExecutor {
         for &value in &self.graph.outputs {
             if self.graph.value(value).producer.is_none() {
                 let output = match self.producerless_source(value, &input_by_value)? {
-                    ProducerlessSource::ExternalInput(tensor) => tensor.clone(),
+                    ProducerlessSource::ExternalInput(tensor) => {
+                        let metadata = self.graph.value(value);
+                        if metadata.dtype == DataType::String
+                            && (tensor.dtype != DataType::String
+                                || as_static_shape(&metadata.shape).as_deref()
+                                    != Some(tensor.shape.as_slice()))
+                        {
+                            return Err(SessionError::Internal(format!(
+                                "input '{}' is returned as a managed string output and requires \
+                                 tensor(string) with shape {:?}; got {:?} {:?}. Supply a matching host tensor",
+                                metadata.name.as_deref().unwrap_or("<unnamed>"),
+                                metadata.shape,
+                                tensor.dtype,
+                                tensor.shape,
+                            )));
+                        }
+                        tensor.clone()
+                    }
                     ProducerlessSource::Initializer(weight) => {
                         self.initializer_output(value, weight)?
                     }
                 };
                 outputs.push(output);
+                continue;
+            }
+            if self.graph.value(value).dtype == DataType::String {
+                outputs.push(
+                    host_strings
+                        .get(&value)
+                        .ok_or_else(|| {
+                            SessionError::Internal(format!(
+                                "managed string graph output value#{} was never produced",
+                                value.0,
+                            ))
+                        })?
+                        .clone(),
+                );
                 continue;
             }
             let producer = self.graph.value(value).producer.expect("checked above");
