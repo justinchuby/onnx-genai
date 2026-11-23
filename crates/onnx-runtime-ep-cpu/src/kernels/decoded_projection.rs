@@ -3,12 +3,12 @@
 use onnx_runtime_ep_api::{EpError, Result};
 use rayon::prelude::*;
 
-/// Decode each weight row once per projection and reuse it across all routed
-/// tokens. The factory makes decoder scratch once per worker shard. Shards do
-/// no nested Rayon work, so suspended tasks cannot retain additional rows.
-/// The projection callback must be serial and overwrite its complete column.
+/// Decode a bounded tile of weight rows once and reuse it across routed tokens.
+/// FEATURE_TILE is a compute tile, not a model dimension. Each worker owns at
+/// most FEATURE_TILE decoded rows and one decoder state, reused across tiles.
+/// The serial projection callback overwrites a complete column-major tile.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn linear_decoded_grouped<D>(
+pub(super) fn linear_decoded_grouped<const FEATURE_TILE: usize, D>(
     context: &str,
     input: &[f32],
     rows: usize,
@@ -16,12 +16,18 @@ pub(super) fn linear_decoded_grouped<D>(
     out_features: usize,
     bias: Option<&[f32]>,
     make_decoder: impl Fn() -> D + Sync,
-    project: impl Fn(&[f32], &[f32], &mut [f32], usize, usize) -> Result<()> + Sync,
+    project: impl Fn(&[f32], &[f32], &mut [f32], usize, usize, usize) -> Result<()> + Sync,
     dispatch: impl FnOnce(&mut [f32], usize, &DecodedShard<'_>) -> Result<()>,
 ) -> Result<Vec<f32>>
 where
     D: FnMut(usize, &mut [f32]) -> Result<()>,
 {
+    const {
+        assert!(
+            FEATURE_TILE > 0,
+            "decoded projection tile must contain an output"
+        );
+    }
     let invalid = |reason: &str| {
         EpError::KernelFailed(format!(
             "{context} row-decoded projection [{rows},{in_features}] -> [{rows},{out_features}]: {reason}; supply addressable dimensions and matching input/bias storage"
@@ -42,15 +48,42 @@ where
     }
     let mut column_major = zeroed_f32(context, "column-major output", elements)?;
     let compute = |column_start: usize, columns: &mut [f32]| -> Result<()> {
-        let mut weight_row = zeroed_f32(context, "decoded weight row", in_features)?;
+        if !columns.len().is_multiple_of(rows) {
+            return Err(invalid(
+                "decoder shard must contain complete output columns",
+            ));
+        }
+        let tile_features = FEATURE_TILE.min(columns.len() / rows);
+        if tile_features == 0 {
+            return Ok(());
+        }
+        let decoded_elements = tile_features
+            .checked_mul(in_features)
+            .ok_or_else(|| invalid("decoded weight tile element count overflow"))?;
+        let mut weight_rows = zeroed_f32(context, "decoded weight tile", decoded_elements)?;
         let mut decode = make_decoder();
-        for (column, output) in columns.chunks_exact_mut(rows).enumerate() {
-            let feature = column_start + column;
-            decode(feature, &mut weight_row)?;
-            project(input, &weight_row, output, rows, in_features)?;
+        for (tile, outputs) in columns.chunks_mut(rows * tile_features).enumerate() {
+            let count = outputs.len() / rows;
+            let first_feature = column_start + tile * tile_features;
+            for column in 0..count {
+                decode(
+                    first_feature + column,
+                    &mut weight_rows[column * in_features..(column + 1) * in_features],
+                )?;
+            }
+            project(
+                input,
+                &weight_rows[..count * in_features],
+                outputs,
+                rows,
+                in_features,
+                count,
+            )?;
             if let Some(bias) = bias {
-                for value in output {
-                    *value += bias[feature];
+                for (column, output) in outputs.chunks_exact_mut(rows).enumerate() {
+                    for value in output {
+                        *value += bias[first_feature + column];
+                    }
                 }
             }
         }

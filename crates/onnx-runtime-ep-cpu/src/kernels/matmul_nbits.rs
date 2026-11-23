@@ -4279,7 +4279,7 @@ impl MatMulNBitsKernel {
         result: &mut [f32],
     ) -> Result<()> {
         let rows = NBitsDenseRows::new(self, packed, scales, zero_points, group_indices)?;
-        let output = super::decoded_projection::linear_decoded_grouped(
+        let output = super::decoded_projection::linear_decoded_grouped::<1, _>(
             "MatMulNBits",
             activations,
             m,
@@ -4292,7 +4292,7 @@ impl MatMulNBitsKernel {
                     Ok(())
                 }
             },
-            |input, row, output, rows, k| {
+            |input, row, output, rows, k, _features| {
                 if rows == 1 {
                     output[0] = dot_f32(input, row);
                     Ok(())

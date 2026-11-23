@@ -545,15 +545,17 @@ block-MoE groups share the CPU GEMM backend, including single-row groups.
 `BlockQuantizedMoE` admits a complete expert's FC1/FC2/optional-FC3 f32 set only
 when it fits `ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES` (default 256 MiB). Constant
 projections use the existing kernel-local dense LRU. If the complete set does
-not fit, the kernel decodes one weight row per worker shard and reuses it for
-all tokens in the group. Budget zero selects this streamed path without
+not fit, the kernel reuses a bounded decoded tile for all tokens in the group:
+up to four rows per shard for portable native compute, one for AVX2/MLAS. Budget zero selects this streamed path without
 hashing identities or creating full f32 expansions. Dispatch tracing records
 `block_moe.dense_resident_set` or `block_moe.streamed_rows` and their byte-budget
 reason. Both paths use f32 compute, not quantized-domain dot products.
 
-The cache ceiling applies independently to every compiled MoE kernel instance;
-it is not a model-wide cap. Resident f32 payload accounting excludes metadata
-and in-flight post-eviction `Arc` leases. Streamed decoded-weight scratch is
+The cache retention ceiling is local to compiled cache state, not a model-wide
+memory cap. A governed Host authority continues charging live payload owners,
+including evicted payloads still borrowed by active calls. Metadata, compressed
+sources and call-owned scratch are separate from this retention ceiling.
+Streamed decoded-weight scratch is
 bounded per projection/call, while grouped activations, outputs and compressed
 strided copies still consume memory. Contiguous compressed weights are borrowed;
 strided inputs copy only selected expert slices. No full all-expert dense buffer
