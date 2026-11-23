@@ -124,3 +124,11 @@ Integrated checks: CPU 2,018 passed / 20 ignored; session library 296 passed;
 projection layout 10 passed; MLAS MoE 21 passed / 1 ignored; strict native
 CPU/session and MLAS CPU all-target Clippy passed. The named cross-pool resource
 test also executes and passes with `ONNX_GENAI_CPU_DECODE_THREADS=1`.
+
+A Windows CLI ORT failure in the earlier QMoE PR also exposed an independent
+linked-model cache bug. This PR includes the same prerequisite correction:
+physical file identity plus modification time replaces a timestamp-only
+non-Unix cache key. One open handle supplies both facts; no weight bytes are
+read/copied. The regression forces equal-size/equal-timestamp replacement.
+The correction runs during model materialization, outside warm inference, and
+does not change the measured MoE/projection production sources or timings.
