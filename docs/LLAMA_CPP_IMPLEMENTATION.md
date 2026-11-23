@@ -788,3 +788,22 @@ files, checking `/props`, exact rendered prompts, tokenizer counts, actual plain
 tool generation and tool-call SSE (with true usage and no raw-tag content leak).
 Strict ORT/server/CLI all-target Clippy passed on the final source. No performance
 claim is made. Remaining delivery rows and PR merge remain open.
+
+Grammar-state prerequisite: constraint masks now return errors with their original
+cause and history position instead of converting backend failures into all-false
+masks. The processor checks exact mask dimensions before touching logits.
+llguidance tracks committed token IDs, replays replacement/rewound histories from
+the original prefilled parser snapshot, reuses valid masks (including terminal
+states), and resets after failed replay. Unsupported history splicing is rejected
+explicitly rather than silently losing forced tokens.
+
+Validation: full native engine 850 passed / 1 inherited ignore and full server
+413 passed / 2 inherited ignores. Subsequent terminal-query and UTF-8 refinements
+passed all 3 selected llguidance cases and both selected Lark suffix cases; these
+prove first-boundary behavior across a single token, split delimiters and raw
+split UTF-8 bytes after prefill. Processor error-cause and malformed-mask cases
+also passed. Strict native-engine/server all-target and benchmark Clippy passed.
+Criterion functional smoke selected and passed both the five-processor chain and
+the cached grammar mask using valid grammar history; no performance claim is made.
+Reasoning plus JSON is still refused: shared classifier/grammar lowering and
+special framing-token semantics remain necessary before enabling that feature.

@@ -252,17 +252,20 @@ fn logit_processing(c: &mut Criterion) {
     let chain = logit_processor_chain();
     let mut group = c.benchmark_group("logit_processing");
     group.throughput(Throughput::Elements(1));
-    group.bench_function("seven_processor_chain_per_step", |b| {
-        b.iter_batched(
-            || logits.clone(),
-            |mut work| {
-                chain
-                    .process(black_box(&mut work), black_box(&context))
-                    .expect("benchmark logits must process")
-            },
-            BatchSize::SmallInput,
-        )
-    });
+    group.bench_function(
+        format!("{}_processor_chain_per_step", chain.names().len()),
+        |b| {
+            b.iter_batched(
+                || logits.clone(),
+                |mut work| {
+                    chain
+                        .process(black_box(&mut work), black_box(&context))
+                        .expect("benchmark logits must process")
+                },
+                BatchSize::SmallInput,
+            )
+        },
+    );
     group.finish();
 }
 
@@ -285,14 +288,27 @@ fn grammar_masking(c: &mut Criterion) {
             is_eos: token_id == 3,
         })
         .collect::<Vec<_>>();
-    let context = processor_context();
+    // This case measures a cached query at a valid grammar position. Sampler
+    // history fixtures are arbitrary token ids and are not a grammar prefix.
+    let context = onnx_genai_engine::ProcessorContext::default();
+    let initial = constraint
+        .allowed_next_tokens(&context, &candidates)
+        .expect("valid grammar benchmark context");
+    assert!(
+        initial.iter().any(|allowed| *allowed),
+        "grammar benchmark must have a selectable token"
+    );
     let mut group = c.benchmark_group("grammar_masking");
     group.throughput(Throughput::Elements(1));
     group.bench_with_input(
-        BenchmarkId::new("llguidance_compute_mask", candidates.len()),
+        BenchmarkId::new("llguidance_cached_mask", candidates.len()),
         &candidates,
         |b, candidates| {
-            b.iter(|| constraint.allowed_next_tokens(black_box(&context), black_box(candidates)))
+            b.iter(|| {
+                constraint
+                    .allowed_next_tokens(black_box(&context), black_box(candidates))
+                    .expect("valid grammar benchmark context")
+            })
         },
     );
     group.finish();

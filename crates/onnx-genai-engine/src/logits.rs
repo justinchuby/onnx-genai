@@ -71,11 +71,13 @@ pub struct TokenCandidate {
 /// character level. Decoding every vocabulary token is intentionally simple and
 /// correct, but can be slow for large vocabularies.
 pub trait Constraint: Send + Sync {
+    /// Return exactly one decision per candidate. A grammar rejection is false;
+    /// parser/history failures are errors, never a fabricated all-false mask.
     fn allowed_next_tokens(
         &self,
         context: &ProcessorContext,
         candidates: &[TokenCandidate],
-    ) -> Vec<bool>;
+    ) -> anyhow::Result<Vec<bool>>;
 
     fn name(&self) -> &str;
 }
@@ -488,7 +490,23 @@ impl LogitProcessor for ConstraintProcessor {
                 }
             })
             .collect();
-        let mask = self.constraint.allowed_next_tokens(context, &candidates);
+        let mask = self
+            .constraint
+            .allowed_next_tokens(context, &candidates)
+            .with_context(|| {
+                format!(
+                    "{} could not compute a token mask at generated offset {}",
+                    self.constraint.name(),
+                    context.generated_tokens.len()
+                )
+            })?;
+        anyhow::ensure!(
+            mask.len() == logits.len(),
+            "{} returned {} mask entries for {} candidate logits; repair the constraint implementation so every candidate has one decision",
+            self.constraint.name(),
+            mask.len(),
+            logits.len()
+        );
         for (idx, logit) in logits.iter_mut().enumerate() {
             if !mask.get(idx).copied().unwrap_or(false) {
                 *logit = f32::NEG_INFINITY;
@@ -542,14 +560,14 @@ impl Constraint for JsonConstraint {
         &self,
         context: &ProcessorContext,
         candidates: &[TokenCandidate],
-    ) -> Vec<bool> {
+    ) -> anyhow::Result<Vec<bool>> {
         let generated = if self.prefix.is_empty() {
             std::borrow::Cow::Borrowed(context.generated_text.as_str())
         } else {
             std::borrow::Cow::Owned(format!("{}{}", self.prefix, context.generated_text))
         };
         let complete = Self::is_complete(&generated);
-        candidates
+        Ok(candidates
             .iter()
             .map(|candidate| {
                 if candidate.is_eos {
@@ -564,7 +582,7 @@ impl Constraint for JsonConstraint {
                 next.push_str(&candidate.text);
                 Self::prefix_is_valid(&next)
             })
-            .collect()
+            .collect())
     }
 
     fn name(&self) -> &str {
@@ -595,7 +613,8 @@ pub struct LlguidanceConstraint {
 
 struct LlguidanceState {
     constraint: LlgConstraint,
-    committed_len: usize,
+    initial: LlgConstraint,
+    committed_tokens: Vec<TokenId>,
 }
 
 impl LlguidanceConstraint {
@@ -756,8 +775,9 @@ impl LlguidanceConstraint {
             kind,
             sampled_vocab_size,
             inner: Mutex::new(LlguidanceState {
+                initial: constraint.deep_clone(),
                 constraint,
-                committed_len: 0,
+                committed_tokens: Vec::new(),
             }),
         })
     }
@@ -782,48 +802,86 @@ impl Constraint for LlguidanceConstraint {
         &self,
         context: &ProcessorContext,
         candidates: &[TokenCandidate],
-    ) -> Vec<bool> {
-        let mut inner = match self.inner.lock() {
-            Ok(inner) => inner,
-            Err(_) => return vec![false; candidates.len()],
-        };
-
-        if context.generated_tokens.len() < inner.committed_len {
-            return vec![false; candidates.len()];
+    ) -> anyhow::Result<Vec<bool>> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            anyhow::anyhow!(
+                "{} parser lock is poisoned; restart this generation with a fresh grammar state",
+                self.name()
+            )
+        })?;
+        if !context
+            .generated_tokens
+            .starts_with(&inner.committed_tokens)
+        {
+            inner.reset();
         }
-
-        for token in &context.generated_tokens[inner.committed_len..] {
-            if inner.constraint.commit_token(Some(*token)).is_err() {
-                return vec![false; candidates.len()];
+        let result = (|| -> anyhow::Result<Vec<bool>> {
+            for &token in &context.generated_tokens[inner.committed_tokens.len()..] {
+                anyhow::ensure!(
+                    (token as usize) < self.sampled_vocab_size,
+                    "grammar history token {token} is outside the sampled vocabulary of {} entries; repair generated history or its tokenizer",
+                    self.sampled_vocab_size
+                );
+                let offset = inner.committed_tokens.len();
+                let step = inner.current_step().with_context(|| {
+                    format!(
+                        "prepare {} before committing history token {token} at offset {offset}",
+                        self.name()
+                    )
+                })?;
+                anyhow::ensure!(
+                    !step.is_stop() || inner.constraint.tok_trie().eos_tokens().contains(&token),
+                    "{} history token {token} at offset {offset} continues after the grammar completed; truncate the stale suffix or start a new generation",
+                    self.name()
+                );
+                let commit = inner
+                    .constraint
+                    .commit_token(Some(token))
+                    .with_context(|| {
+                        format!(
+                            "commit history token {token} at offset {} into {}",
+                            inner.committed_tokens.len(),
+                            self.name()
+                        )
+                    })?;
+                anyhow::ensure!(
+                    commit.backtrack == 0
+                        && (commit.ff_tokens.is_empty() || commit.ff_tokens == [token]),
+                    "{} requested unsupported history splicing at token {token}: backtrack={}, forced_tokens={:?}; use a grammar without hidden stop captures or token splices",
+                    self.name(),
+                    commit.backtrack,
+                    commit.ff_tokens
+                );
+                inner.committed_tokens.push(token);
             }
-            inner.committed_len += 1;
-        }
-
-        let step = match inner.constraint.compute_mask() {
-            Ok(step) => step.clone(),
-            Err(_) => return vec![false; candidates.len()],
-        };
-
-        if step.is_stop() {
-            return candidates
+            let step = inner.current_step().with_context(|| {
+                format!(
+                    "compute {} after {} generated tokens",
+                    self.name(),
+                    context.generated_tokens.len()
+                )
+            })?;
+            if step.is_stop() {
+                return Ok(candidates
+                    .iter()
+                    .map(|candidate| {
+                        (candidate.token_id as usize) < self.sampled_vocab_size && candidate.is_eos
+                    })
+                    .collect());
+            }
+            let mask=step.sample_mask.as_ref().with_context(||format!("{} returned neither a stop nor a sampling mask; use a grammar compatible with ordinary token sampling",self.name()))?;
+            Ok(candidates
                 .iter()
                 .map(|candidate| {
-                    (candidate.token_id as usize) < self.sampled_vocab_size && candidate.is_eos
+                    let idx = candidate.token_id as usize;
+                    idx < self.sampled_vocab_size && idx < mask.len() && mask.get(idx)
                 })
-                .collect();
+                .collect())
+        })();
+        if result.is_err() {
+            inner.reset();
         }
-
-        let Some(mask) = step.sample_mask.as_ref() else {
-            return vec![false; candidates.len()];
-        };
-
-        candidates
-            .iter()
-            .map(|candidate| {
-                let idx = candidate.token_id as usize;
-                idx < self.sampled_vocab_size && idx < mask.len() && mask.get(idx)
-            })
-            .collect()
+        result
     }
 
     fn name(&self) -> &str {
@@ -832,6 +890,21 @@ impl Constraint for LlguidanceConstraint {
             GrammarConstraintKind::Regex => "regex_constraint",
             GrammarConstraintKind::Lark => "lark_constraint",
         }
+    }
+}
+
+impl LlguidanceState {
+    fn current_step(&mut self) -> anyhow::Result<llguidance::toktrie::StepResult> {
+        let previous = self.constraint.step_result();
+        if previous.is_stop() || previous.sample_mask.is_some() {
+            return Ok(previous.clone());
+        }
+        Ok(self.constraint.compute_mask()?.clone())
+    }
+
+    fn reset(&mut self) {
+        self.constraint = self.initial.deep_clone();
+        self.committed_tokens.clear();
     }
 }
 
@@ -4714,7 +4787,9 @@ mod tests {
                     is_eos: id == 5,
                 })
                 .collect::<Vec<_>>();
-            let mask = constraint.allowed_next_tokens(&ProcessorContext::default(), &candidates);
+            let mask = constraint
+                .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+                .unwrap();
             assert_eq!(mask.len(), bytes.len());
             assert!(
                 !mask[1],
@@ -4767,7 +4842,9 @@ mod tests {
                 is_eos: false,
             },
         ];
-        let mask = constraint.allowed_next_tokens(&ProcessorContext::default(), &candidates);
+        let mask = constraint
+            .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+            .unwrap();
         assert_eq!(mask.len(), 2);
         assert!(
             mask[0],
@@ -4793,7 +4870,9 @@ mod tests {
                 is_eos: id == 1 || id == 2,
             })
             .collect::<Vec<_>>();
-        let mask = constraint.allowed_next_tokens(&ProcessorContext::default(), &candidates);
+        let mask = constraint
+            .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+            .unwrap();
         assert!(
             !mask[3],
             "grammar-only prefix must stay masked even with a padded model-logit candidate: {mask:?}"
@@ -4821,6 +4900,341 @@ mod tests {
                 .contains("repair oversized tokenizer pieces"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn llguidance_history_replay_matches_fresh_parsers_after_rewinds_and_replacements() {
+        fn parser() -> LlguidanceConstraint {
+            LlguidanceConstraint::from_token_texts(
+                GrammarConstraintKind::Regex,
+                "a(b|c)",
+                &[
+                    Some("a".into()),
+                    Some("b".into()),
+                    Some("c".into()),
+                    Some("<eos>".into()),
+                ],
+                Some(3),
+            )
+            .unwrap()
+        }
+        let candidates = (0..4)
+            .map(|token_id| TokenCandidate {
+                token_id,
+                text: String::new(),
+                is_eos: token_id == 3,
+            })
+            .collect::<Vec<_>>();
+        let shared = parser();
+        for tokens in [
+            vec![],
+            vec![0],
+            vec![0, 1],
+            vec![0, 1],
+            vec![0, 1, 3],
+            vec![0, 1, 3],
+            vec![0, 2],
+            vec![0],
+            vec![],
+            vec![0, 1],
+        ] {
+            let context = ProcessorContext {
+                generated_tokens: tokens.clone(),
+                ..Default::default()
+            };
+            let expected = parser().allowed_next_tokens(&context, &candidates).unwrap();
+            assert_eq!(
+                shared.allowed_next_tokens(&context, &candidates).unwrap(),
+                expected,
+                "history={tokens:?}"
+            );
+        }
+        let error = shared
+            .allowed_next_tokens(
+                &ProcessorContext {
+                    generated_tokens: vec![0, 0],
+                    ..Default::default()
+                },
+                &candidates,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("commit history token 0 at offset 1"),
+            "{error:#}"
+        );
+        assert!(error.chain().count() > 1);
+        let error = shared
+            .allowed_next_tokens(
+                &ProcessorContext {
+                    generated_tokens: vec![0, 1, 3, 0],
+                    ..Default::default()
+                },
+                &candidates,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("continues after the grammar completed"),
+            "{error:#}"
+        );
+        let retry = ProcessorContext {
+            generated_tokens: vec![0, 2],
+            ..Default::default()
+        };
+        assert_eq!(
+            shared.allowed_next_tokens(&retry, &candidates).unwrap(),
+            parser().allowed_next_tokens(&retry, &candidates).unwrap()
+        );
+    }
+
+    #[test]
+    fn prefilled_llguidance_replay_preserves_the_original_grammar_prefix() {
+        let constraint = LlguidanceConstraint::from_token_bytes_with_prefix(
+            GrammarConstraintKind::Regex,
+            "a(b|c)",
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"<eos>".to_vec(),
+            ],
+            &[3],
+            "a",
+        )
+        .unwrap();
+        let candidates = (0..4)
+            .map(|token_id| TokenCandidate {
+                token_id,
+                text: String::new(),
+                is_eos: token_id == 3,
+            })
+            .collect::<Vec<_>>();
+        for tokens in [vec![], vec![1], vec![], vec![2]] {
+            let mask = constraint
+                .allowed_next_tokens(
+                    &ProcessorContext {
+                        generated_tokens: tokens.clone(),
+                        ..Default::default()
+                    },
+                    &candidates,
+                )
+                .unwrap();
+            assert!(!mask[0]);
+            assert_eq!(mask[3], !tokens.is_empty());
+            if tokens.is_empty() {
+                assert!(mask[1] && mask[2]);
+            }
+        }
+    }
+
+    #[test]
+    fn llguidance_poisoned_state_reports_an_actionable_error() {
+        let constraint = LlguidanceConstraint::from_token_texts(
+            GrammarConstraintKind::Regex,
+            "a",
+            &[Some("a".into())],
+            None,
+        )
+        .unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = constraint.inner.lock().unwrap();
+            panic!("inject grammar state poisoning");
+        }));
+        assert!(panic.is_err());
+        let error = constraint
+            .allowed_next_tokens(&ProcessorContext::default(), &[])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("parser lock is poisoned")
+                && error.to_string().contains("fresh grammar state")
+        );
+    }
+
+    #[test]
+    fn lark_suffix_stops_at_first_boundary_even_inside_a_single_token() {
+        let grammar = r#"start: reasoning payload
+reasoning[suffix="[/r]"]: /(?s:.*)/
+payload: %json {"type":"object","properties":{"n":{"const":1}},"required":["n"],"additionalProperties":false}
+"#;
+        let pieces = [
+            "thought",
+            "[/r]{\"n\":1}",
+            "[/r]bad",
+            "text[/r]{\"n\":1}",
+            "text[/r]bad[/r]{\"n\":1}",
+            "<eos>",
+            "text[/",
+            "r]{\"n\":1}",
+            "r]bad[/r]{\"n\":1}",
+        ];
+        let constraint = LlguidanceConstraint::from_token_texts(
+            GrammarConstraintKind::Lark,
+            grammar,
+            &pieces
+                .iter()
+                .map(|piece| Some((*piece).into()))
+                .collect::<Vec<_>>(),
+            Some(5),
+        )
+        .unwrap();
+        let candidates = pieces
+            .iter()
+            .enumerate()
+            .map(|(id, text)| TokenCandidate {
+                token_id: id as u32,
+                text: (*text).into(),
+                is_eos: id == 5,
+            })
+            .collect::<Vec<_>>();
+        let mask = constraint
+            .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+            .unwrap();
+        assert!(mask[0] && mask[1] && mask[3], "{mask:?}");
+        assert!(!mask[2] && !mask[4] && !mask[5], "{mask:?}");
+        let mask = constraint
+            .allowed_next_tokens(
+                &ProcessorContext {
+                    generated_tokens: vec![6],
+                    ..Default::default()
+                },
+                &candidates,
+            )
+            .unwrap();
+        assert!(mask[7] && !mask[8], "{mask:?}");
+        let mask = constraint
+            .allowed_next_tokens(
+                &ProcessorContext {
+                    generated_tokens: vec![6, 7],
+                    ..Default::default()
+                },
+                &candidates,
+            )
+            .unwrap();
+        assert!(mask[5], "{mask:?}");
+    }
+
+    #[test]
+    fn lark_suffix_accepts_split_utf8_boundary_bytes_after_reasoning_prefill() {
+        let grammar = r#"start: reasoning payload
+reasoning[suffix="終"]: /(?s:.*)/
+payload: %json {"type":"object","properties":{"n":{"const":1}},"required":["n"],"additionalProperties":false}
+"#;
+        let constraint = LlguidanceConstraint::from_token_bytes_with_prefix(
+            GrammarConstraintKind::Lark,
+            grammar,
+            vec![
+                vec![0xe7, 0xb5],
+                b"\x82{\"n\":1}".to_vec(),
+                b"\x82bad".to_vec(),
+                b"thought".to_vec(),
+                b"<eos>".to_vec(),
+            ],
+            &[4],
+            "思考",
+        )
+        .unwrap();
+        let candidates = (0..5)
+            .map(|token_id| TokenCandidate {
+                token_id,
+                text: String::new(),
+                is_eos: token_id == 4,
+            })
+            .collect::<Vec<_>>();
+        let mask = constraint
+            .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+            .unwrap();
+        assert!(mask[0] && !mask[4], "{mask:?}");
+        let mask = constraint
+            .allowed_next_tokens(
+                &ProcessorContext {
+                    generated_tokens: vec![0],
+                    ..Default::default()
+                },
+                &candidates,
+            )
+            .unwrap();
+        assert!(mask[1] && !mask[2], "{mask:?}");
+        let context = ProcessorContext {
+            generated_tokens: vec![0, 1],
+            ..Default::default()
+        };
+        let mask = constraint
+            .allowed_next_tokens(&context, &candidates)
+            .unwrap();
+        assert!(mask[4], "{mask:?}");
+        assert_eq!(
+            constraint
+                .allowed_next_tokens(&context, &candidates)
+                .unwrap(),
+            mask
+        );
+        let rewind = constraint
+            .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+            .unwrap();
+        assert!(rewind[0] && !rewind[4], "{rewind:?}");
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("injected response boundary parsing failure")]
+    struct MaskFailure;
+    struct FailingMask;
+    impl Constraint for FailingMask {
+        fn allowed_next_tokens(
+            &self,
+            _: &ProcessorContext,
+            _: &[TokenCandidate],
+        ) -> anyhow::Result<Vec<bool>> {
+            Err(MaskFailure.into())
+        }
+        fn name(&self) -> &str {
+            "failing_boundary"
+        }
+    }
+    #[test]
+    fn constraint_processor_preserves_parser_failures_before_touching_logits() {
+        let processor =
+            ConstraintProcessor::new(Box::new(FailingMask), vec![Some("a".into())], vec![]);
+        let mut logits = vec![2.0];
+        let error = processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap_err();
+        assert!(error.is::<MaskFailure>());
+        assert!(
+            error.to_string().contains("failing_boundary")
+                && error.to_string().contains("offset 0")
+        );
+        assert_eq!(logits, vec![2.0]);
+    }
+
+    struct MalformedMask;
+    impl Constraint for MalformedMask {
+        fn allowed_next_tokens(
+            &self,
+            _: &ProcessorContext,
+            _: &[TokenCandidate],
+        ) -> anyhow::Result<Vec<bool>> {
+            Ok(vec![])
+        }
+        fn name(&self) -> &str {
+            "malformed_boundary"
+        }
+    }
+    #[test]
+    fn constraint_processor_rejects_malformed_mask_dimensions() {
+        let processor =
+            ConstraintProcessor::new(Box::new(MalformedMask), vec![Some("a".into())], vec![]);
+        let mut logits = vec![2.0];
+        let error = processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("0 mask entries for 1 candidate logits"),
+            "{error:#}"
+        );
+        assert_eq!(logits, vec![2.0]);
     }
 
     #[test]
@@ -5075,11 +5489,11 @@ mod tests {
             &self,
             _context: &ProcessorContext,
             candidates: &[TokenCandidate],
-        ) -> Vec<bool> {
-            candidates
+        ) -> anyhow::Result<Vec<bool>> {
+            Ok(candidates
                 .iter()
                 .map(|candidate| candidate.token_id % 2 == 0)
-                .collect()
+                .collect())
         }
 
         fn name(&self) -> &str {
