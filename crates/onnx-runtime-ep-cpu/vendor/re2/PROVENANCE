@@ -1,0 +1,9 @@
+Upstream: Google RE2
+Release: 2022-06-01
+Source: https://github.com/google/re2/archive/refs/tags/2022-06-01.tar.gz
+License: BSD-3-Clause (see LICENSE)
+
+This directory contains the upstream headers plus the minimal source set named
+by that release's CMakeLists.txt RE2_SOURCES target. Tests, benchmarks, build
+systems, generated-data scripts, and PCRE adapters are omitted. The generated
+perl_groups.cc, unicode_casefold.cc, and unicode_groups.cc files are retained.

@@ -348,7 +348,7 @@ Both declare `SessionPersistent` for all shapes, and both `execute()` and
 | Kernel | Site |
 |---|---|
 | `com.microsoft` `Attention` Phase-2a scratch | `attention.rs:973`, registered at `kernels/mod.rs:946` |
-| default-domain `Attention` (opset 23/24) = `StandardAttention`, prefill / batched | `standard_attention.rs:864`, registered at `kernels/mod.rs:952` |
+| default-domain `Attention` (opset 23/24/25) = `StandardAttention`, prefill / batched | `standard_attention.rs`, registered in `kernels/mod.rs` |
 
 These are the only paths where this change does something observable on
 hardware, and they are what H200 validation must exercise. **GQA decode is not
@@ -357,7 +357,7 @@ one of them** — it declines, so measuring it would validate nothing.
 > Earlier revisions of this document and of #830 called `attention.rs:973` the
 > **default-domain** `Attention` kernel. It is not: `AttentionFactory` is
 > registered only under `("Attention", "com.microsoft", 1)`, and default-domain
-> `Attention` at opsets 23 and 24 resolves to `StandardAttentionFactory`. Both
+> `Attention` at opsets 23 and later resolves to `StandardAttentionFactory`. Both
 > are `StepScoped` at prefill geometry, so the validation plan is unchanged, but
 > a model built with a default-domain `Attention` node exercises the second row,
 > not the first.

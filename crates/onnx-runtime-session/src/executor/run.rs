@@ -198,6 +198,7 @@ impl Executor {
             submission.disarm();
         }
         let unbound = self.unbind_borrowed_inputs();
+        self.string_values.clear();
         if !decode_memo_eligible {
             self.scratch_resolved_shapes = resolved;
         }
@@ -352,7 +353,10 @@ impl Executor {
             let numel = dims
                 .iter()
                 .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
-            self.value_dtypes.get(&vid)?.checked_storage_bytes(numel)
+            let dtype = *self.value_dtypes.get(&vid)?;
+            (dtype != DataType::String)
+                .then(|| dtype.checked_storage_bytes(numel))
+                .flatten()
         };
         let stats = match plan_activations(&self.graph, &view_map, oracle, &options) {
             Ok(PlanStatus::Complete(plan)) => ActivationMemoryPlanStats {
@@ -414,6 +418,7 @@ impl Executor {
         // run-scoped (element Arcs from a prior run must not leak in).
         self.sequences.clear();
         self.seq_elem_values.clear();
+        self.string_values.clear();
         self.restore_shared_buffers()?;
         Ok(())
     }
@@ -663,6 +668,10 @@ impl Executor {
         let mut borrowed_bytes = 0usize;
         for (name, tensor) in inputs {
             let vid = self.input_index[*name];
+            if tensor.dtype == DataType::String {
+                self.string_values.insert(vid, tensor.try_clone()?);
+                continue;
+            }
             let bytes = tensor.as_bytes();
             let buf = self
                 .buffers
@@ -1022,6 +1031,17 @@ impl Executor {
         let mut host_output_bytes = 0usize;
         for output_index in 0..self.graph.outputs.len() {
             let vid = self.graph.outputs[output_index];
+            if self.value_dtypes.get(&vid) == Some(&DataType::String) {
+                let tensor = self.string_values.remove(&vid).map(Ok).unwrap_or_else(|| {
+                    self.string_initializers
+                        .get(&vid)
+                        .ok_or_else(|| self.missing_host_string(vid))?
+                        .try_clone()
+                        .map_err(SessionError::from)
+                })?;
+                results.push(Some(SessionOutput::Tensor(tensor)));
+                continue;
+            }
             if let Some(ext) = external.outputs.get(&vid) {
                 // A graph output with no producing node (e.g. a bare
                 // initializer, or a value `ConstantFolding` collapsed to one

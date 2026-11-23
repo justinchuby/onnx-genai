@@ -1,5 +1,10 @@
 use onnx_runtime_ir::{
-    Attribute, DataType as D, Graph, Node, NodeId, TensorData, quantized_grouped, static_shape,
+    Attribute, DataType as D, Graph, GraphAttribute, Node, NodeId, TensorData, quantized_grouped,
+    static_shape,
+};
+use onnx_runtime_optimizer::{
+    OptimizationPass, PassContext,
+    quantized_grouped::{QuantizedGroupedFusion, explain_at},
 };
 use onnx_runtime_session::{InferenceSession, Tensor};
 
@@ -309,9 +314,6 @@ fn verify(build: impl Fn(Graph) -> InferenceSession) {
 
 #[test]
 fn matcher_keeps_unfused_graph_on_unsupported_version_or_shared_output() {
-    use onnx_runtime_optimizer::{
-        OptimizationPass, PassContext, quantized_grouped::QuantizedGroupedFusion,
-    };
     for shared in [false, true] {
         let mut g = graph(Spelling::Bitwise);
         let op = if shared {
@@ -332,6 +334,182 @@ fn matcher_keeps_unfused_graph_on_unsupported_version_or_shared_output() {
         assert!(g.nodes.values().any(|n| n.op_type == "GroupedMatMul"));
         assert!(g.nodes.values().any(|n| n.op_type == "DequantizeLinear"));
     }
+}
+
+#[test]
+fn affine_explanation_distinguishes_topology_eligibility_and_escape() {
+    let ctx = PassContext::new();
+    for (case, expected) in [
+        ("domain", "structural nonmatch"),
+        ("packed input", "structural nonmatch"),
+        ("shape", "eligibility rejection"),
+        ("outside consumer", "has outside consumer"),
+        ("graph output", "is a graph output"),
+        ("Cast", "is a graph output"),
+        ("Slice", "is a graph output"),
+        ("ConstantOfShape", "is a graph output"),
+        ("capture", "is lexically captured"),
+    ] {
+        let mut g = graph(if case == "Slice" {
+            Spelling::BitwiseWithZero
+        } else {
+            Spelling::Bitwise
+        });
+        let find = |op| g.nodes.values().find(|n| n.op_type == op).unwrap().id;
+        let anchor = find("GroupedMatMul");
+        let low = find("BitwiseAnd");
+        let high = find("BitShift");
+        let dq = find("DequantizeLinear");
+        let wrapper = match case {
+            "Cast" | "Slice" | "ConstantOfShape" => g.node(find(case)).outputs[0],
+            _ => None,
+        };
+        let low_output = g.node(low).outputs[0].unwrap();
+        g.value_mut(low_output).name = Some("low_nibbles".into());
+        match case {
+            "domain" => g.node_mut(low).domain = "custom".into(),
+            "packed input" => {
+                let other = g.create_value(D::Uint8, static_shape([2, 2, 2]));
+                g.add_input(other);
+                g.replace_input(high, 0, Some(other));
+            }
+            "shape" => {
+                let wrong_scale = g.create_value(D::Float32, static_shape([2, 2, 2]));
+                g.add_input(wrong_scale);
+                g.replace_input(dq, 1, Some(wrong_scale));
+            }
+            "outside consumer" => {
+                let copy = g.create_value(D::Uint8, static_shape([2, 2, 2]));
+                g.insert_node(Node::new(
+                    NodeId(0),
+                    "Identity",
+                    vec![Some(low_output)],
+                    vec![copy],
+                ));
+                g.add_output(copy);
+            }
+            "graph output" => g.add_output(low_output),
+            "Cast" | "Slice" | "ConstantOfShape" => {
+                let wrapper = wrapper.unwrap();
+                g.value_mut(wrapper).name = Some("wrapper_output".into());
+                g.add_output(wrapper);
+            }
+            "capture" => {
+                let cond = g.create_value(D::Bool, vec![]);
+                g.add_input(cond);
+                let out = g.create_value(D::Uint8, static_shape([2, 2, 2]));
+                let owner = g.insert_node(Node::new(NodeId(0), "If", vec![Some(cond)], vec![out]));
+                g.add_output(out);
+                for branch in ["then_branch", "else_branch"] {
+                    let mut body = Graph::new();
+                    let capture =
+                        body.create_named_value("low_nibbles", D::Uint8, static_shape([2, 2, 2]));
+                    body.add_output(capture);
+                    g.subgraphs
+                        .insert((owner, GraphAttribute::single(branch)), body);
+                }
+            }
+            _ => unreachable!(),
+        }
+        let message = explain_at(&g, &ctx, anchor).unwrap();
+        assert!(message.contains(expected), "{case}: {message}");
+        if case == "shape" {
+            assert!(
+                message.contains("row-wise blocked affine weights"),
+                "{message}"
+            );
+        }
+        if matches!(case, "outside consumer" | "graph output" | "capture") {
+            assert!(message.contains("low_nibbles"), "{message}");
+        }
+        if wrapper.is_some() {
+            assert!(message.contains("wrapper_output"), "{message}");
+        }
+        let order = g.topological_order().unwrap();
+        QuantizedGroupedFusion.run(&mut g, &ctx).unwrap();
+        assert_eq!(g.node(anchor).op_type, "GroupedMatMul", "{case}");
+        assert_eq!(g.topological_order().unwrap(), order, "{case}");
+    }
+}
+
+#[test]
+fn affine_rewrite_erases_an_internally_shared_decode_but_keeps_projection_output() {
+    let mut g = graph(Spelling::Unpack);
+    let dq = g
+        .nodes
+        .values()
+        .find(|n| n.op_type == "DequantizeLinear")
+        .unwrap()
+        .id;
+    let codes = g.node(dq).inputs[0].unwrap();
+    let decode = g.value(codes).producer.unwrap();
+    let bank = g.node(dq).outputs[0].unwrap();
+    let scale = g.create_value(D::Float32, static_shape([2, 2, 4]));
+    g.add_input(scale);
+    g.replace_input(dq, 1, Some(scale));
+    g.replace_input(dq, 2, Some(codes));
+    g.node_mut(dq)
+        .attributes
+        .insert("block_size".into(), Attribute::Int(1));
+    let output = g.outputs[0];
+    let anchor = g.value(output).producer.unwrap();
+    let ctx = PassContext::new();
+    assert!(explain_at(&g, &ctx, anchor).unwrap().contains("eligible"));
+    QuantizedGroupedFusion.run(&mut g, &ctx).unwrap();
+    assert_eq!(g.node(anchor).op_type, quantized_grouped::OP);
+    assert_eq!(g.node(anchor).inputs[1], g.node(anchor).inputs[4]);
+    assert_eq!(g.outputs, [output]);
+    assert_eq!(g.value(output).producer, Some(anchor));
+    assert!(g.try_node(dq).is_none());
+    assert!(g.try_node(decode).is_none());
+    assert!(g.try_value(bank).is_none());
+    assert!(g.try_value(codes).is_none());
+    g.validate().unwrap();
+}
+
+#[test]
+fn affine_rewrite_preserves_order_and_outputs_for_independent_projections() {
+    let mut g = graph(Spelling::Unpack);
+    let first_output = g.outputs[0];
+    let first = g.value(first_output).producer.unwrap();
+    let bank = g.node(first).inputs[1].unwrap();
+    let mut dq = g.node(g.value(bank).producer.unwrap()).clone();
+    let codes = dq.inputs[0].unwrap();
+    let mut unpack = g.node(g.value(codes).producer.unwrap()).clone();
+    let packed = g.create_value(D::Uint8, static_shape([2, 2, 2]));
+    let decoded = g.create_value(D::Uint8, static_shape([2, 2, 4]));
+    g.add_input(packed);
+    unpack.inputs[0] = Some(packed);
+    unpack.outputs[0] = Some(decoded);
+    let unpack = g.insert_node(unpack);
+    let new_bank = g.create_value(D::Float32, static_shape([2, 2, 4]));
+    dq.inputs[0] = Some(decoded);
+    dq.inputs.truncate(2);
+    dq.outputs[0] = Some(new_bank);
+    let dq = g.insert_node(dq);
+    let output = g.create_value(D::Float32, static_shape([2, 2, 2]));
+    let mut second = g.node(first).clone();
+    second.inputs[1] = Some(new_bank);
+    second.outputs[0] = Some(output);
+    let second = g.insert_node(second);
+    g.add_output(output);
+
+    QuantizedGroupedFusion
+        .run(&mut g, &PassContext::new())
+        .unwrap();
+
+    assert_eq!(g.outputs, [first_output, output]);
+    let fused: Vec<_> = g
+        .topological_order()
+        .unwrap()
+        .into_iter()
+        .filter(|&id| g.node(id).op_type == quantized_grouped::OP)
+        .collect();
+    assert_eq!(fused, [first, second]);
+    assert_eq!(g.node(second).inputs[1], Some(packed));
+    assert!(g.try_node(unpack).is_none());
+    assert!(g.try_node(dq).is_none());
+    g.validate().unwrap();
 }
 
 #[test]

@@ -303,7 +303,7 @@ pub fn concat(sequence: &SequenceValue, axis: i64, new_axis: bool) -> SequenceRe
         tensor.copy_from_host_at(offset, bytes)
     })
     .map_err(|source| SequenceError::TensorCreation { op: OP, source })?;
-    Ok(SeqTensor::new(tensor))
+    SeqTensor::new(tensor)
 }
 
 /// Stack already-validated contiguous element bytes along a new axis.
