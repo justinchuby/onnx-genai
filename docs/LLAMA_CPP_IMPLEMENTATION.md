@@ -963,7 +963,7 @@ can leave literal. NUL/newline/control/DEL values and an escaped newline propert
 name now have actual schema next-token checks. All 3 selected schema-prefill
 cases and strict native-engine all-target Clippy passed after this refinement.
 
-Reusable JSON byte recognition: `JsonByteCursor` compiles a schema once against
+Reusable JSON byte recognition: `GrammarByteCursor` compiles a schema once against
 a byte vocabulary independent of model token IDs. Candidate preview rolls back
 accepted bytes after both viable and rejected trials; atomic commit rejects an
 invalid suffix without retaining its accepted prefix. Status distinguishes viable
@@ -1009,7 +1009,7 @@ open, including partial-byte/framing viability and decoder context agreement.
 
 ### Channel-aware JSON sampling through the production processor chain
 
-`ResponseJson` composes the model tokenizer, declared response projection and a
+`GenerateOptions.response_projection` composes the model tokenizer, declared response framing and a
 compiled JSON Schema cursor in the mandatory generation processor chain. The
 actual rendered assistant prefix primes all three; JSON validates only the
 selected content field, so reasoning can continue before the content boundary.
@@ -1148,7 +1148,7 @@ stops and output/context limits retain their existing partial-value behavior.
 A transactional plain projection retains split UTF-8 and restores rejected,
 failed or panicking inspections. The old character-only generation constraint
 was removed, with no alias. Its pure syntax preflight is now the
-`validate_json_prefix` function. One positive `GenerateOptions.max_json_bytes`
+`validate_json_prefix` function. One positive `GenerateOptions.max_constraint_bytes`
 budget replaces the response-only duplicate; HTTP admission supplies the actual
 configured response buffer limit. All constrained chat/native/legacy generation requests
 validate capability and prefix before execution or SSE headers. Prefix errors
@@ -1256,3 +1256,46 @@ disconnect cleanup. Strict server all-target Clippy passed. The manual-signal
 inference test signals before submission to avoid racing the tiny fixture; it
 does not claim an end-to-end midstream timing test.
 Other unchecked delivery items remain required.
+
+
+## Projected literal grammars and tool observation
+
+One resolved ResponseProjection now owns the template, actual assistant prefill
+and response buffer bound for both grammar constraints and transactional tool
+observation. Json/JsonSchema/Regex/Lark retain their respective languages;
+response-only constraint variants are removed from the pre-release Rust API.
+Constraint prefixes must be empty when the projection owns prefill. Plain
+constraints retain their own prefix. The shared byte cursor is GrammarByteCursor,
+and max_constraint_bytes applies to raw/logical constrained text.
+
+Literal text grammars use the same transactional response projection as JSON
+without canonicalizing their escape spellings. Compiled grammar inspection
+rejects model-token references, token-based limits, rule temperatures and hidden
+stops rather than silently interpreting model token IDs as byte IDs. Unprojected
+model-token Lark remains token-aware. HTTP GBNF remains an independent open item.
+
+Tool observation consumes only the declared content channel, including tool
+prefill. Actual ONNX regression first demonstrated HTTP 500 from a reasoning
+closer being interpreted as text before a tool envelope; it now passes for
+forced Specific tool requests and Auto requests without a grammar. Tool examples
+inside reasoning are retained as reasoning and never become committed calls.
+Buffered tool turns retain reasoning_content, matching live SSE behavior.
+Malformed assistant tool prefill is a typed client error before generation and
+SSE admission, with continuation/chat-template repair context.
+
+Resolved byte codecs retain split UTF-8 and special channel markers. Contextual
+byte decoders without that streaming contract defer observation until terminal
+canonical decoding, with the reason retained in Debug state. Checkpoints and
+aborts restore raw bytes, input representation and projected parser history.
+Backend decoder panics preserve model-token and tokenizer.decoder context.
+
+On main 01632f548 plus the compatibility increments, the complete engine suite
+passed 940 tests (1 inherited ignore), server passed 437 (2 inherited ignores),
+and HTTP integration passed all 37 tests. Explicitly enabling the server's
+native-backend feature passed 446 server tests (2 inherited ignores), including
+the actual Native reasoning-budget and projected-tool cases. Strict engine/server
+all-target Clippy passed for the default feature combination and server Clippy
+also passed with native-backend enabled. The final tool regression explicitly
+selects ORT or Native, covering forced/Auto tools, buffered/SSE/logprob delivery
+and reasoning exclusion. These are functional checks without performance claims.
+The broader unchecked delivery items remain required.

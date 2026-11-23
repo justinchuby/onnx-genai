@@ -4682,10 +4682,10 @@ mod tests {
         let path = scratch.path().join("tokenizer.json");
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         let tokenizer = onnx_genai_ort::Tokenizer::from_file(path).unwrap();
-        let constraint = crate::response_constraint::JsonContentConstraint::new(
+        let constraint = crate::response_constraint::ContentConstraint::json_schema(
             &tokenizer,
             &serde_json::Value::Bool(true),
-            crate::json_projection::ProjectionKind::Plain,
+            crate::text_projection::ProjectionKind::Plain,
             prefix,
             4096,
             vec![eos],

@@ -251,7 +251,7 @@ fn admit_completion_output(
     config: &ServerConfig,
     max_context: Option<usize>,
 ) -> Result<(), ApiError> {
-    prepared.generation.options_mut().max_json_bytes = config.replay_buffer_bytes;
+    prepared.generation.options_mut().max_constraint_bytes = config.replay_buffer_bytes;
     prepared.generation.options_mut().max_new_tokens = admit_output_budget(
         &request.sampling,
         prompt_tokens,
@@ -645,7 +645,7 @@ async fn prepare_chat_input(
     if !input_audio.is_empty() {
         prepared = prepare_audio_generate_request(request, &handle.tokenizer, output_budget)?;
     }
-    prepared.request.options.max_json_bytes = config.replay_buffer_bytes;
+    prepared.request.options.max_constraint_bytes = config.replay_buffer_bytes;
     let pipeline_input = if !image_urls.is_empty() {
         Some(
             preprocess_chat_images(
@@ -808,10 +808,7 @@ async fn run_chat_completion(
     } else {
         Some(output.content)
     };
-    let reasoning = tool_calls
-        .is_none()
-        .then_some(output.reasoning)
-        .filter(|thought| !thought.is_empty());
+    let reasoning = Some(output.reasoning).filter(|thought| !thought.is_empty());
     let total_tokens = prompt_tokens + completion_tokens;
     Ok(ChatCompletionResponse {
         id,
@@ -2136,7 +2133,7 @@ fn prepare_generate_request(
         .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
     let prompt_tokens = token_ids.len();
     let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget)?;
-    options.max_json_bytes = response_buffer_bytes;
+    options.max_constraint_bytes = response_buffer_bytes;
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
     options.resolve_sampling_defaults(
@@ -2148,29 +2145,28 @@ fn prepare_generate_request(
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
     if let Some(template) = context.response_template {
-        let schema = match options.constraint.as_ref() {
-            Some(GenerateConstraint::Json { .. }) => Some(serde_json::Value::Bool(true)),
-            Some(GenerateConstraint::JsonSchema { schema, .. }) => {
-                Some(serde_json::from_str(schema)?)
-            }
-            _ => None,
-        };
-        if let Some(schema) = schema {
-            options.constraint = Some(GenerateConstraint::ResponseJson {
-                schema,
-                template: template.clone(),
-                prefix: prompt.clone(),
-            });
+        if let Some(
+            GenerateConstraint::Json { prefix }
+            | GenerateConstraint::JsonSchema { prefix, .. }
+            | GenerateConstraint::Regex { prefix, .. }
+            | GenerateConstraint::Lark { prefix, .. },
+        ) = options.constraint.as_mut()
+        {
+            prefix.clear();
         }
+        options.response_projection = Some(
+            onnx_genai_engine::response_template::ResponseProjection::resolve(
+                template.clone(),
+                prompt.clone(),
+                response_buffer_bytes,
+            )?,
+        );
     }
     anyhow::ensure!(
         request.continuation_mode() != crate::types::ChatContinuation::Reasoning
             || options.constraint.is_none()
-            || matches!(
-                options.constraint,
-                Some(GenerateConstraint::ResponseJson { .. })
-            ),
-        "reasoning continuation with this constrained output policy requires a channel-aware generation grammar; use response_format with a compatible declared response_template"
+            || options.response_projection.is_some(),
+        "reasoning continuation with constrained output requires declared response framing; provide a compatible response_template"
     );
     if request.input_audio().is_empty() {
         crate::reasoning_request::ReasoningRequest::extract(request)?.apply(

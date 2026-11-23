@@ -218,7 +218,7 @@ reasoning and answer text retain separate fields. Content continuation uses the
 same channel-state check when a response template is declared. Plain Rust request
 builders reject reasoning continuation because they have no model parser contract.
 Tool-call messages and replay into a persistent inference session remain rejected.
-JSON response formats use a channel-aware generation constraint when a response
+JSON response formats and internal Regex/Lark policies use a channel-aware generation constraint when a response
 template is declared. The actual rendered prefill seeds the parser, and model
 token candidates constrain only projected content while reasoning remains free.
 This applies to implicit prefill and explicit reasoning continuation, with the
@@ -241,7 +241,22 @@ property name still has a backend lexical mismatch; its previously supported raw
 key spelling is preserved. Ordinary string values and free property names accept
 escaped DEL. Ordinary JSON output without a response template uses the same
 byte-oriented schema recognition, including split escapes and surrogate pairs.
-Forced tool/Lark output policies during reasoning continuation remain unsupported.
+Forced tool Lark policies use the same declared projection. Reasoning can precede
+the tool envelope, and tool-like examples inside reasoning are excluded from
+transactional tool parsing. Auto tool requests share this projection even without
+a grammar. Buffered and streamed tool turns retain their reasoning_content.
+Projected literal grammars preserve authored backslashes and Unicode spellings;
+only JSON Schema policy applies JSON escape normalization. Model-token references,
+token-count directives, per-rule temperatures and hidden stops cannot be treated
+as bytes and are rejected from projected byte grammars with an actionable error.
+Unprojected model-token Lark retains its existing token-aware behavior. This does
+not implement llama.cpp's HTTP GBNF grammar syntax.
+
+Tool observation preserves strict byte fragments for resolved byte decoders, so
+split Unicode channel markers are never replaced by provisional glyphs in tool
+syntax. Unsupported contextual byte decoders defer tool parsing until terminal
+canonical decoding; the retained decoder reason is visible in observer Debug
+state. Rewind/abort restores the raw input and projected tool-parser history.
 
 Ordinary JSON decoding follows the tokenizer's normal special-token policy;
 protocol-channel projection preserves markers for its declared parser. An EOS
@@ -251,7 +266,7 @@ against the same compiled schema. Escape candidates, contextual non-byte decodin
 and pending UTF-16 spelling use semantic candidate inspection. Model-token masks
 and recognizer-byte masks have separate identities and cannot share cached bits.
 
-`GenerateOptions.max_json_bytes` bounds both raw response text and its canonical
+`GenerateOptions.max_constraint_bytes` bounds both raw response text and its canonical
 JSON prefix, with a 4 MiB Rust default. HTTP preparation uses the configured
 `--replay-buffer-bytes` limit for all JSON output modes. Exceeding the candidate
 budget rejects that candidate; backend errors preserve their cause. Constraints

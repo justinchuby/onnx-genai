@@ -1317,8 +1317,10 @@ impl From<SamplerSequence> for Vec<SamplerStage> {
 pub struct GenerateOptions {
     /// Maximum tokens to produce after the prompt.
     pub max_new_tokens: usize,
-    /// Maximum retained raw and canonical JSON bytes during constrained decoding.
-    pub max_json_bytes: usize,
+    /// Maximum retained raw and logical content bytes during constrained decoding.
+    pub max_constraint_bytes: usize,
+    /// Declared response framing shared by grammar constraints and tool observation.
+    pub response_projection: Option<crate::response_template::ResponseProjection>,
     /// Temperature at its sampling stage. Zero creates a point mass there.
     pub temperature: f32,
     /// Optional entropy-driven temperature scaling; zero range disables it.
@@ -1410,7 +1412,8 @@ impl Default for GenerateOptions {
     fn default() -> Self {
         Self {
             max_new_tokens: 128,
-            max_json_bytes: 4 * 1024 * 1024,
+            max_constraint_bytes: 4 * 1024 * 1024,
+            response_projection: None,
             temperature: 1.0,
             dynamic_temperature: None,
             sampler_order: None,
@@ -1691,7 +1694,16 @@ fn describe_supported(contract: &GenerationContract) -> String {
     )
 }
 
-/// Built-in constrained decoding grammars.
+/// Literal-text grammars over projected response content. Unlike JSON Schema
+/// policy, these preserve authored backslash/Unicode escape spellings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TextGrammar {
+    Regex(String),
+    Lark(String),
+}
+
+/// Built-in constrained decoding grammars. Prefix fields apply to raw text;
+/// leave them empty when response_projection owns the declared assistant prefill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateConstraint {
     /// Constrain the existing prefix plus new output to prefixes of one JSON value.
@@ -1707,13 +1719,6 @@ pub enum GenerateConstraint {
         /// Existing assistant text, excluded from newly generated output.
         prefix: String,
     },
-    /// Constrain declared response content while permitting separate reasoning.
-    ResponseJson {
-        schema: serde_json::Value,
-        template: std::sync::Arc<crate::response_template::ResponseTemplate>,
-        /// Actual rendered assistant prefill, including response framing.
-        prefix: String,
-    },
     /// Constrain output to text matching the provided Rust regular expression.
     Regex {
         pattern: String,
@@ -1722,7 +1727,7 @@ pub enum GenerateConstraint {
     },
     /// Constrain existing prefix plus output to the provided llguidance Lark grammar.
     Lark {
-        /// Complete grammar, including any declared response framing.
+        /// Grammar over projected content, or raw text without response_projection.
         grammar: String,
         /// Existing text consumed by the grammar, excluded from newly generated output.
         prefix: String,
@@ -1735,8 +1740,8 @@ impl GenerateOptions {
             anyhow::bail!("max_new_tokens must be greater than zero");
         }
         anyhow::ensure!(
-            self.max_json_bytes > 0,
-            "max_json_bytes must be greater than zero; configure a positive JSON constraint byte budget"
+            self.max_constraint_bytes > 0,
+            "max_constraint_bytes must be greater than zero; configure a positive constraint text byte budget"
         );
         self.adaptive_p.validate()?;
         if !self.temperature.is_finite() || self.temperature < 0.0 {

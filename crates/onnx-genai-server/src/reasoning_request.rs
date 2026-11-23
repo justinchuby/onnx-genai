@@ -106,27 +106,33 @@ impl ReasoningRequest {
             ),
             BudgetContext::Raw => {}
         }
-        match options.constraint.as_mut() {
-            Some(
-                GenerateConstraint::Json { prefix }
-                | GenerateConstraint::JsonSchema { prefix, .. }
-                | GenerateConstraint::Regex { prefix, .. }
-                | GenerateConstraint::Lark { prefix, .. },
-            ) => {
-                if matches!(context, BudgetContext::Chat { .. }) && !prefix.is_empty() {
-                    ensure!(
-                        prefix == explicit,
-                        "generation_prompt conflicts with the prepared constrained-content prefix; preserve the existing assistant continuation"
-                    );
-                }
-                *prefix = explicit.to_owned();
+        // A resolved projection already owns the complete declared prefix.
+        if let Some(projection) = options.response_projection.as_ref() {
+            if matches!(context, BudgetContext::Raw) {
+                options.response_projection = Some(
+                    onnx_genai_engine::response_template::ResponseProjection::resolve(
+                        projection.template().clone(),
+                        explicit.to_owned(),
+                        projection.max_bytes(),
+                    )?,
+                );
             }
-            Some(GenerateConstraint::ResponseJson { prefix, .. })
-                if matches!(context, BudgetContext::Raw) =>
-            {
-                *prefix = explicit.to_owned()
+            return Ok(());
+        }
+        if let Some(
+            GenerateConstraint::Json { prefix }
+            | GenerateConstraint::JsonSchema { prefix, .. }
+            | GenerateConstraint::Regex { prefix, .. }
+            | GenerateConstraint::Lark { prefix, .. },
+        ) = options.constraint.as_mut()
+        {
+            if matches!(context, BudgetContext::Chat { .. }) && !prefix.is_empty() {
+                ensure!(
+                    prefix == explicit,
+                    "generation_prompt conflicts with the prepared constrained-content prefix; preserve the existing assistant continuation"
+                );
             }
-            _ => {}
+            *prefix = explicit.to_owned();
         }
         Ok(())
     }
@@ -840,6 +846,241 @@ mod tests {
                     .unwrap();
                 drop(guard);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn projected_tool_grammar_ignores_tool_examples_inside_reasoning() {
+        projected_tool_grammar_case(crate::ServerConfig {
+            engine_config: onnx_genai::EngineConfig {
+                decode_backend: onnx_genai::engine::EngineDecodeBackend::Ort,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+    }
+    #[cfg(feature = "native-backend")]
+    #[tokio::test]
+    async fn projected_tool_grammar_native_backend_ignores_reasoning_examples() {
+        projected_tool_grammar_case(crate::ServerConfig {
+            engine_config: onnx_genai::EngineConfig {
+                decode_backend: onnx_genai::engine::EngineDecodeBackend::Native,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+    }
+    async fn projected_tool_grammar_case(config: crate::ServerConfig) {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-tool-call");
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        for (id, text) in [
+            (
+                22,
+                "<tool_call>\n{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>",
+            ),
+            (
+                25,
+                "<tool_call>{\"name\":\"example_only\",\"arguments\":{}}</tool_call>",
+            ),
+        ] {
+            let old = vocab
+                .iter()
+                .find(|(_, value)| **value == json!(id))
+                .unwrap()
+                .0
+                .clone();
+            vocab.remove(&old);
+            vocab.insert(text.to_owned(), json!(id));
+        }
+        std::fs::write(path, tokenizer.to_string()).unwrap();
+        std::fs::write(
+            scratch.path().join("tokenizer_config.json"),
+            json!({
+                "chat_template":"A unused-8{% if messages[-1].role == 'assistant' %}unused-9{{ messages[-1].content }}{% endif %}",
+                "response_template":{"start_anchor":"A","fields":{
+                    "reasoning_content":{"open":"unused-8","close":"unused-9"},
+                    "content":{"close":"<tool-eos>","optional":true}
+                }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let router = crate::app(
+            crate::AppState::load_with_config(
+                scratch.path(),
+                Some("projected-tools".into()),
+                config,
+            )
+            .unwrap(),
+        );
+        for budget in [0, 1] {
+            for stream in [false, true] {
+                for logprobs in [false, true] {
+                    let response = post(router.clone(), json!({
+                    "messages":[{"role":"user","content":"hello"}],
+                    "tools":[{"type":"function","function":{"name":"weather","parameters":{
+                        "type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false
+                    }}}],
+                    "tool_choice":{"type":"function","function":{"name":"weather"}},
+                    "reasoning_budget_tokens":budget,"max_tokens":budget+2,
+                    "temperature":0,"logit_bias":{"25":1000,"22":500},"stream":stream,"logprobs":logprobs
+                })).await;
+                    let status = response.status();
+                    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                        .await
+                        .unwrap();
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    assert_eq!(status, axum::http::StatusCode::OK, "{text}");
+                    let values = if stream {
+                        text.lines()
+                            .filter_map(|line| line.strip_prefix("data: "))
+                            .filter(|line| *line != "[DONE]")
+                            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![serde_json::from_slice::<Value>(&bytes).unwrap()]
+                    };
+                    assert!(
+                        values.iter().all(|value| value.get("error").is_none()),
+                        "{text}"
+                    );
+                    let reasoning = values
+                        .iter()
+                        .map(|value| {
+                            let message = if stream {
+                                &value["choices"][0]["delta"]
+                            } else {
+                                &value["choices"][0]["message"]
+                            };
+                            message["reasoning_content"].as_str().unwrap_or("")
+                        })
+                        .collect::<String>();
+                    assert_eq!(
+                        reasoning,
+                        if budget == 0 {
+                            ""
+                        } else {
+                            "<tool_call>{\"name\":\"example_only\",\"arguments\":{}}</tool_call>"
+                        },
+                        "{text}"
+                    );
+
+                    assert!(
+                        values.iter().any(|value| {
+                            let message = if stream {
+                                &value["choices"][0]["delta"]
+                            } else {
+                                &value["choices"][0]["message"]
+                            };
+                            message["tool_calls"][0]["function"]["name"] == "weather"
+                        }),
+                        "{text}"
+                    );
+                    assert!(
+                        values.iter().all(|value| {
+                            let message = if stream {
+                                &value["choices"][0]["delta"]
+                            } else {
+                                &value["choices"][0]["message"]
+                            };
+                            message["tool_calls"].as_array().is_none_or(|calls| {
+                                calls
+                                    .iter()
+                                    .all(|call| call["function"]["name"] != "example_only")
+                            })
+                        }),
+                        "{text}"
+                    );
+                }
+            }
+        }
+        for stream in [false, true] {
+            let response = post(router.clone(), json!({
+                "messages":[{"role":"user","content":"hello"}],
+                "tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}],
+                "tool_choice":"auto", "reasoning_budget_tokens":1, "max_tokens":2,
+                "temperature":0, "logit_bias":{"25":1000}, "stream":stream
+            })).await;
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert_eq!(status, axum::http::StatusCode::OK, "{text}");
+            let values = if stream {
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|line| *line != "[DONE]")
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .collect::<Vec<_>>()
+            } else {
+                vec![serde_json::from_slice::<Value>(&bytes).unwrap()]
+            };
+            assert!(
+                values.iter().all(|value| value.get("error").is_none()),
+                "{text}"
+            );
+            assert!(
+                values.iter().all(|value| {
+                    let message = if stream {
+                        &value["choices"][0]["delta"]
+                    } else {
+                        &value["choices"][0]["message"]
+                    };
+                    message.get("tool_calls").is_none()
+                }),
+                "{text}"
+            );
+            assert!(
+                values.iter().any(|value| {
+                    let message = if stream {
+                        &value["choices"][0]["delta"]
+                    } else {
+                        &value["choices"][0]["message"]
+                    };
+                    message["reasoning_content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("example_only"))
+                }),
+                "{text}"
+            );
+        }
+        for stream in [false, true] {
+            let response = post(router.clone(), json!({
+                "messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"<tool_call>{bad}</tool_call>"}],
+                "tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}],
+                "tool_choice":"auto","continue_final_message":"content","max_tokens":1,"stream":stream
+            })).await;
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{text}");
+            assert!(
+                !content_type.contains("text/event-stream"),
+                "{content_type}"
+            );
+            assert!(text.contains("assistant tool prefix"), "{text}");
         }
     }
 

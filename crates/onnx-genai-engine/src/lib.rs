@@ -8,6 +8,7 @@
 //! - Speculative decoding (acceleration)
 
 pub(crate) mod batched;
+pub mod byte_grammar;
 mod byte_stream;
 pub mod config;
 pub(crate) mod connector_bridge;
@@ -16,9 +17,7 @@ pub(crate) mod decode_loop;
 pub mod embedding;
 pub mod engine;
 pub mod fim;
-pub mod json_cursor;
 mod json_prefix;
-mod json_projection;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
 pub mod logits;
@@ -41,6 +40,7 @@ pub mod runtime_trace;
 pub mod sampling;
 pub(crate) mod session;
 pub mod speculative;
+mod text_projection;
 pub mod tokenization;
 
 pub use onnx_genai_scheduler::SchedulerAdmissionError;
