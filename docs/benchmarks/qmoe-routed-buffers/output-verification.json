@@ -1,0 +1,86 @@
+[
+  {
+    "shape": [
+      1,
+      32,
+      32,
+      1,
+      0
+    ],
+    "processes": 9,
+    "full_output_sha256": "85d8e40912d336adacce449f32e56bcd5a011d18f4cd4adba96f5364f3a67dff",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      1,
+      64,
+      64,
+      1,
+      0
+    ],
+    "processes": 9,
+    "full_output_sha256": "eaffadcb7f5121179407d6eafb02ce6444b468d89f8d22ed706461ef0204c347",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      1,
+      256,
+      256,
+      1,
+      0
+    ],
+    "processes": 9,
+    "full_output_sha256": "0ef575dc5977b3c0632a4edb5305d0b44a7783b3ba2285f6fdb891222671063a",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      8,
+      256,
+      256,
+      1,
+      0
+    ],
+    "processes": 9,
+    "full_output_sha256": "69b06c4ded0cc10d702aedc42939842859cb7f85800dc5c9fcc990db774d9f86",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      8,
+      256,
+      256,
+      4,
+      0
+    ],
+    "processes": 9,
+    "full_output_sha256": "69b06c4ded0cc10d702aedc42939842859cb7f85800dc5c9fcc990db774d9f86",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      512,
+      256,
+      256,
+      4,
+      0
+    ],
+    "processes": 9,
+    "full_output_sha256": "76600c0da079c205dfb4c308c09ffefbe95e9bf3d2480e7f850e86eda47a598a",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      1,
+      64,
+      64,
+      4,
+      0
+    ],
+    "processes": 9,
+    "full_output_sha256": "eaffadcb7f5121179407d6eafb02ce6444b468d89f8d22ed706461ef0204c347",
+    "argmax_equal": true
+  }
+]
