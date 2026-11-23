@@ -1464,6 +1464,12 @@ pub(super) fn validate_request(
             "top_n_sigma must be finite; use a non-positive value to disable it",
         ));
     }
+    onnx_genai_engine::AdaptivePConfig {
+        target: request.adaptive_target,
+        decay: request.adaptive_decay,
+    }
+    .validate()
+    .map_err(|error| ApiError::invalid_request(error.to_string()))?;
     validate_sampling_range(request.top_p, "top_p")?;
     if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
         return Err(ApiError::invalid_request(
@@ -2132,6 +2138,10 @@ fn build_generate_options(
         temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
         sampler_order: request.samplers.clone(),
         top_n_sigma: request.top_n_sigma,
+        adaptive_p: onnx_genai_engine::AdaptivePConfig {
+            target: request.adaptive_target,
+            decay: request.adaptive_decay,
+        },
         dynamic_temperature: (request.dynatemp_range > 0.0).then_some(
             onnx_genai_engine::DynamicTemperatureConfig {
                 range: request.dynatemp_range,

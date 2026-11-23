@@ -214,9 +214,9 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
             let token_id = {
                 let _span = onnx_genai_ort::prof_span!("loop.sampling");
                 if let Some(sampler) = state.custom_sampler.as_deref_mut() {
-                    select_next_token_with_sampler(&mut logits, &context, chain, sampler)
+                    select_next_token_with_sampler(&mut logits, &context, chain, sampler)?
                 } else if let Some(rng_value) = forward.rng_value {
-                    select_next_token(&mut logits, &context, options, chain, rng_value)
+                    select_next_token(&mut logits, &context, options, chain, rng_value)?
                 } else {
                     select_next_token_with_rng(
                         &mut logits,
@@ -224,7 +224,7 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
                         options,
                         chain,
                         &mut state.rng,
-                    )
+                    )?
                 }
             };
             if let (Some(top_logprobs), Some(logprobs)) =

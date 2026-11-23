@@ -84,3 +84,39 @@ fn prompt_lookup_accepts_multiple_tokens_on_repetitive_context() -> anyhow::Resu
     assert!(stats.multi_token_accepts >= 1, "{stats:?}");
     Ok(())
 }
+
+#[test]
+fn adaptive_p_feedback_survives_speculative_rejection_and_retry() -> anyhow::Result<()> {
+    use onnx_genai_engine::{AdaptivePConfig, SamplerSequence, SamplerStage};
+    let fixture = tiny_llm()?;
+    let mut baseline = deterministic_engine(&fixture, SpeculativeMode::None)?;
+    let mut speculative = deterministic_engine(
+        &fixture,
+        SpeculativeMode::PromptLookup {
+            ngram: 1,
+            max_tokens: 4,
+        },
+    )?;
+    let mut request = greedy_request(GeneratePrompt::Text("hello".into()), 12);
+    // A zero-temperature stage permits the deterministic speculative executor,
+    // while the explicit selector still receives and checkpoints every choice.
+    request.options.greedy = false;
+    request.options.adaptive_p = AdaptivePConfig {
+        target: 0.6,
+        decay: 0.5,
+    };
+    request.options.sampler_order = Some(
+        SamplerSequence::new(vec![SamplerStage::AdaptiveP, SamplerStage::Temperature]).unwrap(),
+    );
+    let expected = baseline.generate(request.clone())?;
+    let actual = speculative.generate(request)?;
+    let stats = speculative.last_speculative_stats();
+    assert_eq!(actual.token_ids, expected.token_ids);
+    assert_eq!(actual.finish_reason, expected.finish_reason);
+    assert!(stats.proposed_tokens > 0, "{stats:?}");
+    assert!(
+        stats.accepted_tokens < stats.proposed_tokens,
+        "fixture must reject a proposal: {stats:?}"
+    );
+    Ok(())
+}

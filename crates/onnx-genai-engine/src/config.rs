@@ -1200,11 +1200,40 @@ pub struct DynamicTemperatureConfig {
     pub exponent: f32,
 }
 
+/// Target-probability selector controls. Negative targets disable adaptation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdaptivePConfig {
+    pub target: f32,
+    pub decay: f32,
+}
+impl Default for AdaptivePConfig {
+    fn default() -> Self {
+        Self {
+            target: -1.0,
+            decay: 0.9,
+        }
+    }
+}
+impl AdaptivePConfig {
+    pub fn validate(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.target.is_finite() && self.target <= 1.0,
+            "adaptive_target must be finite and at most 1; use a negative value to disable adaptation"
+        );
+        anyhow::ensure!(
+            self.decay.is_finite() && (0.0..=0.99).contains(&self.decay),
+            "adaptive_decay must be finite and between 0 and 0.99"
+        );
+        Ok(())
+    }
+}
+
 /// A stage in an explicitly ordered token-sampling pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SamplerStage {
     Penalties,
+    AdaptiveP,
     Dry,
     TopNSigma,
     TopK,
@@ -1223,6 +1252,7 @@ impl<'de> Deserialize<'de> for SamplerStage {
         let normalized = value.to_ascii_lowercase().replace(['_', '-'], "");
         match normalized.as_str() {
             "penalties" => Ok(Self::Penalties),
+            "adaptivep" => Ok(Self::AdaptiveP),
             "dry" => Ok(Self::Dry),
             "topnsigma" => Ok(Self::TopNSigma),
             "topk" => Ok(Self::TopK),
@@ -1233,7 +1263,7 @@ impl<'de> Deserialize<'de> for SamplerStage {
             "xtc" => Ok(Self::Xtc),
             "temperature" | "temp" => Ok(Self::Temperature),
             _ => Err(serde::de::Error::custom(format!(
-                "samplers contains unsupported stage '{value}'; use penalties, dry, top_n_sigma, top_k, typ_p, top_p, min_p, top_a, xtc or temperature"
+                "samplers contains unsupported stage '{value}'; use penalties, adaptive_p, dry, top_n_sigma, top_k, typ_p, top_p, min_p, top_a, xtc or temperature"
             ))),
         }
     }
@@ -1294,6 +1324,8 @@ pub struct GenerateOptions {
     /// Mask logits more than this many population standard deviations below the maximum.
     /// Non-positive values disable the mask.
     pub top_n_sigma: f32,
+    /// Used only when the ordered list explicitly includes adaptive_p.
+    pub adaptive_p: AdaptivePConfig,
     /// Nucleus sampling probability. Values >= 1 disable top-p filtering.
     pub top_p: f32,
     /// Keep only the top-k logits before sampling. Zero disables top-k filtering.
@@ -1374,6 +1406,7 @@ impl Default for GenerateOptions {
             dynamic_temperature: None,
             sampler_order: None,
             top_n_sigma: -1.0,
+            adaptive_p: AdaptivePConfig::default(),
             top_p: 1.0,
             top_k: 0,
             min_p: 0.0,
@@ -1659,6 +1692,7 @@ impl GenerateOptions {
         if self.max_new_tokens == 0 {
             anyhow::bail!("max_new_tokens must be greater than zero");
         }
+        self.adaptive_p.validate()?;
         if !self.temperature.is_finite() || self.temperature < 0.0 {
             anyhow::bail!("temperature must be finite and non-negative");
         }

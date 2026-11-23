@@ -108,7 +108,7 @@ use the common incremental text decoder for their content as well.
 
 Runtime-owned token policies accept an ordered `samplers` array of at most 64
 stages: `penalties`, `dry`, `top_n_sigma`, `top_k`, `typ_p`, `top_p`, `min_p`,
-`top_a`, `xtc` and `temperature`. Case, kebab/compact spellings and upstream
+`top_a`, `xtc`, `temperature` and `adaptive_p`. Case, kebab/compact spellings and upstream
 `nucleus`/`temp`/`typ` aliases are accepted. An empty list applies no optional
 stages; omitted stages stay omitted and repeated stages run again. Bias, grammar
 and stop contracts always remain active. The default ordering follows the pinned
@@ -128,14 +128,25 @@ updates its entropy denominator; mask-only stages retain their candidate count.
 The device sampler runs only when cached typed transforms prove the actual
 parameters and stage order equivalent to its fixed pipeline. Temperature stays
 at its requested position: finite-precision scaling can merge distinct logits,
-so it cannot move across top-k. The matching fixed-order
-device path remains available; other orders execute on host logits.
+so it cannot move across top-k. The matching fixed-order device path remains
+available; other orders execute on host logits.
 
 `/props.nxrt_capabilities.custom_sampler_order` reports the actual executor
 capability. Authored sampler graphs without runtime-owned sampling reject custom
 orders, active top-n-sigma and dynamic temperature before execution, with typed
 400 errors; their properties do not advertise an unusable default stage list.
-Adaptive/infill selector stages, thinking budgets, continuation of a final
+The explicit `adaptive_p` selector runs once after the other requested stages,
+regardless of its listed position or repetitions. `adaptive_target` selects a
+probability in [0, 1]; negative values disable adaptation, and it is inactive
+without the explicit selector. `adaptive_decay` defaults to 0.9 and accepts
+[0, 0.99]. The quadratic/linear probability transform and weighted EMA use the
+original probability of each selected token, following the pinned
+[upstream adaptive-p implementation](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-sampler.cpp).
+Request-local checkpoints restore the EMA when speculative choices are discarded. Stateful feedback stages run
+on host and cannot be skipped by a device argmax shortcut. Mirostat takes
+precedence over the ordered selector list, following upstream.
+
+Infill selector stages, thinking budgets, continuation of a final
 assistant message and other unsupported active controls still return actionable
 request errors.
 Optional progress/control subscription fields from Llama Chat are accepted, but

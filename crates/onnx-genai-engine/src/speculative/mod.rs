@@ -2377,7 +2377,7 @@ impl Engine {
                 step: step + idx,
             };
             let target_token =
-                select_next_token_with_rng(&mut target_logits[idx], &context, options, chain, rng);
+                select_next_token_with_rng(&mut target_logits[idx], &context, options, chain, rng)?;
             if let (Some(top_logprobs), Some(logprobs)) =
                 (options.top_logprobs, candidate_logprobs.as_mut())
             {
@@ -2481,7 +2481,7 @@ impl Engine {
                 options,
                 chain,
                 rng,
-            );
+            )?;
             if let (Some(top_logprobs), Some(logprobs)) =
                 (options.top_logprobs, commit_logprobs.as_mut())
             {

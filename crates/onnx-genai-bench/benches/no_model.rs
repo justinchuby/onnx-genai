@@ -51,7 +51,9 @@ fn sampling(c: &mut Criterion) {
             b.iter_batched(
                 || logits.clone(),
                 |mut work| {
-                    processor.process(&mut work, &context);
+                    processor
+                        .process(&mut work, &context)
+                        .expect("benchmark logits must process");
                     sampler.sample(black_box(&work), black_box(&context))
                 },
                 BatchSize::SmallInput,
@@ -65,20 +67,25 @@ fn full_sort_top_k(logits: &mut [f32], top_k: usize) {
     if top_k == 0 || top_k >= logits.len() {
         return;
     }
-    let mut sorted: Vec<f32> = logits
+    let mut ranked: Vec<_> = logits
         .iter()
         .copied()
-        .filter(|value| !value.is_nan())
+        .enumerate()
+        .filter(|(_, value)| !value.is_nan())
         .collect();
-    if sorted.is_empty() {
-        return;
-    }
-    sorted.sort_unstable_by(|left, right| {
-        right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
+    ranked.sort_unstable_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap()
+            .then_with(|| left.0.cmp(&right.0))
     });
-    let threshold = sorted[top_k.saturating_sub(1).min(sorted.len() - 1)];
-    for logit in logits {
-        if logit.is_nan() || *logit < threshold {
+    let mut kept = vec![false; logits.len()];
+    for &(id, _) in ranked.iter().take(top_k) {
+        kept[id] = true;
+    }
+    for (id, logit) in logits.iter_mut().enumerate() {
+        if !kept[id] {
             *logit = f32::NEG_INFINITY;
         }
     }
@@ -154,7 +161,9 @@ fn qwen3_sampling_processors(c: &mut Criterion) {
     let top_p = TopPProcessor { top_p: 0.95 };
 
     let mut top_k_logits = logits.clone();
-    top_k.process(&mut top_k_logits, &context);
+    top_k
+        .process(&mut top_k_logits, &context)
+        .expect("benchmark logits must process");
 
     let mut group = c.benchmark_group("qwen3_sampling_processors");
     group.throughput(Throughput::Elements(1));
@@ -168,7 +177,11 @@ fn qwen3_sampling_processors(c: &mut Criterion) {
     group.bench_function("top_k_partial_selection", |b| {
         b.iter_batched(
             || logits.clone(),
-            |mut work| top_k.process(black_box(&mut work), black_box(&context)),
+            |mut work| {
+                top_k
+                    .process(black_box(&mut work), black_box(&context))
+                    .expect("benchmark logits must process")
+            },
             BatchSize::SmallInput,
         )
     });
@@ -182,7 +195,11 @@ fn qwen3_sampling_processors(c: &mut Criterion) {
     group.bench_function("top_p_fast_after_top_k", |b| {
         b.iter_batched(
             || top_k_logits.clone(),
-            |mut work| top_p.process(black_box(&mut work), black_box(&context)),
+            |mut work| {
+                top_p
+                    .process(black_box(&mut work), black_box(&context))
+                    .expect("benchmark logits must process")
+            },
             BatchSize::SmallInput,
         )
     });
@@ -200,8 +217,12 @@ fn qwen3_sampling_processors(c: &mut Criterion) {
         b.iter_batched(
             || logits.clone(),
             |mut work| {
-                top_k.process(black_box(&mut work), black_box(&context));
-                top_p.process(black_box(&mut work), black_box(&context));
+                top_k
+                    .process(black_box(&mut work), black_box(&context))
+                    .expect("benchmark logits must process");
+                top_p
+                    .process(black_box(&mut work), black_box(&context))
+                    .expect("benchmark logits must process");
             },
             BatchSize::SmallInput,
         )
@@ -234,7 +255,11 @@ fn logit_processing(c: &mut Criterion) {
     group.bench_function("seven_processor_chain_per_step", |b| {
         b.iter_batched(
             || logits.clone(),
-            |mut work| chain.process(black_box(&mut work), black_box(&context)),
+            |mut work| {
+                chain
+                    .process(black_box(&mut work), black_box(&context))
+                    .expect("benchmark logits must process")
+            },
             BatchSize::SmallInput,
         )
     });

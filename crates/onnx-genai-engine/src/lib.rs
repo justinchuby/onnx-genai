@@ -47,20 +47,21 @@ pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
 pub use engine::graph_port_contracts;
 pub use engine::{
-    DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, DynamicTemperatureConfig,
-    Eagle3Config, Engine, EngineConfig, EngineConfigError, EngineDecodeBackend,
-    EngineGovernorError, EngineResourceGovernor, FinishReason, GenerateConstraint, GenerateOptions,
-    GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
-    GenerationBudgetCap, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
-    MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
-    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
-    OrtEngineWorkerFactory, OrtSessionWorkerLoadError, PackageExecutionError, PrefillRequest,
-    PrefillResult, PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount,
-    SamplerSequence, SamplerStage, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
-    SessionForkError, SessionForkParticipant, SessionForkParticipantKind, SessionForkPlan,
-    SessionId, SessionPosition, SessionPrefillCarry, SpeculativeMode, TokenLogprob, ToolCallPolicy,
-    WeightAccessPattern, WeightPlacementReport, XtcConfig, package_execution_error,
-    parse_device_policy, parse_resource_limit, resolve_device_vram_limit_bytes,
+    AdaptivePConfig, DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig,
+    DynamicTemperatureConfig, Eagle3Config, Engine, EngineConfig, EngineConfigError,
+    EngineDecodeBackend, EngineGovernorError, EngineResourceGovernor, FinishReason,
+    GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
+    GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
+    KvConnectorConfig, LayerWeightBytes, LimitParseError, MemoryPolicyApplication, MemoryStrategy,
+    MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
+    MtpConfig, MtpHiddenLayout, MtpWeightSource, OrtEngineWorkerFactory, OrtSessionWorkerLoadError,
+    PackageExecutionError, PrefillRequest, PrefillResult, PrioritizedGenerateRequest,
+    PrioritizedGenerateResult, RewindTokenCount, SamplerSequence, SamplerStage, SamplingOverrides,
+    ScheduledGenerateArrival, SessionCheckpoint, SessionForkError, SessionForkParticipant,
+    SessionForkParticipantKind, SessionForkPlan, SessionId, SessionPosition, SessionPrefillCarry,
+    SpeculativeMode, TokenLogprob, ToolCallPolicy, WeightAccessPattern, WeightPlacementReport,
+    XtcConfig, package_execution_error, parse_device_policy, parse_resource_limit,
+    resolve_device_vram_limit_bytes,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{

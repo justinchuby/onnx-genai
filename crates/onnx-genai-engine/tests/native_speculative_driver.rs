@@ -178,3 +178,49 @@ fn native_prompt_lookup_matches_plain_greedy_cuda() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn adaptive_p_uses_plain_native_sampling_when_speculation_cannot_run_processors()
+-> anyhow::Result<()> {
+    use onnx_genai_engine::{AdaptivePConfig, SamplerSequence, SamplerStage};
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+    let mut baseline = native_engine(&fixture, None)?;
+    let mut speculative = native_engine(&fixture, None)?;
+    let mut request = greedy_request(GeneratePrompt::TokenIds(vec![0]), 8);
+    request.options.greedy = false;
+    request.options.temperature = 1.0;
+    request.options.adaptive_p = AdaptivePConfig {
+        target: 0.0,
+        decay: 0.9,
+    };
+    request.options.sampler_order =
+        Some(SamplerSequence::new(vec![SamplerStage::AdaptiveP]).unwrap());
+    request.options.logit_bias = (0..32)
+        .map(|id| {
+            (
+                id,
+                match id {
+                    0 => onnx_genai_engine::logits::LogitBias::Add(100.0),
+                    1 => onnx_genai_engine::logits::LogitBias::Add(0.0),
+                    _ => onnx_genai_engine::logits::LogitBias::Ban,
+                },
+            )
+        })
+        .collect();
+    let expected = baseline.generate(request.clone())?;
+    let actual = speculative.generate(with_prompt_lookup(request, 1, 4))?;
+    let stats = speculative.last_speculative_stats();
+    assert_eq!(
+        expected.token_ids,
+        vec![1; 8],
+        "adaptive-p must override the biased raw maximum at token 0"
+    );
+    assert_eq!(actual.token_ids, expected.token_ids);
+    assert_eq!(actual.finish_reason, expected.finish_reason);
+    // Native speculation currently accepts only empty processor chains and
+    // raw greedy selection. It must run the ordinary sampler instead of
+    // bypassing this request's stateful probability transform.
+    assert_eq!(stats.proposed_tokens, 0, "{stats:?}");
+    Ok(())
+}

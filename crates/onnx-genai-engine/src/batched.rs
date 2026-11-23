@@ -1086,7 +1086,7 @@ impl<'a> ContinuousBatchManager<'a> {
                     &row.options,
                     &row.chain,
                     &mut row.state.rng,
-                );
+                )?;
                 if let (Some(top_logprobs), Some(logprobs)) =
                     (row.options.top_logprobs, row.state.logprobs.as_mut())
                 {

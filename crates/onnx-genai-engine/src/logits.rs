@@ -5,6 +5,7 @@
 //! its own temperature/selector mode. Device shortcuts require a cached typed
 //! transform proof, including actual parameters and equivalent stage order.
 
+use anyhow::Context as _;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Mutex;
 
@@ -98,8 +99,19 @@ pub enum DeviceSamplingTransform {
 
 /// A logit processor modifies the logit distribution before sampling.
 pub trait LogitProcessor: Send + Sync {
-    fn process(&self, logits: &mut [f32], context: &ProcessorContext);
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) -> anyhow::Result<()>;
     fn name(&self) -> &str;
+
+    /// Whether selected tokens update request-local sampler state.
+    fn needs_selection_feedback(&self) -> bool {
+        false
+    }
+
+    /// Stage a selected token. A later process call may rewind this choice
+    /// using its generated-token prefix before retrying a branch.
+    fn on_selected(&self, _token: TokenId, _context: &ProcessorContext) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Whether this processor needs logical candidate cardinality after truncation.
     fn needs_candidate_count(&self) -> bool {
@@ -113,9 +125,9 @@ pub trait LogitProcessor: Send + Sync {
         logits: &mut [f32],
         context: &ProcessorContext,
         count: usize,
-    ) -> usize {
-        self.process(logits, context);
-        count
+    ) -> anyhow::Result<usize> {
+        self.process(logits, context)?;
+        Ok(count)
     }
 
     /// Declare exact fixed-device semantics; unknown/custom transforms stay on host.
@@ -147,6 +159,7 @@ pub struct ProcessorChain {
     processors: Vec<Box<dyn LogitProcessor>>,
     device_transforms: Option<Vec<DeviceSamplingTransform>>,
     track_candidates: bool,
+    selection_feedback: bool,
 }
 impl Default for ProcessorChain {
     fn default() -> Self {
@@ -160,6 +173,7 @@ impl ProcessorChain {
             processors: Vec::new(),
             device_transforms: Some(Vec::new()),
             track_candidates: false,
+            selection_feedback: false,
         }
     }
 
@@ -169,6 +183,10 @@ impl ProcessorChain {
 
     pub fn add(&mut self, processor: Box<dyn LogitProcessor>) {
         self.track_candidates |= processor.needs_candidate_count();
+        self.selection_feedback |= processor.needs_selection_feedback();
+        if self.selection_feedback {
+            self.device_transforms = None;
+        }
         if let Some(transforms) = &mut self.device_transforms {
             if let Some(transform) = processor.device_sampling_transform() {
                 transforms.push(transform);
@@ -194,13 +212,16 @@ impl ProcessorChain {
         self.processors.pop();
         self.processors
             .push(Box::new(TopKTopPProcessor { top_k, top_p }));
-        self.device_transforms =
+        self.device_transforms = if self.selection_feedback {
+            None
+        } else {
             self.processors
                 .iter()
                 .try_fold(Vec::new(), |mut transforms, processor| {
                     transforms.push(processor.device_sampling_transform()?);
                     Some(transforms)
-                });
+                })
+        };
         true
     }
 
@@ -221,9 +242,11 @@ impl ProcessorChain {
     /// emptiness here denied the device argmax to every model shipping a chat
     /// template, which is nearly all of them.
     pub fn preserves_argmax(&self) -> bool {
-        self.processors
-            .iter()
-            .all(|processor| processor.preserves_argmax())
+        !self.selection_feedback
+            && self
+                .processors
+                .iter()
+                .all(|processor| processor.preserves_argmax())
     }
 
     pub fn add_constraint(
@@ -240,17 +263,46 @@ impl ProcessorChain {
     }
 
     /// Apply processors in insertion order.
-    pub fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
+    pub fn process(&self, logits: &mut [f32], context: &ProcessorContext) -> anyhow::Result<()> {
         if self.track_candidates {
             let mut candidates = logits.len();
             for processor in &self.processors {
-                candidates = processor.process_with_candidate_count(logits, context, candidates);
+                candidates = processor
+                    .process_with_candidate_count(logits, context, candidates)
+                    .with_context(|| {
+                        format!(
+                            "sampling stage '{}' failed at generated token {}",
+                            processor.name(),
+                            context.generated_tokens.len()
+                        )
+                    })?;
             }
         } else {
             for processor in &self.processors {
-                processor.process(logits, context);
+                processor.process(logits, context).with_context(|| {
+                    format!(
+                        "sampling stage '{}' failed at generated token {}",
+                        processor.name(),
+                        context.generated_tokens.len()
+                    )
+                })?;
             }
         }
+        Ok(())
+    }
+
+    /// Stage feedback only after processing and selecting against this context.
+    /// Keep generated history unchanged until this method succeeds.
+    pub fn on_selected(&self, token: TokenId, context: &ProcessorContext) -> anyhow::Result<()> {
+        if self.selection_feedback {
+            for processor in &self.processors {
+                processor.on_selected(token, context).with_context(|| format!(
+                    "sampling stage '{}' could not stage selected token {token} at generated token {}",
+                    processor.name(), context.generated_tokens.len()
+                ))?;
+            }
+        }
+        Ok(())
     }
 
     /// Return the first termination signal from the ordered chain.
@@ -323,7 +375,7 @@ impl ConstraintProcessor {
 }
 
 impl LogitProcessor for ConstraintProcessor {
-    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) -> anyhow::Result<()> {
         let candidates: Vec<_> = (0..logits.len())
             .map(|idx| {
                 let token_id = idx as TokenId;
@@ -344,6 +396,7 @@ impl LogitProcessor for ConstraintProcessor {
                 *logit = f32::NEG_INFINITY;
             }
         }
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -973,15 +1026,16 @@ impl LogitProcessor for TemperatureProcessor {
     fn needs_candidate_count(&self) -> bool {
         self.dynamic.is_some_and(|config| config.range > 0.0)
     }
-    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
-        self.process_with_candidate_count(logits, context, logits.len());
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) -> anyhow::Result<()> {
+        self.process_with_candidate_count(logits, context, logits.len())?;
+        Ok(())
     }
     fn process_with_candidate_count(
         &self,
         logits: &mut [f32],
         _context: &ProcessorContext,
         count: usize,
-    ) -> usize {
+    ) -> anyhow::Result<usize> {
         let temperature = self.resolved_temperature(logits, count);
         if temperature == 0.0 {
             // A collapsed interval is a point mass on the first maximum, as
@@ -1008,7 +1062,7 @@ impl LogitProcessor for TemperatureProcessor {
                 *logit /= temperature;
             }
         }
-        count
+        Ok(count)
     }
 
     fn name(&self) -> &str {
@@ -1031,7 +1085,7 @@ pub struct LogitBiasProcessor {
     pub biases: std::collections::BTreeMap<TokenId, LogitBias>,
 }
 impl LogitProcessor for LogitBiasProcessor {
-    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) -> anyhow::Result<()> {
         for (id, bias) in &self.biases {
             if let Some(logit) = usize::try_from(*id).ok().and_then(|id| logits.get_mut(id)) {
                 match bias {
@@ -1040,6 +1094,7 @@ impl LogitProcessor for LogitBiasProcessor {
                 }
             }
         }
+        Ok(())
     }
     fn name(&self) -> &str {
         "logit_bias"
@@ -1068,13 +1123,13 @@ impl Default for PenaltiesProcessor {
 }
 
 impl LogitProcessor for PenaltiesProcessor {
-    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) -> anyhow::Result<()> {
         if self.window == Some(0)
             || (self.repetition_penalty == 1.0
                 && self.frequency_penalty == 0.0
                 && self.presence_penalty == 0.0)
         {
-            return;
+            return Ok(());
         }
         let total = context
             .prompt_tokens
@@ -1100,6 +1155,7 @@ impl LogitProcessor for PenaltiesProcessor {
                 *logit -= count as f32 * self.frequency_penalty + self.presence_penalty;
             }
         }
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -1122,14 +1178,14 @@ pub struct DryProcessor {
 }
 
 impl LogitProcessor for DryProcessor {
-    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) -> anyhow::Result<()> {
         if !self.multiplier.is_finite()
             || self.multiplier <= 0.0
             || !self.base.is_finite()
             || self.base < 1.0
             || self.allowed_length == 0
         {
-            return;
+            return Ok(());
         }
 
         let tokens: Vec<_> = context
@@ -1139,7 +1195,7 @@ impl LogitProcessor for DryProcessor {
             .copied()
             .collect();
         if tokens.len() <= self.allowed_length {
-            return;
+            return Ok(());
         }
 
         let tokens = &tokens[tokens
@@ -1198,6 +1254,7 @@ impl LogitProcessor for DryProcessor {
                 *logit -= penalty;
             }
         }
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -1216,7 +1273,9 @@ impl StopSequenceProcessor {
 }
 
 impl LogitProcessor for StopSequenceProcessor {
-    fn process(&self, _logits: &mut [f32], _context: &ProcessorContext) {}
+    fn process(&self, _logits: &mut [f32], _context: &ProcessorContext) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// This processor never touches the logits -- it exists only for its
     /// [`signal`](Self::signal), which the loop reads through
@@ -1258,9 +1317,9 @@ impl LogitProcessor for TopNSigmaProcessor {
         true
     }
 
-    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) -> anyhow::Result<()> {
         if self.n <= 0.0 {
-            return;
+            return Ok(());
         }
         let mut count = 0usize;
         let mut mean = 0.0f64;
@@ -1274,7 +1333,7 @@ impl LogitProcessor for TopNSigmaProcessor {
             maximum = maximum.max(logit);
         }
         if count <= 1 {
-            return;
+            return Ok(());
         }
         let cutoff = f64::from(maximum) - f64::from(self.n) * (m2 / count as f64).sqrt();
         for logit in logits {
@@ -1282,6 +1341,7 @@ impl LogitProcessor for TopNSigmaProcessor {
                 *logit = f32::NEG_INFINITY;
             }
         }
+        Ok(())
     }
     fn name(&self) -> &str {
         "top_n_sigma"
@@ -1321,23 +1381,23 @@ impl LogitProcessor for TopKProcessor {
         logits: &mut [f32],
         context: &ProcessorContext,
         count: usize,
-    ) -> usize {
-        self.process(logits, context);
+    ) -> anyhow::Result<usize> {
+        self.process(logits, context)?;
 
-        if self.top_k > 0 {
+        Ok(if self.top_k > 0 {
             count.min(self.top_k)
         } else {
             count
-        }
+        })
     }
 
     fn device_sampling_transform(&self) -> Option<DeviceSamplingTransform> {
         Some(DeviceSamplingTransform::TopK(self.top_k))
     }
 
-    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) -> anyhow::Result<()> {
         let Some(mut boundary) = top_k_boundary(logits, self.top_k) else {
-            return;
+            return Ok(());
         };
 
         for logit in logits.iter_mut() {
@@ -1345,6 +1405,7 @@ impl LogitProcessor for TopKProcessor {
                 *logit = f32::NEG_INFINITY;
             }
         }
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -1382,19 +1443,19 @@ impl LogitProcessor for TopKTopPProcessor {
         logits: &mut [f32],
         context: &ProcessorContext,
         count: usize,
-    ) -> usize {
-        self.process(logits, context);
+    ) -> anyhow::Result<usize> {
+        self.process(logits, context)?;
         let live = logits.iter().filter(|value| value.is_finite()).count();
         let limited = if self.top_k > 0 {
             count.min(self.top_k)
         } else {
             count
         };
-        if self.top_p < 1.0 && live > 0 {
+        Ok(if self.top_p < 1.0 && live > 0 {
             live.min(limited)
         } else {
             limited
-        }
+        })
     }
 
     fn device_sampling_transform(&self) -> Option<DeviceSamplingTransform> {
@@ -1404,11 +1465,11 @@ impl LogitProcessor for TopKTopPProcessor {
         })
     }
 
-    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) -> anyhow::Result<()> {
         let Some(mut boundary) = top_k_boundary(logits, self.top_k) else {
             // No top-k pruning applies, so this degenerates to plain top-p.
-            TopPProcessor { top_p: self.top_p }.process(logits, _context);
-            return;
+            TopPProcessor { top_p: self.top_p }.process(logits, _context)?;
+            return Ok(());
         };
 
         // Keep exactly k ranked candidates, resolving threshold ties by token
@@ -1428,10 +1489,10 @@ impl LogitProcessor for TopKTopPProcessor {
         }
 
         if !self.top_p.is_finite() || self.top_p >= 1.0 || survivors.is_empty() {
-            return;
+            return Ok(());
         }
         if !maximum_logit.is_finite() {
-            return;
+            return Ok(());
         }
 
         // Softmax over the survivors only.
@@ -1442,7 +1503,7 @@ impl LogitProcessor for TopKTopPProcessor {
             total += weight;
         }
         if !total.is_finite() || total <= 0.0 {
-            return;
+            return Ok(());
         }
         let inverse_total = 1.0_f32 / total;
         let mut zero_probability: Vec<usize> = Vec::new();
@@ -1460,7 +1521,7 @@ impl LogitProcessor for TopKTopPProcessor {
             logits[index] = f32::NEG_INFINITY;
         }
         if probabilities.is_empty() {
-            return;
+            return Ok(());
         }
 
         let cutoff = self.top_p.max(0.0);
@@ -1468,6 +1529,7 @@ impl LogitProcessor for TopKTopPProcessor {
         for &(index, _) in probabilities.iter().skip(keep_count) {
             logits[index] = f32::NEG_INFINITY;
         }
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -1489,32 +1551,32 @@ impl LogitProcessor for TopPProcessor {
         logits: &mut [f32],
         context: &ProcessorContext,
         count: usize,
-    ) -> usize {
-        self.process(logits, context);
+    ) -> anyhow::Result<usize> {
+        self.process(logits, context)?;
         let live = logits.iter().filter(|value| value.is_finite()).count();
-        if self.top_p < 1.0 {
+        Ok(if self.top_p < 1.0 {
             if live > 0 { live.min(count) } else { count }
         } else {
             count
-        }
+        })
     }
 
     fn device_sampling_transform(&self) -> Option<DeviceSamplingTransform> {
         Some(DeviceSamplingTransform::TopP(self.top_p))
     }
 
-    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) -> anyhow::Result<()> {
         if !self.top_p.is_finite() || self.top_p >= 1.0 || logits.is_empty() {
-            return;
+            return Ok(());
         }
 
         let Some((mut probabilities, zero_probability_indices)) =
             nonzero_softmax_probabilities(logits)
         else {
-            return;
+            return Ok(());
         };
         if probabilities.is_empty() {
-            return;
+            return Ok(());
         }
 
         let cutoff = self.top_p.max(0.0);
@@ -1526,6 +1588,7 @@ impl LogitProcessor for TopPProcessor {
         for &(idx, _) in probabilities.iter().skip(keep_count) {
             logits[idx] = f32::NEG_INFINITY;
         }
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -1547,27 +1610,27 @@ impl LogitProcessor for MinPProcessor {
         logits: &mut [f32],
         context: &ProcessorContext,
         count: usize,
-    ) -> usize {
-        self.process(logits, context);
+    ) -> anyhow::Result<usize> {
+        self.process(logits, context)?;
         let live = logits.iter().filter(|value| value.is_finite()).count();
-        if self.min_p > 0.0 {
+        Ok(if self.min_p > 0.0 {
             if live > 0 { live.min(count) } else { count }
         } else {
             count
-        }
+        })
     }
 
     fn device_sampling_transform(&self) -> Option<DeviceSamplingTransform> {
         Some(DeviceSamplingTransform::MinP(self.min_p))
     }
 
-    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) -> anyhow::Result<()> {
         if !self.min_p.is_finite() || self.min_p <= 0.0 || logits.is_empty() {
-            return;
+            return Ok(());
         }
 
         let Some(probabilities) = softmax_probabilities(logits) else {
-            return;
+            return Ok(());
         };
 
         let top_prob = probabilities.iter().copied().fold(0.0, f32::max);
@@ -1577,6 +1640,7 @@ impl LogitProcessor for MinPProcessor {
                 *logit = f32::NEG_INFINITY;
             }
         }
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -1599,22 +1663,22 @@ impl LogitProcessor for TopAProcessor {
         logits: &mut [f32],
         context: &ProcessorContext,
         count: usize,
-    ) -> usize {
-        self.process(logits, context);
+    ) -> anyhow::Result<usize> {
+        self.process(logits, context)?;
         let live = logits.iter().filter(|value| value.is_finite()).count();
-        if self.top_a > 0.0 {
+        Ok(if self.top_a > 0.0 {
             if live > 0 { live.min(count) } else { count }
         } else {
             count
-        }
+        })
     }
 
-    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) -> anyhow::Result<()> {
         if !self.top_a.is_finite() || self.top_a <= 0.0 || logits.is_empty() {
-            return;
+            return Ok(());
         }
         let Some(probabilities) = softmax_probabilities(logits) else {
-            return;
+            return Ok(());
         };
         let maximum_probability = probabilities.iter().copied().fold(0.0, f32::max);
         let threshold = self.top_a.min(1.0) * maximum_probability * maximum_probability;
@@ -1623,6 +1687,7 @@ impl LogitProcessor for TopAProcessor {
                 *logit = f32::NEG_INFINITY;
             }
         }
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -1641,22 +1706,22 @@ impl LogitProcessor for TypicalPProcessor {
         logits: &mut [f32],
         context: &ProcessorContext,
         count: usize,
-    ) -> usize {
-        self.process(logits, context);
+    ) -> anyhow::Result<usize> {
+        self.process(logits, context)?;
         let live = logits.iter().filter(|value| value.is_finite()).count();
-        if self.typical_p < 1.0 {
+        Ok(if self.typical_p < 1.0 {
             if live > 0 { live.min(count) } else { count }
         } else {
             count
-        }
+        })
     }
 
-    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) -> anyhow::Result<()> {
         if !self.typical_p.is_finite() || self.typical_p >= 1.0 || logits.is_empty() {
-            return;
+            return Ok(());
         }
         let Some(probabilities) = softmax_probabilities(logits) else {
-            return;
+            return Ok(());
         };
         let entropy: f32 = probabilities
             .iter()
@@ -1691,6 +1756,7 @@ impl LogitProcessor for TypicalPProcessor {
         for &(index, _, _) in ranked.iter().skip(keep_count) {
             logits[index] = f32::NEG_INFINITY;
         }
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -1777,22 +1843,21 @@ impl MirostatProcessor {
 }
 
 impl LogitProcessor for MirostatProcessor {
-    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) -> anyhow::Result<()> {
         if !self.tau.is_finite()
             || self.tau <= 0.0
             || !self.eta.is_finite()
             || self.eta <= 0.0
             || logits.is_empty()
         {
-            return;
+            return Ok(());
         }
         let Some(probabilities) = softmax_probabilities(logits) else {
-            return;
+            return Ok(());
         };
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
+        let mut state = self.state.lock().map_err(|_| {
+            anyhow::anyhow!("Mirostat request state is poisoned; restart this generation")
+        })?;
 
         if let Some(previous) = state.previous_step.take() {
             if context.generated_tokens.len() < previous.generated_length {
@@ -1818,6 +1883,7 @@ impl LogitProcessor for MirostatProcessor {
             generated_length: context.generated_tokens.len(),
             probabilities,
         });
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -1834,6 +1900,124 @@ fn mirostat_v2_keep_count(ranked: &[(usize, f32)], mu: f32) -> usize {
         .position(|(_, probability)| *probability <= 0.0 || -probability.log2() > mu)
         .unwrap_or(ranked.len())
         .max(1)
+}
+
+/// Request-local adaptive probability transform. The ordinary terminal sampler
+/// supplies the draw; selected-token feedback records original probabilities.
+pub(crate) struct AdaptivePProcessor {
+    config: crate::AdaptivePConfig,
+    state: Mutex<AdaptivePState>,
+}
+#[derive(Clone, Copy)]
+struct AdaptivePStats {
+    weighted_sum: f32,
+    total_weight: f32,
+}
+struct AdaptivePSelection {
+    token: TokenId,
+    before: AdaptivePStats,
+}
+struct AdaptivePPending {
+    generated_len: usize,
+    original_probabilities: Vec<f32>,
+}
+struct AdaptivePState {
+    stats: AdaptivePStats,
+    selections: Vec<AdaptivePSelection>,
+    pending: Option<AdaptivePPending>,
+}
+impl AdaptivePProcessor {
+    pub(crate) fn new(config: crate::AdaptivePConfig) -> anyhow::Result<Self> {
+        config.validate()?;
+        anyhow::ensure!(
+            config.target >= 0.0,
+            "adaptive_p processor requires a non-negative adaptive_target; omit the processor when adaptation is disabled"
+        );
+        Ok(Self {
+            config,
+            state: Mutex::new(AdaptivePState {
+                stats: AdaptivePStats {
+                    weighted_sum: config.target / (1.0 - config.decay),
+                    total_weight: 1.0 / (1.0 - config.decay),
+                },
+                selections: Vec::new(),
+                pending: None,
+            }),
+        })
+    }
+}
+impl LogitProcessor for AdaptivePProcessor {
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) -> anyhow::Result<()> {
+        let mut state = self.state.lock().map_err(|_| {
+            anyhow::anyhow!("adaptive_p request state is poisoned; restart this generation")
+        })?;
+        let common = state
+            .selections
+            .iter()
+            .zip(&context.generated_tokens)
+            .take_while(|(selection, token)| selection.token == **token)
+            .count();
+        if common < state.selections.len() {
+            state.stats = state.selections[common].before;
+            state.selections.truncate(common);
+        }
+        anyhow::ensure!(
+            common == context.generated_tokens.len(),
+            "adaptive_p history contains tokens without selection feedback at offset {common}; restart generation or use the engine's token-selection pipeline"
+        );
+        state.pending = None;
+        let probabilities = softmax_probabilities(logits).ok_or_else(|| anyhow::anyhow!(
+            "adaptive_p could not normalize model logits; leave a finite unmasked candidate by reducing penalties/token bans, or inspect non-finite model outputs"
+        ))?;
+        let target = (2.0 * self.config.target
+            - state.stats.weighted_sum / state.stats.total_weight)
+            .clamp(0.0, 1.0);
+        for (logit, probability) in logits.iter_mut().zip(&probabilities) {
+            if logit.is_nan() || *logit == f32::NEG_INFINITY {
+                *logit = f32::NEG_INFINITY;
+                continue;
+            }
+            let distance = ((*probability - target) * (1.0 / 0.3)).abs();
+            *logit = 5.0 - 10.0 * distance * distance / (1.0 + distance);
+        }
+        state.pending = Some(AdaptivePPending {
+            generated_len: context.generated_tokens.len(),
+            original_probabilities: probabilities,
+        });
+        Ok(())
+    }
+    fn needs_selection_feedback(&self) -> bool {
+        true
+    }
+    fn on_selected(&self, token: TokenId, context: &ProcessorContext) -> anyhow::Result<()> {
+        let mut state = self.state.lock().map_err(|_| {
+            anyhow::anyhow!("adaptive_p request state is poisoned; restart this generation")
+        })?;
+        let pending = state.pending.take().ok_or_else(|| anyhow::anyhow!("adaptive_p selection has no pending probability distribution; process logits before staging a token"))?;
+        anyhow::ensure!(
+            pending.generated_len == context.generated_tokens.len()
+                && state.selections.len() == pending.generated_len
+                && state
+                    .selections
+                    .iter()
+                    .zip(&context.generated_tokens)
+                    .all(|(selection, token)| selection.token == *token),
+            "adaptive_p selection history changed after logits were processed; restart this generation"
+        );
+        let probability = *pending.original_probabilities.get(token as usize).ok_or_else(|| anyhow::anyhow!(
+            "adaptive_p selected token {token} is outside the processed vocabulary; select a token from the model logits"
+        ))?;
+        let before = state.stats;
+        state.stats = AdaptivePStats {
+            weighted_sum: probability + self.config.decay * before.weighted_sum,
+            total_weight: 1.0 + self.config.decay * before.total_weight,
+        };
+        state.selections.push(AdaptivePSelection { token, before });
+        Ok(())
+    }
+    fn name(&self) -> &str {
+        "adaptive_p"
+    }
 }
 
 /// XTC randomly removes all but the least-probable token among top choices.
@@ -1860,30 +2044,30 @@ impl LogitProcessor for XtcProcessor {
         logits: &mut [f32],
         context: &ProcessorContext,
         count: usize,
-    ) -> usize {
+    ) -> anyhow::Result<usize> {
         let before = logits.iter().filter(|value| value.is_finite()).count();
-        self.process(logits, context);
+        self.process(logits, context)?;
         let after = logits.iter().filter(|value| value.is_finite()).count();
-        count.saturating_sub(before.saturating_sub(after))
+        Ok(count.saturating_sub(before.saturating_sub(after)))
     }
 
-    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+    fn process(&self, logits: &mut [f32], _context: &ProcessorContext) -> anyhow::Result<()> {
         if !self.probability.is_finite()
             || self.probability <= 0.0
             || !self.threshold.is_finite()
             || logits.is_empty()
         {
-            return;
+            return Ok(());
         }
         let should_apply = match self.rng.lock() {
             Ok(mut rng) => rng.random::<f32>() < self.probability.min(1.0),
             Err(_) => false,
         };
         if !should_apply {
-            return;
+            return Ok(());
         }
         let Some(probabilities) = softmax_probabilities(logits) else {
-            return;
+            return Ok(());
         };
         let candidates: Vec<_> = probabilities
             .iter()
@@ -1892,7 +2076,7 @@ impl LogitProcessor for XtcProcessor {
             .filter(|(_, probability)| *probability > 0.0 && *probability > self.threshold.max(0.0))
             .collect();
         if candidates.len() < 2 {
-            return;
+            return Ok(());
         }
         let keep_index = candidates
             .iter()
@@ -1908,6 +2092,7 @@ impl LogitProcessor for XtcProcessor {
                 logits[index] = f32::NEG_INFINITY;
             }
         }
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -2259,6 +2444,146 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_p_feedback_uses_original_selected_probability_and_restores_branches() {
+        let processor = AdaptivePProcessor::new(crate::AdaptivePConfig {
+            target: 0.6,
+            decay: 0.0,
+        })
+        .unwrap();
+        let original = vec![0.8_f32.ln(), 0.2_f32.ln(), f32::NEG_INFINITY];
+        let mut context = ProcessorContext::default();
+        let mut first = original.clone();
+        processor.process(&mut first, &context).unwrap();
+        assert!((first[0] - 2.3333333).abs() < 1e-5);
+        assert!((first[1] - -2.6190476).abs() < 1e-5);
+        assert!(first[0] > first[1]);
+        assert_eq!(first[2], f32::NEG_INFINITY);
+        processor.on_selected(0, &context).unwrap();
+        context.generated_tokens.push(0);
+        let mut second = original.clone();
+        processor.process(&mut second, &context).unwrap();
+        assert!(
+            second[1] > second[0],
+            "accepted original probability 0.8 adapts target to 0.4"
+        );
+        assert!((processor.state.lock().unwrap().stats.weighted_sum - 0.8).abs() < 1e-6);
+        processor.on_selected(1, &context).unwrap();
+        // Discard the staged second token and retry the identical accepted prefix.
+        let mut retried = original.clone();
+        processor.process(&mut retried, &context).unwrap();
+        assert_eq!(retried, second);
+        processor.on_selected(0, &context).unwrap();
+        context.generated_tokens.push(0);
+        let mut next = original.clone();
+        processor.process(&mut next, &context).unwrap();
+        assert_eq!(
+            next, second,
+            "discarded probability 0.2 must not leak into EMA"
+        );
+        // Rewind all choices: the request's initial target is restored.
+        context.generated_tokens.clear();
+        let mut reset = original;
+        processor.process(&mut reset, &context).unwrap();
+        assert_eq!(reset, first);
+    }
+
+    #[test]
+    fn adaptive_p_decay_keeps_the_initialized_weighted_prior() {
+        let processor = AdaptivePProcessor::new(crate::AdaptivePConfig {
+            target: 0.5,
+            decay: 0.9,
+        })
+        .unwrap();
+        let context = ProcessorContext::default();
+        let mut logits = [0.8_f32.ln(), 0.2_f32.ln()];
+        processor.process(&mut logits, &context).unwrap();
+        assert!((logits[0] - logits[1]).abs() < 1e-5);
+        processor.on_selected(0, &context).unwrap();
+        let state = processor.state.lock().unwrap();
+        assert!((state.stats.weighted_sum - 5.3).abs() < 1e-5);
+        assert!((state.stats.total_weight - 10.0).abs() < 1e-5);
+        drop(state);
+        let mut context = context;
+        context.generated_tokens.push(0);
+        let mut logits = [0.8_f32.ln(), 0.2_f32.ln()];
+        processor.process(&mut logits, &context).unwrap();
+        assert!((logits[0] - -0.7619048).abs() < 1e-4);
+        assert!((logits[1] - 0.7368421).abs() < 1e-4);
+    }
+
+    #[test]
+    fn adaptive_p_rejects_missing_feedback_and_unusable_distributions() {
+        let processor = AdaptivePProcessor::new(crate::AdaptivePConfig {
+            target: 0.5,
+            decay: 0.9,
+        })
+        .unwrap();
+        let mut logits = vec![0.0, 1.0];
+        let error = processor
+            .process(&mut logits, &context(vec![], vec![0]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("without selection feedback") && error.contains("restart"),
+            "{error}"
+        );
+        let empty = ProcessorContext::default();
+        processor.process(&mut [0.0, 1.0], &empty).unwrap();
+        processor.on_selected(0, &empty).unwrap();
+        let accepted = context(vec![], vec![0]);
+        processor.process(&mut [0.0, 1.0], &accepted).unwrap();
+        let changed = context(vec![], vec![1]);
+        let error = processor.on_selected(1, &changed).unwrap_err().to_string();
+        assert!(
+            error.contains("history changed") && error.contains("restart"),
+            "{error}"
+        );
+        let error = processor
+            .process(&mut [f32::NEG_INFINITY], &ProcessorContext::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("normalize") && error.contains("finite unmasked"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn poisoned_sampler_errors_reach_selection_before_sampling() {
+        struct NeverSample;
+        impl crate::Sampler for NeverSample {
+            fn sample(&mut self, _: &[f32], _: &ProcessorContext) -> TokenId {
+                panic!("error must stop terminal selection")
+            }
+            fn name(&self) -> &str {
+                "must_not_run"
+            }
+        }
+        let processor = MirostatProcessor::new(5.0, 0.1, MirostatVersion::V2);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = processor.state.lock().unwrap();
+            panic!("inject poisoned request state");
+        }));
+        assert!(poisoned.is_err());
+        let mut chain = ProcessorChain::new();
+        chain.add(Box::new(processor));
+        let error = crate::processors::select_next_token_with_sampler(
+            &mut [0.0, 1.0],
+            &ProcessorContext::default(),
+            &chain,
+            &mut NeverSample,
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("mirostat_v2")
+                && error.contains("poisoned")
+                && error.contains("restart"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn repetition_penalty_applies_once_per_seen_token() {
         let processor = PenaltiesProcessor {
             repetition_penalty: 2.0,
@@ -2266,7 +2591,9 @@ mod tests {
             ..Default::default()
         };
         let mut logits = vec![4.0, -4.0, 8.0];
-        processor.process(&mut logits, &context(vec![0, 0], vec![1, 1]));
+        processor
+            .process(&mut logits, &context(vec![0, 0], vec![1, 1]))
+            .unwrap();
         assert_eq!(logits, vec![2.0, -8.0, 8.0]);
     }
 
@@ -2280,7 +2607,9 @@ mod tests {
             ..Default::default()
         };
         let mut logits = vec![4.0, 4.0, 4.0, -4.0];
-        processor.process(&mut logits, &context(vec![0, 1], vec![2, 3]));
+        processor
+            .process(&mut logits, &context(vec![0, 1], vec![2, 3]))
+            .unwrap();
         assert_eq!(logits, vec![4.0, 4.0, 2.0, -8.0]);
     }
 
@@ -2292,7 +2621,9 @@ mod tests {
             ..Default::default()
         };
         let mut logits = vec![4.0, 4.0];
-        processor.process(&mut logits, &context(vec![0], vec![1]));
+        processor
+            .process(&mut logits, &context(vec![0], vec![1]))
+            .unwrap();
         assert_eq!(logits, vec![4.0, 4.0]);
     }
 
@@ -2305,7 +2636,9 @@ mod tests {
         };
         let mut logits = vec![4.0, -4.0, 8.0];
         let original = logits.clone();
-        processor.process(&mut logits, &context(vec![0, 1], vec![2]));
+        processor
+            .process(&mut logits, &context(vec![0, 1], vec![2]))
+            .unwrap();
         assert_eq!(logits, original);
     }
 
@@ -2316,7 +2649,9 @@ mod tests {
             ..Default::default()
         };
         let mut logits = vec![4.0, 4.0, 4.0];
-        processor.process(&mut logits, &context(vec![0, 0], vec![0, 1, 1]));
+        processor
+            .process(&mut logits, &context(vec![0, 0], vec![0, 1, 1]))
+            .unwrap();
         assert_eq!(logits, vec![2.5, 3.0, 4.0]);
     }
 
@@ -2327,7 +2662,9 @@ mod tests {
             ..Default::default()
         };
         let mut logits = vec![4.0, 4.0, 4.0];
-        processor.process(&mut logits, &context(vec![0], vec![1, 1, 2]));
+        processor
+            .process(&mut logits, &context(vec![0], vec![1, 1, 2]))
+            .unwrap();
         assert_eq!(logits, vec![3.25, 3.25, 3.25]);
     }
 
@@ -2342,22 +2679,22 @@ mod tests {
         };
         let original = vec![8.0, -4.0, 4.0, 8.0];
         let mut logits = original.clone();
-        processor.process(&mut logits, &context);
+        processor.process(&mut logits, &context).unwrap();
         assert_eq!(logits, vec![2.0, -4.0, 0.5, 8.0]);
         processor.window = None;
         let mut logits = original.clone();
-        processor.process(&mut logits, &context);
+        processor.process(&mut logits, &context).unwrap();
         assert_eq!(logits, vec![1.5, -9.5, 0.5, 8.0]);
         processor.window = Some(0);
         let mut logits = original.clone();
-        processor.process(&mut logits, &context);
+        processor.process(&mut logits, &context).unwrap();
         assert_eq!(logits, original);
         processor.window = Some(3);
         processor.repetition_penalty = 0.5;
         processor.frequency_penalty = -0.5;
         processor.presence_penalty = -1.0;
         let mut logits = original;
-        processor.process(&mut logits, &context);
+        processor.process(&mut logits, &context).unwrap();
         assert_eq!(logits, vec![18.0, -4.0, 9.5, 8.0]);
     }
 
@@ -2369,7 +2706,9 @@ mod tests {
             ..Default::default()
         };
         let mut logits = vec![1e20];
-        processor.process(&mut logits, &context(vec![0], vec![]));
+        processor
+            .process(&mut logits, &context(vec![0], vec![]))
+            .unwrap();
         assert_eq!(logits, [0.0]);
         assert_ne!((1e20_f32 - 1e20_f32) - 1.0, logits[0]);
     }
@@ -2378,7 +2717,9 @@ mod tests {
     fn top_k_masks_tokens_below_threshold() {
         let processor = TopKProcessor { top_k: 2 };
         let mut logits = vec![0.0, 5.0, 1.0, 4.0];
-        processor.process(&mut logits, &ProcessorContext::default());
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(logits, vec![f32::NEG_INFINITY, 5.0, f32::NEG_INFINITY, 4.0]);
     }
 
@@ -2394,19 +2735,23 @@ mod tests {
                 logits[len - 1] = 3.0;
                 let mut expected = logits.clone();
                 full_sort_top_k(&mut expected, k);
-                TopKProcessor { top_k: k }.process(&mut logits, &ProcessorContext::default());
+                TopKProcessor { top_k: k }
+                    .process(&mut logits, &ProcessorContext::default())
+                    .unwrap();
                 assert_eq!(logits, expected, "len={len} k={k}");
                 assert_eq!(logits.iter().filter(|value| value.is_finite()).count(), k);
                 assert!(logits[len - 1].is_finite());
                 for p in [0.5, 1.0] {
                     let mut sequential = expected.clone();
                     TopPProcessor { top_p: p }
-                        .process(&mut sequential, &ProcessorContext::default());
+                        .process(&mut sequential, &ProcessorContext::default())
+                        .unwrap();
                     let mut fused = vec![2.0; len];
                     fused[0] = f32::NAN;
                     fused[len - 1] = 3.0;
                     TopKTopPProcessor { top_k: k, top_p: p }
-                        .process(&mut fused, &ProcessorContext::default());
+                        .process(&mut fused, &ProcessorContext::default())
+                        .unwrap();
                     assert_eq!(fused, sequential, "len={len} k={k} p={p}");
                 }
             }
@@ -2416,7 +2761,9 @@ mod tests {
             vec![f32::INFINITY, f32::INFINITY, 1.0],
         ] {
             let mut actual = row.clone();
-            TopKProcessor { top_k: 1 }.process(&mut actual, &ProcessorContext::default());
+            TopKProcessor { top_k: 1 }
+                .process(&mut actual, &ProcessorContext::default())
+                .unwrap();
             assert_eq!(actual[0].to_bits(), row[0].to_bits());
             assert_eq!(actual[1..], [f32::NEG_INFINITY, f32::NEG_INFINITY]);
         }
@@ -2433,7 +2780,9 @@ mod tests {
             let mut expected_logits = logits.clone();
             let mut actual_logits = logits.clone();
             full_sort_top_k(&mut expected_logits, top_k);
-            TopKProcessor { top_k }.process(&mut actual_logits, &ProcessorContext::default());
+            TopKProcessor { top_k }
+                .process(&mut actual_logits, &ProcessorContext::default())
+                .unwrap();
             assert_eq!(actual_logits, expected_logits, "top_k={top_k}");
         }
     }
@@ -2442,7 +2791,9 @@ mod tests {
     fn top_p_keeps_minimal_nucleus_and_at_least_one_token() {
         let processor = TopPProcessor { top_p: 0.6 };
         let mut logits = vec![3.0, 2.0, 1.0];
-        processor.process(&mut logits, &ProcessorContext::default());
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert!(logits[0].is_finite());
         assert_eq!(logits[1], f32::NEG_INFINITY);
         assert_eq!(logits[2], f32::NEG_INFINITY);
@@ -2455,7 +2806,9 @@ mod tests {
             let mut expected = logits.clone();
             let mut actual = logits.clone();
             full_sort_top_p(&mut expected, top_p);
-            TopPProcessor { top_p }.process(&mut actual, &ProcessorContext::default());
+            TopPProcessor { top_p }
+                .process(&mut actual, &ProcessorContext::default())
+                .unwrap();
             assert_eq!(actual, expected, "top_p={top_p}");
         }
     }
@@ -2500,12 +2853,17 @@ mod tests {
             for &top_k in &[1usize, 8, 40, 512] {
                 for &top_p in &[0.1f32, 0.9, 0.999] {
                     let mut sequential = logits.clone();
-                    TopKProcessor { top_k }.process(&mut sequential, &ProcessorContext::default());
-                    TopPProcessor { top_p }.process(&mut sequential, &ProcessorContext::default());
+                    TopKProcessor { top_k }
+                        .process(&mut sequential, &ProcessorContext::default())
+                        .unwrap();
+                    TopPProcessor { top_p }
+                        .process(&mut sequential, &ProcessorContext::default())
+                        .unwrap();
 
                     let mut fused = logits.clone();
                     TopKTopPProcessor { top_k, top_p }
-                        .process(&mut fused, &ProcessorContext::default());
+                        .process(&mut fused, &ProcessorContext::default())
+                        .unwrap();
 
                     // Compare surviving sets rather than raw bits: both paths
                     // leave excluded entries as -inf and survivors untouched,
@@ -2730,8 +3088,12 @@ mod tests {
 
         full_sort_top_k(&mut expected, 20);
         full_sort_top_p(&mut expected, 0.95);
-        TopKProcessor { top_k: 20 }.process(&mut actual, &ProcessorContext::default());
-        TopPProcessor { top_p: 0.95 }.process(&mut actual, &ProcessorContext::default());
+        TopKProcessor { top_k: 20 }
+            .process(&mut actual, &ProcessorContext::default())
+            .unwrap();
+        TopPProcessor { top_p: 0.95 }
+            .process(&mut actual, &ProcessorContext::default())
+            .unwrap();
 
         assert_eq!(actual, expected);
         assert_eq!(
@@ -2744,7 +3106,9 @@ mod tests {
     fn min_p_masks_relative_to_top_token_probability() {
         let processor = MinPProcessor { min_p: 0.5 };
         let mut logits = vec![0.0, -0.5, -1.0];
-        processor.process(&mut logits, &ProcessorContext::default());
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert!(logits[0].is_finite());
         assert!(logits[1].is_finite());
         assert_eq!(logits[2], f32::NEG_INFINITY);
@@ -2754,13 +3118,17 @@ mod tests {
     fn top_a_uses_squared_top_probability_threshold_inclusively() {
         let processor = TopAProcessor { top_a: 0.5 };
         let mut logits = vec![0.6_f32.ln(), 0.3_f32.ln(), 0.1_f32.ln()];
-        processor.process(&mut logits, &ProcessorContext::default());
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert!(logits[0].is_finite());
         assert!(logits[1].is_finite());
         assert_eq!(logits[2], f32::NEG_INFINITY);
 
         let mut boundary = vec![0.5_f32.ln(), 0.25_f32.ln(), 0.25_f32.ln()];
-        TopAProcessor { top_a: 1.0 }.process(&mut boundary, &ProcessorContext::default());
+        TopAProcessor { top_a: 1.0 }
+            .process(&mut boundary, &ProcessorContext::default())
+            .unwrap();
         assert!(boundary.iter().all(|logit| logit.is_finite()));
     }
 
@@ -2768,15 +3136,21 @@ mod tests {
     fn top_a_disabled_equal_and_single_token_distributions_are_safe() {
         let original = vec![0.0, 0.0, 0.0];
         let mut disabled = original.clone();
-        TopAProcessor { top_a: 0.0 }.process(&mut disabled, &ProcessorContext::default());
+        TopAProcessor { top_a: 0.0 }
+            .process(&mut disabled, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(disabled, original);
 
         let mut equal = vec![0.0, 0.0, 0.0, 0.0];
-        TopAProcessor { top_a: 1.0 }.process(&mut equal, &ProcessorContext::default());
+        TopAProcessor { top_a: 1.0 }
+            .process(&mut equal, &ProcessorContext::default())
+            .unwrap();
         assert!(equal.iter().all(|logit| logit.is_finite()));
 
         let mut single = vec![4.0];
-        TopAProcessor { top_a: 1.0 }.process(&mut single, &ProcessorContext::default());
+        TopAProcessor { top_a: 1.0 }
+            .process(&mut single, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(single, vec![4.0]);
     }
 
@@ -2785,7 +3159,9 @@ mod tests {
         // For [0.5, 0.3, 0.2], token 1 is most typical, followed by 0, then 2.
         let processor = TypicalPProcessor { typical_p: 0.6 };
         let mut logits = vec![0.5_f32.ln(), 0.3_f32.ln(), 0.2_f32.ln()];
-        processor.process(&mut logits, &ProcessorContext::default());
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert!(logits[0].is_finite());
         assert!(logits[1].is_finite());
         assert_eq!(logits[2], f32::NEG_INFINITY);
@@ -2795,18 +3171,24 @@ mod tests {
     fn typical_p_handles_noop_equal_and_single_token_distributions() {
         let original = vec![1.0, 0.0];
         let mut disabled = original.clone();
-        TypicalPProcessor { typical_p: 1.0 }.process(&mut disabled, &ProcessorContext::default());
+        TypicalPProcessor { typical_p: 1.0 }
+            .process(&mut disabled, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(disabled, original);
 
         let mut equal = vec![0.0; 4];
-        TypicalPProcessor { typical_p: 0.5 }.process(&mut equal, &ProcessorContext::default());
+        TypicalPProcessor { typical_p: 0.5 }
+            .process(&mut equal, &ProcessorContext::default())
+            .unwrap();
         assert!(equal[0].is_finite());
         assert!(equal[1].is_finite());
         assert_eq!(equal[2], f32::NEG_INFINITY);
         assert_eq!(equal[3], f32::NEG_INFINITY);
 
         let mut single = vec![0.0];
-        TypicalPProcessor { typical_p: 0.1 }.process(&mut single, &ProcessorContext::default());
+        TypicalPProcessor { typical_p: 0.1 }
+            .process(&mut single, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(single, vec![0.0]);
     }
 
@@ -2816,7 +3198,9 @@ mod tests {
         // k=round(sqrt(4 / (1 - 4^-1)))=2.
         let processor = MirostatProcessor::new(1.0, 0.1, MirostatVersion::V1);
         let mut logits = vec![0.0, -(4.0_f32).ln(), -(9.0_f32).ln(), -(16.0_f32).ln()];
-        processor.process(&mut logits, &ProcessorContext::default());
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert!(logits[0].is_finite());
         assert!(logits[1].is_finite());
         assert_eq!(logits[2], f32::NEG_INFINITY);
@@ -2837,13 +3221,15 @@ mod tests {
 
         for _ in 0..5 {
             let mut logits = base_logits.clone();
-            processor.process(
-                &mut logits,
-                &ProcessorContext {
-                    generated_tokens: generated_tokens.clone(),
-                    ..Default::default()
-                },
-            );
+            processor
+                .process(
+                    &mut logits,
+                    &ProcessorContext {
+                        generated_tokens: generated_tokens.clone(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
             mu_by_step.push(processor.current_mu());
 
             let selected = logits
@@ -2869,17 +3255,21 @@ mod tests {
     fn mirostat_feedback_moves_mu_in_both_directions() {
         let processor = MirostatProcessor::new(0.5, 0.25, MirostatVersion::V2);
         let mut first = vec![0.6_f32.ln(), 0.3_f32.ln(), 0.1_f32.ln()];
-        processor.process(&mut first, &ProcessorContext::default());
+        processor
+            .process(&mut first, &ProcessorContext::default())
+            .unwrap();
 
         let initial_mu = processor.current_mu();
         let mut second = vec![0.9_f32.ln(), 0.1_f32.ln()];
-        processor.process(
-            &mut second,
-            &ProcessorContext {
-                generated_tokens: vec![1],
-                ..Default::default()
-            },
-        );
+        processor
+            .process(
+                &mut second,
+                &ProcessorContext {
+                    generated_tokens: vec![1],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(
             processor.current_mu() < initial_mu,
             "a token more surprising than tau must lower mu"
@@ -2887,13 +3277,15 @@ mod tests {
 
         let lowered_mu = processor.current_mu();
         let mut third = vec![0.9_f32.ln(), 0.1_f32.ln()];
-        processor.process(
-            &mut third,
-            &ProcessorContext {
-                generated_tokens: vec![1, 0],
-                ..Default::default()
-            },
-        );
+        processor
+            .process(
+                &mut third,
+                &ProcessorContext {
+                    generated_tokens: vec![1, 0],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(
             processor.current_mu() > lowered_mu,
             "a token less surprising than tau must raise mu"
@@ -2905,7 +3297,9 @@ mod tests {
         for version in [MirostatVersion::V1, MirostatVersion::V2] {
             let processor = MirostatProcessor::new(5.0, 0.1, version);
             let mut logits = vec![3.0];
-            processor.process(&mut logits, &ProcessorContext::default());
+            processor
+                .process(&mut logits, &ProcessorContext::default())
+                .unwrap();
             assert_eq!(logits, vec![3.0]);
         }
     }
@@ -2920,7 +3314,9 @@ mod tests {
             window: None,
         };
         let mut logits = vec![0.0; 5];
-        processor.process(&mut logits, &context(vec![1, 2, 3], vec![1, 2]));
+        processor
+            .process(&mut logits, &context(vec![1, 2, 3], vec![1, 2]))
+            .unwrap();
         assert_eq!(logits[3], -2.0);
         assert_eq!(logits[0], 0.0);
         assert_eq!(logits[1], 0.0);
@@ -2940,11 +3336,15 @@ mod tests {
         let original = vec![1.0; 5];
 
         let mut empty = original.clone();
-        processor.process(&mut empty, &ProcessorContext::default());
+        processor
+            .process(&mut empty, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(empty, original);
 
         let mut short = original.clone();
-        processor.process(&mut short, &context(vec![1], vec![2]));
+        processor
+            .process(&mut short, &context(vec![1], vec![2]))
+            .unwrap();
         assert_eq!(short, original);
     }
 
@@ -2958,7 +3358,8 @@ mod tests {
             sequence_breakers: vec![],
             window: None,
         }
-        .process(&mut logits, &context(vec![1, 2, 3, 4], vec![1, 2, 3]));
+        .process(&mut logits, &context(vec![1, 2, 3, 4], vec![1, 2, 3]))
+        .unwrap();
         assert_eq!(logits[4], -3.0);
     }
 
@@ -2977,7 +3378,8 @@ mod tests {
         .process(
             &mut unbroken,
             &context(prompt_tokens.clone(), generated_tokens.clone()),
-        );
+        )
+        .unwrap();
         assert_eq!(unbroken[3], -3.0);
 
         let mut broken = vec![0.0; 10];
@@ -2988,7 +3390,8 @@ mod tests {
             sequence_breakers: vec![vec![9]],
             window: None,
         }
-        .process(&mut broken, &context(prompt_tokens, generated_tokens));
+        .process(&mut broken, &context(prompt_tokens, generated_tokens))
+        .unwrap();
         assert!(broken.iter().all(|logit| *logit == 0.0));
     }
 
@@ -3003,17 +3406,23 @@ mod tests {
         };
         let history = vec![1, 9, 2, 3, 1, 9, 2];
         let mut logits = vec![0.0; 10];
-        processor.process(&mut logits, &context(history.clone(), vec![]));
+        processor
+            .process(&mut logits, &context(history.clone(), vec![]))
+            .unwrap();
         assert_eq!(logits[3], -3.0);
         processor.window = Some(4);
         let mut logits = vec![0.0; 10];
-        processor.process(&mut logits, &context(history, vec![]));
+        processor
+            .process(&mut logits, &context(history, vec![]))
+            .unwrap();
         assert!(logits.iter().all(|value| *value == 0.0));
         processor.window = None;
-        processor.process(
-            &mut logits,
-            &context(vec![1, 9, 8, 2, 3, 1, 9, 8, 2], vec![]),
-        );
+        processor
+            .process(
+                &mut logits,
+                &context(vec![1, 9, 8, 2, 3, 1, 9, 8, 2], vec![]),
+            )
+            .unwrap();
         assert!(logits.iter().all(|value| *value == 0.0));
     }
 
@@ -3028,7 +3437,8 @@ mod tests {
             sequence_breakers: vec![],
             window: None,
         }
-        .process(&mut logits, &context(vec![1, 2, 3], vec![1, 2]));
+        .process(&mut logits, &context(vec![1, 2, 3], vec![1, 2]))
+        .unwrap();
         assert_eq!(logits, original);
     }
 
@@ -3036,7 +3446,9 @@ mod tests {
     fn xtc_probability_one_keeps_exact_expected_set() {
         let processor = XtcProcessor::new(1.0, 0.25, Some(7));
         let mut logits = vec![0.5_f32.ln(), 0.3_f32.ln(), 0.2_f32.ln()];
-        processor.process(&mut logits, &ProcessorContext::default());
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(logits[0], f32::NEG_INFINITY);
         assert!(logits[1].is_finite());
         assert!(logits[2].is_finite());
@@ -3054,7 +3466,9 @@ mod tests {
     fn xtc_threshold_zero_never_admits_masked_tokens_or_masks_every_valid_token() {
         let processor = XtcProcessor::new(1.0, 0.0, Some(7));
         let mut logits = vec![0.7_f32.ln(), 0.3_f32.ln(), f32::NEG_INFINITY];
-        processor.process(&mut logits, &ProcessorContext::default());
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
 
         assert_eq!(logits[0], f32::NEG_INFINITY);
         assert!(logits[1].is_finite());
@@ -3068,7 +3482,9 @@ mod tests {
         let threshold = softmax_probabilities(&processor_logits).expect("valid distribution")[2];
         let processor = XtcProcessor::new(1.0, threshold, Some(7));
         let mut logits = processor_logits;
-        processor.process(&mut logits, &ProcessorContext::default());
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
 
         assert_eq!(logits[0], f32::NEG_INFINITY);
         assert!(logits[1].is_finite());
@@ -3080,7 +3496,9 @@ mod tests {
     fn xtc_probability_zero_is_noop() {
         let original = vec![2.0, 1.0];
         let mut disabled = original.clone();
-        XtcProcessor::new(0.0, 0.1, Some(7)).process(&mut disabled, &ProcessorContext::default());
+        XtcProcessor::new(0.0, 0.1, Some(7))
+            .process(&mut disabled, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(disabled, original);
     }
 
@@ -3088,7 +3506,9 @@ mod tests {
     fn xtc_one_token_above_threshold_is_noop() {
         let original = vec![0.8_f32.ln(), 0.15_f32.ln(), 0.05_f32.ln()];
         let mut logits = original.clone();
-        XtcProcessor::new(1.0, 0.5, Some(7)).process(&mut logits, &ProcessorContext::default());
+        XtcProcessor::new(1.0, 0.5, Some(7))
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(logits, original);
     }
 
@@ -3100,7 +3520,9 @@ mod tests {
             (0..32)
                 .map(|_| {
                     let mut logits = vec![0.5_f32.ln(), 0.3_f32.ln(), 0.2_f32.ln()];
-                    processor.process(&mut logits, &ProcessorContext::default());
+                    processor
+                        .process(&mut logits, &ProcessorContext::default())
+                        .unwrap();
                     logits
                 })
                 .collect::<Vec<_>>()
@@ -3122,7 +3544,9 @@ mod tests {
         let expected = 0.5 + (entropy / 2_f32.ln()).powi(2);
         assert!((processor.resolved_temperature(&logits, logits.len()) - expected).abs() < 1e-6);
         let mut scaled = logits;
-        processor.process(&mut scaled, &ProcessorContext::default());
+        processor
+            .process(&mut scaled, &ProcessorContext::default())
+            .unwrap();
         for (actual, original) in scaled.into_iter().zip(logits) {
             assert!((actual - original / expected).abs() < 1e-6);
         }
@@ -3140,10 +3564,14 @@ mod tests {
             }),
         };
         let mut logits = [0.0, -1000.0, f32::NEG_INFINITY];
-        processor.process(&mut logits, &ProcessorContext::default());
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(logits, [0.0, f32::NEG_INFINITY, f32::NEG_INFINITY]);
         let mut single = [7.0];
-        processor.process(&mut single, &ProcessorContext::default());
+        processor
+            .process(&mut single, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(single, [7.0]);
         processor.dynamic.as_mut().unwrap().exponent = 0.0;
         assert_eq!(processor.resolved_temperature(&[0.0, -1000.0], 2), 1.5);
@@ -3163,7 +3591,9 @@ mod tests {
             vec![f32::INFINITY, f32::INFINITY],
         ] {
             let expected = crate::sampling::sample_greedy(&logits);
-            processor.process(&mut logits, &ProcessorContext::default());
+            processor
+                .process(&mut logits, &ProcessorContext::default())
+                .unwrap();
             assert_eq!(crate::sampling::sample_greedy(&logits), expected);
         }
     }
@@ -3175,7 +3605,9 @@ mod tests {
             dynamic: None,
         };
         let mut logits = vec![2.0, -4.0];
-        processor.process(&mut logits, &ProcessorContext::default());
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(logits, vec![1.0, -2.0]);
     }
 
@@ -3243,7 +3675,7 @@ mod tests {
             };
             let mut logits = vec![f32::NEG_INFINITY; json_token_texts().len()];
             logits[desired as usize] = 1.0;
-            processor.process(&mut logits, &context);
+            processor.process(&mut logits, &context).unwrap();
             let selected = sample_greedy(&logits);
             assert_eq!(selected, desired);
             if selected == eos_token_id {
@@ -3268,7 +3700,9 @@ mod tests {
         let mut logits = vec![0.0; json_token_texts().len()];
         logits[6] = 10.0;
         logits[1] = 1.0;
-        processor.process(&mut logits, &ProcessorContext::default());
+        processor
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(logits[6], f32::NEG_INFINITY);
         assert!(logits[1].is_finite());
         assert_eq!(logits[14], f32::NEG_INFINITY);
@@ -3278,7 +3712,9 @@ mod tests {
             ..Default::default()
         };
         let mut complete_logits = vec![0.0; json_token_texts().len()];
-        processor.process(&mut complete_logits, &complete_context);
+        processor
+            .process(&mut complete_logits, &complete_context)
+            .unwrap();
         assert!(complete_logits[14].is_finite());
         assert_eq!(complete_logits[1], f32::NEG_INFINITY);
     }
@@ -3352,7 +3788,7 @@ mod tests {
             let mut logits = vec![0.0; token_texts.len()];
             logits[0] = 100.0;
             logits[desired as usize] = 101.0;
-            processor.process(&mut logits, &context);
+            processor.process(&mut logits, &context).unwrap();
             assert!(
                 logits[desired as usize].is_finite(),
                 "desired token {desired} was masked at {generated_text:?}"
@@ -3417,7 +3853,7 @@ mod tests {
         assert_eq!(sample_greedy(&logits), 0);
 
         let chain = ProcessorChain::new();
-        chain.process(&mut logits, &context);
+        chain.process(&mut logits, &context).unwrap();
 
         assert_eq!(sample_greedy(&logits), 0);
         assert_eq!(logits, vec![10.0, 1.0]);
@@ -3428,7 +3864,7 @@ mod tests {
     }
 
     impl LogitProcessor for ForceTokenProcessor {
-        fn process(&self, logits: &mut [f32], _context: &ProcessorContext) {
+        fn process(&self, logits: &mut [f32], _context: &ProcessorContext) -> anyhow::Result<()> {
             for (idx, logit) in logits.iter_mut().enumerate() {
                 *logit = if idx as TokenId == self.token_id {
                     0.0
@@ -3436,6 +3872,7 @@ mod tests {
                     f32::NEG_INFINITY
                 };
             }
+            Ok(())
         }
 
         fn name(&self) -> &str {
@@ -3480,7 +3917,7 @@ mod tests {
             .build();
         let mut logits = vec![1.0, 1.0, 1.0, 1.0];
 
-        chain.process(&mut logits, &context);
+        chain.process(&mut logits, &context).unwrap();
 
         assert_eq!(
             logits,

@@ -82,7 +82,7 @@ pub(crate) async fn props(
                 "mirostat": 0, "mirostat_tau": 5.0, "mirostat_eta": 0.1,
                 "xtc_probability": 0.0, "xtc_threshold": 0.1,
                 "dynatemp_range": 0.0, "dynatemp_exponent": 1.0,
-                "top_n_sigma": -1.0,
+                "top_n_sigma": -1.0, "adaptive_target": -1.0, "adaptive_decay": 0.9,
                 "samplers": onnx_genai_engine::SamplerSequence::DEFAULT.iter().filter(|&&stage| stage != onnx_genai_engine::SamplerStage::TopA).collect::<Vec<_>>(),
                 "backend_sampling": false, "timings_per_token": false,
                 "stop": []

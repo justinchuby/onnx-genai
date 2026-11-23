@@ -47,10 +47,10 @@ pub(crate) use std::path::Path;
 pub(crate) use std::sync::Arc;
 
 pub use crate::config::{
-    DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, DynamicTemperatureConfig,
-    Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend, FinishReason,
-    GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
-    GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
+    AdaptivePConfig, DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig,
+    DynamicTemperatureConfig, Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend,
+    FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest,
+    GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
     KvConnectorConfig, LayerWeightBytes, LimitParseError, MemoryPolicyApplication, MemoryStrategy,
     MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
     MtpConfig, MtpHiddenLayout, MtpWeightSource, PrefillRequest, PrefillResult,
@@ -1661,7 +1661,7 @@ mod tests {
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 2.0, 4.0, 3.0];
         assert_eq!(
-            select_next_token(&mut logits, &context, &options, &chain, 0.0),
+            select_next_token(&mut logits, &context, &options, &chain, 0.0).unwrap(),
             2
         );
     }
@@ -1676,7 +1676,7 @@ mod tests {
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 0.0];
         assert_eq!(
-            select_next_token(&mut logits, &context, &options, &chain, 0.75),
+            select_next_token(&mut logits, &context, &options, &chain, 0.75).unwrap(),
             1
         );
     }
@@ -1707,7 +1707,7 @@ mod tests {
         let mut sampler = LastTokenSampler;
 
         assert_eq!(
-            select_next_token_with_sampler(&mut logits, &context, &chain, &mut sampler),
+            select_next_token_with_sampler(&mut logits, &context, &chain, &mut sampler).unwrap(),
             3
         );
         assert_eq!(logits[0], f32::NEG_INFINITY);

@@ -5,10 +5,10 @@ use crate::config::{
     FinishReason, GenerateConstraint, GenerateOptions, SamplerSequence, SamplerStage,
 };
 use crate::logits::{
-    ConstraintProcessor, DryProcessor, GrammarConstraintKind, JsonConstraint, LlguidanceConstraint,
-    MinPProcessor, MirostatProcessor, PenaltiesProcessor, ProcessorChain, ProcessorContext,
-    ProcessorSignal, StopSequence, StopSequenceProcessor, TemperatureProcessor, TokenId,
-    TopAProcessor, TopKProcessor, TopNSigmaProcessor, TopPProcessor, TypicalPProcessor,
+    AdaptivePProcessor, ConstraintProcessor, DryProcessor, GrammarConstraintKind, JsonConstraint,
+    LlguidanceConstraint, MinPProcessor, MirostatProcessor, PenaltiesProcessor, ProcessorChain,
+    ProcessorContext, ProcessorSignal, StopSequence, StopSequenceProcessor, TemperatureProcessor,
+    TokenId, TopAProcessor, TopKProcessor, TopNSigmaProcessor, TopPProcessor, TypicalPProcessor,
     XtcProcessor,
 };
 use crate::sampling::{Sampler, default_sampler_for_options};
@@ -120,6 +120,11 @@ pub(crate) fn build_processor_chain(
     for &stage in stages {
         append_sampler_stage(&mut chain, options, stage, samples);
     }
+    // Adaptive-p owns terminal selection regardless of its listed position;
+    // duplicate selectors still create one terminal transform, as upstream.
+    if samples && stages.contains(&SamplerStage::AdaptiveP) && options.adaptive_p.target >= 0.0 {
+        chain.add(Box::new(AdaptivePProcessor::new(options.adaptive_p)?));
+    }
     Ok(chain)
 }
 
@@ -133,6 +138,7 @@ fn append_sampler_stage(
         return;
     }
     match stage {
+        SamplerStage::AdaptiveP => {}
         SamplerStage::Penalties => {
             if options.penalty_window != Some(0)
                 && (options.repetition_penalty != 1.0
@@ -440,7 +446,7 @@ pub(crate) fn select_next_token(
     options: &GenerateOptions,
     chain: &ProcessorChain,
     rng_value: f32,
-) -> TokenId {
+) -> anyhow::Result<TokenId> {
     let mut sampler = default_sampler_for_options(options, rng_value);
     select_next_token_with_sampler(logits, context, chain, &mut sampler)
 }
@@ -451,7 +457,7 @@ pub(crate) fn select_next_token_with_rng(
     options: &GenerateOptions,
     chain: &ProcessorChain,
     rng: &mut crate::sampling::SamplingRng,
-) -> TokenId {
+) -> anyhow::Result<TokenId> {
     select_next_token(logits, context, options, chain, rng.value_for(options))
 }
 
@@ -460,9 +466,11 @@ pub(crate) fn select_next_token_with_sampler(
     context: &ProcessorContext,
     chain: &ProcessorChain,
     sampler: &mut dyn Sampler,
-) -> TokenId {
-    chain.process(logits, context);
-    sampler.sample(logits, context)
+) -> anyhow::Result<TokenId> {
+    chain.process(logits, context)?;
+    let token = sampler.sample(logits, context);
+    chain.on_selected(token, context)?;
+    Ok(token)
 }
 
 pub(crate) fn finish_reason_after_token(
@@ -728,7 +736,9 @@ mod device_portability_tests {
         assert!(chain.names().contains(&"temperature"));
         assert!(options.selects_greedily());
         let mut logits = vec![3.0, 1.0, 2.0];
-        chain.process(&mut logits, &ProcessorContext::default());
+        chain
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(logits, vec![3.0, f32::NEG_INFINITY, f32::NEG_INFINITY]);
         let raw = build_processor_chain(&greedy_options(options), None, false).unwrap();
         assert!(raw.is_empty());
@@ -794,7 +804,9 @@ mod device_portability_tests {
         let sampling_chain = build_processor_chain(&options_with(4, 0.5), None, false)
             .expect("sampling options build a chain");
         let mut processed = raw.clone();
-        sampling_chain.process(&mut processed, &ProcessorContext::default());
+        sampling_chain
+            .process(&mut processed, &ProcessorContext::default())
+            .unwrap();
         assert_ne!(
             processed, raw,
             "this test is only meaningful if the warpers actually rewrote logits"
@@ -983,7 +995,9 @@ mod logit_bias_tests {
         let chain = build_processor_chain(&options, None, false).unwrap();
         assert!(!is_device_portable_chain(&chain));
         let mut logits = vec![9.0, 3.0, 1.0];
-        chain.process(&mut logits, &ProcessorContext::default());
+        chain
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(logits, vec![f32::NEG_INFINITY, 3.0, 11.0]);
         assert_eq!(crate::sampling::sample_greedy(&logits), 2);
         let invalid = GenerateOptions {
@@ -1023,14 +1037,16 @@ mod ordered_sampler_tests {
             false,
         )
         .unwrap()
-        .process(&mut before, &ProcessorContext::default());
+        .process(&mut before, &ProcessorContext::default())
+        .unwrap();
         build_processor_chain(
             &options(vec![SamplerStage::TopP, SamplerStage::Temperature]),
             None,
             false,
         )
         .unwrap()
-        .process(&mut after, &ProcessorContext::default());
+        .process(&mut after, &ProcessorContext::default())
+        .unwrap();
         assert_eq!(before.iter().filter(|value| value.is_finite()).count(), 2);
         assert_eq!(after.iter().filter(|value| value.is_finite()).count(), 1);
     }
@@ -1053,7 +1069,9 @@ mod ordered_sampler_tests {
             Some(SamplerSequence::new(vec![SamplerStage::Temperature; 2]).unwrap());
         let chain = build_processor_chain(&options, None, false).unwrap();
         let mut logits = vec![4.0, 0.0];
-        chain.process(&mut logits, &ProcessorContext::default());
+        chain
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(logits, vec![1.0, 0.0]);
         assert_eq!(
             device_sampling_plan(&chain, &options, false, true, true),
@@ -1085,8 +1103,9 @@ mod ordered_sampler_tests {
         );
         struct Impostor;
         impl LogitProcessor for Impostor {
-            fn process(&self, logits: &mut [f32], _: &ProcessorContext) {
+            fn process(&self, logits: &mut [f32], _: &ProcessorContext) -> anyhow::Result<()> {
                 logits.reverse();
+                Ok(())
             }
             fn name(&self) -> &str {
                 "temperature"
@@ -1122,14 +1141,17 @@ mod ordered_sampler_tests {
         let mut ranked_first = vec![1e-30, 2e-30];
         build_processor_chain(&precision_options, None, false)
             .unwrap()
-            .process(&mut ranked_first, &ProcessorContext::default());
+            .process(&mut ranked_first, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(ranked_first, vec![f32::NEG_INFINITY, 0.0]);
         precision_options.sampler_order = Some(
             SamplerSequence::new(vec![SamplerStage::Temperature, SamplerStage::TopK]).unwrap(),
         );
         let mut scaled_first = vec![1e-30, 2e-30];
         let chain = build_processor_chain(&precision_options, None, false).unwrap();
-        chain.process(&mut scaled_first, &ProcessorContext::default());
+        chain
+            .process(&mut scaled_first, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(scaled_first, vec![0.0, f32::NEG_INFINITY]);
         assert_eq!(
             device_sampling_plan(&chain, &precision_options, false, true, true),
@@ -1171,7 +1193,8 @@ mod ordered_sampler_tests {
         let mut logits = vec![3.0, 3.0, -100.0, -100.0];
         build_processor_chain(&options, None, false)
             .unwrap()
-            .process(&mut logits, &ProcessorContext::default());
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(logits, vec![2.0, 2.0, f32::NEG_INFINITY, f32::NEG_INFINITY]);
         options.top_n_sigma = 1.0;
         options.sampler_order = Some(
@@ -1180,8 +1203,117 @@ mod ordered_sampler_tests {
         let mut logits = vec![3.0, 3.0, -100.0, -100.0];
         build_processor_chain(&options, None, false)
             .unwrap()
-            .process(&mut logits, &ProcessorContext::default());
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(logits, vec![3.0, 3.0, f32::NEG_INFINITY, f32::NEG_INFINITY]);
+    }
+
+    #[test]
+    fn selected_token_feedback_disables_device_bypass_even_for_rank_preserving_stages() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Feedback(Arc<AtomicUsize>);
+        impl crate::logits::LogitProcessor for Feedback {
+            fn process(&self, _: &mut [f32], _: &ProcessorContext) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "feedback"
+            }
+            fn preserves_argmax(&self) -> bool {
+                true
+            }
+            fn device_sampling_transform(&self) -> Option<crate::logits::DeviceSamplingTransform> {
+                Some(crate::logits::DeviceSamplingTransform::Temperature(1.0))
+            }
+            fn needs_selection_feedback(&self) -> bool {
+                true
+            }
+            fn on_selected(&self, _: TokenId, _: &ProcessorContext) -> anyhow::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let mut chain = ProcessorChain::new();
+        chain.add(Box::new(Feedback(accepted.clone())));
+        let options = GenerateOptions::default();
+        assert_eq!(
+            device_sampling_plan(&chain, &options, false, true, true),
+            DeviceSamplingPlan::Host
+        );
+        let token = select_next_token(
+            &mut [0.0, 1.0],
+            &ProcessorContext::default(),
+            &options,
+            &chain,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(token, 1);
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn adaptive_p_is_one_terminal_stage_and_requires_explicit_selection() {
+        let mut options = GenerateOptions {
+            greedy: false,
+            temperature: 2.0,
+            adaptive_p: crate::AdaptivePConfig {
+                target: 0.2,
+                decay: 0.9,
+            },
+            sampler_order: Some(
+                SamplerSequence::new(vec![
+                    SamplerStage::AdaptiveP,
+                    SamplerStage::Temperature,
+                    SamplerStage::AdaptiveP,
+                ])
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None, false).unwrap();
+        assert_eq!(chain.names(), ["temperature", "adaptive_p"]);
+        assert_eq!(
+            device_sampling_plan(&chain, &options, false, true, true),
+            DeviceSamplingPlan::Host
+        );
+        options.adaptive_p.target = -1.0;
+        assert_eq!(
+            build_processor_chain(&options, None, false)
+                .unwrap()
+                .names(),
+            ["temperature"]
+        );
+        options.adaptive_p.target = 0.2;
+        options.sampler_order = None;
+        assert!(
+            !build_processor_chain(&options, None, false)
+                .unwrap()
+                .names()
+                .contains(&"adaptive_p")
+        );
+        options.sampler_order = Some(SamplerSequence::new(vec![SamplerStage::AdaptiveP]).unwrap());
+        options.mirostat = Some(crate::MirostatConfig {
+            tau: 5.0,
+            eta: 0.1,
+            version: crate::MirostatVersion::V2,
+        });
+        assert_eq!(
+            build_processor_chain(&options, None, false)
+                .unwrap()
+                .names(),
+            ["temperature", "mirostat_v2"]
+        );
+        assert_eq!(
+            serde_json::from_str::<SamplerSequence>(r#"["ADAPTIVE-P"]"#)
+                .unwrap()
+                .stages(),
+            [SamplerStage::AdaptiveP]
+        );
     }
 
     #[test]
@@ -1217,16 +1349,15 @@ mod ordered_sampler_tests {
                 top_k: 0,
                 top_p: 0.7
             }
-            .process_with_candidate_count(&mut logits, &context, 4),
+            .process_with_candidate_count(&mut logits, &context, 4)
+            .unwrap(),
             2
         );
         let mut logits = initial;
         assert_eq!(
-            XtcProcessor::new(1.0, 0.2, Some(17)).process_with_candidate_count(
-                &mut logits,
-                &context,
-                4
-            ),
+            XtcProcessor::new(1.0, 0.2, Some(17))
+                .process_with_candidate_count(&mut logits, &context, 4)
+                .unwrap(),
             3
         );
         assert_eq!(logits.iter().filter(|value| value.is_finite()).count(), 2);
@@ -1275,7 +1406,9 @@ mod ordered_sampler_tests {
             vec![3e38, 2e38, 0.0],
         ] {
             let expected = crate::sampling::sample_greedy(&logits);
-            chain.process(&mut logits, &ProcessorContext::default());
+            chain
+                .process(&mut logits, &ProcessorContext::default())
+                .unwrap();
             assert_eq!(crate::sampling::sample_greedy(&logits), expected);
         }
     }
@@ -1307,7 +1440,9 @@ mod ordered_sampler_tests {
         assert!(SamplerSequence::new(vec![SamplerStage::TopK; 65]).is_err());
         assert!(serde_json::from_value::<SamplerSequence>(serde_json::json!(["unknown"])).is_err());
         let mut logits = vec![3.0, 2.0, 1.0, f32::NEG_INFINITY];
-        TopNSigmaProcessor { n: 1.0 }.process(&mut logits, &ProcessorContext::default());
+        TopNSigmaProcessor { n: 1.0 }
+            .process(&mut logits, &ProcessorContext::default())
+            .unwrap();
         assert_eq!(
             logits,
             vec![3.0, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY]

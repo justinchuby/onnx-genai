@@ -6549,6 +6549,81 @@ mod native_compat {
     }
 
     #[tokio::test]
+    async fn adaptive_p_selects_low_probability_tokens_through_all_generation_protocols() {
+        let router = app(tiny_state());
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    match id {
+                        5 => json!(100),
+                        6 => json!(0),
+                        _ => json!(false),
+                    },
+                )
+            })
+            .collect();
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
+            for (samplers, target, expected) in [
+                (json!(["adaptive_p"]), 0.0, "the the the the"),
+                (json!(["adaptive-p"]), -1.0, "world world world world"),
+                (json!([]), 0.0, "world world world world"),
+            ] {
+                let mut body = json!({"max_tokens":4,"seed":7,"samplers":samplers,
+                    "adaptive_target":target,"adaptive_decay":0.9,
+                    "logit_bias":bias,"ignore_eos":true});
+                if path == "/v1/chat/completions" {
+                    body["messages"] = json!([{"role":"user","content":"world"}]);
+                } else {
+                    body["prompt"] = json!([5]);
+                }
+                let response = request(router.clone(), path, body).await;
+                let status = response.status();
+                let value = json_body(response).await;
+                assert_eq!(status, StatusCode::OK, "{path}: {value}");
+                let text = if path == "/completion" {
+                    &value["content"]
+                } else if path == "/v1/completions" {
+                    &value["choices"][0]["text"]
+                } else {
+                    &value["choices"][0]["message"]["content"]
+                };
+                assert_eq!(text, expected, "{path} target={target}: {value}");
+            }
+        }
+        // Every wire scalar is finite and one token remains available before
+        // processing, but count-weighted penalties overflow that last logit.
+        // The adaptive stage must return its real inference error, not token 0.
+        let one_available: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    if id == 5 { json!(100) } else { json!(false) },
+                )
+            })
+            .collect();
+        let response=request(router.clone(),"/completion",json!({"prompt":[5,5],"max_tokens":1,"samplers":["penalties","adaptive_p"],"adaptive_target":0.0,"frequency_penalty":3e38,"repeat_last_n":-1,"logit_bias":one_available})).await;
+        let status = response.status();
+        let error = json_body(response).await.to_string();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{error}");
+        assert!(
+            error.contains("adaptive_p") && error.contains("finite unmasked"),
+            "{error}"
+        );
+        for (field, value) in [
+            ("adaptive_target", json!(1.1)),
+            ("adaptive_decay", json!(-0.1)),
+            ("adaptive_decay", json!(1.0)),
+        ] {
+            let mut body = json!({"prompt":[5],"max_tokens":1,"samplers":["adaptive_p"]});
+            body[field] = value;
+            let response = request(router.clone(), "/completion", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(json_body(response).await.to_string().contains(field));
+        }
+    }
+
+    #[tokio::test]
     async fn penalties_window_counts_prompt_and_disables_all_penalties_across_protocols() {
         let router = app(tiny_state());
         let response = router

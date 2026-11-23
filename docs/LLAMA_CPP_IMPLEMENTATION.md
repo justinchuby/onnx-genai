@@ -408,7 +408,7 @@ The real HTTP regression swaps penalties and temperature and proves different
 expected tokens through all three generation protocols. It also demonstrates
 that a temperature omitted from an empty stage list does not force greedy output.
 Further sampler conformance work remains, including top-k tie cardinality and
-adaptive/infill selectors; the broad generation-control ledger row stays open.
+infill selectors; the broad generation-control ledger row stays open.
 
 Ordered-sampling validation: the full native engine library passed 814 cases
 with 1 inherited ignore; final refinements passed all 16 selected sampler cases.
@@ -431,7 +431,7 @@ upstream's partial sort does not promise an ordering among equal logits.
 Regression coverage includes heap/partition sizes, high-ranked tokens following
 tied entries, NaN, signed zero, infinity, fusion equivalence, the device algorithm
 CPU oracle and real ONNX HTTP generation with deliberately equal finite logits.
-Adaptive/infill selectors and the other unchecked generation controls remain open.
+Infill selectors and the other unchecked generation controls remain open.
 
 The strict tie cap also exposes why temperature cannot commute across top-k in
 f32: two distinct logits can round to equal scaled values, changing which token
@@ -439,7 +439,7 @@ survives. Transform proofs now retain exact stage order. The fixed-order device
 path remains available; a reversed order uses the host rather than changing the
 requested distribution. A regression proves the distinct winners on underflow.
 Remaining sampler conformance includes device top-p boundary ties in addition to
-adaptive/infill selectors. Missing CUDA driver/NVRTC libraries now return a
+infill selectors. Missing CUDA driver/NVRTC libraries now return a
 capability error before cudarc's dynamic-entry panic path.
 
 Device temperature now divides logits directly, matching the host instead of
@@ -481,3 +481,42 @@ server library 398 passed / 2 inherited ignores, including the real three-protoc
 prompt-count/window regression. Strict engine and server all-target Clippy pass.
 The updated benchmark library and native profiling binary also pass strict
 Clippy with the native backend enabled.
+
+Adaptive-p milestone: `adaptive_p` is an explicit terminal selector, appended
+once after optional stages even if repeated or listed first. The upstream
+quadratic/linear probability transform uses the adapted target and maintains
+a weighted EMA of original selected probabilities. Defaults are target -1
+(disabled) and decay 0.9; valid targets are negative or [0,1], valid decay is
+[0,0.99]. Parameters alone do not activate a selector omitted from `samplers`.
+Mirostat's separate mode still takes precedence. Native, legacy and chat lower
+the same typed configuration and properties advertise the neutral defaults.
+
+The shared processor API now returns Results and records selected-token
+feedback before a token can be committed. Ordinary, continuous-batch, draft and
+speculative target paths propagate those failures. Adaptive-p checkpoints the
+EMA before each staged choice, so reprocessing an accepted prefix rolls back
+discarded branches. Histories containing unobserved choices fail explicitly;
+normalization and poisoned-state errors retain stage/offset/remediation. A
+cached feedback capability prevents device bypass even for processors that
+otherwise preserve argmax. Stateless chains skip feedback dispatch entirely.
+Public processor callers and benchmark targets handle the new Result contract;
+benchmark top-k reference selection also uses the exact candidate cap.
+
+The ORT prompt-lookup regression executes real proposal rejection and verifies
+exact output against ordinary adaptive-enabled selection. Native's current
+speculative driver only supports empty processor chains and raw greedy choices;
+stateful requests therefore use the ordinary native sampler. Its regression
+requires the adaptive selector to choose a low-original-probability token for
+eight steps and verifies identical results when prompt lookup is requested,
+with no speculative proposals reported. This preserves the existing executor
+capability boundary rather than claiming native stateful speculation is present.
+
+Adaptive-p validation: full native engine library 825 passed / 1 inherited
+ignore; all 4 selected adaptive cases passed after final numerical/decay and
+same-length-history-integrity refinements. ORT speculative rejection and native
+ordinary-path capability integration each selected and passed one real test.
+Full server library 399 passed / 2 inherited ignores, including native/legacy/chat
+four-token selection, negative/omitted-selector behavior, invalid parameter
+rejection and real sampling-stage failure propagation without a fabricated token.
+Strict engine/server all-target Clippy and native benchmark library/profiling/
+no-model benchmark Clippy pass. Other unchecked delivery requirements remain open.

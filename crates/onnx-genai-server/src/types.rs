@@ -124,6 +124,10 @@ pub struct ChatCompletionRequest {
     pub samplers: Option<onnx_genai_engine::SamplerSequence>,
     #[serde(default = "default_top_n_sigma")]
     pub top_n_sigma: f32,
+    #[serde(default = "default_adaptive_target")]
+    pub adaptive_target: f32,
+    #[serde(default = "default_adaptive_decay")]
+    pub adaptive_decay: f32,
     /// Absent when the caller left sampling to the model. See
     /// [`Self::sampling_overrides`].
     #[serde(default)]
@@ -782,6 +786,12 @@ pub struct CompletionLogprobs {
 pub(crate) const DEFAULT_REPEAT_LAST_N: i64 = 64;
 fn default_repeat_last_n() -> i64 {
     DEFAULT_REPEAT_LAST_N
+}
+fn default_adaptive_target() -> f32 {
+    -1.0
+}
+fn default_adaptive_decay() -> f32 {
+    0.9
 }
 fn default_top_n_sigma() -> f32 {
     -1.0
