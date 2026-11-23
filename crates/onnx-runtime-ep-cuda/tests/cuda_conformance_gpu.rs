@@ -1790,9 +1790,8 @@ fn cumprod_cases() -> Vec<Case> {
     ] {
         let shape = vec![2, 5];
         let values = match dtype {
-            DataType::Float16 | DataType::BFloat16 | DataType::Float64 => {
-                float_input(dtype, &shape, &[1.13; 10])
-            }
+            DataType::Float16 | DataType::BFloat16 => float_input(dtype, &shape, &[1.13; 10]),
+            DataType::Float64 => input(dtype, &shape, &[1.13_f64; 10]),
             DataType::Int32 => input(dtype, &shape, &[i32::MAX, 2, -3, 5, 0, -5, 4, 3, 2, 1]),
             DataType::Uint32 => input(dtype, &shape, &[u32::MAX, 2, 3, 5, 0, 5, 4, 3, 2, 1]),
             DataType::Uint64 => input(dtype, &shape, &[u64::MAX, 2, 3, 5, 0, 5, 4, 3, 2, 1]),
