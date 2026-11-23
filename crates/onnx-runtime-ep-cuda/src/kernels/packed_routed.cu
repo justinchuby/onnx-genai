@@ -136,6 +136,50 @@ extern "C" __global__ void NAME(const B* x, const B* w, const B* idx, const B* b
     GROUP_ENTRY(S,F,long long,grouped_##TAG##_i64)
 GROUP_TYPE(float,float,f32)
 GROUP_TYPE(double,double,f64)
+
+__device__ int affine_nibble(const B* codes, U row, U col, U width) {
+    return (codes[row * ((width + 1) / 2) + col / 2] >> ((col % 2) * 4)) & 15;
+}
+
+template<typename I>
+__device__ void affine_grouped(const B* x, const B* w, const B* indices, const B* scales,
+    const B* zeros, B* y, unsigned* status, U routes, U lanes, U groups, U selections,
+    U k, U n, U block_size, int zero) {
+    const U blocks = k / block_size;
+    GRID(i, groups * n * blocks) {
+        const float scale = read<float>(scales, i);
+        if (!(scale > 0.0f) || !isfinite(scale)) atomicOr(status, 2u);
+    }
+    GRID(i, n == 0 ? routes : lanes) {
+        const U route = n == 0 ? i : i / n;
+        const I group = read<I>(indices, route);
+        if (group < 0 || (U)group >= groups) {
+            atomicOr(status, 1u);
+            continue;
+        }
+        if (n == 0) continue;
+        const U row = (U)group * n + i % n;
+        const U token = route / selections;
+        float sum = 0.0f;
+        for (U j = 0; j < k; ++j) {
+            const U p = j / block_size;
+            const int z = zeros ? affine_nibble(zeros, row, p, blocks) : zero;
+            const float decoded = __fmul_rn(affine_nibble(w, row, j, k) - z,
+                                             read<float>(scales, row * blocks + p));
+            sum += read<float>(x, token * k + j) * decoded;
+        }
+        write<float>(y, i, sum);
+    }
+}
+
+#define AFFINE_GROUP_ENTRY(I, NAME) \
+extern "C" __global__ void NAME(const B* x, const B* w, const B* idx, const B* scales, \
+    const B* zeros, B* y, unsigned* status, U routes, U lanes, U groups, U selections, \
+    U k, U n, U block_size, int zero) { \
+    affine_grouped<I>(x,w,idx,scales,zeros,y,status,routes,lanes,groups,selections,k,n,block_size,zero); \
+}
+AFFINE_GROUP_ENTRY(int, affine_grouped_i32)
+AFFINE_GROUP_ENTRY(long long, affine_grouped_i64)
 #ifdef NXRT_HAS_HALF
 GROUP_TYPE(__half,float,f16)
 GROUP_TYPE(__nv_bfloat16,float,bf16)

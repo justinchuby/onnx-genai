@@ -109,4 +109,21 @@ pub fn register(reg: &mut InferenceRegistry) {
     for name in OPS {
         reg.register("", name, 29, infer);
     }
+    reg.register(
+        onnx_runtime_ir::RUNTIME_DOMAIN,
+        onnx_runtime_ir::quantized_grouped::OP,
+        1,
+        |ctx| {
+            if let (Some([m, _]), Some([_, n, _]), Some([_, selections])) =
+                (ctx.input_shape(0), ctx.input_shape(1), ctx.input_shape(2))
+            {
+                ctx.set_output(
+                    0,
+                    DataType::Float32,
+                    vec![m.clone(), selections.clone(), n.clone()],
+                );
+            }
+            Ok(())
+        },
+    );
 }
