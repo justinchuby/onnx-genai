@@ -13,5 +13,5 @@
   "engine_integration": false,
   "default_adoption": false,
   "source_changes_after_timing": "None; reports only",
-  "raw_binaries": "Still retained in /tmp/nxrt-active-lane-perf and original QMoE folder for diagnostic inspection; hashes are archived"
+  "raw_binaries": "Hash-verified attribution copies and this temporary probe package cache removed under the shared flock; see cleanup.json. Original QMoE binaries remain in their separate folder."
 }

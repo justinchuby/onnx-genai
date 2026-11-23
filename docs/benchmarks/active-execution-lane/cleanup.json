@@ -1,0 +1,28 @@
+{
+  "removed": [
+    {
+      "path": "/tmp/nxrt-active-lane-perf/original-probe",
+      "sha256": "4183291f36a81f48839173bbe69d2b84e89fb0c0762945064af74904461028da",
+      "logical_bytes": 13877760
+    },
+    {
+      "path": "/tmp/nxrt-active-lane-perf/routed-probe",
+      "sha256": "62945a262790e66474b58eff86dc5e4a45e38f0fc8bd3a0f5badc989960896ff",
+      "logical_bytes": 13884608
+    },
+    {
+      "path": "/tmp/nxrt-active-lane-perf/null-probe",
+      "sha256": "4183291f36a81f48839173bbe69d2b84e89fb0c0762945064af74904461028da",
+      "logical_bytes": 13877760
+    },
+    {
+      "path": "/tmp/nxrt-active-lane-perf/current-probe",
+      "sha256": "e6234b8816e45f612ba8f3de21644a269c3f1d54431d340ee503fb7bcf1543fa",
+      "logical_bytes": 13916192
+    }
+  ],
+  "logical_bytes": 55556320,
+  "probe_cache_clean_exit": 0,
+  "probe_cache_clean_output": "     Removed 8 files, 26.6MiB total\n",
+  "retained": "Original QMoE baseline/candidate binaries in their separate folder remain for ongoing work; raw outputs, batch records and sources remain. No host-lock inode or shared library cache is deleted. Logical byte sizes are not measured physical disk savings."
+}

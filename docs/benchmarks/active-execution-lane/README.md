@@ -35,3 +35,7 @@ The real generation loop does not use this prototype. Its existing adapter borro
 ## Decision
 
 Preserve the prototype and full evidence on its experimental branch; keep it out of default merging. Deterministic checkout reduction alone is insufficient justification for the added public lifecycle surface. Continue source/mechanism attribution of the existing public warm-fit path before choosing a production change. Keep the QMoE draft and its original performance gate intact.
+
+## Cleanup
+
+The four hash-verified attribution executable copies and this temporary probe package cache were removed under the shared host lock after the fixed study. Raw records/output files and source/binary hashes remain; original QMoE binaries in their separate folder remain available for ongoing work. cleanup.json records the exact scope and logical sizes.
