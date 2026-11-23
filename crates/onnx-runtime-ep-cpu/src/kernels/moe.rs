@@ -1264,9 +1264,8 @@ impl MoeWorkspace<'_> {
 }
 
 /// Portable single-token reference expert: plain scalar dot products, no GEMM,
-/// no transposes. Production now routes every row count through
-/// [`run_expert_grouped`]; this is kept as the oracle the tests compare
-/// against.
+/// no transposes. Production uses grouped GEMM projections at every row count;
+/// this is kept as the independent oracle the tests compare against.
 #[cfg(test)]
 pub(super) fn run_expert(
     input: &[f32],

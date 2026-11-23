@@ -1,0 +1,336 @@
+{"status": "queued", "pid": 82116, "action": "Wait for the peer batch on the shared stable flock; no heavy process has started."}
+{"status": "acquired", "pid": 82116, "command": ["env", "CARGO_TARGET_DIR=/tmp/nxrt-miri-moe-prefix-target", "CARGO_INCREMENTAL=0", "ORT_ROOT=/Users/justinc/Documents/GitHub/onnx-genai/target/debug/build/onnx-genai-ort-sys-14a8134a15d047e2/out/ort-prebuilt", "cargo", "+nightly", "miri", "test", "--offline", "-p", "onnx-runtime-ep-cpu", "--test", "decoded_projection_layout", "zeroed_prefix_keeps_whole_bank_initialization_separate", "--", "--exact"]}
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling cfg-if v1.0.4
+   Compiling either v1.17.0
+   Compiling libc v0.2.189
+   Compiling regex-syntax v0.8.11
+   Compiling anyhow v1.0.104
+   Compiling version_check v0.9.5
+   Compiling bitflags v2.13.1
+   Compiling fnv v1.0.7
+   Compiling lazy_static v1.5.0
+   Compiling itertools v0.14.0
+   Compiling beef v0.5.2
+   Compiling prettyplease v0.2.37
+   Compiling hashbrown v0.17.1
+   Compiling generic-array v0.14.7
+   Compiling equivalent v1.0.2
+   Compiling log v0.4.33
+   Compiling bytes v1.12.1
+   Compiling serde_core v1.0.229
+   Compiling indexmap v2.14.0
+   Compiling thiserror v1.0.69
+   Compiling unicode-width v0.1.14
+   Compiling once_cell v1.21.4
+   Compiling rustix v1.1.6
+   Compiling getrandom v0.4.3
+   Compiling regex-automata v0.4.16
+   Compiling errno v0.3.14
+   Compiling syn v2.0.119
+   Compiling syn v3.0.3
+   Compiling thiserror v2.0.19
+   Compiling serde v1.0.229
+   Compiling zmij v1.0.23
+   Compiling typenum v1.20.1
+   Compiling glob v0.3.4
+   Compiling fastrand v2.5.0
+   Compiling serde_json v1.0.151
+   Compiling regex v1.13.1
+   Compiling fixedbitset v0.5.7
+   Compiling petgraph v0.7.1
+   Compiling tempfile v3.27.0
+   Compiling clang-sys v1.8.1
+   Compiling cfg_aliases v0.2.2
+   Compiling memchr v2.8.3
+   Compiling crc32fast v1.5.0
+   Compiling multimap v0.10.1
+   Compiling itoa v1.0.18
+   Compiling heck v0.5.0
+   Compiling nix v0.31.3
+   Compiling crossbeam-utils v0.8.22
+   Compiling minimal-lexical v0.2.1
+   Compiling logos-codegen v0.14.4
+   Compiling zerocopy v0.8.55
+   Compiling nom v7.1.3
+   Compiling block-buffer v0.10.4
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.19
+   Compiling crypto-common v0.1.7
+   Compiling libloading v0.8.9
+   Compiling simd-adler32 v0.3.10
+   Compiling crossbeam-epoch v0.9.20
+   Compiling bumpalo v3.20.3
+   Compiling zlib-rs v0.6.6
+   Compiling bindgen v0.72.1
+   Compiling zopfli v0.8.3
+   Compiling digest v0.10.7
+   Compiling cexpr v0.6.0
+   Compiling cpufeatures v0.2.17
+   Compiling itertools v0.13.0
+   Compiling typed-path v0.12.4
+   Compiling shlex v1.3.0
+   Compiling crossbeam-deque v0.8.7
+   Compiling rustc-hash v2.1.3
+   Compiling sha2 v0.10.9
+   Compiling autocfg v1.5.1
+   Compiling prost-derive v0.13.5
+   Compiling logos-derive v0.14.4
+   Compiling miette-derive v7.6.0
+   Compiling thiserror-impl v1.0.69
+   Compiling zerocopy-derive v0.8.55
+   Compiling logos v0.14.4
+   Compiling rayon-core v1.13.0
+   Compiling num-traits v0.2.19
+   Compiling miette v7.6.0
+   Compiling onnx-runtime-memory-api v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-memory-api)
+   Compiling prost v0.13.5
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-memory-api/src/binding.rs:340:10
+    |
+340 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |          ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+340 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+340 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |
+
+   Compiling memmap2 v0.9.11
+   Compiling flate2 v1.1.9
+   Compiling clap_lex v1.1.0
+warning: `onnx-runtime-memory-api` (lib) generated 1 warning (run `cargo fix --lib -p onnx-runtime-memory-api` to apply 1 suggestion)
+   Compiling onnx-genai-runtime-config v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-genai-runtime-config)
+   Compiling prost-types v0.13.5
+   Compiling onnx-runtime-tracer v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-tracer)
+   Compiling libm v0.2.16
+   Compiling zip v9.0.5
+   Compiling ciborium-io v0.2.2
+   Compiling plotters-backend v0.3.7
+   Compiling anstyle v1.0.14
+   Compiling plotters-svg v0.3.7
+   Compiling onnx-runtime-memory-governor v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-memory-governor)
+   Compiling clap_builder v4.6.2
+   Compiling rayon v1.12.0
+   Compiling protox-parse v0.7.0
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-memory-governor/src/large_alloc_cache.rs:700:18
+    |
+700 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+700 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+700 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-memory-governor/src/manager.rs:519:14
+    |
+519 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+519 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+519 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-memory-governor/src/manager.rs:592:14
+    |
+592 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+592 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+592 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    |
+
+   Compiling prost-reflect v0.14.7
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-memory-governor/src/lib.rs:468:62
+    |
+468 |         let _ = self.mapped_allowance_reserved[tier.index()].fetch_update(
+    |                                                              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+468 -         let _ = self.mapped_allowance_reserved[tier.index()].fetch_update(
+468 +         let _ = self.mapped_allowance_reserved[tier.index()].try_update(
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-memory-governor/src/lib.rs:507:59
+    |
+507 |         let _ = self.mapped_growth_reserved[tier.index()].fetch_update(
+    |                                                           ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+507 -         let _ = self.mapped_growth_reserved[tier.index()].fetch_update(
+507 +         let _ = self.mapped_growth_reserved[tier.index()].try_update(
+    |
+
+   Compiling prost-build v0.13.5
+warning: `onnx-runtime-memory-governor` (lib) generated 5 warnings (run `cargo fix --lib -p onnx-runtime-memory-governor` to apply 5 suggestions)
+   Compiling protox v0.7.2
+   Compiling half v2.7.1
+   Compiling itertools v0.10.5
+   Compiling ciborium-ll v0.2.2
+   Compiling same-file v1.0.6
+   Compiling cast v0.3.0
+   Compiling ciborium v0.2.2
+   Compiling walkdir v2.5.0
+   Compiling plotters v0.3.7
+   Compiling clap v4.6.4
+   Compiling tinytemplate v1.2.1
+   Compiling is-terminal v0.4.17
+   Compiling atomic-wait v1.1.0
+   Compiling onnx-runtime-quantization v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-quantization)
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling smallvec v1.15.2
+   Compiling onnx-runtime-einsum-conformance v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-einsum-conformance)
+   Compiling onnx-runtime-hostmon v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-hostmon)
+   Compiling criterion-plot v0.5.0
+   Compiling onnx-runtime-operator-selection v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-operator-selection)
+   Compiling criterion v0.5.1
+   Compiling onnx-runtime-ir v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-ir)
+   Compiling onnx-genai-ort-sys v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-genai-ort/ort-sys)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-ir/src/pattern/builder.rs:173:14
+    |
+173 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+    |              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+173 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+173 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+    |
+
+   Compiling onnx-runtime-shape-inference v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-shape-inference)
+   Compiling onnx-runtime-optimizer v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-optimizer)
+warning: `onnx-runtime-ir` (lib) generated 1 warning (run `cargo fix --lib -p onnx-runtime-ir` to apply 1 suggestion)
+   Compiling onnx-runtime-loader v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-loader)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-loader/src/weights.rs:717:14
+    |
+717 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+    |              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+717 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+717 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+    |
+
+warning: `onnx-runtime-loader` (lib) generated 1 warning (run `cargo fix --lib -p onnx-runtime-loader` to apply 1 suggestion)
+   Compiling onnx-runtime-ep-api v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-ep-api)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-ep-api/src/provider.rs:372:14
+    |
+372 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+372 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+372 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-ep-api/src/provider.rs:409:14
+    |
+409 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+409 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+409 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-ep-cpu)
+warning: `onnx-runtime-ep-api` (lib) generated 2 warnings (run `cargo fix --lib -p onnx-runtime-ep-api` to apply 2 suggestions)
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-ep-cpu/src/weight_offload.rs:150:14
+    |
+150 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+    |              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+150 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+150 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-ep-cpu/src/weight_offload.rs:184:14
+    |
+184 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+184 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+184 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-ep-cpu/src/weight_offload.rs:351:14
+    |
+351 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+351 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+351 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-ep-cpu/src/weight_offload.rs:359:14
+    |
+359 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+359 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+359 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/onnx-runtime-ep-cpu/src/weight_offload.rs:369:10
+    |
+369 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+    |          ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+369 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+369 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+    |
+
+warning: `onnx-runtime-ep-cpu` (lib) generated 5 warnings (run `cargo fix --lib -p onnx-runtime-ep-cpu` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.33s
+     Running tests/decoded_projection_layout.rs (/tmp/nxrt-miri-moe-prefix-target/miri/aarch64-apple-darwin/debug/deps/decoded_projection_layout-0e1ee33ff0127ca7)
+
+running 1 test
+test zeroed_prefix_keeps_whole_bank_initialization_separate ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.21s
+

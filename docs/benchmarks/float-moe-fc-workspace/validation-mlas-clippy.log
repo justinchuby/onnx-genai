@@ -1,0 +1,3 @@
+   Compiling mlas-sys v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/mlas-sys)
+    Checking onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-float-moe-fc-workspace/crates/onnx-runtime-ep-cpu)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 35.20s
