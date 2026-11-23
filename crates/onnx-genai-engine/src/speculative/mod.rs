@@ -21,7 +21,7 @@ use crate::kv_bridge::{
     rewind_draft_state_to_len, rewind_target_state_to_len, trim_overmaterialized_target_kv,
 };
 use crate::logits::{ProcessorChain, ProcessorContext};
-use crate::processors::{ensure_constrained_finish, select_next_token_with_rng};
+use crate::processors::select_next_token_with_rng;
 use crate::sampling::SamplingRng;
 use crate::session::{DraftModel, DraftSession, EngineSession};
 use crate::{
@@ -1792,7 +1792,6 @@ impl Engine {
         let finished = host.finished.take();
         let committed = host.block.generated_tokens.clone();
         let logprobs = host.block.generated_logprobs.clone();
-        let unfinished_text = host.block.generated_text.clone();
         drop(host);
         // The declared emit and the block executor describe the same
         // generation. Checking them against each other is what keeps the emit
@@ -1805,7 +1804,7 @@ impl Engine {
             None => {
                 // The bound ran out rather than the policy stopping. Report it
                 // the way every other exhausted budget is reported.
-                ensure_constrained_finish(options, &unfinished_text, FinishReason::MaxTokens)?;
+
                 self.finish_result(
                     &committed,
                     FinishReason::MaxTokens,
@@ -1855,7 +1854,6 @@ impl Engine {
 
         if let Some(result) = self.check_speculative_termination(
             generated_tokens,
-            generated_text,
             generated_logprobs,
             state.tokens.len(),
             options,
@@ -2048,7 +2046,6 @@ impl Engine {
     fn check_speculative_termination(
         &self,
         generated_tokens: &[TokenId],
-        generated_text: &str,
         generated_logprobs: &Option<Vec<crate::config::TokenLogprob>>,
         token_count: usize,
         options: &GenerateOptions,
@@ -2056,7 +2053,6 @@ impl Engine {
         prefix_cache_hit_len: usize,
     ) -> anyhow::Result<Option<GenerateResult>> {
         if generated_tokens.len() >= options.max_new_tokens {
-            ensure_constrained_finish(options, generated_text, FinishReason::MaxTokens)?;
             return Ok(Some(self.finish_result(
                 generated_tokens,
                 FinishReason::MaxTokens,
@@ -2065,7 +2061,6 @@ impl Engine {
             )?));
         }
         if reached_context_limit(token_count, max_context) {
-            ensure_constrained_finish(options, generated_text, FinishReason::Length)?;
             return Ok(Some(self.finish_result(
                 generated_tokens,
                 FinishReason::Length,

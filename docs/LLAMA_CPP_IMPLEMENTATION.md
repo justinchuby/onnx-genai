@@ -711,3 +711,29 @@ SSE and logprob SSE output. Both new protocol-decoder tests passed. Strict
 engine/server all-target Clippy passed. These checks use the local ORT runtime;
 no performance claim is made. Reasoning continuation remains explicitly refused
 until its admission and prompt-boundary proof are implemented.
+
+JSON termination parity: removed completeness-only finish rejection from ordinary,
+continuous-batch, authored workflow, speculative and native speculative paths.
+The grammar owns legal token/EOS selection; explicit stops and output/context
+limits independently terminate generation, preserving actual partial text and
+true usage. The pinned upstream server applies these same independent stopping
+conditions in
+[`server-context.cpp`](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-context.cpp#L2107).
+No fallback success is synthesized for a genuine grammar failure.
+
+Stop filtering now precedes chat channel projection in buffered, live and logprob
+SSE output. A matched stop is a terminal buffer state, so later decoder bytes
+cannot reappear after it. A partial stop prefix flushes only when no match was
+completed. This also keeps reasoning-region stop strings out of the response and
+avoids treating text joined across separate channel regions as a raw stop.
+
+Termination validation: native-enabled engine library 843 passed / 1 inherited
+ignore; the final real JSON Object/Schema context-boundary test selected and
+passed 1 additional case, covering both full-context zero-token and one-token
+partial output. Final server library 410 passed / 2 inherited ignores, including
+real JSON Object/Schema buffered/SSE budget and explicit-stop continuations,
+reasoning-channel stops with and without logprobs, and every Unicode split of a
+terminal stop boundary. Strict native-engine and server all-target Clippy passed.
+JSON SSE now uses ordinary incremental delivery rather than collecting the whole
+value before sending content. Remaining delivery rows, including reasoning
+continuation and structured tool projection, stay open.

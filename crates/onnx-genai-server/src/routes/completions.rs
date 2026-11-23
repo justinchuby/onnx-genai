@@ -369,7 +369,7 @@ async fn deliver_completion(
                     .await?;
                 }
                 if matches!(token.finish_reason, Some(FinishReason::StopSequence { .. })) {
-                    stop_buffer.pending.clear();
+                    stop_buffer.discard_pending();
                 }
             }
             Some(DriverEvent::WorkflowPublications(publications)) => {
@@ -850,7 +850,6 @@ async fn stream_chat_completion(
         output_budget,
         handle.model_max_context,
     )?;
-    let wants_constrained_json = request.wants_constrained_json();
     let projection = ChatProjection::new(&handle, &prepared, state.config.replay_buffer_bytes)?;
     let initial_gate = projection.start().map_err(|error| {
         ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
@@ -897,7 +896,6 @@ async fn stream_chat_completion(
             .await;
         }
 
-        let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
         let mut channel_gate = initial_gate;
         let result = loop {
             match tokio::select! {
@@ -905,7 +903,6 @@ async fn stream_chat_completion(
                 event = driver_rx.recv() => event,
             } {
                 Some(DriverEvent::Token(token)) => {
-                    let finish_reason = token.finish_reason.clone();
                     let revealed =
                         match channel_gate.push_token(&tokenizer, token.token_id, &token.text) {
                             Ok(delta) => delta,
@@ -918,16 +915,10 @@ async fn stream_chat_completion(
                         )
                         .await?;
                     }
-                    let content = stop_buffer.push(&revealed.content);
-                    if requested_top_logprobs.is_none()
-                        && !wants_constrained_json
-                        && !content.is_empty()
-                    {
+                    let content = revealed.content;
+                    if requested_top_logprobs.is_none() && !content.is_empty() {
                         send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
                             .await?;
-                    }
-                    if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
-                        stop_buffer.pending.clear();
                     }
                 }
                 Some(DriverEvent::WorkflowPublications(publications)) => {
@@ -954,7 +945,6 @@ async fn stream_chat_completion(
                         &result,
                         &tokenizer,
                         requested_top_logprobs,
-                        &user_stop_sequences,
                         &projection,
                     )
                     .await?
@@ -973,34 +963,7 @@ async fn stream_chat_completion(
                         ),
                     )
                     .await?;
-                } else if wants_constrained_json {
-                    let content = match projection.buffered(&result, &tokenizer) {
-                        Ok(output) => output.content,
-                        Err(error) => {
-                            send_projection_error(&tx, error).await?;
-                            send_stream_end(&tx).await?;
-                            return Ok(());
-                        }
-                    };
-                    if !content.is_empty() {
-                        send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
-                            .await?;
-                    }
-                    send_stream_chunk(
-                        &tx,
-                        crate::sse::done_chunk_with_stop(
-                            &id,
-                            created,
-                            &model,
-                            &result.finish_reason,
-                            &user_stop_sequences,
-                        ),
-                    )
-                    .await?;
                 } else {
-                    // The gate's withheld text is ordinary content rather than a
-                    // partial stop sequence, so it is drained either way; only the
-                    // stop buffer's own pending text is dropped on a stop match.
                     let remaining = match channel_gate.finish(&tokenizer) {
                         Ok(delta) => delta,
                         Err(error) => {
@@ -1016,10 +979,7 @@ async fn stream_chat_completion(
                         )
                         .await?;
                     }
-                    let mut content = stop_buffer.push(&remaining.content);
-                    if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                        content.push_str(&stop_buffer.flush());
-                    }
+                    let content = remaining.content;
                     if !content.is_empty() {
                         send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
                             .await?;
@@ -1089,7 +1049,6 @@ async fn stream_declared_tool_chat_completion(
     include_usage: bool,
 ) -> anyhow::Result<()> {
     let (id, created, model) = response;
-    let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.to_vec());
     let mut buffered_text = String::new();
     let result = loop {
         match tokio::select! {
@@ -1097,7 +1056,6 @@ async fn stream_declared_tool_chat_completion(
             event = driver_rx.recv() => event,
         } {
             Some(DriverEvent::Token(token)) => {
-                let finish_reason = token.finish_reason.clone();
                 let revealed = match channel_gate.push_token(tokenizer, token.token_id, &token.text)
                 {
                     Ok(delta) => delta,
@@ -1107,10 +1065,7 @@ async fn stream_declared_tool_chat_completion(
                     send_stream_chunk(tx, reasoning_chunk(id, created, model, revealed.reasoning))
                         .await?;
                 }
-                buffered_text.push_str(&stop_buffer.push(&revealed.content));
-                if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
-                    stop_buffer.pending.clear();
-                }
+                buffered_text.push_str(&revealed.content);
             }
             Some(DriverEvent::WorkflowPublications(publications)) => {
                 if let Err(error) = send_workflow_publications(tx, &publications).await {
@@ -1137,16 +1092,15 @@ async fn stream_declared_tool_chat_completion(
                     return Ok(());
                 }
             };
-            if requested_top_logprobs.is_none() && !remaining.reasoning.is_empty() {
+            let tool_calls = committed_chat_tool_calls(&result);
+            if (requested_top_logprobs.is_none() || tool_calls.is_some())
+                && !remaining.reasoning.is_empty()
+            {
                 send_stream_chunk(tx, reasoning_chunk(id, created, model, remaining.reasoning))
                     .await?;
             }
-            buffered_text.push_str(&stop_buffer.push(&remaining.content));
-            if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                let trailing = stop_buffer.flush();
-                buffered_text.push_str(&trailing);
-            }
-            if let Some(tool_calls) = committed_chat_tool_calls(&result) {
+            buffered_text.push_str(&remaining.content);
+            if let Some(tool_calls) = tool_calls {
                 send_tool_call_deltas(tx, response, tool_calls).await?;
             } else if let Some(requested_top_logprobs) = requested_top_logprobs {
                 if !send_chat_logprob_chunks(
@@ -1155,7 +1109,6 @@ async fn stream_declared_tool_chat_completion(
                     &result,
                     tokenizer,
                     requested_top_logprobs,
-                    user_stop_sequences,
                     projection,
                 )
                 .await?
@@ -2666,6 +2619,7 @@ struct ChatProjection {
     template: Option<Arc<crate::response_template::ResponseTemplate>>,
     prefix: Arc<str>,
     max_bytes: usize,
+    stop_sequences: Vec<String>,
 }
 impl ChatProjection {
     fn new(
@@ -2682,6 +2636,16 @@ impl ChatProjection {
             template: handle.response_template.clone(),
             prefix: Arc::from(prefix),
             max_bytes,
+            stop_sequences: prepared
+                .request
+                .options
+                .stop_sequences
+                .iter()
+                .filter_map(|stop| match stop {
+                    onnx_genai_engine::StopSequence::Text(text) => Some(text.clone()),
+                    onnx_genai_engine::StopSequence::Tokens(_) => None,
+                })
+                .collect(),
         })
     }
     fn start(&self) -> anyhow::Result<ChannelGate> {
@@ -2697,6 +2661,7 @@ impl ChatProjection {
                     )
                 })
                 .transpose()?,
+            stop_buffer: StopBoundaryBuffer::new(self.stop_sequences.clone()),
             decoder: onnx_genai_engine::tokenization::TokenTextDecoder::new(
                 onnx_genai_engine::tokenization::SpecialTokenHandling::Preserve,
             ),
@@ -2709,7 +2674,7 @@ impl ChatProjection {
     ) -> anyhow::Result<ChannelDelta> {
         let Some(template) = &self.template else {
             return Ok(ChannelDelta {
-                content: result.text.clone(),
+                content: text_before_stop(&result.text, &self.stop_sequences).to_owned(),
                 reasoning: String::new(),
             });
         };
@@ -2725,7 +2690,7 @@ impl ChatProjection {
             &self.prefix,
             self.max_bytes,
         )?;
-        let mut output = parser.feed(&raw)?;
+        let mut output = parser.feed(text_before_stop(&raw, &self.stop_sequences))?;
         let tail = parser.finish()?;
         output.content.push_str(&tail.content);
         output.reasoning.push_str(&tail.reasoning);
@@ -2737,6 +2702,7 @@ impl ChatProjection {
 }
 
 struct ChannelGate {
+    stop_buffer: StopBoundaryBuffer,
     parser: Option<crate::response_template::ResponseParser>,
     decoder: onnx_genai_engine::tokenization::TokenTextDecoder,
 }
@@ -2754,12 +2720,12 @@ impl ChannelGate {
     ) -> anyhow::Result<ChannelDelta> {
         let Some(parser) = &mut self.parser else {
             return Ok(ChannelDelta {
-                content: plain.to_owned(),
+                content: self.stop_buffer.push(plain),
                 reasoning: String::new(),
             });
         };
         let raw = self.decoder.step(tokenizer, id)?;
-        let delta = parser.feed(&raw)?;
+        let delta = parser.feed(&self.stop_buffer.push(&raw))?;
         Ok(ChannelDelta {
             content: delta.content,
             reasoning: delta.reasoning,
@@ -2767,9 +2733,15 @@ impl ChannelGate {
     }
     fn finish(mut self, tokenizer: &Tokenizer) -> anyhow::Result<ChannelDelta> {
         let Some(mut parser) = self.parser.take() else {
-            return Ok(ChannelDelta::default());
+            return Ok(ChannelDelta {
+                content: self.stop_buffer.flush(),
+                reasoning: String::new(),
+            });
         };
-        let mut output = parser.feed(&self.decoder.finish(tokenizer)?)?;
+        let raw = self.decoder.finish(tokenizer)?;
+        let mut safe = self.stop_buffer.push(&raw);
+        safe.push_str(&self.stop_buffer.flush());
+        let mut output = parser.feed(&safe)?;
         let tail = parser.finish()?;
         output.content.push_str(&tail.content);
         output.reasoning.push_str(&tail.reasoning);
@@ -2941,7 +2913,6 @@ async fn send_chat_logprob_chunks(
     result: &GenerateResult,
     tokenizer: &Tokenizer,
     requested_top_logprobs: usize,
-    stop_sequences: &[String],
     projection: &ChatProjection,
 ) -> anyhow::Result<bool> {
     let (id, created, model) = response;
@@ -2977,7 +2948,7 @@ async fn send_chat_logprob_chunks(
     if !reasoning.is_empty() {
         send_stream_chunk(tx, reasoning_chunk(id, created, model, reasoning)).await?;
     }
-    let visible_text = truncate_tokens_at_stop(&stream_text, stop_sequences);
+    let visible_text = stream_text;
     for (index, content) in visible_text.into_iter().enumerate() {
         if content.is_empty() {
             continue;
@@ -3684,6 +3655,7 @@ mod channel_gate_tests {
             template: None,
             prefix: Arc::from(""),
             max_bytes: 4096,
+            stop_sequences: Vec::new(),
         };
         let mut gate = projection.start().unwrap();
         let tokenizer = Tokenizer::from_file(

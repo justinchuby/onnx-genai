@@ -10,9 +10,7 @@ use crate::decode_loop::{
 };
 use crate::engine::Engine;
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
-use crate::processors::{
-    build_processor_chain, ensure_constrained_finish, select_next_token_with_rng,
-};
+use crate::processors::{build_processor_chain, select_next_token_with_rng};
 use crate::sampling::SamplingRng;
 use anyhow::Context;
 use onnx_genai_metadata::decoder_workflow::{CONTINUOUS_BATCH_CONTRACT, IterationPolicy};
@@ -458,7 +456,7 @@ impl<'a> ContinuousBatchManager<'a> {
         if reached_context_limit(prompt_tokens.len(), max_context) {
             self.admissions
                 .push_back(ContinuousBatchAdmission::Assigned { handle });
-            ensure_constrained_finish(&options, "", FinishReason::Length)?;
+
             self.events.push_back(ContinuousBatchEvent::Finished {
                 handle,
                 result: finish_result(self.tokenizer, &[], FinishReason::Length, 0, None)?,
@@ -1119,19 +1117,9 @@ impl<'a> ContinuousBatchManager<'a> {
         let finish_reason = match finish_reason {
             Some(reason) => Some(reason),
             None if row.state.generated_tokens.len() >= row.options.max_new_tokens => {
-                ensure_constrained_finish(
-                    &row.options,
-                    &row.state.generated_text,
-                    FinishReason::MaxTokens,
-                )?;
                 Some(FinishReason::MaxTokens)
             }
             None if reached_context_limit(row.context_tokens.len(), row.max_context) => {
-                ensure_constrained_finish(
-                    &row.options,
-                    &row.state.generated_text,
-                    FinishReason::Length,
-                )?;
                 Some(FinishReason::Length)
             }
             None => None,

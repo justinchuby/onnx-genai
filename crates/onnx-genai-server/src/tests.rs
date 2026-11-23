@@ -6445,6 +6445,105 @@ mod llama_compat {
     }
 
     #[tokio::test]
+    async fn json_constraints_return_actual_partial_text_at_budget_and_user_stop() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        for (id, text) in [(22, "\"key\":"), (23, "{")] {
+            let old = vocab
+                .iter()
+                .find(|(_, value)| value.as_u64() == Some(id))
+                .unwrap()
+                .0
+                .clone();
+            vocab.remove(&old);
+            vocab.insert(text.into(), json!(id));
+        }
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("partial-json".into())).unwrap());
+        for format in [
+            json!({"type":"json_object"}),
+            json!({"type":"json_schema","json_schema":{"name":"key","schema":{
+                "type":"object","properties":{"key":{"type":"integer"}},"required":["key"],"additionalProperties":false
+            }}}),
+        ] {
+            for (continuation, stop, budget, expected, reason) in [
+                (false, false, 1, "{", "length"),
+                (true, false, 1, "\"key\":", "length"),
+                (true, true, 4, "\"key\"", "stop"),
+            ] {
+                let mut body = json!({"messages":[{"role":"user","content":"hello"}],"response_format":format,
+                    "max_tokens":budget,"temperature":0,"logit_bias":{"23":1000,"22":900,"3":10000}});
+                if continuation {
+                    body["messages"] = json!([{"role":"assistant","content":"{"}]);
+                    body["continue_final_message"] = json!(true);
+                    body["add_generation_prompt"] = json!(false);
+                }
+                if stop {
+                    body["stop"] = json!(":");
+                }
+                let (status, value) =
+                    call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{body}: {value}");
+                assert_eq!(
+                    value["choices"][0]["message"]["content"], expected,
+                    "{value}"
+                );
+                assert_eq!(value["choices"][0]["finish_reason"], reason, "{value}");
+                assert_eq!(value["usage"]["completion_tokens"], 1, "{value}");
+                body["stream"] = json!(true);
+                body["stream_options"] = json!({"include_usage":true});
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let events = sse_json_events(&bytes);
+                assert!(
+                    !events.iter().any(|event| event.get("error").is_some()),
+                    "{}",
+                    String::from_utf8_lossy(&bytes)
+                );
+                let text = events
+                    .iter()
+                    .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                    .collect::<String>();
+                assert_eq!(text, expected, "{body}: {events:?}");
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| event["choices"][0]["finish_reason"] == reason),
+                    "{events:?}"
+                );
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| event["usage"]["completion_tokens"] == 1),
+                    "{events:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn json_grammar_failure_is_not_replaced_with_fabricated_success() {
         let router = app(tiny_state());
         let mut body = json!({"messages":[{"role":"user","content":"hello"}],"response_format":{"type":"json_object"},"max_tokens":1,"temperature":0});
@@ -8472,54 +8571,66 @@ async fn declared_response_template_projects_real_generation_for_buffered_and_st
     )
     .unwrap();
     let router = app(AppState::load(scratch.path(), Some("declared-output".into())).unwrap());
-    for stream in [false, true] {
-        for logprobs in [false, true] {
-            let body = json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1,"temperature":0,
+    for (stop, expected_content, expected_reasoning) in [
+        (None, "答案", "秘密"),
+        (Some("密"), "", "秘"),
+        (Some("案"), "答", "秘密"),
+    ] {
+        for stream in [false, true] {
+            for logprobs in [false, true] {
+                let mut body = json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1,"temperature":0,
                 "logit_bias":{"22":1000},"stream":stream,"logprobs":logprobs});
-            let response = router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/v1/chat/completions")
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(body.to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            if stream {
-                let text = std::str::from_utf8(&bytes).unwrap();
-                let mut content = String::new();
-                let mut reasoning = String::new();
-                for line in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
-                    if line == "[DONE]" {
-                        continue;
+                if let Some(stop) = stop {
+                    body["stop"] = json!(stop);
+                }
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                if stream {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    let mut content = String::new();
+                    let mut reasoning = String::new();
+                    for line in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                        if line == "[DONE]" {
+                            continue;
+                        }
+                        let chunk: Value = serde_json::from_str(line).unwrap();
+                        assert!(chunk.get("error").is_none(), "{chunk}");
+                        content.push_str(
+                            chunk["choices"][0]["delta"]["content"]
+                                .as_str()
+                                .unwrap_or(""),
+                        );
+                        reasoning.push_str(
+                            chunk["choices"][0]["delta"]["reasoning_content"]
+                                .as_str()
+                                .unwrap_or(""),
+                        );
                     }
-                    let chunk: Value = serde_json::from_str(line).unwrap();
-                    assert!(chunk.get("error").is_none(), "{chunk}");
-                    content.push_str(
-                        chunk["choices"][0]["delta"]["content"]
-                            .as_str()
-                            .unwrap_or(""),
+                    assert_eq!(content, expected_content, "{text}");
+                    assert_eq!(reasoning, expected_reasoning, "{text}");
+                } else {
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        value["choices"][0]["message"]["content"], expected_content,
+                        "{value}"
                     );
-                    reasoning.push_str(
-                        chunk["choices"][0]["delta"]["reasoning_content"]
-                            .as_str()
-                            .unwrap_or(""),
+                    assert_eq!(
+                        value["choices"][0]["message"]["reasoning_content"], expected_reasoning,
+                        "{value}"
                     );
                 }
-                assert_eq!(content, "答案", "{text}");
-                assert_eq!(reasoning, "秘密", "{text}");
-            } else {
-                let value: Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(value["choices"][0]["message"]["content"], "答案", "{value}");
-                assert_eq!(
-                    value["choices"][0]["message"]["reasoning_content"], "秘密",
-                    "{value}"
-                );
             }
         }
     }

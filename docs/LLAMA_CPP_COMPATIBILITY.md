@@ -168,14 +168,16 @@ still rejected with actionable errors. Thinking budgets and other unsupported
 active controls also remain explicit request errors.
 `response_format: {"type":"json_object"}` continuation validates the original
 assistant prefix as partial JSON and constrains prefix plus new suffix at each
-step. EOS, stop sequences and output-budget completion use that same complete
-value; only newly generated suffix bytes and tokens appear in the response.
+step. Grammar validity and EOS eligibility use prefix plus suffix; only newly
+generated suffix bytes and tokens appear in the response. A user stop or token/
+context limit may end an incomplete value: the response retains actual partial
+output and reports `stop` or `length` rather than inventing a completed object.
 Invalid JSON prefixes are rejected before inference admission.
 A grammar that leaves no finite model candidate fails before token selection.
 JSON generation failures propagate as buffered errors or SSE error events; they
-are never replaced with an ungenerated `{}` and a successful stop. JSON-object
-budget/context exhaustion before completion still needs the upstream partial-
-output/length behavior; that remaining compatibility item is not considered done.
+are never replaced with an ungenerated `{}` and a successful stop. Stopping
+strings are removed before declared response-channel projection, consistently
+for buffered, live and logprob SSE output, including reasoning channels.
 Continuation intent follows the pinned upstream wire forms: `false`/`null` disable
 explicit continuation, `true` selects content unless the final message contains
 only reasoning, and `"content"` / `"reasoning_content"` select their named fields.

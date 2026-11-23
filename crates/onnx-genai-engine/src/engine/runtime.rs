@@ -3666,11 +3666,7 @@ impl Engine {
                 .tokenizer
                 .as_ref()
                 .context("this package declares no tokenizer, so it cannot decode text")?;
-            ensure_constrained_finish(
-                &active.options,
-                &loop_state.generated_text,
-                finish_reason.clone(),
-            )?;
+
             Some(crate::decode_loop::finish_result(
                 tokenizer,
                 &loop_state.generated_tokens,
@@ -3733,20 +3729,13 @@ impl Engine {
                 (true, None) => None,
             };
             match finish {
-                Some(finish_reason) => {
-                    ensure_constrained_finish(
-                        &active.options,
-                        &loop_state.generated_text,
-                        finish_reason.clone(),
-                    )?;
-                    Some(crate::decode_loop::finish_result(
-                        tokenizer,
-                        &loop_state.generated_tokens,
-                        finish_reason,
-                        loop_state.prefix_cache_hit_len,
-                        loop_state.logprobs.as_deref(),
-                    )?)
-                }
+                Some(finish_reason) => Some(crate::decode_loop::finish_result(
+                    tokenizer,
+                    &loop_state.generated_tokens,
+                    finish_reason,
+                    loop_state.prefix_cache_hit_len,
+                    loop_state.logprobs.as_deref(),
+                )?),
                 None => None,
             }
         };
@@ -3761,11 +3750,6 @@ impl Engine {
             return Ok(Some(result));
         }
         if active.generated_tokens.len() >= active.options.max_new_tokens {
-            ensure_constrained_finish(
-                &active.options,
-                &active.generated_text,
-                FinishReason::MaxTokens,
-            )?;
             return self
                 .finish_result(
                     &active.generated_tokens,

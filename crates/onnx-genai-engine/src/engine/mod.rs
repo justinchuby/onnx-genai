@@ -20,8 +20,7 @@ pub(crate) use crate::kv_bridge::{
 };
 pub(crate) use crate::logits::{StopSequence, TokenId};
 pub(crate) use crate::processors::{
-    build_processor_chain, ensure_constrained_finish, load_fim_config_from_model_dir,
-    push_unique_stop_sequence,
+    build_processor_chain, load_fim_config_from_model_dir, push_unique_stop_sequence,
 };
 pub(crate) use crate::sampling::{Sampler, SamplingRng};
 pub(crate) use crate::session::{ActiveGenerate, DraftModel, DraftSession, EngineSession};
@@ -1759,56 +1758,31 @@ mod tests {
     }
 
     #[test]
-    fn json_constraint_defers_stop_until_value_is_complete() {
+    fn json_constraint_obeys_stop_sequences_in_an_incomplete_value() {
         let options = GenerateOptions {
             constraint: Some(GenerateConstraint::Json {
                 prefix: String::new(),
             }),
-            stop_sequences: vec![StopSequence::Text("}".to_string())],
+            stop_sequences: vec![StopSequence::Text(":".into())],
             ..Default::default()
         };
-        let chain_options = GenerateOptions {
-            stop_sequences: options.stop_sequences.clone(),
+        let chain = build_processor_chain(
+            &GenerateOptions {
+                stop_sequences: options.stop_sequences.clone(),
+                ..Default::default()
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        let context = ProcessorContext {
+            generated_text: "{\"value\":".into(),
             ..Default::default()
         };
-        let chain = build_processor_chain(&chain_options, None, false).unwrap();
-        let incomplete = ProcessorContext {
-            generated_text: "{\"value\":".to_string(),
-            ..Default::default()
-        };
-        let complete = ProcessorContext {
-            generated_text: "{\"value\":1}".to_string(),
-            ..Default::default()
-        };
-
         assert_eq!(
-            finish_reason_after_token(1, &options, &chain, &incomplete),
-            None
-        );
-        assert_eq!(
-            finish_reason_after_token(1, &options, &chain, &complete),
+            finish_reason_after_token(1, &options, &chain, &context),
             Some(FinishReason::StopSequence { index: 0 })
         );
-    }
-
-    #[test]
-    fn incomplete_json_constraint_rejects_length_finishes() {
-        let options = GenerateOptions {
-            constraint: Some(GenerateConstraint::Json {
-                prefix: String::new(),
-            }),
-            ..Default::default()
-        };
-        for reason in [FinishReason::MaxTokens, FinishReason::Length] {
-            let error = ensure_constrained_finish(&options, "{\"value\":", reason).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("stopped before a complete JSON value")
-            );
-        }
-        ensure_constrained_finish(&options, "{\"value\":1}", FinishReason::MaxTokens).unwrap();
-        ensure_constrained_finish(&options, "", FinishReason::EosToken).unwrap();
     }
 
     #[test]
@@ -1834,6 +1808,66 @@ mod tests {
         assert_eq!(result.token_ids.len(), 3);
         assert_eq!(result.finish_reason, FinishReason::MaxTokens);
         assert!(engine.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn constrained_json_context_limits_preserve_actual_partial_output() -> anyhow::Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                std::fs::copy(entry.path(), scratch.path().join(entry.file_name()))?;
+            }
+        }
+        let path = scratch.path().join("tokenizer.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let vocab = value["model"]["vocab"].as_object_mut().unwrap();
+        let old = vocab
+            .iter()
+            .find(|(_, id)| id.as_u64() == Some(22))
+            .unwrap()
+            .0
+            .clone();
+        vocab.remove(&old);
+        vocab.insert("{".into(), serde_json::json!(22));
+        std::fs::write(path, serde_json::to_vec(&value)?)?;
+        let metadata_path = scratch.path().join("inference_metadata.yaml");
+        let metadata = std::fs::read_to_string(&metadata_path)?;
+        assert!(metadata.contains("max_sequence_length: 16"));
+        for (max_context, expected) in [(3, ""), (4, "{")] {
+            std::fs::write(
+                &metadata_path,
+                metadata.replace(
+                    "max_sequence_length: 16",
+                    &format!("max_sequence_length: {max_context}"),
+                ),
+            )?;
+            let mut engine = Engine::from_dir(scratch.path(), EngineConfig::default())?;
+            for constraint in [
+                GenerateConstraint::Json {
+                    prefix: String::new(),
+                },
+                GenerateConstraint::JsonSchema {
+                    schema: r#"{"type":"object"}"#.into(),
+                    prefix: String::new(),
+                },
+            ] {
+                let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+                request.options.constraint = Some(constraint.clone());
+                request.options.max_new_tokens = 4;
+                request
+                    .options
+                    .logit_bias
+                    .insert(22, crate::logits::LogitBias::Add(1000.0));
+                let result = engine.generate(request)?;
+                assert_eq!(result.text, expected);
+                assert_eq!(result.token_ids.len(), max_context - 3);
+                assert_eq!(result.finish_reason, FinishReason::Length);
+                assert!(engine.sessions.is_empty());
+            }
+        }
         Ok(())
     }
 

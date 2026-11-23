@@ -48,7 +48,6 @@ use crate::decode_loop::{
     reached_context_limit, select_and_commit_step,
 };
 use crate::logits::ProcessorChain;
-use crate::processors::ensure_constrained_finish;
 
 use super::workflow::{WorkflowExecutionPlan, WorkflowNodeHost, WorkflowNodeRequest};
 use super::{
@@ -759,7 +758,6 @@ impl WorkflowNodeHost for StagedOutputObserverHost<'_> {
 /// interpreter runs every step from its artifact.
 pub(crate) fn run_declared_generation(
     runtime: &WorkflowRuntime,
-    options: &GenerateOptions,
     tokenizer: Option<&Tokenizer>,
     request: PipelineGenerateRequest,
     mut core: Option<&mut dyn GenerationCore>,
@@ -800,16 +798,9 @@ pub(crate) fn run_declared_generation(
         };
         let (values, row_outputs) = plan.execute_retained_with_host_before_commit(
             &mut host,
-            |values, row_outputs, ended_by_predicate| {
+            |values, row_outputs, _ended_by_predicate| {
                 if generic_execution {
-                    preflight_generic_generation_output(
-                        runtime,
-                        options,
-                        tokenizer,
-                        values,
-                        row_outputs,
-                        ended_by_predicate,
-                    )?;
+                    preflight_generic_generation_output(runtime, tokenizer, values, row_outputs)?;
                 }
                 Ok(())
             },
@@ -858,11 +849,9 @@ pub(crate) fn run_declared_generation(
     /// the already validated, commit-only output.
     fn preflight_generic_generation_output(
         runtime: &WorkflowRuntime,
-        options: &GenerateOptions,
         tokenizer: Option<&Tokenizer>,
         values: &super::PipelineTensors,
         row_outputs: &std::collections::BTreeMap<String, Vec<String>>,
-        ended_by_predicate: bool,
     ) -> anyhow::Result<()> {
         let output = runtime
             .workflow_spec()
@@ -892,18 +881,10 @@ pub(crate) fn run_declared_generation(
                 u32::try_from(token).context("the workflow emitted a token outside uint32")
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let text = tokenizer
+        tokenizer
             .map(|tokenizer| tokenizer.decode(&tokens))
             .transpose()?;
-        ensure_constrained_finish(
-            options,
-            text.as_deref().unwrap_or_default(),
-            if ended_by_predicate {
-                FinishReason::EosToken
-            } else {
-                FinishReason::MaxTokens
-            },
-        )?;
+
         Ok(())
     }
 
@@ -929,7 +910,6 @@ pub(crate) fn run_declared_generation(
         .map(|tokenizer| tokenizer.decode(&token_ids))
         .transpose()?
         .unwrap_or_default();
-    ensure_constrained_finish(options, &text, finish_reason.clone())?;
 
     // A core that scored each token already delivered it. Replaying the stream
     // here would double every token a server streamed.
@@ -1008,7 +988,6 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
     // A prompt that already fills the context cannot take a step. Refusing
     // before the plan binds anything keeps the refusal free of partial state.
     if reached_context_limit(backend.context_len(), request.max_context) {
-        ensure_constrained_finish(request.options, &state.generated_text, FinishReason::Length)?;
         let tool_calls = if let Some(observer) = staged_output_observer.as_deref_mut() {
             observer
                 .finish("context-limit boundary")
@@ -1046,11 +1025,10 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
                 .saturating_sub(logprobs.len()),
         );
     }
-    let options = request.options.clone();
     let tokenizer = request.tokenizer;
     let pipeline_request = PipelineGenerateRequest::new(crate::GenerateRequest {
         prompt: crate::GeneratePrompt::TokenIds(prompt_tokens.to_vec()),
-        options: options.clone(),
+        options: request.options.clone(),
     });
     match staged_output_observer {
         Some(observer) => {
@@ -1063,7 +1041,6 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
             );
             run_declared_generation(
                 runtime,
-                &options,
                 Some(tokenizer),
                 pipeline_request,
                 Some(&mut host),
@@ -1075,7 +1052,6 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
             let mut host = GenerationNodeHost::new(backend, state, &request, callback);
             run_declared_generation(
                 runtime,
-                &options,
                 Some(tokenizer),
                 pipeline_request,
                 Some(&mut host),

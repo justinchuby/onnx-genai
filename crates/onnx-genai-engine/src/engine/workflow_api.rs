@@ -381,7 +381,6 @@ impl Engine {
         }
         crate::pipeline::generation::run_declared_generation(
             runtime,
-            &options,
             tokenizer,
             request,
             None,

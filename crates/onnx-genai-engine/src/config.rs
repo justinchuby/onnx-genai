@@ -1682,7 +1682,8 @@ fn describe_supported(contract: &GenerationContract) -> String {
 /// Built-in constrained decoding grammars.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateConstraint {
-    /// Constrain the existing prefix plus new output to one complete JSON value.
+    /// Constrain the existing prefix plus new output to prefixes of one JSON value.
+    /// EOS requires a complete value; explicit stops and length limits may truncate it.
     Json {
         /// Existing assistant content consumed by the grammar, excluded from new output.
         prefix: String,

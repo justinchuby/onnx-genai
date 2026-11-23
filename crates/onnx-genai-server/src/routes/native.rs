@@ -480,7 +480,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                     let content = stop_buffer.push(&token.text);
                     published.push_str(&content);
                     if matches!(token.finish_reason, Some(FinishReason::StopSequence { .. })) {
-                        stop_buffer.pending.clear();
+                        stop_buffer.discard_pending();
                     }
                     json!({"content":content,"tokens":if return_tokens {vec![token.token_id]} else {vec![]},"stop":false,"index":index})
                 }

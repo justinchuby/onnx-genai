@@ -458,34 +458,6 @@ fn build_llguidance_constraint(
     }
 }
 
-fn constrained_json_is_complete(options: &GenerateOptions, generated: &str) -> Option<bool> {
-    let GenerateConstraint::Json { prefix } = options.constraint.as_ref()? else {
-        return None;
-    };
-    if prefix.is_empty() {
-        Some(JsonConstraint::is_complete(generated))
-    } else {
-        Some(JsonConstraint::is_complete(&format!("{prefix}{generated}")))
-    }
-}
-
-pub(crate) fn ensure_constrained_finish(
-    options: &GenerateOptions,
-    generated_text: &str,
-    finish_reason: FinishReason,
-) -> anyhow::Result<()> {
-    if matches!(
-        finish_reason,
-        FinishReason::MaxTokens | FinishReason::Length
-    ) && constrained_json_is_complete(options, generated_text) == Some(false)
-    {
-        anyhow::bail!(
-            "JSON constrained decoding stopped before a complete JSON value; increase max_new_tokens or max_context"
-        );
-    }
-    Ok(())
-}
-
 fn tokenizer_token_texts(tokenizer: &Tokenizer) -> Vec<Option<String>> {
     let vocab = tokenizer.inner().get_vocab(true);
     let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
@@ -539,15 +511,9 @@ pub(crate) fn finish_reason_after_token(
         return Some(FinishReason::EosToken);
     }
 
-    match chain.signal(context) {
-        Some(ProcessorSignal::StopSequence { index })
-            if constrained_json_is_complete(options, &context.generated_text) != Some(false) =>
-        {
-            Some(FinishReason::StopSequence { index })
-        }
-        Some(ProcessorSignal::StopSequence { .. }) => None,
-        None => None,
-    }
+    chain
+        .signal(context)
+        .map(|ProcessorSignal::StopSequence { index }| FinishReason::StopSequence { index })
 }
 
 #[cfg(test)]
@@ -1509,19 +1475,17 @@ mod ordered_sampler_tests {
 mod json_continuation_tests {
     use super::*;
     #[test]
-    fn json_continuation_finish_and_stop_use_prefix_plus_suffix() {
+    fn json_continuation_obeys_stop_before_the_value_is_complete() {
         let options = GenerateOptions {
             constraint: Some(GenerateConstraint::Json { prefix: "{".into() }),
             ..Default::default()
         };
-        ensure_constrained_finish(&options, "}", FinishReason::MaxTokens).unwrap();
-        assert!(ensure_constrained_finish(&options, "", FinishReason::Length).is_err());
         let mut chain = ProcessorChain::new();
         chain.add(Box::new(StopSequenceProcessor::new(vec![
-            StopSequence::Text("}".into()),
+            StopSequence::Text(":".into()),
         ])));
         let context = ProcessorContext {
-            generated_text: "}".into(),
+            generated_text: "\"key\":".into(),
             ..Default::default()
         };
         assert_eq!(

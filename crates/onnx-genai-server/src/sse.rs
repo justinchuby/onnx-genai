@@ -86,7 +86,13 @@ pub(crate) struct ChunkToolCallFunction {
 #[derive(Debug)]
 pub(crate) struct StopBoundaryBuffer {
     stop_sequences: Vec<String>,
-    pub(crate) pending: String,
+    state: StopBoundaryState,
+}
+
+#[derive(Debug)]
+enum StopBoundaryState {
+    Holding(String),
+    Stopped,
 }
 
 impl StopBoundaryBuffer {
@@ -96,56 +102,56 @@ impl StopBoundaryBuffer {
                 .into_iter()
                 .filter(|sequence| !sequence.is_empty())
                 .collect(),
-            pending: String::new(),
+            state: StopBoundaryState::Holding(String::new()),
         }
     }
 
     pub(crate) fn push(&mut self, text: &str) -> String {
+        let StopBoundaryState::Holding(pending) = &mut self.state else {
+            return String::new();
+        };
         if self.stop_sequences.is_empty() {
-            return text.to_string();
+            return text.to_owned();
         }
-
-        self.pending.push_str(text);
-        if let Some(stop_start) = self.earliest_stop_start() {
-            let safe = self.pending[..stop_start].to_string();
-            self.pending.clear();
+        pending.push_str(text);
+        if let Some(stop_start) = self
+            .stop_sequences
+            .iter()
+            .filter_map(|sequence| pending.find(sequence))
+            .min()
+        {
+            let safe = pending[..stop_start].to_owned();
+            self.state = StopBoundaryState::Stopped;
             return safe;
         }
-
-        let keep = self.longest_stop_prefix_suffix_len();
-        let emit_len = self.pending.len().saturating_sub(keep);
-        if emit_len == 0 {
-            return String::new();
-        }
-
-        let safe = self.pending[..emit_len].to_string();
-        self.pending = self.pending[emit_len..].to_string();
-        safe
-    }
-
-    pub(crate) fn flush(&mut self) -> String {
-        std::mem::take(&mut self.pending)
-    }
-
-    fn earliest_stop_start(&self) -> Option<usize> {
-        self.stop_sequences
-            .iter()
-            .filter_map(|sequence| self.pending.find(sequence))
-            .min()
-    }
-
-    fn longest_stop_prefix_suffix_len(&self) -> usize {
         let mut keep = 0;
         for sequence in &self.stop_sequences {
             for (prefix_len, _) in sequence.char_indices().skip(1) {
-                if self.pending.ends_with(&sequence[..prefix_len]) {
+                if pending.ends_with(&sequence[..prefix_len]) {
                     keep = keep.max(prefix_len);
                 }
             }
         }
-        keep
+        let emit_len = pending.len().saturating_sub(keep);
+        let safe = pending[..emit_len].to_owned();
+        pending.drain(..emit_len);
+        safe
+    }
+
+    pub(crate) fn flush(&mut self) -> String {
+        match &mut self.state {
+            StopBoundaryState::Holding(pending) => std::mem::take(pending),
+            StopBoundaryState::Stopped => String::new(),
+        }
+    }
+
+    pub(crate) fn discard_pending(&mut self) {
+        if let StopBoundaryState::Holding(pending) = &mut self.state {
+            pending.clear();
+        }
     }
 }
+
 pub(crate) async fn send_stream_chunk(
     tx: &mpsc::Sender<Result<Event, Infallible>>,
     chunk: ChatCompletionChunk,
@@ -784,5 +790,28 @@ mod reasoning_wire_tests {
         let delivered = rx.recv().await.expect("publication delivered once");
         assert!(delivered.is_ok());
         assert!(rx.try_recv().is_err(), "publication must not be replayed");
+    }
+}
+
+#[cfg(test)]
+mod stop_boundary_tests {
+    use super::*;
+    #[test]
+    fn stop_boundaries_are_terminal_and_preserve_every_unicode_split() {
+        let text = "hello停住hidden";
+        for (split, _) in text
+            .char_indices()
+            .chain(std::iter::once((text.len(), ' ')))
+        {
+            let mut buffer = StopBoundaryBuffer::new(vec!["停住".into()]);
+            let mut output = buffer.push(&text[..split]);
+            output.push_str(&buffer.push(&text[split..]));
+            output.push_str(&buffer.push("later bytes"));
+            output.push_str(&buffer.flush());
+            assert_eq!(output, "hello", "split={split}");
+        }
+        let mut buffer = StopBoundaryBuffer::new(vec!["停住".into()]);
+        assert_eq!(buffer.push("hello停"), "hello");
+        assert_eq!(buffer.flush(), "停");
     }
 }
