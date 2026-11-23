@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use onnx_genai_bench::{fixture_path, synthetic_decoder};
 use onnx_genai_engine::logits::{
-    MinPProcessor, RepetitionPenaltyProcessor, TemperatureProcessor, TopKProcessor, TopPProcessor,
+    MinPProcessor, PenaltiesProcessor, TemperatureProcessor, TopKProcessor, TopPProcessor,
 };
 use onnx_genai_engine::{
     DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, FinishReason, GenerateOptions,
@@ -380,7 +380,7 @@ fn apply_sampling_options(options: &mut GenerateOptions, args: &Args) {
     options.top_p = args.top_p;
     options.top_k = args.top_k;
     options.repetition_penalty = args.repetition_penalty;
-    options.repetition_window = args.repetition_window;
+    options.penalty_window = args.repetition_window;
     options.min_p = args.min_p;
 }
 
@@ -389,9 +389,10 @@ fn apply_sampling_options(options: &mut GenerateOptions, args: &Args) {
 fn sampling_chain(args: &Args) -> ProcessorChain {
     let mut chain = ProcessorChain::new();
     if args.repetition_penalty != 1.0 {
-        chain.add(Box::new(RepetitionPenaltyProcessor {
-            penalty: args.repetition_penalty,
+        chain.add(Box::new(PenaltiesProcessor {
+            repetition_penalty: args.repetition_penalty,
             window: args.repetition_window,
+            ..Default::default()
         }));
     }
     if args.temperature > 0.0 && args.temperature != 1.0 {

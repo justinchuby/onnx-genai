@@ -458,3 +458,26 @@ Strict native-engine all-target Clippy passes.
 Strict CUDA-feature ORT and server all-target Clippy also pass. CUDA top-k
 candidate counts use integer reductions, avoiding float rounding in large
 vocabularies; actual GPU execution remains a separate hardware validation gate.
+
+Shared-penalty milestone: one `PenaltiesProcessor` replaces three independent
+processors and counts the same prompt-plus-generated suffix once. Repetition
+rescales each seen logit once, then count-weighted frequency plus presence is
+subtracted in one expression, matching upstream. `GenerateOptions.penalty_window`
+now names the scope of all three controls; internal callers and benchmarks use
+the new processor directly, with no aliases for our pre-release symbols.
+
+The server parses `repeat_last_n` as a typed common request field, defaults it
+to upstream's 64, and advertises that default in properties. Minus one selects
+full history, zero disables every penalty, and invalid negative/host-oversized
+counts fail with an actionable error. Disabled penalties preserve the device
+argmax path. Unit regressions cover cross-boundary prompt/generated windows,
+positive and negative coefficients, neutral/zero windows and combined rounding;
+the HTTP regression exercises first-token prompt counts through all three APIs.
+
+Shared-penalty validation: full native engine 818 passed / 1 inherited ignore;
+the final focused check selected and passed 12 penalty-related cases including
+the added zero-window device path and joint-subtraction rounding guard. Full
+server library 398 passed / 2 inherited ignores, including the real three-protocol
+prompt-count/window regression. Strict engine and server all-target Clippy pass.
+The updated benchmark library and native profiling binary also pass strict
+Clippy with the native backend enabled.

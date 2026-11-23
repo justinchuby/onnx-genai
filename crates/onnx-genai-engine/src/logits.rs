@@ -5,7 +5,7 @@
 //! its own temperature/selector mode. Device shortcuts require a cached typed
 //! transform proof, including actual parameters and equivalent stage order.
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Mutex;
 
 use crate::config::MirostatVersion;
@@ -1046,99 +1046,64 @@ impl LogitProcessor for LogitBiasProcessor {
     }
 }
 
-pub struct RepetitionPenaltyProcessor {
-    pub penalty: f32,
-    /// When `Some(n)`, only the most recent `n` tokens of the combined
-    /// prompt+generated stream are penalized; `None` penalizes the whole
-    /// history (HF default behavior).
+/// Repetition, frequency and presence penalties share one history window.
+/// The count covers prompt tokens followed by committed generated tokens.
+pub struct PenaltiesProcessor {
+    pub repetition_penalty: f32,
+    pub frequency_penalty: f32,
+    pub presence_penalty: f32,
+    /// None uses the whole history; Some(0) disables all penalties.
     pub window: Option<usize>,
 }
 
-impl LogitProcessor for RepetitionPenaltyProcessor {
+impl Default for PenaltiesProcessor {
+    fn default() -> Self {
+        Self {
+            repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            window: None,
+        }
+    }
+}
+
+impl LogitProcessor for PenaltiesProcessor {
     fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
-        if !self.penalty.is_finite() || self.penalty <= 0.0 || self.penalty == 1.0 {
+        if self.window == Some(0)
+            || (self.repetition_penalty == 1.0
+                && self.frequency_penalty == 0.0
+                && self.presence_penalty == 0.0)
+        {
             return;
         }
-
-        let total = context.prompt_tokens.len() + context.generated_tokens.len();
-        let skip = match self.window {
-            Some(window) => total.saturating_sub(window),
-            None => 0,
-        };
-        let mut seen = HashSet::new();
-        for &token_id in context
+        let total = context
+            .prompt_tokens
+            .len()
+            .saturating_add(context.generated_tokens.len());
+        let skip = self.window.map_or(0, |window| total.saturating_sub(window));
+        let mut counts: HashMap<TokenId, usize> = HashMap::new();
+        for &token in context
             .prompt_tokens
             .iter()
             .chain(context.generated_tokens.iter())
             .skip(skip)
         {
-            if !seen.insert(token_id) {
-                continue;
-            }
-            if let Some(logit) = logits.get_mut(token_id as usize) {
-                if *logit > 0.0 {
-                    *logit /= self.penalty;
+            *counts.entry(token).or_default() += 1;
+        }
+        for (token, count) in counts {
+            if let Some(logit) = logits.get_mut(token as usize) {
+                if *logit <= 0.0 {
+                    *logit *= self.repetition_penalty;
                 } else {
-                    *logit *= self.penalty;
+                    *logit /= self.repetition_penalty;
                 }
+                *logit -= count as f32 * self.frequency_penalty + self.presence_penalty;
             }
         }
     }
 
     fn name(&self) -> &str {
-        "repetition_penalty"
-    }
-}
-
-pub struct FrequencyPenaltyProcessor {
-    pub frequency_penalty: f32,
-}
-
-impl LogitProcessor for FrequencyPenaltyProcessor {
-    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
-        if !self.frequency_penalty.is_finite() || self.frequency_penalty == 0.0 {
-            return;
-        }
-
-        let mut counts: HashMap<TokenId, usize> = HashMap::new();
-        for &token_id in &context.generated_tokens {
-            *counts.entry(token_id).or_default() += 1;
-        }
-
-        for (token_id, count) in counts {
-            if let Some(logit) = logits.get_mut(token_id as usize) {
-                *logit -= self.frequency_penalty * count as f32;
-            }
-        }
-    }
-
-    fn name(&self) -> &str {
-        "frequency_penalty"
-    }
-}
-
-pub struct PresencePenaltyProcessor {
-    pub presence_penalty: f32,
-}
-
-impl LogitProcessor for PresencePenaltyProcessor {
-    fn process(&self, logits: &mut [f32], context: &ProcessorContext) {
-        if !self.presence_penalty.is_finite() || self.presence_penalty == 0.0 {
-            return;
-        }
-
-        let mut seen = HashSet::new();
-        for &token_id in &context.generated_tokens {
-            if seen.insert(token_id)
-                && let Some(logit) = logits.get_mut(token_id as usize)
-            {
-                *logit -= self.presence_penalty;
-            }
-        }
-    }
-
-    fn name(&self) -> &str {
-        "presence_penalty"
+        "penalties"
     }
 }
 
@@ -2295,9 +2260,10 @@ mod tests {
 
     #[test]
     fn repetition_penalty_applies_once_per_seen_token() {
-        let processor = RepetitionPenaltyProcessor {
-            penalty: 2.0,
+        let processor = PenaltiesProcessor {
+            repetition_penalty: 2.0,
             window: None,
+            ..Default::default()
         };
         let mut logits = vec![4.0, -4.0, 8.0];
         processor.process(&mut logits, &context(vec![0, 0], vec![1, 1]));
@@ -2308,9 +2274,10 @@ mod tests {
     fn repetition_penalty_window_limits_to_recent_tokens() {
         // Combined stream is prompt [0,1] ++ generated [2,3]; a window of 2 keeps
         // only the last two tokens (2 and 3), leaving 0 and 1 untouched.
-        let processor = RepetitionPenaltyProcessor {
-            penalty: 2.0,
+        let processor = PenaltiesProcessor {
+            repetition_penalty: 2.0,
             window: Some(2),
+            ..Default::default()
         };
         let mut logits = vec![4.0, 4.0, 4.0, -4.0];
         processor.process(&mut logits, &context(vec![0, 1], vec![2, 3]));
@@ -2319,9 +2286,10 @@ mod tests {
 
     #[test]
     fn repetition_penalty_window_zero_penalizes_nothing() {
-        let processor = RepetitionPenaltyProcessor {
-            penalty: 2.0,
+        let processor = PenaltiesProcessor {
+            repetition_penalty: 2.0,
             window: Some(0),
+            ..Default::default()
         };
         let mut logits = vec![4.0, 4.0];
         processor.process(&mut logits, &context(vec![0], vec![1]));
@@ -2330,9 +2298,10 @@ mod tests {
 
     #[test]
     fn repetition_penalty_disabled_is_identity() {
-        let processor = RepetitionPenaltyProcessor {
-            penalty: 1.0,
+        let processor = PenaltiesProcessor {
+            repetition_penalty: 1.0,
             window: None,
+            ..Default::default()
         };
         let mut logits = vec![4.0, -4.0, 8.0];
         let original = logits.clone();
@@ -2341,23 +2310,68 @@ mod tests {
     }
 
     #[test]
-    fn frequency_penalty_scales_with_generated_count() {
-        let processor = FrequencyPenaltyProcessor {
+    fn frequency_penalty_counts_prompt_and_generated_tokens() {
+        let processor = PenaltiesProcessor {
             frequency_penalty: 0.5,
+            ..Default::default()
         };
         let mut logits = vec![4.0, 4.0, 4.0];
         processor.process(&mut logits, &context(vec![0, 0], vec![0, 1, 1]));
-        assert_eq!(logits, vec![3.5, 3.0, 4.0]);
+        assert_eq!(logits, vec![2.5, 3.0, 4.0]);
     }
 
     #[test]
-    fn presence_penalty_applies_once_per_generated_token() {
-        let processor = PresencePenaltyProcessor {
+    fn presence_penalty_applies_once_per_prompt_or_generated_token() {
+        let processor = PenaltiesProcessor {
             presence_penalty: 0.75,
+            ..Default::default()
         };
         let mut logits = vec![4.0, 4.0, 4.0];
         processor.process(&mut logits, &context(vec![0], vec![1, 1, 2]));
-        assert_eq!(logits, vec![4.0, 3.25, 3.25]);
+        assert_eq!(logits, vec![3.25, 3.25, 3.25]);
+    }
+
+    #[test]
+    fn penalties_share_one_window_across_prompt_generated_and_all_coefficients() {
+        let context = context(vec![0, 1, 0], vec![2, 0]);
+        let mut processor = PenaltiesProcessor {
+            repetition_penalty: 2.0,
+            frequency_penalty: 0.5,
+            presence_penalty: 1.0,
+            window: Some(3),
+        };
+        let original = vec![8.0, -4.0, 4.0, 8.0];
+        let mut logits = original.clone();
+        processor.process(&mut logits, &context);
+        assert_eq!(logits, vec![2.0, -4.0, 0.5, 8.0]);
+        processor.window = None;
+        let mut logits = original.clone();
+        processor.process(&mut logits, &context);
+        assert_eq!(logits, vec![1.5, -9.5, 0.5, 8.0]);
+        processor.window = Some(0);
+        let mut logits = original.clone();
+        processor.process(&mut logits, &context);
+        assert_eq!(logits, original);
+        processor.window = Some(3);
+        processor.repetition_penalty = 0.5;
+        processor.frequency_penalty = -0.5;
+        processor.presence_penalty = -1.0;
+        let mut logits = original;
+        processor.process(&mut logits, &context);
+        assert_eq!(logits, vec![18.0, -4.0, 9.5, 8.0]);
+    }
+
+    #[test]
+    fn penalties_subtract_frequency_and_presence_as_one_expression() {
+        let processor = PenaltiesProcessor {
+            frequency_penalty: 1e20,
+            presence_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut logits = vec![1e20];
+        processor.process(&mut logits, &context(vec![0], vec![]));
+        assert_eq!(logits, [0.0]);
+        assert_ne!((1e20_f32 - 1e20_f32) - 1.0, logits[0]);
     }
 
     #[test]

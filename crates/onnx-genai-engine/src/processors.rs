@@ -5,10 +5,9 @@ use crate::config::{
     FinishReason, GenerateConstraint, GenerateOptions, SamplerSequence, SamplerStage,
 };
 use crate::logits::{
-    ConstraintProcessor, DryProcessor, FrequencyPenaltyProcessor, GrammarConstraintKind,
-    JsonConstraint, LlguidanceConstraint, MinPProcessor, MirostatProcessor,
-    PresencePenaltyProcessor, ProcessorChain, ProcessorContext, ProcessorSignal,
-    RepetitionPenaltyProcessor, StopSequence, StopSequenceProcessor, TemperatureProcessor, TokenId,
+    ConstraintProcessor, DryProcessor, GrammarConstraintKind, JsonConstraint, LlguidanceConstraint,
+    MinPProcessor, MirostatProcessor, PenaltiesProcessor, ProcessorChain, ProcessorContext,
+    ProcessorSignal, StopSequence, StopSequenceProcessor, TemperatureProcessor, TokenId,
     TopAProcessor, TopKProcessor, TopNSigmaProcessor, TopPProcessor, TypicalPProcessor,
     XtcProcessor,
 };
@@ -135,20 +134,16 @@ fn append_sampler_stage(
     }
     match stage {
         SamplerStage::Penalties => {
-            if options.repetition_penalty != 1.0 {
-                chain.add(Box::new(RepetitionPenaltyProcessor {
-                    penalty: options.repetition_penalty,
-                    window: options.repetition_window,
-                }));
-            }
-            if options.frequency_penalty != 0.0 {
-                chain.add(Box::new(FrequencyPenaltyProcessor {
+            if options.penalty_window != Some(0)
+                && (options.repetition_penalty != 1.0
+                    || options.frequency_penalty != 0.0
+                    || options.presence_penalty != 0.0)
+            {
+                chain.add(Box::new(PenaltiesProcessor {
+                    repetition_penalty: options.repetition_penalty,
                     frequency_penalty: options.frequency_penalty,
-                }));
-            }
-            if options.presence_penalty != 0.0 {
-                chain.add(Box::new(PresencePenaltyProcessor {
                     presence_penalty: options.presence_penalty,
+                    window: options.penalty_window,
                 }));
             }
         }
@@ -679,8 +674,25 @@ mod device_portability_tests {
         let chain = build_processor_chain(&options, None, false).expect("options build a chain");
         assert_eq!(
             chain.names(),
-            vec!["stop_sequence", "repetition_penalty", "presence_penalty"],
+            vec!["stop_sequence", "penalties"],
             "only the sampling warpers are dropped under greedy selection"
+        );
+    }
+
+    #[test]
+    fn zero_penalty_window_keeps_the_greedy_device_path_available() {
+        let options = greedy_options(GenerateOptions {
+            repetition_penalty: 1.5,
+            frequency_penalty: 2.0,
+            presence_penalty: 2.0,
+            penalty_window: Some(0),
+            ..Default::default()
+        });
+        let chain = build_processor_chain(&options, None, false).unwrap();
+        assert!(chain.is_empty());
+        assert_eq!(
+            device_sampling_plan(&chain, &options, false, true, true),
+            DeviceSamplingPlan::Greedy
         );
     }
 

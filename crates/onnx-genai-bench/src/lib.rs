@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use onnx_genai_engine::logits::{
-    FrequencyPenaltyProcessor, LlguidanceConstraint, MinPProcessor, PresencePenaltyProcessor,
-    ProcessorChain, RepetitionPenaltyProcessor, TemperatureProcessor, TopKProcessor, TopPProcessor,
+    LlguidanceConstraint, MinPProcessor, PenaltiesProcessor, ProcessorChain, TemperatureProcessor,
+    TopKProcessor, TopPProcessor,
 };
 use onnx_genai_engine::{ProcessorContext, TokenId};
 use tokenizers::Tokenizer;
@@ -43,15 +43,11 @@ pub fn processor_context() -> ProcessorContext {
 
 pub fn logit_processor_chain() -> ProcessorChain {
     let mut chain = ProcessorChain::new();
-    chain.add(Box::new(RepetitionPenaltyProcessor {
-        penalty: 1.1,
-        window: None,
-    }));
-    chain.add(Box::new(FrequencyPenaltyProcessor {
+    chain.add(Box::new(PenaltiesProcessor {
+        repetition_penalty: 1.1,
         frequency_penalty: 0.2,
-    }));
-    chain.add(Box::new(PresencePenaltyProcessor {
         presence_penalty: 0.1,
+        window: None,
     }));
     chain.add(Box::new(TemperatureProcessor {
         temperature: 0.8,

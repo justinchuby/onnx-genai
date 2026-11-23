@@ -65,7 +65,11 @@ rejected because these models execute in-process with explicit nxrt settings.
   pairs. `false` bans a token; finite numbers add a bias before penalties and
   constraints, including under greedy decoding. Unknown IDs and duplicate token
   assignments are rejected. The processor disables incompatible device shortcuts.
-- `repeat_last_n: -1` uses full history; non-negative values select the repetition window.
+- `repeat_last_n` defaults to 64 and selects one prompt-plus-generated history
+  window for repetition, frequency and presence penalties. `-1` uses full history;
+  `0` disables all three. Counts include prompt tokens from the first generated
+  token. Repetition rescales a seen logit once, then frequency and presence are
+  subtracted together, following the pinned upstream penalties stage.
 - `chat_template_kwargs` supplies template variables such as `enable_thinking`.
   Structural variables (`messages`, `tools`, generation prompt and BOS/EOS) cannot
   be overridden through kwargs. Unreferenced variables have the template's normal behavior.

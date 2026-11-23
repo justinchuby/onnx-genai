@@ -75,7 +75,7 @@ pub(crate) async fn props(
                 "temperature": if options.greedy { 0.0 } else { options.temperature },
                 "top_k": options.top_k, "top_p": options.top_p, "min_p": options.min_p,
                 "typ_p": options.typical_p, "repeat_penalty": options.repetition_penalty,
-                "repeat_last_n": -1, "presence_penalty": options.presence_penalty,
+                "repeat_last_n": crate::types::DEFAULT_REPEAT_LAST_N, "presence_penalty": options.presence_penalty,
                 "frequency_penalty": options.frequency_penalty,
                 "dry_multiplier": 0.0, "dry_base": 1.75, "dry_allowed_length": 2,
                 "dry_penalty_last_n": -1, "dry_sequence_breakers": [],
@@ -206,13 +206,15 @@ pub(crate) async fn apply_template(
 /// Controls that do not change inference may be safely accepted. Every other
 /// unknown field is rejected, rather than reporting success with ignored settings.
 pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(), ApiError> {
+    if request.repeat_last_n != -1 && usize::try_from(request.repeat_last_n).is_err() {
+        return Err(ApiError::invalid_request(
+            "repeat_last_n must be -1 for full history, 0 to disable all penalties, or a non-negative token count supported by this host",
+        ));
+    }
     ChatTemplate::validate_kwargs(&request.chat_template_kwargs)
         .map_err(|err| ApiError::invalid_request(err.to_string()))?;
     for (key, value) in &request.extensions {
         let accepted = match key.as_str() {
-            "repeat_last_n" => value
-                .as_i64()
-                .is_some_and(|n| n == -1 || usize::try_from(n).is_ok()),
             "reasoning_format" => value == "auto" || value == "deepseek",
             // These opt into optional progress/control facilities, not a different decoding algorithm.
             "reasoning_control" | "return_progress" | "timings_per_token" => value.is_boolean(),

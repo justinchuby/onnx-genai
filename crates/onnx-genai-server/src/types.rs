@@ -138,6 +138,8 @@ pub struct ChatCompletionRequest {
     pub typical_p: f32,
     #[serde(default = "default_repetition_penalty", rename = "repeat_penalty")]
     pub repetition_penalty: f32,
+    #[serde(default = "default_repeat_last_n")]
+    pub repeat_last_n: i64,
     #[serde(default)]
     pub frequency_penalty: f32,
     #[serde(default)]
@@ -777,6 +779,10 @@ pub struct CompletionLogprobs {
     pub text_offset: Vec<usize>,
 }
 
+pub(crate) const DEFAULT_REPEAT_LAST_N: i64 = 64;
+fn default_repeat_last_n() -> i64 {
+    DEFAULT_REPEAT_LAST_N
+}
 fn default_top_n_sigma() -> f32 {
     -1.0
 }

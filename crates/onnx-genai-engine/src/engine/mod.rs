@@ -1597,9 +1597,7 @@ mod tests {
             chain.names(),
             vec![
                 "stop_sequence",
-                "repetition_penalty",
-                "frequency_penalty",
-                "presence_penalty",
+                "penalties",
                 "dry",
                 "top_k",
                 "typical_p",
@@ -1640,9 +1638,7 @@ mod tests {
             chain.names(),
             vec![
                 "json_constraint",
-                "repetition_penalty",
-                "frequency_penalty",
-                "presence_penalty",
+                "penalties",
                 "top_k",
                 "typical_p",
                 "top_p",

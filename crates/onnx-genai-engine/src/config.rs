@@ -1304,14 +1304,14 @@ pub struct GenerateOptions {
     pub top_a: f32,
     /// Locally typical cumulative probability. One disables typical filtering.
     pub typical_p: f32,
-    /// Repetition penalty applied to prompt and generated tokens. Values <= 1 disable it.
+    /// Repetition penalty applied to seen tokens. One disables it; values below one reward repetition.
     pub repetition_penalty: f32,
-    /// When `Some(n)`, the repetition penalty only considers the most recent `n`
+    /// When `Some(n)`, all three penalties only consider the most recent `n`
     /// tokens of the combined prompt+generated stream. `None` uses the whole history.
-    pub repetition_window: Option<usize>,
-    /// OpenAI-style count penalty: logit[t] -= frequency_penalty * count(t).
+    pub penalty_window: Option<usize>,
+    /// Count penalty over the shared prompt/generated history window.
     pub frequency_penalty: f32,
-    /// OpenAI-style presence penalty: logit[t] -= presence_penalty once if seen.
+    /// Presence penalty applied once to each token seen in the shared window.
     pub presence_penalty: f32,
     /// Explicit token biases applied before penalties, constraints and sampling.
     pub logit_bias: std::collections::BTreeMap<TokenId, LogitBias>,
@@ -1380,7 +1380,7 @@ impl Default for GenerateOptions {
             top_a: 0.0,
             typical_p: 1.0,
             repetition_penalty: 1.0,
-            repetition_window: None,
+            penalty_window: None,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             logit_bias: Default::default(),

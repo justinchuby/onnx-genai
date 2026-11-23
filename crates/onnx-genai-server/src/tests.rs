@@ -6549,6 +6549,91 @@ mod native_compat {
     }
 
     #[tokio::test]
+    async fn penalties_window_counts_prompt_and_disables_all_penalties_across_protocols() {
+        let router = app(tiny_state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/props")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            json_body(response).await["default_generation_settings"]["params"]["repeat_last_n"],
+            64
+        );
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    match id {
+                        5 => json!(100),
+                        6 => json!(99),
+                        _ => json!(false),
+                    },
+                )
+            })
+            .collect();
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
+            for field in ["frequency_penalty", "presence_penalty"] {
+                let cases: &[(i64, &str)] = if field == "frequency_penalty" {
+                    &[(-1, "the"), (1, "world"), (0, "world")]
+                } else {
+                    &[(-1, "the"), (0, "world")]
+                };
+                for &(window, expected) in cases {
+                    let mut body = json!({"max_tokens":1,"temperature":0,
+                        "samplers":["penalties","temperature"], "repeat_last_n":window,
+                        "logit_bias":bias,"ignore_eos":true});
+                    body[field] = json!(2.0);
+                    let (prompt, text) = if field == "frequency_penalty" {
+                        (json!([5, 5, 6]), "world world the")
+                    } else {
+                        (json!([5]), "world")
+                    };
+                    if path == "/v1/chat/completions" {
+                        body["messages"] = json!([{"role":"user","content":text}]);
+                    } else {
+                        body["prompt"] = prompt;
+                    }
+                    let response = request(router.clone(), path, body).await;
+                    let status = response.status();
+                    let value = json_body(response).await;
+                    assert_eq!(status, StatusCode::OK, "{path} {field}: {value}");
+                    let text = if path == "/completion" {
+                        &value["content"]
+                    } else if path == "/v1/completions" {
+                        &value["choices"][0]["text"]
+                    } else {
+                        &value["choices"][0]["message"]["content"]
+                    };
+                    assert_eq!(text, expected, "{path} {field} window={window}: {value}");
+                }
+            }
+            let response = request(
+                router.clone(),
+                path,
+                if path == "/v1/chat/completions" {
+                    json!({"messages":[{"role":"user","content":"world"}],"repeat_last_n":-2})
+                } else {
+                    json!({"prompt":[5],"repeat_last_n":-2})
+                },
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                json_body(response)
+                    .await
+                    .to_string()
+                    .contains("repeat_last_n")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn native_top_k_ties_retain_exactly_the_requested_candidates() {
         let router = app(tiny_state());
         let bias: serde_json::Map<String, Value> = (0..32)

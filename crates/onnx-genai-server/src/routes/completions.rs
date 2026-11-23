@@ -2144,11 +2144,7 @@ fn build_generate_options(
         top_a: request.top_a,
         typical_p: request.typical_p,
         repetition_penalty: request.repetition_penalty,
-        repetition_window: request
-            .extensions
-            .get("repeat_last_n")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| usize::try_from(v).ok()),
+        penalty_window: usize::try_from(request.repeat_last_n).ok(),
         frequency_penalty: request.frequency_penalty,
         presence_penalty: request.presence_penalty,
         greedy: !stochastic_sampling_requested,
