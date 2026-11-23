@@ -41,6 +41,9 @@ pub(super) fn resolve_kernel_constant_inputs<'a>(
             let Some(weight) = graph.initializers.get(value) else {
                 return Ok(None);
             };
+            if weight.dtype() == DataType::String {
+                return Ok(None);
+            }
             let bytes = weights.bytes(weight).ok_or_else(|| {
                 SessionError::Internal(format!(
                     "initializer value {} could not be resolved for kernel preparation",

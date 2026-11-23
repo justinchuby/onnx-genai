@@ -40,6 +40,12 @@ pub struct CpuOpDescriptor {
     /// Supported element types for the "T" type-constraint. Derived from the
     /// kernel's actual dtype dispatch — fail closed (f32-only) when unknown.
     pub supported_dtypes: &'static [DataType],
+    /// Whether this kernel can execute through the fixed-width raw tensor ABI.
+    ///
+    /// Managed host-string kernels remain in the native registry but must not
+    /// become ORT plugin `KernelRegistryEntry`s: that ABI has no string payload
+    /// representation.
+    pub supports_raw_tensor_abi: bool,
 }
 
 // ── Dtype categories ─────────────────────────────────────────────────────────
@@ -160,6 +166,9 @@ static STFT_DTYPES: &[DataType] = &[
 
 /// NonMaxSuppression mixes f32 geometry/thresholds with i64 limits/output.
 static NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
+static STRING_ONLY: &[DataType] = &[DataType::String];
+static STRING_BOOL_DTYPES: &[DataType] = &[DataType::String, DataType::Bool];
+static STRING_I64_DTYPES: &[DataType] = &[DataType::String, DataType::Int64];
 /// Exact dtype union for `pkg.nxrt::DsaIndexSelect` edges.
 ///
 /// Inputs 0..=2 accept the three compute floats, input 3 is f32, and the sole
@@ -279,6 +288,8 @@ pub fn input_dtype_constraints_for_op(
         (2, FLOAT_COMPUTE_DTYPES),
         (3, F32_ONLY),
     ];
+    static TEXT_STRING_INPUT: &[(usize, &[DataType])] = &[(0, STRING_ONLY)];
+    static STRING_CONCAT_INPUTS: &[(usize, &[DataType])] = &[(0, STRING_ONLY), (1, STRING_ONLY)];
     match (op_type, domain) {
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::INPUT_DTYPES,
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
@@ -293,6 +304,8 @@ pub fn input_dtype_constraints_for_op(
         ("STFT", "") => STFT_SLOTS,
         ("NonMaxSuppression", "") => NMS_SLOTS,
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_SLOTS,
+        ("RegexFullMatch", "") | ("StringSplit", "") => TEXT_STRING_INPUT,
+        ("StringConcat", "") => STRING_CONCAT_INPUTS,
         _ => &[],
     }
 }
@@ -306,9 +319,13 @@ pub fn output_dtype_constraints_for_op(
     domain: &str,
 ) -> &'static [(usize, &'static [DataType])] {
     static DSA_INDEX_SELECT_OUTPUTS: &[(usize, &[DataType])] = &[(0, I64_ONLY)];
+    static REGEX_OUTPUTS: &[(usize, &[DataType])] = &[(0, &[DataType::Bool])];
+    static STRING_SPLIT_OUTPUTS: &[(usize, &[DataType])] = &[(0, STRING_ONLY), (1, I64_ONLY)];
     match (op_type, domain) {
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::OUTPUT_DTYPES,
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
+        ("RegexFullMatch", "") => REGEX_OUTPUTS,
+        ("StringSplit", "") => STRING_SPLIT_OUTPUTS,
         _ => &[],
     }
 }
@@ -344,6 +361,10 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("OneHot", "")
         | ("Dropout", "")
         | ("Unique", "") => ALL_DTYPES,
+
+        ("StringConcat", "") => STRING_ONLY,
+        ("RegexFullMatch", "") => STRING_BOOL_DTYPES,
+        ("StringSplit", "") => STRING_I64_DTYPES,
 
         // Arithmetic ops (dispatch_arith!): f32, f16, bf16, f64, int types.
         ("Add", "")
@@ -667,6 +688,7 @@ pub mod sparse_kv_gather;
 pub mod split;
 pub mod stft;
 pub mod tensor_scatter;
+pub mod text;
 pub mod transpose;
 pub mod unary_math;
 pub mod unique;
@@ -1034,11 +1056,22 @@ pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor
 fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
     let mut descriptors: Vec<CpuOpDescriptor> = reg
         .keys()
-        .map(|key| CpuOpDescriptor {
-            op_type: key.op_type.clone(),
-            domain: key.domain.clone(),
-            since_version: key.since_version,
-            supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
+        .map(|key| {
+            let supports_raw_tensor_abi = input_dtype_constraints_for_op(&key.op_type, &key.domain)
+                .iter()
+                .chain(output_dtype_constraints_for_op(&key.op_type, &key.domain))
+                .all(|(_, dtypes)| {
+                    dtypes
+                        .iter()
+                        .any(|dtype| !matches!(dtype, DataType::String | DataType::Undefined))
+                });
+            CpuOpDescriptor {
+                op_type: key.op_type.clone(),
+                domain: key.domain.clone(),
+                since_version: key.since_version,
+                supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
+                supports_raw_tensor_abi,
+            }
         })
         .collect();
     // `OpRegistry` iterates a hash map, so fix an order: callers leak these
@@ -1557,6 +1590,21 @@ pub(crate) fn build_cpu_registry_with_resources(
         OpKey::new("Expand", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(expand::ExpandFactory),
+    );
+    rec.register(
+        OpKey::new("RegexFullMatch", "", 20),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(text::RegexFullMatchFactory),
+    );
+    rec.register(
+        OpKey::new("StringConcat", "", 20),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(text::StringConcatFactory),
+    );
+    rec.register(
+        OpKey::new("StringSplit", "", 20),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(text::StringSplitFactory),
     );
     rec.register(
         OpKey::new("Slice", "", 1),
@@ -3418,7 +3466,7 @@ mod tests {
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
         // The EP-owned affine Gather and grouped-projection fusions each add one.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 109 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 112 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")

@@ -520,6 +520,12 @@ pub unsafe extern "C" fn nxrt_create_tensor(
             OrtErrorCode::InvalidArgument,
             format!("unsupported ONNX data_type {data_type}"),
         ))?;
+        if dtype == DataType::String {
+            return Err((
+                OrtErrorCode::InvalidArgument,
+                "tensor(string) has no raw byte layout in the nxrt ABI; construct it with the Rust Tensor::from_strings API".into(),
+            ));
+        }
 
         if shape.is_null() && rank != 0 {
             return Err((
@@ -692,6 +698,12 @@ pub unsafe extern "C" fn nxrt_get_tensor_data(
             return Err((
                 OrtErrorCode::InvalidArgument,
                 "out_data or out_len is null".into(),
+            ));
+        }
+        if value.inner.dtype == DataType::String {
+            return Err((
+                OrtErrorCode::InvalidArgument,
+                "tensor(string) has no raw byte buffer in the nxrt ABI; use the Rust Tensor::as_strings accessor".into(),
             ));
         }
         let bytes = value.inner.as_bytes();
