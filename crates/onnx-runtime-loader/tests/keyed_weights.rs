@@ -73,6 +73,10 @@ fn safetensors(dir: &Path, file: &str, header: &str, payload: &[u8]) -> KeyedWei
 }
 
 fn gguf(dir: &Path, file: &str, packed_row: u64) -> (PathBuf, Vec<u8>) {
+    gguf_fixture(dir, file, packed_row, 2)
+}
+
+fn gguf_fixture(dir: &Path, file: &str, packed_row: u64, rows: u64) -> (PathBuf, Vec<u8>) {
     fn string(out: &mut Vec<u8>, value: &str) {
         out.extend((value.len() as u64).to_le_bytes());
         out.extend(value.as_bytes());
@@ -84,9 +88,10 @@ fn gguf(dir: &Path, file: &str, packed_row: u64) -> (PathBuf, Vec<u8>) {
     string(&mut bytes, "general.quantization_version");
     bytes.extend(4u32.to_le_bytes());
     bytes.extend(2u32.to_le_bytes());
+    let dense_offset = if rows == 0 { 0 } else { 64 };
     for (name, dims, kind, offset) in [
-        ("packed", [packed_row, 2u64], 2u32, 0u64), // two 18-byte Q4_0 blocks
-        ("matrix", [3, 2], 0, 64),                  // F32; 28 bytes of alignment padding
+        ("packed", [packed_row, rows], 2u32, 0u64), // two 18-byte Q4_0 blocks when nonempty
+        ("matrix", [3, 2], 0, dense_offset), // F32; 28 bytes of alignment padding when nonempty
     ] {
         string(&mut bytes, name);
         bytes.extend(2u32.to_le_bytes());
@@ -98,12 +103,36 @@ fn gguf(dir: &Path, file: &str, packed_row: u64) -> (PathBuf, Vec<u8>) {
     }
     let base = bytes.len().next_multiple_of(32);
     bytes.resize(base, 0);
-    bytes.extend(0u8..36);
-    bytes.resize(base + 64, 0);
+    if rows != 0 {
+        bytes.extend(0u8..36);
+        bytes.resize(base + 64, 0);
+    }
     bytes.extend((1..=6).flat_map(|x| (x as f32).to_le_bytes()));
     let path = dir.join(file);
     std::fs::write(&path, &bytes).unwrap();
     (path, bytes)
+}
+
+#[test]
+fn binds_empty_packed_gguf_sharing_an_offset_with_dense_data() {
+    let dir = directory("keyed_gguf_empty");
+    let (path, _) = gguf_fixture(&dir, "empty.gguf", 32, 0);
+    let (graph, store) = load_model_bytes_with_keyed_weights(
+        &model(vec![
+            initializer("packed", 2, &[0], &[]),
+            initializer("matrix", 1, &[2, 3], &[]),
+        ]),
+        &dir,
+        &[KeyedWeightFile::gguf(path)],
+    )
+    .unwrap();
+    let mut lengths = graph
+        .initializers
+        .values()
+        .map(|w| mapped_bytes(&store, w).len())
+        .collect::<Vec<_>>();
+    lengths.sort_unstable();
+    assert_eq!(lengths, [0, 24]);
 }
 
 #[test]

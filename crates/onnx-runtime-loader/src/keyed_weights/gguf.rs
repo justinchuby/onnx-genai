@@ -130,9 +130,6 @@ pub(super) fn parse(data: &[u8]) -> Result<Entries, String> {
         let mut dims = (0..rank)
             .map(|_| reader.size())
             .collect::<Result<Vec<_>, _>>()?;
-        if dims.contains(&0) {
-            return Err(format!("GGUF tensor {key:?} has a zero dimension"));
-        }
         dims.reverse(); // GGML's first dimension is the contiguous axis.
         let encoding = reader.u32()?;
         let offset = reader.size()?;
@@ -150,15 +147,15 @@ pub(super) fn parse(data: &[u8]) -> Result<Entries, String> {
                     "GGUF tensor {key:?}: contiguous dimension {row} is not divisible by the {format} block size {block_elements}"
                 ));
             }
-            let len = outer
-                .iter()
-                .try_fold(
-                    (row / block_elements)
-                        .checked_mul(block_bytes)
-                        .ok_or_else(|| format!("GGUF tensor {key:?}: packed row size overflows"))?,
-                    |bytes, &dim| bytes.checked_mul(dim),
-                )
-                .ok_or_else(|| format!("GGUF tensor {key:?}: packed tensor size overflows"))?;
+            let len = if dims.contains(&0) {
+                0
+            } else {
+                outer
+                    .iter()
+                    .try_fold(block_bytes, |bytes, &dim| bytes.checked_mul(dim))
+                    .and_then(|bytes| bytes.checked_mul(row / block_elements))
+                    .ok_or_else(|| format!("GGUF tensor {key:?}: packed tensor size overflows"))?
+            };
             dims = vec![len];
             (DataType::Uint8, Some(format), len)
         } else {
@@ -212,7 +209,7 @@ pub(super) fn parse(data: &[u8]) -> Result<Entries, String> {
         entry.offset = base
             .checked_add(entry.offset)
             .ok_or("GGUF tensor offset overflows")?;
-        if entry.offset < end
+        if (entry.len != 0 && entry.offset < end)
             || entry
                 .offset
                 .checked_add(entry.len)
@@ -222,7 +219,9 @@ pub(super) fn parse(data: &[u8]) -> Result<Entries, String> {
                 "GGUF tensor {key:?} overlaps or extends beyond the file"
             ));
         }
-        end = entry.offset + entry.len;
+        if entry.len != 0 {
+            end = entry.offset + entry.len;
+        }
     }
 
     // GGML type IDs and the ONNX DequantizePacked opset-29 (elements, bytes)

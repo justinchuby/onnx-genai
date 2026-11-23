@@ -1184,7 +1184,7 @@ fn load(
         Some(p) => p,
         None => device_to_providers(device.as_deref())?,
     };
-    InferenceSession::new(py, path, Some(providers))
+    InferenceSession::new(py, path, Some(providers), None)
 }
 
 /// The numpy dtype *name* for a [`DataType`] (e.g. `"float32"`), falling back to
