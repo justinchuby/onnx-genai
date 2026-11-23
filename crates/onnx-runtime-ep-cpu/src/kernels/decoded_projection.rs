@@ -32,23 +32,58 @@ impl<'a> ProjectionScratch<'a> {
         let region = std::alloc::Layout::array::<f32>(elements).map_err(|_| {
             EpError::KernelFailed(format!("{operation}: {bytes} scratch bytes exceed addressable capacity; reduce batch or projection dimensions"))
         })?;
-        let [region] = WorkspaceLayout::new([region])?
-            .bind(workspace)
-            .map_err(|source| EpError::Backend {
-                operation,
-                source: Box::new(source),
-            })?;
-        let storage = if elements == 0 {
-            &mut []
-        } else {
-            // SAFETY: the checked layout proves non-null/aligned capacity;
-            // the caller guarantees Host accessibility, exclusivity and lifetime.
-            unsafe { std::slice::from_raw_parts_mut(region.ptr().0.cast(), elements) }
-        };
-        Ok(Self {
-            storage,
-            initialized: false,
-        })
+        // SAFETY: the caller lends the complete Host workspace exclusively.
+        let [scratch] =
+            unsafe { Self::bind_layout(operation, WorkspaceLayout::new([region])?, workspace)? };
+        Ok(scratch)
+    }
+
+    /// Bind one checked composite layout, validating f32 regions before any
+    /// typed references are formed. No region is initialized by binding.
+    ///
+    /// # Safety
+    /// Nonempty backing must be live, Host-accessible and exclusively lent for
+    /// `'a`, including every region and all short borrows made from its owners.
+    pub(super) unsafe fn bind_layout<const N: usize>(
+        operation: &'static str,
+        layout: WorkspaceLayout<N>,
+        workspace: Option<WorkspaceView>,
+    ) -> Result<[Self; N]> {
+        let regions = layout.bind(workspace).map_err(|source| EpError::Backend {
+            operation,
+            source: Box::new(source),
+        })?;
+        for (index, region) in regions.iter().enumerate() {
+            if !region.bytes().is_multiple_of(std::mem::size_of::<f32>())
+                || (region.bytes() != 0
+                    && !(region.ptr().0 as usize).is_multiple_of(std::mem::align_of::<f32>()))
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "{operation}: region {index} has {} bytes at {:#x}, which is not aligned complete f32 storage; declare f32 workspace layouts",
+                    region.bytes(),
+                    region.ptr().0 as usize,
+                )));
+            }
+        }
+        Ok(regions.map(|region| {
+            let storage = if region.bytes() == 0 {
+                &mut []
+            } else {
+                // SAFETY: complete layout validation proves capacity, address
+                // range and disjointness; the checks above prove f32 geometry.
+                // The caller guarantees Host accessibility and exclusive lifetime.
+                unsafe {
+                    std::slice::from_raw_parts_mut(
+                        region.ptr().0.cast(),
+                        region.bytes() / std::mem::size_of::<f32>(),
+                    )
+                }
+            };
+            Self {
+                storage,
+                initialized: false,
+            }
+        }))
     }
 
     /// Gather only the requested rows, initializing every returned value by
@@ -452,6 +487,69 @@ mod tests {
     use super::*;
     use onnx_runtime_ep_api::DevicePtrMut;
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn composite_scratch_binds_disjoint_f32_regions_and_rejects_untyped_geometry() {
+        let mut backing = [MaybeUninit::new(29.0f32); 16];
+        let view = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 16 * 4);
+        let layout = WorkspaceLayout::new([
+            std::alloc::Layout::array::<f32>(4).unwrap(),
+            std::alloc::Layout::array::<f32>(3).unwrap(),
+        ])
+        .unwrap();
+        {
+            // SAFETY: live aligned Host backing is exclusively lent to both regions.
+            let [mut projection, mut gathered] =
+                unsafe { ProjectionScratch::bind_layout("composite test", layout, Some(view)) }
+                    .unwrap();
+            assert_eq!(
+                gathered
+                    .gather_rows(&[1., 2., 3.], 3, [0].into_iter())
+                    .unwrap(),
+                &[1., 2., 3.]
+            );
+            projection.initialized().fill(7.);
+            assert_eq!(
+                gathered.initialized(),
+                &[0.; 3],
+                "a prefix copy does not initialize the entire owner"
+            );
+            assert_eq!(projection.initialized(), &[7.; 4]);
+        }
+        // SAFETY: this fixture initialized the entire backing before binding.
+        assert!(
+            backing[7..]
+                .iter()
+                .all(|x| unsafe { x.assume_init() } == 29.)
+        );
+        let odd = WorkspaceLayout::new([std::alloc::Layout::array::<u8>(3).unwrap()]).unwrap();
+        // SAFETY: backing accessibility/lifetime are valid; f32 geometry is checked by bind_layout.
+        let error = unsafe { ProjectionScratch::bind_layout("odd region", odd, Some(view)) }
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("region 0") && error.contains("complete f32"),
+            "{error}"
+        );
+        let byte_layout =
+            WorkspaceLayout::new([std::alloc::Layout::array::<u8>(4).unwrap()]).unwrap();
+        let misaligned = WorkspaceView::new(
+            DevicePtrMut(view.ptr().0.cast::<u8>().wrapping_add(1).cast()),
+            4,
+        );
+        // SAFETY: the live byte region is addressable; bind_layout must reject its f32 alignment.
+        let error = unsafe {
+            ProjectionScratch::bind_layout("misaligned region", byte_layout, Some(misaligned))
+        }
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            error.contains("region 0") && error.contains("aligned"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn gathered_projection_input_initializes_only_actual_rows_and_reuses_capacity() {

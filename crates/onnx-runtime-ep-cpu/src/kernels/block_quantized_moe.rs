@@ -313,26 +313,14 @@ impl BlockQuantizedMoEKernel {
             return write_dense_f32(&mut outputs[0], &[]);
         }
         let layout = self.execution_workspace_layout(dimensions)?;
-        let [projection, gathered] = layout.bind(workspace).map_err(|source| EpError::Backend {
-            operation: "BlockQuantizedMoE execution workspace binding",
-            source: Box::new(source),
-        })?;
-        // SAFETY: the checked layout lends disjoint, aligned Host regions for
-        // this dispatch. Projection initialization stays lazy; gathering writes
-        // exactly each expert's live prefix before exposing any f32 references.
-        let (mut scratch, mut grouped_scratch) = unsafe {
-            (
-                ProjectionScratch::bind(
-                    "BlockQuantizedMoE projection scratch",
-                    projection.bytes(),
-                    Some(projection),
-                )?,
-                ProjectionScratch::bind(
-                    "BlockQuantizedMoE grouped input",
-                    gathered.bytes(),
-                    Some(gathered),
-                )?,
-            )
+        // SAFETY: one checked layout lends disjoint Host regions for this
+        // dispatch. Neither short borrow nor a projection output escapes.
+        let [mut scratch, mut grouped_scratch] = unsafe {
+            ProjectionScratch::bind_layout(
+                "BlockQuantizedMoE execution workspace binding",
+                layout,
+                workspace,
+            )?
         };
         let Dimensions {
             rows,
@@ -1632,6 +1620,14 @@ mod tests {
         let kernel = CpuExecutionProvider::new()
             .get_kernel(graph.node(node), &[], 1)
             .unwrap();
+        let metadata: Vec<_> = shapes
+            .iter()
+            .map(|input| match input {
+                Some((dtype, shape)) => TensorMetadata::new(*dtype, shape, true),
+                None => TensorMetadata::new(DataType::Float32, &[], false),
+            })
+            .collect();
+        assert_eq!(kernel.workspace_requirement(&metadata).unwrap().bytes, 0);
         let input = Owned::f32(&[1, 0], &[]);
         let router = Owned::f32(&[1, E], &[4., -4.]);
         let fc1 = Owned::u8(&[E, H, 0, 17], &[]);
