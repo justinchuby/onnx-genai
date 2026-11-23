@@ -34,6 +34,7 @@
 #![deny(clippy::mem_forget)]
 
 pub mod abi;
+pub mod affine_gather;
 pub mod epcontext;
 pub mod host_parallel;
 pub mod kernel;

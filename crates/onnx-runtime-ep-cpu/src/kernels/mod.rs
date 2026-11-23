@@ -1046,6 +1046,15 @@ pub(crate) fn build_cpu_registry_with_resources(
     let dense_weight_cache_bytes = resources.weight_cache_limits().dense_bytes;
     let retain_caches = resources.cache_retention().is_admitted();
     let mut rec = OpRegistry::new();
+    rec.register(
+        OpKey::new(
+            onnx_runtime_ir::affine_gather::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(gather::AffineGatherFactory),
+    );
     for name in onnx_runtime_ir::packed_routed::OPS {
         rec.register(
             OpKey::new(name, "", 29),
@@ -3370,7 +3379,7 @@ mod tests {
         // its `com.microsoft` spelling.
         // `STFT` adds its opset-17 standard-domain registration.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 106 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 107 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }

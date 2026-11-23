@@ -77,6 +77,12 @@ fn attr_ints(ctx: &InferenceContext, name: &str) -> Option<Vec<i64>> {
 
 /// Register the data-movement family.
 pub fn register(reg: &mut InferenceRegistry) {
+    reg.register(
+        onnx_runtime_ir::RUNTIME_DOMAIN,
+        onnx_runtime_ir::affine_gather::OP,
+        1,
+        split_gather::affine_gather,
+    );
     reg.register("", "Transpose", 1, transpose);
     reg.register("", "Reshape", 1, reshape);
     reg.register("", "Flatten", 1, flatten);
