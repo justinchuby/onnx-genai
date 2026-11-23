@@ -52,7 +52,7 @@ pub(crate) async fn props(
         return Ok(Json(json!({
             "role": "router", "ui": true, "ui_settings": {},
             "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": false, "resumable_streams": true},
-            "cors_proxy_enabled": false, "endpoint_slots": false,
+            "cors_proxy_enabled": state.config.mcp_proxy_policy.is_enabled(), "endpoint_slots": false,
             "endpoint_props": false, "endpoint_metrics": cfg!(feature = "metrics"),
             "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION"))
         })));
@@ -97,7 +97,7 @@ pub(crate) async fn props(
         "endpoint_slots": false, "endpoint_props": false,
         "endpoint_metrics": cfg!(feature = "metrics"),
         "ui": true, "ui_settings": {}, "is_sleeping": false,
-        "cors_proxy_enabled": false,
+        "cors_proxy_enabled": state.config.mcp_proxy_policy.is_enabled(),
         "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION")),
         "nxrt_capabilities": {
             "resumable_streams": true, "reasoning_control": false,

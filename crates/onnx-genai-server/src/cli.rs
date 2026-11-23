@@ -82,6 +82,22 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     pub replay_buffer_bytes: usize,
 
+    /// Enable the official chat frontend's HTTP(S) MCP proxy (off by default).
+    #[arg(long)]
+    pub ui_mcp_proxy: bool,
+    /// Permit private/local targets through the explicitly enabled MCP proxy.
+    #[arg(long, requires = "ui_mcp_proxy")]
+    pub ui_mcp_proxy_allow_private_urls: bool,
+    /// Maximum bytes in one MCP proxy request or response.
+    #[arg(long, default_value = "67108864")]
+    pub ui_mcp_proxy_max_bytes: std::num::NonZeroUsize,
+    /// Maximum simultaneous outbound MCP proxy transfers.
+    #[arg(long, default_value = "16")]
+    pub ui_mcp_proxy_max_connections: std::num::NonZeroUsize,
+    /// Maximum wait without progress during an MCP proxy transfer, in seconds.
+    #[arg(long, default_value = "600")]
+    pub ui_mcp_proxy_timeout_secs: std::num::NonZeroU64,
+
     /// Reasoning effort applied when a request omits `reasoning_effort`.
     ///
     /// Reasoning models pick their own default when the template receives no
@@ -175,6 +191,16 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         max_rerank_documents: args.max_rerank_documents,
         max_replay_streams: args.max_replay_streams,
         replay_buffer_bytes: args.replay_buffer_bytes,
+        mcp_proxy_policy: if !args.ui_mcp_proxy {
+            crate::McpProxyPolicy::Disabled
+        } else if args.ui_mcp_proxy_allow_private_urls {
+            crate::McpProxyPolicy::AllowPrivate
+        } else {
+            crate::McpProxyPolicy::Public
+        },
+        mcp_proxy_max_bytes: args.ui_mcp_proxy_max_bytes,
+        mcp_proxy_max_connections: args.ui_mcp_proxy_max_connections,
+        mcp_proxy_timeout_secs: args.ui_mcp_proxy_timeout_secs,
         default_reasoning_effort: args.default_reasoning_effort,
         max_sessions: args.max_sessions,
         max_queue_depth: args.max_queue_depth,
@@ -243,6 +269,41 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn mcp_proxy_flags_require_explicit_enable_and_positive_limits() {
+        let disabled = TestCli::parse_from(["test", "model-dir"]);
+        assert_eq!(
+            server_config_from_args(&disabled.serve).mcp_proxy_policy,
+            crate::McpProxyPolicy::Disabled
+        );
+        assert!(
+            TestCli::try_parse_from(["test", "model-dir", "--ui-mcp-proxy-allow-private-urls"])
+                .is_err()
+        );
+        let public = TestCli::parse_from(["test", "model-dir", "--ui-mcp-proxy"]);
+        assert_eq!(
+            server_config_from_args(&public.serve).mcp_proxy_policy,
+            crate::McpProxyPolicy::Public
+        );
+        let private = TestCli::parse_from([
+            "test",
+            "model-dir",
+            "--ui-mcp-proxy",
+            "--ui-mcp-proxy-allow-private-urls",
+        ]);
+        assert_eq!(
+            server_config_from_args(&private.serve).mcp_proxy_policy,
+            crate::McpProxyPolicy::AllowPrivate
+        );
+        for flag in [
+            "--ui-mcp-proxy-max-bytes",
+            "--ui-mcp-proxy-max-connections",
+            "--ui-mcp-proxy-timeout-secs",
+        ] {
+            assert!(TestCli::try_parse_from(["test", "model-dir", flag, "0"]).is_err());
+        }
     }
 
     /// Every subcommand takes the model as the first positional argument, and

@@ -39,6 +39,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/v1/audio/speech`, `/audio/speech`, `/tts` | Declared buffered speech workflow; native input/prompt and raw-prompt handling |
 | GET | `/models/sse` | Initial state and changes to committed model load status; one-second polling, no invented progress |
 | POST | `/models/load`, `/models/unload` | Configured model IDs; requires `--enable-admin-endpoints` |
+| GET, POST | `/cors-proxy` | Optional HTTP(S) MCP transport; explicit forwarding headers, checked and pinned target addresses, bounded streaming |
 | GET | `/metrics` | Existing nxrt Prometheus metrics when compiled with `metrics`; names are not llama metric aliases |
 
 `/props?model=ID&autoload=false` never loads a model. The default is
@@ -353,8 +354,28 @@ parity. These upstream protocols are still unimplemented:
 - Slot save/restore, LoRA hot swapping and realtime reasoning control.
 - GGUF/Hugging Face model downloads and deletion.
 
-`/tools`, `/cors-proxy`, model download/delete and mutable `/props` return
-`403 feature_disabled`; they never execute shell commands or proxy requests.
+`/tools`, model download/delete and mutable `/props` remain disabled. The MCP
+HTTP proxy is separately opt-in with `--ui-mcp-proxy`; `/props` reports
+`cors_proxy_enabled` from that setting. `GET` and `POST /cors-proxy?url=...`
+forward only headers explicitly prefixed with `x-llama-server-proxy-header-`.
+Ambient server credentials and cookies are never forwarded. HTTP(S) targets
+must resolve entirely to public addresses unless the operator also supplies
+`--ui-mcp-proxy-allow-private-urls`. Connections use those checked DNS results;
+environment proxies cannot override the chosen destination. Redirects return
+through `/cors-proxy` for fresh admission, with credential and arbitrary forwarding headers
+removed when the target origin changes; only explicit `Accept`, `Content-Type`
+and `Content-Encoding` representation headers survive that redirect. Remote cookies and hop-by-hop headers
+are removed from responses; proxied documents receive a sandbox CSP.
+
+Transfers stream through a bounded queue and stop on consumer disconnect. At most
+16 outbound transfers run concurrently (`--ui-mcp-proxy-max-connections`); excess
+requests receive `503` with `Retry-After`, and disconnect/timeout releases the slot. The
+request and response byte limit defaults to 64 MiB (`--ui-mcp-proxy-max-bytes`),
+and the idle transfer timeout defaults to 600 seconds
+(`--ui-mcp-proxy-timeout-secs`). Progress resets that timeout, so active SSE
+sessions can outlive it. Streaming failures surface as body errors;
+pre-response failures return actionable HTTP errors. The proxy does not execute
+local tools or shell commands.
 Other unknown paths return JSON 404 errors rather than the HTML app.
 Existing nxrt sessions/admin/debug/image APIs remain available with their own
 contracts. Capability flags are derived from admitted package metadata; ONNX

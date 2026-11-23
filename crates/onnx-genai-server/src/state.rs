@@ -388,6 +388,7 @@ pub struct AppState {
     pub(crate) registry: ModelRegistry,
     pub(crate) replays: crate::replay::ReplayRegistry,
     pub(crate) sessions: SessionRegistry,
+    pub(crate) proxy_connections: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) config: ServerConfig,
 }
 
@@ -423,6 +424,21 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Explicit outbound-network scope for the optional Llama Chat MCP proxy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum McpProxyPolicy {
+    #[default]
+    Disabled,
+    Public,
+    AllowPrivate,
+}
+
+impl McpProxyPolicy {
+    pub fn is_enabled(self) -> bool {
+        self != Self::Disabled
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Node-level identifier reported by `GET /v1/status` for the cluster router
@@ -439,6 +455,14 @@ pub struct ServerConfig {
     pub max_replay_streams: usize,
     /// Maximum retained SSE bytes per conversation (older prefixes are evicted).
     pub replay_buffer_bytes: usize,
+    /// Optional frontend proxy; independent from model-management privileges.
+    pub mcp_proxy_policy: McpProxyPolicy,
+    /// Maximum bytes in each proxy request or streamed response.
+    pub mcp_proxy_max_bytes: std::num::NonZeroUsize,
+    /// Maximum simultaneous outbound proxy transfers.
+    pub mcp_proxy_max_connections: std::num::NonZeroUsize,
+    /// Maximum idle wait during proxy request/response transfer.
+    pub mcp_proxy_timeout_secs: std::num::NonZeroU64,
     /// Reasoning effort applied when a request omits `reasoning_effort`
     /// (`--default-reasoning-effort`). `None` leaves the model's own default in
     /// place, which for a reasoning model is often maximal — enough for an
@@ -490,6 +514,12 @@ impl Default for ServerConfig {
                 .expect("positive default reranking document budget"),
             max_replay_streams: 16,
             replay_buffer_bytes: 4 * 1024 * 1024,
+            mcp_proxy_policy: McpProxyPolicy::Disabled,
+            mcp_proxy_max_connections: std::num::NonZeroUsize::new(16)
+                .expect("positive proxy connection budget"),
+            mcp_proxy_max_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024)
+                .expect("positive proxy byte budget"),
+            mcp_proxy_timeout_secs: std::num::NonZeroU64::new(600).expect("positive proxy timeout"),
             default_reasoning_effort: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
@@ -506,6 +536,19 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     fn validate(self) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.mcp_proxy_max_connections.get() <= tokio::sync::Semaphore::MAX_PERMITS,
+            "ui_mcp_proxy_max_connections exceeds this host's semaphore capacity; configure at most {} connections",
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+        anyhow::ensure!(
+            std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(
+                    self.mcp_proxy_timeout_secs.get()
+                ))
+                .is_some(),
+            "ui_mcp_proxy_timeout_secs exceeds this host's clock range; configure a smaller transfer timeout"
+        );
         anyhow::ensure!(
             self.max_replay_streams > 0,
             "max_replay_streams must be greater than zero"
@@ -571,6 +614,9 @@ impl AppState {
                 config.replay_buffer_bytes,
             ),
             sessions: SessionRegistry::new(config.max_sessions),
+            proxy_connections: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                config.mcp_proxy_max_connections.get(),
+            )),
             config,
         })
     }
@@ -595,6 +641,9 @@ impl AppState {
                 config.replay_buffer_bytes,
             ),
             sessions: SessionRegistry::new(config.max_sessions),
+            proxy_connections: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                config.mcp_proxy_max_connections.get(),
+            )),
             config,
         })
     }

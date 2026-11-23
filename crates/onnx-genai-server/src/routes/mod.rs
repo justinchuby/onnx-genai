@@ -54,6 +54,7 @@ pub(crate) mod llama;
 mod multimodal;
 pub(crate) mod native;
 pub(crate) mod prompt;
+pub(crate) mod proxy;
 pub(crate) mod ranking;
 mod sessions;
 mod speech;
