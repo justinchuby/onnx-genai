@@ -12,6 +12,8 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
+mod common;
+
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
@@ -331,44 +333,12 @@ fn absent_dtype(index: usize, activation_dtype: DataType) -> DataType {
     }
 }
 
-#[test]
-fn cpu_qmoe_oracle_prepares_declared_workspace_without_cuda() {
-    for rows in [1, 6] {
-        let case = Case {
-            experts: 4,
-            rows,
-            hidden: 16,
-            inter: 16,
-            bits: 4,
-            top_k: 2,
-            activation: "identity",
-            swiglu_fusion: 0,
-            affine: false,
-            fc3: false,
-            biases: false,
-            normalize: true,
-            router_weights: false,
-        };
-        let inputs = case_inputs(case, DataType::Float32);
-        let actual = run_cpu(case, &inputs);
-        let reference = qmoe_identity_f64_reference(case, &inputs);
-        assert_eq!(actual.len(), reference.len());
-        for (&actual, &(expected, _)) in actual.iter().zip(&reference) {
-            assert!(
-                actual.is_finite()
-                    && (actual as f64 - expected).abs() <= 1e-4 + 1e-5 * expected.abs()
-            );
-        }
-    }
-}
-
 fn run_cpu(case: Case, inputs: &[Option<HostTensor>]) -> Vec<f32> {
     let output_shape = [case.rows, case.hidden];
     let (graph, node) = model_node(inputs, DataType::Float32, &output_shape, case);
     let model = Model::new(&graph);
-    let kernel = CpuExecutionProvider::new()
-        .get_kernel(model.graph.node(node), &[], 1)
-        .unwrap();
+    let ep = CpuExecutionProvider::new();
+    let kernel = ep.get_kernel(model.graph.node(node), &[], 1).unwrap();
     let strides: Vec<_> = inputs
         .iter()
         .map(|input| {
@@ -394,34 +364,19 @@ fn run_cpu(case: Case, inputs: &[Option<HostTensor>]) -> Vec<f32> {
         .collect();
     let mut output = vec![0u8; case.rows * case.hidden * 4];
     let output_strides = compute_contiguous_strides(&output_shape);
-    let metadata = views
-        .iter()
-        .map(|v| onnx_runtime_ep_api::TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
-        .collect::<Vec<_>>();
-    let requirement = kernel
-        .workspace_requirement_for_execution(&views, &metadata)
-        .unwrap();
-    assert!(requirement.alignment <= std::mem::align_of::<u128>());
-    let mut scratch = vec![0u128; usize::try_from(requirement.bytes).unwrap().div_ceil(16)];
-    let workspace = (!scratch.is_empty()).then(|| {
-        onnx_runtime_ep_api::WorkspaceView::new(
-            DevicePtrMut(scratch.as_mut_ptr().cast()),
-            scratch.len() * 16,
-        )
-    });
-    kernel
-        .execute_with_workspace(
-            &views,
-            &mut [TensorMut::new(
-                DevicePtrMut(output.as_mut_ptr().cast()),
-                DataType::Float32,
-                &output_shape,
-                &output_strides,
-                DeviceId::cpu(),
-            )],
-            workspace,
-        )
-        .unwrap();
+    common::execute_cpu_kernel(
+        &ep,
+        kernel.as_ref(),
+        &views,
+        &mut [TensorMut::new(
+            DevicePtrMut(output.as_mut_ptr().cast()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            DeviceId::cpu(),
+        )],
+    )
+    .unwrap();
     output
         .chunks_exact(4)
         .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))

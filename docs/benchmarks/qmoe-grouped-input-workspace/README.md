@@ -138,3 +138,15 @@ source hashes; the three measured QMoE files are unchanged. These checks do not
 reinterpret the recorded timings as a fresh post-integration baseline. The parent
 API's quarantine-test teardown also passes all 14 provider tests under local
 Miri with leak checking enabled; no production guard is relaxed.
+
+
+CI's CUDA source guard correctly requires every test in a CUDA-named target to
+remain ignored without gpu-tests. The host-only oracle regression is therefore
+in the separate qmoe_cpu_oracle target; qmoe_gpu retains all 57 device tests.
+Both use the same common::execute_cpu_kernel helper, which honors the CPU
+provider's declared workspace alignment and owner lifecycle rather than guessing
+an alignment. The host regression passes with gpu-tests both off and on, without
+a CUDA library/device. Source scan and checker self-tests plus strict CUDA
+all-target Clippy pass. host-target-source.json records this test-only follow-up;
+the two measured CPU runtime files remain unchanged. Historical measured CUDA
+oracle files and source patches are preserved rather than rewritten.

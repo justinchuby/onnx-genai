@@ -403,6 +403,35 @@ pub fn run_cuda(
     result
 }
 
+/// Execute a CPU oracle kernel using its declared scratch, without CUDA calls.
+pub fn execute_cpu_kernel(
+    ep: &dyn ExecutionProvider,
+    kernel: &dyn Kernel,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+) -> onnx_runtime_ep_api::Result<()> {
+    let requirement = runtime_workspace_requirement(kernel, inputs)?;
+    let mut owner = if requirement.bytes == 0 {
+        None
+    } else {
+        let bytes = usize::try_from(requirement.bytes).map_err(|_| {
+            onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                "CPU oracle workspace requires {} bytes beyond usize; reduce the test dimensions",
+                requirement.bytes
+            ))
+        })?;
+        Some(ep.allocate_workspace(bytes, requirement.alignment, requirement.role())?)
+    };
+    let workspace = owner
+        .as_mut()
+        .map(|buffer| WorkspaceView::new(DevicePtrMut(buffer.as_mut_ptr()), buffer.len()));
+    let result = kernel.execute_with_workspace(inputs, outputs, workspace);
+    if let Some(owner) = owner {
+        ep.deallocate_workspace(owner)?;
+    }
+    result
+}
+
 /// Execute the identical node on the CPU EP (the conformance oracle) and return
 /// each output's raw bytes.
 pub fn run_cpu(
@@ -465,7 +494,7 @@ pub fn run_cpu(
             )
         })
         .collect::<Vec<_>>();
-    kernel.execute(&input_views, &mut output_views).unwrap();
+    execute_cpu_kernel(&ep, kernel.as_ref(), &input_views, &mut output_views).unwrap();
     drop(output_views);
     output_bytes
 }
