@@ -671,10 +671,12 @@ impl LlguidanceConstraint {
         // optional leading RFC 8259 whitespace. Preserve that whitespace in
         // the actual prompt, but enter the value recognizer after it.
         let value_prefix = match kind {
-            GrammarConstraintKind::JsonSchema => prefix.trim_start_matches([' ', '\t', '\r', '\n']),
-            _ => prefix,
+            GrammarConstraintKind::JsonSchema => {
+                canonical_json_prefix(prefix).map_err(|source| ConstraintPrefixError { source })?
+            }
+            _ => std::borrow::Cow::Borrowed(prefix),
         };
-        Self::from_token_bytes(kind, grammar, token_bytes, endings, value_prefix)
+        Self::from_token_bytes(kind, grammar, token_bytes, endings, &value_prefix)
     }
 
     fn from_token_bytes(
@@ -781,6 +783,79 @@ impl LlguidanceConstraint {
             }),
         })
     }
+}
+
+// llguidance's JSON string lexer expects canonical spelling of non-control
+// Unicode. Normalize completed escapes only in the recognizer's existing
+// prefix; the request prompt and newly generated output retain their own bytes.
+fn canonical_json_prefix(prefix: &str) -> anyhow::Result<std::borrow::Cow<'_, str>> {
+    let value = prefix.trim_start_matches([' ', '\t', '\r', '\n']);
+    let source_offset = prefix.len() - value.len();
+    let prefix = value;
+    if !prefix.contains("\\u") && !prefix.contains("\\/") {
+        return Ok(std::borrow::Cow::Borrowed(prefix));
+    }
+    let mut output = String::with_capacity(prefix.len());
+    let mut in_string = false;
+    let mut at = 0;
+    while at < prefix.len() {
+        let rest = &prefix[at..];
+        let byte = rest.as_bytes()[0];
+        if byte == b'"' {
+            in_string = !in_string;
+        } else if in_string && byte == b'\\' {
+            let bytes = rest.as_bytes();
+            if bytes.get(1) == Some(&b'/') {
+                output.push('/');
+                at += 2;
+                continue;
+            }
+            if bytes.get(1) == Some(&b'u') && bytes.len() >= 6 {
+                let code = std::str::from_utf8(&bytes[2..6])
+                    .ok()
+                    .and_then(|hex| u16::from_str_radix(hex, 16).ok());
+                if let Some(code) = code {
+                    let length = if (0xd800..=0xdbff).contains(&code) {
+                        12
+                    } else {
+                        6
+                    };
+                    if bytes.len() >= length && rest.is_char_boundary(length) {
+                        let quoted = format!("\"{}\"", &rest[..length]);
+                        let decoded: String = serde_json::from_str(&quoted).with_context(|| {
+                            format!("existing JSON prefix has an invalid Unicode escape at byte {}; supply a complete valid scalar or surrogate pair", source_offset + at)
+                        })?;
+                        let canonical = serde_json::to_string(&decoded)
+                            .context("encode canonical JSON prefix escape")?;
+                        output.push_str(&canonical[1..canonical.len() - 1]);
+                        at += length;
+                        continue;
+                    }
+                }
+            }
+            // Preserve unfinished escapes for the grammar to continue. Skip
+            // complete ordinary escapes so an escaped quote does not end a string.
+            if let Some(&escaped) = bytes.get(1)
+                && escaped.is_ascii()
+            {
+                output.push('\\');
+                output.push(char::from(escaped));
+                at += 2;
+                continue;
+            }
+        }
+        let character = rest
+            .chars()
+            .next()
+            .context("JSON prefix cursor lost its UTF-8 boundary")?;
+        output.push(character);
+        at += character.len_utf8();
+    }
+    Ok(if output == prefix {
+        std::borrow::Cow::Borrowed(prefix)
+    } else {
+        std::borrow::Cow::Owned(output)
+    })
 }
 
 fn top_level_grammar(
@@ -4900,6 +4975,127 @@ mod tests {
                 .contains("repair oversized tokenizer pieces"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn json_schema_prefill_accepts_completed_unicode_and_solidus_escapes() {
+        let schema = serde_json::json!({"const":"[r]💡/"}).to_string();
+        let pieces = vec![b"\"".to_vec(), b"x".to_vec(), b"<eos>".to_vec()];
+        let candidates = (0..3)
+            .map(|token_id| TokenCandidate {
+                token_id,
+                text: String::new(),
+                is_eos: token_id == 2,
+            })
+            .collect::<Vec<_>>();
+        for (prefix, next) in [
+            (r#""\u005br]\ud83d\udca1\/"#, 0),
+            (r#""\u005br]\ud83d\udca1\/""#, 2),
+        ] {
+            let constraint = LlguidanceConstraint::from_token_bytes_with_prefix(
+                GrammarConstraintKind::JsonSchema,
+                &schema,
+                pieces.clone(),
+                &[2],
+                prefix,
+            )
+            .unwrap();
+            let mask = constraint
+                .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+                .unwrap();
+            assert_eq!(
+                mask.iter().position(|allowed| *allowed),
+                Some(next),
+                "{prefix:?}: {mask:?}"
+            );
+            assert_eq!(mask.iter().filter(|allowed| **allowed).count(), 1);
+        }
+        let literal = LlguidanceConstraint::from_token_bytes_with_prefix(
+            GrammarConstraintKind::JsonSchema,
+            &serde_json::json!({"const":r"\u005b"}).to_string(),
+            pieces.clone(),
+            &[2],
+            r#""\\u005b"#,
+        )
+        .unwrap();
+        assert_eq!(
+            literal
+                .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+                .unwrap(),
+            [true, false, false]
+        );
+        let error = LlguidanceConstraint::from_token_bytes_with_prefix(
+            GrammarConstraintKind::JsonSchema,
+            &schema,
+            pieces,
+            &[2],
+            r#""\udca1"#,
+        )
+        .err()
+        .expect("unpaired low surrogate must be rejected");
+        assert!(error.is::<ConstraintPrefixError>());
+        assert!(
+            format!("{error:#}").contains("invalid Unicode escape at byte 1"),
+            "{error:#}"
+        );
+        assert!(error.chain().count() > 1);
+        let whitespace_error = LlguidanceConstraint::from_token_bytes_with_prefix(
+            GrammarConstraintKind::JsonSchema,
+            &schema,
+            vec![b"\"".to_vec(), b"<eos>".to_vec()],
+            &[1],
+            " \n\"\\udca1",
+        )
+        .err()
+        .expect("invalid Unicode prefix after whitespace must be rejected");
+        assert!(
+            format!("{whitespace_error:#}").contains("invalid Unicode escape at byte 3"),
+            "{whitespace_error:#}"
+        );
+    }
+
+    #[test]
+    fn json_schema_prefill_accepts_escaped_keys_without_changing_other_grammars() {
+        let schema = serde_json::json!({
+            "type":"object", "properties":{"n":{"const":1}}, "required":["n"]
+        })
+        .to_string();
+        for (kind, grammar, prefix, suffix) in [
+            (
+                GrammarConstraintKind::JsonSchema,
+                schema.as_str(),
+                r#"{"\u006e":1"#,
+                "}",
+            ),
+            (GrammarConstraintKind::Regex, r"\\u005bx", r"\u005b", "x"),
+        ] {
+            let constraint = LlguidanceConstraint::from_token_bytes_with_prefix(
+                kind,
+                grammar,
+                vec![suffix.as_bytes().to_vec(), b"<eos>".to_vec()],
+                &[1],
+                prefix,
+            )
+            .unwrap();
+            let candidates = [
+                TokenCandidate {
+                    token_id: 0,
+                    text: suffix.into(),
+                    is_eos: false,
+                },
+                TokenCandidate {
+                    token_id: 1,
+                    text: String::new(),
+                    is_eos: true,
+                },
+            ];
+            assert_eq!(
+                constraint
+                    .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+                    .unwrap(),
+                [true, false]
+            );
+        }
     }
 
     #[test]

@@ -430,6 +430,62 @@ impl Region {
     }
 }
 
+enum ProjectedRegions<'a> {
+    None,
+    One(Option<&'a Region>),
+    Repeated {
+        closed: std::slice::Iter<'a, Region>,
+        active: Option<&'a Region>,
+    },
+}
+impl<'a> Iterator for ProjectedRegions<'a> {
+    type Item = &'a Region;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::None => None,
+            Self::One(region) => region.take(),
+            Self::Repeated { closed, active } => closed.next().or_else(|| active.take()),
+        }
+    }
+}
+
+// Borrow selected text directly. Grammar consumers need no copies of unrelated
+// reasoning or opaque bodies, and publication uses exactly the same projection.
+struct FieldChunks<'a> {
+    field: Option<&'a Field>,
+    regions: ProjectedRegions<'a>,
+    buffer: &'a str,
+    omitted_prefix_end: usize,
+    first: bool,
+    default: Option<&'a str>,
+    pending_body: Option<&'a str>,
+}
+impl<'a> Iterator for FieldChunks<'a> {
+    type Item = &'a str;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(body) = self.pending_body.take() {
+            return Some(body);
+        }
+        if let Some(default) = self.default.take() {
+            return Some(default);
+        }
+        let field = self.field?;
+        for region in self.regions.by_ref() {
+            if !region.visible {
+                continue;
+            }
+            let body = region.output(field, self.buffer, self.omitted_prefix_end);
+            if self.first {
+                self.first = false;
+                return Some(body);
+            }
+            self.pending_body = Some(body);
+            return Some(&field.join);
+        }
+        None
+    }
+}
+
 /// Projected chat text, with protocol framing and opaque fields removed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ChatText {
@@ -644,59 +700,50 @@ impl ResponseParser {
         }
         Ok(())
     }
-    fn snapshot(&self, final_chunk: bool) -> ChatText {
-        let mut output = if final_chunk {
-            ChatText {
-                content: self
-                    .spec
-                    .defaults
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                reasoning: self
-                    .spec
-                    .defaults
-                    .get("reasoning_content")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-            }
+    fn field_chunks<'a>(&'a self, name: &str, final_chunk: bool) -> FieldChunks<'a> {
+        let index = self.spec.fields.iter().position(|field| field.name == name);
+        let default = if final_chunk && index.is_none_or(|index| !self.seen[index]) {
+            self.spec
+                .defaults
+                .get(name)
+                .and_then(serde_json::Value::as_str)
         } else {
-            ChatText::default()
+            None
         };
-        for (field, definition) in self.spec.fields.iter().enumerate() {
-            let target = match definition.name.as_str() {
-                "content" => &mut output.content,
-                "reasoning_content" => &mut output.reasoning,
-                _ => continue,
-            };
-            if self.seen[field] {
-                target.clear();
-            }
-            let active = if self.current == Some(field) {
+        let field = index.map(|index| &self.spec.fields[index]);
+        let regions = index.map_or(ProjectedRegions::None, |index| {
+            let active = if self.current == Some(index) {
                 self.region.as_ref()
             } else {
                 None
             };
-            let regions: Vec<&Region> = if !definition.repeats {
-                active
-                    .or_else(|| self.closed[field].last())
-                    .into_iter()
-                    .collect()
-            } else {
-                self.closed[field].iter().chain(active).collect()
-            };
-            let mut first = true;
-            for region in regions.into_iter().filter(|region| region.visible) {
-                if !first {
-                    target.push_str(&definition.join);
+            if self.spec.fields[index].repeats {
+                ProjectedRegions::Repeated {
+                    closed: self.closed[index].iter(),
+                    active,
                 }
-                first = false;
-                target.push_str(region.output(definition, &self.buffer, self.omitted_prefix_end));
+            } else {
+                ProjectedRegions::One(active.or_else(|| self.closed[index].last()))
             }
+        });
+        FieldChunks {
+            field,
+            regions,
+            buffer: &self.buffer,
+            omitted_prefix_end: self.omitted_prefix_end,
+            first: true,
+            default,
+            pending_body: None,
         }
-        output
+    }
+
+    fn snapshot(&self, final_chunk: bool) -> ChatText {
+        ChatText {
+            content: self.field_chunks("content", final_chunk).collect(),
+            reasoning: self
+                .field_chunks("reasoning_content", final_chunk)
+                .collect(),
+        }
     }
     fn delta(&mut self, final_chunk: bool) -> anyhow::Result<ChatText> {
         let now = self.snapshot(final_chunk);
@@ -788,6 +835,19 @@ impl ResponseParser {
     /// Inspect lossless byte pieces; partial UTF-8 is retained only within the trial.
     /// Final candidates must end on a complete UTF-8 scalar.
     pub fn preview_bytes(&mut self, bytes: &[u8], final_chunk: bool) -> anyhow::Result<ChatText> {
+        self.with_preview(
+            bytes,
+            final_chunk,
+            |parser| Ok(parser.snapshot(final_chunk)),
+        )
+    }
+
+    fn with_preview<T>(
+        &mut self,
+        bytes: &[u8],
+        final_chunk: bool,
+        inspect: impl FnOnce(&Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
         let trial = ResponseTrial::new(self);
         trial.parser.append_bytes(bytes)?;
         if final_chunk {
@@ -797,7 +857,7 @@ impl ResponseParser {
         if final_chunk {
             trial.parser.validate_required()?;
         }
-        Ok(trial.parser.snapshot(final_chunk))
+        inspect(trial.parser)
     }
 
     pub fn feed(&mut self, text: &str) -> anyhow::Result<ChatText> {
@@ -907,6 +967,94 @@ mod tests {
         output.reasoning.push_str(&delta.reasoning);
         Ok(output)
     }
+    #[test]
+    fn borrowed_field_chunks_preserve_empty_repeats_joins_and_opaque_projection() {
+        let spec = ResponseTemplate::compile(&serde_json::json!({"start_anchor":"A","fields":{
+            "content":{"open":"<c>","close":"</c>","repeats":true,"join":"|"},
+            "reasoning_content":{"open":"<r>","close":"</r>"},
+            "private":{"open":"<tool>","close":"</tool>","content":"json"}
+        }}))
+        .unwrap();
+        let mut parser = ResponseParser::new(spec, "A", PrefixOutput::Include, 1024).unwrap();
+        let candidate = b"<c></c><r>secret</r><c>visible</c><tool>{}</tool>";
+        let selected = parser
+            .with_preview(candidate, true, |view| {
+                let chunks = view.field_chunks("content", true).collect::<Vec<_>>();
+                assert_eq!(chunks, ["", "|", "visible"]);
+                let visible = chunks[2];
+                let start = view.buffer.as_ptr() as usize;
+                assert!((start..start + view.buffer.len()).contains(&(visible.as_ptr() as usize)));
+                Ok(chunks.concat())
+            })
+            .unwrap();
+        assert_eq!(selected, "|visible");
+        assert!(parser.buffer.is_empty());
+        let output = parser.preview_bytes(candidate, true).unwrap();
+        assert_eq!(output.content, selected);
+        assert_eq!(output.reasoning, "secret");
+    }
+
+    #[test]
+    fn projected_content_schema_checks_use_the_first_declared_channel_boundary() {
+        use crate::logits::{ConstraintPrefixError, GrammarConstraintKind, LlguidanceConstraint};
+        let spec = ResponseTemplate::compile(&serde_json::json!({"start_anchor":"A","fields":{
+            "reasoning_content":{"open":"[r]","close":"[/r]"}, "content":{}
+        }}))
+        .unwrap();
+        let schema = serde_json::json!({"type":"object","properties":{
+            "n":{"const":1}, "x":{"type":"string"}
+        },"required":["n"]})
+        .to_string();
+        let mut parser =
+            ResponseParser::new(spec, "A[r]existing", PrefixOutput::Exclude, 4096).unwrap();
+        for (candidate, expected) in [
+            ("new[/r]{\"n\":1}", true),
+            ("new[/r]{\"n\":2}", false),
+            ("new[/r]bad[/r]{\"n\":1}", false),
+            ("new[/r]{\"n\":1,\"x\":\"[r]hidden[/r]tail\"}", false),
+            (r#"new[/r]{"n":1,"x":"\u005br]literal"}"#, true),
+        ] {
+            let accepted = parser
+                .with_preview(candidate.as_bytes(), true, |view| {
+                    let content = view.field_chunks("content", true).collect::<String>();
+                    match LlguidanceConstraint::from_token_bytes_with_prefix(
+                        GrammarConstraintKind::JsonSchema,
+                        &schema,
+                        vec![b" ".to_vec(), b"<eos>".to_vec()],
+                        &[1],
+                        &content,
+                    ) {
+                        Ok(_) => Ok(true),
+                        Err(error) if error.is::<ConstraintPrefixError>() => Ok(false),
+                        Err(error) => Err(error),
+                    }
+                })
+                .unwrap();
+            assert_eq!(accepted, expected, "candidate={candidate:?}");
+            assert_eq!(parser.buffer, "[r]existing");
+            parser
+                .require_open_text_channel("reasoning_content")
+                .unwrap();
+        }
+        let error = parser
+            .with_preview(b"[/r]{\"n\":1}", true, |_| {
+                Err::<(), _>(
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected schema observer error",
+                    )
+                    .into(),
+                )
+            })
+            .unwrap_err();
+        assert!(error.is::<std::io::Error>());
+        assert_eq!(parser.buffer, "[r]existing");
+        assert_eq!(
+            parser.preview("[/r]{\"n\":1}", true).unwrap().content,
+            "{\"n\":1}"
+        );
+    }
+
     #[test]
     fn byte_response_every_split_matches_text_projection_across_unicode_boundaries() {
         let spec = ResponseTemplate::compile(&serde_json::json!({

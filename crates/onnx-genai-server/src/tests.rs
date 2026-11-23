@@ -6659,6 +6659,72 @@ mod llama_compat {
         assert_eq!(status, StatusCode::OK, "{schema_result}");
         assert_eq!(schema_result["choices"][0]["message"]["content"], "}");
         assert_eq!(schema_result["usage"]["completion_tokens"], 1);
+        for (prefix, value_schema) in [
+            (
+                r#"{"\u006e":1"#,
+                json!({"type":"object","properties":{"n":{"const":1}},"required":["n"],"additionalProperties":false}),
+            ),
+            (
+                r#"{"x":"\u005br]\ud83d\udca1\/""#,
+                json!({"type":"object","properties":{"x":{"const":"[r]💡/"}},"required":["x"],"additionalProperties":false}),
+            ),
+        ] {
+            let mut escaped = body.clone();
+            escaped["messages"][0]["content"] = json!(prefix);
+            escaped["response_format"] = json!({"type":"json_schema","json_schema":{"name":"escaped","schema":value_schema}});
+            escaped["logprobs"] = json!(true);
+            let (status, prompt) =
+                call(router.clone(), "POST", "/apply-template", escaped.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{prompt}");
+            assert!(
+                prompt["prompt"].as_str().unwrap().ends_with(prefix),
+                "{prompt}"
+            );
+            let (status, count) = call(
+                router.clone(),
+                "POST",
+                "/v1/chat/completions/input_tokens",
+                escaped.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{count}");
+            let (status, result) = call(
+                router.clone(),
+                "POST",
+                "/v1/chat/completions",
+                escaped.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["choices"][0]["message"]["content"], "}");
+            assert_eq!(result["usage"]["prompt_tokens"], count["input_tokens"]);
+            assert_eq!(result["usage"]["completion_tokens"], 1);
+            escaped["stream"] = json!(true);
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(escaped.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let events = sse_json_events(&bytes);
+            assert!(
+                events.iter().all(|event| event.get("error").is_none()),
+                "{events:?}"
+            );
+            let content = events
+                .iter()
+                .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                .collect::<String>();
+            assert_eq!(content, "}");
+        }
         let mut invalid_schema_prefix = body.clone();
         invalid_schema_prefix["messages"][0]["content"] = json!("{\"b\":");
         let (status, error) = call(

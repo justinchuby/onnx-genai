@@ -213,9 +213,11 @@ preparation additionally proves the selected parser channel.
 JSON Schema continuation seeds llguidance from lossless vocabulary bytes and the
 existing assistant prefix. Grammar-only prefix chunks never become model
 candidates or response tokens. Optional leading JSON whitespace remains in the
-prompt and is skipped only when entering the schema's value recognizer; bytes
-inside the value, including UTF-8 fragments across chunks, remain exact. Invalid
-schema prefixes return a typed 400 error. Tokenizers without an interpretable
+prompt and is skipped only when entering the schema's value recognizer. Completed
+Unicode escapes, surrogate pairs and escaped soliduses in existing JSON strings
+are canonicalized only for schema recognition; prompt bytes retain the original
+spelling. Literal escaped backslashes keep their meaning. Grammar-only byte chunks
+may still split UTF-8 scalars. Invalid schema prefixes return a typed 400 error. Tokenizers without an interpretable
 lossless byte codec fail explicitly rather than using lossy token decoding.
 Optional progress/control subscription fields from Llama Chat are accepted, but
 `/props.nxrt_capabilities` advertises resumable streams and reports realtime

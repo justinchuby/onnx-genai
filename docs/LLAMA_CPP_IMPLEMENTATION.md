@@ -918,3 +918,32 @@ Final byte-input validation: full server library 404 passed / 2 inherited ignore
 strict native-engine all-target and server all-target Clippy passed. Existing
 text projection, normal prefill, explicit continuation and stop behavior remain
 covered by that server run. Reasoning+JSON admission remains unchanged.
+
+Selected-field projection now borrows region slices and joins lazily from the
+shared classifier. Ordinary snapshots consume this same iterator; internal
+candidate observers can read content without copying unrelated reasoning or
+opaque fields. Their callback is borrow-scoped and errors restore parser state.
+Tests compose projected content with the actual schema recognizer, proving first
+boundary handling and rejection of a later valid JSON object after earlier bad
+content. Raw opening markers inside serialized JSON strings are classified before
+schema recognition; an escaped opener retains its JSON data meaning instead.
+
+That composition exposed a real schema-prefill gap: llguidance's string lexer
+rejects non-control Unicode escapes and escaped soliduses in existing input.
+Completed string escapes are now canonicalized only in the recognizer prefix,
+including paired UTF-16 surrogates and escaped keys. Literal escaped backslashes
+remain literal; invalid complete surrogate escapes retain a typed prefix error
+and causal decode detail. Regex/Lark inputs bypass this JSON-only conversion.
+The original prompt, counts and response prefix are not rewritten. Partially
+written escapes and generation-side escape expansion remain open work.
+
+Validation so far: 2 schema-prefix tests and all 21 classifier cases passed under
+default/native features. The real ONNX continuation case now checks escaped keys
+and a Unicode/surrogate/solidus value in buffered and logprob SSE requests, exact
+raw template suffixes and prompt counts; full server 404 passed / 2 inherited
+ignores. Reasoning+JSON token sampling itself remains guarded and incomplete.
+
+Strict native-engine and server all-target Clippy passed. The final literal
+backslash and leading-whitespace diagnostic refinements reran both schema-prefix
+cases and strict native-engine all-target Clippy successfully. Unicode errors
+refer to the original prefix byte offset, including its leading JSON whitespace.
