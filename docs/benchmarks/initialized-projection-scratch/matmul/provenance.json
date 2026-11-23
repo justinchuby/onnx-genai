@@ -1,0 +1,27 @@
+{
+  "head": "1a7ea336a6483fe9d55eebeb8c6203f5e9409c81",
+  "base": "9886e7a9a201c71b6e7870645c45278429e18086",
+  "source_path": "/tmp/nxrt-compact-wire-grants",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs": "15a08fe9cddad43604b15943bce542f749dcea1ace6d707262896840156dcc7f",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "51acaa044511cb017e2a0efc48ee546135771498faa1c6661e0432aadd9cd839",
+    "crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs": "54dd72bb2bb03edf3d48db73dbea242f039d72911fab8072a2bd778bcf2bd02f",
+    "docs/memory/MEMORY_ARCHITECTURE.md": "ca245dfb3cb7c4b98365700ef96664baebf38389a4850e7c06da7f53aec4ab16"
+  },
+  "probe_sha256": "4fa6bed90e9edc00fb330b2588af102f9c1c19f7d155b92076d761ce2c54d77d",
+  "temporary_dev_dependency": "libc=0.2, identical in both arms, manifest/lock restored",
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "binaries": {
+    "baseline": {
+      "sha256": "87b1aa601502834d71f6a494f261237de82897bde6b059b95402ce4910fd74c8",
+      "symbols": 21570,
+      "mlas_symbols": 0
+    },
+    "after": {
+      "sha256": "29702898c48a750bdc41f257a6fae4ee5003d6f4fe818bf6d8a8ba16005fa69a",
+      "symbols": 21566,
+      "mlas_symbols": 0
+    }
+  }
+}
