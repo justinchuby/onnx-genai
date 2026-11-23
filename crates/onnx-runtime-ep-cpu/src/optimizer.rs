@@ -82,6 +82,9 @@ impl Default for ProjectionFusion {
 pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     let mut passes: Vec<Box<dyn OptimizationPass>> = Vec::new();
     passes.push(Box::new(
+        onnx_runtime_optimizer::quantized_grouped::QuantizedGroupedFusion,
+    ));
+    passes.push(Box::new(
         onnx_runtime_optimizer::affine_gather::AffineGatherFusion,
     ));
     passes.push(Box::new(CpuSiluFusion));

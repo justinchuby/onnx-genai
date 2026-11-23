@@ -1052,6 +1052,15 @@ pub(crate) fn build_cpu_registry_with_resources(
     let mut rec = OpRegistry::new();
     rec.register(
         OpKey::new(
+            onnx_runtime_ir::quantized_grouped::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(packed_routed::AffineFactory),
+    );
+    rec.register(
+        OpKey::new(
             onnx_runtime_ir::affine_gather::OP,
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
@@ -3387,8 +3396,9 @@ mod tests {
         // standard-domain `CausalConvWithState` (opset 27) adds one alongside
         // its `com.microsoft` spelling.
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
+        // The EP-owned affine Gather and grouped-projection fusions each add one.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 107 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 109 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }

@@ -235,6 +235,7 @@ pub(crate) fn cuda_optimization_passes(
     device: Option<CudaDeviceCapabilities>,
 ) -> Vec<Box<dyn OptimizationPass>> {
     vec![
+        Box::new(onnx_runtime_optimizer::quantized_grouped::QuantizedGroupedFusion),
         Box::new(onnx_runtime_optimizer::affine_gather::AffineGatherFusion),
         Box::new(CudaSiluFusion),
         // Collapse the SSM/linear-attention `Reciprocal(Sqrt(x))` normalize-scale
