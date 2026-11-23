@@ -482,10 +482,19 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 
         // Quantization: specific types but advertise broad.
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
-        ("QuantizeLinear", "")
-        | ("DequantizeLinear", "")
-        | ("DynamicQuantizeLinear", "")
-        | ("QLinearMatMul", "") => ARITH_DTYPES,
+        ("DequantizeLinear", "") => &[
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Int4,
+            DataType::Uint4,
+            DataType::Int8,
+            DataType::Uint8,
+            DataType::Int32,
+        ],
+        ("QuantizeLinear", "") | ("DynamicQuantizeLinear", "") | ("QLinearMatMul", "") => {
+            ARITH_DTYPES
+        }
 
         // Sequence/range ops.
         ("Range", "") | ("CumSum", "") | ("CumProd", "") => ARITH_DTYPES,
