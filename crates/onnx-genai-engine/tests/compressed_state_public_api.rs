@@ -22,16 +22,22 @@ fn external_callers_can_match_typed_compressed_state_refusal() {
 
 #[test]
 fn external_callers_can_match_future_schema_without_string_parsing() {
-    let error = onnx_genai_metadata::parse_metadata(
-        "schema_version: \"v1.9\"\nfuture_section: {}\n",
-        Some("yaml"),
-    )
-    .expect_err("future schema must be refused");
+    let maximum = SUPPORTED_SCHEMA_VERSIONS.maximum;
+    let future = SchemaVersion::new(
+        maximum.major,
+        maximum
+            .minor
+            .checked_add(1)
+            .expect("future schema test needs a representable minor version"),
+    );
+    let document = format!("schema_version: {future}\nfuture_section: {{}}\n");
+    let error = onnx_genai_metadata::parse_metadata(&document, Some("yaml"))
+        .expect_err("future schema must be refused");
     let MetadataError::UnsupportedSchema(unsupported) = error else {
-        panic!("future schema was not preserved as a public typed refusal");
+        panic!("future schema was not preserved as a public typed refusal: {error:?}");
     };
     assert_eq!(unsupported.family, SchemaFamily::InferenceMetadata);
-    assert_eq!(unsupported.observed, SchemaVersion::new(1, 9));
+    assert_eq!(unsupported.observed, future);
     assert_eq!(unsupported.supported, SUPPORTED_SCHEMA_VERSIONS);
     assert_eq!(unsupported.document, SchemaDocumentContext::InMemory);
 }

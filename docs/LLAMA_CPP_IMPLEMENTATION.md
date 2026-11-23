@@ -1064,3 +1064,12 @@ refresh. Final tokenizer unit and integration regressions pass after preserving
 the serialization error cause. Windows coverage exposed an unrelated MLAS build
 warning: the AVX2 panel-tail helper was compiled when its sole caller was disabled.
 Give the helper the same `not(feature = "mlas")` condition as its caller.
+
+Final CI fixture corrections: migrate the maintained reranking textproto to
+IR 11 / opset 24 and supply ReduceSum axes as an int64 tensor input. The fixture
+inventory/schema guard passes all 10 cases; both real-engine ranking cases and
+all three selected HTTP/config ranking cases pass. The compressed-state public
+API test now derives a future version from the declared maximum instead of
+misclassifying the supported v1.9 as future; all four public-API cases and all
+24 metadata schema-version cases pass. These resolve the Linux Fast/coverage and
+ORT-backed CI failures without changing runtime ranking or version semantics.
