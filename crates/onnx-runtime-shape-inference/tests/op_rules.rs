@@ -485,7 +485,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        232,
+        233,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -494,7 +494,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        277,
+        279,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -7060,8 +7060,6 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Constant", 1),
     ("", "ConstantOfShape", 1),
     ("", "Conv", 1),
-    ("", "DeformConv", 19),
-    ("", "DeformConv", 22),
     ("", "ConvTranspose", 1),
     ("", "Cos", 1),
     ("", "Cosh", 9),
@@ -7069,6 +7067,8 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "CumSum", 14),
     ("", "DFT", 17),
     ("", "DFT", 20),
+    ("", "DeformConv", 19),
+    ("", "DeformConv", 22),
     ("", "DepthToSpace", 1),
     ("", "DepthToSpace", 11),
     ("", "DepthToSpace", 13),
