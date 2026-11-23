@@ -1,19 +1,19 @@
 //! Model-token constraints over the shared declared response projection.
-use crate::json_cursor::{JsonByteBudgetExceeded, JsonByteCursor, JsonCandidate};
+use crate::byte_stream::{ByteStreamContract, ByteStreamState};
+use crate::json_cursor::{
+    JsonByteBudgetExceeded, JsonByteCursor, JsonCandidate, JsonTokenVocabulary,
+};
 use crate::json_prefix::{InvalidJsonEscape, JsonPrefix};
-use crate::logits::{Constraint, ProcessorContext, TokenCandidate, TokenId};
+use crate::json_projection::{JsonProjection, JsonView, ProjectionKind};
+use crate::logits::{Constraint, ConstraintPrefixError, ProcessorContext, TokenCandidate, TokenId};
 use crate::response_template::{
-    IncompleteResponseUtf8, MissingResponseField, NonMonotonicProjection, PrefixOutput,
-    ResponseBufferExceeded, ResponseParser, ResponseTemplate, projection_extension,
+    IncompleteResponseUtf8, MissingResponseField, NonMonotonicProjection, ResponseBufferExceeded,
+    projection_extension,
 };
 use crate::tokenization::{NonMonotonicText, SpecialTokenHandling, TokenTextDecoder};
 use anyhow::{Context, ensure};
 use onnx_genai_ort::Tokenizer;
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-};
-use tokenizers::decoders::DecoderWrapper;
+use std::{collections::HashSet, sync::Mutex};
 
 #[derive(Debug, thiserror::Error)]
 #[error("response JSON candidate evaluation failed and state recovery also failed: {recovery:#}")]
@@ -24,140 +24,142 @@ struct ResponseConstraintRecovery {
 }
 
 enum Codec {
-    Bytes(Vec<Vec<u8>>),
+    Bytes(ByteStreamContract),
     Canonical(Box<Tokenizer>),
 }
 
+#[derive(Clone)]
+enum DecoderState {
+    Bytes(ByteStreamState),
+    Canonical(TokenTextDecoder),
+}
+
+impl Codec {
+    fn new_state(&self, policy: SpecialTokenHandling) -> DecoderState {
+        match self {
+            Self::Bytes(contract) => DecoderState::Bytes(contract.new_state()),
+            Self::Canonical(_) => DecoderState::Canonical(TokenTextDecoder::new(policy)),
+        }
+    }
+}
+
+impl DecoderState {
+    fn is_identity(&self) -> bool {
+        matches!(self, Self::Bytes(state) if state.is_identity())
+    }
+}
+
 struct State {
-    parser: ResponseParser,
-    decoder: TokenTextDecoder,
+    projection: JsonProjection,
+    decoder: DecoderState,
     json: JsonByteCursor,
     history: Vec<TokenId>,
     raw: String,
-    canonical: String,
+    normalized: JsonPrefix,
     ended: bool,
 }
 
-pub(crate) struct ResponseJsonConstraint {
-    template: Arc<ResponseTemplate>,
+pub(crate) struct JsonContentConstraint {
+    projection_kind: ProjectionKind,
     prefix: String,
     max_bytes: usize,
     endings: HashSet<TokenId>,
     vocabulary: HashSet<TokenId>,
     codec: Codec,
+    plain_vocabulary: Option<JsonTokenVocabulary>,
     state: Mutex<State>,
 }
 
-impl ResponseJsonConstraint {
+impl JsonContentConstraint {
     pub(crate) fn new(
         tokenizer: &Tokenizer,
         schema: &serde_json::Value,
-        template: Arc<ResponseTemplate>,
+        projection_kind: ProjectionKind,
         prefix: &str,
         max_bytes: usize,
         endings: Vec<TokenId>,
     ) -> anyhow::Result<Self> {
-        template.require_json_boundaries()?;
         let vocabulary = tokenizer
             .inner()
             .get_vocab(true)
             .values()
             .copied()
             .collect::<HashSet<_>>();
-        let codec = match tokenizer.inner().get_decoder() {
-            Some(DecoderWrapper::ByteLevel(_) | DecoderWrapper::ByteFallback(_)) => {
-                let size = vocabulary.len();
-                ensure!(
-                    vocabulary
-                        .iter()
-                        .all(|id| usize::try_from(*id).is_ok_and(|id| id < size)),
-                    "projected JSON requires dense byte vocabulary IDs; repair tokenizer.json before enabling this sampling policy"
-                );
-                let ids = (0..size)
-                    .map(u32::try_from)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Codec::Bytes(
-                    crate::tokenization::token_pieces(tokenizer, &ids)
-                        .context("resolve lossless model pieces for response JSON sampling")?,
-                )
-            }
-            decoder => {
-                ensure!(
-                    decoder.is_none_or(|decoder| !crate::tokenization::has_byte_decoder(decoder)),
-                    "projected JSON cannot yet prove contextual byte-decoder sequences; this combination requires a resolved byte-concatenation decoder contract"
-                );
-                Codec::Canonical(Box::new(tokenizer.clone()))
-            }
+        let codec = match ByteStreamContract::resolve(tokenizer, projection_kind.special_tokens())?
+        {
+            Some(contract) => Codec::Bytes(contract),
+            None => Codec::Canonical(Box::new(tokenizer.clone())),
         };
-        let parser =
-            ResponseParser::new(template.clone(), prefix, PrefixOutput::Include, max_bytes)?;
-        let raw = parser.json_content(false);
+        let mut projection = projection_kind.create(prefix, max_bytes)?;
+        let raw = projection.content(false)?;
         let mut json = JsonByteCursor::new(schema, max_bytes)?;
-        let normalized = JsonPrefix::parse(&raw)?;
-        ensure!(
-            matches!(
-                normalized.preview(&mut json, "", b"")?,
-                JsonCandidate::Viable { .. }
-            ),
-            "rendered assistant prefill is not a viable projected JSON prefix; repair the selected content prefix or schema"
-        );
-        let canonical = normalized.canonical;
-        json.commit(canonical.as_bytes())
-            .context("commit normalized assistant prefill to the projected JSON recognizer")?;
+        let normalized = (|| -> anyhow::Result<JsonPrefix> {
+            let normalized = JsonPrefix::parse(&raw)?;
+            if let JsonCandidate::Rejected { byte_offset } = normalized.preview(&mut json, "", b"")? {
+                anyhow::bail!("JSON constraint prefix is not a prefix accepted by this grammar at canonical byte {byte_offset}; provide a valid partial JSON value matching the schema or adjust the schema");
+            }
+            json.commit(normalized.canonical.as_bytes())
+                .context("commit normalized assistant prefill to the JSON recognizer")?;
+            Ok(normalized)
+        })().map_err(|source| ConstraintPrefixError { source })?;
+        let plain_vocabulary = match (&projection_kind, &codec) {
+            (ProjectionKind::Plain, Codec::Bytes(contract)) => {
+                Some(JsonTokenVocabulary::new(&contract.pieces)?)
+            }
+            _ => None,
+        };
+        let special_tokens = projection_kind.special_tokens();
+        let decoder = codec.new_state(special_tokens);
         Ok(Self {
-            template,
+            projection_kind,
             prefix: prefix.into(),
             max_bytes,
             endings: endings.into_iter().collect(),
             vocabulary,
             codec,
+            plain_vocabulary,
             state: Mutex::new(State {
-                parser,
-                decoder: TokenTextDecoder::new(SpecialTokenHandling::Preserve),
+                projection,
+                decoder,
                 json,
                 history: Vec::new(),
                 raw,
-                canonical,
+                normalized,
                 ended: false,
             }),
         })
     }
 
     fn reset(&self, state: &mut State) -> anyhow::Result<()> {
-        state.parser = ResponseParser::new(
-            self.template.clone(),
-            &self.prefix,
-            PrefixOutput::Include,
-            self.max_bytes,
-        )?;
-        state.decoder = TokenTextDecoder::new(SpecialTokenHandling::Preserve);
+        state.projection = self.projection_kind.create(&self.prefix, self.max_bytes)?;
+        state.decoder = self.codec.new_state(self.projection_kind.special_tokens());
         state.history.clear();
-        state.raw = state.parser.json_content(false);
-        state.canonical = JsonPrefix::parse(&state.raw)?.canonical;
+        state.raw = state.projection.content(false)?;
+        state.normalized = JsonPrefix::parse(&state.raw)?;
         state.json.reset();
-        state.json.commit(state.canonical.as_bytes())?;
+        state.json.commit(state.normalized.canonical.as_bytes())?;
         state.ended = false;
         Ok(())
     }
 
     fn inspect_json(
-        view: &ResponseParser,
+        view: JsonView<'_>,
         json: &mut JsonByteCursor,
         base_raw: &str,
         base_canonical: &str,
         terminal: bool,
     ) -> anyhow::Result<bool> {
-        let published = view.json_content(terminal);
+        let published = view.content(terminal);
         if projection_extension(&published, base_raw, terminal, "content")?.is_none() {
             return Ok(true);
         }
         let grammar = if terminal {
             published.clone()
         } else {
-            view.grammar_json_content()
+            view.grammar_content()
         };
         let normalized = JsonPrefix::parse(&grammar)?;
-        let pending = view.pending_json_bytes()?.unwrap_or_default();
+        let pending = view.pending_bytes()?;
         let status = normalized.preview(json, base_canonical, pending)?;
         if let JsonCandidate::Viable { complete } = status
             && (!terminal || complete)
@@ -180,35 +182,16 @@ impl ResponseJsonConstraint {
         }
         let terminal = self.endings.contains(&id);
         let mut fork = state.decoder.clone();
-        let text;
-        let bytes = match &self.codec {
-            Codec::Bytes(pieces) => pieces
-                .get(id as usize)
-                .context("response JSON token has no declared byte piece")?
-                .as_slice(),
-            Codec::Canonical(tokenizer) => {
-                text = {
-                    let mut text = fork.step(tokenizer, id)?;
-                    if terminal {
-                        text.push_str(&fork.finish(tokenizer)?);
-                    } else {
-                        let mut materialized = fork.clone();
-                        text.push_str(&materialized.finish(tokenizer)?);
-                    }
-                    text
-                };
-                text.as_bytes()
-            }
-        };
+        let bytes = self.decode(&mut fork, id, terminal, true)?;
         let State {
-            parser,
+            projection,
             json,
             raw,
-            canonical,
+            normalized,
             ..
         } = state;
-        parser.with_preview(bytes, terminal, |view| {
-            Self::inspect_json(view, json, raw, canonical, terminal)
+        projection.with_preview(&bytes, terminal, |view| {
+            Self::inspect_json(view, json, raw, &normalized.canonical, terminal)
         })
     }
 
@@ -230,34 +213,61 @@ impl ResponseJsonConstraint {
         }
     }
 
-    fn advance(&self, state: &mut State, id: TokenId) -> anyhow::Result<()> {
-        match &self.codec {
-            Codec::Bytes(pieces) => state.parser.commit_unpublished(&pieces[id as usize])?,
-            Codec::Canonical(tokenizer) => {
-                let mut text = state.decoder.step(tokenizer, id)?;
-                if self.endings.contains(&id) {
-                    text.push_str(&state.decoder.finish(tokenizer)?);
+    fn decode(
+        &self,
+        decoder: &mut DecoderState,
+        id: TokenId,
+        terminal: bool,
+        preview: bool,
+    ) -> anyhow::Result<Vec<u8>> {
+        match (&self.codec, decoder) {
+            (Codec::Bytes(contract), DecoderState::Bytes(state)) => {
+                let piece = contract
+                    .pieces
+                    .get(id as usize)
+                    .context("JSON token has no declared byte piece")?;
+                let mut bytes = state.step(piece).into_owned();
+                if terminal {
+                    bytes.extend(state.finish());
                 }
-                state.parser.commit_unpublished(text.as_bytes())?;
+                Ok(bytes)
             }
+            (Codec::Canonical(tokenizer), DecoderState::Canonical(state)) => {
+                let mut text = state.step(tokenizer, id)?;
+                if terminal {
+                    text.push_str(&state.finish(tokenizer)?);
+                } else if preview {
+                    text.push_str(&state.clone().finish(tokenizer)?);
+                }
+                Ok(text.into_bytes())
+            }
+            _ => anyhow::bail!(
+                "JSON decoder state does not match its resolved tokenizer contract; restart generation with a fresh constraint"
+            ),
         }
+    }
+
+    fn advance(&self, state: &mut State, id: TokenId) -> anyhow::Result<()> {
+        let bytes = self.decode(&mut state.decoder, id, self.endings.contains(&id), false)?;
+        state.projection.commit(&bytes)?;
         let raw = if self.endings.contains(&id) {
-            state
-                .parser
-                .with_preview(b"", true, |view| Ok(view.json_content(true)))?
+            state.projection.content(true)?
         } else {
-            state.parser.json_content(false)
+            state.projection.content(false)?
         };
         if projection_extension(&raw, &state.raw, self.endings.contains(&id), "content")?.is_some()
         {
-            let canonical = JsonPrefix::parse(&raw)?.canonical;
-            if let Some(suffix) = canonical.strip_prefix(&state.canonical) {
+            let normalized = JsonPrefix::parse(&raw)?;
+            if let Some(suffix) = normalized
+                .canonical
+                .strip_prefix(&state.normalized.canonical)
+            {
                 state.json.commit(suffix.as_bytes())?;
             } else {
-                state.json.replace_prefix(canonical.as_bytes())?;
+                state.json.replace_prefix(normalized.canonical.as_bytes())?;
             }
             state.raw = raw;
-            state.canonical = canonical;
+            state.normalized = normalized;
         }
         state.history.push(id);
         state.ended = self.endings.contains(&id);
@@ -265,7 +275,7 @@ impl ResponseJsonConstraint {
     }
 }
 
-impl Constraint for ResponseJsonConstraint {
+impl Constraint for JsonContentConstraint {
     fn allowed_next_tokens(
         &self,
         context: &ProcessorContext,
@@ -285,9 +295,58 @@ impl Constraint for ResponseJsonConstraint {
                 );
                 self.advance(&mut state, id)?;
             }
+            if state.ended {
+                return Ok(vec![false; candidates.len()]);
+            }
+            if let (Some(vocabulary), Codec::Bytes(contract)) =
+                (&self.plain_vocabulary, &self.codec)
+                && state.decoder.is_identity()
+                && !state.normalized.has_pending_escape()
+            {
+                let pending = state
+                    .projection
+                    .plain_pending()?
+                    .context("compiled plain JSON vocabulary requires a plain text projection")?
+                    .to_vec();
+                let mask = state.json.vocabulary_mask(vocabulary, &pending)?;
+                return candidates
+                    .iter()
+                    .map(|candidate| {
+                        let id = candidate.token_id;
+                        let piece = contract.pieces.get(id as usize);
+                        if !self.endings.contains(&id)
+                            && let Some(piece) =
+                                piece.filter(|piece| !piece.is_empty() && !piece.contains(&b'\\'))
+                            && !(state.normalized.canonical.is_empty()
+                                && piece.first().is_some_and(u8::is_ascii_whitespace))
+                        {
+                            Ok((id as usize) < mask.len()
+                                && mask.get(id as usize)
+                                && state.projection.can_append_plain(piece.len()))
+                        } else {
+                            self.token_allowed(&mut state, id)
+                        }
+                    })
+                    .collect();
+            }
             candidates
                 .iter()
-                .map(|candidate| self.token_allowed(&mut state, candidate.token_id))
+                .map(|candidate| {
+                    if self.plain_vocabulary.is_some()
+                        && state.normalized.has_pending_escape()
+                        && state.decoder.is_identity()
+                        && let Codec::Bytes(contract) = &self.codec
+                        && !contract
+                            .pieces
+                            .get(candidate.token_id as usize)
+                            .is_some_and(|piece| {
+                                state.normalized.pending_piece_syntax_viable(piece)
+                            })
+                    {
+                        return Ok(false);
+                    }
+                    self.token_allowed(&mut state, candidate.token_id)
+                })
                 .collect()
         })();
         match result {
@@ -305,7 +364,7 @@ impl Constraint for ResponseJsonConstraint {
         }
     }
     fn name(&self) -> &str {
-        "response_json_schema"
+        "json_constraint"
     }
 }
 
@@ -314,6 +373,7 @@ mod tests {
     use super::*;
     use crate::config::{GenerateConstraint, GenerateOptions};
     use crate::processors::build_processor_chain;
+    use crate::response_template::ResponseTemplate;
     use serde_json::{Value, json};
 
     fn tokenizer(byte_level: bool) -> Tokenizer {
@@ -350,6 +410,7 @@ mod tests {
 
     fn options() -> GenerateOptions {
         GenerateOptions {
+            max_json_bytes: 4096,
             eos_token_id: Some(3),
             greedy: true,
             constraint: Some(GenerateConstraint::ResponseJson {
@@ -359,7 +420,6 @@ mod tests {
                 }}))
                 .unwrap(),
                 prefix: "A[r]old".into(),
-                max_bytes: 4096,
             }),
             ..Default::default()
         }
@@ -380,7 +440,10 @@ mod tests {
                 .0
                 .clone();
             vocab.remove(&old);
-            vocab.insert((*text).into(), json!(id));
+            assert!(
+                vocab.insert((*text).into(), json!(id)).is_none(),
+                "duplicate test token piece {text:?}"
+            );
         }
         value["model"] = json!({"type":"BPE","unk_token":"<unk>","byte_fallback":fallback,
             "vocab":value["model"]["vocab"],"merges":[]});
@@ -409,6 +472,257 @@ mod tests {
             )
             .unwrap();
         logits
+    }
+
+    #[test]
+    fn json_decoder_panics_report_token_and_configuration_without_unwinding() {
+        let base = byte_tokenizer(true, &[(4, " ")]);
+        let mut value: Value =
+            serde_json::from_str(&base.inner().to_string(false).unwrap()).unwrap();
+        value["decoder"] = json!({"type":"Sequence","decoders":[
+            {"type":"Strip","content":" ","start":0,"stop":100},
+            {"type":"ByteFallback"}
+        ]});
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let options = GenerateOptions {
+            constraint: Some(GenerateConstraint::Json {
+                prefix: String::new(),
+            }),
+            ..Default::default()
+        };
+        let error = build_processor_chain(&options, Some(&tokenizer), false)
+            .err()
+            .unwrap();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("vocabulary token") && message.contains("tokenizer.decoder"),
+            "{message}"
+        );
+        let mut decoder = TokenTextDecoder::default();
+        let error = decoder.step(&tokenizer, 4).unwrap_err();
+        assert!(format!("{error:#}").contains("token 4"));
+        let error = decoder.finish(&tokenizer).unwrap_err();
+        assert!(format!("{error:#}").contains("pending terminal token text"));
+    }
+
+    #[test]
+    fn plain_json_schema_preserves_composed_byte_fallback_decoder_support() {
+        let base = byte_tokenizer(
+            true,
+            &[(4, "<0xC3>"), (5, "<0xA9>"), (22, "▁\""), (23, "\"")],
+        );
+        let mut value: Value =
+            serde_json::from_str(&base.inner().to_string(false).unwrap()).unwrap();
+        value["decoder"] = json!({"type":"Sequence","decoders":[
+            {"type":"Replace","pattern":{"String":"▁"},"content":" "},
+            {"type":"ByteFallback"},{"type":"Fuse"},
+            {"type":"Strip","content":" ","start":1,"stop":0}
+        ]});
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let schema = json!({"const":"é"});
+        let legacy = crate::logits::LlguidanceConstraint::from_hf_tokenizer(
+            crate::logits::GrammarConstraintKind::JsonSchema,
+            &schema.to_string(),
+            tokenizer.inner(),
+            32,
+            Some(3),
+        )
+        .unwrap();
+        let candidates = (0..32)
+            .map(|token_id| TokenCandidate {
+                token_id,
+                text: String::new(),
+                is_eos: token_id == 3,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            legacy
+                .allowed_next_tokens(
+                    &ProcessorContext {
+                        generated_tokens: vec![23],
+                        ..Default::default()
+                    },
+                    &candidates
+                )
+                .unwrap()[4]
+        );
+        let options = GenerateOptions {
+            eos_token_id: Some(3),
+            constraint: Some(GenerateConstraint::JsonSchema {
+                schema: schema.to_string(),
+                prefix: String::new(),
+            }),
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        for opening in [22u32, 23] {
+            assert!(mask(&chain, &[])[opening as usize].is_finite());
+            assert!(mask(&chain, &[opening])[4].is_finite());
+            assert!(mask(&chain, &[opening, 4])[5].is_finite());
+            assert!(mask(&chain, &[opening, 4, 5])[23].is_finite());
+            assert!(mask(&chain, &[opening, 4, 5, 23])[3].is_finite());
+            assert_eq!(tokenizer.decode(&[opening, 4, 5, 23, 3]).unwrap(), "\"é\"");
+        }
+        let declared_options = GenerateOptions {
+            eos_token_id: Some(3),
+            constraint: Some(GenerateConstraint::ResponseJson {
+                schema: schema.clone(),
+                template: ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
+                    "content":{"open":"<c>","close":"<eos>"}
+                }}))
+                .unwrap(),
+                prefix: "A<c>".into(),
+            }),
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&declared_options, Some(&tokenizer), false).unwrap();
+        for opening in [22u32, 23] {
+            assert!(mask(&chain, &[])[opening as usize].is_finite());
+            assert!(mask(&chain, &[opening])[4].is_finite());
+            assert!(mask(&chain, &[opening, 4])[5].is_finite());
+            assert!(mask(&chain, &[opening, 4, 5])[23].is_finite());
+            assert!(!mask(&chain, &[opening, 4, 5])[3].is_finite());
+            assert!(mask(&chain, &[opening, 4, 5, 23])[3].is_finite());
+        }
+    }
+
+    #[test]
+    fn plain_json_vocabulary_masks_match_semantic_projection_across_rewinds_and_escapes() {
+        let tokenizer = byte_tokenizer(
+            true,
+            &[
+                (4, "\\"),
+                (5, "u"),
+                (6, "0"),
+                (7, "4"),
+                (8, "1"),
+                (9, "2"),
+                (16, "\""),
+                (17, "<0xFF>"),
+                (18, "<0xC0>"),
+                (19, "<0x80>"),
+                (20, "<0xED>"),
+                (21, "<0xA0>"),
+                (22, "{"),
+                (23, "}"),
+                (24, "\"k\":"),
+                (25, "123"),
+                (26, " \n"),
+                (27, "<0xC3>"),
+                (28, "<0xA9>"),
+                (29, "<0x31>"),
+            ],
+        );
+        let fast = JsonContentConstraint::new(
+            &tokenizer,
+            &json!(true),
+            ProjectionKind::Plain,
+            "",
+            4096,
+            vec![3],
+        )
+        .unwrap();
+        let mut reference = JsonContentConstraint::new(
+            &tokenizer,
+            &json!(true),
+            ProjectionKind::Plain,
+            "",
+            4096,
+            vec![3],
+        )
+        .unwrap();
+        assert!(fast.plain_vocabulary.is_some());
+        reference.plain_vocabulary = None;
+        let candidates = (0..32)
+            .map(|token_id| TokenCandidate {
+                token_id,
+                text: String::new(),
+                is_eos: token_id == 3,
+            })
+            .collect::<Vec<_>>();
+        for history in [
+            vec![],
+            vec![22],
+            vec![22, 24],
+            vec![22, 24, 25],
+            vec![22, 24, 25, 23],
+            vec![16],
+            vec![16, 27],
+            vec![16, 27, 28],
+            vec![16, 20],
+            vec![16, 4, 5, 6, 6, 7],
+            vec![16, 4, 5, 6, 6, 7, 8, 16],
+            vec![16],
+            vec![],
+        ] {
+            let context = ProcessorContext {
+                generated_tokens: history.clone(),
+                ..Default::default()
+            };
+            assert_eq!(
+                fast.allowed_next_tokens(&context, &candidates).unwrap(),
+                reference
+                    .allowed_next_tokens(&context, &candidates)
+                    .unwrap(),
+                "{history:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_json_schema_processor_accepts_split_escapes_and_checks_ordinary_eos_text() {
+        let tokenizer = byte_tokenizer(
+            true,
+            &[
+                (4, "\\"),
+                (5, "u"),
+                (6, "0"),
+                (7, "4"),
+                (8, "1"),
+                (9, "2"),
+                (16, "\""),
+                (22, "\"A"),
+            ],
+        );
+        let mut options = GenerateOptions {
+            eos_token_id: Some(3),
+            constraint: Some(GenerateConstraint::JsonSchema {
+                schema: json!({"const":"A"}).to_string(),
+                prefix: "\"".into(),
+            }),
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        assert!(mask(&chain, &[])[4].is_finite());
+        let pending = mask(&chain, &[4, 5, 6, 6, 7]);
+        assert!(pending[8].is_finite() && !pending[9].is_finite() && !pending[3].is_finite());
+        assert!(mask(&chain, &[4, 5, 6, 6, 7, 8])[16].is_finite());
+        assert!(mask(&chain, &[4, 5, 6, 6, 7, 8, 16])[3].is_finite());
+        assert_eq!(pending, mask(&chain, &[4, 5, 6, 6, 7]));
+
+        options.eos_token_id = Some(16);
+        if let Some(GenerateConstraint::JsonSchema { prefix, .. }) = &mut options.constraint {
+            *prefix = "\"A".into();
+        }
+        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        assert!(
+            mask(&chain, &[])[16].is_finite(),
+            "ordinary EOS quote finishes the actual JSON text"
+        );
+        if let Some(GenerateConstraint::JsonSchema { prefix, .. }) = &mut options.constraint {
+            *prefix = "\"A\"".into();
+        }
+        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        assert!(
+            !mask(&chain, &[])[16].is_finite(),
+            "EOS roles do not erase ordinary quote bytes"
+        );
     }
 
     #[test]
@@ -578,10 +892,7 @@ mod tests {
         let tokenizer = tokenizer(false);
         let mut options = options();
         if let Some(GenerateConstraint::ResponseJson {
-            template,
-            schema,
-            max_bytes,
-            ..
+            template, schema, ..
         }) = &mut options.constraint
         {
             *template = ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
@@ -589,8 +900,8 @@ mod tests {
             },"defaults":{"content":format!("{{\"extra\":\"{}\"}}","x".repeat(200))}}))
             .unwrap();
             *schema = json!({"type":"object"});
-            *max_bytes = 64;
         }
+        options.max_json_bytes = 64;
         let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
         let initial = mask(&chain, &[]);
         assert!(

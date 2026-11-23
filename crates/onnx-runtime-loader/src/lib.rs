@@ -50,6 +50,7 @@ pub mod encoder;
 pub mod epcontext;
 pub mod function_inline;
 pub(crate) mod graph_builder;
+mod keyed_weights;
 pub mod proto;
 pub mod weights;
 pub mod writer;
@@ -65,6 +66,7 @@ pub use epcontext::{
     is_ep_context_op, resolve_ep_context,
 };
 pub use error::LoaderError;
+pub use keyed_weights::KeyedWeightFile;
 pub use weights::{
     ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, ExpertWeightRegion,
     NonPageableReason, Pageability, WeightRegionCatalog, WeightStore, qmoe_expert_tensor_layout,
@@ -145,7 +147,7 @@ pub fn load_model_with_weights(
     let path = path.as_ref();
     let bytes = read_model_binary(path)?;
     let model_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    build_from_bytes_with_weights(&bytes, model_dir, FunctionLoading::InlineAll)
+    build_from_bytes_with_weights(&bytes, model_dir, FunctionLoading::InlineAll, &[])
 }
 
 /// Load a model and weights into source-preserving IR without lowering
@@ -223,7 +225,29 @@ pub fn load_model_bytes_with_weights(
     bytes: &[u8],
     base_dir: impl AsRef<Path>,
 ) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
-    build_from_bytes_with_weights(bytes, base_dir.as_ref(), FunctionLoading::InlineAll)
+    load_model_bytes_with_keyed_weights(bytes, base_dir, &[])
+}
+
+/// Load a model with caller-supplied GGUF or SafeTensors weight files.
+pub fn load_model_with_keyed_weights(
+    path: impl AsRef<Path>,
+    files: &[KeyedWeightFile],
+) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
+    let path = path.as_ref();
+    let bytes = read_model_binary(path)?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    load_model_bytes_with_keyed_weights(&bytes, base_dir, files)
+}
+
+/// Bind named weights to top-level external initializers with no ONNX location.
+/// An explicit rename takes precedence over a same-name match. Initializers
+/// with a nonempty ONNX location use ordinary model-relative external data.
+pub fn load_model_bytes_with_keyed_weights(
+    bytes: &[u8],
+    base_dir: impl AsRef<Path>,
+    files: &[KeyedWeightFile],
+) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
+    build_from_bytes_with_weights(bytes, base_dir.as_ref(), FunctionLoading::InlineAll, files)
 }
 
 /// Load in-memory ONNX bytes and weights into source-preserving IR.
@@ -249,10 +273,22 @@ pub fn load_model_bytes_with_weights_filtered(
     base_dir: impl AsRef<Path>,
     keep_as_op: &function_inline::KeepAsOp<'_>,
 ) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
+    load_model_bytes_with_keyed_weights_filtered(bytes, base_dir, &[], keep_as_op)
+}
+
+/// Combine keyed weight resolution with the execution provider's function
+/// inlining policy.
+pub fn load_model_bytes_with_keyed_weights_filtered(
+    bytes: &[u8],
+    base_dir: impl AsRef<Path>,
+    files: &[KeyedWeightFile],
+    keep_as_op: &function_inline::KeepAsOp<'_>,
+) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
     build_from_bytes_with_weights(
         bytes,
         base_dir.as_ref(),
         FunctionLoading::InlineFiltered(keep_as_op),
+        files,
     )
 }
 
@@ -260,6 +296,7 @@ fn build_from_bytes_with_weights(
     bytes: &[u8],
     model_dir: &Path,
     function_loading: FunctionLoading<'_>,
+    files: &[KeyedWeightFile],
 ) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
     let model = parse_model(bytes)?;
     validate_proto(&model)?;
@@ -272,7 +309,7 @@ fn build_from_bytes_with_weights(
     // imports before we touch the (potentially large) weight files.
     validate_opset_imports(&graph)?;
 
-    let mut store = load_weights(&model, model_dir, &name_map)?;
+    let mut store = weights::load_weights_with_keyed_files(&model, model_dir, &name_map, files)?;
     attach_weights(&mut graph, &store);
     weights::resolve_nested_weights(&mut graph, model_dir, &mut store)?;
 

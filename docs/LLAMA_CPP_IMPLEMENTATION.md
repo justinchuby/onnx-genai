@@ -1134,3 +1134,63 @@ The real ONNX HTTP test covers scalar constants, known keys and surrogate pairs
 in buffered and logprob SSE requests with a higher-biased invalid suffix. After the final adjustment, all 5 Unicode prefix cases, 3 existing schema-prefill
 cases, 8 production processor cases and strict engine/server all-target Clippy
 passed. This increment does not close the unchecked delivery items.
+
+
+## Shared ordinary and projected JSON recognition
+
+Ordinary JSON, JSON Schema and declared response-content constraints now use one
+schema cursor and the same Unicode escape semantics. Plain output follows normal
+special-token skipping, while declared channel projection retains protocol markers.
+EOS roles never erase ordinary token bytes: an EOS quote can finish a string,
+and the same quote is rejected after the value has already finished. Explicit
+stops and output/context limits retain their existing partial-value behavior.
+
+A transactional plain projection retains split UTF-8 and restores rejected,
+failed or panicking inspections. The old character-only generation constraint
+was removed, with no alias. Its pure syntax preflight is now the
+`validate_json_prefix` function. One positive `GenerateOptions.max_json_bytes`
+budget replaces the response-only duplicate; HTTP admission supplies the actual
+configured response buffer limit. All constrained chat/native/legacy generation requests
+validate capability and prefix before execution or SSE headers. Prefix errors
+retain their typed request classification and causal details.
+
+For byte-concatenating plain vocabularies, one external model trie walks the
+already compiled byte grammar. No second schema is compiled for the fast path.
+Backend mask caches are invalidated across vocabulary identities; raw byte IDs
+cannot become model IDs. Escape spellings and contextual non-byte codecs still
+use semantic inspection. Pending-escape syntax is checked locally before scanning
+unrelated committed content. Backend access remains panic-fenced, with failure
+state encoded separately from a usable parser; committed-prefix recovery retains
+its source chain.
+
+Validation on the pre-integration baseline: 405 server library tests passed with
+2 inherited ignores, and 728 engine tests passed with 1 inherited ignore. Strict
+engine/server all-target Clippy passed. New tests compare trie and semantic masks
+through rewinds, escapes and malformed/split UTF-8; alternate vocabularies include
+model IDs beyond the byte vocabulary and preserve byte-mask state after failures.
+The real ONNX buffered/logprob-SSE matrix now runs both with and without a declared
+response template. An additional standalone CLI test build exhausted disk space
+before producing a result; no CLI test pass is claimed. After integrating main 332396bcf and its runtime/memory changes, fresh full server
+405 passed / 2 inherited ignores, full engine 728 passed / 1 inherited ignore,
+and strict engine/server all-target Clippy all passed. Other unchecked delivery items remain open.
+
+
+The shared path also resolves composed byte decoders structurally. Token-local
+Replace/Strip stages compile into model pieces before the byte stage; ByteLevel
+is fused by definition, while ByteFallback requires explicit Fuse before initial
+stream stripping. Ordered initial Strip stages retain partial Unicode characters
+and clone with candidate state. Vocabulary trie masks become available once
+these stages have resolved, so neither grammar validation nor the fast mask
+assumes an unstripped candidate spelling. Registered special tokens are filtered
+before transforms only under the normal Skip policy. Declared response projection
+preserves their actual transformed text. Unsupported contextual stages report
+the exact tokenizer.decoder metadata path instead of silently changing semantics.
+Vocabulary predecoding and incremental decoder boundaries now fence backend
+panics and preserve actionable token/configuration context and source chains.
+
+The composed-decoder review added 39 passing JSON-filter tests and 4 passing
+byte-stream contract tests, including plain/declared split-Unicode continuation,
+ordered Unicode prefix stripping, rewind, special-marker preservation and actual
+tokenizer panic containment. The full suite on main 332396bcf plus these changes
+passed 734 engine tests (1 inherited ignore) and 405 server tests (2 inherited
+ignores). These are functional checks, with no performance claim.

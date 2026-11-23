@@ -6,10 +6,10 @@ use crate::config::{
 };
 use crate::logits::{
     AdaptivePProcessor, ConstraintProcessor, DryProcessor, GrammarConstraintKind, InfillContract,
-    InfillProcessor, JsonConstraint, LlguidanceConstraint, MinPProcessor, MirostatProcessor,
-    PenaltiesProcessor, ProcessorChain, ProcessorContext, ProcessorSignal, StopSequence,
-    StopSequenceProcessor, TemperatureProcessor, TokenId, TopAProcessor, TopKProcessor,
-    TopNSigmaProcessor, TopPProcessor, TypicalPProcessor, XtcProcessor,
+    InfillProcessor, LlguidanceConstraint, MinPProcessor, MirostatProcessor, PenaltiesProcessor,
+    ProcessorChain, ProcessorContext, ProcessorSignal, StopSequence, StopSequenceProcessor,
+    TemperatureProcessor, TokenId, TopAProcessor, TopKProcessor, TopNSigmaProcessor, TopPProcessor,
+    TypicalPProcessor, XtcProcessor,
 };
 use crate::sampling::{Sampler, default_sampler_for_options};
 use anyhow::Context;
@@ -46,26 +46,42 @@ pub(crate) fn build_processor_chain(
 
     if let Some(constraint) = &options.constraint {
         let tokenizer = tokenizer.context("constrained decoding requires a tokenizer")?;
-        let token_texts = tokenizer_token_texts(tokenizer);
+        let token_texts = tokenizer_token_texts(tokenizer)?;
         match constraint {
             GenerateConstraint::Json { prefix } => {
                 chain.add(Box::new(ConstraintProcessor::new(
-                    Box::new(JsonConstraint::new(prefix.clone())?),
+                    Box::new(crate::response_constraint::JsonContentConstraint::new(
+                        tokenizer,
+                        &serde_json::Value::Bool(true),
+                        crate::json_projection::ProjectionKind::Plain,
+                        prefix,
+                        options.max_json_bytes,
+                        if options.stop_on_eos {
+                            terminal_token_ids(options)
+                        } else {
+                            Vec::new()
+                        },
+                    )?),
                     token_texts,
                     terminal_token_ids(options),
                 )));
             }
             GenerateConstraint::JsonSchema { schema, prefix } => {
+                let schema = serde_json::from_str(schema)
+                    .context("parse JSON Schema constraint; supply a valid JSON schema value")?;
                 chain.add(Box::new(ConstraintProcessor::new(
-                    build_llguidance_constraint(
-                        GrammarConstraintKind::JsonSchema,
-                        schema,
-                        prefix,
+                    Box::new(crate::response_constraint::JsonContentConstraint::new(
                         tokenizer,
-                        &token_texts,
-                        options.eos_token_id,
-                        &terminal_token_ids(options),
-                    )?,
+                        &schema,
+                        crate::json_projection::ProjectionKind::Plain,
+                        prefix,
+                        options.max_json_bytes,
+                        if options.stop_on_eos {
+                            terminal_token_ids(options)
+                        } else {
+                            Vec::new()
+                        },
+                    )?),
                     token_texts,
                     terminal_token_ids(options),
                 )));
@@ -74,15 +90,14 @@ pub(crate) fn build_processor_chain(
                 schema,
                 template,
                 prefix,
-                max_bytes,
             } => {
                 chain.add(Box::new(ConstraintProcessor::new(
-                    Box::new(crate::response_constraint::ResponseJsonConstraint::new(
+                    Box::new(crate::response_constraint::JsonContentConstraint::new(
                         tokenizer,
                         schema,
-                        template.clone(),
+                        crate::json_projection::ProjectionKind::Declared(template.clone()),
                         prefix,
-                        *max_bytes,
+                        options.max_json_bytes,
                         if options.stop_on_eos {
                             terminal_token_ids(options)
                         } else {
@@ -481,14 +496,17 @@ fn build_llguidance_constraint(
     }
 }
 
-fn tokenizer_token_texts(tokenizer: &Tokenizer) -> Vec<Option<String>> {
+fn tokenizer_token_texts(tokenizer: &Tokenizer) -> anyhow::Result<Vec<Option<String>>> {
     let vocab = tokenizer.inner().get_vocab(true);
     let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
     let mut token_texts = vec![None; max_id + 1];
-    for (id, token_text) in token_texts.iter_mut().enumerate() {
-        *token_text = tokenizer.decode(&[id as TokenId]).ok();
+    for &id in vocab.values() {
+        token_texts[id as usize] = Some(
+            llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| tokenizer.decode(&[id]).map_err(anyhow::Error::from)))
+                .with_context(|| format!("decode vocabulary token {id} for sampling; repair tokenizer.decoder or this vocabulary entry"))?
+        );
     }
-    token_texts
+    Ok(token_texts)
 }
 
 pub(crate) fn select_next_token(

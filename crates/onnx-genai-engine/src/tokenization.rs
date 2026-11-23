@@ -37,24 +37,31 @@ impl TokenTextDecoder {
         }
     }
     pub fn step(&mut self, tokenizer: &Tokenizer, id: u32) -> anyhow::Result<String> {
-        tokenizers::tokenizer::step_decode_stream(
-            tokenizer.inner(), vec![id], self.special_tokens==SpecialTokenHandling::Skip, &mut self.ids, &mut self.prefix, &mut self.prefix_index,
-        ).map(|text| text.unwrap_or_default()).map_err(|error| {
-            if error.is::<tokenizers::tokenizer::DecodeStreamError>() {
-                anyhow::Error::new(NonMonotonicText)
-            } else {
-                anyhow::anyhow!("incremental decoding of token {id} failed: {error}; repair the package tokenizer decoder or its token vocabulary")
-            }
-        })
+        llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokenizers::tokenizer::step_decode_stream(
+                tokenizer.inner(), vec![id], self.special_tokens==SpecialTokenHandling::Skip, &mut self.ids, &mut self.prefix, &mut self.prefix_index,
+            ).map(|text| text.unwrap_or_default()).map_err(|error| {
+                if error.is::<tokenizers::tokenizer::DecodeStreamError>() {
+                    anyhow::Error::new(NonMonotonicText)
+                } else {
+                    anyhow::Error::from_boxed(error)
+                }
+            })
+        })).with_context(|| format!("incremental decoding of token {id} failed; repair tokenizer.decoder or its token vocabulary"))
     }
     /// Emit pending bytes at the terminal boundary, including the tokenizer's
     /// replacement text for an incomplete final UTF-8 sequence.
     pub fn finish(&mut self, tokenizer: &Tokenizer) -> anyhow::Result<String> {
-        let decoded = match self.special_tokens {
-            SpecialTokenHandling::Skip => tokenizer.decode(&self.ids),
-            SpecialTokenHandling::Preserve => tokenizer.decode_with_special_tokens(&self.ids),
-        }
-        .context("decode pending terminal token text")?;
+        let decoded = llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (match self.special_tokens {
+                SpecialTokenHandling::Skip => tokenizer.decode(&self.ids),
+                SpecialTokenHandling::Preserve => tokenizer.decode_with_special_tokens(&self.ids),
+            })
+            .map_err(anyhow::Error::from)
+        }))
+        .context(
+            "decode pending terminal token text; repair tokenizer.decoder if decoding panicked",
+        )?;
         let tail = decoded
             .strip_prefix(&self.prefix)
             .ok_or(NonMonotonicText)?
