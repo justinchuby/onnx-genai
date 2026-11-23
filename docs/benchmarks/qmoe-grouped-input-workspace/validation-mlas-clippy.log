@@ -1,0 +1,6 @@
+   Compiling mlas-sys v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/mlas-sys)
+    Checking onnx-runtime-einsum-conformance v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-einsum-conformance)
+    Checking onnx-runtime-cuda-memory v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-cuda-memory)
+    Checking onnx-runtime-ep-cpu v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cpu)
+    Checking onnx-runtime-session v0.1.0-dev.6 (/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-session)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 35.82s

@@ -1,0 +1,58 @@
+{
+  "rows": 1,
+  "k": 64,
+  "n": 64,
+  "reps": 256,
+  "threads": 1,
+  "cpu_batch_ms": [
+    21.470000000000002,
+    21.438999999999986,
+    21.968999999999987,
+    22.12000000000003,
+    21.509,
+    21.872000000000003,
+    21.927000000000028,
+    21.834999999999994,
+    21.836999999999996
+  ],
+  "wall_batch_ms": [
+    21.471375000000002,
+    21.438792000000003,
+    22.020625,
+    22.150167,
+    21.513958,
+    21.874458,
+    21.929875000000003,
+    21.835708999999998,
+    21.843083999999998
+  ],
+  "control_batch_ms": [
+    96.87100000000004,
+    86.67500000000005,
+    90.233,
+    88.8119999999999,
+    86.10000000000007,
+    90.55199999999996,
+    90.52899999999997,
+    90.46100000000013,
+    91.29299999999985
+  ],
+  "control_reps": 100000,
+  "workspace_requirement_bytes": 0,
+  "funded_workspace_bytes": 0,
+  "retained_derived_bytes": 0,
+  "dense": false,
+  "host_limit_bytes": 67108864,
+  "absolute_peak_rss_bytes": 12959744,
+  "argmax": [
+    34
+  ],
+  "label": "baseline",
+  "tag": "pilot-excluded",
+  "output_sha256": "eaffadcb7f5121179407d6eafb02ce6444b468d89f8d22ed706461ef0204c347",
+  "output_path": "/tmp/nxrt-qmoe-gather-refined-session-perf/pilot-excluded-baseline-m1-k64-n64-t1-dense0.f32",
+  "cpu_ms_per_call": 0.08530078124999999,
+  "wall_ms_per_call": 0.08532454687499999,
+  "control_median_ms": 90.46100000000013,
+  "batch_cpu_min_ms": 21.438999999999986
+}
