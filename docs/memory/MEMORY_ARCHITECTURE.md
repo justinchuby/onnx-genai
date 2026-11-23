@@ -159,7 +159,8 @@ multiplier. It is cleared once per dispatch and borrowed until the final dtype
 and strided-output write, preserving late-write behavior when input and output
 storage alias. Routing, dtype widening and GEMM implementation scratch remain
 separate; other MoE representations retain their
-existing owned-result seam. See the [source-backed CPU evidence](../benchmarks/float-moe-fc-workspace/README.md)
+existing owned-result seam. See the [projection-bank evidence](../benchmarks/float-moe-fc-workspace/README.md)
+and [accumulator evidence](../benchmarks/float-moe-accumulator-workspace/README.md)
 for zero warm workspace issuer callbacks, tests, memory bounds and qualified
 session timing. Zero callbacks do not imply zero total inference overhead.
 

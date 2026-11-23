@@ -1,0 +1,18 @@
+{
+  "recorded_utc": "2026-11-23T14:32:44.071642+00:00",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "hardware": "Apple M1 Max",
+  "source_commit": "47c4973d421e2b2f5f7ed16a2afb34f99a4cbd75",
+  "cuda_device_validation": false,
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "start_process_snapshots": "Retained in /tmp/nxrt-moe-accumulator-perf/*-host.log; not continuous foreign-CPU telemetry",
+  "validation_counts": {
+    "cpu_passed": 2025,
+    "cpu_ignored": 20,
+    "mlas_passed": 2067,
+    "mlas_ignored": 35,
+    "session_passed": 296,
+    "layout_passed": 11
+  }
+}

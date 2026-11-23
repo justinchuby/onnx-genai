@@ -1,0 +1,17 @@
+{"status": "queued", "pid": 94122, "action": "Wait for the peer batch on the shared stable flock; no heavy process has started."}
+{"status": "acquired", "pid": 94122, "command": ["python", "/tmp/nxrt-moe-accumulator-perf/driver.py"]}
+{"stage": "clean", "arm": "baseline"}
+{"stage": "build", "arm": "baseline"}
+{"stage": "clean", "arm": "after"}
+{"stage": "build", "arm": "after"}
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/tmp/nxrt-float-moe-accumulator/crates/onnx-runtime-ep-cpu)
+   Compiling onnx-runtime-session v0.1.0-dev.6 (/tmp/nxrt-float-moe-accumulator/crates/onnx-runtime-session)
+error: failed to build archive at `/tmp/nxrt-erf-nan-target/release/deps/libonnx_runtime_ep_cpu-862915b4594f6aae.rlib`: No space left on device (os error 28)
+
+error: could not compile `onnx-runtime-ep-cpu` (lib) due to 1 previous error
+
+Traceback (most recent call last):
+  File "/tmp/nxrt-moe-accumulator-perf/driver.py", line 24, in <module>
+    if r.returncode:print((artifact/f'{label}-{stage}.log').read_text()[-5000:],flush=True);raise RuntimeError(f'{label} {stage}')
+                                                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: after build

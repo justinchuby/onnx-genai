@@ -1,0 +1,23 @@
+{
+  "base": "098f7d3f1052746d1600d91de2b436e359a7b2be",
+  "source_path": "/tmp/nxrt-float-moe-accumulator",
+  "candidate_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "074d4ed5d0c7cf61921b2ea192beeaf4e51ab294a4eb804d5b4688743898b4d6",
+    "docs/memory/MEMORY_ARCHITECTURE.md": "ba6f78f7bf84df118f32cb544b16e5a37782bc7867ed503aa1c4c6e73ed83b1f"
+  },
+  "probe_sha256": "e3246958962d49a69614778c00b1d794dc0cf3bd7a17063e51c839ed397473c2",
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "binaries": {
+    "baseline": {
+      "sha256": "7f5d9d19c76bac512e6d5a6a4fbf7b693d4290c4dac8ea7472d6347f87e026d3",
+      "symbol_count": 25141,
+      "mlas_symbols": 0
+    },
+    "after": {
+      "sha256": "2496298c75de0b5d117abc6074714a844687af671c4d52e51f28887dcc646c12",
+      "symbol_count": 25101,
+      "mlas_symbols": 0
+    }
+  }
+}
