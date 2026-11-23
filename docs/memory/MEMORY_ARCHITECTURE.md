@@ -101,13 +101,38 @@ One exclusive scratch lane is borrowed by sequential projection calls, which
 return owned results. A private dispatch-local owner lazily initializes the
 required f32 prefix at the first streamed apply; later applies receive short,
 exclusive initialized slices and partition their own prefixes safely. Dense
-resident hits leave scratch untouched, and unused capacity in a larger pool
-slot is not initialized. The initialization proof ends with the dispatch and
+resident hits leave the streamed-projection regions untouched, and unused
+capacity in a larger pool slot is not initialized. The initialization proof ends with the dispatch and
 is never cached across pool borrowers. FC1/FC3 results survive subsequent
-scratch overwrites for gating. Routing, activation buffers, grouped inputs,
-output staging, and their owned intermediate results remain separate allocations; this contract does not
-claim a complete process-memory bound. Dense resident-set admission remains a
+scratch overwrites for gating. BlockQuantizedMoE grouped inputs also borrow an
+input-sized region in that admitted layout; singleton groups can borrow their
+original row. Routing, activation/output staging and owned intermediate results
+remain separate allocations, so this is not a complete process-memory bound. Dense resident-set admission remains a
 separate existing weight-cache operation. No new public EP API is required.
+
+
+### CPU float MoE projection banks
+
+Float MoE uses the same declared-workspace seam for gather, FC1/optional FC3,
+activation and expert output. One admitted lane contains two disjoint f32
+banks. Non-gated execution reuses A for gather/output and B for FC1/activation.
+Gated execution reuses A for gather/activation and B for FC1+FC3/output. The
+last read of each phase precedes overwriting its bank; short borrows enforce
+that order. Only actual destination prefixes are initialized for each GEMM.
+
+Metadata uses the kernel's fixed grouped-work threshold to exclude unreachable
+grouped execution, otherwise covers rows*top_k; preparation never relies on its
+current thread-pool width. Bank widths follow the simultaneously live operands,
+with checked arithmetic and no expert-count multiplier. Fixed banks remain a
+conservative bound, especially when gated hidden width dominates intermediate
+width. A reused larger physical lane remains charged at its actual capacity.
+
+The common layer owns admission, pooling and release. There are no per-expert
+quota callbacks. Final accumulation/results, routing, dtype widening and GEMM
+implementation scratch remain separate; other MoE representations retain their
+existing owned-result seam. See the [source-backed CPU evidence](../benchmarks/float-moe-fc-workspace/README.md)
+for zero warm workspace issuer callbacks, tests, memory bounds and qualified
+session timing. Zero callbacks do not imply zero total inference overhead.
 
 ## Implementation status
 

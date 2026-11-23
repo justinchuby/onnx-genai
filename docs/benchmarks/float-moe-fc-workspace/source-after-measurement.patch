@@ -1,0 +1,35 @@
+diff --git a/crates/onnx-runtime-ep-cpu/src/kernels/moe.rs b/crates/onnx-runtime-ep-cpu/src/kernels/moe.rs
+index 7189bb408..9b5d744f8 100644
+--- a/crates/onnx-runtime-ep-cpu/src/kernels/moe.rs
++++ b/crates/onnx-runtime-ep-cpu/src/kernels/moe.rs
+@@ -1264,9 +1264,8 @@ impl MoeWorkspace<'_> {
+ }
+ 
+ /// Portable single-token reference expert: plain scalar dot products, no GEMM,
+-/// no transposes. Production now routes every row count through
+-/// [`run_expert_grouped`]; this is kept as the oracle the tests compare
+-/// against.
++/// no transposes. Production uses grouped GEMM projections at every row count;
++/// this is kept as the independent oracle the tests compare against.
+ #[cfg(test)]
+ pub(super) fn run_expert(
+     input: &[f32],
+@@ -1450,10 +1449,14 @@ pub(super) fn run_expert_projections<P: ExpertProjection>(
+                 let mut gate = Vec::with_capacity(rows * inter);
+                 let mut linear = Vec::with_capacity(rows * inter);
+                 for row in fc1_out.chunks_exact(fc1_size) {
+-                    for index in 0..inter {
+-                        let (g, l) = attributes.gated_pair_indices(index, inter, false);
+-                        gate.push(row[g]);
+-                        linear.push(row[l]);
++                    if attributes.swiglu_fusion == 1 {
++                        for pair in row.as_chunks::<2>().0 {
++                            gate.push(pair[0]);
++                            linear.push(pair[1]);
++                        }
++                    } else {
++                        gate.extend_from_slice(&row[..inter]);
++                        linear.extend_from_slice(&row[inter..]);
+                     }
+                 }
+                 (gate, linear)

@@ -1,0 +1,21 @@
+{
+  "measured_equivalent_commit": "e165460c0c6d4f1367f536810e6b8b23fd02254d",
+  "main_base": "28fad980b5b04570284a1aaf237dce916fbbb7d3",
+  "files": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs": {
+      "measured_sha256": "86b1385c7c406e75d9693d72e7dc48ca98225afa215a45ab288cb2e21513682a",
+      "published_sha256": "86b1385c7c406e75d9693d72e7dc48ca98225afa215a45ab288cb2e21513682a"
+    },
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": {
+      "measured_sha256": "809b05ca26d44f6980a7ee61a990686d3e32e9c870d7b1b7b49a8cbc0674080a",
+      "published_sha256": "6fc67740a260b9a3a09923b283a23af9917a6b23c2dc306b931e33f2ed3f0d36"
+    },
+    "crates/onnx-runtime-ep-cpu/tests/decoded_projection_layout.rs": {
+      "measured_sha256": "0475f9a274351cf00256a3d00399f4f26ca1c7a33bf7b3fbae127c6f1d31976b",
+      "published_sha256": "0475f9a274351cf00256a3d00399f4f26ca1c7a33bf7b3fbae127c6f1d31976b"
+    }
+  },
+  "post_measurement_change": "Corrected oracle Rustdoc and restored the baseline bulk-copy split-half path in the active owned projection helper. The timed Float workspace prefix and shared GEMM primitive are byte-identical; owned QMoE/BQM keeps its original data movement.",
+  "timed_float_prefix_sha256": "1420cbd9c92f837ffb64d4d5836a449b1924e5f244f414fac0bd36c3847d9659",
+  "shared_gemm_primitive_sha256": "e56343ac9ac77eacb6a3f11d6ff3da68200a84e24b80eb4fc2e10a868c941458"
+}

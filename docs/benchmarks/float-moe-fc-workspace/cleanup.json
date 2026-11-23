@@ -1,0 +1,35 @@
+{
+  "removed_probe_copies": [
+    {
+      "path": "/tmp/nxrt-float-moe-fc-perf/baseline-probe",
+      "sha256": "8159e481d9d7bfc187d66f6a4031ac890774f2672af232748321ccf2b8c2502d",
+      "logical_bytes": 13892624
+    },
+    {
+      "path": "/tmp/nxrt-float-moe-fc-perf/after-probe",
+      "sha256": "643117a593dd1bdfc5ce1b04a298cac26562ecff22182014cfab1db803ee776d",
+      "logical_bytes": 13891856
+    },
+    {
+      "path": "/tmp/nxrt-float-moe-fc-perf/null-probe",
+      "sha256": "8159e481d9d7bfc187d66f6a4031ac890774f2672af232748321ccf2b8c2502d",
+      "logical_bytes": 13892624
+    },
+    {
+      "path": "/tmp/nxrt-erf-nan-target/release/nxrt-float-moe-fc-probe",
+      "sha256": "643117a593dd1bdfc5ce1b04a298cac26562ecff22182014cfab1db803ee776d",
+      "logical_bytes": 13891856
+    },
+    {
+      "path": "/tmp/nxrt-erf-nan-target/release/deps/nxrt_float_moe_fc_probe-4d2b43c8130302ba",
+      "sha256": "643117a593dd1bdfc5ce1b04a298cac26562ecff22182014cfab1db803ee776d",
+      "logical_bytes": 13891856
+    }
+  ],
+  "removed_miri_target": "/tmp/nxrt-miri-moe-prefix-target",
+  "miri_logical_bytes": 833065556,
+  "total_logical_bytes": 902526372,
+  "physical_disk_saving_not_measured": true,
+  "source_logs_raw_outputs_preserved": true,
+  "stable_lock_inode_preserved": true
+}

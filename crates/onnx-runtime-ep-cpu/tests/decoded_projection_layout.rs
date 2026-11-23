@@ -312,3 +312,40 @@ fn parallel_gather_initializes_complete_rows_and_recovers_after_refusal() {
         });
     }
 }
+
+#[test]
+fn zeroed_prefix_keeps_whole_bank_initialization_separate() {
+    use decoded_projection::ProjectionScratch;
+    use onnx_runtime_ep_api::{DevicePtrMut, WorkspaceView};
+    use std::mem::MaybeUninit;
+    let mut backing = [MaybeUninit::<f32>::uninit(); 8];
+    let bytes = std::mem::size_of_val(&backing);
+    // SAFETY: the private Host storage remains exclusively lent to this test.
+    let mut scratch = unsafe {
+        ProjectionScratch::bind(
+            "prefix fixture",
+            bytes,
+            Some(WorkspaceView::new(
+                DevicePtrMut(backing.as_mut_ptr().cast()),
+                bytes,
+            )),
+        )
+    }
+    .unwrap();
+    assert!(scratch.zeroed_prefix(0).unwrap().is_empty());
+    let prefix = scratch.zeroed_prefix(2).unwrap();
+    assert_eq!(prefix, [0., 0.]);
+    prefix[0] = 7.;
+    assert!(
+        scratch
+            .zeroed_prefix(9)
+            .unwrap_err()
+            .to_string()
+            .contains("workspace has 8")
+    );
+    // A partial write cannot certify untouched MaybeUninit tail storage.
+    assert_eq!(scratch.initialized(), [0.; 8]);
+    scratch.initialized().fill(42.);
+    assert_eq!(scratch.zeroed_prefix(3).unwrap(), [0.; 3]);
+    assert_eq!(scratch.initialized(), [0., 0., 0., 42., 42., 42., 42., 42.]);
+}

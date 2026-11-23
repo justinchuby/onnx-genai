@@ -2352,3 +2352,30 @@ outputs. Candidate CPU medians change -1.19% to +0.90%, with overlapping ranges
 and all null/control duration gates passing; observed OS activity limits the
 performance evidence. See [the reproducible report](../benchmarks/float-moe-workspace/README.md).
 No CUDA runtime or model throughput conclusion follows.
+
+
+### Float MoE FC intermediates reuse two admitted banks
+
+The former gather-only boundary now includes FC1, optional FC3, activated and
+expert-output matrices. The two fixed banks follow their live ranges: nongated
+A gather/output and B FC1/activation; gated A gather/activation and B
+FC1+FC3/output. Actual prefixes are initialized without treating untouched bank
+capacity as initialized. The final accumulation/result, routing, widening and
+GEMM-internal storage remain separate. Fixed banks are a conservative explicit
+bound; they do not introduce a per-phase allocator or new public EP API.
+
+Native CPU 2,019, MLAS CPU 2,061, session 296 and projection-layout 11 tests pass.
+The named prefix primitive passes Miri; the cross-pool resource test also passes
+at MLAS budget 1. Strict native/MLAS all-target Clippy passes. Exact-capacity Host
+controls reconcile funding, zero warm issuer callbacks and final zero usage.
+
+All 126 formal full outputs and argmaxes agree across the original 72-process
+study and one fixed 54-process diagnostic. The original forced split-SwiGLU
+control fails its 5% gate and is retained. The diagnostic passes all three
+control/duration gates, with overlapping CPU ranges for the two large forced
+cells (+1.89%/+0.65%, null +1.38%/-0.70%); a small cost is not excluded. Neither
+study proves universally zero overhead, an RSS saving or a model speedup.
+[The report](../benchmarks/float-moe-fc-workspace/README.md) retains both protocols,
+source/binary hashes, raw batches, conservative capacity costs and host limits.
+Consumed probes and the private Miri target were removed under the stable lock,
+with receipts; sources, results, shared dependencies and lock inode remain.

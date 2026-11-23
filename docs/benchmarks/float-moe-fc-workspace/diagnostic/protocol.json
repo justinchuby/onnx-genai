@@ -1,0 +1,43 @@
+{
+  "source_and_binaries": "Unchanged from original eight-cell sweep; hashes verified before this fixed diagnostic",
+  "reason": "One Relu control failed the 5% gate; forced parallel cells have large baseline/null differences",
+  "orders": [
+    [
+      "baseline",
+      "after",
+      "null"
+    ],
+    [
+      "after",
+      "null",
+      "baseline"
+    ],
+    [
+      "null",
+      "baseline",
+      "after"
+    ],
+    [
+      "null",
+      "after",
+      "baseline"
+    ],
+    [
+      "after",
+      "baseline",
+      "null"
+    ],
+    [
+      "baseline",
+      "null",
+      "after"
+    ]
+  ],
+  "repetitions": {
+    "(512, 256, 256, 4, '0', 'identity')": 26,
+    "(512, 256, 256, 4, '0', 'swiglu2')": 16,
+    "(8, 64, 128, 4, '0', 'silu3')": 1056
+  },
+  "attempts": 1,
+  "rule": "Report both studies; do not replace original records or repeat until favourable."
+}

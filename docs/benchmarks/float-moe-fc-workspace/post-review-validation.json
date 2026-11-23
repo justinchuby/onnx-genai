@@ -1,0 +1,47 @@
+{
+  "reason": "Restored baseline owned split-half bulk-copy loop without changing the timed Float prefix or shared GEMM primitive. Rechecked complete CPU suites, session and strict lint.",
+  "source_proof": "published-source.json",
+  "owned_splitter_matches_baseline": true,
+  "results": [
+    {
+      "name": "layout",
+      "raw_path": "/tmp/nxrt-float-moe-fc-validation/layout.log",
+      "sha256": "f5585d521891b1aa7414169ed85708436393b4e29d9baf179b7f652298856044",
+      "passed": 11,
+      "ignored": 0
+    },
+    {
+      "name": "native",
+      "raw_path": "/tmp/nxrt-float-moe-fc-validation/native.log",
+      "sha256": "ab8399ab1230154d6f4b681b142f8fe80b6d5d1dbb04f6beeeff383b7db9664b",
+      "passed": 2019,
+      "ignored": 20
+    },
+    {
+      "name": "session",
+      "raw_path": "/tmp/nxrt-float-moe-fc-validation/session.log",
+      "sha256": "f304dcf53f0691536a1b935055561984a63c4b30e7276cd7eff367e3c5d69459",
+      "passed": 296,
+      "ignored": 0
+    },
+    {
+      "name": "mlas",
+      "raw_path": "/tmp/nxrt-float-moe-fc-validation/mlas.log",
+      "sha256": "b47cd776fe674019c2c1419f1cd4d4acd2c5ebf8db78da24aa44ad2b1869d76e",
+      "passed": 2061,
+      "ignored": 35
+    },
+    {
+      "name": "clippy",
+      "raw_path": "/tmp/nxrt-float-moe-fc-validation/clippy.log",
+      "sha256": "c311210558582a8b459b362964afc17875a056d197b6b123d2d2283de1ba8b7b",
+      "strict_all_target_clippy_passed": true
+    },
+    {
+      "name": "mlas-clippy",
+      "raw_path": "/tmp/nxrt-float-moe-fc-validation/mlas-clippy.log",
+      "sha256": "7ec11b71da32ca61db5fbd83d2b6cf8b2c6544dba51a9c47046e0b1765d1755e",
+      "strict_all_target_clippy_passed": true
+    }
+  ]
+}

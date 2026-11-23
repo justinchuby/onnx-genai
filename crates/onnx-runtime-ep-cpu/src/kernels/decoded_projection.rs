@@ -167,6 +167,20 @@ impl<'a> ProjectionScratch<'a> {
         Ok(unsafe { std::slice::from_raw_parts_mut(target.as_mut_ptr().cast(), count) })
     }
 
+    /// Initialize only the requested prefix for a fresh projection destination.
+    /// A partial prefix does not establish initialization of the whole bank.
+    pub(super) fn zeroed_prefix(&mut self, elements: usize) -> Result<&mut [f32]> {
+        let capacity = self.storage.len();
+        let target = self.storage.get_mut(..elements).ok_or_else(|| EpError::KernelFailed(
+            format!("projection destination needs {elements} values, workspace has {capacity}; prepare the complete projection bound")
+        ))?;
+        // SAFETY: the short borrow is exclusive; zero bytes initialize f32.
+        unsafe {
+            target.as_mut_ptr().write_bytes(0, elements);
+        }
+        Ok(unsafe { std::slice::from_raw_parts_mut(target.as_mut_ptr().cast(), elements) })
+    }
+
     pub(super) fn initialized(&mut self) -> &mut [f32] {
         if !self.initialized {
             // SAFETY: binding exclusively lends every element. All-zero bytes
