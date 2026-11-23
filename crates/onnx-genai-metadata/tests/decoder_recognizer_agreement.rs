@@ -65,6 +65,14 @@ use GraphCardinality::{Composite, NoGraph, SingleGraph};
 
 /// Every workflow this repository maintains, and how it classifies.
 const MATRIX: &[Row] = &[
+    row(
+        "tests/fixtures/onnx_genai_workflows/reranking/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        None,
+        false,
+        None,
+    ),
     // ── catalogue: worked examples of the metadata format ────────────────────
     // These document graph ABIs. Several declare a lone decoder component
     // without the runtime's decode contract, which is exactly why the two

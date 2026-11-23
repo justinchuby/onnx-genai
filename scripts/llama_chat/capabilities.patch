@@ -1,0 +1,53 @@
+diff --git a/ui/apps/chat/src/lib/services/chat.service.ts b/ui/apps/chat/src/lib/services/chat.service.ts
+index 38c7eba..84d0408 100644
+--- a/ui/apps/chat/src/lib/services/chat.service.ts
++++ b/ui/apps/chat/src/lib/services/chat.service.ts
+@@ -31,6 +31,8 @@ import {
+ 	ReasoningFormat,
+ 	StreamConnectionState
+ } from '#lib/enums/index.ts';
++import { PropsService } from '#lib/services/props.service.ts';
++import { serverStore } from '#lib/stores/llama-server.svelte.ts';
+ import { modelsStore } from '#lib/stores/models/index.svelte.ts';
+ import { settingsStore } from '#lib/stores/settings/index.svelte.ts';
+ import type {
+@@ -1176,6 +1178,16 @@ export class ChatService {
+ 			});
+ 		}
+ 
++		// Browser tools are attached by default upstream. A backend with explicit
++		// package capabilities must not be sent tools its model cannot interpret.
++		let requestTools = tools;
++		if (tools?.length && serverStore.props?.nxrt_capabilities) {
++			const props = options.model
++				? await PropsService.fetchForModel(options.model, true)
++				: serverStore.props;
++			if (props.nxrt_capabilities?.tools === false) requestTools = undefined;
++		}
++
+ 		const requestBody: ApiChatCompletionRequest = {
+ 			messages: normalizedMessages.map((msg: ApiChatMessageData) => {
+ 				const mapped: ApiChatCompletionRequest['messages'][0] = {
+@@ -1195,7 +1207,7 @@ export class ChatService {
+ 			return_progress: stream ? true : undefined,
+ 			sse_ping_interval: stream ? 1 : undefined,
+ 			stream,
+-			tools: tools && tools.length > 0 ? tools : undefined
++			tools: requestTools && requestTools.length > 0 ? requestTools : undefined
+ 		};
+ 
+ 		// Include model in request if provided (required in ROUTER mode)
+diff --git a/ui/apps/chat/src/lib/types/api.d.ts b/ui/apps/chat/src/lib/types/api.d.ts
+index abdd1b3..6b066fa 100644
+--- a/ui/apps/chat/src/lib/types/api.d.ts
++++ b/ui/apps/chat/src/lib/types/api.d.ts
+@@ -219,6 +219,9 @@ export interface ApiModelDetails {
+ }
+ 
+ export interface ApiLlamaCppServerProps {
++	/** Optional backend capabilities; absent on an ordinary llama-server. */
++	nxrt_capabilities?: { tools?: boolean; reasoning_control?: boolean; resumable_streams?: boolean };
++
+ 	default_generation_settings: {
+ 		id: number;
+ 		id_task: number;

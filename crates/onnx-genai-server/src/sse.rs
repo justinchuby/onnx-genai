@@ -1,3 +1,4 @@
+use onnx_genai_engine::FinishReason;
 use std::convert::Infallible;
 
 use anyhow::Context;
@@ -35,6 +36,8 @@ pub(crate) struct ChatCompletionChunk {
     created: u64,
     model: String,
     choices: Vec<ChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nxrt_prompt_tokens: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,6 +46,8 @@ pub(crate) struct ChunkChoice {
     delta: Delta,
     logprobs: Option<ChatLogprobs>,
     finish_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_sequence: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -81,7 +86,13 @@ pub(crate) struct ChunkToolCallFunction {
 #[derive(Debug)]
 pub(crate) struct StopBoundaryBuffer {
     stop_sequences: Vec<String>,
-    pub(crate) pending: String,
+    state: StopBoundaryState,
+}
+
+#[derive(Debug)]
+enum StopBoundaryState {
+    Holding(String),
+    Stopped,
 }
 
 impl StopBoundaryBuffer {
@@ -91,56 +102,56 @@ impl StopBoundaryBuffer {
                 .into_iter()
                 .filter(|sequence| !sequence.is_empty())
                 .collect(),
-            pending: String::new(),
+            state: StopBoundaryState::Holding(String::new()),
         }
     }
 
     pub(crate) fn push(&mut self, text: &str) -> String {
+        let StopBoundaryState::Holding(pending) = &mut self.state else {
+            return String::new();
+        };
         if self.stop_sequences.is_empty() {
-            return text.to_string();
+            return text.to_owned();
         }
-
-        self.pending.push_str(text);
-        if let Some(stop_start) = self.earliest_stop_start() {
-            let safe = self.pending[..stop_start].to_string();
-            self.pending.clear();
+        pending.push_str(text);
+        if let Some(stop_start) = self
+            .stop_sequences
+            .iter()
+            .filter_map(|sequence| pending.find(sequence))
+            .min()
+        {
+            let safe = pending[..stop_start].to_owned();
+            self.state = StopBoundaryState::Stopped;
             return safe;
         }
-
-        let keep = self.longest_stop_prefix_suffix_len();
-        let emit_len = self.pending.len().saturating_sub(keep);
-        if emit_len == 0 {
-            return String::new();
-        }
-
-        let safe = self.pending[..emit_len].to_string();
-        self.pending = self.pending[emit_len..].to_string();
-        safe
-    }
-
-    pub(crate) fn flush(&mut self) -> String {
-        std::mem::take(&mut self.pending)
-    }
-
-    fn earliest_stop_start(&self) -> Option<usize> {
-        self.stop_sequences
-            .iter()
-            .filter_map(|sequence| self.pending.find(sequence))
-            .min()
-    }
-
-    fn longest_stop_prefix_suffix_len(&self) -> usize {
         let mut keep = 0;
         for sequence in &self.stop_sequences {
             for (prefix_len, _) in sequence.char_indices().skip(1) {
-                if self.pending.ends_with(&sequence[..prefix_len]) {
+                if pending.ends_with(&sequence[..prefix_len]) {
                     keep = keep.max(prefix_len);
                 }
             }
         }
-        keep
+        let emit_len = pending.len().saturating_sub(keep);
+        let safe = pending[..emit_len].to_owned();
+        pending.drain(..emit_len);
+        safe
+    }
+
+    pub(crate) fn flush(&mut self) -> String {
+        match &mut self.state {
+            StopBoundaryState::Holding(pending) => std::mem::take(pending),
+            StopBoundaryState::Stopped => String::new(),
+        }
+    }
+
+    pub(crate) fn discard_pending(&mut self) {
+        if let StopBoundaryState::Holding(pending) = &mut self.state {
+            pending.clear();
+        }
     }
 }
+
 pub(crate) async fn send_stream_chunk(
     tx: &mpsc::Sender<Result<Event, Infallible>>,
     chunk: ChatCompletionChunk,
@@ -268,6 +279,16 @@ pub(crate) fn buffered_workflow_publication(
 
 /// Render the same semantic record for an SSE data field. Delivery failure from
 /// the caller of this function cannot change the already committed envelope.
+pub(crate) fn text_before_stop<'a>(text: &'a str, stops: &[String]) -> &'a str {
+    let cutoff = stops
+        .iter()
+        .filter(|stop| !stop.is_empty())
+        .filter_map(|stop| text.find(stop))
+        .min()
+        .unwrap_or(text.len());
+    &text[..cutoff]
+}
+
 #[cfg(test)]
 pub(crate) fn sse_workflow_publication_data(
     publication: &WorkflowOutputPublication,
@@ -304,6 +325,7 @@ pub(crate) fn completion_chunk(
     id: &str,
     created: u64,
     model: &str,
+    index: usize,
     text: String,
     logprobs: Option<CompletionLogprobs>,
 ) -> CompletionChunk {
@@ -314,7 +336,7 @@ pub(crate) fn completion_chunk(
         model: model.to_string(),
         choices: vec![CompletionChunkChoice {
             text,
-            index: 0,
+            index,
             finish_reason: None,
             logprobs,
         }],
@@ -325,6 +347,7 @@ pub(crate) fn completion_done_chunk(
     id: &str,
     created: u64,
     model: &str,
+    index: usize,
     finish_reason: &'static str,
 ) -> CompletionChunk {
     CompletionChunk {
@@ -334,16 +357,22 @@ pub(crate) fn completion_done_chunk(
         model: model.to_string(),
         choices: vec![CompletionChunkChoice {
             text: String::new(),
-            index: 0,
+            index,
             finish_reason: Some(finish_reason),
             logprobs: None,
         }],
     }
 }
 
-pub(crate) fn role_chunk(id: &str, created: u64, model: &str) -> ChatCompletionChunk {
+pub(crate) fn role_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    prompt_tokens: usize,
+) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
+        nxrt_prompt_tokens: Some(prompt_tokens),
         object: "chat.completion.chunk",
         created,
         model: model.to_string(),
@@ -357,6 +386,7 @@ pub(crate) fn role_chunk(id: &str, created: u64, model: &str) -> ChatCompletionC
             },
             logprobs: None,
             finish_reason: None,
+            stop_sequence: None,
         }],
     }
 }
@@ -370,6 +400,7 @@ pub(crate) fn content_chunk(
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
+        nxrt_prompt_tokens: None,
         object: "chat.completion.chunk",
         created,
         model: model.to_string(),
@@ -383,6 +414,7 @@ pub(crate) fn content_chunk(
             },
             logprobs,
             finish_reason: None,
+            stop_sequence: None,
         }],
     }
 }
@@ -396,6 +428,7 @@ pub(crate) fn reasoning_chunk(
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
+        nxrt_prompt_tokens: None,
         object: "chat.completion.chunk",
         created,
         model: model.to_string(),
@@ -409,6 +442,7 @@ pub(crate) fn reasoning_chunk(
             },
             logprobs: None,
             finish_reason: None,
+            stop_sequence: None,
         }],
     }
 }
@@ -465,6 +499,7 @@ fn tool_call_delta_chunk(
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
+        nxrt_prompt_tokens: None,
         object: "chat.completion.chunk",
         created,
         model: model.to_string(),
@@ -478,6 +513,7 @@ fn tool_call_delta_chunk(
             },
             logprobs: None,
             finish_reason: None,
+            stop_sequence: None,
         }],
     }
 }
@@ -490,6 +526,7 @@ pub(crate) fn done_chunk(
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
+        nxrt_prompt_tokens: None,
         object: "chat.completion.chunk",
         created,
         model: model.to_string(),
@@ -498,8 +535,32 @@ pub(crate) fn done_chunk(
             delta: Delta::default(),
             logprobs: None,
             finish_reason: Some(finish_reason),
+            stop_sequence: None,
         }],
     }
+}
+
+pub(crate) fn done_chunk_with_stop(
+    id: &str,
+    created: u64,
+    model: &str,
+    reason: &FinishReason,
+    stops: &[String],
+) -> ChatCompletionChunk {
+    let mut chunk = done_chunk(
+        id,
+        created,
+        model,
+        match reason {
+            FinishReason::MaxTokens | FinishReason::Length => "length",
+            FinishReason::ToolCalls => "tool_calls",
+            _ => "stop",
+        },
+    );
+    if let FinishReason::StopSequence { index } = reason {
+        chunk.choices[0].stop_sequence = stops.get(*index).cloned();
+    }
+    chunk
 }
 
 #[cfg(test)]
@@ -729,5 +790,28 @@ mod reasoning_wire_tests {
         let delivered = rx.recv().await.expect("publication delivered once");
         assert!(delivered.is_ok());
         assert!(rx.try_recv().is_err(), "publication must not be replayed");
+    }
+}
+
+#[cfg(test)]
+mod stop_boundary_tests {
+    use super::*;
+    #[test]
+    fn stop_boundaries_are_terminal_and_preserve_every_unicode_split() {
+        let text = "hello停住hidden";
+        for (split, _) in text
+            .char_indices()
+            .chain(std::iter::once((text.len(), ' ')))
+        {
+            let mut buffer = StopBoundaryBuffer::new(vec!["停住".into()]);
+            let mut output = buffer.push(&text[..split]);
+            output.push_str(&buffer.push(&text[split..]));
+            output.push_str(&buffer.push("later bytes"));
+            output.push_str(&buffer.flush());
+            assert_eq!(output, "hello", "split={split}");
+        }
+        let mut buffer = StopBoundaryBuffer::new(vec!["停住".into()]);
+        assert_eq!(buffer.push("hello停"), "hello");
+        assert_eq!(buffer.flush(), "停");
     }
 }

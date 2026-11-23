@@ -353,7 +353,8 @@ impl Scheduler {
             return Ok((admitted, requested_bytes, None));
         };
 
-        let minimum_required = self.estimated_bytes(request.prompt_tokens, 1);
+        let minimum_required =
+            self.estimated_bytes(request.prompt_tokens, usize::from(request.max_tokens > 0));
         let reservation =
             match budget.try_reserve_at_most(requested_bytes, minimum_required, bytes_per_token) {
                 Ok(reservation) => reservation,
@@ -412,7 +413,8 @@ impl Scheduler {
         requested_bytes: u64,
         error: ByteBudgetError,
     ) -> SchedulerAdmissionError {
-        let minimum_required = self.estimated_bytes(request.prompt_tokens, 1);
+        let minimum_required =
+            self.estimated_bytes(request.prompt_tokens, usize::from(request.max_tokens > 0));
         SchedulerAdmissionError::ByteBudget {
             request_id: request.id,
             seq_id: request.seq_id,
@@ -1096,6 +1098,21 @@ mod tests {
             })
         );
         assert_eq!(budget.used(), 640);
+    }
+
+    #[test]
+    fn prompt_only_admission_reserves_no_phantom_output_token() {
+        let budget = ByteBudget::new(512);
+        let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(2), budget.clone());
+        scheduler.enqueue_generate_request(7, 256, 0, Priority::Normal);
+        let request = scheduler.drive_next_fcfs_result().unwrap().unwrap();
+        assert_eq!(request.max_tokens, 0);
+        assert_eq!(budget.used(), 512);
+        scheduler.complete(7);
+        assert_eq!(budget.used(), 0);
+        scheduler.enqueue_generate_request(8, 257, 0, Priority::Normal);
+        assert!(scheduler.drive_next_fcfs_result().is_err());
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]

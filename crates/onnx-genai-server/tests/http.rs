@@ -23,6 +23,20 @@ async fn test_app() -> axum::Router {
     app(state)
 }
 
+async fn json_test_app() -> (tempfile::TempDir, axum::Router) {
+    let package = tempfile::tempdir().unwrap();
+    copy_tree(&fixture_dir(), package.path());
+    let path = package.path().join("tokenizer.json");
+    let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+    vocab.remove("tok22");
+    vocab.insert("{}".into(), json!(22));
+    tokenizer["added_tokens"] = json!([{"id":3,"content":"<eos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}]);
+    std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+    let router = app(AppState::load(package.path(), Some("tiny-llm".into())).unwrap());
+    (package, router)
+}
+
 async fn fixture_app(name: &str) -> axum::Router {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures")
@@ -1067,10 +1081,15 @@ async fn completions_with_suffix_rejects_model_without_fim_tokens() {
     let json: Value = serde_json::from_slice(&body).unwrap();
     let message = json["error"]["message"].as_str().unwrap();
     assert!(
-        message.contains("FIM is not supported by this model"),
+        message.contains("suffix requires a model declaring FIM tokens"),
         "{json}"
     );
-    assert!(message.contains("recognized FIM tokens"), "{json}");
+    assert!(
+        message.contains("choose a FIM-capable package or omit suffix"),
+        "{json}"
+    );
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert_eq!(json["error"]["code"], 400);
 }
 
 #[test]
@@ -1104,21 +1123,36 @@ fn response_format_maps_to_the_requested_generate_constraint() {
     }));
 
     assert_eq!(
-        build_generate_request(&json_request).options.constraint,
-        Some(GenerateConstraint::Json)
-    );
-    assert_eq!(
-        build_generate_request(&json_schema_request)
+        build_generate_request(&json_request, &fixture_tokenizer())
+            .unwrap()
             .options
             .constraint,
-        Some(GenerateConstraint::JsonSchema(schema.to_string()))
+        Some(GenerateConstraint::Json {
+            prefix: String::new()
+        })
     );
     assert_eq!(
-        build_generate_request(&text_request).options.constraint,
+        build_generate_request(&json_schema_request, &fixture_tokenizer())
+            .unwrap()
+            .options
+            .constraint,
+        Some(GenerateConstraint::JsonSchema {
+            schema: schema.to_string(),
+            prefix: String::new()
+        })
+    );
+    assert_eq!(
+        build_generate_request(&text_request, &fixture_tokenizer())
+            .unwrap()
+            .options
+            .constraint,
         None
     );
     assert_eq!(
-        build_generate_request(&absent_request).options.constraint,
+        build_generate_request(&absent_request, &fixture_tokenizer())
+            .unwrap()
+            .options
+            .constraint,
         None
     );
 }
@@ -1189,14 +1223,18 @@ fn forced_specific_tool_choice_builds_lark_tool_call_constraint() {
         }
     }));
 
-    let Some(GenerateConstraint::Lark(grammar)) =
-        build_generate_request_with_protocol(&request, &declared_protocol("tagged-json"))
-            .unwrap()
-            .options
-            .constraint
+    let Some(GenerateConstraint::Lark { grammar, prefix }) = build_generate_request_with_protocol(
+        &request,
+        &declared_protocol("tagged-json"),
+        &fixture_tokenizer(),
+    )
+    .unwrap()
+    .options
+    .constraint
     else {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
+    assert!(prefix.is_empty());
     assert!(
         grammar.contains("start: \"<tool_call>\\n\" tool \"\\n</tool_call>\""),
         "{grammar}"
@@ -1236,14 +1274,18 @@ fn required_tool_choice_with_multiple_tools_allows_any_tool_schema() {
         "tool_choice": "required"
     }));
 
-    let Some(GenerateConstraint::Lark(grammar)) =
-        build_generate_request_with_protocol(&request, &declared_protocol("tagged-json"))
-            .unwrap()
-            .options
-            .constraint
+    let Some(GenerateConstraint::Lark { grammar, prefix }) = build_generate_request_with_protocol(
+        &request,
+        &declared_protocol("tagged-json"),
+        &fixture_tokenizer(),
+    )
+    .unwrap()
+    .options
+    .constraint
     else {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
+    assert!(prefix.is_empty());
     let schema_text = grammar.split_once("tool: %json ").unwrap().1.trim();
     let schema: Value = serde_json::from_str(schema_text).unwrap();
     let any_of = schema["anyOf"].as_array().unwrap();
@@ -1275,20 +1317,31 @@ fn auto_and_none_tool_choice_do_not_constrain_generation() {
     }));
 
     assert_eq!(
-        build_generate_request_with_protocol(&auto_request, &declared_protocol("tagged-json"))
-            .unwrap()
-            .options
-            .constraint,
+        build_generate_request_with_protocol(
+            &auto_request,
+            &declared_protocol("tagged-json"),
+            &fixture_tokenizer()
+        )
+        .unwrap()
+        .options
+        .constraint,
         None
     );
     assert_eq!(
-        build_generate_request_with_protocol(&none_request, &declared_protocol("atem-xml"))
-            .unwrap()
-            .options
-            .constraint,
+        build_generate_request_with_protocol(
+            &none_request,
+            &declared_protocol("atem-xml"),
+            &fixture_tokenizer()
+        )
+        .unwrap()
+        .options
+        .constraint,
         None
     );
-    let GeneratePrompt::Text(prompt) = build_generate_request(&none_request).prompt else {
+    let GeneratePrompt::Text(prompt) = build_generate_request(&none_request, &fixture_tokenizer())
+        .unwrap()
+        .prompt
+    else {
         panic!("expected text prompt");
     };
     assert!(!prompt.contains("<|tools|>"), "{prompt}");
@@ -1326,7 +1379,7 @@ fn generic_request_builder_does_not_guess_a_tool_protocol() {
         "tool_choice": "auto"
     }));
 
-    let generate_request = build_generate_request(&request);
+    let generate_request = build_generate_request(&request, &fixture_tokenizer()).unwrap();
     let GeneratePrompt::Text(prompt) = generate_request.prompt else {
         panic!("expected text prompt");
     };
@@ -1698,7 +1751,7 @@ async fn no_tools_and_none_do_not_publish_typed_tool_calls() {
 
 #[tokio::test]
 async fn chat_completions_response_format_json_object_returns_valid_json() {
-    let app = test_app().await;
+    let (_package, app) = json_test_app().await;
     let session_id = create_http_session(app.clone()).await;
     let response = app
         .oneshot(
@@ -1712,7 +1765,7 @@ async fn chat_completions_response_format_json_object_returns_valid_json() {
                         "model": "tiny-llm",
                         "messages": [{"role": "user", "content": "hello"}],
                         "max_tokens": 13,
-                        "response_format": {"type": "json_object"}
+                        "response_format": {"type": "json_object"}, "logit_bias":{"22":1000}
                     })
                     .to_string(),
                 ))
@@ -1726,6 +1779,10 @@ async fn chat_completions_response_format_json_object_returns_valid_json() {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["object"], "chat.completion");
+    assert!(
+        json["usage"]["completion_tokens"].as_u64().unwrap() > 0,
+        "must report actual generated JSON tokens: {json}"
+    );
     assert_eq!(json["choices"][0]["message"]["role"], "assistant");
     let content = json["choices"][0]["message"]["content"].as_str().unwrap();
     let parsed: Value = serde_json::from_str(content).unwrap();
@@ -1734,7 +1791,7 @@ async fn chat_completions_response_format_json_object_returns_valid_json() {
 
 #[tokio::test]
 async fn streaming_chat_completions_response_format_json_object_streams_valid_json() {
-    let app = test_app().await;
+    let (_package, app) = json_test_app().await;
     let session_id = create_http_session(app.clone()).await;
     let response = app
         .oneshot(
@@ -1748,8 +1805,8 @@ async fn streaming_chat_completions_response_format_json_object_streams_valid_js
                         "model": "tiny-llm",
                         "messages": [{"role": "user", "content": "hello"}],
                         "max_tokens": 13,
-                        "stream": true,
-                        "response_format": {"type": "json_object"}
+                        "stream": true,"stream_options":{"include_usage":true},
+                        "response_format": {"type": "json_object"}, "logit_bias":{"22":1000}
                     })
                     .to_string(),
                 ))
@@ -1769,6 +1826,14 @@ async fn streaming_chat_completions_response_format_json_object_streams_valid_js
     assert_eq!(data_lines.last(), Some(&"[DONE]"), "{text}");
 
     let chunks = sse_json_chunks(&text);
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["usage"]["completion_tokens"]
+                .as_u64()
+                .is_some_and(|count| count > 0)),
+        "must report actual generated JSON tokens: {text}"
+    );
     let content: String = chunks
         .iter()
         .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
@@ -1991,4 +2056,12 @@ async fn chat_completions_reuses_persistent_session() {
         .await
         .unwrap();
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+}
+
+fn fixture_tokenizer() -> onnx_genai_ort::Tokenizer {
+    onnx_genai_ort::Tokenizer::from_file(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+    )
+    .unwrap()
 }

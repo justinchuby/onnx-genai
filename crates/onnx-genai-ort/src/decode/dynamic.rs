@@ -1155,62 +1155,6 @@ impl<'a> DecodeSession<'a> {
                 );
             }
 
-            fn prefix_value(value: &Arc<Value>, shape: &[i64], seq_axis: usize) -> Result<Value> {
-                let owner_shape = value.shape();
-                let prefix_is_contiguous = owner_shape.iter().take(seq_axis).all(|&dim| dim == 1);
-                if prefix_is_contiguous {
-                    return Value::alias_with_shape(Arc::clone(value), shape);
-                }
-
-                match value.dtype() {
-                    DataType::Float32 => {
-                        let data = value.to_vec_f32()?;
-                        let prefix = copy_prefix(&data, owner_shape, shape);
-                        Value::from_vec_f32(prefix, shape)
-                    }
-                    DataType::Float16 => {
-                        let data = value.to_vec_f16_bits()?;
-                        let prefix = copy_prefix(&data, owner_shape, shape);
-                        Value::from_vec_f16_bits(prefix, shape)
-                    }
-                    DataType::BFloat16 => {
-                        let data = value.to_vec_bf16_bits()?;
-                        let prefix = copy_prefix(&data, owner_shape, shape);
-                        Value::from_vec_bf16_bits(prefix, shape)
-                    }
-                    dtype => Err(OrtError::InvalidArgument(format!(
-                        "cannot rewind KV tensor with dtype {dtype:?}"
-                    ))),
-                }
-            }
-
-            fn copy_prefix<T: Copy>(
-                data: &[T],
-                input_shape: &[i64],
-                output_shape: &[i64],
-            ) -> Vec<T> {
-                let output_len = output_shape.iter().product::<i64>() as usize;
-                let mut output = Vec::with_capacity(output_len);
-                let input_strides = row_major_strides(input_shape);
-                for mut linear in 0..output_len {
-                    let mut input_offset = 0usize;
-                    for (axis, &dim) in output_shape.iter().enumerate().rev() {
-                        let index = linear % dim as usize;
-                        linear /= dim as usize;
-                        input_offset += index * input_strides[axis];
-                    }
-                    output.push(data[input_offset]);
-                }
-                output
-            }
-
-            fn row_major_strides(shape: &[i64]) -> Vec<usize> {
-                let mut strides = vec![1; shape.len()];
-                for axis in (0..shape.len().saturating_sub(1)).rev() {
-                    strides[axis] = strides[axis + 1] * shape[axis + 1] as usize;
-                }
-                strides
-            }
             self.current_kv = rewound;
         }
         self.current_len = target_len;
@@ -1275,22 +1219,68 @@ impl<'a> DecodeSession<'a> {
     /// as materialized OrtValues; shared-buffer mode owns fixed max-length
     /// device buffers that are not portable across sessions.
     pub fn export_kv(&self) -> Result<Vec<(String, Value)>> {
-        if self.mode != DecodeKvMode::ZeroCopyRebind {
-            return Err(OrtError::InvalidArgument(
-                "export_kv is only supported in ZeroCopyRebind mode".into(),
-            ));
+        self.export_kv_prefix(self.current_len)
+    }
+
+    /// Exact host payload required to export the declared KV prefix.
+    pub fn kv_prefix_bytes(&self, len: usize) -> Result<u64> {
+        if self.mode != DecodeKvMode::ZeroCopyRebind || len > self.current_len {
+            return Err(OrtError::InvalidArgument(format!(
+                "cannot export KV prefix {len} from mode {:?} at length {}",
+                self.mode, self.current_len
+            )));
         }
-        let mut exported = Vec::with_capacity(self.kv_pairs.len());
-        for pair in &self.kv_pairs {
+        self.kv_pairs.iter().try_fold(0u64, |total, pair| {
             let value = self.current_kv.get(&pair.past).ok_or_else(|| {
-                OrtError::InvalidArgument(format!(
-                    "cannot export KV: missing tensor '{}' (run a prefill/decode step first)",
-                    pair.past
-                ))
+                OrtError::InvalidArgument(format!("KV prefix export missing '{}'", pair.past))
             })?;
-            exported.push((pair.past.clone(), clone_value_to_owned(value)?));
-        }
-        Ok(exported)
+            if !value.shape().get(pair.seq_axis).and_then(|&extent| usize::try_from(extent).ok()).is_some_and(|extent| extent >= len) {
+                return Err(OrtError::InvalidArgument(format!("KV prefix '{}' requests {len} tokens on sequence axis {}, but its physical shape is {:?}; re-export matching present KV rank and sequence extents", pair.past, pair.seq_axis, value.shape())));
+            }
+            let bytes = value.shape().iter().enumerate().try_fold(
+                value.dtype().size_of() as u64,
+                |bytes, (axis, &extent)| {
+                    let extent = if axis == pair.seq_axis {
+                        len as u64
+                    } else {
+                        u64::try_from(extent).map_err(|_| {
+                            OrtError::InvalidArgument(format!(
+                                "negative KV shape for '{}'",
+                                pair.past
+                            ))
+                        })?
+                    };
+                    bytes.checked_mul(extent).ok_or_else(|| {
+                        OrtError::InvalidArgument(format!(
+                            "KV prefix byte size overflows for '{}'",
+                            pair.past
+                        ))
+                    })
+                },
+            )?;
+            total.checked_add(bytes).ok_or_else(|| {
+                OrtError::InvalidArgument("KV prefix total byte size overflows".into())
+            })
+        })
+    }
+
+    /// Export a compact, owned, byte-exact prefix without mutating the runner.
+    pub fn export_kv_prefix(&self, len: usize) -> Result<Vec<(String, Value)>> {
+        self.kv_prefix_bytes(len)?;
+        self.kv_pairs
+            .iter()
+            .map(|pair| {
+                let value = self.current_kv.get(&pair.past).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!("KV prefix export missing '{}'", pair.past))
+                })?;
+                let mut shape = value.shape().to_vec();
+                shape[pair.seq_axis] = i64::try_from(len).map_err(|_| {
+                    OrtError::InvalidArgument("KV prefix length exceeds i64".into())
+                })?;
+                let prefix = prefix_value(value, &shape, pair.seq_axis)?;
+                Ok((pair.past.clone(), clone_value_to_owned(&prefix)?))
+            })
+            .collect()
     }
 
     /// Adopt a KV cache produced by another session (same model) and set the
@@ -1726,6 +1716,133 @@ impl DecodeSession<'_> {
 fn debug_shapes_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("ONNX_GENAI_ORT_DEBUG_SHAPES").is_some())
+}
+
+fn prefix_value(value: &Arc<Value>, shape: &[i64], seq_axis: usize) -> Result<Value> {
+    let owner_shape = value.shape();
+    if shape.len() != owner_shape.len()
+        || seq_axis >= shape.len()
+        || shape
+            .iter()
+            .zip(owner_shape)
+            .enumerate()
+            .any(|(axis, (&target, &source))| {
+                target < 0 || target > source || (axis != seq_axis && target != source)
+            })
+    {
+        return Err(OrtError::InvalidArgument(format!(
+            "KV prefix shape {shape:?} is incompatible with source {owner_shape:?} on sequence axis {seq_axis}; preserve non-sequence extents and select a non-negative prefix no longer than the source"
+        )));
+    }
+    let prefix_is_contiguous = owner_shape.iter().take(seq_axis).all(|&dim| dim == 1);
+    if prefix_is_contiguous {
+        return Value::alias_with_shape(Arc::clone(value), shape);
+    }
+
+    let byte_shape = |dimensions: &[i64]| -> Result<Vec<i64>> {
+        let mut dimensions = dimensions.to_vec();
+        let last = dimensions.last_mut().ok_or_else(|| {
+            OrtError::InvalidArgument("KV prefix requires a non-scalar tensor".into())
+        })?;
+        *last = last
+            .checked_mul(value.dtype().size_of() as i64)
+            .ok_or_else(|| {
+                OrtError::InvalidArgument("KV prefix byte-axis extent overflows".into())
+            })?;
+        Ok(dimensions)
+    };
+    let bytes = copy_prefix(
+        value.as_raw_bytes()?,
+        &byte_shape(owner_shape)?,
+        &byte_shape(shape)?,
+    );
+    Value::from_raw_bytes(bytes, shape, value.dtype())
+}
+
+fn copy_prefix<T: Copy>(data: &[T], input_shape: &[i64], output_shape: &[i64]) -> Vec<T> {
+    let output_len = output_shape.iter().product::<i64>() as usize;
+    let mut output = Vec::with_capacity(output_len);
+    let input_strides = row_major_strides(input_shape);
+    for mut linear in 0..output_len {
+        let mut input_offset = 0usize;
+        for (axis, &dim) in output_shape.iter().enumerate().rev() {
+            let index = linear % dim as usize;
+            linear /= dim as usize;
+            input_offset += index * input_strides[axis];
+        }
+        output.push(data[input_offset]);
+    }
+    output
+}
+
+fn row_major_strides(shape: &[i64]) -> Vec<usize> {
+    let mut strides = vec![1; shape.len()];
+    for axis in (0..shape.len().saturating_sub(1)).rev() {
+        strides[axis] = strides[axis + 1] * shape[axis + 1] as usize;
+    }
+    strides
+}
+
+#[cfg(test)]
+mod prefix_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn portable_kv_prefix_refuses_incompatible_shapes_before_alias_or_slice() -> Result<()> {
+        let owner = Arc::new(Value::from_raw_bytes(
+            vec![1; 12],
+            &[1, 2, 3, 2],
+            DataType::Int8,
+        )?);
+        for (shape, axis) in [
+            (vec![1, 2, 4, 2], 2),
+            (vec![1, 3, 2, 2], 2),
+            (vec![1, 2, 2], 2),
+            (vec![1, 2, -1, 2], 2),
+            (vec![1, 2, 2, 2], 4),
+        ] {
+            let error = prefix_value(&owner, &shape, axis)
+                .err()
+                .expect("invalid prefix must fail before accessing bytes");
+            assert!(error.to_string().contains("KV prefix shape"), "{error}");
+        }
+        assert_eq!(owner.to_raw_bytes()?, vec![1; 12]);
+        Ok(())
+    }
+
+    #[test]
+    fn portable_kv_prefix_preserves_bytes_for_arbitrary_element_types_and_head_strides()
+    -> Result<()> {
+        for dtype in [
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Int8,
+            DataType::Int64,
+        ] {
+            for heads in [1, 2] {
+                let size = dtype.size_of();
+                let bytes: Vec<u8> = (0..heads * 6 * size).map(|offset| offset as u8).collect();
+                let owner = Arc::new(Value::from_raw_bytes(
+                    bytes.clone(),
+                    &[1, heads as i64, 3, 2],
+                    dtype,
+                )?);
+                let prefix = prefix_value(&owner, &[1, heads as i64, 2, 2], 2)?;
+                let expected: Vec<_> = (0..heads)
+                    .flat_map(|head| {
+                        bytes[head * 6 * size..head * 6 * size + 4 * size]
+                            .iter()
+                            .copied()
+                    })
+                    .collect();
+                assert_eq!(prefix.to_raw_bytes()?, expected, "{dtype:?}, heads={heads}");
+                assert_eq!(clone_value_to_owned(&prefix)?.to_raw_bytes()?, expected);
+                assert_eq!(owner.to_raw_bytes()?, bytes);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

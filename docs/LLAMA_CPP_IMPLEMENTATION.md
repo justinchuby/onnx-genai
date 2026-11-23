@@ -1,0 +1,1087 @@
+# llama.cpp compatibility implementation ledger
+
+Goal: maximize protocol and official-frontend compatibility, implement missing
+server features with real runtime semantics, remove the terminal REPL, then
+self-review and merge PR #2427.
+
+The upstream baseline is pinned in `vendor/llama-chat/UPSTREAM`. A matching route
+name or a successful empty response is not an implemented capability.
+
+## Integration decision
+
+The user authorized merging the validated compatibility implementation on
+2026-11-22, with llguidance/tokenizers upgraded to current stable releases.
+Unchecked rows below remain follow-up compatibility work; earlier draft/merge
+notes record milestone status at the time and are not the current merge gate.
+The supported surface and explicit limitations are documented in
+[`LLAMA_CPP_COMPATIBILITY.md`](LLAMA_CPP_COMPATIBILITY.md).
+
+## Delivery order and acceptance
+
+- [x] Embed Llama Chat, package provenance and licenses, remove REPL and dependencies.
+- [x] Discovery, model properties/management, tokenizer and chat-template endpoints.
+- [x] Preserve the noninteractive generation/transcription/profiling commands.
+- [x] Create working branch and draft PR; incorporate current main before further work.
+- [ ] Resumable SSE: byte-exact replay, explicit cancellation, replacement, bounded history, expiry, frontend refresh/reconnect; finish destructive native-cache rollback audit.
+- [ ] Native completion/embedding/infill protocols and native request parameters.
+- [x] Token-counting protocols using the inference preparation path, including declared media.
+- [ ] Responses and Anthropic Messages, including tools and streamed event contracts.
+- [ ] Generation controls/sampling and reporting needed by the upstream frontend.
+- [ ] Capability-backed ranking, adapter and slot/state operations; audit the engine boundary before introducing transport support.
+- [ ] Optional tools/MCP proxy, model catalogue/download semantics and audio transports; preserve explicit configuration and resource bounds.
+- [ ] Full compatibility matrix and executable conformance tests.
+- [ ] Fresh full checks, adversarial self-review, PR description update, CI and merge.
+
+## Design constraints
+
+Every wire protocol lowers into the existing admitted model/driver transaction.
+The compatibility layer does not choose model architecture or execution providers.
+Replay is a transport concern and owns retained response bytes, not inference
+state. State export and LoRA/ranking require declared engine capabilities, not
+synthetic slots or embedding similarities presented as cross-encoder scores.
+
+All substantial local builds/tests/inference share the stable Darwin host lock
+with the performance-research session. These are functional tests and carry no
+performance claims.
+
+## Protocol milestone
+
+The implementation now includes bounded resumable SSE (byte offsets, replacement,
+explicit cancellation, reader admission and completed-history cleanup), native
+completion/infill/pooled embedding adapters, text input-token counting, and
+buffered/streamed Responses and Anthropic Messages adapters. These all execute
+through the admitted engine driver. A real tiny-model HTTP test covers both
+alternate protocols and their streamed usage; synthetic stream tests pin reasoning,
+tool indices and incomplete-stream rejection.
+
+This milestone does not check off the remaining rows above: native prefill-only,
+timing/progress, additional
+sampling and runtime-backed state/adapter work still need completion.
+
+Sampling follow-up: `logit_bias` now lowers OpenAI objects and native token/text
+pairs into one typed engine processor, including explicit bans. Token vocabulary
+validation is shared by the server and engine. Real tiny-model generation and
+engine processor tests pass, including the greedy/device-shortcut guard.
+
+Latest verified checkpoint: server library 375 passed / 2 inherited ignores,
+4 protocol-history tests, real logit-bias HTTP and engine tests, 6 DRY engine
+tests, and the multi-token DRY request mapping test pass. Strict server all-target
+Clippy passes. The real Chrome smoke now verifies chat, persisted conversation
+and byte-identical replay after reload, with no browser errors. CLI library tests:
+71 passed. Vendored asset and documented environment-variable checks pass.
+No merge has been performed.
+
+Speech follow-up: native `/tts` now lowers input/prompt into the existing declared
+speech workflow and returns real PCM WAV. Explicit raw prompts bypass text
+assembly while retaining resource limits. Unsupported voice and synthesis fields
+are rejected, including on the OpenAI speech API. All 13 selected speech tests
+pass, including actual native synthesis; strict server all-target Clippy passes.
+
+Media-counting follow-up: buffered/streamed chat and all token counters now use
+one input-preparation path, including tool admission and declared media expansion.
+The fallback prompt formatter and `/apply-template` preserve image placeholders
+for packages without a chat template. An executable hermetic VLM HTTP test proves
+that Chat, Responses and Anthropic media counts equal real generation usage;
+the OpenAI count routes also return the required response.input_tokens object.
+Full server validation: 369 passed, 2 inherited ignores; strict all-target
+Clippy passes.
+
+Tokenizer/error follow-up: native parse_special=false now treats registered
+special-token spellings as ordinary text, independently of BOS/EOS insertion,
+without mutating shared tokenizer state. Core library and real HTTP tests pass.
+Explicit API errors now carry numeric HTTP code and native request/not-found/
+permission classifications. Messages errors include the Anthropic envelope even
+for JSON extraction failures, retain retry headers, and late SSE errors preserve
+the original status/category across adapters. Full server: 375 passed, 2 inherited
+ignores; strict all-target Clippy passes. Active-generation browser reconnect
+is now verified by the browser milestone below.
+
+Byte-piece follow-up: native with_pieces now preserves incomplete UTF-8 using
+byte arrays. The existing byte vocabulary adapter is invoked once per requested
+batch and special framing is removed only when it matches marker+spelling;
+literal 0xff remains intact. ByteFallback and ByteLevel engine tests, special-token
+framing, invalid-id checks and an HTTP Unicode round-trip pass. Strict server
+all-target Clippy passes.
+
+Reranking follow-up: `/rerank`, `/reranking` and both `/v1` aliases now use a
+metadata-declared token-pair workflow with the package tokenizer's paired IDs,
+attention mask and segment IDs. Jina/TEI shapes, stable ordering, top_n, exact
+non-padding token usage and positive document/token budgets are covered by real
+ONNX HTTP tests. An actual raw-logit workflow is rejected with repair guidance;
+no embedding similarity is substituted for cross-encoder scores. Metadata guards
+cover ambiguous/unsupported profiles, vector scores and mismatched fixed inputs.
+Adapter and slot/state work in the shared delivery row remains outstanding.
+
+Reranking checkpoint: full server library 379 passed / 2 inherited ignores;
+metadata library 76 passed; both real engine ranking tests passed, including
+invalid score rejection. Strict server all-target Clippy and pinned asset checks
+pass. PR remains draft while the remaining compatibility work continues.
+
+Native-input follow-up: `/tokenize` and native completions share mixed text/token
+encoding with the pinned first-segment special-token policy and token vocabulary
+validation. Native completion batches are bounded, fully validated before any
+inference and executed sequentially through normal admission. Buffered arrays and
+SSE retain input indices; a disconnect or failed stream never submits later
+prompts. Native streaming now uses the tokenizer's incremental decoder and checks
+its published prefix against the final result, fixing missing word separators.
+HTTP tests compare mixed and explicit-token inference and buffered/streamed batch
+text; lifecycle tests exercise explicit completion, failure and disconnect.
+
+Native-input validation: full server library 384 passed / 2 inherited ignores,
+then all 24 selected native tests passed after the final stop-text and UTF-8
+regressions; strict all-target Clippy passes. The complete metadata test suite,
+including integration tests and the exhaustive workflow matrix, passes. The CI
+classification omission from the ranking fixture is fixed in the same branch.
+
+Engine-text follow-up: the shared token commit path retains request-local
+incremental decoder state through ordinary, scheduled and speculative generation.
+Stop processors now see sequence text with real word separators, and a real
+HTTP regression verifies a multi-token text stop terminates at token two.
+Post-commit callback publication uses one text-batch decoder across the engine,
+workflow replay, candidate-tree and DFlash paths. Staged batches preserve the
+exact full decode even when malformed final bytes revise a prefix; live output
+reports an actionable non-monotonic-decoder error instead of retracting bytes.
+Native transport consumes those canonical text events without decoding again.
+The full engine library passed 611 tests, with one existing external FIM-model
+ignore. OpenAI chat/completion HTTP tests compare streamed and buffered text,
+including tokenizer-inserted spaces. Legacy OpenAI completion generation controls, default-model behavior and prompt
+batching are covered below.
+
+Engine-text checks: strict engine/server all-target Clippy, all 71 CLI library
+tests and the 291-asset provenance check pass. The server regression run covered
+the complete library; its new fixture-specific output assertion was corrected
+to compare actual buffered/streamed results and then passed independently.
+
+Legacy-completion follow-up: `/v1/completions` now lowers its wire-only prompt,
+suffix and integer logprobs into the common chat/native generation parameters.
+It no longer drops seed, logit_bias or other sampling fields. Default-model
+resolution, output/context admission, model defaults, stop visibility and opt-in
+streamed usage share the existing implementations. Unsupported controls fail
+explicitly, and wrapper deserialization preserves parameter paths in errors.
+Real ONNX HTTP tests force a non-default token with bias, verify exact buffered/
+streamed usage and text, terminate on a declared stop with max_tokens=-1, and
+exercise malformed and unknown fields. Full server: 388 passed / 2 inherited
+ignores; all 27 native/alternate protocol tests and strict all-target Clippy pass
+after the error-path and source-order lint fixes.
+
+OpenAI batching follow-up: `/v1/completions` accepts text, token rows, mixed
+rows, text prompt objects and outer prompt batches using the same classifier
+and insertion policy as native completions. One immutable sampling object is
+shared across batch inputs. All prompts and output budgets are prepared before
+model work, with the common positive prompt-count bound. Buffered responses
+combine indexed choices and true summed usage; SSE retains one ID, indexed
+choice finishes, one aggregate usage frame and one DONE terminator. Explicit
+conversation headers are refused for multi-prompt requests. Delivery failures,
+truncated sources and disconnects never manufacture completed usage; a failed
+input aborts subsequent submissions. Canonical text chunks now also back the
+legacy/chat probability stream content, fixing tokenizer separator loss there.
+Real ONNX batch tests cover all input shapes with/without logprobs, exact totals,
+indices, pre-header validation and single-prompt conversation constraints.
+
+Batch ownership checks: native batches now retain one resolved model handle
+through all preparation and execution, so concurrent admin reloads cannot mix
+tokenizer/model versions inside a request. Multi-prompt legacy workflow-output
+extras carry prompt_index around the unchanged runtime publication, preserving
+input ownership in both buffered JSON and SSE. Single-input records keep their
+existing shape.
+
+OpenAI-batch validation: full server library 392 passed / 2 inherited ignores.
+After the final model-snapshot and publication-ownership checks, all 29 selected
+native/alternate-protocol tests and strict all-target Clippy pass.
+
+Active-browser milestone: the real Chrome smoke now covers an initial reader
+disconnection followed by automatic replay from a nonzero byte offset, then
+a page reload while the same server producer remains active. A temporary,
+bounded extension of the tiny fixture's position table permits real 16,384-token
+ONNX generation without changing runtime behavior or delaying the network.
+The frontend makes exactly one generation POST, automatically issues two replay
+requests, renders the complete retained answer and reports no runtime errors.
+The final script passed, including subprocess/proxy/fixture cleanup. Existing
+HTTP/unit checks cover byte boundaries, reader admission, replacement, history
+limits and expiry.
+
+Cancellation audit found a receiver-closure probe attached only to specialized
+speculative paths. DELETE initially cancelled transport retention without proof
+of mid-compute termination. The decoder and browser milestone below resolves
+that gap; transport cancellation alone was not counted as completed delivery.
+
+Generic-workflow cancellation: the engine accepts GenerationControl for declared
+workflow execution, checks it before each authored node and resolves the atomic
+commit race before semantic publication. A forwarding host preserves the original
+node executor, tool observer and provisional output transport; cancellation uses
+the existing transaction abort path. Specialized drivers retain their own control
+authority rather than competing with a second commit owner. Tests cancel after
+two real hosted loop iterations, retract a prior provisional revision, cover both
+commit-race outcomes, and preserve a previously committed session value/version.
+This generic-workflow checkpoint preceded the fused decoder propagation and
+server wiring verified below.
+
+Generic-cancellation validation: full engine library 613 passed / 1 inherited
+ignore; full server library 392 passed / 2 inherited ignores. Final focused
+checks selected and passed both cancellation tests plus the session-baseline
+regression. Strict all-target Clippy passes for both engine and server.
+
+Decoder-cancellation milestone: one driver receiver-closure authority now reaches
+generic, ORT and native requests, including cold/session generation. Ordinary
+node hosts observe it between authored nodes and after decoder forwards; the
+outer decoder participant retains the semantic commit race and baseline rollback.
+Speculative blocks observe the same authority without installing a transport
+callback or changing token publication. Native accepted-token staging also checks
+cancellation. The obsolete unsupported-control type and specialized-only server
+gate are removed. Real ORT and native CPU tests cancel after the second forward,
+publish no provisional tokens, restore a warm session, release the scheduler and
+retry with the same result as an independent engine.
+
+The real Chrome smoke now additionally clicks Stop while a real worker owns a
+long generation, observes DELETE /v1/stream returning 204, waits for active_turns
+to reach zero and verifies the cancelled replay returns 404. Basic chat, completed
+byte replay, injected reader disconnect, active reload, exact final token count
+and zero browser errors all pass with the same built server. The full resumable
+SSE transport/browser checks pass; the destructive native-cache rollback audit
+below still gates the complete row. Remaining compatibility rows and PR merge stay open.
+
+Decoder validation: full engine library 614 passed / 1 inherited ignore; native
+feature set 787 passed / 1 inherited ignore. The final focused run selects and
+passes three tests covering warm ORT/native sessions, cold native generation and
+native prompt lookup. Full server library 392 passed / 2 inherited ignores;
+strict server and native-enabled engine all-target Clippy pass.
+
+Commit-boundary self-review: native session generation published its logical
+token history and LRU stamp before staged-output validation and the cancellation
+commit gate. A new regression reproduced a cancelled warm session growing from
+2 to 5 tokens. Logical history is now published only after validation and the
+commit race succeed; retention eviction follows transaction commit. The ORT and
+native regressions now cover both cancellation after two forwards and cancellation
+at BeforeSemanticCommit, including exact token-history/access-stamp preservation
+and scheduler release.
+
+Before closing cancellation, audit physical KV restoration when a native request
+replaces or rewinds an existing prompt, rather than appending to its cached
+prefix. The tiny native fixture has constant logits, so matching retry token IDs
+alone cannot prove that old KV bytes were restored. Add a content-dependent state
+oracle and verify the backend checkpoint/rollback boundary directly. Native
+prefill-only support must use that same trustworthy state boundary; n_predict=0
+must evaluate the prompt without sampling, not merely return an empty success.
+
+Commit-boundary validation: the new native case failed before the fix (5 retained
+tokens versus the committed 2), then all three selected cancellation tests passed
+with both boundary cases. Full native-enabled engine library: 788 passed / 1
+inherited ignore. Strict native-enabled engine all-target Clippy passes.
+
+Physical-KV audit: a content-dependent ONNX cache fixture reproduced silent
+corruption after cancelled prompt replacement: the restored length was correct,
+but KV value 0.0 had become 1.0. Rollback now distinguishes an unchanged prefix
+from a destructive overwrite/reset. Host-owned state takes a complete tensor and
+hidden-conditioning snapshot, with an explicit governor lease reserved before
+copying. Abort consumes the snapshot without allocating another copy. Tests
+compare exact KV values/shapes and verify append requests avoid full copies,
+snapshot bytes are charged, and transaction resolution releases the reservation.
+
+Named native conversations on in-place/device/compressed backends without a
+complete checkpoint now refuse destructive replacement before mutation with a
+typed 409. Stateless requests hold only a discardable implementation cache and
+continue to accept replacement. The old rollback-poison regression is retained
+on the prefix-preserving append path, where rewind is still the correct rollback
+primitive. Complete state snapshots for the remaining backends and prefill-only
+execution, remain required work; this does not close the cancellation row.
+
+Physical-KV checkpoint validation: the content-dependent test failed before the
+fix (1.0 instead of the committed 0.0), then passed with complete snapshots.
+Full native-enabled engine library: 790 passed / 1 inherited ignore. Final
+focused runs selected and passed exact KV/resource restoration, in-place refusal
+plus stateless replacement, and rollback-failure poisoning. The typed server
+409 mapping test passes; strict native engine and server all-target Clippy pass.
+
+In-place CPU checkpoint milestone: complete native snapshots now retain live
+rows from the persistent GQA bindings, in addition to host tensors and hidden
+conditioning. Per-binding geometry and dtype come from the actual binding;
+snapshot size excludes unused capacity. Restore preflights every port, dtype,
+non-sequence axis and row length before writing, and maps each batch/head block
+onto the current physical capacity, including after cache growth. Native engine
+tests now exercise successful named-conversation replacement and cancellation
+with exact CPU KV snapshot comparison. Stateless replacement remains supported.
+Separate multi-head/multi-binding tests overwrite and grow the destination before
+restoring, and prove a later incompatible binding cannot partially overwrite an
+earlier valid one. Full native engine library: 792 passed / 1 inherited ignore;
+strict native engine and server all-target Clippy pass. Device and compressed
+state checkpoints and the broader compatibility rows remain unfinished.
+
+Compressed host-state milestone: complete checkpoints now retain compressed
+records, record cursors and unfinished ratio-4/ratio-128 carries at the saved
+boundary. Direct ONNX tests reset/overwrite the model, restore both borrowed and
+owned snapshots, compare every state shape/dtype/byte, and compare subsequent
+calculation with an untouched instance. A real Engine test cancels an edited,
+partially shared prompt before semantic commit, restores all compressed state,
+publishes no tokens, retries successfully and exercises stateless replacement.
+Non-sliceable state is reset/re-evaluated for edited prefixes rather than treated
+as a token-sliceable cache. Prefix snapshots and stateless cache reuse honor the
+canonical prefix_reusable policy; complete transaction recovery does not grant
+shared-prefix reuse.
+
+The Engine test exposed a loader refusal that treated seven growing state ports
+as ordinary key/value pairs. The shared paged bridge now resolves canonical
+role/layer identities, retaining all other ports for the decoder while selecting
+only its actual key/value pairs. Port order is irrelevant, and a uniquely
+identified unindexed pair needs no invented layer number. The explicit flat ABI
+keeps its existing pairing validation when no canonical groups are present.
+Tests cover shuffled declarations, unindexed pairs and missing-role refusal.
+Full native engine: 795 passed / 1 inherited ignore; full server: 392 passed /
+2 inherited ignores. The final canonical-role regression and strict native
+engine/server all-target Clippy pass. Device-resident complete checkpoints and
+the remaining compatibility features, conformance, review and merge remain open.
+
+Dynamic-temperature follow-up: `dynatemp_range` and `dynatemp_exponent` now lower
+into a typed entropy-temperature processor instead of accepting only neutral
+values. The interval and exponent formula follows the pinned upstream
+[`llama_sampler_temp_ext_apply`](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-sampler.cpp).
+The processor occupies nxrt's existing temperature stage; custom sampler order
+remains outstanding. Zero range disables adaptation, zero temperature retains
+greedy mode, and non-finite/negative controls fail with their field names.
+A distinct processor capability prevents the fixed device sampler from silently
+substituting a constant temperature. Authored sampler graphs without a matching
+input contract refuse active dynamic temperature before admission through a typed
+400 package-capability error. Formula, point-mass, custom/greedy chain, model
+sampling-default and actual seeded HTTP endpoint-equivalence tests accompany the
+change, including a fixed-base control that must produce different tokens.
+
+Dynamic-temperature validation after integrating main through #2430: full native
+engine library 799 passed / 1 inherited ignore; the authored-sampler refusal
+integration filter selected and passed one test; full server library 394 passed /
+2 inherited ignores. Strict all-target engine/server Clippy and the native
+benchmark library/profiling-bin Clippy pass. The seeded HTTP test also proves
+that disabling adaptation changes the fixture's output, so an ignored control
+cannot satisfy endpoint equivalence. PR remains draft while the other ledger
+items are implemented.
+
+Prompt-only milestone: native `n_predict=0` / `max_tokens=0` now lowers to an
+independent engine PrefillRequest rather than a zero-iteration generation loop
+or a sampled throwaway token. Both native and ORT perform a real decoder forward,
+share ordinary driver/worker admission and atomic cancellation, and publish no
+output token. A prompt-only scheduler reservation does not demand space for an
+extra output token. The structural admission requires an isolated runtime-owned
+decoder/policy/emit loop without authored setup or effects; other packages must
+export a prefill operation rather than have their workflow silently skipped.
+
+The real cache test exposed reporting-only ORT cross-request reuse: the old
+token-prefix vector remembered token matches after its runner was destroyed. It
+is removed. Portable runners now export compact, byte-exact KV snapshots into
+the shared prefix trie, with explicit host-memory leases for retained and staging
+bytes. A new request imports that state and reports only the materialized prefix;
+unsupported or memory-constrained restores perform full evaluation and report
+zero reuse. Snapshot byte slicing follows tensor strides and element sizes, not
+model identities or fixed attention geometry.
+
+Prefill reuse also honors every declared decoder state group's prefix policy;
+`prefix_reusable=false` never publishes or loads a cross-request snapshot.
+Restoring a cached prefix requires its actual physical runner state to be
+installed before the hit count is returned; the regression inspects those
+restored bytes against the saved state. Raw KV clone/prefix extraction preserves
+element bytes (including non-contiguous heads and multiple element types).
+
+The zero-output operation is currently exposed by the native completion/infill
+adapter. OpenAI-compatible zero-budget request behavior still needs a separate
+contract audit; positive-output GenerateOptions retain their existing invariant.
+Composite workflow prefill, native media/infill extras, timing/progress, custom
+sampler order, device checkpoint/state/adapter operations and the other unchecked
+rows remain open. This milestone does not complete the overall goal or authorize
+marking the draft PR merged before those delivery requirements are satisfied.
+
+Prompt-only validation: full native engine library 805 passed / 1 inherited ignore
+and full server library 395 passed / 2 inherited ignores. Final focused checks
+selected and passed all 7 prefill engine tests after physical-byte and cold-start
+counter refinements, plus the real native HTTP batch/SSE/context-limit regression.
+The authored-workflow refusal integration test selected and passed one test.
+Scheduler validation passed all 72 unit and 15 pressure-conformance tests. Both
+portable KV byte/invalid-shape tests pass. Strict engine/server/ORT/scheduler
+all-target Clippy passes; git diff whitespace checks pass. These are functional
+checks, with no performance claims.
+
+Ordered-sampling milestone: `samplers` now has a bounded typed sequence shared
+by native, legacy OpenAI completion and chat requests. Defaults use upstream
+penalties/DRY/sigma/K/typical/P/min-p/XTC/temperature ordering, with the nxrt top-A
+extension between min-p and XTC. Omissions, empty lists, repetition and upstream
+name aliases are executable behavior. Mandatory bias/grammar/stops remain outside
+the optional list. Mirostat selects its separate temperature/selector mode.
+Top-n-sigma now performs a real finite-logit population-deviation mask.
+
+Device dispatch no longer trusts processor names: a cached typed transform proof
+checks both parameter values and equivalent operation order. Adjacent active
+top-k/top-p still fuse; fixed-order sampled transforms and rank-preserving
+zero-temperature argmax paths remain eligible. A renamed or foreign processor
+cannot obtain a shortcut through its diagnostic name. Dynamic temperature tracks
+logical candidate counts across truncations, mask-only sigma and XTC removal.
+Package capability errors for custom order, sigma and dynamic temperature share
+one typed runtime-sampling refusal. Properties advertise only actual executors.
+
+The real HTTP regression swaps penalties and temperature and proves different
+expected tokens through all three generation protocols. It also demonstrates
+that a temperature omitted from an empty stage list does not force greedy output.
+Further sampler conformance work remains, including top-k tie cardinality and
+infill selectors; the broad generation-control ledger row stays open.
+
+Ordered-sampling validation: the full native engine library passed 814 cases
+with 1 inherited ignore; final refinements passed all 16 selected sampler cases.
+The full server library passed 396 cases with 2 inherited ignores. Both selected
+authored-sampler integration cases and the actual HTTP ordering/sigma/empty-list
+regression passed. Strict native engine and server all-target Clippy passed.
+The official frontend passed real Chrome chat and persistence, automatic
+nonzero-offset replay and active refresh during a 16,384-token ONNX generation
+(one generation POST, two replay requests), and explicit Stop with worker release
+and cancelled replay returning 404. No browser errors were reported.
+Strict non-native engine all-target Clippy also passes after gating the
+native/test-only prefix helper import.
+
+Top-k cardinality follow-up: the ordinary and fused processors share an exactly-k
+boundary with a remaining tie quota. The small-k heap retains its bounded
+allocation; large-k partitioning derives the quota from its partition. CUDA
+uses the same candidate cap, with a token-order tie pass only when the threshold
+would exceed k. Stable token-ID ordering makes host/fused/device choices agree;
+upstream's partial sort does not promise an ordering among equal logits.
+Regression coverage includes heap/partition sizes, high-ranked tokens following
+tied entries, NaN, signed zero, infinity, fusion equivalence, the device algorithm
+CPU oracle and real ONNX HTTP generation with deliberately equal finite logits.
+Infill selectors and the other unchecked generation controls remain open.
+
+The strict tie cap also exposes why temperature cannot commute across top-k in
+f32: two distinct logits can round to equal scaled values, changing which token
+survives. Transform proofs now retain exact stage order. The fixed-order device
+path remains available; a reversed order uses the host rather than changing the
+requested distribution. A regression proves the distinct winners on underflow.
+Remaining sampler conformance includes device top-p boundary ties in addition to
+infill selectors. Missing CUDA driver/NVRTC libraries now return a
+capability error before cudarc's dynamic-entry panic path.
+
+Device temperature now divides logits directly, matching the host instead of
+forming a reciprocal that can overflow for a finite subnormal temperature.
+CUDA library presence is checked before dynamic calls; missing driver/compiler
+errors identify the device, missing library and remediation. This macOS host
+executes the CPU differential tests and CUDA-feature Rust checks; it cannot prove
+execution of the changed CUDA kernel on actual GPU hardware.
+
+Top-k validation: full native engine library 817 passed / 1 inherited ignore.
+All 8 selected top-k engine tests and the real HTTP equal-logit generation test
+passed. Four selected CUDA-feature ORT cases passed: strict top-k CPU differential,
+broad device-algorithm CPU sweep, subnormal-temperature division, and actionable
+missing-library errors. Actual GPU subcases were unavailable on this host.
+Strict native-engine all-target Clippy passes.
+Strict CUDA-feature ORT and server all-target Clippy also pass. CUDA top-k
+candidate counts use integer reductions, avoiding float rounding in large
+vocabularies; actual GPU execution remains a separate hardware validation gate.
+
+Shared-penalty milestone: one `PenaltiesProcessor` replaces three independent
+processors and counts the same prompt-plus-generated suffix once. Repetition
+rescales each seen logit once, then count-weighted frequency plus presence is
+subtracted in one expression, matching upstream. `GenerateOptions.penalty_window`
+now names the scope of all three controls; internal callers and benchmarks use
+the new processor directly, with no aliases for our pre-release symbols.
+
+The server parses `repeat_last_n` as a typed common request field, defaults it
+to upstream's 64, and advertises that default in properties. Minus one selects
+full history, zero disables every penalty, and invalid negative/host-oversized
+counts fail with an actionable error. Disabled penalties preserve the device
+argmax path. Unit regressions cover cross-boundary prompt/generated windows,
+positive and negative coefficients, neutral/zero windows and combined rounding;
+the HTTP regression exercises first-token prompt counts through all three APIs.
+
+Shared-penalty validation: full native engine 818 passed / 1 inherited ignore;
+the final focused check selected and passed 12 penalty-related cases including
+the added zero-window device path and joint-subtraction rounding guard. Full
+server library 398 passed / 2 inherited ignores, including the real three-protocol
+prompt-count/window regression. Strict engine and server all-target Clippy pass.
+The updated benchmark library and native profiling binary also pass strict
+Clippy with the native backend enabled.
+
+Adaptive-p milestone: `adaptive_p` is an explicit terminal selector, appended
+once after optional stages even if repeated or listed first. The upstream
+quadratic/linear probability transform uses the adapted target and maintains
+a weighted EMA of original selected probabilities. Defaults are target -1
+(disabled) and decay 0.9; valid targets are negative or [0,1], valid decay is
+[0,0.99]. Parameters alone do not activate a selector omitted from `samplers`.
+Mirostat's separate mode still takes precedence. Native, legacy and chat lower
+the same typed configuration and properties advertise the neutral defaults.
+
+The shared processor API now returns Results and records selected-token
+feedback before a token can be committed. Ordinary, continuous-batch, draft and
+speculative target paths propagate those failures. Adaptive-p checkpoints the
+EMA before each staged choice, so reprocessing an accepted prefix rolls back
+discarded branches. Histories containing unobserved choices fail explicitly;
+normalization and poisoned-state errors retain stage/offset/remediation. A
+cached feedback capability prevents device bypass even for processors that
+otherwise preserve argmax. Stateless chains skip feedback dispatch entirely.
+Public processor callers and benchmark targets handle the new Result contract;
+benchmark top-k reference selection also uses the exact candidate cap.
+
+The ORT prompt-lookup regression executes real proposal rejection and verifies
+exact output against ordinary adaptive-enabled selection. Native's current
+speculative driver only supports empty processor chains and raw greedy choices;
+stateful requests therefore use the ordinary native sampler. Its regression
+requires the adaptive selector to choose a low-original-probability token for
+eight steps and verifies identical results when prompt lookup is requested,
+with no speculative proposals reported. This preserves the existing executor
+capability boundary rather than claiming native stateful speculation is present.
+
+Adaptive-p validation: full native engine library 825 passed / 1 inherited
+ignore; all 4 selected adaptive cases passed after final numerical/decay and
+same-length-history-integrity refinements. ORT speculative rejection and native
+ordinary-path capability integration each selected and passed one real test.
+Full server library 399 passed / 2 inherited ignores, including native/legacy/chat
+four-token selection, negative/omitted-selector behavior, invalid parameter
+rejection and real sampling-stage failure propagation without a fabricated token.
+Strict engine/server all-target Clippy and native benchmark library/profiling/
+no-model benchmark Clippy pass. Other unchecked delivery requirements remain open.
+
+Infill-selector milestone: the explicitly ordered `infill` stage implements the
+upstream ending-mass check, probability-rank prefix merging, two retention
+thresholds and preferred forced ending. It reuses lossless tokenizer byte pieces,
+including non-UTF-8 fragments, and excludes tokenizer-declared special pieces from prefix merging. A numeric
+ending role alone never changes an ordinary token's byte piece. Immutable lexical prefix ranges are shared across repeated
+stages; a live rank-minimum index visits only prefix-related active candidates.
+Every merge removes one candidate, bounding merging to O(V log V) rather than
+copying upstream's O(V²) nested scan into a public endpoint. A literal small-input
+reference checks rank-order equivalence, ties and byte fragments.
+
+Identity-sensitive chains now carry the actual logical candidate ids in addition
+to cardinality. Top-k/fused-k/p/probability truncations and XTC describe their
+retention; mask-only stages preserve slots. Dynamic temperature after infill
+therefore sees the correct denominator, including retained masked EOS records.
+An extension that changes cardinality without an identity contract fails clearly.
+Chains without such a stage retain their prior count-only/stateless execution.
+
+Package token facts optionally declare `eot_token_id`, constrained to the
+existing EOS set. One validated end-token policy flows through ordinary and
+continuous/static batch paths; explicit EOS overrides remain authoritative.
+The fallback can restore a role excluded by an optional sampler, while the
+input/model and mandatory bias/grammar masks remain binding. Unavailable endings, byte codecs
+and vocabulary inconsistencies report actionable failures. Schema and token
+authority documentation describe the new optional role. Integrated main #2431.
+
+Preferred-ending facts introduce schema v1.9. Both untyped parser presence checks
+and typed metadata validation use the same minimum-version gate; older versions
+remain accepted without the new role. Future-version refusal tests now use v1.10,
+and v1.8 compressed-state documents retain their existing minimum version.
+The true HTTP package declares its publication mode and materialized output
+family when exercising the preferred EOT role, instead of relabeling a legacy
+document with a newer version while omitting its required contracts.
+
+Metaspace byte pieces retain their initial whitespace independently of full-text
+first-token decoding. Decoder normalization is local to piece extraction and
+never mutates the shared tokenizer; registered special spellings remain literal.
+The regression distinguishes space-prefixed and ordinary vocabulary pieces.
+
+Infill validation: full metadata tests passed; full native engine library
+834 passed / 1 inherited ignore, and full server library 400 passed / 2 inherited
+ignores. The HTTP case covers native/legacy/chat endings, real byte-prefix
+selection and a package-declared preferred EOT fallback. After the final
+Metaspace correction, all 3 selected tokenization and 7 selected infill cases
+passed. Strict metadata, engine and server all-target Clippy and native benchmark
+library/profiling/no-model benchmark Clippy passed. These are functional checks
+on this macOS ARM64 host; remaining delivery rows above remain open.
+
+Content-continuation follow-up: official Llama Chat's explicit boolean continuation
+request now retains the final assistant prefix instead of opening a new message.
+A differential template render proves its position and rejects dropped,
+duplicated or transformed final content; the built-in formatter preserves the
+same original prefix bytes. Template rendering, count routes and real buffered/
+streamed generation use this shared preparation. Empty/reasoning-only prefixes,
+assistant tool calls and persistent-session replay retain explicit refusals;
+reasoning-parser resumption, string continuation modes and upstream's implicit
+prefill heuristic remain open work rather than an advertised completed row.
+Constrained JSON continuation is also refused until grammar admission consumes
+the existing assistant prefix; starting a fresh JSON grammar for a partial object
+would accept the request while generating the wrong language.
+The behavior is checked against the pinned upstream server's
+`common/chat.cpp` continuation admission and
+`common/chat-auto-parser-generator.cpp` generation-prefix assembly, together with
+Llama Chat's `chat.service.ts` continuation request. Unlike an EOS-name heuristic,
+our renderer verifies the loaded template's actual content boundary.
+
+Continuation validation: 2 selected continuation cases passed, followed by the
+complete server library (402 passed / 2 inherited ignores) and strict server
+all-target Clippy on the final tree. Tests cover exact template/fallback framing,
+Unicode and original whitespace, earlier matching text, dropped/duplicated/
+transformed content, shared count/generation preparation, buffered and SSE HTTP,
+and actionable refusal of conflicting flags, tool-call/reasoning-only prefixes,
+JSON grammar without prefix state, and persistent-session replay.
+
+JSON-prefix follow-up: the typed `GenerateConstraint::Json` now owns its existing
+text prefix. The shared JSON recognizer consumes that prefix plus the generated
+suffix, while response bytes and usage remain suffix-only. The same joined text
+controls EOS masks, stop-sequence completion and output-budget validation.
+Non-continuation callers explicitly construct an empty prefix; all internal and
+HTTP integration callers are updated without retaining the old unit variant.
+Invalid prefixes fail before HTTP inference admission and at engine constraint
+construction. JSON Schema still needs its own llguidance prefix-state contract.
+
+JSON-prefix validation: both selected engine continuation cases passed; all four
+selected server continuation cases passed, including real buffered/SSE suffix-only
+generation and a forbidden premature EOS with stronger bias than the valid token.
+Full native engine library: 837 passed / 1 inherited ignore. Full server library:
+403 passed / 2 inherited ignores. Strict engine/server all-target Clippy passed,
+including compilation of the updated public HTTP request-mapping tests.
+
+Schema-prefix milestone: `GenerateConstraint::JsonSchema` now owns its serialized
+schema and existing text prefix. Prefilled requests build a lossless byte
+vocabulary, frame tokenizer-declared special tokens and every declared ending,
+and consume the prefix into llguidance before the first model sample. Prefix
+bytes are grammar-only cells of at most 256 bytes, bounding additional trie depth
+independently of request length; UTF-8 scalars may span cells. These ids are outside
+the model vocabulary and are absent from sampling candidates, response bytes and
+usage. No codec fallback silently replaces incomplete bytes with decoded text.
+
+The JSON Schema compiler enters at the value rather than its optional RFC 8259
+leading whitespace. That whitespace stays in the prompt; only the recognizer's
+entry skips those four ASCII whitespace characters. Interior bytes stay exact.
+A vocabulary with no declared EOS receives a recognizer-only ending rather than
+silently assigning ordinary token 0 that role. Multiple real endings use the
+trie's EOS set. Prefix rejection carries `ConstraintPrefixError` through the
+worker boundary to HTTP 400, without classifying error text or converting runtime
+failures into request errors. Internal/public HTTP callers use the new schema
+variant without keeping a pre-release API alias. Reasoning continuation remains
+open work.
+
+The recognizer stores the sampled-vocabulary bound separately from its internal
+prefix cells, so a padded model logit tensor cannot expose a prefix cell as a real
+token. The regression deliberately includes that out-of-vocabulary candidate
+when an integer prefix could otherwise accept its bytes as another digit.
+Underlying parser errors remain typed sources inside `ConstraintPrefixError`;
+the worker's 400 classification retains the detailed cause and actionable repair.
+
+Schema-prefix validation: all four new engine regressions passed in the full
+native engine suite (841 passed / 1 inherited ignore): exact prefix-byte/schema
+masks, long UTF-8 chunks without an assumed token-0 EOS, multiple endings with
+padded model candidates, and an unsupported trie vocabulary returned as an error
+rather than a worker unwind. The real HTTP continuation case now covers both
+JSON object and JSON Schema suffix generation, streamed schema output, token
+usage and typed HTTP 400 refusal of an undeclared-property prefix. Full server:
+403 passed / 2 inherited ignores. Strict engine/server all-target Clippy passed
+on the final tree, including updated public HTTP integration callers.
+
+Continuation-intent milestone: a typed `ChatContinuation` replaces the old boolean
+field and accepts exactly the pinned upstream boolean/null/content/reasoning forms.
+Auto resolution gives existing answer content precedence over reasoning and tests
+message-part presence rather than flattening an empty text part into an absent
+message. Content-string requests execute the existing proven prompt path;
+reasoning intent receives an explicit capability refusal rather than a misleading
+JSON type error. Invalid values name accepted forms. The request's one validation
+method now serves HTTP extension admission, direct prompt rendering and both public
+Rust generation builders, so direct callers cannot silently generate under a
+rejected reasoning mode. The public field type and all internal callers change
+without a pre-release bool alias. Implicit prefill and reasoning parser resumption
+remain open work.
+
+Continuation-intent validation: all 7 selected continuation tests passed, including
+wire forms, field/part-aware auto resolution, the public Rust builder and real
+HTTP string-content count/generation/SSE paths. Full server library: 406 passed /
+2 inherited ignores. Strict server all-target Clippy passed on the final tree.
+
+Declared response parsing milestone: replaced the private-channel presence flag
+and hardcoded ATEM text filters with a compiled `response_template` descriptor.
+Chat and response contracts load from one strict tokenizer-configuration snapshot
+before starting workers. Literal and regex boundaries, last-turn anchoring,
+prefill state, split delimiters, repeated text fields, stripping and defaults
+follow the pinned
+[response-parsing specification](https://github.com/huggingface/transformers/blob/be48e7a0b63d2ff22ce1ebccbccbd0374c1592ef/docs/source/en/chat_response_parsing.md).
+The parser excludes original prefix bytes, withholds opaque structured fields,
+and fails explicitly on unsupported transforms, invalid declarations, buffer
+exhaustion or nonmonotonic streamed replacement. Structured-field projection into
+tool calls remains open; an XML tool declaration alone does not prove a chat
+recipient protocol.
+
+Buffered chat, live SSE and logprob SSE consume the same declared parser and the
+actual rendered text prefix. A canonical incremental decoder preserves protocol
+specials and split UTF-8. Declared chat templates own their special tokens, so
+encoding does not add a second tokenizer postprocessor BOS/EOS. Undeclared output
+remains ordinary text. Parser failures produce explicit SSE error events rather
+than a successful terminal chunk. The parser byte budget uses the configured
+per-response replay buffer limit. Reasoning continuation admission and lazy
+reasoning/JSON grammar activation still remain open requirements.
+
+JSON-failure truthfulness milestone: removed all three transport branches that
+converted an incomplete JSON generation error into `{}`, successful `stop` and
+zero generated tokens. Buffered and both stream paths now use ordinary typed
+failure propagation. Constraint processing refuses an all-masked/nonfinite
+candidate set before selection, with grammar name, generated offset and a repair
+for incompatible vocabulary or bans; greedy selection cannot fabricate token 0.
+
+The HTTP JSON success fixtures now explicitly declare an actual JSON token and
+a tokenizer-special EOS. They run real generation and assert nonzero completion
+usage in buffered and streamed responses. A separate original text-only fixture
+proves real buffered HTTP 500/SSE error envelopes, with no fabricated JSON delta.
+Native-enabled engine library: 842 passed / 1 inherited ignore. Full server:
+407 passed / 2 inherited ignores. Both selected public HTTP JSON integration cases
+passed, as did strict engine/server all-target Clippy. Parser-module work remains
+uncommitted until runtime wiring is finished. JSON-object budget-prefix/length
+parity remains open; removing a false success is not claimed to finish that item.
+
+Declared-parser validation: full server library 407 passed / 2 inherited ignores;
+the final prompt-special-token regression passed separately (1 selected), and
+all 12 response-template selections passed, including real generated buffered,
+SSE and logprob SSE output. Both new protocol-decoder tests passed. Strict
+engine/server all-target Clippy passed. These checks use the local ORT runtime;
+no performance claim is made. Reasoning continuation remains explicitly refused
+until its admission and prompt-boundary proof are implemented.
+
+JSON termination parity: removed completeness-only finish rejection from ordinary,
+continuous-batch, authored workflow, speculative and native speculative paths.
+The grammar owns legal token/EOS selection; explicit stops and output/context
+limits independently terminate generation, preserving actual partial text and
+true usage. The pinned upstream server applies these same independent stopping
+conditions in
+[`server-context.cpp`](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-context.cpp#L2107).
+No fallback success is synthesized for a genuine grammar failure.
+
+Stop filtering now precedes chat channel projection in buffered, live and logprob
+SSE output. A matched stop is a terminal buffer state, so later decoder bytes
+cannot reappear after it. A partial stop prefix flushes only when no match was
+completed. This also keeps reasoning-region stop strings out of the response and
+avoids treating text joined across separate channel regions as a raw stop.
+
+Termination validation: native-enabled engine library 843 passed / 1 inherited
+ignore; the final real JSON Object/Schema context-boundary test selected and
+passed 1 additional case, covering both full-context zero-token and one-token
+partial output. Final server library 410 passed / 2 inherited ignores, including
+real JSON Object/Schema buffered/SSE budget and explicit-stop continuations,
+reasoning-channel stops with and without logprobs, and every Unicode split of a
+terminal stop boundary. Strict native-engine and server all-target Clippy passed.
+JSON SSE now uses ordinary incremental delivery rather than collecting the whole
+value before sending content. Remaining delivery rows, including reasoning
+continuation and structured tool projection, stay open.
+
+Reasoning continuation now uses the declared response parser's actual prefill
+state. Request-shape validation selects and validates the final field; model-aware
+rendering proves its unique template position and verifies that the truncated
+prefix leaves that same parser channel open. This check also covers content
+continuations on packages with declared response templates. Direct model-free
+Rust builders refuse reasoning continuation with a missing-contract error.
+
+Explicit continuation suppresses `add_generation_prompt` regardless of the
+request's default/explicit true flag, matching pinned upstream
+[`common/chat.cpp`](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/chat.cpp#L1547).
+Reasoning prefix bytes are consumed without echo; ordinary, streamed and logprob
+output share the existing generated-only projection. A prefix that closes the
+selected channel is rejected before inference. Reasoning plus JSON/forced output
+grammars still requires a channel-aware grammar implementation; implicit prefill,
+structured tool projection and persistent-session continuation remain open work.
+
+Reasoning-continuation validation: all 9 selected continuation cases passed,
+including real ONNX explicit/auto reasoning prefixes, discarded pre-existing
+answer content, template/count/inference agreement, buffered/SSE/logprob suffix-only
+output, default-true generation-prompt suppression, closed-channel rejection,
+missing declarations and constrained-grammar refusal. Full server library:
+412 passed / 2 inherited ignores. Strict server all-target Clippy passed.
+The unchanged engine layer was not remeasured for this server-only milestone.
+
+Named-template milestone: one loader now owns template presence and asset
+selection. It accepts config strings, named objects and name/template lists, plus
+independent default and `chat_templates/*.jinja` files. Standalone asset sets take
+priority over config entries. The model-free directory API retains its documented
+built-in fallback; serving consumes explicit absence from the shared-snapshot
+loader instead of repeating filesystem/type presence checks.
+
+Base/tool selection follows the pinned
+[`common/chat.cpp`](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/chat.cpp#L1519)
+nonempty-tool policy and tool-only base fallback. Asset forms and independent-file
+priority follow the declared Hugging Face tokenizer format
+([pinned loader](https://github.com/huggingface/transformers/blob/be48e7a0b63d2ff22ce1ebccbccbd0374c1592ef/src/transformers/tokenization_utils_base.py#L1822)).
+Empty declarations remain absent; nonempty sets need a recognized default/tool-use
+base. Duplicate declarations and bad types fail with names and repair guidance;
+I/O failures retain their actual path and causal error. `/props` exposes the
+explicit tool-use source while existing protocol metadata remains authoritative
+for tool execution. Named-template presence does not invent a tool parser.
+
+Named-template validation: full ORT library 187 passed, full server 413 passed /
+2 inherited ignores and CLI library 71 passed. After the final empty-asset
+refinement, all 17 chat-template cases passed, including the new absence case.
+The real HTTP named-template case passed for config lists, maps and independent
+files, checking `/props`, exact rendered prompts, tokenizer counts, actual plain/
+tool generation and tool-call SSE (with true usage and no raw-tag content leak).
+Strict ORT/server/CLI all-target Clippy passed on the final source. No performance
+claim is made. Remaining delivery rows and PR merge remain open.
+
+Grammar-state prerequisite: constraint masks now return errors with their original
+cause and history position instead of converting backend failures into all-false
+masks. The processor checks exact mask dimensions before touching logits.
+llguidance tracks committed token IDs, replays replacement/rewound histories from
+the original prefilled parser snapshot, reuses valid masks (including terminal
+states), and resets after failed replay. Unsupported history splicing is rejected
+explicitly rather than silently losing forced tokens.
+
+Validation: full native engine 850 passed / 1 inherited ignore and full server
+413 passed / 2 inherited ignores. Subsequent terminal-query and UTF-8 refinements
+passed all 3 selected llguidance cases and both selected Lark suffix cases; these
+prove first-boundary behavior across a single token, split delimiters and raw
+split UTF-8 bytes after prefill. Processor error-cause and malformed-mask cases
+also passed. Strict native-engine/server all-target and benchmark Clippy passed.
+Criterion functional smoke selected and passed both the five-processor chain and
+the cached grammar mask using valid grammar history; no performance claim is made.
+Reasoning plus JSON is still refused: shared classifier/grammar lowering and
+special framing-token semantics remain necessary before enabling that feature.
+
+Ordinary-prefill projection now differs explicitly from continuation projection.
+Pinned upstream `common_chat_session` primes its emitted baseline only for an
+explicit continuation without echo. The response parser therefore takes a typed
+include/exclude policy: ordinary requests include declared assistant content and
+reasoning from the final anchored template region; continuations exclude existing
+bytes while retaining their parser state. Buffered output, live SSE and logprob
+replay share this policy. Region visibility is named independently of whether its
+bytes came from generation. This fixes lost static template prefill without
+changing continuation suffix behavior.
+
+Validation: full server library 415 passed / 2 inherited ignores and strict
+all-target Clippy passed. After extending the real ONNX fixture to cover both
+content and reasoning prefill, all 2 ordinary-prefill cases and the original
+real response-projection case passed; strict all-target Clippy passed again.
+The fixture checks buffered/SSE, logprobs on/off and stops before/within generated
+text. Parser tests cover closed/open repeated regions, Unicode chunk boundaries,
+prefix-only completion and last-anchor selection. All 9 selected continuation
+cases passed. Constrained prefill and reasoning+JSON still require further work;
+this milestone does not enable their missing grammar integration.
+
+Lark-prefill API prerequisite: `GenerateConstraint::Lark` now carries the complete
+grammar and existing text prefix explicitly. Processor construction seeds the
+same byte-oriented recognizer used for schema prefixes; no duplicate old tuple
+API remains. Tool-constraint builders and public HTTP integration tests use an
+explicit empty prefix. Grammar-prefix rejection guidance now describes arbitrary
+grammars rather than assuming every grammar is JSON Schema.
+
+Actual-tokenizer processor tests cover empty/partial/complete Lark prefixes,
+invalid-prefix typed errors, suffix-only next-token selection, EOS eligibility,
+and explicit special-token transitions alongside ordinary literal alternatives.
+This exposes the engine capability needed by response-channel grammar lowering;
+it does not itself enable reasoning+JSON in the server.
+
+Lark-prefill validation: 2 selected engine cases passed under both default and
+native-backend features; 3 public HTTP tool-choice tests and all 6 tool-protocol
+unit cases passed. The real JSON-continuation regression passed with its updated
+generic grammar-prefix repair guidance. Strict default/native engine all-target
+and server all-target Clippy passed. The first HTTP filter selected zero tests;
+it is not counted as coverage and was replaced by the verified 3-case filter.
+
+Shared response-classifier milestone: the declared response template compiler,
+channel state and text projection now live in `onnx-genai-engine::response_template`.
+Server loading, continuation validation and buffered/live/logprob output consume
+that public engine implementation directly; the former server module is removed.
+Private boundary internals remain private. Regex dependencies move with their
+owner, with no new package versions introduced.
+
+Regions now store ranges into the request's raw buffer instead of duplicating
+body strings. Trimming and omitted-prefix offsets operate on those same bytes;
+closed/reopened fields and opaque regions retain the existing matching policy.
+This supplies one classifier for subsequent constrained sampling without adding
+a second channel grammar or claiming that reasoning+JSON is already enabled.
+
+Validation: all 12 moved classifier cases passed under default features. Full
+server library: 403 passed / 2 inherited ignores; the previous 415 count included
+the 12 cases now owned by the engine. Coverage still includes actual ONNX normal
+prefill/continuation, buffered/SSE/logprobs, stops, named templates and alternate
+protocol adapters. No performance claim is made for the storage representation.
+
+Final shared-parser validation: the same 12 cases passed with native-backend;
+strict native-engine all-target and server all-target Clippy passed after the
+unnecessary lazy region-construction closure was simplified. There are no
+remaining duplicate server parser definitions or compatibility aliases.
+
+Response candidate transactions: `ResponseParser::preview` returns a cumulative
+candidate projection without publishing or consuming it. A borrow-scoped guard
+restores the original buffer length, cursor, active/closed regions and seen flags
+on success, error and unwind. Closed region metadata uses copy-on-write sharing;
+raw body bytes and published text are not copied into checkpoints. Final preview
+uses the same boundary resolution, defaults and required-field checks as finish.
+
+Buffered chat now projects the final raw result once through this candidate path,
+rather than imposing streaming append-only delta checks on an intermediate parse.
+This fixes a pending regex opener that replaces earlier nonrepeated content only
+at EOF: buffered output can return its final empty replacement while live output
+still rejects retraction of already published text. Raw stop filtering is retained
+before classification. This is a shared-parser capability for the forthcoming
+channel constraint, not completed reasoning+JSON wire support.
+
+Validation: all 3 new candidate tests and the buffered projection regression
+passed; all 15 classifier tests passed with native-backend. Full server library:
+404 passed / 2 inherited ignores. Candidate tests check repeated/replaced fields,
+unchanged publication baselines, copy-on-write checkpoint restoration, Unicode,
+required-field and budget failures, defaults and injected unwind recovery.
+
+Strict native-engine all-target and server all-target Clippy passed on the final
+candidate-preview implementation. The HTTP reasoning+JSON admission guard remains
+in place until candidate token decoding and JSON recognizer composition are wired
+and verified; no compatibility ledger row is closed by this prerequisite alone.
+
+Byte-candidate prerequisite: response classification now accepts strict UTF-8
+byte pieces through `feed_bytes` and `preview_bytes`; text entry points share the
+same ingestion path. A typed zero/one/two/three-byte tail retains incomplete
+scalars between pieces. Pending bytes count against the existing raw buffer
+budget. Invalid sequences preserve the original UTF-8 error and name their raw
+offset; a rejected piece appends none of its valid prefix. Final projection
+requires a complete scalar. Candidate checkpoints also restore pending bytes.
+
+Four new cases cover every byte split of Unicode reasoning and a regex closer,
+three-byte pending tails and budget limits, invalid/overlong/surrogate/out-of-range
+encodings with unchanged state, final incomplete sequences, and real ByteFallback
+vocabulary pieces forming a Chinese channel delimiter plus JSON text. All four
+passed under default features; all 19 classifier cases passed with native-backend.
+The channel-to-JSON sampling composition and contextual decoder agreement remain
+open; accepting byte pieces alone does not enable reasoning+JSON requests.
+
+Final byte-input validation: full server library 404 passed / 2 inherited ignores;
+strict native-engine all-target and server all-target Clippy passed. Existing
+text projection, normal prefill, explicit continuation and stop behavior remain
+covered by that server run. Reasoning+JSON admission remains unchanged.
+
+Selected-field projection now borrows region slices and joins lazily from the
+shared classifier. Ordinary snapshots consume this same iterator; internal
+candidate observers can read content without copying unrelated reasoning or
+opaque fields. Their callback is borrow-scoped and errors restore parser state.
+Tests compose projected content with the actual schema recognizer, proving first
+boundary handling and rejection of a later valid JSON object after earlier bad
+content. Raw opening markers inside serialized JSON strings are classified before
+schema recognition; an escaped opener retains its JSON data meaning instead.
+
+That composition exposed a real schema-prefill gap: llguidance's string lexer
+rejects non-control Unicode escapes and escaped soliduses in existing input.
+Completed string escapes are now canonicalized only in the recognizer prefix,
+including paired UTF-16 surrogates and escaped keys. Literal escaped backslashes
+remain literal; invalid complete surrogate escapes retain a typed prefix error
+and causal decode detail. Regex/Lark inputs bypass this JSON-only conversion.
+The original prompt, counts and response prefix are not rewritten. Partially
+written escapes and generation-side escape expansion remain open work.
+
+Validation so far: 2 schema-prefix tests and all 21 classifier cases passed under
+default/native features. The real ONNX continuation case now checks escaped keys
+and a Unicode/surrogate/solidus value in buffered and logprob SSE requests, exact
+raw template suffixes and prompt counts; full server 404 passed / 2 inherited
+ignores. Reasoning+JSON token sampling itself remains guarded and incomplete.
+
+Strict native-engine and server all-target Clippy passed. The final literal
+backslash and leading-whitespace diagnostic refinements reran both schema-prefix
+cases and strict native-engine all-target Clippy successfully. Unicode errors
+refer to the original prefix byte offset, including its leading JSON whitespace.
+
+The final escape self-review also preserves ASCII control quoting required by
+the backend string-value lexer, including DEL which ordinary JSON serialization
+can leave literal. NUL/newline/control/DEL values and an escaped newline property
+name now have actual schema next-token checks. All 3 selected schema-prefill
+cases and strict native-engine all-target Clippy passed after this refinement.
+
+Reusable JSON byte recognition: `JsonByteCursor` compiles a schema once against
+a byte vocabulary independent of model token IDs. Candidate preview rolls back
+accepted bytes after both viable and rejected trials; atomic commit rejects an
+invalid suffix without retaining its accepted prefix. Status distinguishes viable
+partial content, complete grammar EOF and rejection at a logical byte offset.
+Its explicit byte budget is checked before mutating recognizer state. User stops
+and length limits remain independent of grammar completeness.
+
+Backend failures reconstruct the committed logical prefix from the initial
+compiled state and retain their causal errors. If recovery fails, the cursor
+holds both failures and refuses reuse until an explicit reset. Tests exercise
+normal/rejected/terminal trials, split UTF-8, invalid bytes, resource/schema errors,
+backend recovery and sticky failed recovery. The channel-composition test now
+uses one compiled cursor for all candidates, after the same field projection and
+JSON prefix normalization, instead of compiling a grammar for every candidate.
+
+Validation: all 5 cursor cases passed under default and native-backend features;
+all 21 shared classifier cases passed with the compiled-cursor composition.
+Strict native-engine all-target and server all-target Clippy passed. Server
+runtime behavior was not changed or remeasured in this milestone. The HTTP joint
+reasoning+JSON guard remains; model-token decoding, pending-boundary viability
+and actual processor integration still require completion.
+
+Canonical candidate-decoder ownership: tokenizer handles can now be cloned for
+an owned request-local sampler, and the incremental text decoder can fork its
+existing lookbehind and special-token policy. Candidate completion, alternate
+continuations and failed terminal materialization leave the live decoder intact.
+The same upstream incremental decoder remains the sole text implementation;
+there is no isolated-token concatenation substitute.
+
+A shared decode-loop regression pins the terminal contract: selected EOS IDs
+are committed before stop decisions, remain in result history, and are decoded
+according to the declared special-token registration. Skip and preserve policies
+are distinct from the stop_on_eos control. Template projection sees the actual
+preserved spelling, so future JSON EOS checks must project that spelling through
+the declaration rather than silently dropping a token because of its role.
+
+Validation: all 8 native tokenization cases and the terminal-contract case passed;
+new fork cases also passed under default features. Both ORT tokenizer integration
+cases and the request-local special-token policy case passed. Strict native-engine,
+ORT and server all-target Clippy passed. No HTTP joint-constraint behavior was
+enabled by these ownership and contract changes; processor integration remains
+open, including partial-byte/framing viability and decoder context agreement.
+
+### Channel-aware JSON sampling through the production processor chain
+
+`ResponseJson` composes the model tokenizer, declared response projection and a
+compiled JSON Schema cursor in the mandatory generation processor chain. The
+actual rendered assistant prefix primes all three; JSON validates only the
+selected content field, so reasoning can continue before the content boundary.
+The server lowers JSON response formats through this processor and validates
+its capabilities before admitting generation or writing SSE headers. Explicit
+reasoning continuation no longer rejects these supported combinations.
+
+Candidates preserve request-local decoder state, strict split UTF-8 bytes,
+actual EOS spelling and the configured termination policy. Pending literal
+boundaries use the publication parser's classifier, including overlapping
+short/long delimiters. Active JSON string whitespace remains data even when
+publication trims field ends. Reopened fields and streaming share one typed
+append-only projection rule. Exact history replacement replays the original
+prefill; failed candidates restore parser and grammar state, and recovery errors
+retain both causes. Byte cursor representation replacement reuses the compiled
+schema and preserves the old prefix on failure.
+
+Scope remains explicit: root ByteLevel/ByteFallback and canonical non-byte
+decoders are supported; byte-decoder sequences and regex field boundaries still
+require further implementation. Incomplete Unicode escape spelling remains an
+open lexical compatibility item. These gaps do not close the delivery ledger
+or authorize merging this draft.
+
+Validation: seven production-processor cases cover model-token masks, history
+rewind/replacement, split Unicode data/framing, overlapping delimiters,
+provisional string whitespace and candidate budgets. Six byte-cursor cases
+include atomic representation replacement. All 21 response classifier cases
+pass. Full default engine: 712 passed / 1 inherited ignore. Full server:
+404 passed / 2 inherited ignores. The expanded real ONNX continuation matrix
+covers explicit/automatic reasoning resume, JSON/Schema/unconstrained output,
+buffered/SSE and logprobs; a higher-scoring invalid schema value is masked.
+Regex capability rejection is verified as HTTP 400 before SSE. Strict default
+engine/server all-target Clippy passes.
+Native-feature validation also passes all seven processor and six cursor cases,
+plus strict native-engine all-target Clippy.
+
+### Dependency refresh for integration
+
+Upgrade llguidance, toktrie and toktrie_hf_tokenizers to 1.9.1 and workspace
+runtime tokenizers to 0.23.2. The published grammar adapter still requires
+0.21 internally; use its public tokenizer JSON interface rather than mixing
+Rust types from different versions. Byte vocabulary and grammar construction
+share this adapter boundary. Incremental decoding passes the new token-list
+argument while retaining the existing request-local state and token policy.
+
+After the upgrade, complete library runs pass: engine 894 / 1 inherited ignore
+(with native features unified by the server tests), ORT 188, server 404 /
+2 inherited ignores. This includes the Unicode, EOS, response projection,
+constrained continuation, cancellation and HTTP protocol regressions.
+Strict engine/ORT/server all-target Clippy also passes after the dependency
+refresh. Final tokenizer unit and integration regressions pass after preserving
+the serialization error cause. Windows coverage exposed an unrelated MLAS build
+warning: the AVX2 panel-tail helper was compiled when its sole caller was disabled.
+Give the helper the same `not(feature = "mlas")` condition as its caller.
+
+Final CI fixture corrections: migrate the maintained reranking textproto to
+IR 11 / opset 24 and supply ReduceSum axes as an int64 tensor input. The fixture
+inventory/schema guard passes all 10 cases; both real-engine ranking cases and
+all three selected HTTP/config ranking cases pass. The compressed-state public
+API test now derives a future version from the declared maximum instead of
+misclassifying the supported v1.9 as future; all four public-API cases and all
+24 metadata schema-version cases pass. These resolve the Linux Fast/coverage and
+ORT-backed CI failures without changing runtime ranking or version semantics.
+The complete HTTP integration suite also passes all 37 cases after updating
+the suffix-without-FIM refusal assertion to the shared, metadata-driven admission
+message. The test verifies HTTP 400, invalid_request_error, the rejected suffix
+field and the remedy; no runtime behavior or refusal is weakened.
+Windows CI additionally exposed newline-sensitive test construction in the
+content-dependent KV cancellation fixture. Build that variant by parsing and
+editing ONNX nodes, then canonically printing the graph, instead of matching
+formatted source strings. CRLF and compact-layout equivalence and the original
+real KV rollback oracle both pass; strict native-engine library/tests Clippy
+passes. Production inference behavior is unchanged. Both required Linux checks
+passed on the preceding head; the Windows test correction is validated locally
+before restoring automatic integration on the updated head.

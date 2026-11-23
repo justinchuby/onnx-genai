@@ -77,11 +77,12 @@ impl ToolProtocol {
                         "tagged-json@v1 cannot encode forced tool-choice schema: {error}"
                     ))
                 })?;
-                Ok(ToolOutputConstraint::Set(Some(GenerateConstraint::Lark(
-                    format!(
+                Ok(ToolOutputConstraint::Set(Some(GenerateConstraint::Lark {
+                    grammar: format!(
                         "start: \"<tool_call>\\n\" tool \"\\n</tool_call>\"\ntool: %json {schema}\n"
                     ),
-                ))))
+                    prefix: String::new(),
+                })))
             }
             ParsedToolProtocol::AtemXmlV1 => Ok(if forced_tool_choice_schemas(request).is_some() {
                 ToolOutputConstraint::Set(None)
@@ -707,7 +708,7 @@ mod tests {
         assert!(rendered.fallback_prefix.contains("<|tool_choice|>"));
         assert!(matches!(
             tagged.output_constraint(&request).unwrap(),
-            ToolOutputConstraint::Set(Some(GenerateConstraint::Lark(_)))
+            ToolOutputConstraint::Set(Some(GenerateConstraint::Lark { .. }))
         ));
 
         let atem = protocol("atem-xml");

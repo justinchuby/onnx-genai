@@ -8,18 +8,19 @@ pub(crate) use crate::decode::{
     next_session_token_logits, next_session_token_sampled,
 };
 pub(crate) use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, exceeded_context_limit};
+#[cfg(any(feature = "native-backend", test))]
+pub(crate) use crate::kv_bridge::common_prefix_len;
 pub(crate) use crate::kv_bridge::{
     KvModelInfo, PlacedPayload, RewindRequest, RewindRunnerPolicy, attach_pages_to_sequence,
-    chunk_payload_from_exported, common_prefix_len, exported_layers_from_runner,
-    infer_kv_model_info, kv_model_past_is_f32, load_materialized_past,
-    ort_session_has_recurrent_state, past_kv_from_payloads, rewind_draft_state_to_len,
-    rewind_target_state_to_len, sequence_pages_for_len, validate_draft_state_rewind_to_len,
+    chunk_payload_from_exported, exported_layers_from_runner, infer_kv_model_info,
+    kv_model_past_is_f32, load_materialized_past, ort_session_has_recurrent_state,
+    past_kv_from_payloads, rewind_draft_state_to_len, rewind_target_state_to_len,
+    sequence_pages_for_len, validate_draft_state_rewind_to_len,
     validate_target_state_rewind_to_len,
 };
 pub(crate) use crate::logits::{StopSequence, TokenId};
 pub(crate) use crate::processors::{
-    build_processor_chain, ensure_constrained_finish, load_fim_config_from_model_dir,
-    push_unique_stop_sequence,
+    build_processor_chain, load_fim_config_from_model_dir, push_unique_stop_sequence,
 };
 pub(crate) use crate::sampling::{Sampler, SamplingRng};
 pub(crate) use crate::session::{ActiveGenerate, DraftModel, DraftSession, EngineSession};
@@ -45,16 +46,18 @@ pub(crate) use std::path::Path;
 pub(crate) use std::sync::Arc;
 
 pub use crate::config::{
-    DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, EngineConfig,
-    EngineConfigError, EngineDecodeBackend, FinishReason, GenerateConstraint, GenerateOptions,
-    GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
-    GenerationBudgetCap, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
-    MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
-    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
+    AdaptivePConfig, DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig,
+    DynamicTemperatureConfig, Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend,
+    FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest,
+    GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
+    KvConnectorConfig, LayerWeightBytes, LimitParseError, MemoryPolicyApplication, MemoryStrategy,
+    MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
+    MtpConfig, MtpHiddenLayout, MtpWeightSource, PrefillRequest, PrefillResult,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
-    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint, SessionId,
-    SessionPosition, SpeculativeMode, TokenLogprob, ToolCallPolicy, WeightAccessPattern,
-    WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
+    RewindTokenCount, SamplerSequence, SamplerStage, SamplingOverrides, ScheduledGenerateArrival,
+    SessionCheckpoint, SessionId, SessionPosition, SpeculativeMode, TokenLogprob, ToolCallPolicy,
+    WeightAccessPattern, WeightPlacementReport, XtcConfig, parse_device_policy,
+    parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -79,7 +82,7 @@ mod model;
 #[cfg(feature = "native-backend")]
 mod placement;
 mod runtime;
-pub(crate) use runtime::apply_eos_policy;
+pub(crate) use runtime::{EndTokenPolicy, apply_eos_policy};
 mod session_fork;
 pub(crate) mod session_state;
 mod speculative_load;
@@ -209,7 +212,6 @@ mod tests {
             metadata_hints: MetadataHints::default(),
             kv_cache,
             prefix_cache: PrefixCache::new(),
-            token_prefix_cache: Vec::new(),
             kv_model: None,
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
@@ -1579,12 +1581,8 @@ mod tests {
                 multiplier: 0.5,
                 base: 1.75,
                 allowed_length: 2,
-                sequence_breakers: vec![13],
-            }),
-            mirostat: Some(crate::config::MirostatConfig {
-                tau: 5.0,
-                eta: 0.1,
-                version: crate::config::MirostatVersion::V2,
+                sequence_breakers: vec![vec![13]],
+                window: None,
             }),
             xtc: Some(crate::config::XtcConfig {
                 probability: 0.5,
@@ -1597,22 +1595,16 @@ mod tests {
         assert_eq!(
             chain.names(),
             vec![
-                "repetition_penalty",
-                "frequency_penalty",
-                "presence_penalty",
-                "dry",
                 "stop_sequence",
-                "temperature",
-                // top_k and top_p are fused when both are configured: running
-                // them separately makes top_p rescan the whole vocabulary that
-                // top_k just reduced. The fused processor occupies the same
-                // position in the order and produces the same surviving set.
-                "top_k_top_p",
+                "penalties",
+                "dry",
+                "top_k",
+                "typical_p",
+                "top_p",
                 "min_p",
                 "top_a",
-                "typical_p",
-                "mirostat_v2",
-                "xtc"
+                "xtc",
+                "temperature"
             ]
         );
     }
@@ -1635,7 +1627,9 @@ mod tests {
             repetition_penalty: 1.1,
             frequency_penalty: 0.2,
             presence_penalty: 0.3,
-            constraint: Some(GenerateConstraint::Json),
+            constraint: Some(GenerateConstraint::Json {
+                prefix: String::new(),
+            }),
             ..Default::default()
         };
 
@@ -1644,15 +1638,14 @@ mod tests {
         assert_eq!(
             chain.names(),
             vec![
-                "repetition_penalty",
-                "frequency_penalty",
-                "presence_penalty",
                 "json_constraint",
-                "temperature",
-                "top_k_top_p",
+                "penalties",
+                "top_k",
+                "typical_p",
+                "top_p",
                 "min_p",
                 "top_a",
-                "typical_p"
+                "temperature"
             ]
         );
         Ok(())
@@ -1669,7 +1662,7 @@ mod tests {
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 2.0, 4.0, 3.0];
         assert_eq!(
-            select_next_token(&mut logits, &context, &options, &chain, 0.0),
+            select_next_token(&mut logits, &context, &options, &chain, 0.0).unwrap(),
             2
         );
     }
@@ -1684,7 +1677,7 @@ mod tests {
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 0.0];
         assert_eq!(
-            select_next_token(&mut logits, &context, &options, &chain, 0.75),
+            select_next_token(&mut logits, &context, &options, &chain, 0.75).unwrap(),
             1
         );
     }
@@ -1715,7 +1708,7 @@ mod tests {
         let mut sampler = LastTokenSampler;
 
         assert_eq!(
-            select_next_token_with_sampler(&mut logits, &context, &chain, &mut sampler),
+            select_next_token_with_sampler(&mut logits, &context, &chain, &mut sampler).unwrap(),
             3
         );
         assert_eq!(logits[0], f32::NEG_INFINITY);
@@ -1765,52 +1758,31 @@ mod tests {
     }
 
     #[test]
-    fn json_constraint_defers_stop_until_value_is_complete() {
+    fn json_constraint_obeys_stop_sequences_in_an_incomplete_value() {
         let options = GenerateOptions {
-            constraint: Some(GenerateConstraint::Json),
-            stop_sequences: vec![StopSequence::Text("}".to_string())],
+            constraint: Some(GenerateConstraint::Json {
+                prefix: String::new(),
+            }),
+            stop_sequences: vec![StopSequence::Text(":".into())],
             ..Default::default()
         };
-        let chain_options = GenerateOptions {
-            stop_sequences: options.stop_sequences.clone(),
+        let chain = build_processor_chain(
+            &GenerateOptions {
+                stop_sequences: options.stop_sequences.clone(),
+                ..Default::default()
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        let context = ProcessorContext {
+            generated_text: "{\"value\":".into(),
             ..Default::default()
         };
-        let chain = build_processor_chain(&chain_options, None, false).unwrap();
-        let incomplete = ProcessorContext {
-            generated_text: "{\"value\":".to_string(),
-            ..Default::default()
-        };
-        let complete = ProcessorContext {
-            generated_text: "{\"value\":1}".to_string(),
-            ..Default::default()
-        };
-
         assert_eq!(
-            finish_reason_after_token(1, &options, &chain, &incomplete),
-            None
-        );
-        assert_eq!(
-            finish_reason_after_token(1, &options, &chain, &complete),
+            finish_reason_after_token(1, &options, &chain, &context),
             Some(FinishReason::StopSequence { index: 0 })
         );
-    }
-
-    #[test]
-    fn incomplete_json_constraint_rejects_length_finishes() {
-        let options = GenerateOptions {
-            constraint: Some(GenerateConstraint::Json),
-            ..Default::default()
-        };
-        for reason in [FinishReason::MaxTokens, FinishReason::Length] {
-            let error = ensure_constrained_finish(&options, "{\"value\":", reason).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("stopped before a complete JSON value")
-            );
-        }
-        ensure_constrained_finish(&options, "{\"value\":1}", FinishReason::MaxTokens).unwrap();
-        ensure_constrained_finish(&options, "", FinishReason::EosToken).unwrap();
     }
 
     #[test]
@@ -1836,6 +1808,66 @@ mod tests {
         assert_eq!(result.token_ids.len(), 3);
         assert_eq!(result.finish_reason, FinishReason::MaxTokens);
         assert!(engine.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn constrained_json_context_limits_preserve_actual_partial_output() -> anyhow::Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                std::fs::copy(entry.path(), scratch.path().join(entry.file_name()))?;
+            }
+        }
+        let path = scratch.path().join("tokenizer.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let vocab = value["model"]["vocab"].as_object_mut().unwrap();
+        let old = vocab
+            .iter()
+            .find(|(_, id)| id.as_u64() == Some(22))
+            .unwrap()
+            .0
+            .clone();
+        vocab.remove(&old);
+        vocab.insert("{".into(), serde_json::json!(22));
+        std::fs::write(path, serde_json::to_vec(&value)?)?;
+        let metadata_path = scratch.path().join("inference_metadata.yaml");
+        let metadata = std::fs::read_to_string(&metadata_path)?;
+        assert!(metadata.contains("max_sequence_length: 16"));
+        for (max_context, expected) in [(3, ""), (4, "{")] {
+            std::fs::write(
+                &metadata_path,
+                metadata.replace(
+                    "max_sequence_length: 16",
+                    &format!("max_sequence_length: {max_context}"),
+                ),
+            )?;
+            let mut engine = Engine::from_dir(scratch.path(), EngineConfig::default())?;
+            for constraint in [
+                GenerateConstraint::Json {
+                    prefix: String::new(),
+                },
+                GenerateConstraint::JsonSchema {
+                    schema: r#"{"type":"object"}"#.into(),
+                    prefix: String::new(),
+                },
+            ] {
+                let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+                request.options.constraint = Some(constraint.clone());
+                request.options.max_new_tokens = 4;
+                request
+                    .options
+                    .logit_bias
+                    .insert(22, crate::logits::LogitBias::Add(1000.0));
+                let result = engine.generate(request)?;
+                assert_eq!(result.text, expected);
+                assert_eq!(result.token_ids.len(), max_context - 3);
+                assert_eq!(result.finish_reason, FinishReason::Length);
+                assert!(engine.sessions.is_empty());
+            }
+        }
         Ok(())
     }
 
@@ -2556,7 +2588,6 @@ mod tests {
         // Drop the in-process caches so the connector is the ONLY source of
         // cross-session reuse — simulating a fresh process / different node that
         // shares nothing but the connector.
-        engine.token_prefix_cache.clear();
         engine.prefix_cache = PrefixCache::new();
 
         // Request 2 shares the whole prefix (≥ 1 chunk) with request 1.
@@ -2610,7 +2641,6 @@ mod tests {
         engine.generate(warm)?;
         assert!(engine.last_connector_stats().stores > 0);
 
-        engine.token_prefix_cache.clear();
         engine.prefix_cache = PrefixCache::new();
 
         let mut isolated = GenerateRequest::new(GeneratePrompt::TokenIds(prompt));

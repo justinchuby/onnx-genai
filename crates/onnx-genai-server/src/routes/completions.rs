@@ -1,32 +1,108 @@
 use super::*;
 use crate::tool_protocol::{self, ToolOutputConstraint, ToolProtocol};
+use onnx_genai_engine::response_template;
 
 pub(crate) async fn completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    ApiJson(request): ApiJson<CompletionRequest>,
+    ApiJson(mut body): ApiJson<serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Response, ApiError> {
-    let handle = resolve_model(&state.registry, &request.model).await?;
-    validate_completion_request(&request, &state.config)?;
+    let prompt = body
+        .remove("prompt")
+        .ok_or_else(|| ApiError::invalid_request("prompt is required for completions"))?;
+    let super::prompt::PromptBatch { first, rest } =
+        super::prompt::PromptBatch::parse(prompt, state.config.max_completion_prompts)?;
     let session_id = session_id_from_headers(&headers)?;
-    if request.suffix.is_some() && handle.fim_config.is_none() {
-        return Err(ApiError::bad_request(
-            "FIM is not supported by this model because its tokenizer configuration does not declare recognized FIM tokens",
+    if !rest.is_empty() && session_id.is_some() {
+        return Err(ApiError::invalid_request(
+            "X-Session-Id requires a single prompt; send independent batch prompts without a conversation header",
         ));
     }
-    if request.suffix.is_some() && session_id.is_some() {
-        return Err(ApiError::bad_request(
+    body.insert("prompt".into(), first);
+    let first: CompletionRequest =
+        serde_path_to_error::deserialize(serde_json::Value::Object(body)).map_err(|error| {
+            ApiError::invalid_request(format!("invalid completion request: {error}"))
+        })?;
+    validate_completion_request(&first, &state.config)?;
+    let mut requests = Vec::with_capacity(rest.len());
+    for (index, prompt) in rest.into_iter().enumerate() {
+        requests.push(CompletionRequest {
+            prompt: super::prompt::MixedPrompt::parse_completion(prompt).map_err(|error| {
+                ApiError::invalid_request(format!("prompt[{}]: {error}", index + 1))
+            })?,
+            suffix: first.suffix.clone(),
+            logprobs: first.logprobs,
+            sampling: Arc::clone(&first.sampling),
+        });
+    }
+    let handle = resolve_model(&state.registry, &first.sampling.model).await?;
+    if first.suffix.is_some() && handle.fim_config.is_none() {
+        return Err(ApiError::invalid_request(
+            "suffix requires a model declaring FIM tokens; choose a FIM-capable package or omit suffix",
+        ));
+    }
+    if first.suffix.is_some() && session_id.is_some() {
+        return Err(ApiError::invalid_request(
             "X-Session-Id is not supported for FIM completions",
         ));
     }
-
-    if request.stream {
-        Ok(stream_completion(state, handle, request, session_id)
-            .await?
-            .into_response())
-    } else {
-        Ok(Json(run_completion(state, handle, request, session_id).await?).into_response())
+    let prepare = |request: &CompletionRequest| -> Result<PreparedCompletion, ApiError> {
+        let mut prepared = prepare_completion(request, &handle, state.config.max_output_tokens)?;
+        let prompt_tokens = prepared.prompt_tokens;
+        admit_completion_output(
+            &mut prepared,
+            request,
+            prompt_tokens,
+            &state.config,
+            handle.model_max_context,
+        )?;
+        Ok(prepared)
+    };
+    let first_prepared = prepare(&first)?;
+    let mut rest = Vec::with_capacity(requests.len());
+    for (index, request) in requests.into_iter().enumerate() {
+        let prepared = prepare(&request).map_err(|error| ApiError {
+            message: format!("prompt[{}]: {}", index + 1, error.message),
+            ..error
+        })?;
+        rest.push((request, prepared));
     }
+    if first.sampling.stream {
+        return Ok(
+            stream_completions(state, handle, (first, first_prepared), rest, session_id)
+                .await?
+                .into_response(),
+        );
+    }
+    let is_batch = !rest.is_empty();
+    let mut response = run_completion(
+        &state,
+        &handle,
+        first,
+        first_prepared,
+        session_id.as_deref(),
+    )
+    .await?;
+    if is_batch {
+        response.workflow_outputs = index_completion_publications(response.workflow_outputs, 0);
+    }
+    for (index, (request, prepared)) in rest.into_iter().enumerate() {
+        let next = run_completion(&state, &handle, request, prepared, None).await?;
+        add_completion_usage(&mut response.usage, &next.usage)?;
+        response
+            .choices
+            .extend(next.choices.into_iter().map(|mut choice| {
+                choice.index = index + 1;
+                choice
+            }));
+        response
+            .workflow_outputs
+            .extend(index_completion_publications(
+                next.workflow_outputs,
+                index + 1,
+            ));
+    }
+    Ok(Json(response).into_response())
 }
 
 pub(crate) async fn embeddings(
@@ -57,6 +133,7 @@ pub(crate) async fn embeddings(
             }
             all
         }
+        EmbeddingInput::Tokens(tokens) => vec![tokens],
         EmbeddingInput::TokenArrays(arrays) => arrays,
     };
 
@@ -92,14 +169,14 @@ fn validate_embedding_request(
     tokenizer: &Tokenizer,
 ) -> Result<(), ApiError> {
     if request.dimensions == Some(0) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "dimensions must be greater than zero",
         ));
     }
 
     let validate_tokens = |tokens: &[u32]| {
         if tokens.is_empty() {
-            Err(ApiError::bad_request(
+            Err(ApiError::invalid_request(
                 "embedding input must contain at least one token",
             ))
         } else {
@@ -109,27 +186,28 @@ fn validate_embedding_request(
     match &request.input {
         EmbeddingInput::String(input) => {
             let tokens = tokenizer.encode(input).map_err(|err| {
-                ApiError::bad_request(format!("input tokenization failed: {err}"))
+                ApiError::invalid_request(format!("input tokenization failed: {err}"))
             })?;
             validate_tokens(&tokens)
         }
         EmbeddingInput::Strings(inputs) => {
             if inputs.is_empty() {
-                return Err(ApiError::bad_request(
+                return Err(ApiError::invalid_request(
                     "embedding input array must not be empty",
                 ));
             }
             for input in inputs {
                 let tokens = tokenizer.encode(input).map_err(|err| {
-                    ApiError::bad_request(format!("input tokenization failed: {err}"))
+                    ApiError::invalid_request(format!("input tokenization failed: {err}"))
                 })?;
                 validate_tokens(&tokens)?;
             }
             Ok(())
         }
+        EmbeddingInput::Tokens(tokens) => validate_tokens(tokens),
         EmbeddingInput::TokenArrays(inputs) => {
             if inputs.is_empty() {
-                return Err(ApiError::bad_request(
+                return Err(ApiError::invalid_request(
                     "embedding input array must not be empty",
                 ));
             }
@@ -141,265 +219,409 @@ fn validate_embedding_request(
     }
 }
 
+fn index_completion_publications(
+    publications: Vec<serde_json::Value>,
+    index: usize,
+) -> Vec<serde_json::Value> {
+    publications
+        .into_iter()
+        .map(|publication| serde_json::json!({"prompt_index":index,"publication":publication}))
+        .collect()
+}
+struct StartedCompletion {
+    events: mpsc::Receiver<DriverEvent>,
+    prompt_tokens: usize,
+}
+fn admit_completion_output(
+    prepared: &mut PreparedCompletion,
+    request: &CompletionRequest,
+    prompt_tokens: usize,
+    config: &ServerConfig,
+    max_context: Option<usize>,
+) -> Result<(), ApiError> {
+    prepared.generation.options_mut().max_new_tokens = admit_output_budget(
+        &request.sampling,
+        prompt_tokens,
+        request.sampling.output_budget(config.max_output_tokens),
+        max_context,
+    )?;
+    Ok(())
+}
+fn add_completion_usage(total: &mut Usage, next: &Usage) -> Result<(), ApiError> {
+    let overflow = || {
+        ApiError::internal(
+            "completion batch usage overflow; reduce the prompt count or output budget",
+        )
+    };
+    total.prompt_tokens = total
+        .prompt_tokens
+        .checked_add(next.prompt_tokens)
+        .ok_or_else(overflow)?;
+    total.completion_tokens = total
+        .completion_tokens
+        .checked_add(next.completion_tokens)
+        .ok_or_else(overflow)?;
+    total.total_tokens = total
+        .prompt_tokens
+        .checked_add(total.completion_tokens)
+        .ok_or_else(overflow)?;
+    Ok(())
+}
+async fn start_completion(
+    state: &AppState,
+    handle: &ModelHandle,
+    request: &CompletionRequest,
+    mut prepared: PreparedCompletion,
+    client_session_id: Option<&str>,
+) -> Result<StartedCompletion, ApiError> {
+    let conversational = conversational_session_id(&prepared.generation, client_session_id);
+    let lease = lease_bound_session(handle, &state.sessions, conversational)?;
+    let carried_tokens = carried_session_tokens(handle, lease.as_ref()).await?;
+    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
+    admit_completion_output(
+        &mut prepared,
+        request,
+        prompt_tokens,
+        &state.config,
+        handle.model_max_context,
+    )?;
+    let session = open_session_after_admission(state, handle, conversational, lease).await?;
+    let generation = submit_completion(handle, prepared.generation, session).await?;
+    await_driver_admission(generation.admission).await?;
+    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
+    Ok(StartedCompletion {
+        events: generation.events,
+        prompt_tokens,
+    })
+}
 async fn run_completion(
-    state: AppState,
-    handle: Arc<ModelHandle>,
+    state: &AppState,
+    handle: &ModelHandle,
     request: CompletionRequest,
-    client_session_id: Option<String>,
+    prepared: PreparedCompletion,
+    client_session_id: Option<&str>,
 ) -> Result<CompletionResponse, ApiError> {
     let id = text_completion_id();
     let created = now_unix();
-    let model = request.model.clone();
-    let requested_logprobs = request.logprobs;
-    let tokenizer = handle.tokenizer.clone();
-    let prepared = prepare_completion(&request, &handle)?;
-    let conversational =
-        conversational_session_id(&prepared.generation, client_session_id.as_deref());
-    // Before the first driver round trip, so a second turn on a live session is
-    // refused here rather than queued behind the turn it conflicts with.
-    let lease = lease_bound_session(&handle, &state.sessions, conversational)?;
-    let carried_tokens = carried_session_tokens(&handle, lease.as_ref()).await?;
-    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
-    enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
-    let session = open_session_after_admission(&state, &handle, conversational, lease).await?;
-    let generation = submit_completion(&handle, prepared.generation, session).await?;
-    let collected = collect_generation_with_publications(generation.events)
+    let started = start_completion(state, handle, &request, prepared, client_session_id).await?;
+    let collected = collect_generation_with_publications(started.events)
         .await
         .map_err(generation_failure)?;
     let result = collected.result;
-    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     let completion_tokens = result.token_ids.len();
-    let logprobs = completion_logprobs(&result, &tokenizer, requested_logprobs)
-        .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
-
+    let stops = request
+        .sampling
+        .stop
+        .clone()
+        .map(StopInput::into_texts)
+        .unwrap_or_default();
+    let logprobs = completion_logprobs(&result, &handle.tokenizer, request.logprobs)
+        .map_err(|error| ApiError::internal(format!("logprobs conversion failed: {error:#}")))?;
     Ok(CompletionResponse {
         id,
         object: "text_completion",
         created,
-        model,
+        model: handle.id.clone(),
         choices: vec![CompletionChoice {
-            text: result.text,
+            text: text_before_stop(&result.text, &stops).to_owned(),
             index: 0,
             finish_reason: finish_reason_label(&result.finish_reason),
             logprobs,
         }],
         usage: Usage {
-            prompt_tokens,
+            prompt_tokens: started.prompt_tokens,
             completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
+            total_tokens: started.prompt_tokens + completion_tokens,
         },
         workflow_outputs: collected.publications,
     })
 }
-
-async fn stream_completion(
+enum CompletionDelivery {
+    Finished(Usage),
+    Failed(DriverFailure),
+    Disconnected,
+}
+async fn deliver_completion(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    response: (&str, u64, &str, usize),
+    mut started: StartedCompletion,
+    tokenizer: &Tokenizer,
+    logprobs: Option<usize>,
+    stops: &[String],
+    is_batch: bool,
+) -> anyhow::Result<CompletionDelivery> {
+    let (id, created, model, index) = response;
+    let mut stop_buffer = StopBoundaryBuffer::new(stops.to_vec());
+    let mut emitted = false;
+    let result = loop {
+        match tokio::select! { _=tx.closed()=>return Ok(CompletionDelivery::Disconnected),event=started.events.recv()=>event }
+        {
+            Some(DriverEvent::Token(token)) => {
+                if logprobs.is_some() {
+                    continue;
+                }
+                let text = stop_buffer.push(&token.text);
+                if !text.is_empty() {
+                    emitted = true;
+                    send_completion_stream_chunk(
+                        tx,
+                        completion_chunk(id, created, model, index, text, None),
+                    )
+                    .await?;
+                }
+                if matches!(token.finish_reason, Some(FinishReason::StopSequence { .. })) {
+                    stop_buffer.discard_pending();
+                }
+            }
+            Some(DriverEvent::WorkflowPublications(publications)) => {
+                let publications = if is_batch {
+                    index_completion_publications(publications, index)
+                } else {
+                    publications
+                };
+                send_workflow_publications(tx, &publications).await?
+            }
+            Some(DriverEvent::Finished(result)) => break result,
+            Some(DriverEvent::Error(error)) => return Ok(CompletionDelivery::Failed(error)),
+            None => {
+                return Ok(CompletionDelivery::Failed(DriverFailure::internal(
+                    "generation stream ended before its final result; retry the request",
+                )));
+            }
+        }
+    };
+    if let Some(logprobs) = logprobs {
+        send_completion_logprob_chunks(tx, response, &result, tokenizer, logprobs, stops).await?;
+    } else if !emitted {
+        let text = text_before_stop(&result.text, stops).to_owned();
+        if !text.is_empty() {
+            send_completion_stream_chunk(
+                tx,
+                completion_chunk(id, created, model, index, text, None),
+            )
+            .await?;
+        }
+    } else if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
+        let text = stop_buffer.flush();
+        if !text.is_empty() {
+            send_completion_stream_chunk(
+                tx,
+                completion_chunk(id, created, model, index, text, None),
+            )
+            .await?;
+        }
+    }
+    send_completion_stream_chunk(
+        tx,
+        completion_done_chunk(
+            id,
+            created,
+            model,
+            index,
+            finish_reason_label(&result.finish_reason),
+        ),
+    )
+    .await?;
+    let completion_tokens = result.token_ids.len();
+    Ok(CompletionDelivery::Finished(Usage {
+        prompt_tokens: started.prompt_tokens,
+        completion_tokens,
+        total_tokens: started.prompt_tokens + completion_tokens,
+    }))
+}
+async fn send_completion_error(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    error: ApiError,
+    index: usize,
+) -> anyhow::Result<()> {
+    tx.send(Ok(Event::default().event("error").data(serde_json::json!({"error":{"code":error.status.as_u16(),"message":error.message,"type":error.kind},"index":index}).to_string())))
+        .await.context("completion error receiver closed")?;
+    Ok(())
+}
+async fn stream_completions(
     state: AppState,
     handle: Arc<ModelHandle>,
-    request: CompletionRequest,
+    first: (CompletionRequest, PreparedCompletion),
+    rest: Vec<(CompletionRequest, PreparedCompletion)>,
     client_session_id: Option<String>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
-    let id = text_completion_id();
-    let created = now_unix();
-    let model = request.model.clone();
-    let requested_logprobs = request.logprobs;
-    let tokenizer = handle.tokenizer.clone();
-    let user_stop_sequences = request
+    let is_batch = !rest.is_empty();
+    let (request, prepared) = first;
+    let started = start_completion(
+        &state,
+        &handle,
+        &request,
+        prepared,
+        client_session_id.as_deref(),
+    )
+    .await?;
+    let include_usage = request.sampling.stream_options.include_usage;
+    let logprobs = request.logprobs;
+    let stops = request
+        .sampling
         .stop
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
-    let prepared = prepare_completion(&request, &handle)?;
-    let conversational =
-        conversational_session_id(&prepared.generation, client_session_id.as_deref());
-    // Before the first driver round trip, so a second turn on a live session is
-    // refused here rather than queued behind the turn it conflicts with.
-    let lease = lease_bound_session(&handle, &state.sessions, conversational)?;
-    let carried_tokens = carried_session_tokens(&handle, lease.as_ref()).await?;
-    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
-    enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
-    let session = open_session_after_admission(&state, &handle, conversational, lease).await?;
-    let generation = submit_completion(&handle, prepared.generation, session).await?;
-    await_driver_admission(generation.admission).await?;
-    let mut driver_rx = generation.events;
-    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
+    let id = text_completion_id();
+    let created = now_unix();
+    let model = handle.id.clone();
     let (tx, rx) = mpsc::channel(16);
-
     tokio::spawn(async move {
-        let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
-        let mut emitted_text = false;
-        let result = loop {
-            match driver_rx.recv().await {
-                Some(DriverEvent::Token(token)) => {
-                    if requested_logprobs.is_some() {
-                        continue;
-                    }
-                    let finish_reason = token.finish_reason.clone();
-                    let text = stop_buffer.push(&token.text);
-                    if !text.is_empty() {
-                        emitted_text = true;
-                        send_completion_stream_chunk(
-                            &tx,
-                            completion_chunk(&id, created, &model, text, None),
-                        )
-                        .await?;
-                    }
-                    if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
-                        stop_buffer.pending.clear();
-                    }
-                }
-                Some(DriverEvent::WorkflowPublications(publications)) => {
-                    send_workflow_publications(&tx, &publications).await?;
-                }
-                Some(DriverEvent::Finished(result)) => break Ok(result),
-                Some(DriverEvent::Error(error)) => break Err(error),
-                None => {
-                    break Err(DriverFailure::internal(
-                        "generation stream ended before result",
-                    ));
-                }
-            }
+        let mut current = started;
+        let mut rest = rest.into_iter();
+        let mut index = 0;
+        let mut total = Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
         };
-
-        match result {
-            Ok(result) => {
-                if let Some(requested_logprobs) = requested_logprobs {
-                    send_completion_logprob_chunks(
-                        &tx,
-                        (&id, created, &model),
-                        &result,
-                        &tokenizer,
-                        requested_logprobs,
-                        &user_stop_sequences,
-                    )
-                    .await?;
-                } else if !emitted_text && !result.text.is_empty() {
-                    send_completion_stream_chunk(
-                        &tx,
-                        completion_chunk(&id, created, &model, result.text, None),
-                    )
-                    .await?;
-                } else if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                    let text = stop_buffer.flush();
-                    if !text.is_empty() {
-                        send_completion_stream_chunk(
-                            &tx,
-                            completion_chunk(&id, created, &model, text, None),
-                        )
-                        .await?;
+        let mut failed = false;
+        loop {
+            match deliver_completion(
+                &tx,
+                (&id, created, &model, index),
+                current,
+                &handle.tokenizer,
+                logprobs,
+                &stops,
+                is_batch,
+            )
+            .await
+            {
+                Ok(CompletionDelivery::Finished(usage)) => {
+                    if let Err(error) = add_completion_usage(&mut total, &usage) {
+                        send_completion_error(&tx, error, index).await?;
+                        failed = true;
+                        break;
                     }
                 }
-                send_completion_stream_chunk(
-                    &tx,
-                    completion_done_chunk(
-                        &id,
-                        created,
-                        &model,
-                        finish_reason_label(&result.finish_reason),
-                    ),
-                )
-                .await?;
+                Ok(CompletionDelivery::Disconnected) => return Ok(()),
+                Ok(CompletionDelivery::Failed(error)) => {
+                    send_completion_error(&tx, generation_failure(error), index).await?;
+                    failed = true;
+                    break;
+                }
+                Err(error) => {
+                    if tx.is_closed() {
+                        return Ok(());
+                    }
+                    send_completion_error(&tx,ApiError::internal(format!(
+                        "completion output conversion failed for prompt {index}: {error:#}; check the package tokenizer and output contract"
+                    )),index).await?;
+                    failed = true;
+                    break;
+                }
             }
-            Err(err) => {
-                let error = generation_failure(err);
-                tx.send(Ok(Event::default().event("error").data(
-                    serde_json::to_string(&ErrorResponse {
-                        error: ErrorBody {
-                            message: error.message,
-                            kind: error.kind,
-                        },
-                    })?,
-                )))
-                .await
-                .context("stream receiver closed")?;
+            let Some((request, prepared)) = rest.next() else {
+                break;
+            };
+            index += 1;
+            let started = tokio::select! { biased; _=tx.closed()=>return Ok(()),started=start_completion(&state,&handle,&request,prepared,None)=>started };
+            match started {
+                Ok(started) => current = started,
+                Err(error) => {
+                    send_completion_error(&tx, error, index).await?;
+                    failed = true;
+                    break;
+                }
             }
         }
-
+        if include_usage && !failed {
+            let usage = CompletionResponse {
+                id,
+                object: "text_completion",
+                created,
+                model,
+                choices: Vec::new(),
+                usage: total,
+                workflow_outputs: Vec::new(),
+            };
+            tx.send(Ok(Event::default().data(serde_json::to_string(&usage)?)))
+                .await
+                .context("completion usage receiver closed")?;
+        }
         tx.send(Ok(Event::default().data("[DONE]")))
             .await
-            .context("stream receiver closed")?;
+            .context("completion receiver closed")?;
         Ok::<(), anyhow::Error>(())
     });
-
     Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
 pub(crate) async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    ApiJson(request): ApiJson<ChatCompletionRequest>,
+    ApiJson(mut request): ApiJson<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let handle = resolve_model(&state.registry, &request.model).await?;
     validate_request(&request, &state.config)?;
-    tool_protocol::validate_request(
-        &request,
-        handle.tool_protocol.as_ref(),
-        handle.tool_protocol_metadata_path.as_deref(),
-    )
-    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    super::llama::validate_extensions(&request)?;
+    let handle = resolve_model(&state.registry, &request.model).await?;
+    request.model = handle.id.clone();
     let requested_session_id = session_id_from_headers(&headers)?;
     // The session header names a conversation. Which runtime state continues it
     // — a decode core's paged KV sequence, or the interpreter's session-scoped
     // cells — is the engine's business, and it resolves that itself.
     let session_id = requested_session_id;
+    if request.stream {
+        Ok(stream_chat_completion(state, handle, request, session_id)
+            .await?
+            .into_response())
+    } else {
+        let response = run_chat_completion(state, handle, request, session_id).await?;
+        Ok(Json(response).into_response())
+    }
+}
+
+struct PreparedChatInput {
+    prepared: PreparedGenerateRequest,
+    pipeline_input: Option<MultimodalInput>,
+}
+
+// Inference and token counting must prepare the same tokenizer prompt and media
+// expansion. Only inference reserves output context or opens a session.
+async fn prepare_chat_input(
+    request: &ChatCompletionRequest,
+    handle: &ModelHandle,
+    config: &ServerConfig,
+    has_session: bool,
+    output_budget: usize,
+    media_reservation: usize,
+) -> Result<PreparedChatInput, ApiError> {
+    tool_protocol::validate_request(
+        request,
+        handle.tool_protocol.as_ref(),
+        handle.tool_protocol_metadata_path.as_deref(),
+    )
+    .map_err(|error| ApiError::invalid_request(error.to_string()))?;
     let image_urls = request.image_urls();
     let input_audio = request.input_audio();
-    // One admission policy, shared with the CLI, so both front ends accept and
-    // reject the same inputs with the same explanation.
     crate::multimodal::admit_attachments(
         handle.multimodal.as_ref(),
         &format!("model '{}'", handle.id),
         image_urls.len(),
         input_audio.len(),
     )
-    .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
-
-    if request.stream {
-        Ok(
-            stream_chat_completion(state, handle, request, session_id, image_urls, input_audio)
-                .await?
-                .into_response(),
-        )
-    } else {
-        let response =
-            run_chat_completion(state, handle, request, session_id, image_urls, input_audio)
-                .await?;
-        Ok(Json(response).into_response())
-    }
-}
-
-async fn run_chat_completion(
-    state: AppState,
-    handle: Arc<ModelHandle>,
-    request: ChatCompletionRequest,
-    client_session_id: Option<String>,
-    image_urls: Vec<String>,
-    input_audio: Vec<InputAudio>,
-) -> Result<ChatCompletionResponse, ApiError> {
-    let id = completion_id();
-    let created = now_unix();
-    let model = request.model.clone();
-    let requested_top_logprobs = request
-        .logprobs
-        .then_some(request.top_logprobs.unwrap_or(0));
-    let tokenizer = handle.tokenizer.clone();
-    let placeholder = positional_image_placeholder(&request, &handle);
-    let output_budget = request.output_budget(state.config.max_output_tokens);
+    .map_err(|err| ApiError::invalid_request(format!("{err:#}")))?;
+    let placeholder = positional_image_placeholder(request, handle);
     let mut prepared = prepare_generate_request(
-        &request,
+        request,
         &handle.tokenizer,
-        client_session_id.is_some(),
+        has_session,
         &PromptContext {
             chat_template: handle.chat_template.as_deref(),
+            response_template: handle.response_template.as_ref(),
             tool_protocol: handle.tool_protocol.as_ref(),
             image_placeholder: placeholder.as_deref(),
             generation_defaults: handle.generation_defaults.as_ref(),
-            default_reasoning_effort: state.config.default_reasoning_effort,
+            default_reasoning_effort: config.default_reasoning_effort,
         },
         output_budget,
+        config.replay_buffer_bytes,
     )
-    .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+    .map_err(|err| ApiError::invalid_request(format!("prompt preparation failed: {err}")))?;
     if !input_audio.is_empty() {
-        prepared = prepare_audio_generate_request(&request, &handle.tokenizer, output_budget)?;
+        prepared = prepare_audio_generate_request(request, &handle.tokenizer, output_budget)?;
     }
     let pipeline_input = if !image_urls.is_empty() {
         Some(
@@ -410,21 +632,65 @@ async fn run_chat_completion(
                     .as_ref()
                     .and_then(|multimodal| multimodal.vision.as_ref())
                     .ok_or_else(|| {
-                        ApiError::bad_request(
+                        ApiError::invalid_request(
                             "image input requires a model with a declared vision input",
                         )
                     })?,
                 &mut prepared,
                 handle.model_max_context,
-                reserved_output_tokens(&request, state.config.max_output_tokens),
+                media_reservation,
             )
             .await?,
         )
     } else if let Some(audio) = input_audio.first() {
-        Some(preprocess_chat_audio(audio, &handle)?)
+        Some(preprocess_chat_audio(audio, handle)?)
     } else {
         None
     };
+    Ok(PreparedChatInput {
+        prepared,
+        pipeline_input,
+    })
+}
+
+pub(super) async fn count_model_input_tokens(
+    request: &ChatCompletionRequest,
+    handle: &ModelHandle,
+    config: &ServerConfig,
+) -> Result<usize, ApiError> {
+    validate_request(request, config)?;
+    Ok(prepare_chat_input(request, handle, config, false, 1, 0)
+        .await?
+        .prepared
+        .prompt_tokens)
+}
+
+async fn run_chat_completion(
+    state: AppState,
+    handle: Arc<ModelHandle>,
+    request: ChatCompletionRequest,
+    client_session_id: Option<String>,
+) -> Result<ChatCompletionResponse, ApiError> {
+    let id = completion_id();
+    let created = now_unix();
+    let model = request.model.clone();
+    let requested_top_logprobs = request
+        .logprobs
+        .then_some(request.top_logprobs.unwrap_or(0));
+    let tokenizer = handle.tokenizer.clone();
+    let output_budget = request.output_budget(state.config.max_output_tokens);
+    let PreparedChatInput {
+        prepared,
+        pipeline_input,
+    } = prepare_chat_input(
+        &request,
+        &handle,
+        &state.config,
+        client_session_id.is_some(),
+        output_budget,
+        reserved_output_tokens(&request, state.config.max_output_tokens),
+    )
+    .await?;
     // The conversation is counted before admission, because the tokens this
     // turn is prefilled with are the conversation plus the request. The session
     // itself is opened after, so a rejected request neither strands one nor
@@ -441,6 +707,15 @@ async fn run_chat_completion(
         output_budget,
         handle.model_max_context,
     )?;
+    let projection = ChatProjection::new(
+        &handle,
+        &prepared,
+        &request,
+        state.config.replay_buffer_bytes,
+    )?;
+    projection.start().map_err(|error| {
+        ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
+    })?;
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
@@ -452,7 +727,6 @@ async fn run_chat_completion(
     // command that carries the turn, and the token count is read after that turn
     // has ended and released it.
     let session_for_count = session_lookup.as_ref().map(SessionLeaseGuard::placement);
-    let wants_constrained_json = request.wants_constrained_json();
     // One submission. The driver resolves how to execute it from the runtime it
     // owns, so this route no longer branches on which package shape was loaded.
     let generation = handle
@@ -482,44 +756,34 @@ async fn run_chat_completion(
         None
     };
 
-    let mut workflow_outputs = Vec::new();
-    let (content, tool_calls, completion_tokens, finish_reason, logprobs, reasoning) = match result
-    {
-        Ok(collected) => {
-            workflow_outputs = collected.publications;
-            let result = collected.result;
-            let default_finish_reason = finish_reason_label(&result.finish_reason);
-            let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
-                .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
-            let output = assistant_output_text(&result, &tokenizer);
-            let tool_calls = committed_chat_tool_calls(&result);
-            let content = if tool_calls.is_some() {
-                None
-            } else {
-                Some(atem_visible_content(&output).unwrap_or(output.clone()))
-            };
-            let reasoning = tool_calls
-                .is_none()
-                .then(|| atem_reasoning_content(&output))
-                .flatten()
-                .filter(|thought| !thought.is_empty());
-            (
-                content,
-                tool_calls,
-                result.token_ids.len(),
-                default_finish_reason,
-                logprobs,
-                reasoning,
-            )
-        }
-        Err(err)
-            if wants_constrained_json
-                && json_constraint_stopped_incomplete_message(&err.message) =>
-        {
-            (Some("{}".to_string()), None, 0, "stop", None, None)
-        }
-        Err(err) => return Err(err),
+    let collected = result?;
+    let workflow_outputs = collected.publications;
+    let result = collected.result;
+    let stop_sequence = if let FinishReason::StopSequence { index } = &result.finish_reason {
+        request
+            .stop
+            .as_ref()
+            .and_then(|stop| stop.clone().into_texts().get(*index).cloned())
+    } else {
+        None
     };
+    let finish_reason = finish_reason_label(&result.finish_reason);
+    let completion_tokens = result.token_ids.len();
+    let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
+        .map_err(|error| ApiError::internal(format!("logprobs conversion failed: {error}")))?;
+    let output = projection
+        .buffered(&result, &tokenizer)
+        .map_err(|error| ApiError::internal(format!("response parsing failed: {error:#}")))?;
+    let tool_calls = committed_chat_tool_calls(&result);
+    let content = if tool_calls.is_some() {
+        None
+    } else {
+        Some(output.content)
+    };
+    let reasoning = tool_calls
+        .is_none()
+        .then_some(output.reasoning)
+        .filter(|thought| !thought.is_empty());
     let total_tokens = prompt_tokens + completion_tokens;
     Ok(ChatCompletionResponse {
         id,
@@ -537,6 +801,7 @@ async fn run_chat_completion(
                 name: None,
             },
             finish_reason,
+            stop_sequence,
             logprobs,
         }],
         usage: Some(Usage {
@@ -555,8 +820,6 @@ async fn stream_chat_completion(
     handle: Arc<ModelHandle>,
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
-    image_urls: Vec<String>,
-    input_audio: Vec<InputAudio>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
     let id = completion_id();
     let created = now_unix();
@@ -570,49 +833,19 @@ async fn stream_chat_completion(
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
-    let placeholder = positional_image_placeholder(&request, &handle);
     let output_budget = request.output_budget(state.config.max_output_tokens);
-    let mut prepared = prepare_generate_request(
+    let PreparedChatInput {
+        prepared,
+        pipeline_input,
+    } = prepare_chat_input(
         &request,
-        &handle.tokenizer,
+        &handle,
+        &state.config,
         client_session_id.is_some(),
-        &PromptContext {
-            chat_template: handle.chat_template.as_deref(),
-            tool_protocol: handle.tool_protocol.as_ref(),
-            image_placeholder: placeholder.as_deref(),
-            generation_defaults: handle.generation_defaults.as_ref(),
-            default_reasoning_effort: state.config.default_reasoning_effort,
-        },
         output_budget,
+        reserved_output_tokens(&request, state.config.max_output_tokens),
     )
-    .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
-    if !input_audio.is_empty() {
-        prepared = prepare_audio_generate_request(&request, &handle.tokenizer, output_budget)?;
-    }
-    let pipeline_input = if !image_urls.is_empty() {
-        Some(
-            preprocess_chat_images(
-                &image_urls,
-                handle
-                    .multimodal
-                    .as_ref()
-                    .and_then(|multimodal| multimodal.vision.as_ref())
-                    .ok_or_else(|| {
-                        ApiError::bad_request(
-                            "image input requires a model with a declared vision input",
-                        )
-                    })?,
-                &mut prepared,
-                handle.model_max_context,
-                reserved_output_tokens(&request, state.config.max_output_tokens),
-            )
-            .await?,
-        )
-    } else if let Some(audio) = input_audio.first() {
-        Some(preprocess_chat_audio(audio, &handle)?)
-    } else {
-        None
-    };
+    .await?;
     // Taken before anything this request does can queue behind the turn it would
     // conflict with — including the carry read below, which is itself a command
     // to the worker running that turn.
@@ -625,7 +858,15 @@ async fn stream_chat_completion(
         output_budget,
         handle.model_max_context,
     )?;
-    let wants_constrained_json = request.wants_constrained_json();
+    let projection = ChatProjection::new(
+        &handle,
+        &prepared,
+        &request,
+        state.config.replay_buffer_bytes,
+    )?;
+    let initial_gate = projection.start().map_err(|error| {
+        ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
+    })?;
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
@@ -650,36 +891,36 @@ async fn stream_chat_completion(
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
 
     tokio::spawn(async move {
-        send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
+        send_stream_chunk(&tx, role_chunk(&id, created, &model, prompt_tokens)).await?;
 
         if request.has_tool_context() {
             return stream_declared_tool_chat_completion(
                 &tx,
                 (&id, created, &model),
                 &tokenizer,
-                handle.private_channels,
+                &projection,
+                initial_gate,
                 requested_top_logprobs,
                 &user_stop_sequences,
-                wants_constrained_json,
                 &mut driver_rx,
+                prompt_tokens,
+                request.stream_options.include_usage,
             )
             .await;
         }
 
-        let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.clone());
-        let mut channel_gate = PrivateChannelGate::new(handle.private_channels);
+        let mut channel_gate = initial_gate;
         let result = loop {
-            match driver_rx.recv().await {
+            match tokio::select! {
+                _ = tx.closed() => return Ok(()),
+                event = driver_rx.recv() => event,
+            } {
                 Some(DriverEvent::Token(token)) => {
-                    let finish_reason = token.finish_reason.clone();
-                    // The special-token spelling is only read by an armed gate; a
-                    // model with no private channel discards it, so skip the extra
-                    // per-token decode on that common path.
-                    let spelled = channel_gate
-                        .armed()
-                        .then(|| tokenizer.decode_with_special_tokens(&[token.token_id]).ok())
-                        .flatten();
-                    let revealed = channel_gate.push(spelled.as_deref(), &token.text);
+                    let revealed =
+                        match channel_gate.push_token(&tokenizer, token.token_id, &token.text) {
+                            Ok(delta) => delta,
+                            Err(error) => break Err(StreamOutputFailure::Projection(error)),
+                        };
                     if !revealed.reasoning.is_empty() {
                         send_stream_chunk(
                             &tx,
@@ -687,16 +928,10 @@ async fn stream_chat_completion(
                         )
                         .await?;
                     }
-                    let content = stop_buffer.push(&revealed.content);
-                    if requested_top_logprobs.is_none()
-                        && !wants_constrained_json
-                        && !content.is_empty()
-                    {
+                    let content = revealed.content;
+                    if requested_top_logprobs.is_none() && !content.is_empty() {
                         send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
                             .await?;
-                    }
-                    if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
-                        stop_buffer.pending.clear();
                     }
                 }
                 Some(DriverEvent::WorkflowPublications(publications)) => {
@@ -717,47 +952,39 @@ async fn stream_chat_completion(
         match result {
             Ok(result) => {
                 if let Some(requested_top_logprobs) = requested_top_logprobs {
-                    send_chat_logprob_chunks(
+                    if !send_chat_logprob_chunks(
                         &tx,
                         (&id, created, &model),
                         &result,
                         &tokenizer,
                         requested_top_logprobs,
-                        &user_stop_sequences,
-                        handle.private_channels,
+                        &projection,
                     )
-                    .await?;
-                    send_stream_chunk(
-                        &tx,
-                        done_chunk(
-                            &id,
-                            created,
-                            &model,
-                            finish_reason_label(&result.finish_reason),
-                        ),
-                    )
-                    .await?;
-                } else if wants_constrained_json {
-                    let content = visible_assistant_text(&result, &tokenizer);
-                    if !content.is_empty() {
-                        send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
-                            .await?;
+                    .await?
+                    {
+                        send_stream_end(&tx).await?;
+                        return Ok(());
                     }
                     send_stream_chunk(
                         &tx,
-                        done_chunk(
+                        crate::sse::done_chunk_with_stop(
                             &id,
                             created,
                             &model,
-                            finish_reason_label(&result.finish_reason),
+                            &result.finish_reason,
+                            &user_stop_sequences,
                         ),
                     )
                     .await?;
                 } else {
-                    // The gate's withheld text is ordinary content rather than a
-                    // partial stop sequence, so it is drained either way; only the
-                    // stop buffer's own pending text is dropped on a stop match.
-                    let remaining = channel_gate.flush();
+                    let remaining = match channel_gate.finish(&tokenizer) {
+                        Ok(delta) => delta,
+                        Err(error) => {
+                            send_projection_error(&tx, error).await?;
+                            send_stream_end(&tx).await?;
+                            return Ok(());
+                        }
+                    };
                     if !remaining.reasoning.is_empty() {
                         send_stream_chunk(
                             &tx,
@@ -765,42 +992,39 @@ async fn stream_chat_completion(
                         )
                         .await?;
                     }
-                    let mut content = stop_buffer.push(&remaining.content);
-                    if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                        content.push_str(&stop_buffer.flush());
-                    }
+                    let content = remaining.content;
                     if !content.is_empty() {
                         send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
                             .await?;
                     }
                     send_stream_chunk(
                         &tx,
-                        done_chunk(
+                        crate::sse::done_chunk_with_stop(
                             &id,
                             created,
                             &model,
-                            finish_reason_label(&result.finish_reason),
+                            &result.finish_reason,
+                            &user_stop_sequences,
                         ),
                     )
                     .await?;
                 }
-            }
-            Err(StreamOutputFailure::Driver(err))
-                if wants_constrained_json
-                    && json_constraint_stopped_incomplete_message(&err.message) =>
-            {
-                send_stream_chunk(
-                    &tx,
-                    content_chunk(&id, created, &model, "{}".to_string(), None),
-                )
-                .await?;
-                send_stream_chunk(&tx, done_chunk(&id, created, &model, "stop")).await?;
+                if request.stream_options.include_usage {
+                    send_usage(
+                        &tx,
+                        (&id, created, &model),
+                        prompt_tokens,
+                        result.token_ids.len(),
+                    )
+                    .await?;
+                }
             }
             Err(StreamOutputFailure::Driver(err)) => {
                 let error = generation_failure(err);
                 tx.send(Ok(Event::default().event("error").data(
                     serde_json::to_string(&ErrorResponse {
                         error: ErrorBody {
+                            code: error.status.as_u16(),
                             message: error.message,
                             kind: error.kind,
                         },
@@ -808,6 +1032,9 @@ async fn stream_chat_completion(
                 )))
                 .await
                 .context("stream receiver closed")?;
+            }
+            Err(StreamOutputFailure::Projection(error)) => {
+                send_projection_error(&tx, error).await?;
             }
             Err(StreamOutputFailure::Delivery(error)) => return Err(error),
         }
@@ -826,33 +1053,32 @@ async fn stream_declared_tool_chat_completion(
     tx: &mpsc::Sender<Result<Event, Infallible>>,
     response: (&str, u64, &str),
     tokenizer: &Tokenizer,
-    private_channels: bool,
+    projection: &ChatProjection,
+    mut channel_gate: ChannelGate,
     requested_top_logprobs: Option<usize>,
     user_stop_sequences: &[String],
-    wants_constrained_json: bool,
     driver_rx: &mut mpsc::Receiver<DriverEvent>,
+    prompt_tokens: usize,
+    include_usage: bool,
 ) -> anyhow::Result<()> {
     let (id, created, model) = response;
-    let mut stop_buffer = StopBoundaryBuffer::new(user_stop_sequences.to_vec());
-    let mut channel_gate = PrivateChannelGate::new(private_channels);
     let mut buffered_text = String::new();
     let result = loop {
-        match driver_rx.recv().await {
+        match tokio::select! {
+            _ = tx.closed() => return Ok(()),
+            event = driver_rx.recv() => event,
+        } {
             Some(DriverEvent::Token(token)) => {
-                let finish_reason = token.finish_reason.clone();
-                let spelled = channel_gate
-                    .armed()
-                    .then(|| tokenizer.decode_with_special_tokens(&[token.token_id]).ok())
-                    .flatten();
-                let revealed = channel_gate.push(spelled.as_deref(), &token.text);
+                let revealed = match channel_gate.push_token(tokenizer, token.token_id, &token.text)
+                {
+                    Ok(delta) => delta,
+                    Err(error) => break Err(StreamOutputFailure::Projection(error)),
+                };
                 if !revealed.reasoning.is_empty() {
                     send_stream_chunk(tx, reasoning_chunk(id, created, model, revealed.reasoning))
                         .await?;
                 }
-                buffered_text.push_str(&stop_buffer.push(&revealed.content));
-                if matches!(finish_reason, Some(FinishReason::StopSequence { .. })) {
-                    stop_buffer.pending.clear();
-                }
+                buffered_text.push_str(&revealed.content);
             }
             Some(DriverEvent::WorkflowPublications(publications)) => {
                 if let Err(error) = send_workflow_publications(tx, &publications).await {
@@ -871,36 +1097,46 @@ async fn stream_declared_tool_chat_completion(
 
     match result {
         Ok(result) => {
-            let remaining = channel_gate.flush();
-            if !remaining.reasoning.is_empty() {
+            let remaining = match channel_gate.finish(tokenizer) {
+                Ok(delta) => delta,
+                Err(error) => {
+                    send_projection_error(tx, error).await?;
+                    send_stream_end(tx).await?;
+                    return Ok(());
+                }
+            };
+            let tool_calls = committed_chat_tool_calls(&result);
+            if (requested_top_logprobs.is_none() || tool_calls.is_some())
+                && !remaining.reasoning.is_empty()
+            {
                 send_stream_chunk(tx, reasoning_chunk(id, created, model, remaining.reasoning))
                     .await?;
             }
-            buffered_text.push_str(&stop_buffer.push(&remaining.content));
-            if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-                let trailing = stop_buffer.flush();
-                buffered_text.push_str(&trailing);
-            }
-            if let Some(tool_calls) = committed_chat_tool_calls(&result) {
+            buffered_text.push_str(&remaining.content);
+            if let Some(tool_calls) = tool_calls {
                 send_tool_call_deltas(tx, response, tool_calls).await?;
             } else if let Some(requested_top_logprobs) = requested_top_logprobs {
-                send_chat_logprob_chunks(
+                if !send_chat_logprob_chunks(
                     tx,
                     response,
                     &result,
                     tokenizer,
                     requested_top_logprobs,
-                    user_stop_sequences,
-                    private_channels,
+                    projection,
                 )
-                .await?;
+                .await?
+                {
+                    send_stream_end(tx).await?;
+                    return Ok(());
+                }
                 send_stream_chunk(
                     tx,
-                    done_chunk(
+                    crate::sse::done_chunk_with_stop(
                         id,
                         created,
                         model,
-                        finish_reason_label(&result.finish_reason),
+                        &result.finish_reason,
+                        user_stop_sequences,
                     ),
                 )
                 .await?;
@@ -911,32 +1147,26 @@ async fn stream_declared_tool_chat_completion(
                 }
                 send_stream_chunk(
                     tx,
-                    done_chunk(
+                    crate::sse::done_chunk_with_stop(
                         id,
                         created,
                         model,
-                        finish_reason_label(&result.finish_reason),
+                        &result.finish_reason,
+                        user_stop_sequences,
                     ),
                 )
                 .await?;
             }
-        }
-        Err(StreamOutputFailure::Driver(err))
-            if wants_constrained_json
-                && json_constraint_stopped_incomplete_message(&err.message) =>
-        {
-            send_stream_chunk(
-                tx,
-                content_chunk(id, created, model, "{}".to_string(), None),
-            )
-            .await?;
-            send_stream_chunk(tx, done_chunk(id, created, model, "stop")).await?;
+            if include_usage {
+                send_usage(tx, response, prompt_tokens, result.token_ids.len()).await?;
+            }
         }
         Err(StreamOutputFailure::Driver(err)) => {
             let error = generation_failure(err);
             tx.send(Ok(Event::default().event("error").data(
                 serde_json::to_string(&ErrorResponse {
                     error: ErrorBody {
+                        code: error.status.as_u16(),
                         message: error.message,
                         kind: error.kind,
                     },
@@ -944,6 +1174,9 @@ async fn stream_declared_tool_chat_completion(
             )))
             .await
             .context("stream receiver closed")?;
+        }
+        Err(StreamOutputFailure::Projection(error)) => {
+            send_projection_error(tx, error).await?;
         }
         Err(StreamOutputFailure::Delivery(error)) => return Err(error),
     }
@@ -954,7 +1187,7 @@ async fn stream_declared_tool_chat_completion(
     Ok(())
 }
 
-async fn await_driver_admission(
+pub(super) async fn await_driver_admission(
     admission: oneshot::Receiver<Result<(), DriverFailure>>,
 ) -> Result<(), ApiError> {
     match admission.await {
@@ -1098,16 +1331,16 @@ fn preprocess_chat_audio(
     handle: &ModelHandle,
 ) -> Result<MultimodalInput, ApiError> {
     let bytes = crate::audio_input::decode_chat_audio(input)
-        .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
+        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err}")))?;
     let spec = handle
         .multimodal
         .as_ref()
         .and_then(|multimodal| multimodal.audio.as_ref())
         .ok_or_else(|| {
-            ApiError::bad_request("audio input requires a model with a declared audio input")
+            ApiError::invalid_request("audio input requires a model with a declared audio input")
         })?;
     MultimodalInput::from_wav(spec, &bytes)
-        .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))
+        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err}")))
 }
 
 async fn preprocess_chat_images(
@@ -1119,10 +1352,10 @@ async fn preprocess_chat_images(
 ) -> Result<MultimodalInput, ApiError> {
     let max_prompt_tokens =
         crate::multimodal::expansion_token_budget(model_max_context, max_tokens)
-            .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+            .map_err(|err| ApiError::invalid_request(format!("{err:#}")))?;
     let images = crate::image_input::fetch_images(image_urls)
         .await
-        .map_err(|err| ApiError::bad_request(format!("invalid image input: {err:#}")))?;
+        .map_err(|err| ApiError::invalid_request(format!("invalid image input: {err:#}")))?;
     let GeneratePrompt::TokenIds(mut token_ids) = std::mem::replace(
         &mut prepared.request.prompt,
         GeneratePrompt::TokenIds(Vec::new()),
@@ -1132,7 +1365,7 @@ async fn preprocess_chat_images(
         ));
     };
     let input = MultimodalInput::from_images(spec, &images, &mut token_ids, max_prompt_tokens)
-        .map_err(|err| ApiError::bad_request(format!("invalid image input: {err:#}")))?;
+        .map_err(|err| ApiError::invalid_request(format!("invalid image input: {err:#}")))?;
     prepared.prompt_tokens = token_ids.len();
     prepared.request.prompt = GeneratePrompt::TokenIds(token_ids);
     Ok(input)
@@ -1146,97 +1379,127 @@ fn prepare_audio_generate_request(
     let token_ids = audio_decoder_prompt(tokenizer, None)?;
     let prompt_tokens = token_ids.len();
     Ok(PreparedGenerateRequest {
+        response_prefix: None,
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
-            options: build_generate_options_with_tokenizer(request, tokenizer, output_budget),
+            options: build_generate_options_with_tokenizer(request, tokenizer, output_budget)
+                .map_err(|err| ApiError::invalid_request(err.to_string()))?,
         },
         prompt_tokens,
     })
 }
 
-fn validate_request(
+pub(super) fn validate_request(
     request: &ChatCompletionRequest,
     config: &ServerConfig,
 ) -> Result<(), ApiError> {
     if request.messages.is_empty() {
-        return Err(ApiError::bad_request("messages must not be empty"));
+        return Err(ApiError::invalid_request("messages must not be empty"));
     }
     if let Some((field, requested)) = request.requested_output_budget() {
         if requested == 0 {
-            return Err(ApiError::bad_request(format!(
+            return Err(ApiError::invalid_request(format!(
                 "{field} must be greater than zero"
             )));
         }
         if requested > config.max_output_tokens {
-            return Err(ApiError::bad_request(format!(
+            return Err(ApiError::invalid_request(format!(
                 "{field} must be less than or equal to the server cap of {}",
                 config.max_output_tokens
             )));
         }
     }
     validate_sampling_range(request.temperature, "temperature")?;
+    for (field, value) in [
+        ("dynatemp_range", request.dynatemp_range),
+        ("dynatemp_exponent", request.dynatemp_exponent),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(ApiError::invalid_request(format!(
+                "{field} must be finite and non-negative"
+            )));
+        }
+    }
+    if !(request.temperature.unwrap_or(NEUTRAL_SAMPLING) + request.dynatemp_range).is_finite() {
+        return Err(ApiError::invalid_request(
+            "temperature + dynatemp_range must be finite; reduce the requested range",
+        ));
+    }
+    if !request.top_n_sigma.is_finite() {
+        return Err(ApiError::invalid_request(
+            "top_n_sigma must be finite; use a non-positive value to disable it",
+        ));
+    }
+    onnx_genai_engine::AdaptivePConfig {
+        target: request.adaptive_target,
+        decay: request.adaptive_decay,
+    }
+    .validate()
+    .map_err(|error| ApiError::invalid_request(error.to_string()))?;
     validate_sampling_range(request.top_p, "top_p")?;
     if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "min_p must be finite and between 0 and 1",
         ));
     }
     if !request.top_a.is_finite() || !(0.0..=1.0).contains(&request.top_a) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "top_a must be finite and between 0 and 1",
         ));
     }
     if !request.typical_p.is_finite() || !(0.0..=1.0).contains(&request.typical_p) {
-        return Err(ApiError::bad_request(
-            "typical_p must be finite and between 0 and 1",
+        return Err(ApiError::invalid_request(
+            "typ_p must be finite and between 0 and 1",
         ));
     }
     if !request.repetition_penalty.is_finite() || request.repetition_penalty <= 0.0 {
-        return Err(ApiError::bad_request(
-            "repetition_penalty must be finite and greater than zero",
+        return Err(ApiError::invalid_request(
+            "repeat_penalty must be finite and greater than zero",
         ));
     }
     if !request.frequency_penalty.is_finite() {
-        return Err(ApiError::bad_request("frequency_penalty must be finite"));
+        return Err(ApiError::invalid_request(
+            "frequency_penalty must be finite",
+        ));
     }
     if !request.presence_penalty.is_finite() {
-        return Err(ApiError::bad_request("presence_penalty must be finite"));
+        return Err(ApiError::invalid_request("presence_penalty must be finite"));
     }
     if !request.dry_multiplier.is_finite() || request.dry_multiplier < 0.0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "dry_multiplier must be finite and non-negative",
         ));
     }
     if !request.dry_base.is_finite() || request.dry_base < 1.0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "dry_base must be finite and at least 1",
         ));
     }
     if request.dry_allowed_length == 0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "dry_allowed_length must be greater than zero",
         ));
     }
     if request.mirostat > 2 {
-        return Err(ApiError::bad_request("mirostat must be 0, 1, or 2"));
+        return Err(ApiError::invalid_request("mirostat must be 0, 1, or 2"));
     }
     if !request.mirostat_tau.is_finite() || request.mirostat_tau <= 0.0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "mirostat_tau must be finite and greater than zero",
         ));
     }
     if !request.mirostat_eta.is_finite() || request.mirostat_eta <= 0.0 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "mirostat_eta must be finite and greater than zero",
         ));
     }
     if !request.xtc_probability.is_finite() || !(0.0..=1.0).contains(&request.xtc_probability) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "xtc_probability must be finite and between 0 and 1",
         ));
     }
     if !request.xtc_threshold.is_finite() || !(0.0..=1.0).contains(&request.xtc_threshold) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "xtc_threshold must be finite and between 0 and 1",
         ));
     }
@@ -1244,12 +1507,12 @@ fn validate_request(
         .top_logprobs
         .is_some_and(|count| count > MAX_CHAT_TOP_LOGPROBS)
     {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "top_logprobs must be between 0 and {MAX_CHAT_TOP_LOGPROBS}"
         )));
     }
     if request.top_logprobs.is_some() && !request.logprobs {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_request(
             "top_logprobs requires logprobs to be true",
         ));
     }
@@ -1261,38 +1524,16 @@ fn validate_completion_request(
     request: &CompletionRequest,
     config: &ServerConfig,
 ) -> Result<(), ApiError> {
-    if request.max_tokens == 0 {
-        return Err(ApiError::bad_request(
-            "max_tokens must be greater than zero",
-        ));
-    }
-    if request.max_tokens > config.max_output_tokens {
-        return Err(ApiError::bad_request(format!(
-            "max_tokens must be less than or equal to the server cap of {}",
-            config.max_output_tokens
-        )));
-    }
-    validate_sampling_range(request.temperature, "temperature")?;
-    validate_sampling_range(request.top_p, "top_p")?;
-    if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
-        return Err(ApiError::bad_request(
-            "min_p must be finite and between 0 and 1",
-        ));
-    }
-    if !request.frequency_penalty.is_finite() {
-        return Err(ApiError::bad_request("frequency_penalty must be finite"));
-    }
-    if !request.presence_penalty.is_finite() {
-        return Err(ApiError::bad_request("presence_penalty must be finite"));
-    }
     if request
         .logprobs
         .is_some_and(|count| count > MAX_COMPLETION_LOGPROBS)
     {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "logprobs must be between 0 and {MAX_COMPLETION_LOGPROBS}"
         )));
     }
+    validate_request(&request.sampling, config)?;
+    super::llama::validate_extensions(&request.sampling)?;
     Ok(())
 }
 
@@ -1304,7 +1545,7 @@ fn validate_completion_request(
 /// that named none asked for whatever fits, so its budget shrinks to the
 /// context the prompt left behind rather than turning into a rejection — the
 /// server's cap is a ceiling on generosity, not a reservation the caller made.
-fn admit_output_budget(
+pub(super) fn admit_output_budget(
     request: &ChatCompletionRequest,
     prompt_tokens: usize,
     budget: usize,
@@ -1321,7 +1562,7 @@ fn admit_output_budget(
         .checked_sub(prompt_tokens)
         .filter(|remaining| *remaining > 0)
         .ok_or_else(|| {
-            ApiError::bad_request(format!(
+            ApiError::invalid_request(format!(
                 "What: request admission exceeded the model context limit. \
                  Why: final prefill length ({prompt_tokens}) after placeholder expansion leaves no room to decode within {model_max_context}. \
                  How: shorten the prompt or reduce the image count/expansion size."
@@ -1350,12 +1591,12 @@ fn enforce_context_cap(
     let total = prompt_tokens
         .checked_add(max_tokens)
         .ok_or_else(|| {
-            ApiError::bad_request(
+            ApiError::invalid_request(
                 "What: request admission length overflowed. Why: final prefill length plus max_tokens does not fit usize. How: reduce the prompt, image expansion size, or max_tokens.",
             )
         })?;
     if total > model_max_context {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "What: request admission exceeded the model context limit. \
              Why: final prefill length ({prompt_tokens}) after placeholder expansion plus max_tokens ({max_tokens}) is {total}, above {model_max_context}. \
              How: reduce the prompt, image count/expansion size, or max_tokens."
@@ -1375,14 +1616,14 @@ fn validate_tool_choice(request: &ChatCompletionRequest) -> Result<(), ApiError>
                 .as_ref()
                 .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "function"))
             {
-                return Err(ApiError::bad_request(
+                return Err(ApiError::invalid_request(
                     "tool_choice required requires at least one function tool",
                 ));
             }
         }
         ToolChoice::Specific(choice) => {
             if choice.kind != "function" {
-                return Err(ApiError::bad_request(
+                return Err(ApiError::invalid_request(
                     "specific tool_choice type must be function",
                 ));
             }
@@ -1391,7 +1632,7 @@ fn validate_tool_choice(request: &ChatCompletionRequest) -> Result<(), ApiError>
                     tool.kind == "function" && tool.function.name == choice.function.name
                 })
             }) {
-                return Err(ApiError::bad_request(format!(
+                return Err(ApiError::invalid_request(format!(
                     "tool_choice function '{}' was not provided in tools",
                     choice.function.name
                 )));
@@ -1408,13 +1649,13 @@ fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErr
     };
     let session_id = value
         .to_str()
-        .map_err(|_| ApiError::bad_request("X-Session-Id must be valid UTF-8"))?
+        .map_err(|_| ApiError::invalid_request("X-Session-Id must be valid UTF-8"))?
         .trim();
     if session_id.is_empty() {
-        return Err(ApiError::bad_request("X-Session-Id must not be empty"));
+        return Err(ApiError::invalid_request("X-Session-Id must not be empty"));
     }
     if session_id.len() > MAX_SESSION_ID_LEN {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::invalid_request(format!(
             "X-Session-Id must be at most {MAX_SESSION_ID_LEN} bytes"
         )));
     }
@@ -1600,11 +1841,19 @@ async fn get_or_create_session(
 
 /// Builds a generation request without a server in hand, so an unspecified
 /// output budget falls back to the default cap a server would have applied.
-pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateRequest {
-    GenerateRequest {
+pub fn build_generate_request(
+    request: &ChatCompletionRequest,
+    tokenizer: &Tokenizer,
+) -> anyhow::Result<GenerateRequest> {
+    request.validate_plain_continuation()?;
+    Ok(GenerateRequest {
         prompt: GeneratePrompt::Text(build_prompt(request)),
-        options: build_generate_options(request, request.output_budget(DEFAULT_MAX_OUTPUT_TOKENS)),
-    }
+        options: build_generate_options_with_tokenizer(
+            request,
+            tokenizer,
+            request.output_budget(DEFAULT_MAX_OUTPUT_TOKENS),
+        )?,
+    })
 }
 
 /// Build options for one already-resolved package protocol.
@@ -1614,15 +1863,21 @@ pub fn build_generate_request(request: &ChatCompletionRequest) -> GenerateReques
 pub fn build_generate_request_with_protocol(
     request: &ChatCompletionRequest,
     protocol: &ToolProtocol,
-) -> Result<GenerateRequest, tool_protocol::ToolProtocolError> {
-    let mut options =
-        build_generate_options(request, request.output_budget(DEFAULT_MAX_OUTPUT_TOKENS));
+    tokenizer: &Tokenizer,
+) -> anyhow::Result<GenerateRequest> {
+    request.validate_plain_continuation()?;
+    let mut options = build_generate_options_with_tokenizer(
+        request,
+        tokenizer,
+        request.output_budget(DEFAULT_MAX_OUTPUT_TOKENS),
+    )?;
     apply_tool_output_constraint(&mut options, protocol, request)?;
     let rendered = protocol.render(request)?;
     Ok(GenerateRequest {
         prompt: GeneratePrompt::Text(build_prompt_with_tool_prefix(
             request,
             &rendered.fallback_prefix,
+            None,
         )),
         options,
     })
@@ -1631,35 +1886,56 @@ pub fn build_generate_request_with_protocol(
 pub(crate) fn prepare_completion(
     request: &CompletionRequest,
     handle: &ModelHandle,
+    output_cap: usize,
 ) -> Result<PreparedCompletion, ApiError> {
-    let mut options = build_completion_options(request);
+    let mut options = build_generate_options_with_tokenizer(
+        &request.sampling,
+        &handle.tokenizer,
+        request.sampling.output_budget(output_cap),
+    )
+    .map_err(|error| {
+        ApiError::invalid_request(format!("invalid completion generation controls: {error:#}"))
+    })?;
     options.max_context = handle.model_max_context;
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
     options.resolve_sampling_defaults(
         handle.generation_defaults.as_ref(),
-        &completion_sampling_overrides(request),
+        &chat_sampling_overrides(&request.sampling),
     );
     if let Some(suffix) = request.suffix.as_ref() {
         let fim_config = handle
             .fim_config
             .as_ref()
-            .ok_or_else(|| ApiError::bad_request("FIM is not supported by this model"))?;
-        let prompt = fim_config.format_prompt(&request.prompt, suffix);
+            .ok_or_else(|| ApiError::invalid_request("FIM is not supported by this model"))?;
+        let super::prompt::MixedPrompt::Text(prefix) = &request.prompt else {
+            return Err(ApiError::invalid_request(
+                "suffix requires a text prompt; send text for FIM or omit suffix for token input",
+            ));
+        };
+        let prompt = fim_config.format_prompt(prefix, suffix);
         let prompt_tokens = tokenize_prompt(&handle.tokenizer, &prompt)?;
         Ok(PreparedCompletion {
             generation: CompletionGeneration::Fim {
-                prefix: request.prompt.clone(),
+                prefix: prefix.clone(),
                 suffix: suffix.clone(),
                 options,
             },
             prompt_tokens,
         })
     } else {
-        let token_ids = handle
-            .tokenizer
-            .encode(&request.prompt)
-            .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
+        let token_ids = request.prompt.encode(
+            &handle.tokenizer,
+            onnx_genai_ort::TokenizationOptions {
+                add_special: true,
+                parse_special: true,
+            },
+        )?;
+        if token_ids.is_empty() {
+            return Err(ApiError::invalid_request(
+                "prompt must encode to at least one token; send nonempty text or token ids",
+            ));
+        }
         let prompt_tokens = token_ids.len();
         Ok(PreparedCompletion {
             generation: CompletionGeneration::Plain(GenerateRequest {
@@ -1695,7 +1971,7 @@ async fn submit_completion(
             let fim_config = handle
                 .fim_config
                 .clone()
-                .ok_or_else(|| ApiError::bad_request("FIM is not supported by this model"))?;
+                .ok_or_else(|| ApiError::invalid_request("FIM is not supported by this model"))?;
             handle
                 .engine
                 .generate_fim(prefix, suffix, fim_config, options)
@@ -1712,46 +1988,6 @@ fn tokenize_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<usize, ApiErro
         .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))
 }
 
-fn build_completion_options(request: &CompletionRequest) -> GenerateOptions {
-    let mut options = GenerateOptions {
-        max_new_tokens: request.max_tokens,
-        temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
-        top_p: request.top_p.unwrap_or(NEUTRAL_SAMPLING),
-        min_p: request.min_p,
-        frequency_penalty: request.frequency_penalty,
-        presence_penalty: request.presence_penalty,
-        top_logprobs: request.logprobs,
-        ..GenerateOptions::default()
-    };
-    if let Some(stop) = request.stop.clone() {
-        options.stop_sequences = stop.into_sequences();
-    }
-    options
-}
-
-/// The caller's *explicit* sampling selections for a text completion, feeding
-/// [`GenerateOptions::resolve_sampling_defaults`].
-///
-/// Completions historically decoded greedily by default. `temperature: 0`
-/// keeps that as an explicit greedy request; `min_p > 0` (the only stochastic
-/// knob the completions schema exposes) is an explicit request to sample.
-/// Otherwise the greedy decision is deferred (`None`) so a model that declares
-/// `do_sample: true` samples instead of looping under forced greedy.
-fn completion_sampling_overrides(request: &CompletionRequest) -> SamplingOverrides {
-    let greedy = if request.temperature == Some(0.0) {
-        Some(true)
-    } else if request.min_p > 0.0 {
-        Some(false)
-    } else {
-        None
-    };
-    SamplingOverrides {
-        greedy,
-        temperature: request.temperature,
-        top_p: request.top_p,
-        top_k: None,
-    }
-}
 /// The text spelling of this model's image placeholder, if it declares one.
 ///
 /// Decoded from the declared token id rather than hardcoded, so the prompt
@@ -1795,6 +2031,7 @@ fn positional_image_placeholder(
 /// fail, so they are passed as one value instead of four positional arguments.
 struct PromptContext<'a> {
     chat_template: Option<&'a ChatTemplate>,
+    response_template: Option<&'a Arc<response_template::ResponseTemplate>>,
     tool_protocol: Option<&'a ToolProtocol>,
     image_placeholder: Option<&'a str>,
     generation_defaults: Option<&'a GenerationDefaults>,
@@ -1805,6 +2042,7 @@ struct PromptContext<'a> {
 enum StreamOutputFailure {
     Driver(DriverFailure),
     Delivery(anyhow::Error),
+    Projection(anyhow::Error),
 }
 
 fn prepare_generate_request(
@@ -1813,17 +2051,28 @@ fn prepare_generate_request(
     session: bool,
     context: &PromptContext<'_>,
     output_budget: usize,
+    response_buffer_bytes: usize,
 ) -> anyhow::Result<PreparedGenerateRequest> {
+    anyhow::ensure!(
+        !session || !request.continue_final_message.is_enabled(),
+        "continue_final_message cannot append a replayed assistant prefix to a persistent inference session; omit the session header and send the full conversation"
+    );
     let prompt = if session && !request.has_tool_context() {
         build_session_prompt(&request.messages, context.image_placeholder)
     } else {
         render_prompt(request, context)?
     };
     let token_ids = tokenizer
-        .encode(&prompt)
+        .encode_with_options(
+            &prompt,
+            onnx_genai_ort::TokenizationOptions {
+                add_special: context.chat_template.is_none(),
+                parse_special: true,
+            },
+        )
         .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
     let prompt_tokens = token_ids.len();
-    let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget);
+    let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget)?;
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
     options.resolve_sampling_defaults(
@@ -1834,13 +2083,56 @@ fn prepare_generate_request(
         apply_tool_output_constraint(&mut options, protocol, request)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
+    if let Some(template) = context.response_template {
+        let schema = match options.constraint.as_ref() {
+            Some(GenerateConstraint::Json { .. }) => Some(serde_json::Value::Bool(true)),
+            Some(GenerateConstraint::JsonSchema { schema, .. }) => {
+                Some(serde_json::from_str(schema)?)
+            }
+            _ => None,
+        };
+        if let Some(schema) = schema {
+            options.constraint = Some(GenerateConstraint::ResponseJson {
+                schema,
+                template: template.clone(),
+                prefix: prompt.clone(),
+                max_bytes: response_buffer_bytes,
+            });
+            options.validate_processors(tokenizer)
+                .map_err(|error| anyhow::anyhow!("resolve response_format against the declared response_template and tokenizer: {error:#}"))?;
+        }
+    }
+    anyhow::ensure!(
+        request.continuation_mode() != crate::types::ChatContinuation::Reasoning
+            || options.constraint.is_none()
+            || matches!(
+                options.constraint,
+                Some(GenerateConstraint::ResponseJson { .. })
+            ),
+        "reasoning continuation with this constrained output policy requires a channel-aware generation grammar; use response_format with a compatible declared response_template"
+    );
     Ok(PreparedGenerateRequest {
+        response_prefix: Some(prompt),
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
             options,
         },
         prompt_tokens,
     })
+}
+
+fn requests_stochastic_sampling(request: &ChatCompletionRequest) -> bool {
+    request.temperature.is_some()
+        || request.samplers.is_some()
+        || request.top_n_sigma > 0.0
+        || request.dynatemp_range > 0.0
+        || request.seed.is_some()
+        || request.top_k > 0
+        || request.min_p > 0.0
+        || request.top_a > 0.0
+        || request.typical_p < 1.0
+        || request.mirostat > 0
+        || request.xtc_probability > 0.0
 }
 
 fn build_generate_options(
@@ -1850,31 +2142,53 @@ fn build_generate_options(
     // Chat historically used greedy decoding even with its default temperature
     // and top-p fields. Preserve that default while treating the newly exposed
     // stochastic controls as an explicit request to sample.
-    let stochastic_sampling_requested = request.seed.is_some()
-        || request.top_k > 0
-        || request.min_p > 0.0
-        || request.top_a > 0.0
-        || request.typical_p < 1.0
-        || request.mirostat > 0
-        || request.xtc_probability > 0.0;
+    let stochastic_sampling_requested = requests_stochastic_sampling(request);
     let mut options = GenerateOptions {
         max_new_tokens: output_budget,
         temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
+        sampler_order: request.samplers.clone(),
+        top_n_sigma: request.top_n_sigma,
+        adaptive_p: onnx_genai_engine::AdaptivePConfig {
+            target: request.adaptive_target,
+            decay: request.adaptive_decay,
+        },
+        dynamic_temperature: (request.dynatemp_range > 0.0).then_some(
+            onnx_genai_engine::DynamicTemperatureConfig {
+                range: request.dynatemp_range,
+                exponent: request.dynatemp_exponent,
+            },
+        ),
         top_p: request.top_p.unwrap_or(NEUTRAL_SAMPLING),
         top_k: request.top_k,
         min_p: request.min_p,
         top_a: request.top_a,
         typical_p: request.typical_p,
         repetition_penalty: request.repetition_penalty,
+        penalty_window: usize::try_from(request.repeat_last_n).ok(),
         frequency_penalty: request.frequency_penalty,
         presence_penalty: request.presence_penalty,
-        greedy: request.temperature == Some(0.0) || !stochastic_sampling_requested,
+        greedy: !stochastic_sampling_requested,
         seed: request.seed,
+        cold_start: request
+            .extensions
+            .get("cache_prompt")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false),
+        stop_on_eos: request
+            .extensions
+            .get("ignore_eos")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true),
         dry: (request.dry_multiplier > 0.0).then(|| DryConfig {
             multiplier: request.dry_multiplier,
             base: request.dry_base,
             allowed_length: request.dry_allowed_length,
-            sequence_breakers: request.dry_sequence_breakers.clone(),
+            sequence_breakers: Vec::new(),
+            window: request
+                .extensions
+                .get("dry_penalty_last_n")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok()),
         }),
         mirostat: match request.mirostat {
             1 => Some(MirostatConfig {
@@ -1933,21 +2247,9 @@ fn apply_tool_output_constraint(
 /// cannot express "unspecified", so the API defaults win over any model-declared
 /// temperature/top_p/top_k, and only the greedy (do_sample) decision defers to
 /// the model.
-fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides {
-    let requests_sampling = request.seed.is_some()
-        || request.top_k > 0
-        || request.min_p > 0.0
-        || request.top_a > 0.0
-        || request.typical_p < 1.0
-        || request.mirostat > 0
-        || request.xtc_probability > 0.0;
-    let greedy = if request.temperature == Some(0.0) {
-        Some(true)
-    } else if requests_sampling {
-        Some(false)
-    } else {
-        None
-    };
+pub(super) fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides {
+    let requests_sampling = requests_stochastic_sampling(request);
+    let greedy = if requests_sampling { Some(false) } else { None };
     SamplingOverrides {
         greedy,
         // An absent field is a caller with no opinion, not a caller choosing
@@ -1974,33 +2276,131 @@ const NEUTRAL_SAMPLING: f32 = 1.0;
 /// package's business rather than a value to judge.
 fn validate_sampling_range(value: Option<f32>, field: &str) -> Result<(), ApiError> {
     match value {
-        Some(value) if !value.is_finite() || value < 0.0 => Err(ApiError::bad_request(format!(
-            "{field} must be finite and non-negative"
-        ))),
+        Some(value) if !value.is_finite() || value < 0.0 => Err(ApiError::invalid_request(
+            format!("{field} must be finite and non-negative"),
+        )),
         _ => Ok(()),
     }
 }
 
 fn response_format_constraint(request: &ChatCompletionRequest) -> Option<GenerateConstraint> {
     match request.response_format.as_ref()? {
-        ResponseFormat::JsonObject => Some(GenerateConstraint::Json),
+        ResponseFormat::JsonObject => Some(GenerateConstraint::Json {
+            prefix: if request.continue_final_message.is_enabled() {
+                request
+                    .messages
+                    .last()
+                    .and_then(|message| message.content.as_ref())
+                    .map(|content| content.text())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            },
+        }),
         ResponseFormat::JsonSchema { json_schema } => serde_json::to_string(&json_schema.schema)
             .ok()
-            .map(GenerateConstraint::JsonSchema),
+            .map(|schema| GenerateConstraint::JsonSchema {
+                schema,
+                prefix: if request.continue_final_message.is_enabled() {
+                    request
+                        .messages
+                        .last()
+                        .and_then(|message| message.content.as_ref())
+                        .map(|content| content.text())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                },
+            }),
         ResponseFormat::Text => None,
     }
 }
 
-fn build_generate_options_with_tokenizer(
+pub(super) fn build_generate_options_with_tokenizer(
     request: &ChatCompletionRequest,
-    _tokenizer: &Tokenizer,
+    tokenizer: &Tokenizer,
     output_budget: usize,
-) -> GenerateOptions {
-    build_generate_options(request, output_budget)
-}
-
-fn json_constraint_stopped_incomplete_message(message: &str) -> bool {
-    message.contains("JSON constrained decoding stopped before a complete JSON value")
+) -> anyhow::Result<GenerateOptions> {
+    let mut options = build_generate_options(request, output_budget);
+    if let Some(biases) = request.extensions.get("logit_bias") {
+        use onnx_genai_engine::logits::LogitBias;
+        let pairs: Vec<(serde_json::Value, serde_json::Value)> = match biases {
+            serde_json::Value::Object(object) => object.iter().map(|(key,value)| (serde_json::json!(key),value.clone())).collect(),
+            serde_json::Value::Array(items) => items.iter().enumerate().map(|(index,item)| {
+                let pair = item.as_array().filter(|pair| pair.len()==2).ok_or_else(|| anyhow::anyhow!("logit_bias[{index}] must be [token_id or text, finite bias or false]"))?;
+                Ok((pair[0].clone(),pair[1].clone()))
+            }).collect::<anyhow::Result<_>>()?,
+            _ => anyhow::bail!("logit_bias must be a token-id object or array of [token,bias] pairs"),
+        };
+        for (token, value) in pairs {
+            let bias = if value == false {
+                LogitBias::Ban
+            } else {
+                let value = value.as_f64().ok_or_else(|| {
+                    anyhow::anyhow!("logit_bias for {token} must be a finite number or false")
+                })?;
+                anyhow::ensure!(
+                    value.is_finite() && (value as f32).is_finite(),
+                    "logit_bias for {token} exceeds the finite float range"
+                );
+                LogitBias::Add(value as f32)
+            };
+            let ids = if let Some(id) = token.as_u64().and_then(|id| u32::try_from(id).ok()) {
+                vec![id]
+            } else if let Some(text) = token.as_str() {
+                if biases.is_object()
+                    && !text.is_empty()
+                    && text.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    vec![text.parse::<u32>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "logit_bias token id '{text}' exceeds the unsigned 32-bit token range"
+                        )
+                    })?]
+                } else {
+                    tokenizer
+                        .inner()
+                        .encode(text, false)
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "logit_bias text {text:?} could not be tokenized: {err}"
+                            )
+                        })?
+                        .get_ids()
+                        .to_vec()
+                }
+            } else {
+                anyhow::bail!("logit_bias token {token} must be an unsigned token id or text");
+            };
+            anyhow::ensure!(
+                !ids.is_empty(),
+                "logit_bias token {token} encodes to no tokens; provide nonempty text"
+            );
+            for id in ids {
+                anyhow::ensure!(
+                    options.logit_bias.insert(id, bias).is_none(),
+                    "logit_bias defines token id {id} more than once; combine its biases into one entry"
+                );
+            }
+        }
+    }
+    options.validate_logit_bias(tokenizer)?;
+    if let Some(dry) = &mut options.dry {
+        for (index, breaker) in request.dry_sequence_breakers.iter().enumerate() {
+            let ids = tokenizer
+                .inner()
+                .encode(breaker.as_str(), false)
+                .map_err(|err| {
+                    anyhow::anyhow!("dry_sequence_breakers[{index}] could not be tokenized: {err}")
+                })?;
+            anyhow::ensure!(
+                !ids.is_empty(),
+                "dry_sequence_breakers[{index}] encodes to no tokens; use a nonempty breaker"
+            );
+            dry.sequence_breakers.push(ids.get_ids().to_vec());
+        }
+    }
+    Ok(options)
 }
 
 fn build_session_prompt(messages: &[ChatMessage], image_placeholder: Option<&str>) -> String {
@@ -2029,6 +2429,7 @@ fn template_message(
             .unwrap_or_default(),
     )
     .with_tool_result(message.name.clone(), message.tool_call_id.clone());
+    template_message.reasoning_content = message.reasoning_content.clone();
     if let Some(tool_calls) = &message.tool_calls {
         template_message = template_message.with_tool_calls(template_tool_calls(tool_calls)?);
     }
@@ -2063,10 +2464,38 @@ fn template_tool_calls(tool_calls: &[ChatMessageToolCall]) -> anyhow::Result<ser
     Ok(value)
 }
 
+pub(super) fn render_model_prompt(
+    request: &ChatCompletionRequest,
+    handle: &ModelHandle,
+    default_reasoning_effort: Option<ReasoningEffort>,
+) -> anyhow::Result<String> {
+    let placeholder = positional_image_placeholder(request, handle);
+    render_prompt(
+        request,
+        &PromptContext {
+            chat_template: handle.chat_template.as_deref(),
+            response_template: handle.response_template.as_ref(),
+            tool_protocol: handle.tool_protocol.as_ref(),
+            image_placeholder: placeholder.as_deref(),
+            generation_defaults: handle.generation_defaults.as_ref(),
+            default_reasoning_effort,
+        },
+    )
+}
+
 fn render_prompt(
     request: &ChatCompletionRequest,
     context: &PromptContext<'_>,
 ) -> anyhow::Result<String> {
+    request.validate_continuation()?;
+    let continuation = request.continuation_mode();
+    ChatTemplate::validate_kwargs(&request.chat_template_kwargs)?;
+    if continuation == crate::types::ChatContinuation::Reasoning {
+        anyhow::ensure!(
+            context.chat_template.is_some() && context.response_template.is_some(),
+            "reasoning continuation requires a declared response_template and a chat template preserving reasoning_content; provide those model assets before resuming reasoning"
+        );
+    }
     if let Some(chat_template) = context.chat_template {
         let messages = request
             .messages
@@ -2078,40 +2507,147 @@ fn render_prompt(
             .map(|protocol| protocol.render(request))
             .transpose()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-        return chat_template
-            .render_with_reasoning_effort(
-                &messages,
-                rendered_tools
-                    .as_ref()
-                    .and_then(|rendered| rendered.tools_json.as_deref()),
-                true,
-                request
-                    .reasoning_effort
-                    .or(context.default_reasoning_effort)
-                    .map(ReasoningEffort::as_str),
-            )
-            .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"));
+        let render = |messages: &[TemplateChatMessage]| {
+            chat_template
+                .render_with_kwargs(
+                    messages,
+                    rendered_tools
+                        .as_ref()
+                        .and_then(|rendered| rendered.tools_json.as_deref()),
+                    request.effective_add_generation_prompt(),
+                    request
+                        .reasoning_effort
+                        .or(context.default_reasoning_effort)
+                        .map(ReasoningEffort::as_str),
+                    &request.chat_template_kwargs,
+                )
+                .map_err(|err| anyhow::anyhow!("chat template render failed: {err}"))
+        };
+        let rendered = render(&messages)?;
+        if !request.continue_final_message.is_enabled() {
+            return Ok(rendered);
+        }
+        let selected_field = if continuation == crate::types::ChatContinuation::Reasoning {
+            "reasoning_content"
+        } else {
+            "content"
+        };
+        // Prove which occurrence belongs to the final message. Searching just
+        // for its text could accidentally select an earlier identical quote
+        // when a template drops the final assistant turn.
+        let mut probe = messages;
+        static NEXT_BOUNDARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let marker = format!(
+            "NXRT_CONTINUATION_BOUNDARY_{}",
+            NEXT_BOUNDARY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        anyhow::ensure!(
+            !rendered.contains(&marker),
+            "continuation template probe collides with literal prompt content; retry the request"
+        );
+        let final_message = probe
+            .last_mut()
+            .context("continue_final_message requires a final assistant message")?;
+        if continuation == crate::types::ChatContinuation::Reasoning {
+            final_message.reasoning_content = Some(marker.clone());
+        } else {
+            final_message.content = marker.clone();
+        }
+        let probe = render(&probe)?;
+        anyhow::ensure!(
+            probe.matches(&marker).count() == 1,
+            "continue_final_message requires a chat template that preserves the selected final assistant field exactly once (field {selected_field:?}); repair the template rather than dropping or duplicating that field"
+        );
+        let boundary = probe
+            .find(&marker)
+            .context("continuation template boundary disappeared")?;
+        let prefix = &probe[..boundary];
+        anyhow::ensure!(
+            rendered.starts_with(prefix),
+            "continue_final_message cannot prove the final assistant boundary because template framing changes with its content; use a template with stable assistant framing"
+        );
+        let prompt =
+            continue_rendered_prompt(request, rendered, context.image_placeholder, boundary)?;
+        if let Some(spec) = context.response_template {
+            response_template::ResponseParser::new(
+                spec.clone(),
+                &prompt,
+                response_template::PrefixOutput::Exclude,
+                prompt.len().max(1),
+            )?
+            .require_open_text_channel(selected_field)?;
+        }
+        return Ok(prompt);
     }
+    request.validate_plain_continuation()?;
     let prefix = context
         .tool_protocol
         .map(|protocol| protocol.render(request))
         .transpose()
         .map_err(|error| anyhow::anyhow!("{error}"))?
         .map_or_else(String::new, |rendered| rendered.fallback_prefix);
-    Ok(build_prompt_with_tool_prefix(request, &prefix))
+    Ok(build_prompt_with_tool_prefix(
+        request,
+        &prefix,
+        context.image_placeholder,
+    ))
+}
+
+/// Remove the template's closing framing after the last assistant content.
+/// Never guess an EOS spelling: the actual rendered content must be preserved.
+fn continue_rendered_prompt(
+    request: &ChatCompletionRequest,
+    mut prompt: String,
+    image_placeholder: Option<&str>,
+    boundary: usize,
+) -> anyhow::Result<String> {
+    if request.continue_final_message.is_enabled() {
+        let last = request
+            .messages
+            .last()
+            .context("continue_final_message requires a final assistant message")?;
+        let content = if request.continuation_mode() == crate::types::ChatContinuation::Reasoning {
+            last.reasoning_content
+                .clone()
+                .context("continue_final_message requires final assistant reasoning_content")?
+        } else {
+            last.content
+                .as_ref()
+                .context("continue_final_message requires final assistant content")?
+                .render(image_placeholder)
+        };
+        // Validate the proven boundary against either literal or HF-trimmed
+        // content, then restore the original prefix bytes for continuation.
+        anyhow::ensure!(
+            !content.trim().is_empty(),
+            "continue_final_message requires a nonempty selected assistant field"
+        );
+        anyhow::ensure!(
+            prompt[boundary..].starts_with(&content)
+                || prompt[boundary..].starts_with(content.trim()),
+            "continue_final_message requires the final assistant text to be preserved by the chat template; remove content-transforming filters or use a preserving template"
+        );
+        prompt.truncate(boundary);
+        prompt.push_str(&content);
+    }
+    Ok(prompt)
 }
 
 /// Build the Phase 2 chat prompt with a simple role-tagged template:
 /// `<|role|>\n{content}\n` for every message, followed by `<|assistant|>\n`.
 /// Model-specific templates will replace this once tokenizer chat templates are wired.
 pub fn build_prompt(request: &ChatCompletionRequest) -> String {
-    build_prompt_with_tool_prefix(request, "")
+    build_prompt_with_tool_prefix(request, "", None)
 }
 
-fn build_prompt_with_tool_prefix(request: &ChatCompletionRequest, tool_prefix: &str) -> String {
+fn build_prompt_with_tool_prefix(
+    request: &ChatCompletionRequest,
+    tool_prefix: &str,
+    image_placeholder: Option<&str>,
+) -> String {
     let mut prompt = String::new();
     prompt.push_str(tool_prefix);
-    for message in &request.messages {
+    for (index, message) in request.messages.iter().enumerate() {
         prompt.push_str("<|");
         prompt.push_str(message.role.trim());
         prompt.push_str("|>\n");
@@ -2121,7 +2657,7 @@ fn build_prompt_with_tool_prefix(request: &ChatCompletionRequest, tool_prefix: &
             prompt.push('\n');
         }
         if let Some(content) = &message.content {
-            prompt.push_str(&content.text());
+            prompt.push_str(&content.render(image_placeholder));
         }
         if let Some(tool_calls) = &message.tool_calls {
             if message.content.is_some() {
@@ -2130,9 +2666,13 @@ fn build_prompt_with_tool_prefix(request: &ChatCompletionRequest, tool_prefix: &
             prompt
                 .push_str(&serde_json::to_string(tool_calls).unwrap_or_else(|_| "[]".to_string()));
         }
-        prompt.push('\n');
+        if !request.continue_final_message.is_enabled() || index + 1 != request.messages.len() {
+            prompt.push('\n');
+        }
     }
-    prompt.push_str("<|assistant|>\n");
+    if request.effective_add_generation_prompt() {
+        prompt.push_str("<|assistant|>\n");
+    }
     prompt
 }
 
@@ -2153,217 +2693,148 @@ fn committed_chat_tool_calls(result: &GenerateResult) -> Option<Vec<ChatMessageT
     })
 }
 
-/// Opens an ATEM channel, ending the address that names its recipient.
-const ATEM_MESSAGE: &str = "<|message|>";
-/// Begins the address that names an ATEM channel's recipient.
-const ATEM_ADDRESS: &str = "to=";
-/// The ATEM channel addressed to the caller, i.e. the visible answer.
-const ATEM_USER_CHANNEL: &str = "to=user<|message|>";
-
-/// The part of an ATEM turn a client may see, or `None` for output that carries
-/// no ATEM channel at all.
-///
-/// A turn is a sequence of channels, each addressed to a recipient: the model
-/// itself for private reasoning, a tool for a call, or the user. Only the one
-/// addressed to the user is an answer, so a turn that ends before reaching it —
-/// truncated by the token budget, say — produced no answer, and yields empty
-/// content rather than leaking the model's reasoning as if it were one.
-fn atem_visible_content(output: &str) -> Option<String> {
-    if let Some((_, answer)) = output.rsplit_once(ATEM_USER_CHANNEL) {
-        let end = ["<|eot|>", "<|eom|>"]
-            .into_iter()
-            .filter_map(|marker| answer.find(marker))
-            .min()
-            .unwrap_or(answer.len());
-        return Some(answer[..end].to_string());
+/// A resolved declaration plus the exact prompt that was actually rendered.
+#[derive(Clone)]
+struct ChatProjection {
+    template: Option<Arc<response_template::ResponseTemplate>>,
+    prefix: Arc<str>,
+    prefix_output: response_template::PrefixOutput,
+    max_bytes: usize,
+    stop_sequences: Vec<String>,
+}
+impl ChatProjection {
+    fn new(
+        handle: &ModelHandle,
+        prepared: &PreparedGenerateRequest,
+        request: &ChatCompletionRequest,
+        max_bytes: usize,
+    ) -> Result<Self, ApiError> {
+        let prefix = if handle.response_template.is_some() {
+            prepared.response_prefix.as_deref().ok_or_else(||ApiError::invalid_request("this workflow did not publish the textual prefill needed by its response_template; use a workflow with a declared text-prefix contract"))?
+        } else {
+            ""
+        };
+        Ok(Self {
+            template: handle.response_template.clone(),
+            prefix: Arc::from(prefix),
+            prefix_output: if request.continue_final_message.is_enabled() {
+                response_template::PrefixOutput::Exclude
+            } else {
+                response_template::PrefixOutput::Include
+            },
+            max_bytes,
+            stop_sequences: prepared
+                .request
+                .options
+                .stop_sequences
+                .iter()
+                .filter_map(|stop| match stop {
+                    onnx_genai_engine::StopSequence::Text(text) => Some(text.clone()),
+                    onnx_genai_engine::StopSequence::Tokens(_) => None,
+                })
+                .collect(),
+        })
     }
-    atem_addresses_a_channel(output).then(String::new)
-}
-
-/// The ATEM channel the model addresses to itself, i.e. its private thinking.
-const ATEM_SELF_CHANNEL: &str = "to=self<|message|>";
-
-/// What an ATEM turn thought before answering, or `None` for output that
-/// carries no private channel.
-///
-/// A turn may think more than once — between tool calls, say — and the whole of
-/// it is one train of thought, so the segments are joined. This is not part of
-/// the answer and is never merged into it; it is offered separately so a client
-/// can show that the model is working rather than watching silence.
-fn atem_reasoning_content(output: &str) -> Option<String> {
-    let mut thought = String::new();
-    let mut addressed = false;
-    for (at, marker) in output.match_indices(ATEM_SELF_CHANNEL) {
-        addressed = true;
-        let rest = &output[at + marker.len()..];
-        let end = ["<|eot|>", "<|eom|>"]
-            .into_iter()
-            .filter_map(|marker| rest.find(marker))
-            .min()
-            .unwrap_or(rest.len());
-        thought.push_str(&rest[..end]);
+    fn start(&self) -> anyhow::Result<ChannelGate> {
+        Ok(ChannelGate {
+            parser: self
+                .template
+                .as_ref()
+                .map(|template| {
+                    response_template::ResponseParser::new(
+                        template.clone(),
+                        &self.prefix,
+                        self.prefix_output,
+                        self.max_bytes,
+                    )
+                })
+                .transpose()?,
+            stop_buffer: StopBoundaryBuffer::new(self.stop_sequences.clone()),
+            decoder: onnx_genai_engine::tokenization::TokenTextDecoder::new(
+                onnx_genai_engine::tokenization::SpecialTokenHandling::Preserve,
+            ),
+        })
     }
-    addressed.then_some(thought)
+    fn buffered(
+        &self,
+        result: &GenerateResult,
+        tokenizer: &Tokenizer,
+    ) -> anyhow::Result<ChannelDelta> {
+        let Some(template) = &self.template else {
+            return Ok(ChannelDelta {
+                content: text_before_stop(&result.text, &self.stop_sequences).to_owned(),
+                reasoning: String::new(),
+            });
+        };
+        let raw = if result.token_ids.is_empty() {
+            result.text.clone()
+        } else {
+            tokenizer
+                .decode_with_special_tokens(&result.token_ids)
+                .context("decode generated response with declared protocol markers")?
+        };
+        let mut parser = response_template::ResponseParser::new(
+            template.clone(),
+            &self.prefix,
+            self.prefix_output,
+            self.max_bytes,
+        )?;
+        let output = parser.preview(text_before_stop(&raw, &self.stop_sequences), true)?;
+        Ok(ChannelDelta {
+            content: output.content,
+            reasoning: output.reasoning,
+        })
+    }
 }
 
-/// Whether the output has opened a channel addressed to someone.
-///
-/// The recipient is matched by shape rather than by name because a model may
-/// address any tool it was offered, not only itself and the user, and a channel
-/// addressed to a tool is no more visible than one addressed to the model.
-fn atem_addresses_a_channel(output: &str) -> bool {
-    output.match_indices(ATEM_ADDRESS).any(|(at, _)| {
-        output[at..]
-            .split_once(ATEM_MESSAGE)
-            .is_some_and(|(address, _)| !address.contains('<'))
-    })
+struct ChannelGate {
+    stop_buffer: StopBoundaryBuffer,
+    parser: Option<response_template::ResponseParser>,
+    decoder: onnx_genai_engine::tokenization::TokenTextDecoder,
 }
-
-/// Streams only the part of a channelled turn a client may see.
-///
-/// A streamed token's text has its special tokens stripped, so the channel
-/// markers that decide what is visible are invisible token by token and a
-/// streaming turn would otherwise send private reasoning as it is produced. The
-/// gate keeps the turn's special-token spelling and asks [`atem_visible_content`]
-/// what is visible so far, emitting only what has grown since the previous
-/// token, so channel semantics stay in one place and streaming agrees with the
-/// buffered path by construction.
-///
-/// The gate is armed from the package's own declaration that it has a private
-/// channel, not from guessing at the shape of a turn, so a model that declares
-/// none is never gated and streams exactly what it generated. An armed gate
-/// then fails closed: nothing it cannot place in the channel addressed to the
-/// caller is served as an answer, because the cost of withholding an answer is
-/// a retry and the cost of releasing reasoning as one is a disclosure that
-/// cannot be taken back. Private thinking is not discarded, though — it is
-/// reported separately, so a client can show the model working instead of
-/// waiting on silence.
-#[derive(Debug)]
-struct PrivateChannelGate {
-    /// The turn so far, spelled with the special tokens that mark channels.
-    transcript: String,
-    /// How much of the answer has already been streamed.
-    content: ChannelStream,
-    /// How much of the thinking has already been streamed.
-    reasoning: ChannelStream,
-    /// Whether the model declares a channel the caller must not be shown.
-    armed: bool,
-}
-
-/// What one token added to each channel.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ChannelDelta {
-    /// Text belonging to the answer.
     content: String,
-    /// Text belonging to the model's private thinking.
     reasoning: String,
 }
-
-/// Tracks how much of one channel has been sent, so each emission carries only
-/// what has appeared since the last one.
-#[derive(Debug, Default)]
-struct ChannelStream {
-    sent: String,
-}
-
-impl ChannelStream {
-    /// What `revealed` adds to what was already sent.
-    ///
-    /// A channel that is reopened replaces its text rather than extending it,
-    /// so text that is no longer a continuation is sent whole.
-    fn growth(&mut self, revealed: String) -> String {
-        let grown = match revealed.strip_prefix(&self.sent) {
-            Some(grown) => grown.to_string(),
-            None => revealed.clone(),
-        };
-        self.sent = revealed;
-        grown
-    }
-}
-
-impl PrivateChannelGate {
-    fn new(armed: bool) -> Self {
-        Self {
-            transcript: String::new(),
-            content: ChannelStream::default(),
-            reasoning: ChannelStream::default(),
-            armed,
-        }
-    }
-
-    /// Whether the gate withholds private channels, in which case the caller
-    /// must supply each token's special-token spelling for it to read.
-    fn armed(&self) -> bool {
-        self.armed
-    }
-
-    /// The visible text this token added, which is empty while the token
-    /// belongs to a private channel.
-    ///
-    /// `spelled` is the token with its special tokens intact and `plain` is the
-    /// same token as a client would see it. A token that cannot be spelled
-    /// leaves the gate unable to place it in a channel, so an armed gate
-    /// withholds it.
-    fn push(&mut self, spelled: Option<&str>, plain: &str) -> ChannelDelta {
-        if !self.armed {
-            return ChannelDelta {
-                content: plain.to_string(),
+impl ChannelGate {
+    fn push_token(
+        &mut self,
+        tokenizer: &Tokenizer,
+        id: u32,
+        plain: &str,
+    ) -> anyhow::Result<ChannelDelta> {
+        let Some(parser) = &mut self.parser else {
+            return Ok(ChannelDelta {
+                content: self.stop_buffer.push(plain),
                 reasoning: String::new(),
-            };
-        }
-        let Some(spelled) = spelled else {
-            return ChannelDelta::default();
+            });
         };
-        self.transcript.push_str(spelled);
-        self.growth()
+        let raw = self.decoder.step(tokenizer, id)?;
+        let delta = parser.feed(&self.stop_buffer.push(&raw))?;
+        Ok(ChannelDelta {
+            content: delta.content,
+            reasoning: delta.reasoning,
+        })
     }
-
-    /// Whatever the gate is still holding once the turn ends.
-    ///
-    /// A turn that never reached the caller's channel produced no answer, so
-    /// nothing is released as one: the model spent the turn thinking, and
-    /// saying so is the honest empty completion a `length` finish reason
-    /// already reports. The thinking itself is still returned, in the channel
-    /// that is for thinking.
-    fn flush(&mut self) -> ChannelDelta {
-        if !self.armed {
-            return ChannelDelta::default();
-        }
-        self.growth()
-    }
-
-    /// What each channel has revealed since the last emission.
-    fn growth(&mut self) -> ChannelDelta {
-        ChannelDelta {
-            content: self
-                .content
-                .growth(atem_visible_content(&self.transcript).unwrap_or_default()),
-            reasoning: self
-                .reasoning
-                .growth(atem_reasoning_content(&self.transcript).unwrap_or_default()),
-        }
-    }
-}
-
-/// The part of a finished turn a caller may see.
-///
-/// The buffered paths all reduce to this, so no path can disagree with the
-/// streaming gate about which channel carried the answer.
-fn visible_assistant_text(result: &GenerateResult, tokenizer: &Tokenizer) -> String {
-    let output = assistant_output_text(result, tokenizer);
-    atem_visible_content(&output).unwrap_or(output)
-}
-
-fn assistant_output_text(result: &GenerateResult, tokenizer: &Tokenizer) -> String {
-    let Ok(with_special_tokens) = tokenizer.decode_with_special_tokens(&result.token_ids) else {
-        return result.text.clone();
-    };
-    if atem_addresses_a_channel(&with_special_tokens)
-        || with_special_tokens.contains("<atem:invoke")
-    {
-        with_special_tokens
-    } else {
-        result.text.clone()
+    fn finish(mut self, tokenizer: &Tokenizer) -> anyhow::Result<ChannelDelta> {
+        let Some(mut parser) = self.parser.take() else {
+            return Ok(ChannelDelta {
+                content: self.stop_buffer.flush(),
+                reasoning: String::new(),
+            });
+        };
+        let raw = self.decoder.finish(tokenizer)?;
+        let mut safe = self.stop_buffer.push(&raw);
+        safe.push_str(&self.stop_buffer.flush());
+        let mut output = parser.feed(&safe)?;
+        let tail = parser.finish()?;
+        output.content.push_str(&tail.content);
+        output.reasoning.push_str(&tail.reasoning);
+        Ok(ChannelDelta {
+            content: output.content,
+            reasoning: output.reasoning,
+        })
     }
 }
 
@@ -2485,20 +2956,17 @@ fn decode_logprob_token(tokenizer: &Tokenizer, token_id: u32) -> anyhow::Result<
 
 async fn send_completion_logprob_chunks(
     tx: &mpsc::Sender<Result<Event, Infallible>>,
-    response: (&str, u64, &str),
+    response: (&str, u64, &str, usize),
     result: &GenerateResult,
     tokenizer: &Tokenizer,
     requested_top_logprobs: usize,
     stop_sequences: &[String],
 ) -> anyhow::Result<()> {
-    let (id, created, model) = response;
+    let (id, created, model, choice_index) = response;
     let logprobs = completion_logprobs(result, tokenizer, Some(requested_top_logprobs))?
         .context("requested completion logprobs were not built")?;
-    let stream_text = result
-        .token_ids
-        .iter()
-        .map(|&token_id| tokenizer.decode(&[token_id]).map_err(anyhow::Error::from))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let stream_text =
+        onnx_genai_engine::tokenization::token_texts(Some(tokenizer), &result.token_ids)?;
     let visible_text = truncate_tokens_at_stop(&stream_text, stop_sequences);
     for (index, text) in visible_text.into_iter().enumerate() {
         if text.is_empty() {
@@ -2510,6 +2978,7 @@ async fn send_completion_logprob_chunks(
                 id,
                 created,
                 model,
+                choice_index,
                 text,
                 Some(CompletionLogprobs {
                     tokens: vec![logprobs.tokens[index].clone()],
@@ -2530,26 +2999,42 @@ async fn send_chat_logprob_chunks(
     result: &GenerateResult,
     tokenizer: &Tokenizer,
     requested_top_logprobs: usize,
-    stop_sequences: &[String],
-    private_channels: bool,
-) -> anyhow::Result<()> {
+    projection: &ChatProjection,
+) -> anyhow::Result<bool> {
     let (id, created, model) = response;
     let logprobs = chat_logprobs(result, tokenizer, Some(requested_top_logprobs))?
         .context("requested chat logprobs were not built")?;
     // Logprobs are per token, so the visible text is gated per token too: a
     // token inside a private channel contributes an empty string and keeps its
     // logprob entry aligned by index, rather than being dropped here.
-    let mut gate = PrivateChannelGate::new(private_channels);
-    let stream_text = result
-        .token_ids
-        .iter()
-        .map(|&token_id| {
-            let spelled = tokenizer.decode_with_special_tokens(&[token_id]).ok();
-            let plain = tokenizer.decode(&[token_id])?;
-            Ok(gate.push(spelled.as_deref(), &plain).content)
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let visible_text = truncate_tokens_at_stop(&stream_text, stop_sequences);
+    let prepare = || -> anyhow::Result<(Vec<String>, String)> {
+        let mut gate = projection.start()?;
+        let plain =
+            onnx_genai_engine::tokenization::token_texts(Some(tokenizer), &result.token_ids)?;
+        let mut reasoning = String::new();
+        let mut text = Vec::with_capacity(result.token_ids.len());
+        for (&token_id, plain) in result.token_ids.iter().zip(&plain) {
+            let delta = gate.push_token(tokenizer, token_id, plain)?;
+            text.push(delta.content);
+        }
+        let tail = gate.finish(tokenizer)?;
+        if let Some(last) = text.last_mut() {
+            last.push_str(&tail.content);
+        }
+        reasoning.push_str(&tail.reasoning);
+        Ok((text, reasoning))
+    };
+    let (stream_text, reasoning) = match prepare() {
+        Ok(output) => output,
+        Err(error) => {
+            send_projection_error(tx, error).await?;
+            return Ok(false);
+        }
+    };
+    if !reasoning.is_empty() {
+        send_stream_chunk(tx, reasoning_chunk(id, created, model, reasoning)).await?;
+    }
+    let visible_text = stream_text;
     for (index, content) in visible_text.into_iter().enumerate() {
         if content.is_empty() {
             continue;
@@ -2568,17 +3053,12 @@ async fn send_chat_logprob_chunks(
         )
         .await?;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn truncate_tokens_at_stop(tokens: &[String], stop_sequences: &[String]) -> Vec<String> {
     let text = tokens.concat();
-    let cutoff = stop_sequences
-        .iter()
-        .filter(|stop| !stop.is_empty())
-        .filter_map(|stop| text.find(stop))
-        .min()
-        .unwrap_or(text.len());
+    let cutoff = text_before_stop(&text, stop_sequences).len();
     let mut cursor = 0;
     let mut visible = Vec::new();
     for token in tokens {
@@ -2638,6 +3118,44 @@ mod prompt_rendering_tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn declared_template_owns_prompt_special_tokens() {
+        let tokenizer = Tokenizer::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+        )
+        .unwrap();
+        let template = ChatTemplate::from_source("hello");
+        let request: ChatCompletionRequest =
+            serde_json::from_value(json!({"messages":[{"role":"user","content":"hello"}]}))
+                .unwrap();
+        let prepared = prepare_generate_request(
+            &request,
+            &tokenizer,
+            false,
+            &context(&template, None),
+            8,
+            crate::state::ServerConfig::default().replay_buffer_bytes,
+        )
+        .unwrap();
+        let expected = tokenizer
+            .encode_with_options(
+                "hello",
+                onnx_genai_ort::TokenizationOptions {
+                    add_special: false,
+                    parse_special: true,
+                },
+            )
+            .unwrap();
+        assert_ne!(expected, tokenizer.encode("hello").unwrap());
+        let GeneratePrompt::TokenIds(actual) = prepared.request.prompt else {
+            panic!("rendered chat must be encoded once")
+        };
+        assert_eq!(actual, expected);
+        assert_eq!(prepared.prompt_tokens, actual.len());
+        assert_eq!(prepared.response_prefix.as_deref(), Some("hello"));
+    }
+
     // A tool result reaches the template with the identity the caller sent, so
     // a tool-calling template can name the function it answers.
     #[test]
@@ -2691,6 +3209,7 @@ mod prompt_rendering_tests {
     ) -> PromptContext<'a> {
         PromptContext {
             chat_template: Some(template),
+            response_template: None,
             tool_protocol: None,
             image_placeholder: None,
             generation_defaults: None,
@@ -2725,12 +3244,14 @@ mod prompt_rendering_tests {
             false,
             &PromptContext {
                 chat_template: None,
+                response_template: None,
                 tool_protocol: Some(&protocol),
                 image_placeholder: None,
                 generation_defaults: None,
                 default_reasoning_effort: None,
             },
             DEFAULT_MAX_OUTPUT_TOKENS,
+            crate::state::ServerConfig::default().replay_buffer_bytes,
         )
         .expect("production preparation");
 
@@ -2738,6 +3259,100 @@ mod prompt_rendering_tests {
         assert_eq!(
             tool_protocol::request_policy(&request),
             onnx_genai_engine::ToolCallPolicy::Required
+        );
+    }
+
+    #[test]
+    fn continuation_checks_the_selected_declared_parser_channel() {
+        let template = ChatTemplate::from_source(
+            "A[r]{{ messages[0].reasoning_content }}[/r]{{ messages[0].content }}Z",
+        );
+        let request:ChatCompletionRequest=serde_json::from_value(json!({"messages":[{"role":"assistant","reasoning_content":"old","content":"answer"}],"continue_final_message":"content"})).unwrap();
+        let spec =
+            response_template::ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
+                "reasoning_content":{"open":"[r]","close":"[/r]"},"content":{}
+            }}))
+            .unwrap();
+        let mut context = context(&template, None);
+        context.response_template = Some(&spec);
+        assert_eq!(
+            render_prompt(&request, &context).unwrap(),
+            "A[r]old[/r]answer"
+        );
+        let mismatched =
+            response_template::ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
+                "reasoning_content":{"open":"[r]","close":"[/r]"},"content":{"open":"[c]"}
+            }}))
+            .unwrap();
+        context.response_template = Some(&mismatched);
+        let error = render_prompt(&request, &context).unwrap_err().to_string();
+        assert!(
+            error.contains("field \"content\" open") && error.contains("active field is None"),
+            "{error}"
+        );
+        let mut reasoning = request;
+        reasoning.continue_final_message = crate::types::ChatContinuation::Reasoning;
+        let dropping = ChatTemplate::from_source("A{{ messages[0].content }}Z");
+        context.chat_template = Some(&dropping);
+        let error = render_prompt(&reasoning, &context).unwrap_err().to_string();
+        assert!(
+            error.contains("exactly once") && error.contains("reasoning_content"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn assistant_continuation_removes_only_final_framing_and_proves_content_position() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"café"},{"role":"assistant","content":" café  "}],
+            "continue_final_message":true,"add_generation_prompt":false
+        }))
+        .unwrap();
+        let template = ChatTemplate::from_source(
+            "{% for message in messages %}[{{ message.role }}]{{ message.content | trim }}[end]{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
+        );
+        assert_eq!(
+            render_prompt(&request, &context(&template, None)).unwrap(),
+            "[user]café[end][assistant] café  "
+        );
+        let dropping = ChatTemplate::from_source(
+            "{% for message in messages %}{% if message.role != 'assistant' %}{{ message.content }}{% endif %}{% endfor %}",
+        );
+        assert!(
+            render_prompt(&request, &context(&dropping, None))
+                .unwrap_err()
+                .to_string()
+                .contains("preserves the selected final assistant field exactly once")
+        );
+        let duplicated = ChatTemplate::from_source(
+            "{% for message in messages %}{{ message.content }}{{ message.content }}{% endfor %}",
+        );
+        assert!(
+            render_prompt(&request, &context(&duplicated, None))
+                .unwrap_err()
+                .to_string()
+                .contains("exactly once")
+        );
+        let transforming = ChatTemplate::from_source(
+            "{% for message in messages %}[{{ message.role }}]{{ message.content | upper }}[end]{% endfor %}",
+        );
+        assert!(
+            render_prompt(&request, &context(&transforming, None))
+                .unwrap_err()
+                .to_string()
+                .contains("preserved")
+        );
+        let builtin = PromptContext {
+            chat_template: None,
+            response_template: None,
+            tool_protocol: None,
+            image_placeholder: None,
+            generation_defaults: None,
+            default_reasoning_effort: None,
+        };
+        assert_eq!(
+            render_prompt(&request, &builtin).unwrap(),
+            "<|user|>\ncafé\n<|assistant|>\n café  "
         );
     }
 
@@ -2852,6 +3467,31 @@ mod sampling_resolution_tests {
         serde_json::from_value(body).unwrap()
     }
 
+    #[test]
+    fn dynamic_temperature_controls_request_sampling_at_zero_base_temperature() {
+        let request = chat_request(json!({"dynatemp_range":0.4,"dynatemp_exponent":2.0}));
+        let mut options = build_generate_options(&request, 4);
+        options.resolve_sampling_defaults(
+            Some(&declared(Some(false), Some(0.8))),
+            &chat_sampling_overrides(&request),
+        );
+        assert!(!options.greedy);
+        assert_eq!(options.temperature, 0.8);
+        assert_eq!(
+            options.dynamic_temperature.unwrap(),
+            onnx_genai_engine::DynamicTemperatureConfig {
+                range: 0.4,
+                exponent: 2.0
+            }
+        );
+        let request = chat_request(json!({"temperature":0.0,"dynatemp_range":0.4}));
+        let options = build_generate_options(&request, 4);
+        assert!(
+            !options.selects_greedily(),
+            "a positive dynamic interval can sample even when its base temperature is zero"
+        );
+    }
+
     // A silent chat request against a model that declares do_sample=true now
     // samples instead of being forced greedy — the server inherits the fix.
     #[test]
@@ -2888,7 +3528,10 @@ mod sampling_resolution_tests {
             Some(&declared(Some(true), Some(0.6))),
             &chat_sampling_overrides(&cold),
         );
-        assert!(options.greedy, "temperature 0 forces greedy over the model");
+        assert!(
+            options.selects_greedily(),
+            "temperature zero selects a point mass after preceding stages"
+        );
     }
 
     // `top_k` is absent from the OpenAI schema, so a client that never mentions
@@ -2918,14 +3561,14 @@ mod sampling_resolution_tests {
         let request: CompletionRequest =
             serde_json::from_value(json!({ "model": "m", "prompt": "hi" })).unwrap();
         let mut options = GenerateOptions {
-            temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
-            top_p: request.top_p.unwrap_or(NEUTRAL_SAMPLING),
+            temperature: request.sampling.temperature.unwrap_or(NEUTRAL_SAMPLING),
+            top_p: request.sampling.top_p.unwrap_or(NEUTRAL_SAMPLING),
             ..GenerateOptions::default()
         };
         assert!(options.greedy, "completions default to greedy");
         options.resolve_sampling_defaults(
             Some(&declared(Some(true), Some(0.6))),
-            &completion_sampling_overrides(&request),
+            &chat_sampling_overrides(&request.sampling),
         );
         assert!(!options.greedy, "model do_sample=true must disable greedy");
         assert_eq!(
@@ -2954,7 +3597,7 @@ mod sampling_resolution_tests {
     // Zero temperature is still how OpenAI clients ask for determinism, and it
     // has to keep winning over a package that declares sampling.
     #[test]
-    fn an_explicit_zero_temperature_still_forces_greedy() {
+    fn an_explicit_zero_temperature_still_selects_a_point_mass() {
         let request = chat_request(json!({ "temperature": 0.0 }));
         let mut options = build_generate_options(&request, DEFAULT_MAX_OUTPUT_TOKENS);
         options.resolve_sampling_defaults(
@@ -2962,7 +3605,10 @@ mod sampling_resolution_tests {
             &chat_sampling_overrides(&request),
         );
 
-        assert!(options.greedy, "an explicit zero temperature is greedy");
+        assert!(
+            options.selects_greedily(),
+            "an explicit zero-temperature stage selects a point mass"
+        );
         assert_eq!(options.temperature, 0.0);
     }
 
@@ -3109,244 +3755,208 @@ mod output_budget_tests {
 #[cfg(test)]
 mod channel_gate_tests {
     use super::*;
-
-    /// Feeds a turn to an armed gate one token at a time and returns what
-    /// streamed.
-    ///
-    /// Each token is given as `(spelled, plain)` so the test can state exactly
-    /// where the special tokens fall, which is what the gate reads.
-    fn stream(tokens: &[(&str, &str)]) -> String {
-        channels(tokens).0
-    }
-
-    /// The private thinking an armed gate reports for the same turn.
-    fn thinking(tokens: &[(&str, &str)]) -> String {
-        channels(tokens).1
-    }
-
-    /// What an armed gate routes to each channel, as `(answer, thinking)`.
-    fn channels(tokens: &[(&str, &str)]) -> (String, String) {
-        let mut gate = PrivateChannelGate::new(true);
-        let mut answer = String::new();
-        let mut thought = String::new();
-        for (spelled, plain) in tokens {
-            let revealed = gate.push(Some(spelled), plain);
-            answer.push_str(&revealed.content);
-            thought.push_str(&revealed.reasoning);
+    #[test]
+    fn declared_channels_use_the_rendered_prefix_and_never_echo_it() {
+        let template = response_template::ResponseTemplate::compile(&serde_json::json!({
+            "start_anchor":"<assistant>",
+            "fields": {
+                "reasoning_content":{"open":"<think>","close":"</think>","content":"text"},
+                "content":{"content":"text"}
+            }
+        }))
+        .unwrap();
+        let mut parser = response_template::ResponseParser::new(
+            template,
+            "history<assistant><think>prior",
+            response_template::PrefixOutput::Exclude,
+            4096,
+        )
+        .unwrap();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        for text in ["new", "</thi", "nk>answer"] {
+            let delta = parser.feed(text).unwrap();
+            content.push_str(&delta.content);
+            reasoning.push_str(&delta.reasoning);
         }
-        let remaining = gate.flush();
-        answer.push_str(&remaining.content);
-        thought.push_str(&remaining.reasoning);
-        (answer, thought)
+        let tail = parser.finish().unwrap();
+        content.push_str(&tail.content);
+        reasoning.push_str(&tail.reasoning);
+        assert_eq!(content, "answer");
+        assert_eq!(reasoning, "new");
     }
-
-    // Private reasoning must never reach a streaming client, and a turn cut off
-    // before it addresses the user streams nothing rather than the thinking.
     #[test]
-    fn reasoning_never_streams() {
+    fn buffered_projection_resolves_final_replacements_without_streaming_retractions() {
+        let template = response_template::ResponseTemplate::compile(&serde_json::json!({
+            "start_anchor":"[a]", "fields":{"content":{"open_pattern":"<c>\\s*","close":"</c>"}}
+        }))
+        .unwrap();
+        let projection = ChatProjection {
+            template: Some(template),
+            prefix: Arc::from("[a]<c>old"),
+            prefix_output: response_template::PrefixOutput::Include,
+            max_bytes: 4096,
+            stop_sequences: Vec::new(),
+        };
+        let tokenizer = Tokenizer::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+        )
+        .unwrap();
+        let result = GenerateResult {
+            text: "</c><c>".into(),
+            token_ids: Vec::new(),
+            finish_reason: onnx_genai_engine::FinishReason::MaxTokens,
+            tool_calls: Vec::new(),
+            prefix_cache_hit_len: 0,
+            logprobs: None,
+            budget_cap: None,
+        };
         assert_eq!(
-            stream(&[
-                (" to=self", " to=self"),
-                ("<|message|>", ""),
-                ("secret", "secret"),
-                (" plan", " plan"),
-            ]),
-            ""
+            projection.buffered(&result, &tokenizer).unwrap(),
+            ChannelDelta::default()
         );
     }
 
-    // Once the turn addresses the user, the answer streams incrementally and
-    // the reasoning that preceded it stays withheld.
     #[test]
-    fn only_the_user_channel_streams() {
-        assert_eq!(
-            stream(&[
-                (" to=self", " to=self"),
-                ("<|message|>", ""),
-                ("secret", "secret"),
-                ("<|end|> to=user<|message|>", "<|end|> to=user"),
-                ("Hello", "Hello"),
-                (" there", " there"),
-                ("<|eot|>", ""),
-            ]),
-            "Hello there"
-        );
-    }
-
-    // A model may address any tool it was offered, and that channel carries a
-    // call rather than an answer, so it must not stream as content either.
-    #[test]
-    fn a_tool_channel_never_streams() {
-        assert_eq!(
-            stream(&[
-                (" to=functions.bash", " to=functions.bash"),
-                ("<|message|>", ""),
-                ("<atem:invoke name=\"bash\">", "<atem:invoke name=\"bash\">"),
-            ]),
-            ""
-        );
-    }
-
-    // An armed gate fails closed: a turn from a model that declares a private
-    // channel is withheld until it names the channel the caller may see, even
-    // when its opening tokens look like ordinary prose.
-    #[test]
-    fn an_armed_gate_withholds_an_unaddressed_turn() {
-        assert_eq!(stream(&[("Hello", "Hello"), (" world", " world")]), "");
-    }
-
-    // A session prompt is not wrapped in the chat template, so the model spells
-    // the turn header itself. The gate must not mistake that for prose and let
-    // the reasoning through.
-    #[test]
-    fn a_self_opened_turn_still_hides_reasoning() {
-        assert_eq!(
-            stream(&[
-                ("<|start|>", ""),
-                ("assistant", "assistant"),
-                (" to=self<|message|>", " to=self"),
-                ("secret", "secret"),
-                (
-                    "<|end|><|start|>assistant to=user<|message|>",
-                    "<|end|>assistant to=user"
-                ),
-                ("Hi", "Hi"),
-            ]),
-            "Hi"
-        );
-    }
-
-    // A token the tokenizer cannot spell leaves channels undecidable. An armed
-    // gate withholds it, because releasing a token that might be reasoning is
-    // the one mistake it cannot take back.
-    #[test]
-    fn an_unspellable_token_is_withheld() {
-        let mut gate = PrivateChannelGate::new(true);
-        assert_eq!(gate.push(None, "raw"), ChannelDelta::default());
-        assert_eq!(
-            gate.push(Some(" to=self<|message|>"), " to=self").content,
-            ""
-        );
-        assert_eq!(gate.push(Some("secret"), "secret").content, "");
-    }
-
-    // A model that declares no private channel is every ordinary model, and it
-    // must stream exactly what it generated.
-    #[test]
-    fn an_unarmed_gate_streams_everything() {
-        let mut gate = PrivateChannelGate::new(false);
-        assert_eq!(
-            gate.push(Some(" to=self<|message|>"), " to=self").content,
-            " to=self"
-        );
-        assert_eq!(gate.push(None, "raw").content, "raw");
-        assert_eq!(gate.flush(), ChannelDelta::default());
-    }
-
-    // Thinking is withheld from the answer but not thrown away: it is reported
-    // on its own channel as it is produced, so a client can show the model
-    // working instead of waiting on silence.
-    #[test]
-    fn thinking_is_reported_on_its_own_channel_as_it_is_produced() {
-        let tokens = [
-            (" to=self", " to=self"),
-            ("<|message|>", ""),
-            ("weigh", "weigh"),
-            (" it", " it"),
-            (
-                "<|eom|><|start|>assistant to=user<|message|>",
-                "assistant to=user",
-            ),
-            ("Hi", "Hi"),
-        ];
-        assert_eq!(stream(&tokens), "Hi");
-        assert_eq!(thinking(&tokens), "weigh it");
-    }
-
-    // A turn that never reaches the user still reports what it was thinking,
-    // which is the whole of what a truncated turn produced.
-    #[test]
-    fn a_turn_that_never_answers_still_reports_its_thinking() {
-        let tokens = [
-            (" to=self", " to=self"),
-            ("<|message|>", ""),
-            ("still", "still"),
-            (" going", " going"),
-        ];
-        assert_eq!(stream(&tokens), "");
-        assert_eq!(thinking(&tokens), "still going");
-    }
-
-    // Thinking resumed after a tool call is one train of thought, so the
-    // segments join rather than the later one replacing the earlier.
-    #[test]
-    fn thinking_resumed_after_a_tool_call_extends_it() {
-        let tokens = [
-            (" to=self<|message|>", " to=self"),
-            ("first", "first"),
-            (
-                "<|eom|><|start|>assistant to=self<|message|>",
-                "assistant to=self",
-            ),
-            ("second", "second"),
-        ];
-        assert_eq!(thinking(&tokens), "firstsecond");
-    }
-
-    // An unarmed gate has no private channel to report, so it never invents one.
-    #[test]
-    fn an_unarmed_gate_reports_no_thinking() {
-        let mut gate = PrivateChannelGate::new(false);
-        assert_eq!(gate.push(Some(" to=self<|message|>"), "x").reasoning, "");
-    }
-
-    // The streaming loop skips the per-token special-token decode when the gate
-    // is unarmed. That is sound only if an unarmed gate ignores `spelled`, so
-    // pin it: `armed()` reports the state, and an unarmed gate yields the same
-    // delta whether or not the spelling is supplied.
-    #[test]
-    fn an_unarmed_gate_ignores_spelling_so_the_decode_can_be_skipped() {
-        assert!(!PrivateChannelGate::new(false).armed());
-        assert!(PrivateChannelGate::new(true).armed());
-        let mut with = PrivateChannelGate::new(false);
-        let mut without = PrivateChannelGate::new(false);
-        for plain in [" to=self", "weigh", " it", "Hi"] {
-            let spelled = format!("{plain}<|message|>");
-            assert_eq!(with.push(Some(&spelled), plain), without.push(None, plain));
-        }
+    fn undeclared_protocol_is_not_interpreted() {
+        let projection = ChatProjection {
+            template: None,
+            prefix: Arc::from(""),
+            prefix_output: response_template::PrefixOutput::Include,
+            max_bytes: 4096,
+            stop_sequences: Vec::new(),
+        };
+        let mut gate = projection.start().unwrap();
+        let tokenizer = Tokenizer::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+        )
+        .unwrap();
+        let text = "to=self<|message|>ordinary text";
+        assert_eq!(gate.push_token(&tokenizer, 0, text).unwrap().content, text);
+        assert_eq!(gate.finish(&tokenizer).unwrap(), ChannelDelta::default());
     }
 }
 
-// The buffered (non-streamed) path does not go through the gate: it composes
-// `atem_reasoning_content` for the reasoning and `atem_visible_content` for
-// the answer, exactly as `run_chat_completion` does. These assert that a
-// buffered turn reports its thinking on `reasoning_content` while keeping it out
-// of `content`, so the two paths agree instead of the buffered one silently
-// stripping reasoning as it did before #1197 was reversed.
+async fn send_stream_end(tx: &mpsc::Sender<Result<Event, Infallible>>) -> anyhow::Result<()> {
+    tx.send(Ok(Event::default().data("[DONE]")))
+        .await
+        .context("stream receiver closed before terminal event")
+}
+
+async fn send_projection_error(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    error: anyhow::Error,
+) -> anyhow::Result<()> {
+    let body = ErrorResponse {
+        error: ErrorBody {
+            code: 500,
+            message: format!(
+                "response_template could not project generated output: {error:#}; check the declared delimiters and text fields"
+            ),
+            kind: "server_error",
+        },
+    };
+    tx.send(Ok(Event::default()
+        .event("error")
+        .data(serde_json::to_string(&body)?)))
+        .await
+        .context("stream receiver closed before response-template error delivery")
+}
+
+async fn send_usage(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    (id, created, model): (&str, u64, &str),
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> anyhow::Result<()> {
+    let data = serde_json::json!({
+        "id": id, "object": "chat.completion.chunk", "created": created,
+        "model": model, "choices": [], "usage": {
+            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens
+        }
+    });
+    tx.send(Ok(Event::default().data(data.to_string())))
+        .await
+        .context("stream receiver closed before usage delivery")
+}
+
 #[cfg(test)]
-mod buffered_reasoning_tests {
+mod completion_delivery_tests {
     use super::*;
-
-    // The final buffered message reports the thinking beside the answer, and the
-    // answer is only the user channel — reasoning is never spliced into content.
-    #[test]
-    fn a_buffered_message_reports_reasoning_beside_the_answer() {
-        let output =
-            " to=self<|message|>weigh it<|eom|><|start|>assistant to=user<|message|>Hi<|eot|>"
-                .to_string();
-        assert_eq!(atem_reasoning_content(&output).as_deref(), Some("weigh it"));
-        assert_eq!(atem_visible_content(&output).as_deref(), Some("Hi"));
+    fn tokenizer() -> Tokenizer {
+        Tokenizer::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+        )
+        .unwrap()
     }
-
-    // A buffered turn that never reaches the user still reports what it thought,
-    // and its answer is empty rather than the reasoning leaking out as one.
-    #[test]
-    fn a_buffered_turn_that_never_answers_still_reports_its_thinking() {
-        let output = " to=self<|message|>still going<|eot|>".to_string();
-        assert_eq!(
-            atem_reasoning_content(&output).as_deref(),
-            Some("still going")
-        );
-        assert_eq!(atem_visible_content(&output).as_deref(), Some(""));
+    #[tokio::test]
+    async fn failed_or_truncated_completion_delivery_never_claims_finished_usage() {
+        let tokenizer = tokenizer();
+        for explicit_error in [false, true] {
+            let (source, events) = mpsc::channel(2);
+            if explicit_error {
+                source
+                    .send(DriverEvent::Error(DriverFailure::internal(
+                        "fixture forward failed; retry with a valid input",
+                    )))
+                    .await
+                    .unwrap();
+            }
+            drop(source);
+            let (tx, mut rx) = mpsc::channel(2);
+            let delivery = deliver_completion(
+                &tx,
+                ("id", 1, "model", 3),
+                StartedCompletion {
+                    events,
+                    prompt_tokens: 3,
+                },
+                &tokenizer,
+                None,
+                &[],
+                false,
+            )
+            .await
+            .unwrap();
+            let CompletionDelivery::Failed(error) = delivery else {
+                panic!("unfinished source must fail instead of claiming completed usage");
+            };
+            assert!(error.message.contains(if explicit_error {
+                "fixture forward"
+            } else {
+                "final result"
+            }));
+            assert!(
+                rx.try_recv().is_err(),
+                "an incomplete input must not publish a choice finish frame"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn disconnected_completion_delivery_releases_its_source_without_finishing() {
+        let tokenizer = tokenizer();
+        let (source, events) = mpsc::channel(2);
+        let (tx, rx) = mpsc::channel(2);
+        drop(rx);
+        let delivery = deliver_completion(
+            &tx,
+            ("id", 1, "model", 0),
+            StartedCompletion {
+                events,
+                prompt_tokens: 3,
+            },
+            &tokenizer,
+            None,
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(delivery, CompletionDelivery::Disconnected));
+        assert!(source.is_closed());
     }
 }

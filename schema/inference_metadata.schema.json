@@ -4874,6 +4874,15 @@
           },
           "type": "array"
         },
+        "eot_token_id": {
+          "description": "Preferred end-of-turn token (schema v1.9+); must belong to eos_token_id.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "image_token_id": {
           "description": "Prompt placeholder replaced by image features.",
           "format": "uint32",

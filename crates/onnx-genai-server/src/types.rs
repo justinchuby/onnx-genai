@@ -5,9 +5,13 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AudioSpeechRequest {
     pub model: String,
     pub input: String,
+    /// Bypass declared text assembly when the caller supplies the complete raw prompt.
+    #[serde(default)]
+    pub raw_prompt: bool,
     #[serde(default)]
     pub instructions: String,
     #[serde(default = "default_wav_response_format")]
@@ -38,6 +42,7 @@ pub struct EmbeddingRequest {
 pub enum EmbeddingInput {
     String(String),
     Strings(Vec<String>),
+    Tokens(Vec<u32>),
     TokenArrays(Vec<Vec<u32>>),
 }
 
@@ -96,11 +101,12 @@ pub struct EmbeddingUsage {
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
+    #[serde(default)]
     pub model: String,
     pub messages: Vec<ChatMessage>,
     /// Deprecated by OpenAI in favour of `max_completion_tokens`, and absent
     /// from requests aimed at reasoning models. See [`Self::output_budget`].
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_token_budget")]
     pub max_tokens: Option<usize>,
     /// The budget covering reasoning *and* answer tokens, which is the only
     /// output limit OpenAI accepts for a reasoning model.
@@ -110,6 +116,18 @@ pub struct ChatCompletionRequest {
     /// [`Self::sampling_overrides`].
     #[serde(default)]
     pub temperature: Option<f32>,
+    #[serde(default)]
+    pub dynatemp_range: f32,
+    #[serde(default = "default_typical_p")]
+    pub dynatemp_exponent: f32,
+    #[serde(default)]
+    pub samplers: Option<onnx_genai_engine::SamplerSequence>,
+    #[serde(default = "default_top_n_sigma")]
+    pub top_n_sigma: f32,
+    #[serde(default = "default_adaptive_target")]
+    pub adaptive_target: f32,
+    #[serde(default = "default_adaptive_decay")]
+    pub adaptive_decay: f32,
     /// Absent when the caller left sampling to the model. See
     /// [`Self::sampling_overrides`].
     #[serde(default)]
@@ -120,15 +138,17 @@ pub struct ChatCompletionRequest {
     pub min_p: f32,
     #[serde(default)]
     pub top_a: f32,
-    #[serde(default = "default_typical_p")]
+    #[serde(default = "default_typical_p", rename = "typ_p")]
     pub typical_p: f32,
-    #[serde(default = "default_repetition_penalty")]
+    #[serde(default = "default_repetition_penalty", rename = "repeat_penalty")]
     pub repetition_penalty: f32,
+    #[serde(default = "default_repeat_last_n")]
+    pub repeat_last_n: i64,
     #[serde(default)]
     pub frequency_penalty: f32,
     #[serde(default)]
     pub presence_penalty: f32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_seed")]
     pub seed: Option<u64>,
     #[serde(default)]
     pub dry_multiplier: f32,
@@ -137,7 +157,7 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_dry_allowed_length")]
     pub dry_allowed_length: usize,
     #[serde(default)]
-    pub dry_sequence_breakers: Vec<u32>,
+    pub dry_sequence_breakers: Vec<String>,
     /// `0` disables Mirostat; `1` and `2` select the corresponding algorithm.
     #[serde(default)]
     pub mirostat: u8,
@@ -167,34 +187,154 @@ pub struct ChatCompletionRequest {
     /// the model's chat template on its own default.
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub chat_template_kwargs: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub stream_options: StreamOptions,
+    #[serde(default = "default_true")]
+    pub add_generation_prompt: bool,
+    #[serde(default)]
+    pub continue_final_message: ChatContinuation,
+    /// Retain extensions so unsupported active controls cannot silently disappear.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+/// llama.cpp's explicit final-message continuation intent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChatContinuation {
+    #[default]
+    None,
+    Auto,
+    Content,
+    Reasoning,
+}
+
+impl ChatContinuation {
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+impl<'de> Deserialize<'de> for ChatContinuation {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Null | serde_json::Value::Bool(false) => Ok(Self::None),
+            serde_json::Value::Bool(true) => Ok(Self::Auto),
+            serde_json::Value::String(mode) if mode == "content" => Ok(Self::Content),
+            serde_json::Value::String(mode) if mode == "reasoning_content" => Ok(Self::Reasoning),
+            _ => Err(D::Error::custom(
+                "continue_final_message must be null, a boolean, \"content\" or \"reasoning_content\"; select a supported continuation mode",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn deserialize_token_budget<'de, D: Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+    let value = Option::<i64>::deserialize(d)?;
+    match value {
+        None | Some(-1) => Ok(None),
+        Some(value) => usize::try_from(value).map(Some).map_err(|_| {
+            D::Error::custom("max_tokens must be -1 (server limit) or a non-negative integer")
+        }),
+    }
+}
+
+fn deserialize_seed<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let value = Option::<serde_json::Number>::deserialize(d)?;
+    match value {
+        None => Ok(None),
+        Some(value) if value.as_i64() == Some(-1) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            D::Error::custom("seed must be -1 (random) or an unsigned 64-bit integer")
+        }),
+    }
+}
+
+/// One completion input after HTTP batch classification, with shared controls.
+#[derive(Debug)]
 pub struct CompletionRequest {
-    pub model: String,
-    pub prompt: String,
-    #[serde(default)]
+    pub prompt: crate::MixedPrompt,
     pub suffix: Option<String>,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
-    /// Absent when the caller left sampling to the model.
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    /// Absent when the caller left sampling to the model.
-    #[serde(default)]
-    pub top_p: Option<f32>,
-    #[serde(default)]
-    pub min_p: f32,
-    #[serde(default)]
-    pub frequency_penalty: f32,
-    #[serde(default)]
-    pub presence_penalty: f32,
-    #[serde(default)]
-    pub stream: bool,
-    #[serde(default)]
-    pub stop: Option<StopInput>,
-    #[serde(default)]
     pub logprobs: Option<usize>,
+    pub sampling: std::sync::Arc<ChatCompletionRequest>,
+}
+impl<'de> Deserialize<'de> for CompletionRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut body = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let prompt = body
+            .remove("prompt")
+            .ok_or_else(|| D::Error::custom("prompt is required for completions"))?;
+        let prompt = crate::MixedPrompt::parse_completion(prompt).map_err(D::Error::custom)?;
+        let suffix = body
+            .remove("suffix")
+            .map(serde_json::from_value::<Option<String>>)
+            .transpose()
+            .map_err(D::Error::custom)?
+            .flatten();
+        let logprobs = body
+            .remove("logprobs")
+            .map(serde_json::from_value::<Option<usize>>)
+            .transpose()
+            .map_err(|error| {
+                D::Error::custom(format!(
+                    "logprobs must be a non-negative integer or null: {error}"
+                ))
+            })?
+            .flatten();
+        for field in [
+            "messages",
+            "top_logprobs",
+            "chat_template_kwargs",
+            "add_generation_prompt",
+        ] {
+            if body.contains_key(field) {
+                return Err(D::Error::custom(format!(
+                    "{field} is not a raw text completion field; use /v1/chat/completions for chat rendering and use integer logprobs for legacy token probabilities"
+                )));
+            }
+        }
+        if let Some(echo) = body.remove("echo")
+            && echo != false
+        {
+            return Err(D::Error::custom(
+                "echo=true is unsupported; omit echo or send false to return only generated text",
+            ));
+        }
+        body.insert(
+            "messages".into(),
+            serde_json::json!([{"role":"user","content":""}]),
+        );
+        body.insert("logprobs".into(), serde_json::json!(logprobs.is_some()));
+        if let Some(count) = logprobs {
+            body.insert("top_logprobs".into(), serde_json::json!(count));
+        }
+        let sampling: ChatCompletionRequest =
+            serde_path_to_error::deserialize(serde_json::Value::Object(body))
+                .map_err(D::Error::custom)?;
+        if sampling.has_tool_context() || sampling.reasoning_effort.is_some() {
+            return Err(D::Error::custom(
+                "tools and reasoning_effort require /v1/chat/completions; raw completions do not render a chat template",
+            ));
+        }
+        Ok(Self {
+            prompt,
+            suffix,
+            logprobs,
+            sampling: std::sync::Arc::new(sampling),
+        })
+    }
 }
 
 /// How much a reasoning model should think before answering, in OpenAI's
@@ -224,6 +364,87 @@ impl ReasoningEffort {
 }
 
 impl ChatCompletionRequest {
+    pub(crate) fn continuation_mode(&self) -> ChatContinuation {
+        match self.continue_final_message {
+            ChatContinuation::Auto => {
+                let reasoning_only = self.messages.last().is_some_and(|last| {
+                    let empty = last.content.as_ref().is_none_or(|content| match content {
+                        ChatMessageContent::Text(text) => text.is_empty(),
+                        ChatMessageContent::Parts(parts) => parts.is_empty(),
+                    });
+                    empty
+                        && last
+                            .reasoning_content
+                            .as_ref()
+                            .is_some_and(|text| !text.is_empty())
+                });
+                if reasoning_only {
+                    ChatContinuation::Reasoning
+                } else {
+                    ChatContinuation::Content
+                }
+            }
+            mode => mode,
+        }
+    }
+
+    pub(crate) fn validate_continuation(&self) -> anyhow::Result<()> {
+        if !self.continue_final_message.is_enabled() {
+            return Ok(());
+        }
+        let last=self.messages.last().filter(|message|message.role.trim()=="assistant")
+            .ok_or_else(||anyhow::anyhow!("continue_final_message requires a final assistant message; append the assistant text to continue"))?;
+        anyhow::ensure!(
+            !last
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty()),
+            "continue_final_message cannot resume an assistant message containing tool_calls; finish the tool results before continuing"
+        );
+        match self.continuation_mode() {
+            ChatContinuation::Reasoning => {
+                anyhow::ensure!(
+                    last.reasoning_content
+                        .as_ref()
+                        .is_some_and(|text| !text.trim().is_empty()),
+                    "continue_final_message reasoning_content requires nonempty final assistant reasoning_content; provide the reasoning prefix to resume"
+                );
+            }
+            _ => {
+                anyhow::ensure!(
+                    last.content
+                        .as_ref()
+                        .is_some_and(|content| !content.text().trim().is_empty()),
+                    "continue_final_message content requires nonempty final assistant content; provide the answer prefix to resume"
+                );
+                if self.wants_constrained_json() {
+                    let prefix = last
+                        .content
+                        .as_ref()
+                        .map(|content| content.text())
+                        .unwrap_or_default();
+                    onnx_genai_engine::JsonConstraint::new(prefix).map_err(|error| {
+                        anyhow::anyhow!("continue_final_message JSON prefix rejected: {error}")
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn effective_add_generation_prompt(&self) -> bool {
+        self.add_generation_prompt && !self.continue_final_message.is_enabled()
+    }
+
+    pub(crate) fn validate_plain_continuation(&self) -> anyhow::Result<()> {
+        self.validate_continuation()?;
+        anyhow::ensure!(
+            self.continuation_mode() != ChatContinuation::Reasoning,
+            "reasoning continuation requires a declared response_template and a chat template preserving reasoning_content; use model-aware server preparation rather than the plain prompt builder"
+        );
+        Ok(())
+    }
+
     /// How many tokens this turn may decode, given the server's cap.
     ///
     /// `max_completion_tokens` supersedes `max_tokens`, which OpenAI deprecated
@@ -613,6 +834,8 @@ pub struct ChatChoice {
     pub index: usize,
     pub message: ChatMessage,
     pub finish_reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequence: Option<String>,
     pub logprobs: Option<ChatLogprobs>,
 }
 
@@ -671,8 +894,18 @@ pub struct CompletionLogprobs {
     pub text_offset: Vec<usize>,
 }
 
-fn default_max_tokens() -> usize {
-    256
+pub(crate) const DEFAULT_REPEAT_LAST_N: i64 = 64;
+fn default_repeat_last_n() -> i64 {
+    DEFAULT_REPEAT_LAST_N
+}
+fn default_adaptive_target() -> f32 {
+    -1.0
+}
+fn default_adaptive_decay() -> f32 {
+    0.9
+}
+fn default_top_n_sigma() -> f32 {
+    -1.0
 }
 fn default_typical_p() -> f32 {
     1.0
@@ -694,4 +927,72 @@ fn default_mirostat_eta() -> f32 {
 }
 fn default_xtc_threshold() -> f32 {
     0.1
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn continuation_wire_modes_match_upstream_values_and_reject_unknown_forms() {
+        for (wire, expected) in [
+            (json!(null), ChatContinuation::None),
+            (json!(false), ChatContinuation::None),
+            (json!(true), ChatContinuation::Auto),
+            (json!("content"), ChatContinuation::Content),
+            (json!("reasoning_content"), ChatContinuation::Reasoning),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<ChatContinuation>(wire).unwrap(),
+                expected
+            );
+        }
+        for wire in [
+            json!(1),
+            json!([]),
+            json!({}),
+            json!("auto"),
+            json!("CONTENT"),
+        ] {
+            let error = serde_json::from_value::<ChatContinuation>(wire)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("continue_final_message") && error.contains("reasoning_content"),
+                "{error}"
+            );
+        }
+    }
+    #[test]
+    fn continuation_auto_resolves_content_before_reasoning_without_treating_parts_as_empty_text() {
+        let request = |content: serde_json::Value,
+                       mode: serde_json::Value|
+         -> ChatCompletionRequest {
+            serde_json::from_value(json!({"continue_final_message":mode,"messages":[{"role":"assistant","content":content,"reasoning_content":"thought"}]})).unwrap()
+        };
+        assert_eq!(
+            request(json!("answer"), json!(true)).continuation_mode(),
+            ChatContinuation::Content
+        );
+        assert_eq!(
+            request(json!(""), json!(true)).continuation_mode(),
+            ChatContinuation::Reasoning
+        );
+        assert_eq!(
+            request(json!([]), json!(true)).continuation_mode(),
+            ChatContinuation::Reasoning
+        );
+        assert_eq!(
+            request(json!([{"type":"text","text":""}]), json!(true)).continuation_mode(),
+            ChatContinuation::Content
+        );
+        assert_eq!(
+            request(json!(""), json!("content")).continuation_mode(),
+            ChatContinuation::Content
+        );
+        assert_eq!(
+            request(json!("answer"), json!("reasoning_content")).continuation_mode(),
+            ChatContinuation::Reasoning
+        );
+    }
 }

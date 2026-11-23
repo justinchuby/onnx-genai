@@ -45,6 +45,7 @@ pub(crate) struct ActiveGenerate {
     pub(crate) prefix_cache_hit_len: usize,
     pub(crate) generated_tokens: Vec<TokenId>,
     pub(crate) generated_text: String,
+    pub(crate) text_decoder: crate::tokenization::TokenTextDecoder,
     pub(crate) logprobs: Option<Vec<TokenLogprob>>,
     pub(crate) budget_cap: Option<GenerationBudgetCap>,
     pub(crate) step: usize,

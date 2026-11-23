@@ -1,6 +1,6 @@
 //! Public generation API types and configuration.
 
-use crate::logits::{StopSequence, TokenId};
+use crate::logits::{LogitBias, StopSequence, TokenId};
 use anyhow::Context as _;
 use onnx_genai_kv::{CachePriority, DEFAULT_CHUNK_SIZE, KvDType, LocalTieredConfig, SequenceId};
 use onnx_genai_metadata::{GenerationContract, GenerationDefaults};
@@ -1158,8 +1158,10 @@ pub struct DryConfig {
     pub base: f32,
     /// Repeated prefix length allowed before penalties begin.
     pub allowed_length: usize,
-    /// Tokens that stop matching across semantic sequence boundaries.
-    pub sequence_breakers: Vec<TokenId>,
+    /// Token sequences that stop matching across semantic boundaries.
+    pub sequence_breakers: Vec<Vec<TokenId>>,
+    /// Maximum recent history to inspect; None uses all prompt/generated tokens.
+    pub window: Option<usize>,
 }
 
 /// Mirostat feedback algorithm version.
@@ -1189,13 +1191,143 @@ pub struct XtcConfig {
     pub threshold: f32,
 }
 
+/// Entropy-driven temperature interval around `GenerateOptions::temperature`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DynamicTemperatureConfig {
+    /// Half-width of the temperature interval; zero disables adaptation.
+    pub range: f32,
+    /// Power applied to normalized entropy; zero selects the upper endpoint.
+    pub exponent: f32,
+}
+
+/// Target-probability selector controls. Negative targets disable adaptation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdaptivePConfig {
+    pub target: f32,
+    pub decay: f32,
+}
+impl Default for AdaptivePConfig {
+    fn default() -> Self {
+        Self {
+            target: -1.0,
+            decay: 0.9,
+        }
+    }
+}
+impl AdaptivePConfig {
+    pub fn validate(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.target.is_finite() && self.target <= 1.0,
+            "adaptive_target must be finite and at most 1; use a negative value to disable adaptation"
+        );
+        anyhow::ensure!(
+            self.decay.is_finite() && (0.0..=0.99).contains(&self.decay),
+            "adaptive_decay must be finite and between 0 and 0.99"
+        );
+        Ok(())
+    }
+}
+
+/// A stage in an explicitly ordered token-sampling pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplerStage {
+    Penalties,
+    AdaptiveP,
+    Infill,
+    Dry,
+    TopNSigma,
+    TopK,
+    #[serde(rename = "typ_p")]
+    TypicalP,
+    TopP,
+    MinP,
+    TopA,
+    Xtc,
+    Temperature,
+}
+
+impl<'de> Deserialize<'de> for SamplerStage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let normalized = value.to_ascii_lowercase().replace(['_', '-'], "");
+        match normalized.as_str() {
+            "penalties" => Ok(Self::Penalties),
+            "adaptivep" => Ok(Self::AdaptiveP),
+            "infill" => Ok(Self::Infill),
+            "dry" => Ok(Self::Dry),
+            "topnsigma" => Ok(Self::TopNSigma),
+            "topk" => Ok(Self::TopK),
+            "typp" | "typ" => Ok(Self::TypicalP),
+            "topp" | "nucleus" => Ok(Self::TopP),
+            "minp" => Ok(Self::MinP),
+            "topa" => Ok(Self::TopA),
+            "xtc" => Ok(Self::Xtc),
+            "temperature" | "temp" => Ok(Self::Temperature),
+            _ => Err(serde::de::Error::custom(format!(
+                "samplers contains unsupported stage '{value}'; use penalties, adaptive_p, infill, dry, top_n_sigma, top_k, typ_p, top_p, min_p, top_a, xtc or temperature"
+            ))),
+        }
+    }
+}
+
+/// Bounded ordered sampling stages. Empty lists intentionally apply no stages.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(try_from = "Vec<SamplerStage>", into = "Vec<SamplerStage>")]
+pub struct SamplerSequence(Vec<SamplerStage>);
+
+impl SamplerSequence {
+    pub const MAX_STAGES: usize = 64;
+    pub const DEFAULT: &'static [SamplerStage] = &[
+        SamplerStage::Penalties,
+        SamplerStage::Dry,
+        SamplerStage::TopNSigma,
+        SamplerStage::TopK,
+        SamplerStage::TypicalP,
+        SamplerStage::TopP,
+        SamplerStage::MinP,
+        SamplerStage::TopA,
+        SamplerStage::Xtc,
+        SamplerStage::Temperature,
+    ];
+    pub fn new(stages: Vec<SamplerStage>) -> Result<Self, &'static str> {
+        if stages.len() > Self::MAX_STAGES {
+            return Err("samplers must contain at most 64 stages; shorten the requested pipeline");
+        }
+        Ok(Self(stages))
+    }
+    pub fn stages(&self) -> &[SamplerStage] {
+        &self.0
+    }
+}
+impl TryFrom<Vec<SamplerStage>> for SamplerSequence {
+    type Error = &'static str;
+    fn try_from(value: Vec<SamplerStage>) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl From<SamplerSequence> for Vec<SamplerStage> {
+    fn from(value: SamplerSequence) -> Self {
+        value.0
+    }
+}
+
 /// User-controllable decoding options for Phase 1 generation.
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
     /// Maximum tokens to produce after the prompt.
     pub max_new_tokens: usize,
-    /// Temperature applied before sampling. Zero forces greedy selection.
+    /// Temperature at its sampling stage. Zero creates a point mass there.
     pub temperature: f32,
+    /// Optional entropy-driven temperature scaling; zero range disables it.
+    pub dynamic_temperature: Option<DynamicTemperatureConfig>,
+    /// An explicit sequence replaces the default stage list, including omissions.
+    pub sampler_order: Option<SamplerSequence>,
+    /// Mask logits more than this many population standard deviations below the maximum.
+    /// Non-positive values disable the mask.
+    pub top_n_sigma: f32,
+    /// Used only when the ordered list explicitly includes adaptive_p.
+    pub adaptive_p: AdaptivePConfig,
     /// Nucleus sampling probability. Values >= 1 disable top-p filtering.
     pub top_p: f32,
     /// Keep only the top-k logits before sampling. Zero disables top-k filtering.
@@ -1206,15 +1338,17 @@ pub struct GenerateOptions {
     pub top_a: f32,
     /// Locally typical cumulative probability. One disables typical filtering.
     pub typical_p: f32,
-    /// Repetition penalty applied to prompt and generated tokens. Values <= 1 disable it.
+    /// Repetition penalty applied to seen tokens. One disables it; values below one reward repetition.
     pub repetition_penalty: f32,
-    /// When `Some(n)`, the repetition penalty only considers the most recent `n`
+    /// When `Some(n)`, all three penalties only consider the most recent `n`
     /// tokens of the combined prompt+generated stream. `None` uses the whole history.
-    pub repetition_window: Option<usize>,
-    /// OpenAI-style count penalty: logit[t] -= frequency_penalty * count(t).
+    pub penalty_window: Option<usize>,
+    /// Count penalty over the shared prompt/generated history window.
     pub frequency_penalty: f32,
-    /// OpenAI-style presence penalty: logit[t] -= presence_penalty once if seen.
+    /// Presence penalty applied once to each token seen in the shared window.
     pub presence_penalty: f32,
+    /// Explicit token biases applied before penalties, constraints and sampling.
+    pub logit_bias: std::collections::BTreeMap<TokenId, LogitBias>,
     /// Optional DRY n-gram repetition penalty.
     pub dry: Option<DryConfig>,
     /// Optional adaptive Mirostat sampler.
@@ -1232,6 +1366,8 @@ pub struct GenerateOptions {
     /// A model may have several package-default end tokens, so callers that
     /// need a multi-id override use [`Self::eos_token_ids`].
     pub eos_token_id: Option<TokenId>,
+    /// Preferred end-of-turn token for infill; must be in the effective EOS set.
+    pub eot_token_id: Option<TokenId>,
     /// A caller's optional multi-id EOS override.
     ///
     /// When neither request field is set, the engine copies the package default
@@ -1271,15 +1407,20 @@ impl Default for GenerateOptions {
         Self {
             max_new_tokens: 128,
             temperature: 1.0,
+            dynamic_temperature: None,
+            sampler_order: None,
+            top_n_sigma: -1.0,
+            adaptive_p: AdaptivePConfig::default(),
             top_p: 1.0,
             top_k: 0,
             min_p: 0.0,
             top_a: 0.0,
             typical_p: 1.0,
             repetition_penalty: 1.0,
-            repetition_window: None,
+            penalty_window: None,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            logit_bias: Default::default(),
             dry: None,
             mirostat: None,
             xtc: None,
@@ -1287,6 +1428,7 @@ impl Default for GenerateOptions {
             seed: None,
             stop_sequences: Vec::new(),
             eos_token_id: None,
+            eot_token_id: None,
             eos_token_ids: Vec::new(),
             stop_on_eos: true,
             max_context: None,
@@ -1332,6 +1474,31 @@ pub struct SamplingOverrides {
 }
 
 impl GenerateOptions {
+    /// Resolve request-local processor capabilities before admitting generation.
+    /// The decoder builds its own mutable chain when execution starts.
+    pub fn validate_processors(&self, tokenizer: &onnx_genai_ort::Tokenizer) -> anyhow::Result<()> {
+        crate::processors::build_processor_chain(self, Some(tokenizer), false).map(drop)
+    }
+
+    /// Validate explicit token biases against the admitted model vocabulary.
+    pub fn validate_logit_bias(&self, tokenizer: &onnx_genai_ort::Tokenizer) -> anyhow::Result<()> {
+        for id in self.logit_bias.keys() {
+            anyhow::ensure!(
+                tokenizer.inner().id_to_token(*id).is_some(),
+                "logit_bias token id {id} is absent from the model vocabulary"
+            );
+        }
+        anyhow::ensure!(
+            self.logit_bias
+                .values()
+                .filter(|bias| matches!(bias, LogitBias::Ban))
+                .count()
+                < tokenizer.inner().get_vocab_size(true),
+            "logit_bias bans the entire model vocabulary; leave at least one token available"
+        );
+        Ok(())
+    }
+
     /// Whether `token` ends generation.
     ///
     /// The single place that question is answered, so the fast path, the
@@ -1343,21 +1510,23 @@ impl GenerateOptions {
             && (self.eos_token_ids.contains(&token) || self.eos_token_id == Some(token))
     }
 
-    /// Whether token selection is greedy: the maximum logit wins, deterministically.
-    ///
-    /// `temperature == 0.0` means the same thing as `greedy` -- a zero-temperature
-    /// softmax is a point mass on the maximum -- and callers use both spellings,
-    /// so every decision that turns on "is this greedy" must ask here rather than
-    /// re-spell the disjunction. Three places had spelled it out inline and one
-    /// of them was already drifting.
-    ///
-    /// This is the predicate that decides whether the sampling warpers
-    /// (temperature, top-k, top-p, min-p, top-a, typical-p, mirostat, XTC) are
-    /// built at all: under greedy selection they cannot affect the outcome that
-    /// the caller asked for, so applying them would be a silent contradiction of
-    /// the request.
+    /// Whether final selection is deterministic after the processor chain.
+    /// An explicit greedy policy bypasses warpers. Otherwise a temperature-zero
+    /// stage creates a point mass only when that stage is present and its
+    /// dynamic interval is disabled. Stage execution is a separate question:
+    /// earlier penalties/filters still run before a zero-temperature stage.
     pub fn selects_greedily(&self) -> bool {
-        self.greedy || self.temperature == 0.0
+        self.greedy
+            || (self.temperature == 0.0
+                && (self.mirostat.is_some()
+                    || self
+                        .dynamic_temperature
+                        .is_none_or(|dynamic| dynamic.range == 0.0))
+                && (self.mirostat.is_some()
+                    || self
+                        .sampler_order
+                        .as_ref()
+                        .is_none_or(|order| order.stages().contains(&SamplerStage::Temperature))))
     }
 
     /// Resolve sampling controls against a model author's declared generation
@@ -1378,15 +1547,11 @@ impl GenerateOptions {
     /// runtime from baking in a decoding assumption the model contradicts
     /// (RULES.md rule 2).
     ///
-    /// After the four controls are resolved, a *resolved* temperature of `0.0`
-    /// forces `greedy = true`, regardless of where that zero came from (an
-    /// explicit caller override, or a model that declares `do_sample: true`
-    /// alongside `temperature: 0.0`). Temperature zero has no stochastic meaning
-    /// — the sampler already collapses it to argmax — so the resolved
-    /// `GenerateOptions` is made self-consistent here rather than leaving a
-    /// `greedy: false, temperature: 0.0` state that reads as "sample at zero".
-    /// Every consumer (not just the CLI) therefore inherits the
-    /// `temperature 0 -> greedy` mapping by construction.
+    /// A zero temperature normally resolves to the global greedy policy when
+    /// there is no explicit sampling override or custom stage list. An explicit
+    /// sampling policy keeps the stages enabled instead: temperature zero then
+    /// creates a point mass at its position. This preserves both authored model
+    /// defaults and the ordered-sampling contract without discarding stages.
     pub fn resolve_sampling_defaults(
         &mut self,
         declared: Option<&GenerationDefaults>,
@@ -1417,10 +1582,13 @@ impl GenerateOptions {
         {
             self.top_k = top_k;
         }
-        // A resolved temperature of zero is greedy by definition; keep the flag
-        // and the value consistent so the decision is inspectable rather than
-        // implicit in the sampler (RULES.md rule 5).
-        if self.temperature == 0.0 {
+        // An explicit sampling override keeps ordered stage execution enabled;
+        // temperature zero still determines terminal selection through the
+        // shared selects_greedily() predicate.
+        if self.temperature == 0.0
+            && self.sampler_order.is_none()
+            && overrides.greedy != Some(false)
+        {
             self.greedy = true;
         }
     }
@@ -1520,14 +1688,36 @@ fn describe_supported(contract: &GenerationContract) -> String {
 /// Built-in constrained decoding grammars.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateConstraint {
-    /// Constrain output to one complete, well-formed JSON value.
-    Json,
+    /// Constrain the existing prefix plus new output to prefixes of one JSON value.
+    /// EOS requires a complete value; explicit stops and length limits may truncate it.
+    Json {
+        /// Existing assistant content consumed by the grammar, excluded from new output.
+        prefix: String,
+    },
     /// Constrain output to a JSON value accepted by the provided JSON Schema.
-    JsonSchema(String),
+    JsonSchema {
+        /// Serialized JSON Schema for the complete value.
+        schema: String,
+        /// Existing assistant text, excluded from newly generated output.
+        prefix: String,
+    },
+    /// Constrain declared response content while permitting separate reasoning.
+    ResponseJson {
+        schema: serde_json::Value,
+        template: std::sync::Arc<crate::response_template::ResponseTemplate>,
+        /// Actual rendered assistant prefill, including response framing.
+        prefix: String,
+        max_bytes: usize,
+    },
     /// Constrain output to text matching the provided Rust regular expression.
     Regex(String),
-    /// Constrain output to the provided llguidance Lark grammar.
-    Lark(String),
+    /// Constrain existing prefix plus output to the provided llguidance Lark grammar.
+    Lark {
+        /// Complete grammar, including any declared response framing.
+        grammar: String,
+        /// Existing text consumed by the grammar, excluded from newly generated output.
+        prefix: String,
+    },
 }
 
 impl GenerateOptions {
@@ -1535,8 +1725,26 @@ impl GenerateOptions {
         if self.max_new_tokens == 0 {
             anyhow::bail!("max_new_tokens must be greater than zero");
         }
+        self.adaptive_p.validate()?;
         if !self.temperature.is_finite() || self.temperature < 0.0 {
             anyhow::bail!("temperature must be finite and non-negative");
+        }
+        if let Some(dynamic) = self.dynamic_temperature {
+            anyhow::ensure!(
+                dynamic.range.is_finite() && dynamic.range >= 0.0,
+                "dynatemp_range must be finite and non-negative"
+            );
+            anyhow::ensure!(
+                dynamic.exponent.is_finite() && dynamic.exponent >= 0.0,
+                "dynatemp_exponent must be finite and non-negative"
+            );
+            anyhow::ensure!(
+                (self.temperature + dynamic.range).is_finite(),
+                "temperature + dynatemp_range must be finite; reduce the requested range"
+            );
+        }
+        if !self.top_n_sigma.is_finite() {
+            anyhow::bail!("top_n_sigma must be finite; use a non-positive value to disable it");
         }
         if !self.top_p.is_finite() || self.top_p < 0.0 {
             anyhow::bail!("top_p must be finite and non-negative");
@@ -1559,6 +1767,15 @@ impl GenerateOptions {
         if !self.presence_penalty.is_finite() {
             anyhow::bail!("presence_penalty must be finite");
         }
+        for (id, bias) in &self.logit_bias {
+            if let LogitBias::Add(value) = bias
+                && !value.is_finite()
+            {
+                anyhow::bail!(
+                    "logit_bias[{id}] must be finite; use LogitBias::Ban to exclude a token"
+                );
+            }
+        }
         if let Some(dry) = &self.dry {
             if !dry.multiplier.is_finite() || dry.multiplier < 0.0 {
                 anyhow::bail!("dry multiplier must be finite and non-negative");
@@ -1566,6 +1783,12 @@ impl GenerateOptions {
             if !dry.base.is_finite() || dry.base < 1.0 {
                 anyhow::bail!("dry base must be finite and at least 1");
             }
+            anyhow::ensure!(
+                dry.sequence_breakers
+                    .iter()
+                    .all(|breaker| !breaker.is_empty()),
+                "DRY sequence breakers must contain at least one token"
+            );
             if dry.allowed_length == 0 {
                 anyhow::bail!("dry allowed_length must be greater than zero");
             }
@@ -1769,6 +1992,22 @@ mod mtp_config_tests {
     }
 }
 
+/// Evaluate a prompt without committing any generated token.
+#[derive(Debug, Clone)]
+pub struct PrefillRequest {
+    pub prompt: GeneratePrompt,
+    pub max_context: Option<usize>,
+    /// Re-evaluate the complete prompt instead of loading an existing prefix.
+    pub cold_start: bool,
+}
+
+/// Actual prompt evaluation and the prefix reused from an earlier request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillResult {
+    pub prompt_tokens: usize,
+    pub prefix_cache_hit_len: usize,
+}
+
 /// A single generation request.
 #[derive(Debug, Clone)]
 pub struct GenerateRequest {
@@ -1896,6 +2135,9 @@ pub struct TokenLogprob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateToken {
     pub token_id: TokenId,
+    /// Incrementally decoded text, including required decoder lookbehind.
+    /// May be empty while a UTF-8 sequence is incomplete; terminal delivery
+    /// includes any pending text. Staged output may defer a changing prefix.
     pub text: String,
     pub finish_reason: Option<FinishReason>,
 }

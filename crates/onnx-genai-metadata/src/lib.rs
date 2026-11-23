@@ -26,6 +26,7 @@ pub mod parser;
 pub mod schema;
 pub mod session_state;
 mod state_plan;
+pub mod task_profiles;
 pub mod tool_protocol;
 pub mod validation;
 pub mod version;

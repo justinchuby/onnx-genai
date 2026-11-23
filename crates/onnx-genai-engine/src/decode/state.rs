@@ -377,10 +377,6 @@ impl DecodeState {
         self.sink_tokens
     }
 
-    pub(crate) fn uses_token_prefix_cache(&self) -> bool {
-        self.has_runner() || self.is_windowed()
-    }
-
     pub(crate) fn validate_rewind_to_len(
         &self,
         absolute_current_len: usize,
@@ -773,6 +769,20 @@ impl DecodeState {
             Some(DecodeRunner::PastPresent(session))
                 if session.mode() == DecodeKvMode::ZeroCopyRebind
         )
+    }
+
+    pub(crate) fn runner_prefix_bytes(&self, len: usize) -> anyhow::Result<u64> {
+        match &self.runner {
+            Some(DecodeRunner::PastPresent(session)) => Ok(session.kv_prefix_bytes(len)?),
+            _ => anyhow::bail!("this decoder runner cannot export a portable KV prefix"),
+        }
+    }
+
+    pub(crate) fn export_runner_prefix(&self, len: usize) -> anyhow::Result<Vec<(String, Value)>> {
+        match &self.runner {
+            Some(DecodeRunner::PastPresent(session)) => Ok(session.export_kv_prefix(len)?),
+            _ => anyhow::bail!("this decoder runner cannot export a portable KV prefix"),
+        }
     }
 
     /// Export the runner's current KV as owned `(past_key_values.* name, Value)`

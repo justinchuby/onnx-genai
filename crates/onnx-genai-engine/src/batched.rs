@@ -10,9 +10,7 @@ use crate::decode_loop::{
 };
 use crate::engine::Engine;
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
-use crate::processors::{
-    build_processor_chain, ensure_constrained_finish, select_next_token_with_rng,
-};
+use crate::processors::{build_processor_chain, select_next_token_with_rng};
 use crate::sampling::SamplingRng;
 use anyhow::Context;
 use onnx_genai_metadata::decoder_workflow::{CONTINUOUS_BATCH_CONTRACT, IterationPolicy};
@@ -248,7 +246,7 @@ pub struct ContinuousBatchManager<'a> {
     /// itself, and reading only the tokenizer's first id is what made a
     /// multi-EOS model run past its end on the batched route while stopping
     /// correctly on the single-row one.
-    eos_token_ids: Vec<TokenId>,
+    end_tokens: crate::engine::EndTokenPolicy,
     metadata_max_context: Option<usize>,
     static_max_len: usize,
     queue: VecDeque<PendingContinuousRequest>,
@@ -379,7 +377,7 @@ impl<'a> ContinuousBatchManager<'a> {
     fn new(
         mut decode: Box<dyn BatchedDecodeSession<'a> + 'a>,
         tokenizer: &'a Tokenizer,
-        eos_token_ids: Vec<TokenId>,
+        end_tokens: crate::engine::EndTokenPolicy,
         metadata_max_context: Option<usize>,
         max_batch: usize,
         runtime: Rc<WorkflowRuntime>,
@@ -402,7 +400,7 @@ impl<'a> ContinuousBatchManager<'a> {
         Ok(Self {
             decode,
             tokenizer,
-            eos_token_ids,
+            end_tokens,
             metadata_max_context,
             static_max_len,
             queue: VecDeque::new(),
@@ -439,7 +437,7 @@ impl<'a> ContinuousBatchManager<'a> {
         self.next_handle += 1;
         request.options.validate()?;
         let mut options = request.options;
-        crate::engine::apply_eos_policy(&mut options, &self.eos_token_ids);
+        crate::engine::apply_eos_policy(&mut options, &self.end_tokens)?;
         let prompt_tokens = match request.prompt {
             GeneratePrompt::TokenIds(tokens) => tokens,
             GeneratePrompt::TokenRows(_) => {
@@ -458,7 +456,7 @@ impl<'a> ContinuousBatchManager<'a> {
         if reached_context_limit(prompt_tokens.len(), max_context) {
             self.admissions
                 .push_back(ContinuousBatchAdmission::Assigned { handle });
-            ensure_constrained_finish(&options, "", FinishReason::Length)?;
+
             self.events.push_back(ContinuousBatchEvent::Finished {
                 handle,
                 result: finish_result(self.tokenizer, &[], FinishReason::Length, 0, None)?,
@@ -1086,7 +1084,7 @@ impl<'a> ContinuousBatchManager<'a> {
                     &row.options,
                     &row.chain,
                     &mut row.state.rng,
-                );
+                )?;
                 if let (Some(top_logprobs), Some(logprobs)) =
                     (row.options.top_logprobs, row.state.logprobs.as_mut())
                 {
@@ -1119,19 +1117,9 @@ impl<'a> ContinuousBatchManager<'a> {
         let finish_reason = match finish_reason {
             Some(reason) => Some(reason),
             None if row.state.generated_tokens.len() >= row.options.max_new_tokens => {
-                ensure_constrained_finish(
-                    &row.options,
-                    &row.state.generated_text,
-                    FinishReason::MaxTokens,
-                )?;
                 Some(FinishReason::MaxTokens)
             }
             None if reached_context_limit(row.context_tokens.len(), row.max_context) => {
-                ensure_constrained_finish(
-                    &row.options,
-                    &row.state.generated_text,
-                    FinishReason::Length,
-                )?;
                 Some(FinishReason::Length)
             }
             None => None,
@@ -1572,7 +1560,7 @@ impl Engine {
         // Resolved before the session borrows below, and from the same source
         // the single-row path uses: the manager cannot reach the package's
         // workflow once it holds a mutable session borrow.
-        let eos_token_ids = self.default_eos_token_ids()?;
+        let end_tokens = self.default_end_token_policy()?;
         // Native backend (#750 stage 4): wire the manager onto the native CUDA
         // persistent batch path. Stage 3a made the fused forward ragged (per-row
         // `row_lens`/`position_ids`/mask window) and stage 3b built the two seams
@@ -1607,7 +1595,7 @@ impl Engine {
             return ContinuousBatchManager::new(
                 decode,
                 tokenizer,
-                eos_token_ids,
+                end_tokens,
                 metadata_max_context,
                 max_batch,
                 runtime,
@@ -1703,7 +1691,7 @@ impl Engine {
             self.tokenizer.as_ref().context(
                 "continuous batching requires a tokenizer, which this package does not declare",
             )?,
-            eos_token_ids,
+            end_tokens,
             metadata_max_context,
             max_batch,
             runtime,
@@ -2530,7 +2518,7 @@ mod tests {
         let mut manager = ContinuousBatchManager::new(
             Box::new(RejectAssignDecode),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             1,
             batch_runtime(),
@@ -2567,7 +2555,7 @@ mod tests {
         let mut manager = ContinuousBatchManager::new(
             Box::new(AcceptAssignDecode),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             1,
             batch_runtime(),
@@ -2591,7 +2579,7 @@ mod tests {
         let mut manager = ContinuousBatchManager::new(
             Box::new(RejectAssignDecode),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             1,
             batch_runtime(),
@@ -2843,7 +2831,7 @@ mod tests {
         let mut manager = ContinuousBatchManager::new(
             Box::new(decode),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             4,
             batch_runtime(),
@@ -2898,7 +2886,7 @@ mod tests {
         let mut manager = ContinuousBatchManager::new(
             Box::new(decode),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             2,
             batch_runtime(),
@@ -2927,7 +2915,7 @@ mod tests {
                 false,
             )),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             1,
             batch_runtime(),
@@ -2983,7 +2971,7 @@ mod tests {
                 false,
             )),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             2,
             batch_runtime(),
@@ -3067,7 +3055,7 @@ mod tests {
         let mut manager = ContinuousBatchManager::new(
             Box::new(decode),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             1,
             batch_runtime(),
@@ -3147,7 +3135,7 @@ mod tests {
                 false,
             )),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             2,
             batch_runtime(),
@@ -3240,7 +3228,7 @@ mod tests {
                 false,
             )),
             &tokenizer,
-            vec![unreachable, stop],
+            crate::engine::EndTokenPolicy::new(vec![unreachable, stop], None).unwrap(),
             None,
             1,
             batch_runtime(),
@@ -3299,7 +3287,7 @@ mod tests {
         let mut device_manager = ContinuousBatchManager::new(
             Box::new(ScriptedBatchDecode::new(logits(), vocab, true)),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             3,
             batch_runtime(),
@@ -3308,7 +3296,7 @@ mod tests {
         let mut host_manager = ContinuousBatchManager::new(
             Box::new(ScriptedBatchDecode::new(logits(), vocab, false)),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             3,
             batch_runtime(),
@@ -3382,7 +3370,7 @@ mod tests {
         let mut manager = ContinuousBatchManager::new(
             Box::new(decode),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             3,
             batch_runtime(),
@@ -3423,7 +3411,7 @@ mod tests {
         let mut manager = ContinuousBatchManager::new(
             Box::new(decode),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             8,
             batch_runtime(),
@@ -3453,7 +3441,7 @@ mod tests {
         let mut manager = ContinuousBatchManager::new(
             Box::new(decode),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             3,
             batch_runtime(),
@@ -3490,7 +3478,7 @@ mod tests {
         let mut manager = ContinuousBatchManager::new(
             Box::new(decode),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             2,
             batch_runtime(),
@@ -3534,7 +3522,7 @@ mod tests {
         let manager = ContinuousBatchManager::new(
             Box::new(AcceptAssignDecode),
             &tokenizer,
-            Vec::new(),
+            crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
             None,
             1,
             batch_runtime(),

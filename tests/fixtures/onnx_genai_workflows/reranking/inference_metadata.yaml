@@ -1,0 +1,70 @@
+schema_version: v1.2
+package:
+  tokenizer:
+    algorithm: word_level
+    vocab_size: 32
+    artifacts:
+    - location: tokenizer.json
+    special_tokens:
+      bos_token_id: 2
+      eos_token_id: [3]
+profiles:
+  relevance:
+    kind: reranking
+    version: '1'
+    outputs:
+      score: probability
+pipeline:
+  workflow:
+    manifest: {}
+    inputs:
+      pair.ids:
+        contract:
+          dtype: int64
+          shape: [batch, sequence]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: runtime, version: '1.0', role: prompt_tokens}
+        source: {kind: request}
+        required: true
+      pair.mask:
+        contract:
+          dtype: int64
+          shape: [batch, sequence]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: application, name: attention_mask}
+        required: true
+      pair.segments:
+        contract:
+          dtype: int64
+          shape: [batch, sequence]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: opaque}
+        source: {kind: application, name: token_type_ids}
+        required: true
+    outputs:
+      probability:
+        contract:
+          dtype: float32
+          shape: [batch]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: tensor
+        stage: pre_adapter
+    components:
+      pair_classifier:
+        implementation:
+          kind: onnx
+          artifact: model.onnx.textproto
+    steps:
+    - kind: invoke
+      component: pair_classifier
+      inputs:
+        input_ids: pair.ids
+        attention_mask: pair.mask
+        token_type_ids: pair.segments
+      outputs:
+        score: inference.score
+    - kind: emit
+      value: inference.score
+      output: probability
+      mode: replace

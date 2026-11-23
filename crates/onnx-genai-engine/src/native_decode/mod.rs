@@ -295,19 +295,45 @@ pub struct CompressedStatePathStats {
     pub environment_reads: u64,
 }
 
-/// Deep-copy of the native loop-carried tensors at a semantic prefix boundary.
+/// Deep-copy of host-owned native state at a prefix or transaction boundary.
 ///
-/// Host-native decoding keeps dense KV and recurrent state in the same `past`
-/// map, so the production snapshot stores the whole map to make restoring a
-/// boundary actually executable. The recurrent entries are still identified
-/// from the declared present→past pairs for sizing and gating.
+/// Host-native state includes the `past` tensor map and optional in-place CPU
+/// KV bindings. The snapshot retains both, together with hidden conditioning,
+/// so restoring a boundary restores executable state rather than just lengths.
 pub(crate) struct NativePastSnapshot {
     past: HashMap<String, Tensor>,
     len: usize,
     bytes: u64,
+    last_hidden: Option<Vec<f32>>,
+    cpu_kv: Option<cpu::CpuKvSnapshot>,
 }
 
 impl NativePastSnapshot {
+    #[cfg(test)]
+    pub(crate) fn host_contents(
+        &self,
+    ) -> std::collections::BTreeMap<String, (Vec<usize>, DataType, Vec<u8>)> {
+        self.past
+            .iter()
+            .map(|(name, tensor)| {
+                (
+                    name.clone(),
+                    (
+                        tensor.shape.clone(),
+                        tensor.dtype,
+                        tensor.as_bytes().to_vec(),
+                    ),
+                )
+            })
+            .collect()
+    }
+    #[cfg(test)]
+    pub(crate) fn cpu_kv_snapshot(&self) -> Option<&cpu::CpuKvSnapshot> {
+        self.cpu_kv.as_ref()
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -735,10 +761,10 @@ impl NativeDecodeSession {
     }
 
     pub(crate) fn supports_past_snapshots(&self) -> bool {
+        // A complete host capture contains the declared record cursors and
+        // partial carries too. It restores a saved boundary, not an arbitrary
+        // prefix inferred from a token count.
         self.cuda.is_none()
-            && self.cpu_kv.is_none()
-            && self.has_recurrent_state()
-            && self.compressed_state.is_empty()
     }
 
     fn recurrent_past_names(&self) -> HashSet<String> {
@@ -798,22 +824,45 @@ impl NativeDecodeSession {
         !self.recurrent_past_names().is_empty() || !self.compressed_state.is_empty()
     }
 
-    pub(crate) fn snapshot_past(&self) -> anyhow::Result<NativePastSnapshot> {
-        if let Some(error) = self.compressed_state_refusal(NativeStateOperation::Snapshot, None) {
-            return Err(error);
-        }
+    pub(crate) fn past_snapshot_bytes(&self) -> anyhow::Result<u64> {
+        let past = self.past.values().try_fold(0u64, |sum, tensor| {
+            sum.checked_add(u64::try_from(tensor.as_bytes().len())?)
+                .context("native state snapshot byte count overflow")
+        })?;
+        let past = past
+            .checked_add(
+                self.cpu_kv
+                    .as_ref()
+                    .map_or(Ok(0), DecodeCpuKvState::snapshot_bytes)?,
+            )
+            .context("native in-place KV snapshot byte count overflow")?;
+        let hidden = self.last_hidden.as_ref().map_or(0, |hidden| hidden.len());
+        past.checked_add(
+            u64::try_from(hidden)?
+                .checked_mul(4)
+                .context("native hidden-state snapshot byte count overflow")?,
+        )
+        .context("native complete state snapshot byte count overflow")
+    }
+
+    pub(crate) fn snapshot_past(&mut self) -> anyhow::Result<NativePastSnapshot> {
         if !self.supports_past_snapshots() {
-            bail!("native past snapshots require host past tensors and recurrent state");
+            bail!(
+                "complete native state snapshots require host-owned state; this decoder keeps state on the device"
+            );
         }
         let recurrent = self.recurrent_past_names();
         if !recurrent.iter().all(|name| self.past.contains_key(name)) {
             bail!("cannot snapshot recurrent prefix before all recurrent tensors are materialized");
         }
-        let mut bytes = 0u64;
+        let bytes = self.past_snapshot_bytes()?;
+        let cpu_kv = self
+            .cpu_kv
+            .as_mut()
+            .map(DecodeCpuKvState::snapshot)
+            .transpose()?;
         let mut past = HashMap::with_capacity(self.past.len());
         for (name, tensor) in &self.past {
-            bytes =
-                bytes.saturating_add(u64::try_from(tensor.as_bytes().len()).unwrap_or(u64::MAX));
             past.insert(
                 name.clone(),
                 tensor.try_clone().map_err(anyhow::Error::from)?,
@@ -823,6 +872,8 @@ impl NativeDecodeSession {
             past,
             len: self.current_len,
             bytes,
+            last_hidden: self.last_hidden.clone(),
+            cpu_kv,
         })
     }
 
@@ -830,13 +881,10 @@ impl NativeDecodeSession {
         &mut self,
         snapshot: &NativePastSnapshot,
     ) -> anyhow::Result<()> {
-        if let Some(error) =
-            self.compressed_state_refusal(NativeStateOperation::Restore, Some(snapshot.len))
-        {
-            return Err(error);
-        }
         if !self.supports_past_snapshots() {
-            bail!("native past snapshots require host past tensors and recurrent state");
+            bail!(
+                "complete native state snapshots require host-owned state; this decoder keeps state on the device"
+            );
         }
         let mut restored = HashMap::with_capacity(snapshot.past.len());
         for (name, tensor) in &snapshot.past {
@@ -845,10 +893,40 @@ impl NativeDecodeSession {
                 tensor.try_clone().map_err(anyhow::Error::from)?,
             );
         }
+        self.restore_cpu_snapshot(snapshot.cpu_kv.as_ref())?;
         self.past = restored;
         self.current_len = snapshot.len;
-        self.last_hidden = None;
+        self.last_hidden = snapshot.last_hidden.clone();
         Ok(())
+    }
+
+    /// Restore a transaction-owned capture without allocating a second copy.
+    pub(crate) fn restore_owned_past_snapshot(
+        &mut self,
+        snapshot: NativePastSnapshot,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.supports_past_snapshots(),
+            "complete native state restore requires host-owned state; this decoder keeps state on the device"
+        );
+        self.restore_cpu_snapshot(snapshot.cpu_kv.as_ref())?;
+        self.past = snapshot.past;
+        self.current_len = snapshot.len;
+        self.last_hidden = snapshot.last_hidden;
+        Ok(())
+    }
+
+    fn restore_cpu_snapshot(
+        &mut self,
+        snapshot: Option<&cpu::CpuKvSnapshot>,
+    ) -> anyhow::Result<()> {
+        match (self.cpu_kv.as_mut(), snapshot) {
+            (Some(state), Some(snapshot)) => state.restore_snapshot(snapshot),
+            (None, None) => Ok(()),
+            _ => bail!(
+                "native state snapshot uses a different CPU KV storage mode; restore with the original decoder"
+            ),
+        }
     }
 
     /// Snapshot native state that cannot be token-prefix-sliced as of the last
@@ -1956,6 +2034,7 @@ impl NativeDecodeSession {
             tokenizer,
             runtime,
             None,
+            None,
             callback,
         )
     }
@@ -1968,6 +2047,7 @@ impl NativeDecodeSession {
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
         runtime: &crate::pipeline::WorkflowRuntime,
+        control: Option<&crate::pipeline::GenerationControl>,
         staged_output_observer: Option<&mut crate::pipeline::ToolCallStagedOutputObserver>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -1990,6 +2070,7 @@ impl NativeDecodeSession {
             &mut state,
             prompt_tokens,
             GenerationRequest {
+                control,
                 options,
                 chain,
                 tokenizer,
@@ -2073,6 +2154,7 @@ impl NativeDecodeSession {
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
         runtime: &crate::pipeline::WorkflowRuntime,
+        control: Option<&crate::pipeline::GenerationControl>,
         staged_output_observer: Option<&mut crate::pipeline::ToolCallStagedOutputObserver>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -2088,6 +2170,7 @@ impl NativeDecodeSession {
                 chain,
                 tokenizer,
                 runtime,
+                control,
                 staged_output_observer,
                 callback,
             );
@@ -2119,6 +2202,7 @@ impl NativeDecodeSession {
             &mut state,
             prompt_tokens,
             GenerationRequest {
+                control,
                 options,
                 chain,
                 tokenizer,

@@ -97,6 +97,7 @@ tracing = { workspace = true }
 onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.6" }
 
 [dev-dependencies]
+tempfile = "3"
 serde_yaml = { workspace = true }
 
 [lints]

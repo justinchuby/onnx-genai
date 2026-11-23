@@ -48,7 +48,6 @@ use crate::decode_loop::{
     reached_context_limit, select_and_commit_step,
 };
 use crate::logits::ProcessorChain;
-use crate::processors::ensure_constrained_finish;
 
 use super::workflow::{WorkflowExecutionPlan, WorkflowNodeHost, WorkflowNodeRequest};
 use super::{
@@ -395,6 +394,7 @@ pub(crate) trait GenerationCore: WorkflowNodeHost {
 
 /// Everything one generation needs beyond its decode executor.
 pub(crate) struct GenerationRequest<'a> {
+    pub(crate) control: Option<&'a super::GenerationControl>,
     pub(crate) options: &'a GenerateOptions,
     pub(crate) chain: &'a ProcessorChain,
     pub(crate) tokenizer: &'a Tokenizer,
@@ -414,6 +414,7 @@ pub(crate) struct GenerationNodeHost<'a, 'c, B: DecodeLoopBackend + ?Sized> {
     chain: &'a ProcessorChain,
     tokenizer: &'a Tokenizer,
     max_context: Option<usize>,
+    control: Option<&'a super::GenerationControl>,
     callback: Option<&'a mut GenerateTokenCallback<'c>>,
     staged_output_observer: Option<&'a mut ToolCallStagedOutputObserver>,
     /// Logits from this iteration's decode node, awaiting its policy node.
@@ -451,6 +452,7 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             chain: request.chain,
             tokenizer: request.tokenizer,
             max_context: request.max_context,
+            control: request.control,
             callback,
             staged_output_observer,
             pending_forward: None,
@@ -483,6 +485,9 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             self.options,
             self.chain,
         )?);
+        if let Some(control) = self.control {
+            control.check(super::GenerationBoundary::AfterDecoderForward)?;
+        }
         Ok(())
     }
 
@@ -491,6 +496,12 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             "the generation loop applied its token policy before any decoder forward pass \
              produced logits",
         )?;
+        let wants_callback = self.callback.is_some();
+        let mut committed_event = None;
+        let mut capture = |event: crate::config::GenerateToken| {
+            committed_event = Some(event);
+            Ok(())
+        };
         let (token, mut reason) = select_and_commit_step(
             self.backend,
             self.state,
@@ -498,7 +509,11 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             self.chain,
             self.tokenizer,
             forward,
-            None,
+            if wants_callback {
+                Some(&mut capture)
+            } else {
+                None
+            },
         )?;
         // The context bound is a stop like any other, decided by the policy that
         // just committed a token: the next iteration is the one that could not
@@ -506,18 +521,17 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
         // what lets `continue_when` remain the single liveness predicate.
         if reason.is_none() && reached_context_limit(self.backend.context_len(), self.max_context) {
             reason = Some(FinishReason::Length);
+            let tail = self.state.text_decoder.finish(self.tokenizer)?;
+            self.state.generated_text.push_str(&tail);
+            if let Some(event) = committed_event.as_mut() {
+                event.text.push_str(&tail);
+            }
         }
         self.finish = reason.clone();
         if let Some(callback) = self.callback.as_deref_mut() {
-            let text = self
-                .tokenizer
-                .decode(&[token])
-                .map_err(|error| anyhow::anyhow!("failed to detokenize token {token}: {error}"))?;
-            callback(crate::config::GenerateToken {
-                token_id: token,
-                text,
-                finish_reason: reason.clone(),
-            })?;
+            let mut event = committed_event.context("generation policy omitted its committed token event; repair the decode policy callback")?;
+            event.finish_reason = reason.clone();
+            callback(event)?;
         }
         self.publish_policy_outputs(request, token, reason.is_some())
     }
@@ -568,6 +582,13 @@ impl<B: DecodeLoopBackend + ?Sized> WorkflowNodeHost for GenerationNodeHost<'_, 
         DECODE_CORE_CONTRACTS
     }
 
+    fn observe_boundary(&mut self, boundary: super::GenerationBoundary) -> anyhow::Result<()> {
+        if let Some(control) = self.control {
+            control.check(boundary)?;
+        }
+        Ok(())
+    }
+
     fn begin_turn(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
         if let Some(observer) = self.staged_output_observer.as_deref_mut() {
             observer.begin_turn();
@@ -576,6 +597,9 @@ impl<B: DecodeLoopBackend + ?Sized> WorkflowNodeHost for GenerationNodeHost<'_, 
     }
 
     fn before_turn_commit(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
+        // The enclosing decoder participant owns semantic commit. This inner
+        // workflow pass only observes cancellation while its output is staged.
+        self.observe_boundary(super::GenerationBoundary::BeforeWorkflowNode)?;
         if let Some(observer) = self.staged_output_observer.as_deref_mut()
             && let StagedOutputObservation::TerminalComplete(calls) = observer
                 .finish("semantic commit")
@@ -734,7 +758,6 @@ impl WorkflowNodeHost for StagedOutputObserverHost<'_> {
 /// interpreter runs every step from its artifact.
 pub(crate) fn run_declared_generation(
     runtime: &WorkflowRuntime,
-    options: &GenerateOptions,
     tokenizer: Option<&Tokenizer>,
     request: PipelineGenerateRequest,
     mut core: Option<&mut dyn GenerationCore>,
@@ -775,16 +798,9 @@ pub(crate) fn run_declared_generation(
         };
         let (values, row_outputs) = plan.execute_retained_with_host_before_commit(
             &mut host,
-            |values, row_outputs, ended_by_predicate| {
+            |values, row_outputs, _ended_by_predicate| {
                 if generic_execution {
-                    preflight_generic_generation_output(
-                        runtime,
-                        options,
-                        tokenizer,
-                        values,
-                        row_outputs,
-                        ended_by_predicate,
-                    )?;
+                    preflight_generic_generation_output(runtime, tokenizer, values, row_outputs)?;
                 }
                 Ok(())
             },
@@ -833,11 +849,9 @@ pub(crate) fn run_declared_generation(
     /// the already validated, commit-only output.
     fn preflight_generic_generation_output(
         runtime: &WorkflowRuntime,
-        options: &GenerateOptions,
         tokenizer: Option<&Tokenizer>,
         values: &super::PipelineTensors,
         row_outputs: &std::collections::BTreeMap<String, Vec<String>>,
-        ended_by_predicate: bool,
     ) -> anyhow::Result<()> {
         let output = runtime
             .workflow_spec()
@@ -867,18 +881,10 @@ pub(crate) fn run_declared_generation(
                 u32::try_from(token).context("the workflow emitted a token outside uint32")
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let text = tokenizer
+        tokenizer
             .map(|tokenizer| tokenizer.decode(&tokens))
             .transpose()?;
-        ensure_constrained_finish(
-            options,
-            text.as_deref().unwrap_or_default(),
-            if ended_by_predicate {
-                FinishReason::EosToken
-            } else {
-                FinishReason::MaxTokens
-            },
-        )?;
+
         Ok(())
     }
 
@@ -904,17 +910,13 @@ pub(crate) fn run_declared_generation(
         .map(|tokenizer| tokenizer.decode(&token_ids))
         .transpose()?
         .unwrap_or_default();
-    ensure_constrained_finish(options, &text, finish_reason.clone())?;
 
     // A core that scored each token already delivered it. Replaying the stream
     // here would double every token a server streamed.
     let already_streamed = core.as_deref().is_some_and(GenerationCore::streams_tokens);
     if let (Some(callback), false) = (callback.as_mut(), already_streamed) {
-        for (index, token_id) in token_ids.iter().copied().enumerate() {
-            let token_text = tokenizer
-                .map(|tokenizer| tokenizer.decode(&[token_id]))
-                .transpose()?
-                .unwrap_or_default();
+        let pieces = crate::tokenization::token_texts(tokenizer, &token_ids)?;
+        for (index, (token_id, token_text)) in token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
                 token_id,
                 text: token_text,
@@ -986,7 +988,6 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
     // A prompt that already fills the context cannot take a step. Refusing
     // before the plan binds anything keeps the refusal free of partial state.
     if reached_context_limit(backend.context_len(), request.max_context) {
-        ensure_constrained_finish(request.options, &state.generated_text, FinishReason::Length)?;
         let tool_calls = if let Some(observer) = staged_output_observer.as_deref_mut() {
             observer
                 .finish("context-limit boundary")
@@ -1024,11 +1025,10 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
                 .saturating_sub(logprobs.len()),
         );
     }
-    let options = request.options.clone();
     let tokenizer = request.tokenizer;
     let pipeline_request = PipelineGenerateRequest::new(crate::GenerateRequest {
         prompt: crate::GeneratePrompt::TokenIds(prompt_tokens.to_vec()),
-        options: options.clone(),
+        options: request.options.clone(),
     });
     match staged_output_observer {
         Some(observer) => {
@@ -1041,7 +1041,6 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
             );
             run_declared_generation(
                 runtime,
-                &options,
                 Some(tokenizer),
                 pipeline_request,
                 Some(&mut host),
@@ -1053,7 +1052,6 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
             let mut host = GenerationNodeHost::new(backend, state, &request, callback);
             run_declared_generation(
                 runtime,
-                &options,
                 Some(tokenizer),
                 pipeline_request,
                 Some(&mut host),

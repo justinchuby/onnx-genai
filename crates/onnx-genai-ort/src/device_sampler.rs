@@ -427,6 +427,21 @@ __device__ __forceinline__ float blk_sum(float v) {
     return r;
 }
 
+// Candidate cardinalities must not round through f32 for large vocabularies.
+__device__ __forceinline__ int blk_count(int v) {
+    __shared__ int s[BLOCK];
+    int t = threadIdx.x;
+    s[t] = v;
+    __syncthreads();
+    for (int off = BLOCK >> 1; off > 0; off >>= 1) {
+        if (t < off) { s[t] += s[t + off]; }
+        __syncthreads();
+    }
+    int r = s[0];
+    __syncthreads();
+    return r;
+}
+
 // `w` holds temperature-scaled logits (NaN entries pre-set to -inf) and `m` is
 // their max. It applies the host processor pipeline SEQUENTIALLY — top-k, then
 // top-p (renormalized over the top-k survivors), then min-p — masking filtered
@@ -466,14 +481,15 @@ __device__ void finish_row(float* w, int vocab, float m,
         return;
     }
 
-    // ---------- top-k: mask logits below the k-th largest (with multiplicity) --
-    // Host `TopKProcessor` sorts the logits descending and thresholds at
-    // sorted[k-1], masking every logit strictly below it (ties at the threshold
-    // are all kept). Find that value by walking distinct logits downward until
-    // the running count of `>= thr` entries reaches k.
+    // ---------- top-k: retain exactly k, resolving ties by lowest token id --
+    // Walk distinct logits until the candidate count reaches k. The previous
+    // count is the number strictly above the final threshold; only boundary
+    // ties need a token-ordered pass, and only when they would exceed k.
     if (top_k > 0 && top_k < vocab) {
         float thr = POS_INF;
         int applied = 0;
+        int above = 0;
+        int count = 0;
         for (;;) {
             float lm = NEG_INF; // largest logit strictly below the current thr
             for (int i = tid; i < vocab; i += BLOCK) {
@@ -484,16 +500,27 @@ __device__ void finish_row(float* w, int vocab, float m,
             if (cur == NEG_INF) break; // no more distinct finite values
             thr = cur;
             applied = 1;
-            float lc = 0.0f;
+            int lc = 0;
             for (int i = tid; i < vocab; i += BLOCK) {
-                if (w[i] >= thr) lc += 1.0f;
+                if (w[i] >= thr) ++lc;
             }
-            float cnt = blk_sum(lc);
-            if (cnt >= (float)top_k) break;
+            above = count;
+            count = blk_count(lc);
+            if (count >= top_k) break;
         }
         if (applied) {
             for (int i = tid; i < vocab; i += BLOCK) {
                 if (w[i] < thr) w[i] = NEG_INF;
+            }
+            __syncthreads();
+            if (count > top_k && tid == 0) {
+                int remaining = top_k - above;
+                for (int i = 0; i < vocab; ++i) {
+                    if (w[i] == thr) {
+                        if (remaining > 0) --remaining;
+                        else w[i] = NEG_INF;
+                    }
+                }
             }
             __syncthreads();
         }
@@ -609,11 +636,11 @@ extern "C" __global__ void sample_f16(const unsigned short* x, int rows, int voc
     const unsigned short* r = x + (size_t)row * (size_t)vocab;
     float* w = work + (size_t)row * (size_t)vocab;
     const float NEG_INF = __int_as_float(0xff800000);
-    float inv_t = (temperature > 0.0f && temperature != 1.0f) ? (1.0f / temperature) : 1.0f;
+    float divisor = (temperature > 0.0f) ? temperature : 1.0f;
     float lmax = NEG_INF;
     for (int i = threadIdx.x; i < vocab; i += BLOCK) {
         float v = h2f(r[i]);
-        if (v == v) { v *= inv_t; w[i] = v; if (v > lmax) lmax = v; }
+        if (v == v) { v /= divisor; w[i] = v; if (v > lmax) lmax = v; }
         else { w[i] = NEG_INF; }
     }
     float m = blk_max(lmax);
@@ -628,11 +655,11 @@ extern "C" __global__ void sample_bf16(const unsigned short* x, int rows, int vo
     const unsigned short* r = x + (size_t)row * (size_t)vocab;
     float* w = work + (size_t)row * (size_t)vocab;
     const float NEG_INF = __int_as_float(0xff800000);
-    float inv_t = (temperature > 0.0f && temperature != 1.0f) ? (1.0f / temperature) : 1.0f;
+    float divisor = (temperature > 0.0f) ? temperature : 1.0f;
     float lmax = NEG_INF;
     for (int i = threadIdx.x; i < vocab; i += BLOCK) {
         float v = bf2f(r[i]);
-        if (v == v) { v *= inv_t; w[i] = v; if (v > lmax) lmax = v; }
+        if (v == v) { v /= divisor; w[i] = v; if (v > lmax) lmax = v; }
         else { w[i] = NEG_INF; }
     }
     float m = blk_max(lmax);
@@ -647,11 +674,11 @@ extern "C" __global__ void sample_f32(const float* x, int rows, int vocab,
     const float* r = x + (size_t)row * (size_t)vocab;
     float* w = work + (size_t)row * (size_t)vocab;
     const float NEG_INF = __int_as_float(0xff800000);
-    float inv_t = (temperature > 0.0f && temperature != 1.0f) ? (1.0f / temperature) : 1.0f;
+    float divisor = (temperature > 0.0f) ? temperature : 1.0f;
     float lmax = NEG_INF;
     for (int i = threadIdx.x; i < vocab; i += BLOCK) {
         float v = r[i];
-        if (v == v) { v *= inv_t; w[i] = v; if (v > lmax) lmax = v; }
+        if (v == v) { v /= divisor; w[i] = v; if (v > lmax) lmax = v; }
         else { w[i] = NEG_INF; }
     }
     float m = blk_max(lmax);
@@ -744,6 +771,21 @@ impl CudaSampler {
     /// Initialise the primary context on device `ordinal`, compile the sampler
     /// module, and allocate the initial result scratch.
     pub(crate) fn new(ordinal: usize) -> Result<Self> {
+        // cudarc's dynamic entry points panic when a library is absent. Probe
+        // first so CPU-only hosts receive the ordinary capability error.
+        // SAFETY: these probes only load/unload the driver/compiler libraries;
+        // no device pointers or CUDA entry points are accessed.
+        if !unsafe { cudarc::driver::sys::is_culib_present() } {
+            return Err(OrtError::Cuda(format!(
+                "device sampler on CUDA device {ordinal} requires the CUDA driver library, which could not be loaded; install a compatible NVIDIA driver or select host sampling"
+            )));
+        }
+        // SAFETY: as above, this only probes the compiler shared library.
+        if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+            return Err(OrtError::Cuda(format!(
+                "device sampler on CUDA device {ordinal} requires the NVRTC library, which could not be loaded; install a compatible CUDA NVRTC library on the loader path or select host sampling"
+            )));
+        }
         let ctx = CudaContext::new(ordinal)
             .map_err(|e| OrtError::Cuda(format!("CudaContext::new({ordinal}): {e:?}")))?;
         let stream = ctx.default_stream();
@@ -1902,15 +1944,26 @@ mod tests {
         if top_k == 0 || top_k >= logits.len() {
             return;
         }
-        let mut sorted: Vec<f32> = logits.iter().copied().filter(|v| !v.is_nan()).collect();
-        if sorted.is_empty() {
-            return;
+        let mut ranked: Vec<_> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, value)| !value.is_nan())
+            .collect();
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap()
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let mut kept = vec![false; logits.len()];
+        for &(index, _) in ranked.iter().take(top_k) {
+            kept[index] = true;
         }
-        sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let threshold = sorted[top_k.saturating_sub(1).min(sorted.len() - 1)];
-        for l in logits.iter_mut() {
-            if l.is_nan() || *l < threshold {
-                *l = NEG_INF;
+        for (index, value) in logits.iter_mut().enumerate() {
+            if !kept[index] {
+                *value = NEG_INF;
             }
         }
     }
@@ -2075,14 +2128,14 @@ mod tests {
         if params.greedy {
             return host_argmax(logits);
         }
-        let inv_t = if params.temperature > 0.0 && params.temperature != 1.0 {
-            1.0 / params.temperature
+        let divisor = if params.temperature > 0.0 {
+            params.temperature
         } else {
             1.0
         };
         let mut w: Vec<f32> = logits
             .iter()
-            .map(|&l| if l.is_nan() { NEG_INF } else { l * inv_t })
+            .map(|&l| if l.is_nan() { NEG_INF } else { l / divisor })
             .collect();
         let m = w.iter().cloned().fold(NEG_INF, f32::max);
         if m == NEG_INF {
@@ -2093,11 +2146,13 @@ mod tests {
             return w.iter().position(|&v| v == f32::INFINITY).unwrap_or(0) as u32;
         }
 
-        // top-k: mask logits below the k-th largest (with multiplicity).
+        // top-k: exactly k candidates, lowest token id wins boundary ties.
         let top_k = params.top_k.min(vocab);
         if top_k > 0 && top_k < vocab {
             let mut thr = f32::INFINITY;
             let mut applied = false;
+            let mut above = 0;
+            let mut count = 0;
             loop {
                 let mut lm = NEG_INF;
                 for &v in &w {
@@ -2110,8 +2165,9 @@ mod tests {
                 }
                 thr = lm;
                 applied = true;
-                let cnt = w.iter().filter(|&&v| v >= thr).count();
-                if cnt >= top_k {
+                above = count;
+                count = w.iter().filter(|&&v| v >= thr).count();
+                if count >= top_k {
                     break;
                 }
             }
@@ -2119,6 +2175,18 @@ mod tests {
                 for v in w.iter_mut() {
                     if *v < thr {
                         *v = NEG_INF;
+                    }
+                }
+                if count > top_k {
+                    let mut remaining = top_k - above;
+                    for v in &mut w {
+                        if *v == thr {
+                            if remaining > 0 {
+                                remaining -= 1;
+                            } else {
+                                *v = NEG_INF;
+                            }
+                        }
                     }
                 }
             }
@@ -2374,6 +2442,8 @@ mod tests {
     /// by both the GPU parity test and the CPU-only differential test.
     fn parity_combos() -> Vec<DeviceSampleParams> {
         let mut combos = vec![
+            params(1e-40, 0, 1.0, 0.0, 0.05),
+            params(1e-40, 1, 1.0, 0.0, 0.5),
             params(1.0, 0, 1.0, 0.0, 0.05),
             params(1.0, 0, 1.0, 0.0, 0.5),
             params(1.0, 0, 1.0, 0.0, 0.95),
@@ -2446,6 +2516,78 @@ mod tests {
                     host, dev,
                     "host/device divergence: logits={logits:?} params={p:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn device_temperature_division_does_not_overflow_a_reciprocal() {
+        let row = [0.0, 1e-40, -1e-40];
+        for rng in [0.0, 0.13, 0.5, 0.9, 0.999] {
+            for k in [0, 1, 2] {
+                let p = params(1e-40, k, 1.0, 0.0, rng);
+                assert_eq!(
+                    device_algo_cpu(&row, &p),
+                    host_oracle(&row, &p),
+                    "k={k} rng={rng}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_sampler_libraries_return_actionable_capability_errors() {
+        // SAFETY: library presence probes access no device memory or entry points.
+        let driver = unsafe { cudarc::driver::sys::is_culib_present() };
+        // SAFETY: same library-only probe for NVRTC.
+        let compiler = unsafe { cudarc::nvrtc::sys::is_culib_present() };
+        if !driver || !compiler {
+            let error = CudaSampler::new(0)
+                .err()
+                .expect("missing library must refuse the device sampler")
+                .to_string();
+            assert!(
+                error.contains(if !driver {
+                    "CUDA driver library"
+                } else {
+                    "NVRTC library"
+                }),
+                "{error}"
+            );
+            assert!(error.contains("device 0"), "{error}");
+            assert!(
+                error.contains("install") && error.contains("host sampling"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn top_k_ties_match_exact_candidate_count_cpu_and_available_gpu() {
+        let sampler = new_sampler();
+        for row in [vec![2.0; 8], vec![1.0, 2.0, 2.0, 2.0, 3.0, 2.0, 2.0, 0.0]] {
+            for k in [1, 2, 3, 7] {
+                let mut masked = row.clone();
+                host_top_k(&mut masked, k);
+                assert_eq!(masked.iter().filter(|value| value.is_finite()).count(), k);
+                for rng in [0.0, 0.13, 0.5, 0.9, 0.999] {
+                    let p = params(1.0, k, 1.0, 0.0, rng);
+                    let expected = host_oracle(&row, &p);
+                    assert_eq!(
+                        device_algo_cpu(&row, &p),
+                        expected,
+                        "row={row:?} k={k} rng={rng}"
+                    );
+                    if let Some(sampler) = &sampler {
+                        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+                            let ptr = upload(std::slice::from_ref(&row), dtype);
+                            let actual = sampler
+                                .sample(dtype, ptr, 1, row.len(), &p)
+                                .expect("tied top-k device sample");
+                            assert_eq!(actual, [expected], "dtype={dtype:?} k={k} rng={rng}");
+                        }
+                    }
+                }
             }
         }
     }

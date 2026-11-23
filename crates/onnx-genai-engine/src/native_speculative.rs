@@ -34,7 +34,6 @@ use crate::decode_loop::{
 };
 use crate::logits::{ProcessorChain, TokenId};
 use crate::native_decode::NativeDecodeSession;
-use crate::processors::ensure_constrained_finish;
 use crate::sampling::sample_greedy;
 use crate::speculative::{
     MtpEmbedder, MtpLmHead, MtpProposer, NgramProposer, SpeculativeProposer,
@@ -244,20 +243,13 @@ impl<'a> NativeSpeculativeDriver<'a> {
         )?;
         match finished {
             Some(result) => Ok(result),
-            None => {
-                ensure_constrained_finish(
-                    options,
-                    &block.state.generated_text,
-                    FinishReason::MaxTokens,
-                )?;
-                finish_result(
-                    tokenizer,
-                    &block.state.generated_tokens,
-                    FinishReason::MaxTokens,
-                    0,
-                    block.state.logprobs.as_deref(),
-                )
-            }
+            None => finish_result(
+                tokenizer,
+                &block.state.generated_tokens,
+                FinishReason::MaxTokens,
+                0,
+                block.state.logprobs.as_deref(),
+            ),
         }
     }
 
@@ -300,7 +292,6 @@ impl<'a> NativeSpeculativeDriver<'a> {
         let stats = &mut *block.stats;
         let mut callback = block.callback.as_deref_mut();
         if state.generated_tokens.len() >= options.max_new_tokens {
-            ensure_constrained_finish(options, &state.generated_text, FinishReason::MaxTokens)?;
             return Ok(Some(finish_result(
                 tokenizer,
                 &state.generated_tokens,
@@ -311,7 +302,6 @@ impl<'a> NativeSpeculativeDriver<'a> {
         }
         let context_len = prompt_len + state.generated_tokens.len();
         if reached_context_limit(context_len, options.max_context) {
-            ensure_constrained_finish(options, &state.generated_text, FinishReason::Length)?;
             return Ok(Some(finish_result(
                 tokenizer,
                 &state.generated_tokens,

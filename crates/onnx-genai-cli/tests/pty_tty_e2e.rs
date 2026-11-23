@@ -32,7 +32,7 @@
 #[cfg(unix)]
 mod pty_tty {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::os::fd::OwnedFd;
     use std::os::unix::io::AsFd;
     use std::path::{Path, PathBuf};
@@ -50,48 +50,10 @@ mod pty_tty {
         repository_root().join("tests/fixtures/tiny-llm")
     }
 
-    fn strip_terminal_controls(text: &str) -> String {
-        let mut out = String::new();
-        let mut chars = text.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '\x1b' {
-                if let Some('[') = chars.next() {
-                    for next in chars.by_ref() {
-                        if next.is_ascii_alphabetic() {
-                            break;
-                        }
-                    }
-                }
-            } else if ch != '\r' {
-                out.push(ch);
-            }
-        }
-        out
-    }
-
-    fn text_has_nearby_ansi_style(raw: &str, text: &str) -> bool {
-        raw.match_indices(text).any(|(index, _)| {
-            let window_start = index.saturating_sub(32);
-            raw[window_start..index].contains("\x1b[")
-        })
-    }
-
     /// Open a fresh PTY pair.  The slave is the child-side terminal device;
     /// the master is the parent-side pipe into/out of that device.
     ///
-    /// The slave is given a real 24×80 window size on purpose — **do not pass
-    ///   `None` here.**  `openpty(None, ..)` leaves the window at 0×0. The
-    /// append-only `run` renderer no longer depends on a viewport, but reedline
-    /// still renders an interactive prompt and needs a realistic terminal size
-    /// for wrapping/repaint behavior. 24×80 is the smallest ordinary terminal
-    /// size that avoids false terminal-harness failures; the exact numbers are
-    /// not magic, only "non-zero and realistic".
-    ///
-    /// Companion gotcha for anyone writing input into the master: a terminal
-    /// sends **CR (`\r`)** for Enter, and crossterm maps CR → `Enter`.  Writing
-    /// `\n` (LF) instead leaves the line un-terminated, so `read_line` never
-    /// returns and the child hangs — another false "swallowed input".  Send
-    /// `\r`, not `\n`.
+    /// Give terminal-rendering checks a realistic, nonzero window size.
     fn open_pty() -> (OwnedFd, OwnedFd) {
         let winsize = Winsize {
             ws_row: 24,
@@ -120,7 +82,7 @@ mod pty_tty {
     ///   the trailing-newline assertion and masqueraded as a rendering defect.
     ///   120 s is ~2.5× that measured worst case: headroom for a cold CI runner
     ///   with a cold cargo/model cache, not a number picked to feel safe.
-    /// * **Long stream.**  A future test that drives the `run` REPL against a
+    /// * **Long stream.**  A future test that drives streaming generation against a
     ///   real, many-token reply streams for a long time.  Because the clock is
     ///   reset on every byte, an arbitrarily long reply never trips the timeout
     ///   as long as tokens keep arriving; only a genuinely *stuck* child (no
@@ -345,134 +307,5 @@ mod pty_tty {
              the reply already ended with \\n and an extra newline was added. \
              got: {pty_out:?}"
         );
-    }
-
-    #[test]
-    #[ignore = "flaky under CI load, see #615: the turn state machine counts \
-                '>>>' occurrences, which reedline's prompt repaints inflate \
-                non-deterministically. Re-enable once it advances on a \
-                once-per-turn event instead."]
-    fn run_repl_preserves_submitted_lines_across_two_tty_turns() {
-        let (master, slave) = open_pty();
-        let slave_stdin = dup(&slave).expect("dup stdin must succeed");
-        let slave_stdout = dup(&slave).expect("dup stdout must succeed");
-        let slave_stderr = slave;
-
-        let mut child = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
-            .arg("run")
-            .arg(text_model())
-            .arg("--raw")
-            .arg("--max-new-tokens")
-            .arg("2")
-            .env("ONNX_GENAI_EP", "cpu")
-            .stdin(Stdio::from(slave_stdin))
-            .stdout(Stdio::from(slave_stdout))
-            .stderr(Stdio::from(slave_stderr))
-            .spawn()
-            .expect("CLI binary must start");
-
-        let mut master: std::fs::File = master.into();
-        let mut bytes = Vec::new();
-        let mut first_sent = false;
-        let mut second_sent = false;
-        let mut exit_sent = false;
-        let mut dsr_answered = 0usize;
-        let mut buf = [0u8; 4096];
-        loop {
-            let ready = {
-                let borrowed = master.as_fd();
-                let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
-                poll(
-                    &mut fds,
-                    PollTimeout::try_from(DRAIN_IDLE_TIMEOUT).unwrap_or(PollTimeout::MAX),
-                )
-                .unwrap_or(0)
-            };
-            assert!(
-                ready != 0,
-                "timed out waiting for two-turn REPL transcript; bytes so far: {:?}",
-                String::from_utf8_lossy(&bytes)
-            );
-
-            match master.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => bytes.extend_from_slice(&buf[..n]),
-                Err(_) => break,
-            }
-
-            // reedline probes the cursor position (DSR, `ESC[6n`) while setting
-            // up its line editor; a real terminal answers with `ESC[<row>;<col>R`.
-            // This headless PTY has no emulator behind it, so the harness must
-            // answer or reedline aborts the turn with "The cursor position could
-            // not be read within a normal duration". Reply once per query.
-            const DSR_QUERY: &[u8] = b"\x1b[6n";
-            let dsr_seen = bytes
-                .windows(DSR_QUERY.len())
-                .filter(|w| *w == DSR_QUERY)
-                .count();
-            while dsr_answered < dsr_seen {
-                master
-                    .write_all(b"\x1b[1;1R")
-                    .expect("answer cursor-position query");
-                dsr_answered += 1;
-            }
-
-            let transcript = strip_terminal_controls(&String::from_utf8_lossy(&bytes));
-            let prompt_count = transcript.matches(">>>").count();
-            if !first_sent && prompt_count >= 1 {
-                master.write_all(b"first\r").expect("send first prompt");
-                first_sent = true;
-            }
-            if first_sent && !second_sent && prompt_count >= 2 {
-                master.write_all(b"second\r").expect("send second prompt");
-                second_sent = true;
-            }
-            if second_sent && !exit_sent && prompt_count >= 3 {
-                master.write_all(b"\r").expect("send empty exit line");
-                exit_sent = true;
-            }
-            if exit_sent && child.try_wait().expect("poll child").is_some() {
-                break;
-            }
-        }
-        let _ = child.wait();
-
-        let transcript = strip_terminal_controls(&String::from_utf8_lossy(&bytes));
-        let raw = String::from_utf8_lossy(&bytes);
-        assert!(
-            text_has_nearby_ansi_style(&raw, "first") && text_has_nearby_ansi_style(&raw, "second"),
-            "TTY reedline input should be styled distinctly from model output; raw transcript: {raw:?}"
-        );
-        let first_input = transcript
-            .find(">>> first")
-            .unwrap_or_else(|| panic!("first submitted line was not preserved: {transcript:?}"));
-        let second_input = transcript
-            .find(">>> second")
-            .unwrap_or_else(|| panic!("second submitted line was not preserved: {transcript:?}"));
-        let first_answer = transcript[first_input..second_input]
-            .find("tok")
-            .map(|offset| first_input + offset)
-            .unwrap_or_else(|| {
-                panic!("first reply text missing before second input: {transcript:?}")
-            });
-        let second_answer = transcript[second_input..]
-            .find("tok")
-            .map(|offset| second_input + offset)
-            .unwrap_or_else(|| {
-                panic!("second reply text missing after second input: {transcript:?}")
-            });
-
-        assert!(
-            first_input < first_answer
-                && first_answer < second_input
-                && second_input < second_answer,
-            "turn ordering must be input1 -> reply1 -> input2 -> reply2; transcript: {transcript:?}"
-        );
-        for line in transcript.lines() {
-            assert!(
-                !(line.trim().is_empty() && line.len() >= 8),
-                "renderer leaked a blank/whitespace row into scrollback: {transcript:?}"
-            );
-        }
     }
 }

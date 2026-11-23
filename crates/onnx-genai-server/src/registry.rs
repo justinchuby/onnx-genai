@@ -1,7 +1,8 @@
+use onnx_genai_engine::response_template;
 use std::{
     collections::HashMap,
     fmt,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -64,10 +65,7 @@ pub(crate) struct ModelHandle {
     pub(crate) multimodal: Option<MultimodalSpecs>,
     pub(crate) speech: Option<crate::speech::SpeechCapability>,
     pub(crate) image_pipeline: Option<ImagePipelineSpec>,
-    /// Whether the package declares a channel whose content the caller must not
-    /// be shown, i.e. whether a generated turn carries private reasoning that
-    /// has to be filtered out of everything this server returns.
-    pub(crate) private_channels: bool,
+    pub(crate) response_template: Option<Arc<response_template::ResponseTemplate>>,
     /// Epoch-millisecond timestamp of the last call to `ModelRegistry::resolve`.
     /// Initialised to construction time; updated on every resolve for LRU eviction.
     pub(crate) last_request_at: AtomicU64,
@@ -82,13 +80,10 @@ pub(crate) struct ModelHandle {
 /// optional and same-typed, so positional construction was easy to get wrong.
 pub(crate) struct ModelHandleParts {
     pub(crate) id: String,
-    /// Directory the model was loaded from. Read once at construction to decide
-    /// whether the package declares a private reasoning channel; not retained
-    /// on the handle, which has no other package-relative file to resolve.
-    pub(crate) model_dir: PathBuf,
     pub(crate) engine: EngineDriver,
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
+    pub(crate) response_template: Option<Arc<response_template::ResponseTemplate>>,
     pub(crate) tool_protocol: Option<ToolProtocol>,
     pub(crate) tool_protocol_metadata_path: Option<PathBuf>,
     pub(crate) model_max_context: Option<usize>,
@@ -103,10 +98,10 @@ impl ModelHandle {
     pub(crate) fn new(parts: ModelHandleParts) -> Self {
         let ModelHandleParts {
             id,
-            model_dir,
             mut engine,
             tokenizer,
             chat_template,
+            response_template,
             tool_protocol,
             tool_protocol_metadata_path,
             model_max_context,
@@ -116,7 +111,6 @@ impl ModelHandle {
             speech,
             image_pipeline,
         } = parts;
-        let private_channels = declares_private_channels(&model_dir);
         // The only place a routable model gets its id, so it is also the only
         // place the engine learns which model's sessions it owns. Everything
         // that keys a session or a lease reads it back off the driver, which is
@@ -135,7 +129,7 @@ impl ModelHandle {
             multimodal,
             speech,
             image_pipeline,
-            private_channels,
+            response_template,
             last_request_at: AtomicU64::new(now_millis()),
             warmed: AtomicBool::new(false),
             warmup_lock: std::sync::Mutex::new(()),
@@ -475,22 +469,28 @@ impl ModelRegistry {
         &self,
         requested: &str,
     ) -> Result<Option<Arc<ModelHandle>>, RegistryError> {
+        let handle = self.lookup_loaded(requested)?;
+        if let Some(handle) = &handle {
+            handle
+                .last_request_at
+                .store(now_millis(), Ordering::Relaxed);
+        }
+        Ok(handle)
+    }
+
+    /// Inspect committed state without counting UI polling as an inference use
+    /// for the eviction policy. Resolution and introspection share this lookup.
+    pub(crate) fn lookup_loaded(
+        &self,
+        requested: &str,
+    ) -> Result<Option<Arc<ModelHandle>>, RegistryError> {
         let inner = self.read()?;
-        let handle = if !requested.trim().is_empty() {
-            inner.models.get(requested)
+        let id = if requested.trim().is_empty() {
+            inner.default_id.as_deref()
         } else {
-            inner
-                .default_id
-                .as_deref()
-                .and_then(|default| inner.models.get(default))
+            Some(requested)
         };
-        let Some(handle) = handle else {
-            return Ok(None);
-        };
-        handle
-            .last_request_at
-            .store(now_millis(), Ordering::Relaxed);
-        Ok(Some(Arc::clone(handle)))
+        Ok(id.and_then(|id| inner.models.get(id)).cloned())
     }
 
     /// Returns `true` if `id` is a configured model (loaded or not).
@@ -499,6 +499,7 @@ impl ModelRegistry {
     }
 
     /// Returns the ids of all currently loaded models in insertion order.
+    #[cfg(test)]
     pub(crate) fn ids(&self) -> Result<Vec<String>, RegistryError> {
         Ok(self.read()?.order.clone())
     }
@@ -864,26 +865,6 @@ impl ModelRegistry {
     }
 }
 
-/// Whether a package declares a response channel the caller must not be shown.
-///
-/// A reasoning model spells its turn as channels addressed to different
-/// recipients, and declares in `response_template` which one carries the answer
-/// and which carries its private thinking. Only a package that declares the
-/// private one needs its output filtered, so every other model streams and
-/// returns exactly what it generated.
-fn declares_private_channels(model_dir: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(model_dir.join("tokenizer_config.json")) else {
-        return false;
-    };
-    let Ok(config) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return false;
-    };
-    config
-        .pointer("/response_template/fields/reasoning_content/open_pattern")
-        .and_then(serde_json::Value::as_str)
-        .is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{path::PathBuf, sync::Arc};
@@ -892,45 +873,6 @@ mod tests {
 
     use super::*;
     use crate::driver::EngineDriver;
-
-    // Only a package that declares a private reasoning channel needs its output
-    // filtered, so the flag is read from the package rather than guessed at.
-    #[test]
-    fn a_declared_reasoning_channel_arms_filtering() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("tokenizer_config.json"),
-            serde_json::json!({
-                "response_template": {
-                    "fields": {
-                        "content": {"open_pattern": "to=user<\\|message\\|>"},
-                        "reasoning_content": {"open_pattern": "to=self<\\|message\\|>"}
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .expect("write config");
-
-        assert!(declares_private_channels(dir.path()));
-    }
-
-    // A model that declares no private channel, or ships no template at all,
-    // must stream exactly what it generated.
-    #[test]
-    fn an_undeclared_reasoning_channel_leaves_output_untouched() {
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        assert!(!declares_private_channels(dir.path()));
-
-        std::fs::write(
-            dir.path().join("tokenizer_config.json"),
-            serde_json::json!({"response_template": {"fields": {"content": {}}}}).to_string(),
-        )
-        .expect("write config");
-
-        assert!(!declares_private_channels(dir.path()));
-    }
 
     /// Build a minimal `ModelHandle` stub backed by the tiny-llm tokenizer fixture.
     /// The stub has a dead command channel (no engine thread); it is only used to
@@ -957,7 +899,7 @@ mod tests {
             multimodal: None,
             speech: None,
             image_pipeline: None,
-            private_channels: false,
+            response_template: None,
             last_request_at: AtomicU64::new(last_request_at),
             warmed: AtomicBool::new(false),
             warmup_lock: std::sync::Mutex::new(()),
@@ -967,6 +909,8 @@ mod tests {
     fn stub_engine_driver() -> EngineDriver {
         let (tx, _rx) = mpsc::channel(1);
         EngineDriver {
+            reranking: None,
+            runtime_sampling: false,
             workflow_facts: crate::driver::WorkflowFacts {
                 components: 0,
                 graph_components: 0,
@@ -1016,10 +960,10 @@ mod tests {
 
         let handle = ModelHandle::new(ModelHandleParts {
             id: "adapter-only".to_string(),
-            model_dir: dir.path().to_path_buf(),
             engine: stub_engine_driver(),
             tokenizer: load_tokenizer(),
             chat_template: None,
+            response_template: None,
             tool_protocol: None,
             tool_protocol_metadata_path: None,
             model_max_context: None,

@@ -1,0 +1,4 @@
+https://github.com/ggml-org/llama.cpp.git
+8d60873dfb8619f2b5ed31adfbab07cccb40db5c
+ui/apps/chat
+Built with npm ci && npm run build; scripts/llama_chat/capabilities.patch applied.

@@ -4,6 +4,19 @@ use super::*;
 
 use super::session_state::{CheckedPosition, SessionLen, SessionStore};
 
+struct OrtPrefixTensor {
+    name: String,
+    shape: Vec<i64>,
+    dtype: DataType,
+    bytes: Vec<u8>,
+}
+
+struct OrtPrefixSnapshot {
+    length: usize,
+    tensors: Vec<OrtPrefixTensor>,
+    _lease: onnx_runtime_memory_governor::MemoryLease,
+}
+
 fn generate_uses_scheduler(_backend: EngineDecodeBackend) -> bool {
     true
 }
@@ -205,10 +218,11 @@ impl DecoderTurnParticipant {
         let Some(callback) = callback else {
             return Ok(());
         };
-        for (index, token_id) in result.token_ids.iter().copied().enumerate() {
+        let pieces = crate::tokenization::token_texts(Some(tokenizer), &result.token_ids)?;
+        for (index, (token_id, text)) in result.token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
                 token_id,
-                text: tokenizer.decode(&[token_id])?,
+                text,
                 finish_reason: (index + 1 == result.token_ids.len())
                     .then(|| result.finish_reason.clone()),
             })?;
@@ -273,15 +287,59 @@ struct NativeDecoderTurnParticipant {
     turn: crate::pipeline::TurnTransaction,
     session_id: SessionId,
     identity: crate::native_decode::NativeLogicalStateIdentity,
-    materialized_len: Option<usize>,
-    recurrent: Option<crate::native_decode::RecurrentStateSnapshot>,
+    baseline: NativeTurnBaseline,
     speculative_stats: SpeculativeStats,
     connector_stats: ConnectorStats,
 }
 
 #[cfg(feature = "native-backend")]
+enum NativeSessionTarget {
+    /// An implementation cache for a stateless request, not a named conversation.
+    CachedRequest(SessionId),
+    Conversation(SessionId),
+}
+
+#[cfg(feature = "native-backend")]
+impl NativeSessionTarget {
+    fn id(&self) -> SessionId {
+        match self {
+            Self::CachedRequest(id) | Self::Conversation(id) => *id,
+        }
+    }
+}
+
+#[cfg(feature = "native-backend")]
+enum NativeTurnBaseline {
+    Empty,
+    PreservedPrefix {
+        length: usize,
+        recurrent: Option<crate::native_decode::RecurrentStateSnapshot>,
+    },
+    Complete {
+        snapshot: crate::native_decode::NativePastSnapshot,
+        _lease: onnx_runtime_memory_governor::MemoryLease,
+    },
+}
+
+#[cfg(feature = "native-backend")]
+impl NativeTurnBaseline {
+    fn len(&self) -> Option<usize> {
+        match self {
+            Self::Empty => None,
+            Self::PreservedPrefix { length, .. } => Some(*length),
+            Self::Complete { snapshot, .. } => Some(snapshot.len()),
+        }
+    }
+}
+
+#[cfg(feature = "native-backend")]
 impl NativeDecoderTurnParticipant {
-    fn admit(engine: &mut Engine, session_id: SessionId) -> anyhow::Result<Self> {
+    fn admit(
+        engine: &mut Engine,
+        target: NativeSessionTarget,
+        prompt: &[TokenId],
+    ) -> anyhow::Result<Self> {
+        let session_id = target.id();
         let identity = engine.native_turn_identity(session_id)?;
         let active_before = engine.native_active_session;
         let native = engine.native_session.as_mut().context(
@@ -290,24 +348,54 @@ impl NativeDecoderTurnParticipant {
         if active_before == Some(session_id) {
             native.ensure_logical_state(identity)?;
         }
-        let materialized_len = (active_before == Some(session_id)).then(|| native.current_len());
-        let recurrent = materialized_len
-            .filter(|length| *length > 0 && native.has_recurrent_state())
-            .map(|_| {
-                native.snapshot_recurrent_state().with_context(|| {
-                    "cannot admit atomic native decoder turn: non-prefix-sliceable state could \
-                     not be snapshotted before mutation"
-                })
-            })
-            .transpose()?;
+        let baseline = if active_before != Some(session_id)
+            || matches!(target, NativeSessionTarget::CachedRequest(_))
+        {
+            NativeTurnBaseline::Empty
+        } else {
+            let length = native.current_len();
+            // Prefix slicing can restore an append, but cannot undo a reset or
+            // an overwrite. Generation re-evaluates a fully cached final token.
+            let preserves_prefix = engine
+                .native_sessions
+                .get(&session_id)
+                .is_some_and(|state| {
+                    prompt.len() > length && common_prefix_len(&state.tokens, prompt) >= length
+                });
+            if length > 0 && !preserves_prefix {
+                if !native.supports_past_snapshots() {
+                    return Err(PackageExecutionError::NativePromptReplacementUnavailable.into());
+                }
+                let bytes = native.past_snapshot_bytes()?;
+                let lease = onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                    engine.governor.memory(),
+                    onnx_runtime_memory_api::Tier::Host,
+                    bytes,
+                    Holder::DecoderTurnSnapshot.role(),
+                    Holder::DecoderTurnSnapshot.id(),
+                )
+                .context("reserve host memory for atomic decoder prompt replacement")?;
+                NativeTurnBaseline::Complete {
+                    snapshot: native
+                        .snapshot_past()
+                        .context("capture complete native state before prompt replacement")?,
+                    _lease: lease,
+                }
+            } else {
+                let recurrent = (length > 0 && native.has_recurrent_state())
+                    .then(|| native.snapshot_recurrent_state())
+                    .transpose()
+                    .context("capture non-prefix-sliceable state before native append")?;
+                NativeTurnBaseline::PreservedPrefix { length, recurrent }
+            }
+        };
         Ok(Self {
             turn: crate::pipeline::TurnTransaction::admit_runtime_participant(
                 engine.workflow.next_turn_transaction_id(),
             ),
             session_id,
             identity,
-            materialized_len,
-            recurrent,
+            baseline,
             speculative_stats: engine.last_speculative_stats,
             connector_stats: engine.connector.stats().clone(),
         })
@@ -329,25 +417,30 @@ impl NativeDecoderTurnParticipant {
     ) -> anyhow::Result<crate::pipeline::TurnTransactionOutcome> {
         engine.last_speculative_stats = self.speculative_stats;
         engine.connector.restore_stats(self.connector_stats);
+        let materialized_len = self.baseline.len();
         let restored = {
             let native = engine.native_session.as_mut().context(
                 "cannot abort atomic native decoder turn: native decoder session is unavailable",
             )?;
-            match self.materialized_len {
-                Some(length) => {
+            match self.baseline {
+                NativeTurnBaseline::PreservedPrefix { length, recurrent } => {
                     native.ensure_logical_state(self.identity)?;
-                    if let Some(snapshot) = &self.recurrent {
+                    if let Some(snapshot) = &recurrent {
                         native.restore_state_snapshot_at(snapshot, length)
                     } else {
                         native.rewind(length)
                     }
                 }
-                None => native.reset(),
+                NativeTurnBaseline::Complete { snapshot, _lease } => {
+                    native.ensure_logical_state(self.identity)?;
+                    native.restore_owned_past_snapshot(snapshot)
+                }
+                NativeTurnBaseline::Empty => native.reset(),
             }
         };
         if let Err(rollback) = restored {
             engine.native_active_session = None;
-            let logical_baseline_lost = self.materialized_len.is_some();
+            let logical_baseline_lost = materialized_len.is_some();
             if logical_baseline_lost {
                 poison_native_generation(
                     &mut engine.native_sessions,
@@ -383,7 +476,7 @@ impl NativeDecoderTurnParticipant {
                 ))),
             };
         }
-        engine.native_active_session = self.materialized_len.map(|_| self.session_id);
+        engine.native_active_session = materialized_len.map(|_| self.session_id);
         Ok(self.turn.abort(reason)?)
     }
 }
@@ -842,6 +935,17 @@ impl Engine {
         Ok(Vec::new())
     }
 
+    pub(crate) fn default_end_token_policy(&self) -> anyhow::Result<EndTokenPolicy> {
+        let eot = self
+            .metadata
+            .package
+            .as_ref()
+            .and_then(|p| p.tokenizer.as_ref())
+            .and_then(|t| t.special_tokens.as_ref())
+            .and_then(|t| t.eot_token_id);
+        EndTokenPolicy::new(self.default_eos_token_ids()?, eot)
+    }
+
     /// Apply the model's stop condition to a request.
     ///
     /// Every effective EOS id becomes a stop sequence, not just the first. A
@@ -853,8 +957,7 @@ impl Engine {
     /// package defaults come from
     /// `package.tokenizer.special_tokens.eos_token_id`.
     pub(super) fn apply_eos_defaults(&self, options: &mut GenerateOptions) -> anyhow::Result<()> {
-        apply_eos_policy(options, &self.default_eos_token_ids()?);
-        Ok(())
+        apply_eos_policy(options, &self.default_end_token_policy()?)
     }
 
     /// Effective context limit for a request, combining model metadata,
@@ -911,6 +1014,7 @@ impl Engine {
         &mut self,
         mut request: GenerateRequest,
         tool_call_policy: ToolCallPolicy,
+        control: Option<&crate::pipeline::GenerationControl>,
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -956,7 +1060,11 @@ impl Engine {
         options.max_new_tokens = scheduled.max_tokens;
         let mut staged_output =
             CommitOnlyTokenStager::new(native_output_stage_limit(options.max_new_tokens));
-        let turn = match NativeDecoderTurnParticipant::admit(self, scheduler_session_id) {
+        let turn = match NativeDecoderTurnParticipant::admit(
+            self,
+            NativeSessionTarget::CachedRequest(scheduler_session_id),
+            &prompt_tokens,
+        ) {
             Ok(turn) => turn,
             Err(error) => {
                 self.scheduler.complete(scheduler_session_id);
@@ -1009,7 +1117,12 @@ impl Engine {
         }
 
         let result = {
-            let mut stage_token = |token| staged_output.stage(token);
+            let mut stage_token = |token| {
+                if let Some(control) = control {
+                    control.check(crate::pipeline::GenerationBoundary::BeforeWorkflowNode)?;
+                }
+                staged_output.stage(token)
+            };
             // Speculation ON (implemented greedy prompt-lookup) → the native
             // speculative driver. Every other request stays on the untouched plain
             // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
@@ -1106,6 +1219,7 @@ impl Engine {
                     &chain,
                     tokenizer,
                     runtime,
+                    control,
                     tool_observer.as_mut(),
                     Some(&mut stage_token),
                 )
@@ -1115,6 +1229,9 @@ impl Engine {
             result.and_then(|mut result| {
                 result.budget_cap = budget_cap;
                 staged_output.validate(&result)?;
+                if let Some(control) = control {
+                    control.require_commit()?;
+                }
                 Ok(result)
             }),
             EngineDecodeBackend::Native,
@@ -1122,10 +1239,26 @@ impl Engine {
         let result = match result {
             Ok(result) => {
                 let _outcome = turn.commit()?;
+                if let Some(control) = control {
+                    control.finish_commit();
+                }
                 Ok(result)
             }
             Err(error) => {
-                match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                if let Some(control) = control {
+                    control.abort_commit();
+                }
+                match turn.abort(
+                    self,
+                    if error
+                        .downcast_ref::<crate::pipeline::GenerationCancelled>()
+                        .is_some()
+                    {
+                        crate::pipeline::TurnAbortReason::Cancellation
+                    } else {
+                        crate::pipeline::TurnAbortReason::ExecutionFailure
+                    },
+                ) {
                     Ok(_) => Err(error),
                     Err(rollback) => Err(error.context(format!(
                         "atomic native cold turn failed and its baseline restoration also \
@@ -1146,6 +1279,7 @@ impl Engine {
         &mut self,
         _request: GenerateRequest,
         _tool_call_policy: ToolCallPolicy,
+        _control: Option<&crate::pipeline::GenerationControl>,
         _admission_callback: Option<&mut dyn FnMut()>,
         _callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -1276,6 +1410,281 @@ impl Engine {
         Ok(())
     }
 
+    /// Evaluate the complete prompt without sampling or publishing an output token.
+    pub fn prefill(&mut self, request: PrefillRequest) -> anyhow::Result<PrefillResult> {
+        self.prefill_with_callbacks(request, None, None)
+    }
+
+    /// Prompt-only evaluation with ordinary admission and atomic cancellation.
+    pub fn prefill_with_callbacks(
+        &mut self,
+        request: PrefillRequest,
+        control: Option<crate::pipeline::GenerationControl>,
+        mut admitted: Option<&mut dyn FnMut()>,
+    ) -> anyhow::Result<PrefillResult> {
+        self.require_workflow_execution_admitted()?;
+        let unavailable = |reason: String| PackageExecutionError::PrefillUnavailable { reason };
+        if !self.holds_decode_core() {
+            return Err(
+                unavailable("the package has no runtime-owned decode executor".into()).into(),
+            );
+        }
+        let workflow = self.workflow.workflow_spec();
+        crate::pipeline::generation::validate_generation_workflow(workflow).map_err(|error| {
+            unavailable(format!(
+                "the generation contract cannot be isolated: {error:#}"
+            ))
+        })?;
+        // Only a decoder/policy/emit loop with no authored setup can have its
+        // decoder evaluated alone. Component identities and model names carry
+        // no authority; the declared contracts and effects decide this.
+        let [onnx_genai_metadata::WorkflowStep::Loop { setup, steps, .. }] =
+            workflow.steps.as_slice()
+        else {
+            return Err(unavailable(
+                "the workflow includes steps outside its generation loop".into(),
+            )
+            .into());
+        };
+        let [
+            onnx_genai_metadata::WorkflowStep::Invoke {
+                component: decoder, ..
+            },
+            onnx_genai_metadata::WorkflowStep::Invoke {
+                component: policy, ..
+            },
+            onnx_genai_metadata::WorkflowStep::Emit { .. },
+        ] = steps.as_slice()
+        else {
+            return Err(unavailable(
+                "the loop includes authored work beyond decoder, token policy and emission".into(),
+            )
+            .into());
+        };
+        let implements = |name: &str, expected: &str| {
+            workflow.components.get(name).is_some_and(|component| {
+                component.effects.is_empty()
+                    && component
+                        .contract
+                        .as_ref()
+                        .is_some_and(|contract| contract.id == expected)
+            })
+        };
+        if !setup.is_empty()
+            || !implements(
+                decoder,
+                onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT,
+            )
+            || !implements(
+                policy,
+                onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT,
+            )
+        {
+            return Err(unavailable(
+                "the loop has setup, external effects, or non-runtime decoder/policy contracts"
+                    .into(),
+            )
+            .into());
+        }
+        let tokens = self.tokenize_prompt(&request.prompt)?;
+        anyhow::ensure!(
+            !tokens.is_empty(),
+            "prefill prompt must contain at least one token"
+        );
+        let tokenizer = self.require_tokenizer()?;
+        for (index, &id) in tokens.iter().enumerate() {
+            anyhow::ensure!(
+                tokenizer.inner().id_to_token(id).is_some(),
+                "prefill prompt[{index}] token id {id} is absent from the package vocabulary; tokenize with this package"
+            );
+        }
+        anyhow::ensure!(
+            request.max_context != Some(0),
+            "prefill max_context must be greater than zero"
+        );
+        let max_context = self.max_context_for_request(&GenerateOptions::default());
+        let max_context = match (max_context, request.max_context) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        anyhow::ensure!(
+            max_context.is_none_or(|limit| tokens.len() <= limit),
+            "prefill prompt contains {} tokens, exceeding max_context {:?}; shorten the prompt",
+            tokens.len(),
+            max_context
+        );
+        if let Some(control) = &control {
+            control.check(crate::pipeline::GenerationBoundary::BeforeWorkflowNode)?;
+        }
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            return self.prefill_native(&tokens, control.as_ref(), admitted);
+        }
+        let session = self.create_session()?;
+        let result = (|| -> anyhow::Result<PrefillResult> {
+            self.admit_generate_request_with_scheduler(session, tokens.len(), 0, Priority::Normal)?;
+            let result = (|| -> anyhow::Result<PrefillResult> {
+                let mut state = self
+                    .sessions
+                    .remove(&session)
+                    .context("prefill session disappeared before admission")?;
+                let outcome = (|| -> anyhow::Result<PrefillResult> {
+                    let turn = DecoderTurnParticipant::admit(
+                        self.workflow.next_turn_transaction_id(),
+                        &mut state,
+                        self.last_speculative_stats,
+                        self.connector.stats().clone(),
+                    )?;
+                    let result = (|| -> anyhow::Result<PrefillResult> {
+                        if let Some(callback) = admitted.as_mut() {
+                            callback();
+                        }
+                        let prefix_cache_hit_len = if request.cold_start {
+                            if self.connector.is_active() {
+                                self.connector.reset_stats();
+                            }
+                            state.tokens.extend_from_slice(&tokens);
+                            0
+                        } else {
+                            self.prepare_session_prefix(session, &mut state, &tokens)?
+                        };
+                        // This also runs a no-KV decoder: ensure_session_kv_current
+                        // alone would skip its entire forward pass.
+                        let _ = next_session_token_logits(
+                            self.session.as_deref().context(MISSING_ORT_SESSION)?,
+                            self.kv_model.as_ref(),
+                            &mut self.kv_cache,
+                            session,
+                            &mut state,
+                        )?;
+                        self.ensure_session_kv_current(session, &mut state)?;
+                        if let Some(control) = &control {
+                            control
+                                .check(crate::pipeline::GenerationBoundary::AfterDecoderForward)?;
+                            control.require_commit()?;
+                        }
+                        Ok(PrefillResult {
+                            prompt_tokens: tokens.len(),
+                            prefix_cache_hit_len,
+                        })
+                    })();
+                    match result {
+                        Ok(result) => {
+                            turn.commit()?;
+                            if let Some(control) = &control {
+                                control.finish_commit();
+                            }
+                            if let Err(error) =
+                                self.insert_cached_prefixes(session, &state, tokens.len())
+                            {
+                                tracing::debug!(%error, "prefill committed but optional prefix publication failed");
+                            }
+                            Ok(result)
+                        }
+                        Err(error) => {
+                            if let Some(control) = &control {
+                                control.abort_commit();
+                            }
+                            let reason =
+                                if error.downcast_ref::<crate::GenerationCancelled>().is_some() {
+                                    crate::pipeline::TurnAbortReason::Cancellation
+                                } else {
+                                    crate::pipeline::TurnAbortReason::ExecutionFailure
+                                };
+                            if let Err(rollback) = turn.abort(self, session, &mut state, reason) {
+                                return Err(error.context(format!("prompt-only decoder transaction failed and baseline restoration also failed: {rollback:#}")));
+                            }
+                            Err(error)
+                        }
+                    }
+                })();
+                self.sessions.insert(session, state);
+                outcome
+            })();
+            self.scheduler.complete(session);
+            result
+        })();
+        let closed = self.close_session(session);
+        match (result, closed) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn prefill_native(
+        &mut self,
+        tokens: &[TokenId],
+        control: Option<&crate::pipeline::GenerationControl>,
+        mut admitted: Option<&mut dyn FnMut()>,
+    ) -> anyhow::Result<PrefillResult> {
+        let session = self.default_native_session()?;
+        let identity = self.ensure_native_session_dispatchable(session)?;
+        self.admit_generate_request_with_scheduler(session, tokens.len(), 0, Priority::Normal)?;
+        let result = (|| -> anyhow::Result<PrefillResult> {
+            let turn = NativeDecoderTurnParticipant::admit(
+                self,
+                NativeSessionTarget::CachedRequest(session),
+                tokens,
+            )?;
+            let result = (|| -> anyhow::Result<PrefillResult> {
+                if let Some(callback) = admitted.as_mut() {
+                    callback();
+                }
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native prefill executor is unavailable")?;
+                native.prepare_generation_workspace_preserving_state(tokens)?;
+                native.reset()?;
+                native.bind_logical_state(identity)?;
+                self.native_active_session = Some(session);
+                native.prefill_prefix(tokens)?;
+                if let Some(control) = control {
+                    control.check(crate::pipeline::GenerationBoundary::AfterDecoderForward)?;
+                    control.require_commit()?;
+                }
+                Ok(PrefillResult {
+                    prompt_tokens: tokens.len(),
+                    prefix_cache_hit_len: 0,
+                })
+            })();
+            match result {
+                Ok(result) => {
+                    let last_access = self.touch_native_session();
+                    let state = self
+                        .native_sessions
+                        .get_mut(&session)
+                        .context("admitted native prefill session disappeared")?;
+                    state.tokens = tokens.to_vec();
+                    state.last_access = last_access;
+                    turn.commit()?;
+                    if let Some(control) = control {
+                        control.finish_commit();
+                    }
+                    self.evict_native_sessions(session);
+                    Ok(result)
+                }
+                Err(error) => {
+                    if let Some(control) = control {
+                        control.abort_commit();
+                    }
+                    let reason = if error.downcast_ref::<crate::GenerationCancelled>().is_some() {
+                        crate::pipeline::TurnAbortReason::Cancellation
+                    } else {
+                        crate::pipeline::TurnAbortReason::ExecutionFailure
+                    };
+                    if let Err(rollback) = turn.abort(self, reason) {
+                        return Err(error.context(format!("native prompt-only transaction failed and baseline restoration also failed: {rollback:#}")));
+                    }
+                    Err(error)
+                }
+            }
+        })();
+        self.scheduler.complete(session);
+        result
+    }
+
     /// Generate text for a request.
     ///
     pub fn generate(&mut self, request: GenerateRequest) -> anyhow::Result<GenerateResult> {
@@ -1360,6 +1769,11 @@ impl Engine {
         session.generate(prompt_tokens, options, chain, tokenizer, runtime)
     }
 
+    /// Whether this runtime can execute ordered sampling stages itself.
+    pub fn supports_runtime_sampling(&self) -> bool {
+        self.holds_decode_core()
+    }
+
     /// Whether this runtime holds the fused decode session that implements the
     /// declared `onnx-genai.autoregressive-decode` step.
     ///
@@ -1442,28 +1856,6 @@ impl Engine {
         Ok(result)
     }
 
-    /// Generate by interpreting every declared component from its artifact.
-    ///
-    /// The same drive the decode-core path uses, with no core: the interpreter
-    /// walks the same declared loop, honours the same bound and predicate, and
-    /// publishes the same `tokens` output. What it does not have is a fused
-    /// session to route the decode step to, so it invokes the component the
-    /// package names.
-    fn generate_interpreted_with_tool_policy(
-        &mut self,
-        request: GenerateRequest,
-        tool_call_policy: ToolCallPolicy,
-        on_admitted: Option<&mut dyn FnMut()>,
-        callback: Option<&mut GenerateTokenCallback<'_>>,
-    ) -> anyhow::Result<GenerateResult> {
-        self.generate_with_pipeline_callbacks(
-            crate::pipeline::PipelineGenerateRequest::new(request)
-                .with_tool_call_policy(tool_call_policy),
-            on_admitted,
-            callback,
-        )
-    }
-
     /// Admit a workflow-driven request through the scheduler.
     ///
     /// A workflow-driven request still shares this runtime's scheduler, and —
@@ -1473,7 +1865,7 @@ impl Engine {
     /// [`crate::engine::workflow_api::Engine::generate_with_pipeline_callbacks`]'s
     /// workflow branch — the one place every request that runs the declared
     /// workflow passes through, whether it arrived cold
-    /// ([`Self::generate_interpreted`]), through a continuing workflow session
+    /// ([`Self::generate_with_tool_policy_callbacks`]), through a continuing workflow session
     /// ([`Self::generate_in_workflow_session`]), or carrying tensors no prompt
     /// can express — this gives the path
     /// the same "reject at the door" guarantee
@@ -1721,6 +2113,7 @@ impl Engine {
         self.generate_with_tool_policy_callbacks(
             request,
             ToolCallPolicy::Disabled,
+            None,
             admission_callback,
             token_callback,
         )
@@ -1731,10 +2124,13 @@ impl Engine {
     /// When enabled, token callbacks are commit-only: protocol parsing and
     /// request-policy validation complete inside the semantic transaction
     /// before any generated output is delivered.
+    /// An optional control aborts provisional execution at workflow boundaries
+    /// and races semantic commit through the decoder's existing transaction.
     pub fn generate_with_tool_policy_callbacks(
         &mut self,
         request: GenerateRequest,
         tool_call_policy: ToolCallPolicy,
+        control: Option<crate::pipeline::GenerationControl>,
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -1748,9 +2144,11 @@ impl Engine {
         // interpreter invokes every declared component from the artifact the
         // package names — the same loop, the same emits, the same stop.
         if !self.holds_decode_core() {
-            return self.generate_interpreted_with_tool_policy(
+            let mut request = crate::pipeline::PipelineGenerateRequest::new(request)
+                .with_tool_call_policy(tool_call_policy);
+            request.generation_control = control;
+            return self.generate_with_pipeline_callbacks(
                 request,
-                tool_call_policy,
                 admission_callback,
                 token_callback,
             );
@@ -1768,6 +2166,7 @@ impl Engine {
                 let result = self.generate_native_cold_with_callback(
                     request,
                     tool_call_policy,
+                    control.as_ref(),
                     admission_callback,
                     token_callback,
                 );
@@ -1776,9 +2175,10 @@ impl Engine {
             }
             let session_id = self.default_native_session()?;
             return self.generate_native_in_session_with_callbacks(
-                session_id,
+                NativeSessionTarget::CachedRequest(session_id),
                 request,
                 tool_call_policy,
+                control.as_ref(),
                 admission_callback,
                 token_callback,
             );
@@ -1789,6 +2189,7 @@ impl Engine {
                 return self.generate_native_cold_with_callback(
                     request,
                     tool_call_policy,
+                    control.as_ref(),
                     admission_callback,
                     token_callback,
                 );
@@ -1802,6 +2203,7 @@ impl Engine {
             Priority::Normal,
             None,
             tool_call_policy,
+            control,
             admission_callback,
             token_callback,
         );
@@ -1822,15 +2224,10 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        if self.holds_decode_core() {
-            return Err(crate::pipeline::GenerationControlUnsupported {
-                operation: "Engine::generate_with_control_callbacks",
-                runtime: "the fused decode backend",
-            }
-            .into());
-        }
-        self.generate_with_pipeline_callbacks(
-            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
+        self.generate_with_tool_policy_callbacks(
+            request,
+            ToolCallPolicy::Disabled,
+            Some(control),
             admission_callback,
             token_callback,
         )
@@ -1860,6 +2257,7 @@ impl Engine {
             ToolCallPolicy::Disabled,
             None,
             None,
+            None,
         )
     }
 
@@ -1877,6 +2275,7 @@ impl Engine {
             None,
             ToolCallPolicy::Disabled,
             None,
+            None,
             callback,
         )
     }
@@ -1893,6 +2292,7 @@ impl Engine {
             session_id,
             request,
             ToolCallPolicy::Disabled,
+            None,
             admission_callback,
             token_callback,
         )
@@ -1904,6 +2304,7 @@ impl Engine {
         session_id: SessionId,
         request: GenerateRequest,
         tool_call_policy: ToolCallPolicy,
+        control: Option<crate::pipeline::GenerationControl>,
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -1913,12 +2314,13 @@ impl Engine {
             Priority::Normal,
             None,
             tool_call_policy,
+            control,
             admission_callback,
             token_callback,
         )
     }
 
-    /// Continue an interpreted workflow session with request-scoped
+    /// Continue a session with request-scoped
     /// cancellation and transaction checkpoints.
     pub fn generate_in_session_with_control_callbacks(
         &mut self,
@@ -1928,16 +2330,11 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        if self.holds_decode_core() {
-            return Err(crate::pipeline::GenerationControlUnsupported {
-                operation: "Engine::generate_in_session_with_control_callbacks",
-                runtime: "the fused decode backend",
-            }
-            .into());
-        }
-        self.generate_in_workflow_session(
+        self.generate_in_session_with_tool_policy_callbacks(
             session_id,
-            crate::pipeline::PipelineGenerateRequest::new(request).with_generation_control(control),
+            request,
+            ToolCallPolicy::Disabled,
+            Some(control),
             admission_callback,
             token_callback,
         )
@@ -1965,6 +2362,7 @@ impl Engine {
             ToolCallPolicy::Disabled,
             None,
             None,
+            None,
         )
     }
 
@@ -1976,6 +2374,7 @@ impl Engine {
         priority: Priority,
         mut custom_sampler: Option<Box<dyn Sampler>>,
         tool_call_policy: ToolCallPolicy,
+        control: Option<crate::pipeline::GenerationControl>,
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
@@ -1991,10 +2390,12 @@ impl Engine {
                 "a package whose components the interpreter invokes declares its sampler; a \
                  caller-supplied one would replace a step the package states in its own graph"
             );
+            let mut request = crate::pipeline::PipelineGenerateRequest::new(request)
+                .with_tool_call_policy(tool_call_policy);
+            request.generation_control = control;
             return self.generate_in_workflow_session(
                 session_id,
-                crate::pipeline::PipelineGenerateRequest::new(request)
-                    .with_tool_call_policy(tool_call_policy),
+                request,
                 admission_callback,
                 callback,
             );
@@ -2008,9 +2409,10 @@ impl Engine {
                 anyhow::bail!("custom samplers are not supported on the native backend");
             }
             return self.generate_native_in_session_with_callbacks(
-                session_id,
+                NativeSessionTarget::Conversation(session_id),
                 request,
                 tool_call_policy,
+                control.as_ref(),
                 admission_callback,
                 callback,
             );
@@ -2066,6 +2468,9 @@ impl Engine {
         self.last_speculative_stats = SpeculativeStats::default();
 
         let result = (|| -> anyhow::Result<GenerateResult> {
+            if let Some(control) = &control {
+                control.check(crate::pipeline::GenerationBoundary::BeforeWorkflowNode)?;
+            }
             let prefix_cache_hit_len =
                 self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
             let mut loop_state =
@@ -2078,6 +2483,7 @@ impl Engine {
                 && !has_custom_sampler
             {
                 return self.generate_speculative_loop(crate::speculative::SpeculativeLoopState {
+                    control: control.as_ref(),
                     session_id,
                     state: &mut state,
                     options: &options,
@@ -2086,6 +2492,7 @@ impl Engine {
                     prefix_cache_hit_len,
                     generated_tokens: &mut loop_state.generated_tokens,
                     generated_text: &mut loop_state.generated_text,
+                    text_decoder: &mut loop_state.text_decoder,
                     generated_logprobs: &mut loop_state.logprobs,
                     rng: &mut loop_state.rng,
                     callback: None,
@@ -2124,6 +2531,7 @@ impl Engine {
                 &mut loop_state,
                 &prompt_tokens,
                 crate::pipeline::generation::GenerationRequest {
+                    control: control.as_ref(),
                     options: &options,
                     chain: &chain,
                     tokenizer,
@@ -2138,11 +2546,17 @@ impl Engine {
                 self.ensure_session_kv_current(session_id, &mut state)?;
             }
             result.budget_cap = budget_cap;
+            if let Some(control) = &control {
+                control.require_commit()?;
+            }
             Ok(result)
         });
         let result = match result {
             Ok(result) => {
                 let _outcome = turn.commit()?;
+                if let Some(control) = &control {
+                    control.finish_commit();
+                }
                 if !exceeded_context_limit(state.tokens.len(), max_context)
                     && let Err(error) =
                         self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())
@@ -2154,18 +2568,30 @@ impl Engine {
                 }
                 Ok(result)
             }
-            Err(error) => match turn.abort(
-                self,
-                session_id,
-                &mut state,
-                crate::pipeline::TurnAbortReason::ExecutionFailure,
-            ) {
-                Ok(_outcome) => Err(error),
-                Err(rollback) => Err(error.context(format!(
-                    "atomic decoder turn failed and its baseline restoration also failed: \
+            Err(error) => {
+                if let Some(control) = &control {
+                    control.abort_commit();
+                }
+                match turn.abort(
+                    self,
+                    session_id,
+                    &mut state,
+                    if error
+                        .downcast_ref::<crate::pipeline::GenerationCancelled>()
+                        .is_some()
+                    {
+                        crate::pipeline::TurnAbortReason::Cancellation
+                    } else {
+                        crate::pipeline::TurnAbortReason::ExecutionFailure
+                    },
+                ) {
+                    Ok(_outcome) => Err(error),
+                    Err(rollback) => Err(error.context(format!(
+                        "atomic decoder turn failed and its baseline restoration also failed: \
                      {rollback:#}"
-                ))),
-            },
+                    ))),
+                }
+            }
         };
         self.sessions.insert(session_id, state);
         self.scheduler.complete(session_id);
@@ -2236,6 +2662,7 @@ impl Engine {
                                 arrival.request.priority,
                                 None,
                                 ToolCallPolicy::Disabled,
+                                None,
                                 None,
                                 None,
                             )
@@ -2838,6 +3265,14 @@ impl Engine {
         }
     }
 
+    fn prefix_reuse_permitted(&self) -> bool {
+        self.metadata.decoder_io().is_none_or(|io| {
+            io.state_groups
+                .iter()
+                .all(|group| group.reuse.prefix_reusable)
+        })
+    }
+
     fn prepare_session_prefix(
         &mut self,
         session_id: SessionId,
@@ -2858,15 +3293,53 @@ impl Engine {
         let mut loaded_prompt_prefix = 0;
         let mut cross_session_hit_len = 0;
 
-        if started_empty && state.decode_state.uses_token_prefix_cache() {
-            cross_session_hit_len = self
-                .token_prefix_cache
-                .iter()
-                .map(|cached| common_prefix_len(cached, prompt_tokens).min(cached.len()))
-                .filter(|&len| len > 0)
-                .max()
-                .unwrap_or(0);
+        if started_empty
+            && self.prefix_reuse_permitted()
+            && state.decode_state.runner_supports_kv_handoff()
+        {
+            if let Some((matched, snapshot)) = self
+                .prefix_cache
+                .lookup_snapshot::<OrtPrefixSnapshot>(prompt_tokens)
+            {
+                let materialized = matched.min(prompt_tokens.len().saturating_sub(1));
+                if materialized > 0
+                    && let Ok(_staging) = onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                        self.governor.memory(),
+                        onnx_runtime_memory_api::Tier::Host,
+                        snapshot._lease.bytes().checked_mul(2).context("ORT prefix restore staging size overflows")?,
+                        Holder::OrtPrefixSnapshot.role(),
+                        Holder::OrtPrefixSnapshot.id(),
+                    ).inspect_err(|error| tracing::debug!(%error, materialized, "portable KV prefix restore lacks host staging budget; recomputing the complete prompt"))
+                {
+                    let kv = snapshot
+                        .tensors
+                        .iter()
+                        .map(|tensor| {
+                            Ok((
+                                tensor.name.clone(),
+                                onnx_genai_ort::Value::from_raw_bytes(
+                                    tensor.bytes.clone(),
+                                    &tensor.shape,
+                                    tensor.dtype,
+                                )?,
+                            ))
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    state.decode_state.import_runner_kv(snapshot.length, kv)?;
+                    state.decode_state.rewind_runner(materialized)?;
+                    self.kv_cache.append(session_id, materialized)?;
+                    state.kv_token_count = materialized;
+                    state
+                        .tokens
+                        .extend_from_slice(&prompt_tokens[..materialized]);
+                    loaded_prompt_prefix = materialized;
+                    cross_session_hit_len = materialized;
+                }
+            }
         } else if started_empty
+            && self.prefix_reuse_permitted()
+            && !state.decode_state.has_runner()
+            && !state.decode_state.is_windowed()
             && state.decode_state.use_kv
             && self.kv_model.is_some()
             && self.kv_cache.page_table.tensor_config.is_some()
@@ -2941,7 +3414,7 @@ impl Engine {
         // absolute positions is byte-exact — proven token-identical by the gold
         // integration test. If injection is not possible we fall back to the
         // reporting-only `lookup_extension`, never claiming a hit we can't serve.
-        if self.connector.is_active() {
+        if self.connector.is_active() && self.prefix_reuse_permitted() {
             let injected =
                 self.try_connector_kv_injection(session_id, state, prompt_tokens, in_process_hit)?;
             if let Some(total) = injected {
@@ -3097,6 +3570,7 @@ impl Engine {
                     &mut backend,
                     &mut loop_state,
                     &crate::pipeline::generation::GenerationRequest {
+                        control: None,
                         options: &options,
                         chain: &chain,
                         tokenizer,
@@ -3164,6 +3638,7 @@ impl Engine {
             prefix_cache_hit_len,
             generated_tokens: loop_state.generated_tokens,
             generated_text: loop_state.generated_text,
+            text_decoder: loop_state.text_decoder,
             logprobs: loop_state.logprobs,
             budget_cap: None,
             step: loop_state.step,
@@ -3179,6 +3654,7 @@ impl Engine {
         let mut loop_state = DecodeLoopState {
             generated_tokens: std::mem::take(&mut active.generated_tokens),
             generated_text: std::mem::take(&mut active.generated_text),
+            text_decoder: std::mem::take(&mut active.text_decoder),
             logprobs: active.logprobs.take(),
             step: active.step,
             prefix_cache_hit_len: active.prefix_cache_hit_len,
@@ -3190,11 +3666,7 @@ impl Engine {
                 .tokenizer
                 .as_ref()
                 .context("this package declares no tokenizer, so it cannot decode text")?;
-            ensure_constrained_finish(
-                &active.options,
-                &loop_state.generated_text,
-                finish_reason.clone(),
-            )?;
+
             Some(crate::decode_loop::finish_result(
                 tokenizer,
                 &loop_state.generated_tokens,
@@ -3229,6 +3701,7 @@ impl Engine {
                 &mut backend,
                 &mut loop_state,
                 &crate::pipeline::generation::GenerationRequest {
+                    control: None,
                     options: &active.options,
                     chain: &active.chain,
                     tokenizer,
@@ -3256,25 +3729,19 @@ impl Engine {
                 (true, None) => None,
             };
             match finish {
-                Some(finish_reason) => {
-                    ensure_constrained_finish(
-                        &active.options,
-                        &loop_state.generated_text,
-                        finish_reason.clone(),
-                    )?;
-                    Some(crate::decode_loop::finish_result(
-                        tokenizer,
-                        &loop_state.generated_tokens,
-                        finish_reason,
-                        loop_state.prefix_cache_hit_len,
-                        loop_state.logprobs.as_deref(),
-                    )?)
-                }
+                Some(finish_reason) => Some(crate::decode_loop::finish_result(
+                    tokenizer,
+                    &loop_state.generated_tokens,
+                    finish_reason,
+                    loop_state.prefix_cache_hit_len,
+                    loop_state.logprobs.as_deref(),
+                )?),
                 None => None,
             }
         };
         active.generated_tokens = loop_state.generated_tokens;
         active.generated_text = loop_state.generated_text;
+        active.text_decoder = loop_state.text_decoder;
         active.logprobs = loop_state.logprobs;
         active.step = loop_state.step;
         active.rng = loop_state.rng;
@@ -3283,11 +3750,6 @@ impl Engine {
             return Ok(Some(result));
         }
         if active.generated_tokens.len() >= active.options.max_new_tokens {
-            ensure_constrained_finish(
-                &active.options,
-                &active.generated_text,
-                FinishReason::MaxTokens,
-            )?;
             return self
                 .finish_result(
                     &active.generated_tokens,
@@ -3444,6 +3906,9 @@ impl Engine {
         state: &EngineSession,
         prompt_len: usize,
     ) -> anyhow::Result<()> {
+        if !self.prefix_reuse_permitted() {
+            return Ok(());
+        }
         // K4: extract the freshly computed KV for each complete resident chunk
         // and push the real bytes to the external connector for future
         // cross-session / cross-node reuse. Only ZeroCopyRebind `PastPresent`
@@ -3452,12 +3917,15 @@ impl Engine {
         if self.connector.is_active() {
             self.store_connector_prefix(session_id, state);
         }
-        if state.decode_state.uses_token_prefix_cache() {
-            if prompt_len > 0 && prompt_len <= state.kv_token_count {
-                self.insert_token_prefix(&state.tokens[..prompt_len]);
-            }
-            if state.kv_token_count == state.tokens.len() {
-                self.insert_token_prefix(&state.tokens);
+        if state.decode_state.has_runner() || state.decode_state.is_windowed() {
+            if state.decode_state.runner_supports_kv_handoff() {
+                if prompt_len > 0 && prompt_len <= state.kv_token_count {
+                    self.insert_runner_prefix(state, prompt_len)?;
+                }
+                if state.kv_token_count == state.tokens.len() && state.kv_token_count != prompt_len
+                {
+                    self.insert_runner_prefix(state, state.kv_token_count)?;
+                }
             }
             return Ok(());
         }
@@ -3487,16 +3955,54 @@ impl Engine {
         Ok(())
     }
 
-    fn insert_token_prefix(&mut self, tokens: &[TokenId]) {
-        if tokens.is_empty()
-            || self
-                .token_prefix_cache
-                .iter()
-                .any(|cached| cached.as_slice() == tokens)
+    fn insert_runner_prefix(&mut self, state: &EngineSession, length: usize) -> anyhow::Result<()> {
+        let tokens = &state.tokens[..length];
+        if self
+            .prefix_cache
+            .lookup_snapshot::<OrtPrefixSnapshot>(tokens)
+            .is_some_and(|(matched, _)| matched == length)
         {
-            return;
+            return Ok(());
         }
-        self.token_prefix_cache.push(tokens.to_vec());
+        let bytes = state.decode_state.runner_prefix_bytes(length)?;
+        let memory = self.governor.memory();
+        let reserve = || {
+            onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                memory,
+                onnx_runtime_memory_api::Tier::Host,
+                bytes,
+                Holder::OrtPrefixSnapshot.role(),
+                Holder::OrtPrefixSnapshot.id(),
+            )
+        };
+        let lease = match reserve() {
+            Ok(lease) => lease,
+            Err(_) if self.prefix_cache.evict_lru_snapshot() => reserve()?,
+            Err(error) => return Err(error.into()),
+        };
+        // Export and compacting/raw-byte copies coexist only during capture.
+        let _staging = reserve()?;
+        let exported = state.decode_state.export_runner_prefix(length)?;
+        let tensors = exported
+            .into_iter()
+            .map(|(name, value)| {
+                Ok(OrtPrefixTensor {
+                    name,
+                    shape: value.shape().to_vec(),
+                    dtype: value.dtype(),
+                    bytes: value.to_raw_bytes()?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.prefix_cache.insert_snapshot(
+            tokens,
+            Arc::new(OrtPrefixSnapshot {
+                length,
+                tensors,
+                _lease: lease,
+            }),
+        );
+        Ok(())
     }
 
     pub(crate) fn finish_result(
@@ -3610,12 +4116,15 @@ impl Engine {
 
     fn generate_native_in_session_with_callbacks(
         &mut self,
-        session_id: SessionId,
+        target: NativeSessionTarget,
         request: GenerateRequest,
         tool_call_policy: ToolCallPolicy,
+        control: Option<&crate::pipeline::GenerationControl>,
         mut admission_callback: Option<&mut dyn FnMut()>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        let session_id = target.id();
+        let cached_request = matches!(&target, NativeSessionTarget::CachedRequest(_));
         request.options.validate()?;
         let mut options = request.options;
         reject_native_request_speculation(&options)?;
@@ -3646,7 +4155,7 @@ impl Engine {
         options.max_new_tokens = scheduled.max_tokens;
         let mut staged_output =
             CommitOnlyTokenStager::new(native_output_stage_limit(options.max_new_tokens));
-        let turn = match NativeDecoderTurnParticipant::admit(self, session_id) {
+        let turn = match NativeDecoderTurnParticipant::admit(self, target, &prompt_tokens) {
             Ok(turn) => turn,
             Err(error) => {
                 self.scheduler.complete(session_id);
@@ -3701,10 +4210,14 @@ impl Engine {
                 common_prefix_len(&state.tokens, &prompt_tokens)
             };
 
-            let supports_past_snapshots = self
-                .native_session
-                .as_ref()
-                .is_some_and(|native| native.supports_past_snapshots());
+            // Semantic-prefix caching targets recurrent history. Complete
+            // turn snapshots also admit dense host KV, without changing this
+            // cache's scope or its recurrent-prefix telemetry.
+            let prefix_reuse_permitted = self.prefix_reuse_permitted();
+            let supports_past_snapshots = prefix_reuse_permitted
+                && self.native_session.as_ref().is_some_and(|native| {
+                    native.has_recurrent_state() && native.supports_past_snapshots()
+                });
             let mut restored_prefix_len = None;
             let mut should_store_semantic_snapshot = false;
             if !active_matches
@@ -3814,7 +4327,12 @@ impl Engine {
             }
 
             let mut result = {
-                let mut stage_token = |token| staged_output.stage(token);
+                let mut stage_token = |token| {
+                    if let Some(control) = control {
+                        control.check(crate::pipeline::GenerationBoundary::BeforeWorkflowNode)?;
+                    }
+                    staged_output.stage(token)
+                };
                 // Borrowed before the mutable native-session borrow below.
                 let tokenizer = self
                     .tokenizer
@@ -3836,6 +4354,15 @@ impl Engine {
                 if resume_from >= prompt_tokens.len() {
                     resume_from = prompt_tokens.len().saturating_sub(1);
                 }
+                // Reusing an implementation cache obeys the package's prefix
+                // policy. A recurrent/record state cannot be reconstructed by
+                // slicing an earlier token boundary; re-evaluate the complete
+                // prompt instead, under the already admitted turn checkpoint.
+                if (cached_request && !prefix_reuse_permitted)
+                    || (native.has_recurrent_state() && resume_from < native.current_len())
+                {
+                    resume_from = 0;
+                }
 
                 native.generate_incremental_with_callback_and_staged_observer(
                     &prompt_tokens,
@@ -3844,36 +4371,56 @@ impl Engine {
                     &chain,
                     tokenizer,
                     runtime,
+                    control,
                     tool_observer.as_mut(),
                     Some(&mut stage_token),
                 )?
             };
             result.budget_cap = budget_cap;
-            let last_access = self.touch_native_session();
-
-            let state = self
-                .native_sessions
-                .get_mut(&session_id)
-                .with_context(|| format!("session {session_id} not found"))?;
-            state.tokens.truncate(prefix_len);
-            state.tokens.extend_from_slice(&prompt_tokens[prefix_len..]);
-            state.tokens.extend_from_slice(&result.token_ids);
-            state.last_access = last_access;
-            self.evict_native_sessions(session_id);
-
             Ok(result)
         })();
         let result = result.and_then(|result| {
             staged_output.validate(&result)?;
+            if let Some(control) = control {
+                control.require_commit()?;
+            }
             Ok(result)
         });
         let result = match result {
             Ok(result) => {
+                // Staging validation and cancellation must finish before any
+                // durable history or retention policy changes. The exclusive
+                // engine borrow keeps this admitted session present until here.
+                let last_access = self.touch_native_session();
+                let state = self
+                    .native_sessions
+                    .get_mut(&session_id)
+                    .expect("admitted native session remains until turn resolution");
+                state.tokens.clone_from(&prompt_tokens);
+                state.tokens.extend_from_slice(&result.token_ids);
+                state.last_access = last_access;
                 let _outcome = turn.commit()?;
+                if let Some(control) = control {
+                    control.finish_commit();
+                }
+                self.evict_native_sessions(session_id);
                 Ok(result)
             }
             Err(error) => {
-                match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
+                if let Some(control) = control {
+                    control.abort_commit();
+                }
+                match turn.abort(
+                    self,
+                    if error
+                        .downcast_ref::<crate::pipeline::GenerationCancelled>()
+                        .is_some()
+                    {
+                        crate::pipeline::TurnAbortReason::Cancellation
+                    } else {
+                        crate::pipeline::TurnAbortReason::ExecutionFailure
+                    },
+                ) {
                     Ok(_) => Err(error),
                     Err(rollback) => Err(error.context(format!(
                         "atomic native decoder turn failed and its baseline restoration also \
@@ -3958,6 +4505,133 @@ mod tests {
         assert!(generate_uses_scheduler(EngineDecodeBackend::Auto));
     }
 
+    fn assert_decoder_cancellation_preserves_session(
+        make_engine: impl Fn() -> anyhow::Result<Engine>,
+        cancel_before_commit: bool,
+    ) -> anyhow::Result<()> {
+        use crate::pipeline::{GenerationBoundary, GenerationCancelled, GenerationControl};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut engine = make_engine()?;
+        let session = engine.create_session()?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+        request.options.max_new_tokens = 1;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        engine.generate_in_session(session, request.clone())?;
+        let baseline = engine.session_token_count(session)?;
+        #[cfg(feature = "native-backend")]
+        let native_baseline = engine.native_sessions.get(&session).map(|state| {
+            (
+                state.tokens.clone(),
+                state.last_access,
+                engine.native_access_counter,
+            )
+        });
+        request.options.max_new_tokens = 4;
+        let forwards = Arc::new(AtomicUsize::new(0));
+        let observed = forwards.clone();
+        let authority = GenerationControl::new();
+        let cancellation = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == GenerationBoundary::AfterDecoderForward {
+                let count = observed.fetch_add(1, Ordering::SeqCst) + 1;
+                if !cancel_before_commit && count == 2 {
+                    assert!(cancellation.cancel());
+                }
+            }
+            if cancel_before_commit && boundary == GenerationBoundary::BeforeSemanticCommit {
+                assert!(cancellation.cancel());
+            }
+            Ok(())
+        });
+        let mut published = Vec::new();
+        let error = engine
+            .generate_in_session_with_control_callbacks(
+                session,
+                request.clone(),
+                control,
+                None,
+                Some(&mut |token| {
+                    published.push(token.token_id);
+                    Ok(())
+                }),
+            )
+            .expect_err("request cancellation must abort before semantic commit");
+        let expected_boundary = if cancel_before_commit {
+            GenerationBoundary::BeforeSemanticCommit
+        } else {
+            GenerationBoundary::AfterDecoderForward
+        };
+        assert_eq!(
+            error
+                .downcast_ref::<GenerationCancelled>()
+                .map(|error| error.boundary),
+            Some(expected_boundary),
+            "{error:#}"
+        );
+        assert_eq!(
+            forwards.load(Ordering::SeqCst),
+            if cancel_before_commit { 4 } else { 2 }
+        );
+        assert!(
+            published.is_empty(),
+            "aborted tokens must never reach the transport"
+        );
+        assert_eq!(engine.session_token_count(session)?, baseline);
+        #[cfg(feature = "native-backend")]
+        assert_eq!(
+            engine.native_sessions.get(&session).map(|state| (
+                state.tokens.clone(),
+                state.last_access,
+                engine.native_access_counter
+            )),
+            native_baseline,
+            "cancelled native turns must preserve both token history and LRU stamps"
+        );
+        assert_eq!(engine.scheduler.running_count(), 0);
+        let actual = engine.generate_in_session(session, request.clone())?;
+        let mut independent = make_engine()?;
+        let expected_session = independent.create_session()?;
+        let mut warm = request.clone();
+        warm.options.max_new_tokens = 1;
+        independent.generate_in_session(expected_session, warm)?;
+        let expected = independent.generate_in_session(expected_session, request)?;
+        assert_eq!(
+            actual.token_ids, expected.token_ids,
+            "retry must start from the committed baseline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_cancellation_stops_ort_decoder_and_restores_session() -> anyhow::Result<()> {
+        for cancel_before_commit in [false, true] {
+            assert_decoder_cancellation_preserves_session(
+                || {
+                    Engine::from_dir(
+                        &Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../tests/fixtures/tiny-llm"),
+                        EngineConfig::default(),
+                    )
+                },
+                cancel_before_commit,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn request_cancellation_stops_native_decoder_and_restores_session() -> anyhow::Result<()> {
+        for cancel_before_commit in [false, true] {
+            assert_decoder_cancellation_preserves_session(
+                tiny_native_cold_engine,
+                cancel_before_commit,
+            )?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "native-backend")]
     fn tiny_native_cold_engine() -> anyhow::Result<Engine> {
         let fixture =
@@ -3970,6 +4644,362 @@ mod tests {
                 ..EngineConfig::default()
             },
         )
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn content_dependent_kv_fixture(source: &str) -> anyhow::Result<String> {
+        use onnx_runtime_loader::proto::onnx::{AttributeProto, attribute_proto::AttributeType};
+        let mut model = onnx_std::textproto::from_textproto(source)?.to_proto()?;
+        let graph = model
+            .graph
+            .as_mut()
+            .context("native cancellation fixture needs a graph")?;
+        let cast = graph
+            .node
+            .iter_mut()
+            .find(|node| node.output == ["cast_input_ids"])
+            .context("native cancellation fixture needs the input Cast")?;
+        anyhow::ensure!(
+            cast.op_type == "Cast" && cast.input == ["attention_mask"],
+            "native cancellation fixture's Cast no longer consumes attention_mask"
+        );
+        cast.input = vec!["input_ids".into()];
+        for kind in ["key", "value"] {
+            let output = format!("present.0.{kind}");
+            let node = graph
+                .node
+                .iter_mut()
+                .find(|node| node.output == [output.as_str()])
+                .with_context(|| format!("native cancellation fixture needs {output}"))?;
+            anyhow::ensure!(
+                node.op_type == "Identity" && node.input == ["current_kv"],
+                "native cancellation fixture's {output} is no longer the current_kv identity"
+            );
+            node.op_type = "Concat".into();
+            node.input = vec![format!("past_key_values.0.{kind}"), "current_kv".into()];
+            node.attribute = vec![AttributeProto {
+                name: "axis".into(),
+                i: 2,
+                r#type: AttributeType::Int as i32,
+                ..AttributeProto::default()
+            }];
+        }
+        Ok(onnx_std::textproto::to_textproto(
+            &onnx_std::Model::from_proto(model)?,
+        )?)
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_content_dependent_kv_fixture_ignores_text_format_whitespace() -> anyhow::Result<()> {
+        let source =
+            include_str!("../../../../tests/fixtures/tiny-native-engine/model.onnx.textproto");
+        let expected = content_dependent_kv_fixture(source)?;
+        let lf = source.lines().collect::<Vec<_>>().join("\n");
+        for spelling in [
+            lf.replace('\n', "\r\n"),
+            lf.lines().map(str::trim).collect::<Vec<_>>().join(" "),
+        ] {
+            assert_eq!(content_dependent_kv_fixture(&spelling)?, expected);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_cancelled_prompt_replacement_restores_exact_kv_contents() -> anyhow::Result<()> {
+        use crate::pipeline::{GenerationBoundary, GenerationCancelled, GenerationControl};
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        let directory = tempfile::tempdir()?;
+        for name in ["inference_metadata.yaml", "tokenizer.json"] {
+            std::fs::copy(source.join(name), directory.path().join(name))?;
+        }
+        // This fixture's KV must depend on token content; its constant logits
+        // alone cannot distinguish an overwritten prefix from the old state.
+        let graph = content_dependent_kv_fixture(&std::fs::read_to_string(
+            source.join("model.onnx.textproto"),
+        )?)?;
+        std::fs::write(directory.path().join("model.onnx.textproto"), graph)?;
+        let mut engine = Engine::from_dir(
+            directory.path(),
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..EngineConfig::default()
+            },
+        )?;
+        let session = engine.create_session()?;
+        let mut request = tiny_native_cold_request(false);
+        request.options.max_new_tokens = 1;
+        engine.generate_in_session(session, request.clone())?;
+        let cache = || "past_key_values.0.key";
+        let baseline = engine
+            .native_session
+            .as_ref()
+            .unwrap()
+            .host_present_kv(cache())
+            .context("warm KV")?;
+        assert_eq!(baseline.0, [0.0]);
+        let memory = engine.governor.memory().clone();
+        let used = || {
+            onnx_runtime_memory_governor::MemoryGovernor::used(
+                &memory,
+                onnx_runtime_memory_api::Tier::Host,
+            )
+        };
+        let before = used();
+        let mut append = engine.native_sessions[&session].tokens.clone();
+        append.push(0);
+        let append_turn = NativeDecoderTurnParticipant::admit(
+            &mut engine,
+            NativeSessionTarget::Conversation(session),
+            &append,
+        )?;
+        assert!(matches!(
+            &append_turn.baseline,
+            NativeTurnBaseline::PreservedPrefix { .. }
+        ));
+        assert_eq!(used(), before, "an append must not copy the full KV cache");
+        append_turn.abort(&mut engine, crate::pipeline::TurnAbortReason::Cancellation)?;
+        let snapshot_bytes = engine
+            .native_session
+            .as_ref()
+            .unwrap()
+            .past_snapshot_bytes()?;
+        let replacement_turn = NativeDecoderTurnParticipant::admit(
+            &mut engine,
+            NativeSessionTarget::Conversation(session),
+            &[1],
+        )?;
+        assert!(matches!(
+            &replacement_turn.baseline,
+            NativeTurnBaseline::Complete { .. }
+        ));
+        assert_eq!(
+            used(),
+            before + snapshot_bytes,
+            "complete snapshots must be charged before mutation"
+        );
+        replacement_turn.abort(&mut engine, crate::pipeline::TurnAbortReason::Cancellation)?;
+        assert_eq!(
+            used(),
+            before,
+            "resolved turn must release its snapshot reservation"
+        );
+        let authority = GenerationControl::new();
+        let cancellation = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == GenerationBoundary::BeforeSemanticCommit {
+                assert!(cancellation.cancel());
+            }
+            Ok(())
+        });
+        request.prompt = GeneratePrompt::TokenIds(vec![1]);
+        request.options.max_new_tokens = 4;
+        let error = engine
+            .generate_in_session_with_control_callbacks(session, request, control, None, None)
+            .expect_err("replacement must cancel before commit");
+        assert!(
+            error.downcast_ref::<GenerationCancelled>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(
+            engine
+                .native_session
+                .as_ref()
+                .unwrap()
+                .host_present_kv(cache())
+                .context("restored KV")?,
+            baseline,
+            "rewinding length alone cannot restore bytes overwritten by prompt replacement"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_compressed_prompt_replacement_cancellation_restores_complete_state()
+    -> anyhow::Result<()> {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-deepseek-v4-csa");
+        let directory = tempfile::tempdir()?;
+        for name in ["inference_metadata.yaml", "model.onnx.textproto"] {
+            std::fs::copy(source.join(name), directory.path().join(name))?;
+        }
+        let metadata: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(
+            source.join("inference_metadata.yaml"),
+        )?)?;
+        let vocab_size = metadata["package"]["tokenizer"]["vocab_size"]
+            .as_u64()
+            .context("fixture vocabulary size")?;
+        let vocab: serde_json::Map<String, serde_json::Value> = (0..vocab_size)
+            .map(|token| (format!("t{token}"), serde_json::json!(token)))
+            .collect();
+        std::fs::write(
+            directory.path().join("tokenizer.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version":"1.0", "truncation":null, "padding":null, "added_tokens":[], "normalizer":null,
+                "pre_tokenizer":{"type":"Whitespace"}, "post_processor":null, "decoder":null,
+                "model":{"type":"WordLevel", "vocab":vocab, "unk_token":"t0"}
+            }))?,
+        )?;
+        let mut engine = Engine::from_dir(
+            directory.path(),
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..EngineConfig::default()
+            },
+        )?;
+        let session = engine.create_session()?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2, 3, 4, 5, 6, 7]));
+        request.options.max_new_tokens = 1;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        request.options.semantic_prefix_len = Some(4);
+        engine.generate_in_session(session, request.clone())?;
+        assert_eq!(
+            engine.native_recurrent_prefix_stats.stores, 0,
+            "complete rollback checkpoints must not override a package's prefix_reusable=false contract"
+        );
+        let baseline = engine.native_session.as_mut().unwrap().snapshot_past()?;
+        let tokens = engine.native_sessions[&session].tokens.clone();
+        let authority = crate::GenerationControl::new();
+        let cancel = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == crate::GenerationBoundary::BeforeSemanticCommit {
+                assert!(cancel.cancel());
+            }
+            Ok(())
+        });
+        request.prompt = GeneratePrompt::TokenIds(vec![1, 2, 3, 21, 22]);
+        request.options.max_new_tokens = 2;
+        let mut published = Vec::new();
+        let error = engine
+            .generate_in_session_with_control_callbacks(
+                session,
+                request.clone(),
+                control,
+                None,
+                Some(&mut |token| {
+                    published.push(token.token_id);
+                    Ok(())
+                }),
+            )
+            .expect_err("compressed replacement must cancel at the semantic commit boundary");
+        assert!(
+            error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+            "{error:#}"
+        );
+        assert!(published.is_empty());
+        assert_eq!(engine.native_sessions[&session].tokens, tokens);
+        let restored = engine.native_session.as_mut().unwrap().snapshot_past()?;
+        assert_eq!(restored.len(), baseline.len());
+        assert_eq!(
+            restored.host_contents(),
+            baseline.host_contents(),
+            "all compressed records, cursors and partial carries must survive cancellation"
+        );
+        assert_eq!(engine.scheduler.running_count(), 0);
+        assert_eq!(
+            engine
+                .generate_in_session(session, request.clone())?
+                .token_ids
+                .len(),
+            2
+        );
+        assert_eq!(engine.generate(request.clone())?.token_ids.len(), 2);
+        request.prompt = GeneratePrompt::TokenIds(vec![1, 2, 3, 31, 32]);
+        assert_eq!(
+            engine.generate(request)?.token_ids.len(),
+            2,
+            "stateless replacement must reset a non-reusable partial prefix, not attempt an invalid record rewind"
+        );
+        assert_eq!(engine.native_recurrent_prefix_stats.stores, 0);
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_inplace_prompt_replacement_restores_complete_snapshot() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-native-scalar-gqa");
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..EngineConfig::default()
+            },
+        )?;
+        let session = engine.create_session()?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+        request.options.max_new_tokens = 1;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        engine.generate_in_session(session, request.clone())?;
+        let native = engine.native_session.as_mut().unwrap();
+        let baseline = native.snapshot_past()?;
+        assert!(
+            baseline.cpu_kv_snapshot().is_some(),
+            "fixture must exercise an in-place backend"
+        );
+        let materialized = native.current_len();
+        assert!(materialized > 0);
+        let tokens = engine.native_sessions[&session].tokens.clone();
+        let stamp = engine.native_sessions[&session].last_access;
+        let authority = crate::GenerationControl::new();
+        let cancel = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == crate::GenerationBoundary::BeforeSemanticCommit {
+                assert!(cancel.cancel());
+            }
+            Ok(())
+        });
+        let mut replacement = request.clone();
+        replacement.prompt = GeneratePrompt::TokenIds(vec![1]);
+        replacement.options.max_new_tokens = 4;
+        let error = engine
+            .generate_in_session_with_control_callbacks(
+                session,
+                replacement.clone(),
+                control,
+                None,
+                None,
+            )
+            .expect_err("cancelled replacement must abort");
+        assert!(
+            error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+            "{error:#}"
+        );
+        let restored = engine.native_session.as_mut().unwrap().snapshot_past()?;
+        assert_eq!(
+            restored.cpu_kv_snapshot(),
+            baseline.cpu_kv_snapshot(),
+            "cancelled replacement must restore every live in-place KV row"
+        );
+        assert_eq!(
+            engine.native_session.as_ref().unwrap().current_len(),
+            materialized
+        );
+        assert_eq!(engine.native_sessions[&session].tokens, tokens);
+        assert_eq!(engine.native_sessions[&session].last_access, stamp);
+        assert_eq!(engine.scheduler.running_count(), 0);
+        replacement.options.max_new_tokens = 1;
+        assert_eq!(
+            engine
+                .generate_in_session(session, replacement)?
+                .token_ids
+                .len(),
+            1
+        );
+        // Stateless requests own only a discardable implementation cache, so
+        // replacing it must keep working even without conversation snapshots.
+        assert_eq!(engine.generate(request.clone())?.token_ids.len(), 1);
+        request.prompt = GeneratePrompt::TokenIds(vec![1]);
+        assert_eq!(engine.generate(request)?.token_ids.len(), 1);
+        Ok(())
     }
 
     #[cfg(feature = "native-backend")]
@@ -3986,6 +5016,56 @@ mod tests {
             });
         }
         request
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn request_cancellation_stops_cold_native_and_prompt_lookup_without_publication()
+    -> anyhow::Result<()> {
+        use crate::pipeline::{GenerationBoundary, GenerationCancelled, GenerationControl};
+        for speculative in [false, true] {
+            let mut engine = tiny_native_cold_engine()?;
+            let mut request = tiny_native_cold_request(speculative);
+            request.options.cold_start = true;
+            let authority = GenerationControl::new();
+            let cancellation = authority.clone();
+            let boundary = if speculative {
+                GenerationBoundary::BeforeWorkflowNode
+            } else {
+                GenerationBoundary::AfterDecoderForward
+            };
+            let control = authority.with_checkpoint(move |observed| {
+                if observed == boundary {
+                    assert!(cancellation.cancel());
+                }
+                Ok(())
+            });
+            let mut published = Vec::new();
+            let error = engine
+                .generate_with_control_callbacks(
+                    request.clone(),
+                    control,
+                    None,
+                    Some(&mut |token| {
+                        published.push(token.token_id);
+                        Ok(())
+                    }),
+                )
+                .expect_err("cancelled cold generation must abort");
+            assert!(
+                error.downcast_ref::<GenerationCancelled>().is_some(),
+                "{error:#}"
+            );
+            assert!(published.is_empty());
+            assert_eq!(engine.scheduler.running_count(), 0);
+            let actual = engine.generate(request.clone())?;
+            let expected = tiny_native_cold_engine()?.generate(request)?;
+            assert_eq!(
+                actual.token_ids, expected.token_ids,
+                "cancelled cold state leaked into retry"
+            );
+        }
+        Ok(())
     }
 
     /// The callback the server passes here emits `DriverEvent::Token`
@@ -4174,13 +5254,17 @@ mod tests {
         engine.generate_in_session(failed, tiny_native_cold_request(false))?;
         assert_eq!(engine.native_active_session, Some(failed));
 
+        let mut append = tiny_native_cold_request(false);
+        let mut prompt = engine.native_sessions[&failed].tokens.clone();
+        prompt.push(0);
+        append.prompt = GeneratePrompt::TokenIds(prompt);
         engine
             .native_session
             .as_mut()
             .context("native decoder")?
-            .fail_rewind_after_for_test(1);
+            .fail_rewind_after_for_test(0);
         let failure = with_native_output_stage_limit_for_test(1, || {
-            engine.generate_in_session(failed, tiny_native_cold_request(false))
+            engine.generate_in_session(failed, append)
         })
         .expect_err("the active turn's rollback must hit the injected rewind failure");
         let failure = format!("{failure:#}");
@@ -4313,6 +5397,300 @@ mod tests {
         Ok(())
     }
 
+    fn prefill_request(tokens: &[TokenId]) -> PrefillRequest {
+        PrefillRequest {
+            prompt: GeneratePrompt::TokenIds(tokens.to_vec()),
+            max_context: None,
+            cold_start: false,
+        }
+    }
+
+    #[test]
+    fn prompt_only_prefill_publishes_real_ort_cache_without_output() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let prompt = [2, 4, 3];
+        let result = engine.prefill(prefill_request(&prompt))?;
+        assert_eq!(
+            result,
+            PrefillResult {
+                prompt_tokens: 3,
+                prefix_cache_hit_len: 0
+            }
+        );
+        assert!(
+            engine.sessions.is_empty(),
+            "ephemeral prefill session must be closed"
+        );
+        assert_eq!(engine.scheduler.running_count(), 0);
+        assert_eq!(
+            engine
+                .prefix_cache
+                .lookup_snapshot::<OrtPrefixSnapshot>(&prompt)
+                .unwrap()
+                .0,
+            3,
+            "the real evaluated KV must outlive its ephemeral session"
+        );
+        let snapshot = engine
+            .prefix_cache
+            .lookup_snapshot::<OrtPrefixSnapshot>(&prompt)
+            .unwrap()
+            .1;
+        assert!(
+            snapshot
+                .tensors
+                .iter()
+                .any(|tensor| tensor.bytes.iter().any(|&byte| byte != 0)),
+            "this fixture must expose nonzero computed KV bytes"
+        );
+        // A cache hit must install actual physical state, not just publish a
+        // token-match count. No forward is executed by this preparation call.
+        let inspection = engine.create_session()?;
+        let mut state = engine.sessions.remove(&inspection).unwrap();
+        assert_eq!(
+            engine.prepare_session_prefix(inspection, &mut state, &prompt)?,
+            2
+        );
+        assert_eq!(state.decode_state.runner_len(), 2);
+        let restored = state.decode_state.export_runner_kv()?;
+        assert!(!restored.is_empty());
+        for (name, tensor) in restored {
+            let source = snapshot
+                .tensors
+                .iter()
+                .find(|tensor| tensor.name == name)
+                .unwrap();
+            assert_eq!(tensor.dtype(), source.dtype);
+            let mut strides = vec![1usize; source.shape.len()];
+            for axis in (0..strides.len() - 1).rev() {
+                strides[axis] = strides[axis + 1] * source.shape[axis + 1] as usize;
+            }
+            let size = source.dtype.size_of();
+            let mut expected = Vec::new();
+            for mut linear in 0..tensor.numel() {
+                let mut offset = 0;
+                for (axis, &extent) in tensor.shape().iter().enumerate().rev() {
+                    offset += (linear % extent as usize) * strides[axis];
+                    linear /= extent as usize;
+                }
+                expected.extend_from_slice(&source.bytes[offset * size..(offset + 1) * size]);
+            }
+            assert_eq!(
+                tensor.to_raw_bytes()?,
+                expected,
+                "restored physical KV for {name}"
+            );
+        }
+        engine.sessions.insert(inspection, state);
+        engine.close_session(inspection)?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.to_vec()));
+        request.options.max_new_tokens = 2;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        let generated = engine.generate(request.clone())?;
+        assert!(generated.prefix_cache_hit_len > 0);
+        let oracle = Engine::from_dir(&fixture, EngineConfig::default())?.generate(request)?;
+        assert_eq!(generated.token_ids, oracle.token_ids);
+        assert_eq!(generated.text, oracle.text);
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_only_prefill_honors_declared_no_prefix_reuse() -> anyhow::Result<()> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let directory = tempfile::tempdir()?;
+        for name in ["model.onnx.textproto", "tokenizer.json"] {
+            std::fs::copy(source.join(name), directory.path().join(name))?;
+        }
+        let metadata = std::fs::read_to_string(source.join("inference_metadata.yaml"))?
+            .replace("prefix_reusable: true", "prefix_reusable: false");
+        std::fs::write(directory.path().join("inference_metadata.yaml"), metadata)?;
+        let mut engine = Engine::from_dir(directory.path(), EngineConfig::default())?;
+        let prompt = [2, 4, 3];
+        engine.prefill(prefill_request(&prompt))?;
+        assert!(
+            engine
+                .prefix_cache
+                .lookup_snapshot::<OrtPrefixSnapshot>(&prompt)
+                .is_none()
+        );
+        assert_eq!(
+            engine
+                .prefill(prefill_request(&prompt))?
+                .prefix_cache_hit_len,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_only_prefill_cache_restore_budget_shortfall_recomputes_honestly() -> anyhow::Result<()>
+    {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(&source, EngineConfig::default())?;
+        let prompt = [2, 4, 3];
+        engine.prefill(prefill_request(&prompt))?;
+        let memory = engine.governor.memory();
+        let available = onnx_runtime_memory_governor::MemoryGovernor::available(
+            memory,
+            onnx_runtime_memory_api::Tier::Host,
+        );
+        let _pressure = onnx_runtime_memory_governor::MemoryGovernor::reserve(
+            memory,
+            onnx_runtime_memory_api::Tier::Host,
+            available,
+            Holder::OrtPrefixSnapshot.role(),
+            Holder::OrtPrefixSnapshot.id(),
+        )?;
+        let result = engine.prefill(prefill_request(&prompt))?;
+        assert_eq!(result.prefix_cache_hit_len, 0);
+        assert_eq!(result.prompt_tokens, prompt.len());
+        assert_eq!(engine.scheduler.running_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_only_prefill_cold_start_resets_connector_request_counters() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                kv_connector: KvConnectorConfig {
+                    backend: KvConnectorBackend::LocalTiered(onnx_genai_kv::LocalTieredConfig {
+                        chunk_size: 2,
+                        page_size: 2,
+                        ..Default::default()
+                    }),
+                    chunk_size: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )?;
+        let mut request = prefill_request(&[2, 4, 3, 5]);
+        engine.prefill(request.clone())?;
+        assert!(engine.last_connector_stats().stores > 0);
+        request.cold_start = true;
+        engine.prefill(request.clone())?;
+        let first_cold = engine.last_connector_stats();
+        assert_eq!(first_cold.lookups, 0);
+        engine.prefill(request)?;
+        assert_eq!(engine.last_connector_stats(), first_cold);
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_prompt_only_prefill_restores_ort_and_does_not_publish_prefix() -> anyhow::Result<()>
+    {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let prompt = [2, 4, 3];
+        let authority = crate::GenerationControl::new();
+        let cancel = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == crate::GenerationBoundary::BeforeSemanticCommit {
+                cancel.cancel();
+            }
+            Ok(())
+        });
+        let error = engine
+            .prefill_with_callbacks(prefill_request(&prompt), Some(control), None)
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+            "{error:#}"
+        );
+        assert!(
+            engine
+                .prefix_cache
+                .lookup_snapshot::<OrtPrefixSnapshot>(&prompt)
+                .is_none()
+        );
+        assert!(engine.sessions.is_empty());
+        assert_eq!(engine.scheduler.running_count(), 0);
+        assert_eq!(
+            engine
+                .prefill(prefill_request(&prompt))?
+                .prefix_cache_hit_len,
+            0
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_only_prefill_retains_exact_native_prompt_and_cancellation_is_atomic()
+    -> anyhow::Result<()> {
+        let mut engine = tiny_native_cold_engine()?;
+        let prompt = [0, 0, 0];
+        let result = engine.prefill(prefill_request(&prompt))?;
+        assert_eq!(result.prompt_tokens, prompt.len());
+        let session = engine.native_default_session.unwrap();
+        assert_eq!(engine.native_sessions[&session].tokens, prompt);
+        assert_eq!(
+            engine.native_session.as_ref().unwrap().current_len(),
+            prompt.len()
+        );
+        let access = engine.native_sessions[&session].last_access;
+        let authority = crate::GenerationControl::new();
+        let cancel = authority.clone();
+        let control = authority.with_checkpoint(move |boundary| {
+            if boundary == crate::GenerationBoundary::BeforeSemanticCommit {
+                cancel.cancel();
+            }
+            Ok(())
+        });
+        let error = engine
+            .prefill_with_callbacks(prefill_request(&[0, 0]), Some(control), None)
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(engine.native_sessions[&session].tokens, prompt);
+        assert_eq!(engine.native_sessions[&session].last_access, access);
+        assert_eq!(engine.native_active_session, None);
+        assert_eq!(engine.scheduler.running_count(), 0);
+        engine.prefill(prefill_request(&prompt))?;
+        assert_eq!(
+            engine.native_session.as_ref().unwrap().current_len(),
+            prompt.len()
+        );
+        let mut request = tiny_native_cold_request(false);
+        request.prompt = GeneratePrompt::TokenIds(prompt.to_vec());
+        let actual = engine.generate(request.clone())?;
+        assert_eq!(
+            actual.token_ids,
+            tiny_native_cold_engine()?.generate(request)?.token_ids
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_only_prefill_refuses_empty_invalid_and_over_context_before_admission()
+    -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        for (tokens, limit, field) in [
+            (vec![], None, "at least one"),
+            (vec![999999], None, "token id"),
+            (vec![2, 4, 3], Some(2), "max_context"),
+            (vec![2], Some(0), "max_context"),
+        ] {
+            let mut request = prefill_request(&tokens);
+            request.max_context = limit;
+            let mut admitted = false;
+            let error = engine
+                .prefill_with_callbacks(request, None, Some(&mut || admitted = true))
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(field), "{error:#}");
+            assert!(!admitted);
+            assert_eq!(engine.scheduler.running_count(), 0);
+        }
+        Ok(())
+    }
+
     #[test]
     fn aborted_turn_restores_tier_journal_and_preserves_sibling_session() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4353,7 +5731,6 @@ mod tests {
         assert!(sibling_len > 0);
         let committed_connector_stats = engine.last_connector_stats();
 
-        engine.token_prefix_cache.clear();
         engine.prefix_cache = PrefixCache::new();
         let target = engine.create_session()?;
         let mut state = engine
@@ -4538,7 +5915,6 @@ mod tests {
             metadata_hints: MetadataHints::default(),
             kv_cache: PagedKvCache::new(1, 1),
             prefix_cache: PrefixCache::new(),
-            token_prefix_cache: Vec::new(),
             kv_model: None,
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::with_byte_budget(
@@ -5142,7 +6518,6 @@ mod tests {
             metadata_hints: MetadataHints::default(),
             kv_cache: PagedKvCache::new(1, 1),
             prefix_cache: PrefixCache::new(),
-            token_prefix_cache: Vec::new(),
             kv_model: None,
             decode_path: ModelDecodePath::StaticCache { max_len: 16 },
             scheduler: Scheduler::with_byte_budget(
@@ -5199,25 +6574,51 @@ mod tests {
     }
 }
 
+/// Validated package end-of-generation roles, including the preferred end of turn.
+#[derive(Clone)]
+pub(crate) struct EndTokenPolicy {
+    eos: Vec<TokenId>,
+    eot: Option<TokenId>,
+}
+impl EndTokenPolicy {
+    pub(crate) fn new(eos: Vec<TokenId>, eot: Option<TokenId>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            eot.is_none_or(|id| eos.contains(&id)),
+            "eot_token_id must belong to the package eos_token_id set; declare its end-of-turn role in the stop set"
+        );
+        Ok(Self { eos, eot })
+    }
+}
+
 /// Apply a model's end tokens to a request.
 ///
 /// The one implementation, shared by the single-row path, the continuous batch
 /// manager and static batching. Three copies of this is how a model stops
 /// correctly on one route and runs past its end on another — which is
 /// unobservable from the API and shows up as a serving-only bug.
-pub(crate) fn apply_eos_policy(options: &mut GenerateOptions, ids: &[TokenId]) {
+pub(crate) fn apply_eos_policy(
+    options: &mut GenerateOptions,
+    policy: &EndTokenPolicy,
+) -> anyhow::Result<()> {
     if let Some(id) = options.eos_token_id {
         if !options.eos_token_ids.contains(&id) {
             options.eos_token_ids.push(id);
         }
-        return;
-    }
-    if !options.eos_token_ids.is_empty() {
+    } else if !options.eos_token_ids.is_empty() {
         options.eos_token_id = options.eos_token_ids.first().copied();
-        return;
+    } else {
+        options.eos_token_ids.extend_from_slice(&policy.eos);
+        options.eos_token_id = options.eos_token_ids.first().copied();
     }
-    options.eos_token_ids.extend_from_slice(ids);
-    options.eos_token_id = options.eos_token_ids.first().copied();
+    if let Some(id) = options.eot_token_id {
+        anyhow::ensure!(
+            options.eos_token_ids.contains(&id),
+            "eot_token_id {id} is absent from the effective eos_token_id set; include it in the stop set or omit the override"
+        );
+    } else {
+        options.eot_token_id = policy.eot.filter(|id| options.eos_token_ids.contains(id));
+    }
+    Ok(())
 }
 
 /// The legacy direct decode path cannot be selected.
@@ -5289,5 +6690,33 @@ mod canonical_refusal_tests {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod end_token_policy_tests {
+    use super::*;
+    #[test]
+    fn preferred_end_of_turn_role_respects_request_eos_overrides() {
+        let policy = EndTokenPolicy::new(vec![3, 4], Some(4)).unwrap();
+        let mut defaults = GenerateOptions::default();
+        apply_eos_policy(&mut defaults, &policy).unwrap();
+        assert_eq!(defaults.eos_token_ids, [3, 4]);
+        assert_eq!(defaults.eot_token_id, Some(4));
+        let mut override_ = GenerateOptions {
+            eos_token_id: Some(7),
+            ..Default::default()
+        };
+        apply_eos_policy(&mut override_, &policy).unwrap();
+        assert_eq!(override_.eos_token_ids, [7]);
+        assert_eq!(override_.eot_token_id, None);
+        override_.eot_token_id = Some(4);
+        assert!(
+            apply_eos_policy(&mut override_, &policy)
+                .unwrap_err()
+                .to_string()
+                .contains("effective eos_token_id")
+        );
+        assert!(EndTokenPolicy::new(vec![3], Some(4)).is_err());
     }
 }

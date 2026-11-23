@@ -1537,9 +1537,12 @@ mappings, and chat templates remain in the declared tokenizer assets and are
 not repeated in metadata.
 
 The numeric fields are `pad_token_id`, `bos_token_id`, the ordered
-`eos_token_id` list, `sep_token_id`, `decoder_start_token_id`,
+`eos_token_id` list, optional preferred `eot_token_id`, `sep_token_id`, `decoder_start_token_id`,
 `image_token_id`, `video_token_id`, `audio_token_id`, and
-`vision_start_token_id`. A producer
+`vision_start_token_id`. The optional `eot_token_id` requires schema v1.9 or
+newer; parser and typed validation enforce this version gate. It must also be present in the ordered
+`eos_token_id` stop set; it selects the preferred forced ending for infill without
+creating another stop authority. A producer
 derives them from the package's authoritative source configuration. When more
 than one source is present, package-authored `genai_config.json` wins over the
 pinned `generation_config.json`, which wins over pinned model `config.json`;

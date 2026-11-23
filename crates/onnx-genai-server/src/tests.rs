@@ -161,10 +161,14 @@ fn content_only_stream_deltas_remain_content_with_stop_finish_reason() {
 }
 
 fn tiny_png_data_uri() -> String {
+    png_data_uri(3, 4)
+}
+
+fn png_data_uri(width: u32, height: u32) -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 
-    let image = RgbImage::from_pixel(3, 4, Rgb([64, 128, 255]));
+    let image = RgbImage::from_pixel(width, height, Rgb([64, 128, 255]));
     let mut png = Cursor::new(Vec::new());
     DynamicImage::ImageRgb8(image)
         .write_to(&mut png, ImageFormat::Png)
@@ -289,15 +293,16 @@ fn chat_sampling_controls_round_trip_into_generate_options() {
         "top_k": 40,
         "min_p": 0.1,
         "top_a": 0.2,
-        "typical_p": 0.7,
-        "repetition_penalty": 1.15,
+        "typ_p": 0.7,
+        "repeat_penalty": 1.15,
         "frequency_penalty": 0.3,
         "presence_penalty": 0.4,
         "seed": 1234,
         "dry_multiplier": 0.5,
         "dry_base": 1.75,
         "dry_allowed_length": 3,
-        "dry_sequence_breakers": [13, 42],
+        "dry_sequence_breakers": ["hello world"],
+        "dry_penalty_last_n": 7,
         "mirostat": 2,
         "mirostat_tau": 4.5,
         "mirostat_eta": 0.2,
@@ -306,7 +311,9 @@ fn chat_sampling_controls_round_trip_into_generate_options() {
     }))
     .unwrap();
 
-    let options = build_generate_request(&request).options;
+    let options = build_generate_request(&request, &fixture_tokenizer())
+        .unwrap()
+        .options;
     assert_eq!(options.temperature, 0.8);
     assert_eq!(options.top_p, 0.9);
     assert_eq!(options.top_k, 40);
@@ -323,7 +330,20 @@ fn chat_sampling_controls_round_trip_into_generate_options() {
     assert_eq!(dry.multiplier, 0.5);
     assert_eq!(dry.base, 1.75);
     assert_eq!(dry.allowed_length, 3);
-    assert_eq!(dry.sequence_breakers, vec![13, 42]);
+    assert_eq!(
+        dry.sequence_breakers,
+        vec![
+            fixture_tokenizer()
+                .inner()
+                .encode("hello world", false)
+                .unwrap()
+                .get_ids()
+                .to_vec()
+        ]
+    );
+
+    assert_eq!(dry.window, Some(7));
+    assert!(dry.sequence_breakers[0].len() > 1);
 
     let mirostat = options.mirostat.expect("Mirostat enabled");
     assert_eq!(mirostat.tau, 4.5);
@@ -346,8 +366,15 @@ fn chat_sampling_defaults_stay_greedy_while_seed_enables_sampling() {
         .unwrap()
     };
 
-    assert!(build_generate_request(&request(Value::Null)).options.greedy);
-    let seeded = build_generate_request(&request(json!(17))).options;
+    assert!(
+        build_generate_request(&request(Value::Null), &fixture_tokenizer())
+            .unwrap()
+            .options
+            .greedy
+    );
+    let seeded = build_generate_request(&request(json!(17)), &fixture_tokenizer())
+        .unwrap()
+        .options;
     assert!(!seeded.greedy);
     assert_eq!(seeded.seed, Some(17));
 }
@@ -614,7 +641,14 @@ async fn streaming_chat_and_completion_chunks_include_logprobs() {
     assert_eq!(content_events.len(), 2);
     for event in content_events {
         let record = &event["choices"][0]["logprobs"]["content"][0];
-        assert_eq!(event["choices"][0]["delta"]["content"], record["token"]);
+        // Decoder context can add a boundary space that isolated token spelling lacks.
+        assert_eq!(
+            event["choices"][0]["delta"]["content"]
+                .as_str()
+                .unwrap()
+                .trim_start(),
+            record["token"].as_str().unwrap()
+        );
         assert_eq!(record["top_logprobs"].as_array().unwrap().len(), 1);
         assert!(record["bytes"].is_array());
     }
@@ -793,8 +827,8 @@ async fn chat_sampling_controls_reject_invalid_ranges() {
     for (field, value) in [
         ("min_p", json!(1.1)),
         ("top_a", json!(-0.1)),
-        ("typical_p", json!(1.1)),
-        ("repetition_penalty", json!(0.0)),
+        ("typ_p", json!(1.1)),
+        ("repeat_penalty", json!(0.0)),
         ("dry_base", json!(0.5)),
         ("mirostat", json!(3)),
         ("xtc_probability", json!(1.1)),
@@ -2460,8 +2494,11 @@ async fn admin_vram_override_requires_engine_runtime_override() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["type"], "permission_error");
+    assert_eq!(body["error"]["code"], 403);
     assert!(
-        json_body(response).await["error"]["message"]
+        body["error"]["message"]
             .as_str()
             .unwrap()
             .contains("allow_runtime_override")
@@ -2542,7 +2579,7 @@ fn completion_suffix_maps_to_fim_generation() {
     }))
     .unwrap();
 
-    let prepared = prepare_completion(&request, &handle).unwrap();
+    let prepared = prepare_completion(&request, &handle, 4096).unwrap();
     match prepared.generation {
         CompletionGeneration::Fim {
             prefix,
@@ -2827,7 +2864,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
             input: None,
             session_id: None,
             lease: None,
-            request: Box::new(build_generate_request(&slow_request)),
+            request: Box::new(build_generate_request(&slow_request, &fixture_tokenizer()).unwrap()),
             tool_call_policy: onnx_genai_engine::ToolCallPolicy::Disabled,
             admission: slow_admission,
             events: slow_tx,
@@ -2838,7 +2875,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
     let fast_rx = driver
         .generate(
             None,
-            build_generate_request(&fast_request),
+            build_generate_request(&fast_request, &fixture_tokenizer()).unwrap(),
             onnx_genai_engine::ToolCallPolicy::Disabled,
             None,
         )
@@ -3565,7 +3602,7 @@ async fn admin_unload_distinguishes_poisoned_registry_from_absent_model() {
             .unwrap(),
     )
     .unwrap();
-    assert_well_formed_error_without_internal_path(&body);
+    assert_well_formed_error_without_internal_path(&body, "not_found_error");
     assert_eq!(error_message(&body), "model 'model-b' is not loaded");
 
     let poisoned_registry_state = lazy_state(ServerConfig {
@@ -3593,7 +3630,7 @@ async fn admin_unload_distinguishes_poisoned_registry_from_absent_model() {
             .unwrap(),
     )
     .unwrap();
-    assert_well_formed_error_without_internal_path(&body);
+    assert_well_formed_error_without_internal_path(&body, "server_error");
     assert_eq!(error_message(&body), "model registry failed");
 }
 
@@ -3809,12 +3846,12 @@ fn error_message(body: &Value) -> String {
         .to_string()
 }
 
-fn assert_well_formed_error_without_internal_path(body: &Value) {
+fn assert_well_formed_error_without_internal_path(body: &Value, expected_kind: &str) {
     let message = body["error"]["message"]
         .as_str()
         .expect("error response must contain a message");
     assert!(!message.is_empty());
-    assert_eq!(body["error"]["type"], "server_error");
+    assert_eq!(body["error"]["type"], expected_kind);
     assert!(
         !message.contains(env!("CARGO_MANIFEST_DIR")),
         "error must not expose the crate path: {body}"
@@ -3930,7 +3967,7 @@ async fn poisoned_model_registry_returns_http_500() {
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_well_formed_error_without_internal_path(&body);
+    assert_well_formed_error_without_internal_path(&body, "server_error");
     assert_eq!(error_message(&body), "model registry failed");
 }
 
@@ -4193,6 +4230,19 @@ async fn sessions_open_and_close_for_an_interpreted_package() {
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
 }
 
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create package directory");
+    for entry in std::fs::read_dir(from).expect("read fixture") {
+        let entry = entry.expect("fixture entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy fixture file");
+        }
+    }
+}
+
 /// An interpreted package's conversation survives the HTTP boundary.
 ///
 /// A session is what a client holds across requests, so the property has to be
@@ -4204,18 +4254,6 @@ fn workflow_session_package(scratch: &tempfile::TempDir) -> PathBuf {
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
     let source = fixtures.join("onnx_genai_workflows/decoder");
     let destination = scratch.path().join("package");
-    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
-        std::fs::create_dir_all(to).expect("create package directory");
-        for entry in std::fs::read_dir(from).expect("read fixture") {
-            let entry = entry.expect("fixture entry");
-            let target = to.join(entry.file_name());
-            if entry.file_type().expect("file type").is_dir() {
-                copy_tree(&entry.path(), &target);
-            } else {
-                std::fs::copy(entry.path(), target).expect("copy fixture file");
-            }
-        }
-    }
     copy_tree(&source, &destination);
     // The conformance fixture ships no tokenizer because its conformance is
     // about the workflow. An HTTP completion is text, so this borrows the tiny
@@ -5783,6 +5821,22 @@ async fn a_cancelled_client_does_not_leak_its_session_lease() {
 fn capability_refusals_map_to_the_status_their_variant_means() {
     use onnx_genai_engine::PackageExecutionError;
 
+    let dynamic = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageExecutionError::RuntimeSamplingUnavailable {
+            field: "dynatemp_range".into(),
+        },
+    ));
+    let response = crate::routes::generation_failure(dynamic);
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert!(response.message.contains("dynatemp_range"));
+
+    let replacement = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageExecutionError::NativePromptReplacementUnavailable,
+    ));
+    let response = crate::routes::generation_failure(replacement);
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert!(response.message.contains("refused before mutation"));
+
     let no_state = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
         PackageExecutionError::NoSessionState,
     ));
@@ -6025,4 +6079,2964 @@ async fn every_session_refusal_reports_a_status_and_a_type_a_client_can_branch_o
         "{conflict}"
     );
     drop(busy);
+}
+
+fn fixture_tokenizer() -> onnx_genai_ort::Tokenizer {
+    onnx_genai_ort::Tokenizer::from_file(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+    )
+    .unwrap()
+}
+
+mod llama_compat {
+    use super::*;
+
+    async fn call(
+        router: axum::Router,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn discovery_and_properties_describe_the_admitted_model() {
+        let state = tiny_state();
+        let handle = state.registry.lookup_loaded("").unwrap().unwrap();
+        handle
+            .last_request_at
+            .store(42, std::sync::atomic::Ordering::Relaxed);
+        let router = app(state);
+        for path in ["/health", "/v1/health"] {
+            let (status, body) = call(router.clone(), "GET", path, Value::Null).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "ok");
+        }
+        let (_, models) = call(router.clone(), "GET", "/models", Value::Null).await;
+        assert_eq!(models["data"][0]["id"], "tiny-llm");
+        let (status, props) =
+            call(router.clone(), "GET", "/props?autoload=false", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(props["role"], "model");
+        assert_eq!(props["model_alias"], "tiny-llm");
+        assert_eq!(props["modalities"]["vision"], false);
+        assert!(props["chat_template"].is_string());
+        assert_eq!(props["endpoint_slots"], false);
+        assert_eq!(
+            handle
+                .last_request_at
+                .load(std::sync::atomic::Ordering::Relaxed),
+            42,
+            "metadata polling must not refresh the model's LRU inference timestamp"
+        );
+        let (status, error) = call(
+            router,
+            "GET",
+            "/props?model=missing&autoload=false",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn tokenizer_round_trip_and_invalid_ids_are_explicit() {
+        let router = app(tiny_state());
+        let (status, encoded) = call(
+            router.clone(),
+            "POST",
+            "/tokenize",
+            json!({"content": "hello", "add_special": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, decoded) = call(
+            router.clone(),
+            "POST",
+            "/detokenize",
+            json!({"tokens": encoded["tokens"]}),
+        )
+        .await;
+        assert_eq!(decoded["content"], "hello");
+        let (_, pieces) = call(
+            router.clone(),
+            "POST",
+            "/tokenize",
+            json!({"content": "hello", "with_pieces": true}),
+        )
+        .await;
+        assert!(pieces["tokens"][0]["id"].is_number());
+        assert!(pieces["tokens"][0]["piece"].is_string());
+        let (status, error) = call(
+            router,
+            "POST",
+            "/detokenize",
+            json!({"tokens": [4294967295_u32]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("4294967295")
+        );
+    }
+
+    #[tokio::test]
+    async fn named_templates_drive_props_prompt_counts_and_real_tool_generation() {
+        let base = "ordinary";
+        let tool = "assistant {{ tools[0].function.name }}";
+        for format in ["list", "map", "files"] {
+            let scratch = tempfile::tempdir().unwrap();
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-tool-call");
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+                }
+            }
+            let config = match format {
+                "list" => {
+                    json!({"chat_template":[{"name":"default","template":base},{"name":"tool_use","template":tool}]})
+                }
+                "map" => json!({"chat_template":{"default":base,"tool_use":tool}}),
+                _ => {
+                    std::fs::write(scratch.path().join("chat_template.jinja"), base).unwrap();
+                    std::fs::create_dir(scratch.path().join("chat_templates")).unwrap();
+                    std::fs::write(scratch.path().join("chat_templates/tool_use.jinja"), tool)
+                        .unwrap();
+                    json!({"chat_template":"ignored config source"})
+                }
+            };
+            std::fs::write(
+                scratch.path().join("tokenizer_config.json"),
+                config.to_string(),
+            )
+            .unwrap();
+            let router = app(AppState::load(scratch.path(), Some("named-tools".into())).unwrap());
+            let (status, props) = call(router.clone(), "GET", "/props", Value::Null).await;
+            assert_eq!(status, StatusCode::OK, "{props}");
+            assert_eq!(props["chat_template"], base);
+            assert_eq!(props["chat_template_tool_use"], tool);
+            for has_tools in [false, true] {
+                let mut body = json!({"messages":[{"role":"user","content":"ordinary"}],"max_tokens":1,"temperature":0});
+                if has_tools {
+                    body["tools"] = json!([{"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]);
+                    body["logit_bias"] = json!({"5":1000});
+                } else {
+                    body["tools"] = json!([]);
+                    body["logit_bias"] = json!({"7":1000});
+                }
+                let (status, prompt) =
+                    call(router.clone(), "POST", "/apply-template", body.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{prompt}");
+                assert_eq!(
+                    prompt["prompt"],
+                    if has_tools { "assistant weather" } else { base }
+                );
+                let (status, count) = call(
+                    router.clone(),
+                    "POST",
+                    "/v1/chat/completions/input_tokens",
+                    body.clone(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{count}");
+                assert_eq!(count["input_tokens"], if has_tools { 2 } else { 1 });
+                let (status, result) =
+                    call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{format}: {result}");
+                assert_eq!(result["usage"]["prompt_tokens"], count["input_tokens"]);
+                assert_eq!(result["usage"]["completion_tokens"], 1);
+                if has_tools {
+                    assert_eq!(
+                        result["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                        "weather",
+                        "{result}"
+                    );
+                    body["stream"] = json!(true);
+                    body["stream_options"] = json!({"include_usage":true});
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/v1/chat/completions")
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(body.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                    let events = sse_json_events(&bytes);
+                    assert!(
+                        !events.iter().any(|event| event.get("error").is_some()),
+                        "{events:?}"
+                    );
+                    assert!(events.iter().any(|event|event["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]=="weather"),"{events:?}");
+                    assert!(
+                        events
+                            .iter()
+                            .all(|event| event["choices"][0]["delta"]["content"]
+                                .as_str()
+                                .is_none_or(str::is_empty)),
+                        "{events:?}"
+                    );
+                    assert!(
+                        events
+                            .iter()
+                            .any(|event| event["usage"]["prompt_tokens"] == 2
+                                && event["usage"]["completion_tokens"] == 1),
+                        "{events:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        result["choices"][0]["message"]["content"], "Results accepted.",
+                        "{result}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn template_endpoint_renders_model_template_and_protects_structural_variables() {
+        let router = app(tiny_state());
+        let (status, result) = call(
+            router.clone(),
+            "POST",
+            "/apply-template",
+            json!({
+                "messages": [{"role": "user", "content": "hello"}], "add_generation_prompt": true
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let request: ChatCompletionRequest =
+            serde_json::from_value(json!({"messages": [{"role": "user", "content": "hello"}]}))
+                .unwrap();
+        let expected = crate::build_prompt(&request);
+        assert_eq!(result["prompt"], expected);
+        let (status, error) = call(router, "POST", "/apply-template", json!({
+            "messages": [{"role": "user", "content": "hello"}], "chat_template_kwargs": {"messages": []}
+        })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reserved")
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_continuation_uses_the_same_prompt_for_template_count_and_generation() {
+        let router = app(tiny_state());
+        let mut body = json!({"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"world"}],"continue_final_message":true,"add_generation_prompt":false,"max_tokens":2,"temperature":0});
+        let (status, rendered) =
+            call(router.clone(), "POST", "/apply-template", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{rendered}");
+        assert_eq!(rendered["prompt"], "<|user|>\nhello\n<|assistant|>\nworld");
+        body["continue_final_message"] = json!("content");
+        let (status, count) = call(
+            router.clone(),
+            "POST",
+            "/v1/chat/completions/input_tokens",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{count}");
+        let (status, generated) =
+            call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{generated}");
+        assert_eq!(generated["usage"]["prompt_tokens"], count["input_tokens"]);
+        body["stream"] = json!(true);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .ends_with("data: [DONE]\n\n")
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-session-id", "continuation-prefix")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("session"),
+            "{error}"
+        );
+        for (field, value, expected) in [
+            (
+                "continue_final_message",
+                json!("reasoning_content"),
+                "requires nonempty final assistant reasoning_content",
+            ),
+            ("continue_final_message", json!("auto"), "must be null"),
+            ("continue_final_message", json!(1), "must be null"),
+            (
+                "messages",
+                json!([{"role":"user","content":"hello"}]),
+                "final assistant",
+            ),
+            (
+                "messages",
+                json!([{"role":"assistant","content":"world","tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]}]),
+                "tool_calls",
+            ),
+            (
+                "messages",
+                json!([{"role":"assistant","content":"","reasoning_content":"unfinished"}]),
+                "content requires nonempty final assistant content",
+            ),
+        ] {
+            let mut invalid = body.clone();
+            invalid[field] = value;
+            let (status, error) =
+                call(router.clone(), "POST", "/v1/chat/completions", invalid).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected),
+                "{error}"
+            );
+        }
+        let mut unsupported = body.clone();
+        unsupported["continue_final_message"] = json!(true);
+        unsupported["messages"] = json!([{"role":"assistant","reasoning_content":"unfinished"}]);
+        let (status, error) = call(router, "POST", "/v1/chat/completions", unsupported).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("requires a declared response_template"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn continuation_public_request_builders_enforce_the_same_mode_validation() {
+        let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+            "messages":[{"role":"assistant","content":"world"}],
+            "continue_final_message":"content","add_generation_prompt":false
+        }))
+        .unwrap();
+        let generated = build_generate_request(&request, &fixture_tokenizer()).unwrap();
+        assert!(
+            matches!(generated.prompt,onnx_genai::GeneratePrompt::Text(ref text) if text=="<|assistant|>\nworld")
+        );
+        request.add_generation_prompt = true;
+        let generated = build_generate_request(&request, &fixture_tokenizer()).unwrap();
+        assert!(
+            matches!(generated.prompt,onnx_genai::GeneratePrompt::Text(ref text) if text=="<|assistant|>\nworld")
+        );
+        request.continue_final_message = crate::ChatContinuation::Reasoning;
+        request.messages.last_mut().unwrap().reasoning_content = Some("unfinished".into());
+        assert!(
+            build_generate_request(&request, &fixture_tokenizer())
+                .unwrap_err()
+                .to_string()
+                .contains("requires a declared response_template")
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_continuation_resumes_declared_channel_without_echoing_prefill() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        let old = vocab
+            .iter()
+            .find(|(_, id)| id.as_u64() == Some(22))
+            .unwrap()
+            .0
+            .clone();
+        vocab.remove(&old);
+        vocab.insert("new[/r]{\"n\":1}".into(), json!(22));
+        let old = vocab
+            .iter()
+            .find(|(_, id)| id.as_u64() == Some(23))
+            .unwrap()
+            .0
+            .clone();
+        vocab.remove(&old);
+        vocab.insert("new[/r]{\"n\":2}".into(), json!(23));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        std::fs::write(scratch.path().join("tokenizer_config.json"),json!({
+            "chat_template":"{% for m in messages %}[assistant][r]{{ m.reasoning_content }}[/r]{{ m.content }}[end]{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
+            "response_template":{"start_anchor":"[assistant]","fields":{
+                "reasoning_content":{"open":"[r]","close":"[/r]","content":"text"},"content":{"content":"text"}
+            }}
+        }).to_string()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("reasoning-prefill".into())).unwrap());
+        for format in [
+            serde_json::Value::Null,
+            json!({"type":"json_object"}),
+            json!({"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"n":{"const":1}},"required":["n"],"additionalProperties":false}}}),
+        ] {
+            for (mode, content) in [
+                (json!("reasoning_content"), Some("discarded")),
+                (json!(true), None),
+            ] {
+                let mut message = json!({"role":"assistant","reasoning_content":"old "});
+                if let Some(content) = content {
+                    message["content"] = json!(content);
+                }
+                // An explicit continuation overrides even the default true generation-prompt flag.
+                let mut body = json!({"messages":[message],"continue_final_message":mode,"max_tokens":1,"temperature":0,"logit_bias":{"22":1000}});
+                if !format.is_null() {
+                    body["response_format"] = format.clone();
+                    if format["type"] == "json_schema" {
+                        // The invalid value has the highest score and must be masked.
+                        body["logit_bias"]["23"] = json!(2000);
+                    }
+                }
+                let (status, prompt) =
+                    call(router.clone(), "POST", "/apply-template", body.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{prompt}");
+                assert_eq!(prompt["prompt"], "[assistant][r]old ");
+                let (status, count) = call(
+                    router.clone(),
+                    "POST",
+                    "/v1/chat/completions/input_tokens",
+                    body.clone(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{count}");
+                for logprobs in [false, true] {
+                    let mut request = body.clone();
+                    request["logprobs"] = json!(logprobs);
+                    let (status, result) = call(
+                        router.clone(),
+                        "POST",
+                        "/v1/chat/completions",
+                        request.clone(),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "{result}");
+                    assert_eq!(
+                        result["choices"][0]["message"]["reasoning_content"], "new",
+                        "{result}"
+                    );
+                    assert_eq!(
+                        result["choices"][0]["message"]["content"], "{\"n\":1}",
+                        "{result}"
+                    );
+                    assert_eq!(result["usage"]["completion_tokens"], 1);
+                    assert_eq!(result["usage"]["prompt_tokens"], count["input_tokens"]);
+                    request["stream"] = json!(true);
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/v1/chat/completions")
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(request.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let events =
+                        sse_json_events(&to_bytes(response.into_body(), usize::MAX).await.unwrap());
+                    assert!(
+                        !events.iter().any(|event| event.get("error").is_some()),
+                        "{events:?}"
+                    );
+                    let reasoning = events
+                        .iter()
+                        .filter_map(|event| {
+                            event["choices"][0]["delta"]["reasoning_content"].as_str()
+                        })
+                        .collect::<String>();
+                    let content = events
+                        .iter()
+                        .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                        .collect::<String>();
+                    assert_eq!(reasoning, "new", "{events:?}");
+                    assert_eq!(content, "{\"n\":1}", "{events:?}");
+                }
+                let mut invalid = body.clone();
+                invalid["messages"][0]["reasoning_content"] = json!("old[/r]");
+                let (status, error) =
+                    call(router.clone(), "POST", "/v1/chat/completions", invalid).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+                assert!(
+                    error["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("leave response_template field"),
+                    "{error}"
+                );
+            }
+        }
+        // Capability rejection must precede SSE headers and model execution.
+        let config_path = scratch.path().join("tokenizer_config.json");
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["response_template"]["fields"]["reasoning_content"]
+            .as_object_mut()
+            .unwrap()
+            .remove("close");
+        config["response_template"]["fields"]["reasoning_content"]["close_pattern"] =
+            json!(r"\[/r\]");
+        std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("reasoning-prefill".into())).unwrap());
+        for stream in [false, true] {
+            let body = json!({"messages":[{"role":"assistant","reasoning_content":"old "}],"continue_final_message":"reasoning_content","response_format":{"type":"json_object"},"stream":stream,"max_tokens":1});
+            let (status, error) = call(router.clone(), "POST", "/v1/chat/completions", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("byte-prefix boundary"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn json_continuation_generates_only_the_valid_missing_suffix() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        vocab.remove("world");
+        vocab.insert("}".into(), json!(5));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("json-prefix".into())).unwrap());
+        let mut body = json!({"messages":[{"role":"assistant","content":"{"}],"continue_final_message":true,
+            "add_generation_prompt":false,"response_format":{"type":"json_object"},"max_tokens":1,"temperature":0,"logit_bias":{"5":1000,"3":10000}});
+        let (status, result) =
+            call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["choices"][0]["message"]["content"], "}");
+        assert_eq!(result["usage"]["completion_tokens"], 1);
+        let schema = json!({"type":"json_schema","json_schema":{"name":"empty_object","schema":{"type":"object","additionalProperties":false}}});
+        body["response_format"] = schema;
+        let (status, schema_result) =
+            call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{schema_result}");
+        assert_eq!(schema_result["choices"][0]["message"]["content"], "}");
+        assert_eq!(schema_result["usage"]["completion_tokens"], 1);
+        for (prefix, value_schema) in [
+            (
+                r#"{"\u006e":1"#,
+                json!({"type":"object","properties":{"n":{"const":1}},"required":["n"],"additionalProperties":false}),
+            ),
+            (
+                r#"{"x":"\u005br]\ud83d\udca1\/""#,
+                json!({"type":"object","properties":{"x":{"const":"[r]💡/"}},"required":["x"],"additionalProperties":false}),
+            ),
+        ] {
+            let mut escaped = body.clone();
+            escaped["messages"][0]["content"] = json!(prefix);
+            escaped["response_format"] = json!({"type":"json_schema","json_schema":{"name":"escaped","schema":value_schema}});
+            escaped["logprobs"] = json!(true);
+            let (status, prompt) =
+                call(router.clone(), "POST", "/apply-template", escaped.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{prompt}");
+            assert!(
+                prompt["prompt"].as_str().unwrap().ends_with(prefix),
+                "{prompt}"
+            );
+            let (status, count) = call(
+                router.clone(),
+                "POST",
+                "/v1/chat/completions/input_tokens",
+                escaped.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{count}");
+            let (status, result) = call(
+                router.clone(),
+                "POST",
+                "/v1/chat/completions",
+                escaped.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["choices"][0]["message"]["content"], "}");
+            assert_eq!(result["usage"]["prompt_tokens"], count["input_tokens"]);
+            assert_eq!(result["usage"]["completion_tokens"], 1);
+            escaped["stream"] = json!(true);
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(escaped.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let events = sse_json_events(&bytes);
+            assert!(
+                events.iter().all(|event| event.get("error").is_none()),
+                "{events:?}"
+            );
+            let content = events
+                .iter()
+                .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                .collect::<String>();
+            assert_eq!(content, "}");
+        }
+        let mut invalid_schema_prefix = body.clone();
+        invalid_schema_prefix["messages"][0]["content"] = json!("{\"b\":");
+        let (status, error) = call(
+            router.clone(),
+            "POST",
+            "/v1/chat/completions",
+            invalid_schema_prefix,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("prefix accepted by this grammar"),
+            "{error}"
+        );
+        body["stream"] = json!(true);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = sse_json_events(&bytes)
+            .iter()
+            .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+            .collect::<String>();
+        assert_eq!(text, "}");
+        body["messages"][0]["content"] = json!("not JSON");
+        let (status, error) = call(router, "POST", "/v1/chat/completions", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("valid partial JSON"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_constraints_return_actual_partial_text_at_budget_and_user_stop() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        for (id, text) in [(22, "\"key\":"), (23, "{")] {
+            let old = vocab
+                .iter()
+                .find(|(_, value)| value.as_u64() == Some(id))
+                .unwrap()
+                .0
+                .clone();
+            vocab.remove(&old);
+            vocab.insert(text.into(), json!(id));
+        }
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("partial-json".into())).unwrap());
+        for format in [
+            json!({"type":"json_object"}),
+            json!({"type":"json_schema","json_schema":{"name":"key","schema":{
+                "type":"object","properties":{"key":{"type":"integer"}},"required":["key"],"additionalProperties":false
+            }}}),
+        ] {
+            for (continuation, stop, budget, expected, reason) in [
+                (false, false, 1, "{", "length"),
+                (true, false, 1, "\"key\":", "length"),
+                (true, true, 4, "\"key\"", "stop"),
+            ] {
+                let mut body = json!({"messages":[{"role":"user","content":"hello"}],"response_format":format,
+                    "max_tokens":budget,"temperature":0,"logit_bias":{"23":1000,"22":900,"3":10000}});
+                if continuation {
+                    body["messages"] = json!([{"role":"assistant","content":"{"}]);
+                    body["continue_final_message"] = json!(true);
+                    body["add_generation_prompt"] = json!(false);
+                }
+                if stop {
+                    body["stop"] = json!(":");
+                }
+                let (status, value) =
+                    call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{body}: {value}");
+                assert_eq!(
+                    value["choices"][0]["message"]["content"], expected,
+                    "{value}"
+                );
+                assert_eq!(value["choices"][0]["finish_reason"], reason, "{value}");
+                assert_eq!(value["usage"]["completion_tokens"], 1, "{value}");
+                body["stream"] = json!(true);
+                body["stream_options"] = json!({"include_usage":true});
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let events = sse_json_events(&bytes);
+                assert!(
+                    !events.iter().any(|event| event.get("error").is_some()),
+                    "{}",
+                    String::from_utf8_lossy(&bytes)
+                );
+                let text = events
+                    .iter()
+                    .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                    .collect::<String>();
+                assert_eq!(text, expected, "{body}: {events:?}");
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| event["choices"][0]["finish_reason"] == reason),
+                    "{events:?}"
+                );
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| event["usage"]["completion_tokens"] == 1),
+                    "{events:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn json_grammar_failure_is_not_replaced_with_fabricated_success() {
+        let router = app(tiny_state());
+        let mut body = json!({"messages":[{"role":"user","content":"hello"}],"response_format":{"type":"json_object"},"max_tokens":1,"temperature":0});
+        let (status, error) =
+            call(router.clone(), "POST", "/v1/chat/completions", body.clone()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no finite selectable token"),
+            "{error}"
+        );
+        assert!(error.get("choices").is_none(), "{error}");
+        body["stream"] = json!(true);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let events = sse_json_events(&bytes);
+        assert!(
+            events.iter().any(|event| event["error"]["code"] == 500
+                && event["error"]["message"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("no finite selectable token"))),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["choices"][0]["delta"]["content"] == "{}"),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_chat_payload_streams_usage_and_rejects_unsupported_controls() {
+        let router = app(tiny_state());
+        let body = json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 2, "seed": -1, "repeat_penalty": 1.0,
+            "repeat_last_n": -1, "typ_p": 1.0,
+            "reasoning_format": "auto", "reasoning_control": true,
+            "return_progress": true, "sse_ping_interval": 1,
+            "dynatemp_range": 0.0, "dynatemp_exponent": 1.0,
+            "stream": true, "stream_options": {"include_usage": true},
+            "chat_template_kwargs": {"enable_thinking": false}
+        });
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let events = sse_json_events(&bytes);
+        let usage = events.last().unwrap();
+        assert_eq!(usage["choices"], json!([]));
+        assert!(usage["usage"]["completion_tokens"].as_u64().unwrap() <= 2);
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .ends_with("data: [DONE]\n\n")
+        );
+        for (key, value) in [
+            ("dynatemp_range", json!(-0.2)),
+            ("samplers", json!(["unknown"])),
+            ("thinking_budget_tokens", json!(32)),
+        ] {
+            let mut body = json!({"messages": [{"role": "user", "content": "hello"}]});
+            body[key] = value;
+            let (status, error) = call(router.clone(), "POST", "/v1/chat/completions", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert!(error["error"]["message"].as_str().unwrap().contains(key));
+        }
+    }
+
+    #[test]
+    fn llama_sentinels_and_parameter_spellings_are_preserved() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "messages": [], "max_tokens": -1, "seed": -1,
+            "repeat_penalty": 1.2, "typ_p": 0.8
+        }))
+        .unwrap();
+        assert_eq!(request.output_budget(123), 123);
+        assert_eq!(request.seed, None);
+        assert_eq!(request.repetition_penalty, 1.2);
+        assert_eq!(request.typical_p, 0.8);
+        for body in [
+            json!({"messages": [], "max_tokens": -2}),
+            json!({"messages": [], "seed": -2}),
+        ] {
+            assert!(serde_json::from_value::<ChatCompletionRequest>(body).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_ui_and_disabled_features_have_correct_http_contracts() {
+        let router = app(tiny_state());
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers()["cross-origin-opener-policy"],
+            "same-origin"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("_app/immutable/")
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_app/does-not-exist.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        for path in ["/tools", "/cors-proxy"] {
+            let (status, error) = call(router.clone(), "GET", path, Value::Null).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(error["error"]["type"], "feature_disabled");
+        }
+    }
+}
+
+mod llama_router_compat {
+    use super::*;
+    use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn router_discovery_lifecycle_and_events_follow_registry_state() {
+        let state = lazy_state(ServerConfig {
+            enable_admin_endpoints: true,
+            ..ServerConfig::default()
+        });
+        let router = app(state.clone());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/props?autoload=false")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_body(response).await["role"], "router");
+        assert!(
+            state.registry.resolve("model-b").unwrap().is_none(),
+            "discovery must not lazy-load"
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        assert_eq!(body["data"].as_array().unwrap().len(), 2);
+        assert_eq!(body["data"][1]["status"]["value"], "unloaded");
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/models/sse")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let first = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&first)
+                .unwrap()
+                .contains("status_update")
+        );
+        drop(stream);
+        for (path, loaded) in [("/models/load", true), ("/models/unload", false)] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({"model": "model-b"}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["success"], true);
+            assert_eq!(state.registry.resolve("model-b").unwrap().is_some(), loaded);
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/models/load")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"model": "model-b", "extra_args": ["--ctx-size", "1024"]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("extra_args")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_props_query_and_template_overrides_are_actionable_before_inference() {
+        let router = app(tiny_state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/props?autoload=perhaps")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("autoload")
+        );
+        let response = router.oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"messages": [{"role": "user", "content": "hello"}], "chat_template_kwargs": {"messages": []}}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reserved")
+        );
+    }
+}
+
+mod native_compat {
+    use super::*;
+    async fn request(router: axum::Router, path: &str, body: Value) -> axum::response::Response {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn native_dynamic_temperature_matches_the_entropy_interval_endpoint() {
+        let router = app(tiny_state());
+        // Exponent zero maps every distribution to the upper endpoint. A real
+        // seeded decoder must agree with that fixed temperature, not the base.
+        let mut changed_from_base = false;
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    match id {
+                        5 => json!(1.0),
+                        6 => json!(0.0),
+                        _ => json!(false),
+                    },
+                )
+            })
+            .collect();
+        for seed in 0..8 {
+            let mut dynamic = json!({"prompt":"hello","n_predict":4,"temperature":0.1,
+                "dynatemp_range":1.4,"dynatemp_exponent":0.0,"seed":seed,"return_tokens":true,"ignore_eos":true,"logit_bias":bias});
+            let response = request(router.clone(), "/completion", dynamic.clone()).await;
+            let status = response.status();
+            let actual = json_body(response).await;
+            assert_eq!(status, StatusCode::OK, "{actual}");
+            dynamic["temperature"] = json!(1.5);
+            dynamic["dynatemp_range"] = json!(0.0);
+            let response = request(router.clone(), "/completion", dynamic.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let expected = json_body(response).await;
+            assert_eq!(actual["tokens"], expected["tokens"], "seed {seed}");
+            assert_eq!(actual["content"], expected["content"], "seed {seed}");
+            dynamic["temperature"] = json!(0.1);
+            let response = request(router.clone(), "/completion", dynamic).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            changed_from_base |= actual["tokens"] != json_body(response).await["tokens"];
+        }
+        assert!(
+            changed_from_base,
+            "this fixture must distinguish active dynamic temperature from an ignored range"
+        );
+        for (field, value) in [
+            ("dynatemp_range", json!(-1)),
+            ("dynatemp_exponent", json!(-0.1)),
+            ("dynatemp_exponent", json!("steep")),
+            ("dynatemp_range", json!(1e100)),
+        ] {
+            let mut body = json!({"prompt":"hello","n_predict":1});
+            body[field] = value;
+            let response = request(router.clone(), "/completion", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                json_body(response).await["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(field)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn infill_sampler_merges_token_prefixes_and_selects_real_endings() {
+        let router = app(tiny_state());
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    match id {
+                        3 | 5 => json!(1e20),
+                        _ => json!(false),
+                    },
+                )
+            })
+            .collect();
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
+            for seed in 0..8 {
+                let mut body =
+                    json!({"max_tokens":4,"samplers":["infill"],"logit_bias":bias,"seed":seed});
+                if path == "/v1/chat/completions" {
+                    body["messages"] = json!([{"role":"user","content":"world"}]);
+                } else {
+                    body["prompt"] = json!([5]);
+                }
+                if path == "/completion" {
+                    body["return_tokens"] = json!(true);
+                }
+                let response = request(router.clone(), path, body).await;
+                let status = response.status();
+                let value = json_body(response).await;
+                assert_eq!(status, StatusCode::OK, "{path}: {value}");
+                if path == "/completion" {
+                    assert_eq!(value["tokens"], json!([3]), "{value}");
+                    assert_eq!(value["stop_type"], "eos");
+                } else {
+                    assert_eq!(value["choices"][0]["finish_reason"], "stop");
+                    assert_eq!(value["usage"]["completion_tokens"], 1);
+                }
+            }
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        vocab.remove("world");
+        vocab.remove("the");
+        vocab.insert("a".into(), json!(5));
+        vocab.insert("ab".into(), json!(6));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let metadata_path = scratch.path().join("inference_metadata.yaml");
+        let mut metadata: serde_yaml::Value =
+            serde_yaml::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+        metadata["schema_version"] = serde_yaml::Value::String("v1.9".into());
+        metadata["pipeline"]["workflow"]["publication_mode"] =
+            serde_yaml::Value::String("commit_only".into());
+        for output in metadata["pipeline"]["workflow"]["outputs"]
+            .as_mapping_mut()
+            .unwrap()
+            .values_mut()
+        {
+            output["family"] = serde_yaml::to_value(json!({"kind":"materialized"})).unwrap();
+        }
+        metadata["package"]=serde_yaml::to_value(json!({"tokenizer":{"algorithm":"wordlevel","vocab_size":32,"byte_level":false,"artifacts":[{"location":"tokenizer.json"}],"special_tokens":{"eos_token_id":[3,2],"eot_token_id":2}}})).unwrap();
+        std::fs::write(metadata_path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("prefix-fixture".into())).unwrap());
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    if id == 5 || id == 6 {
+                        json!(1e20)
+                    } else {
+                        json!(false)
+                    },
+                )
+            })
+            .collect();
+        let mut raw_selected_second = false;
+        for seed in 0..16 {
+            for stages in [json!([]), json!(["infill"])] {
+                let response=request(router.clone(),"/completion",json!({"prompt":[5],"max_tokens":1,"samplers":stages,"logit_bias":bias,"seed":seed,"return_tokens":true,"ignore_eos":true})).await;
+                let status = response.status();
+                let value = json_body(response).await;
+                assert_eq!(status, StatusCode::OK, "{value}");
+                if stages == json!(["infill"]) {
+                    assert_eq!(value["tokens"], json!([5]), "{value}");
+                } else {
+                    raw_selected_second |= value["tokens"] == json!([6]);
+                }
+            }
+        }
+        assert!(
+            raw_selected_second,
+            "raw categorical sampling must retain both prefix-related candidates"
+        );
+        let fallback_bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    if [4, 5, 7, 8, 9, 10].contains(&id) {
+                        json!(1e20)
+                    } else if id == 2 || id == 3 {
+                        json!(0)
+                    } else {
+                        json!(false)
+                    },
+                )
+            })
+            .collect();
+        let response=request(router,"/completion",json!({"prompt":[5],"max_tokens":1,"samplers":["infill"],"logit_bias":fallback_bias,"return_tokens":true})).await;
+        let status = response.status();
+        let value = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(
+            value["tokens"],
+            json!([2]),
+            "declared end-of-turn role must take precedence over primary EOS 3: {value}"
+        );
+        assert_eq!(value["stop_type"], "eos");
+    }
+
+    #[tokio::test]
+    async fn adaptive_p_selects_low_probability_tokens_through_all_generation_protocols() {
+        let router = app(tiny_state());
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    match id {
+                        5 => json!(100),
+                        6 => json!(0),
+                        _ => json!(false),
+                    },
+                )
+            })
+            .collect();
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
+            for (samplers, target, expected) in [
+                (json!(["adaptive_p"]), 0.0, "the the the the"),
+                (json!(["adaptive-p"]), -1.0, "world world world world"),
+                (json!([]), 0.0, "world world world world"),
+            ] {
+                let mut body = json!({"max_tokens":4,"seed":7,"samplers":samplers,
+                    "adaptive_target":target,"adaptive_decay":0.9,
+                    "logit_bias":bias,"ignore_eos":true});
+                if path == "/v1/chat/completions" {
+                    body["messages"] = json!([{"role":"user","content":"world"}]);
+                } else {
+                    body["prompt"] = json!([5]);
+                }
+                let response = request(router.clone(), path, body).await;
+                let status = response.status();
+                let value = json_body(response).await;
+                assert_eq!(status, StatusCode::OK, "{path}: {value}");
+                let text = if path == "/completion" {
+                    &value["content"]
+                } else if path == "/v1/completions" {
+                    &value["choices"][0]["text"]
+                } else {
+                    &value["choices"][0]["message"]["content"]
+                };
+                assert_eq!(text, expected, "{path} target={target}: {value}");
+            }
+        }
+        // Every wire scalar is finite and one token remains available before
+        // processing, but count-weighted penalties overflow that last logit.
+        // The adaptive stage must return its real inference error, not token 0.
+        let one_available: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    if id == 5 { json!(100) } else { json!(false) },
+                )
+            })
+            .collect();
+        let response=request(router.clone(),"/completion",json!({"prompt":[5,5],"max_tokens":1,"samplers":["penalties","adaptive_p"],"adaptive_target":0.0,"frequency_penalty":3e38,"repeat_last_n":-1,"logit_bias":one_available})).await;
+        let status = response.status();
+        let error = json_body(response).await.to_string();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{error}");
+        assert!(
+            error.contains("adaptive_p") && error.contains("finite unmasked"),
+            "{error}"
+        );
+        for (field, value) in [
+            ("adaptive_target", json!(1.1)),
+            ("adaptive_decay", json!(-0.1)),
+            ("adaptive_decay", json!(1.0)),
+        ] {
+            let mut body = json!({"prompt":[5],"max_tokens":1,"samplers":["adaptive_p"]});
+            body[field] = value;
+            let response = request(router.clone(), "/completion", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(json_body(response).await.to_string().contains(field));
+        }
+    }
+
+    #[tokio::test]
+    async fn penalties_window_counts_prompt_and_disables_all_penalties_across_protocols() {
+        let router = app(tiny_state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/props")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            json_body(response).await["default_generation_settings"]["params"]["repeat_last_n"],
+            64
+        );
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    match id {
+                        5 => json!(100),
+                        6 => json!(99),
+                        _ => json!(false),
+                    },
+                )
+            })
+            .collect();
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
+            for field in ["frequency_penalty", "presence_penalty"] {
+                let cases: &[(i64, &str)] = if field == "frequency_penalty" {
+                    &[(-1, "the"), (1, "world"), (0, "world")]
+                } else {
+                    &[(-1, "the"), (0, "world")]
+                };
+                for &(window, expected) in cases {
+                    let mut body = json!({"max_tokens":1,"temperature":0,
+                        "samplers":["penalties","temperature"], "repeat_last_n":window,
+                        "logit_bias":bias,"ignore_eos":true});
+                    body[field] = json!(2.0);
+                    let (prompt, text) = if field == "frequency_penalty" {
+                        (json!([5, 5, 6]), "world world the")
+                    } else {
+                        (json!([5]), "world")
+                    };
+                    if path == "/v1/chat/completions" {
+                        body["messages"] = json!([{"role":"user","content":text}]);
+                    } else {
+                        body["prompt"] = prompt;
+                    }
+                    let response = request(router.clone(), path, body).await;
+                    let status = response.status();
+                    let value = json_body(response).await;
+                    assert_eq!(status, StatusCode::OK, "{path} {field}: {value}");
+                    let text = if path == "/completion" {
+                        &value["content"]
+                    } else if path == "/v1/completions" {
+                        &value["choices"][0]["text"]
+                    } else {
+                        &value["choices"][0]["message"]["content"]
+                    };
+                    assert_eq!(text, expected, "{path} {field} window={window}: {value}");
+                }
+            }
+            let response = request(
+                router.clone(),
+                path,
+                if path == "/v1/chat/completions" {
+                    json!({"messages":[{"role":"user","content":"world"}],"repeat_last_n":-2})
+                } else {
+                    json!({"prompt":[5],"repeat_last_n":-2})
+                },
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                json_body(response)
+                    .await
+                    .to_string()
+                    .contains("repeat_last_n")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_top_k_ties_retain_exactly_the_requested_candidates() {
+        let router = app(tiny_state());
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    if id == 5 || id == 6 {
+                        json!(1e20)
+                    } else {
+                        json!(false)
+                    },
+                )
+            })
+            .collect();
+        // The finite bias rounds both model logits to the same f32 value.
+        // With k=1, the second token can never survive; k=2 keeps both.
+        let mut second_selected = false;
+        for k in [1, 2] {
+            for seed in 0..16 {
+                let response = request(
+                    router.clone(),
+                    "/completion",
+                    json!({
+                        "prompt":[5], "max_tokens":1, "samplers":["top_k"],
+                        "top_k":k, "logit_bias":bias, "seed":seed,
+                        "ignore_eos":true, "return_tokens":true
+                    }),
+                )
+                .await;
+                let status = response.status();
+                let value = json_body(response).await;
+                assert_eq!(status, StatusCode::OK, "{value}");
+                if k == 1 {
+                    assert_eq!(value["tokens"], json!([5]), "seed={seed}: {value}");
+                } else {
+                    assert!(value["tokens"] == json!([5]) || value["tokens"] == json!([6]));
+                    second_selected |= value["tokens"] == json!([6]);
+                }
+            }
+        }
+        assert!(second_selected, "k=2 must permit the tied second candidate");
+    }
+
+    #[tokio::test]
+    async fn native_sampler_order_changes_actual_generation_across_protocols() {
+        let router = app(tiny_state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/props")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let properties = json_body(response).await;
+        assert_eq!(
+            properties["nxrt_capabilities"]["custom_sampler_order"],
+            true
+        );
+        assert_eq!(
+            properties["default_generation_settings"]["params"]["samplers"],
+            json!([
+                "penalties",
+                "dry",
+                "top_n_sigma",
+                "top_k",
+                "typ_p",
+                "top_p",
+                "min_p",
+                "xtc",
+                "temperature"
+            ])
+        );
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    match id {
+                        5 => json!(100),
+                        6 => json!(99),
+                        _ => json!(false),
+                    },
+                )
+            })
+            .collect();
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
+            let mut outputs = Vec::new();
+            for samplers in [
+                json!(["penalties", "temperature"]),
+                json!(["temperature", "penalties"]),
+            ] {
+                let mut body = json!({"max_tokens":1,"temperature":0,"repeat_penalty":2.0,"repeat_last_n":-1,"samplers":samplers,"logit_bias":bias,"ignore_eos":true});
+                if path == "/v1/chat/completions" {
+                    body["messages"] = json!([{"role":"user","content":"world"}]);
+                } else {
+                    body["prompt"] = json!([5]);
+                }
+                let response = request(router.clone(), path, body).await;
+                let status = response.status();
+                let value = json_body(response).await;
+                assert_eq!(status, StatusCode::OK, "{path}: {value}");
+                let text = if path == "/completion" {
+                    value["content"].clone()
+                } else if path == "/v1/completions" {
+                    value["choices"][0]["text"].clone()
+                } else {
+                    value["choices"][0]["message"]["content"].clone()
+                };
+                outputs.push(text);
+            }
+            assert_eq!(
+                outputs,
+                json!(["the", "world"]).as_array().unwrap().clone(),
+                "{path}"
+            );
+        }
+        let mut categorical_selected_second = false;
+        for seed in 0..16 {
+            let response=request(router.clone(),"/completion",json!({"prompt":[5],"max_tokens":1,"temperature":0,"samplers":[],"logit_bias":bias,"seed":seed,"ignore_eos":true,"return_tokens":true})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json_body(response).await;
+            assert!(
+                value["tokens"] == json!([5]) || value["tokens"] == json!([6]),
+                "mandatory bias must survive an empty stage list: {value}"
+            );
+            categorical_selected_second |= value["tokens"] == json!([6]);
+            let response=request(router.clone(),"/completion",json!({"prompt":[5],"max_tokens":1,"temperature":0,"samplers":["top_n_sigma"],"top_n_sigma":0.1,"logit_bias":bias,"seed":seed,"ignore_eos":true,"return_tokens":true})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                json_body(response).await["tokens"],
+                json!([5]),
+                "sigma stage must mask the lower logit even without a temperature stage"
+            );
+        }
+        assert!(
+            categorical_selected_second,
+            "an omitted temperature stage must leave the original categorical distribution"
+        );
+        for samplers in [json!(["unknown"]), json!(vec!["top_k"; 65]), json!(false)] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":"hello","max_tokens":1,"samplers":samplers}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_prompt_only_prefill_returns_zero_output_and_real_cache_reuse() {
+        let router = app(tiny_state());
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":[2,4,3],"n_predict":0,"return_tokens":true}),
+        )
+        .await;
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["content"], "");
+        assert_eq!(body["tokens"], json!([]));
+        assert_eq!(body["tokens_predicted"], 0);
+        assert_eq!(body["tokens_evaluated"], 3);
+        assert_eq!(body["stop"], true);
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":[2,4,3],"n_predict":2,"temperature":0,"return_tokens":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let generated = json_body(response).await;
+        assert!(
+            generated["tokens_cached"].as_u64().unwrap() > 0,
+            "{generated}"
+        );
+        assert_eq!(generated["tokens_predicted"], 2);
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":[2,4,3],"n_predict":0,"cache_prompt":false}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["tokens_cached"], 0);
+        for streaming in [false, true] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":["hello","world"],"max_tokens":0,"stream":streaming}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let values = if streaming {
+                sse_json_events(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            } else {
+                json_body(response).await.as_array().unwrap().clone()
+            };
+            assert_eq!(values.len(), 2);
+            for (index, value) in values.iter().enumerate() {
+                assert_eq!(value["index"], index);
+                assert_eq!(value["tokens_predicted"], 0);
+                assert_eq!(value["content"], "");
+                assert_eq!(value["stop"], true);
+            }
+        }
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":vec![2;16],"n_predict":0,"cache_prompt":false}),
+        )
+        .await;
+        let status = response.status();
+        let at_limit = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{at_limit}");
+        assert_eq!(at_limit["tokens_evaluated"], 16);
+        assert_eq!(at_limit["tokens_predicted"], 0);
+        for invalid in [
+            json!({"prompt":"hello","n_predict":0,"max_completion_tokens":1}),
+            json!({"prompt":[999999],"n_predict":0}),
+            json!({"prompt":vec![2;17],"n_predict":0}),
+        ] {
+            let response = request(router.clone(), "/completion", invalid).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_completion_aliases_return_real_counts_tokens_and_stop_state() {
+        let router = app(tiny_state());
+        for path in ["/completion", "/completions"] {
+            let response = request(
+                router.clone(),
+                path,
+                json!({"prompt":"hello","n_predict":2,"temperature":0,"return_tokens":true}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["stop"], true);
+            assert_eq!(body["model"], "tiny-llm");
+            assert!(body["content"].is_string());
+            assert_eq!(
+                body["tokens"].as_array().unwrap().len(),
+                body["tokens_predicted"].as_u64().unwrap() as usize
+            );
+            assert!(body["tokens_evaluated"].as_u64().unwrap() > 0);
+        }
+    }
+    #[tokio::test]
+    async fn native_mixed_tokens_follow_first_segment_special_policy_and_generate() {
+        let router = app(tiny_state());
+        for (input, expected) in [
+            (json!(["hello", 5]), json!([2, 4, 3, 5])),
+            (json!([2, "hello", 5]), json!([2, 4, 5])),
+            (json!([4, "world"]), json!([4, 5])),
+        ] {
+            let response = request(
+                router.clone(),
+                "/tokenize",
+                json!({"content":input,"add_special":true}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["tokens"], expected);
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":input,"n_predict":2,"temperature":0,"return_tokens":true}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let actual = json_body(response).await;
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":expected,"n_predict":2,"temperature":0,"return_tokens":true}),
+            )
+            .await;
+            let explicit = json_body(response).await;
+            assert_eq!(actual["tokens"], explicit["tokens"]);
+            assert_eq!(actual["content"], explicit["content"]);
+            assert_eq!(
+                actual["tokens_evaluated"],
+                expected.as_array().unwrap().len()
+            );
+        }
+        for invalid in [
+            json!([4, -1]),
+            json!([4, 1.5]),
+            json!([4, true]),
+            json!([4, 4294967296u64]),
+        ] {
+            for path in ["/tokenize", "/completion"] {
+                let body = if path == "/tokenize" {
+                    json!({"content":invalid})
+                } else {
+                    json!({"prompt":invalid,"n_predict":1})
+                };
+                let response = request(router.clone(), path, body).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert!(
+                    json_body(response).await["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("input[1]")
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn native_prompt_batches_preserve_indices_for_buffered_and_streamed_results() {
+        let router = app(tiny_state());
+        let prompts = json!(["hello", [2, "world", 3], [4, 5], {"prompt_string":"hello", "multimodal_data":[]}]);
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":prompts,"n_predict":2,"temperature":0,"return_tokens":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let buffered = json_body(response).await;
+        assert_eq!(buffered.as_array().unwrap().len(), 4);
+        let response = request(router.clone(), "/completion",
+            json!({"prompt":prompts,"n_predict":2,"temperature":0,"return_tokens":true,"stream":true})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let events = sse_json_events(&bytes);
+        for index in 0..4 {
+            assert_eq!(buffered[index]["index"], index);
+            let rows: Vec<_> = events.iter().filter(|row| row["index"] == index).collect();
+            let final_row = rows.last().unwrap();
+            assert_eq!(final_row["stop"], true);
+            assert_eq!(
+                final_row["tokens_evaluated"],
+                buffered[index]["tokens_evaluated"]
+            );
+            let text = rows
+                .iter()
+                .map(|row| row["content"].as_str().unwrap())
+                .collect::<String>();
+            assert_eq!(text, buffered[index]["content"].as_str().unwrap());
+        }
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":["hello"],"n_predict":1}),
+        )
+        .await;
+        assert!(json_body(response).await.is_object());
+        for invalid in [
+            json!([]),
+            json!(["hello", [999999]]),
+            json!({"prompt_string":"hello","multimodal_data":["AAAA"]}),
+            json!({"prompt_string":"hello","typo":true}),
+        ] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":invalid,"n_predict":1,"stream":true}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let mut state = tiny_state();
+        state.config.max_completion_prompts = std::num::NonZeroUsize::new(1).unwrap();
+        let response = request(
+            app(state),
+            "/completion",
+            json!({"prompt":["hello","world"],"n_predict":1}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--max-completion-prompts")
+        );
+    }
+    #[tokio::test]
+    async fn native_stream_ends_with_stop_and_supports_exact_prompt_token_ids() {
+        let router = app(tiny_state());
+        let tokens = fixture_tokenizer().encode("hello").unwrap();
+        let response = request(
+            router,
+            "/completion",
+            json!({"prompt":tokens,"n_predict":2,"stream":true,"return_tokens":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let events = sse_json_events(&bytes);
+        assert_eq!(events.last().unwrap()["stop"], true);
+        assert!(events.iter().any(|event| event["stop"] == false));
+        assert!(!std::str::from_utf8(&bytes).unwrap().contains("[DONE]"));
+    }
+    #[tokio::test]
+    async fn native_stop_text_is_omitted_from_buffered_and_streamed_content() {
+        let router = app(tiny_state());
+        for (stop, count) in [("tok22", 1), ("tok22 tok22", 2)] {
+            for stream in [false, true] {
+                let response=request(router.clone(),"/completion",json!({
+                "prompt":"hello","n_predict":4,"temperature":0,"logit_bias":{"22":100},"stop":[stop],"stream":stream
+            })).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                if stream {
+                    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    let events = sse_json_events(&bytes);
+                    assert_eq!(events.last().unwrap()["stop_type"], "word");
+                    assert_eq!(events.last().unwrap()["tokens_predicted"], count);
+                    assert!(events.iter().all(|event| event["content"] == ""));
+                } else {
+                    let body = json_body(response).await;
+                    assert_eq!(body["stop_type"], "word");
+                    assert_eq!(body["content"], "");
+                    assert_eq!(body["tokens_predicted"], count);
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn canonical_stream_text_matches_buffered_chat_and_completion_decoding() {
+        let router = app(tiny_state());
+        for path in ["/v1/chat/completions", "/v1/completions"] {
+            let mut body = json!({"model":"tiny-llm","temperature":0,"max_tokens":2});
+            if path.contains("chat") {
+                body["messages"] = json!([{"role":"user","content":"hello"}]);
+            } else {
+                body["prompt"] = json!("hello");
+            }
+            let response = request(router.clone(), path, body.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let buffered = json_body(response).await;
+            let expected = if path.contains("chat") {
+                buffered["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap()
+            } else {
+                buffered["choices"][0]["text"].as_str().unwrap()
+            };
+            assert!(
+                expected.contains(' '),
+                "fixture must exercise decoder-inserted spacing: {path}: {expected:?}"
+            );
+            body["stream"] = json!(true);
+            let response = request(router.clone(), path, body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let events = sse_json_events(&bytes);
+            let text = events
+                .iter()
+                .filter_map(|event| {
+                    if path.contains("chat") {
+                        event["choices"][0]["delta"]["content"].as_str()
+                    } else {
+                        event["choices"][0]["text"].as_str()
+                    }
+                })
+                .collect::<String>();
+            assert_eq!(text, expected, "{path}");
+        }
+    }
+    #[tokio::test]
+    async fn legacy_completion_batches_preserve_indices_token_inputs_and_total_usage() {
+        let router = app(tiny_state());
+        let prompts = json!(["hello",[2,"world",3],[4,5],{"prompt_string":"hello"}]);
+        for probabilities in [false, true] {
+            let mut body =
+                json!({"prompt":prompts,"max_tokens":2,"temperature":0,"logit_bias":{"5":100}});
+            if probabilities {
+                body["logprobs"] = json!(2);
+            }
+            let response = request(router.clone(), "/v1/completions", body.clone()).await;
+            let status = response.status();
+            let buffered = json_body(response).await;
+            assert_eq!(status, StatusCode::OK, "{buffered}");
+            assert_eq!(buffered["choices"].as_array().unwrap().len(), 4);
+            for index in 0..4 {
+                assert!(
+                    buffered["workflow_outputs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["prompt_index"] == index && row["publication"].is_object())
+                );
+            }
+            assert_eq!(
+                buffered["usage"],
+                json!({"prompt_tokens":11,"completion_tokens":8,"total_tokens":19})
+            );
+            for (index, choice) in buffered["choices"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(choice["index"], index);
+                assert_eq!(choice["text"], "world world");
+            }
+            body["stream"] = json!(true);
+            body["stream_options"] = json!({"include_usage":true});
+            let response = request(router.clone(), "/v1/completions", body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let events = sse_json_events(&bytes);
+            assert_eq!(events.last().unwrap()["usage"], buffered["usage"]);
+            for index in 0..4 {
+                assert!(
+                    events
+                        .iter()
+                        .any(|row| row["prompt_index"] == index && row["publication"].is_object())
+                );
+            }
+            let chunks: Vec<_> = events
+                .iter()
+                .filter(|row| row["object"] == "text_completion")
+                .collect();
+            let id = chunks[0]["id"].clone();
+            assert!(id.is_string());
+            assert!(chunks.iter().all(|row| row["id"] == id));
+            for index in 0..4 {
+                let rows: Vec<_> = events
+                    .iter()
+                    .filter(|row| row["choices"][0]["index"] == index)
+                    .collect();
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| row["choices"][0]["finish_reason"].is_string())
+                        .count(),
+                    1
+                );
+                let text = rows
+                    .iter()
+                    .filter_map(|row| row["choices"][0]["text"].as_str())
+                    .collect::<String>();
+                assert_eq!(text, "world world");
+            }
+            assert_eq!(
+                std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .matches("data: [DONE]")
+                    .count(),
+                1
+            );
+        }
+        for prompt in [json!([2, "hello", 3]), json!([2, 4, 3])] {
+            let response = request(
+                router.clone(),
+                "/v1/completions",
+                json!({"prompt":prompt,"max_tokens":1,"temperature":0}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["choices"].as_array().unwrap().len(), 1);
+            assert_eq!(body["usage"]["prompt_tokens"], 3);
+        }
+    }
+    #[tokio::test]
+    async fn legacy_completion_batch_failures_are_rejected_before_stream_headers() {
+        let mut state = tiny_state();
+        state.config.max_completion_prompts = std::num::NonZeroUsize::new(2).unwrap();
+        let router = app(state);
+        for prompt in [
+            json!([]),
+            json!(["hello", "world", "the"]),
+            json!(["hello", [999999]]),
+            json!(["hello",{"prompt_string":false}]),
+        ] {
+            let response = request(
+                router.clone(),
+                "/v1/completions",
+                json!({"prompt":prompt,"max_tokens":1,"stream":true}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["type"],
+                "invalid_request_error"
+            );
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("X-Session-Id", "batch-conversation")
+                    .body(Body::from(
+                        json!({"prompt":["hello","world"],"max_tokens":1}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("single prompt")
+        );
+    }
+    #[tokio::test]
+    async fn legacy_completion_uses_common_sampling_defaults_biases_and_stream_usage() {
+        let router = app(tiny_state());
+        let body = json!({"prompt":"hello","temperature":0,"max_tokens":2,
+            "seed":7,"top_k":8,"typ_p":0.9,"repeat_penalty":1.1,
+            "repeat_last_n":-1,"logit_bias":{"5":100},"echo":false});
+        let response = request(router.clone(), "/v1/completions", body.clone()).await;
+        let status = response.status();
+        let buffered = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{buffered}");
+        assert_eq!(buffered["model"], "tiny-llm");
+        assert_eq!(buffered["choices"][0]["text"], "world world");
+        assert_eq!(buffered["usage"]["completion_tokens"], 2);
+        let mut streamed = body;
+        streamed["stream"] = json!(true);
+        streamed["stream_options"] = json!({"include_usage":true});
+        let response = request(router.clone(), "/v1/completions", streamed).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let events = sse_json_events(&bytes);
+        let usage = events.last().unwrap();
+        assert_eq!(usage["model"], "tiny-llm");
+        assert_eq!(usage["choices"], json!([]));
+        assert_eq!(usage["usage"], buffered["usage"]);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|row| row["choices"][0]["text"].as_str())
+                .collect::<String>(),
+            "world world"
+        );
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .ends_with("data: [DONE]\n\n")
+        );
+        // -1 leaves only the server/context cap, rather than failing usize parsing.
+        let response=request(router.clone(),"/v1/completions",json!({
+            "prompt":"hello","temperature":0,"max_tokens":-1,"logit_bias":{"5":100},"stop":["world"]
+        })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["choices"][0]["text"], "");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["completion_tokens"], 1);
+        let response=request(router,"/v1/completions",json!({
+            "prompt":"hello","temperature":0,"max_tokens":2,"logit_bias":{"5":100},"stop":["world"],"stream":true
+        })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(
+            sse_json_events(&bytes)
+                .iter()
+                .filter_map(|row| row["choices"][0]["text"].as_str())
+                .collect::<String>(),
+            ""
+        );
+    }
+    #[tokio::test]
+    async fn legacy_completion_rejects_dropped_controls_and_invalid_common_sampling() {
+        let router = app(tiny_state());
+        for (control, field) in [
+            (json!({"samplers":["unknown"]}), "samplers"),
+            (json!({"misspelled_control":true}), "misspelled_control"),
+            (json!({"logit_bias":{"999999":100}}), "token"),
+            (json!({"seed":-2}), "seed"),
+            (json!({"seed":true}), "seed"),
+            (json!({"temperature":"warm"}), "temperature"),
+            (json!({"echo":true}), "echo"),
+            (
+                json!({"chat_template_kwargs":{"x":true}}),
+                "chat_template_kwargs",
+            ),
+            (json!({"logprobs":true}), "logprobs"),
+        ] {
+            let mut body = json!({"prompt":"hello","max_tokens":1});
+            body.as_object_mut()
+                .unwrap()
+                .extend(control.as_object().unwrap().clone());
+            let response = request(router.clone(), "/v1/completions", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+            let body = json_body(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(
+                body["error"]["message"].as_str().unwrap().contains(field),
+                "{body}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn native_errors_and_token_count_are_actionable() {
+        let router = app(tiny_state());
+        for (body, field) in [
+            (json!({"prompt":[999999],"n_predict":1}), "token id"),
+            (
+                json!({"prompt":"hello","n_predict":1,"max_tokens":1}),
+                "not both",
+            ),
+        ] {
+            let response = request(router.clone(), "/completion", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                json_body(response).await["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(field)
+            );
+        }
+        let response = request(
+            router.clone(),
+            "/infill",
+            json!({"input_prefix":"hello","input_suffix":"world","n_predict":1}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("FIM")
+        );
+        let response = request(
+            router,
+            "/v1/chat/completions/input_tokens",
+            json!({"messages":[{"role":"user","content":"hello"}]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(json_body(response).await["input_tokens"].as_u64().unwrap() > 0);
+    }
+    #[tokio::test]
+    async fn logit_bias_controls_real_greedy_generation_and_validates_vocabulary() {
+        let router = app(tiny_state());
+        let target = fixture_tokenizer()
+            .inner()
+            .encode("world", false)
+            .unwrap()
+            .get_ids()[0];
+        let response = request(router.clone(), "/completion", json!({"prompt":"hello","n_predict":1,"temperature":0,"return_tokens":true,"logit_bias":{(target.to_string()):1000}})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["tokens"], json!([target]));
+        let response = request(router.clone(), "/completion", json!({"prompt":"hello","n_predict":1,"temperature":0,"return_tokens":true,"logit_bias":[["world",1000]]})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["tokens"], json!([target]));
+        for biases in [
+            json!({"999999":2}),
+            json!([[target, 2], [target, false]]),
+            json!([[target, true]]),
+        ] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":"hello","n_predict":1,"logit_bias":biases}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                json_body(response).await["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("logit_bias")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_tts_executes_declared_speech_and_rejects_ignored_controls() {
+        let router = app(speech_state());
+        for field in ["input", "prompt"] {
+            let mut body = json!({"raw_prompt":false,"speed":1,"seed":-1});
+            body[field] = json!("hello world");
+            let response = request(router.clone(), "/tts", body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "audio/wav");
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert_eq!(&bytes[..4], b"RIFF");
+            assert_eq!(&bytes[8..12], b"WAVE");
+            assert!(bytes.len() > 44);
+        }
+        let response = request(
+            router.clone(),
+            "/tts",
+            json!({"input":"hello world","raw_prompt":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "audio/wav");
+        for body in [
+            json!({"input":"hi","prompt":"hi"}),
+            json!({"input":"hi","raw_prompt":true,"instructions":"conflict"}),
+            json!({"input":"hi","voice":"unconfigured"}),
+            json!({"input":"hi","speed":2}),
+        ] {
+            let response = request(router.clone(), "/tts", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(json_body(response).await["error"]["message"].is_string());
+        }
+        let response = request(
+            router,
+            "/v1/audio/speech",
+            json!({"model":"speech-wav","input":"hi","voice":"unconfigured"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("voice")
+        );
+    }
+
+    #[tokio::test]
+    async fn client_request_failures_have_protocol_invalid_request_types() {
+        let router = app(tiny_state());
+        for (path, body) in [
+            ("/v1/chat/completions", json!({"messages":[]})),
+            (
+                "/v1/completions",
+                json!({"model":"tiny-llm","prompt":"hi","max_tokens":0}),
+            ),
+            ("/v1/embeddings", json!({"model":"tiny-llm","input":[]})),
+        ] {
+            let response = request(router.clone(), path, body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["type"],
+                "invalid_request_error"
+            );
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"].as_str().unwrap().contains("JSON"));
+    }
+
+    #[tokio::test]
+    async fn messages_errors_include_anthropic_envelopes_for_handlers_and_extractors() {
+        let router = app(tiny_state());
+        for (path, body, status, kind) in [
+            (
+                "/v1/messages",
+                json!({"messages":[],"max_tokens":1}),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+            (
+                "/v1/messages",
+                json!({"model":"absent","messages":[{"role":"user","content":"hi"}],"max_tokens":1}),
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+            ),
+            (
+                "/v1/messages/count_tokens",
+                json!({}),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+        ] {
+            let response = request(router.clone(), path, body).await;
+            assert_eq!(response.status(), status);
+            let body = json_body(response).await;
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], kind);
+            assert!(body["error"]["message"].is_string());
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn not_found_errors_use_native_protocol_classifications() {
+        let router = app(tiny_state());
+        let response = request(
+            router.clone(),
+            "/v1/chat/completions",
+            json!({"model":"absent","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(body["error"]["code"], 404);
+        let response = request(router, "/not-served", json!({})).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(body["error"]["code"], 404);
+    }
+
+    #[tokio::test]
+    async fn native_token_pieces_preserve_incomplete_utf8_bytes_over_http() {
+        let scratch = tempfile::tempdir().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        copy_tree(&fixtures.join("tiny-llm"), scratch.path());
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut vocab = tokenizer["model"]["vocab"].as_object().unwrap().clone();
+        vocab.remove("hello");
+        vocab.remove("world");
+        vocab.insert("<0xC3>".into(), json!(4));
+        vocab.insert("<0xA9>".into(), json!(5));
+        tokenizer["model"] = json!({"type":"BPE","unk_token":"<unk>","byte_fallback":true,"vocab":vocab,"merges":[]});
+        tokenizer["decoder"] = json!({"type":"ByteFallback"});
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("byte-pieces".into())).unwrap());
+        let response = request(
+            router.clone(),
+            "/tokenize",
+            json!({"content":"é","with_pieces":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["tokens"],
+            json!([{"id":4,"piece":[195]},{"id":5,"piece":[169]}])
+        );
+        let response = request(router.clone(), "/detokenize", json!({"tokens":[4,5]})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["content"], "é");
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({
+                "prompt":[2,4,3],"n_predict":2,"temperature":0,"logit_bias":{"4":100}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let expected = json_body(response).await;
+        assert!(!expected["content"].as_str().unwrap().is_empty());
+        let response = request(
+            router,
+            "/completion",
+            json!({
+                "prompt":[2,4,3],"n_predict":2,"temperature":0,"logit_bias":{"4":100},"stream":true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let events = sse_json_events(&bytes);
+        assert_eq!(events.last().unwrap()["stop"], true);
+        let text = events
+            .iter()
+            .map(|event| event["content"].as_str().unwrap())
+            .collect::<String>();
+        assert_eq!(text, expected["content"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn native_tokenization_can_treat_special_tokens_as_plain_text() {
+        let scratch = tempfile::tempdir().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        copy_tree(&fixtures.join("tiny-llm"), scratch.path());
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        tokenizer["added_tokens"] = json!([{"id":31,"content":"tok31","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}]);
+        std::fs::write(path, serde_json::to_string(&tokenizer).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("special-policy".into())).unwrap());
+        for (parse, add, expected) in [
+            (true, false, json!([4, 31, 5])),
+            (false, false, json!([1])),
+            (true, true, json!([2, 4, 31, 5, 3])),
+            (false, true, json!([2, 1, 3])),
+            (true, false, json!([4, 31, 5])),
+        ] {
+            let response = request(
+                router.clone(),
+                "/tokenize",
+                json!({"content":"hellotok31world","parse_special":parse,"add_special":add}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["tokens"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn media_input_token_counts_match_real_multimodal_inference() {
+        let scratch = tempfile::tempdir().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let package = scratch.path().join("vlm");
+        copy_tree(&fixtures.join("onnx_genai_workflows/vlm"), &package);
+        std::fs::copy(
+            fixtures.join("tiny-llm/tokenizer.json"),
+            package.join("tokenizer.json"),
+        )
+        .unwrap();
+        let tokenizer_path = package.join("tokenizer.json");
+        let mut tokenizer: Value =
+            serde_json::from_str(&std::fs::read_to_string(&tokenizer_path).unwrap()).unwrap();
+        tokenizer["added_tokens"] = json!([{"id":31,"content":"tok31","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}]);
+        std::fs::write(&tokenizer_path, serde_json::to_string(&tokenizer).unwrap()).unwrap();
+        let metadata_path = package.join("inference_metadata.yaml");
+        let mut metadata: Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
+        metadata["package"]["tokenizer"]["special_tokens"]["image_token_id"] = json!(31);
+        std::fs::write(&metadata_path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        let state = AppState::load(&package, Some("vlm-counter".into())).unwrap();
+        let router = app(state);
+        let image = png_data_uri(1, 1);
+        let messages = json!([{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":image}}]}]);
+        let template = request(
+            router.clone(),
+            "/apply-template",
+            json!({"messages":messages}),
+        )
+        .await;
+        assert_eq!(template.status(), StatusCode::OK);
+        assert!(
+            json_body(template).await["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("tok31")
+        );
+        let response = request(
+            router.clone(),
+            "/v1/chat/completions",
+            json!({"messages":messages,"max_tokens":1,"temperature":0}),
+        )
+        .await;
+        let status = response.status();
+        let generation = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{generation}");
+        let expected = generation["usage"]["prompt_tokens"].as_u64().unwrap();
+        assert!(
+            expected >= 4,
+            "expanded image must contribute its declared patch count"
+        );
+        for (path, body) in [
+            (
+                "/v1/chat/completions/input_tokens",
+                json!({"messages":messages}),
+            ),
+            (
+                "/v1/responses/input_tokens",
+                json!({"input":[{"role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":image}]}]}),
+            ),
+            (
+                "/v1/messages/count_tokens",
+                json!({"messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image","source":{"type":"url","url":image}}]}]}),
+            ),
+        ] {
+            let response = request(router.clone(), path, body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["input_tokens"], expected);
+            if path.contains("messages") {
+                assert!(body.get("object").is_none());
+            } else {
+                assert_eq!(body["object"], "response.input_tokens");
+            }
+        }
+    }
+
+    fn ranking_state() -> AppState {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/reranking");
+        AppState::load(&root, Some("pair-ranker".into())).unwrap()
+    }
+    #[tokio::test]
+    async fn reranking_aliases_execute_real_pairs_and_return_native_jina_and_tei_shapes() {
+        let router = app(ranking_state());
+        for path in ["/reranking", "/rerank", "/v1/rerank", "/v1/reranking"] {
+            let response = request(
+                router.clone(),
+                path,
+                json!({"query":"hello","documents":["world","hello","the"],"top_n":2}),
+            )
+            .await;
+            let status = response.status();
+            let body = json_body(response).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["model"], "pair-ranker");
+            assert_eq!(body["object"], "list");
+            assert_eq!(body["results"][0]["index"], 1);
+            assert_eq!(body["results"][1]["index"], 0);
+            assert_eq!(body["results"].as_array().unwrap().len(), 2);
+            assert_eq!(body["usage"]["prompt_tokens"], 15);
+            assert!((body["results"][0]["relevance_score"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        }
+        let response=request(router.clone(),"/v1/rerank",json!({"query":{"text":["wor","ld"]},"texts":[{"text":["hel","lo"]},"world"],"return_text":true})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert!(body.is_array());
+        assert_eq!(body[0]["index"], 1);
+        assert_eq!(body[0]["text"], "world");
+        assert!(body[0].get("relevance_score").is_none());
+        let response = request(
+            router.clone(),
+            "/rerank",
+            json!({"query":"hello","documents":["world","hello"],"top_n":0}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["results"], json!([]));
+        assert_eq!(body["usage"]["prompt_tokens"], 10);
+        let response = request(
+            router.clone(),
+            "/rerank",
+            json!({"query":"hello","documents":["hello"],"texts":["world"],"return_text":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert!(body.is_array());
+        assert_eq!(body[0]["text"], "hello");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/props")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            json_body(response).await["nxrt_capabilities"]["reranking"],
+            true
+        );
+    }
+    #[tokio::test]
+    async fn reranking_rejects_unsupported_models_media_and_resource_overruns() {
+        let router = app(ranking_state());
+        for body in [
+            json!({"query":"hello","documents":[]}),
+            json!({"query":{"image":"data:image/png;base64,AAAA"},"documents":["hello"]}),
+            json!({"query":"hello","documents":["hello"],"top_n":-1}),
+            json!({"query":"hello","documents":[{"text":[1]}]}),
+        ] {
+            let response = request(router.clone(), "/rerank", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["type"],
+                "invalid_request_error"
+            );
+        }
+        let response = request(
+            app(tiny_state()),
+            "/rerank",
+            json!({"query":"hello","documents":["hello"]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json_body(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reranking v1 profile")
+        );
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/reranking");
+        let state = AppState::load_with_config(
+            &root,
+            Some("pair-ranker".into()),
+            ServerConfig {
+                max_rerank_input_tokens: std::num::NonZeroUsize::new(4).unwrap(),
+                max_rerank_documents: std::num::NonZeroUsize::new(1).unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for documents in [json!(["hello"]), json!(["hello", "world"])] {
+            let response = request(
+                app(state.clone()),
+                "/rerank",
+                json!({"query":"hello","documents":documents}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = json_body(response).await;
+            assert!(
+                body["error"]["message"].as_str().unwrap().contains("limit")
+                    || body["error"]["message"].as_str().unwrap().contains("items")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn alternate_protocols_use_real_generation_and_usage() {
+        let router = app(tiny_state());
+        for (path, body, protocol) in [
+            (
+                "/v1/responses",
+                json!({"input":"hello","max_output_tokens":2,"temperature":0}),
+                "response",
+            ),
+            (
+                "/v1/messages",
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":2,"temperature":0}),
+                "message",
+            ),
+        ] {
+            let response = request(router.clone(), path, body.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let result = json_body(response).await;
+            assert!(result["usage"]["input_tokens"].as_u64().unwrap() > 0);
+            assert!(result["usage"]["output_tokens"].as_u64().unwrap() > 0);
+            assert_eq!(
+                result[if protocol == "response" {
+                    "object"
+                } else {
+                    "type"
+                }],
+                protocol
+            );
+            let mut streaming = body;
+            streaming["stream"] = json!(true);
+            let response = request(router.clone(), path, streaming).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let events = sse_json_events(&bytes);
+            assert!(
+                !events.iter().any(|event| event["type"] == "error"),
+                "{events:?}"
+            );
+            assert!(
+                events.iter().any(|event| event["type"]
+                    == if protocol == "response" {
+                        "response.completed"
+                    } else {
+                        "message_stop"
+                    })
+                    || events
+                        .iter()
+                        .any(|event| event["type"] == "response.incomplete")
+            );
+        }
+        for (path, body) in [
+            ("/v1/responses/input_tokens", json!({"input":"hello"})),
+            (
+                "/v1/messages/count_tokens",
+                json!({"messages":[{"role":"user","content":"hello"}]}),
+            ),
+        ] {
+            let response = request(router.clone(), path, body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(json_body(response).await["input_tokens"].as_u64().unwrap() > 0);
+        }
+    }
+    #[tokio::test]
+    async fn conversation_replay_http_contract_is_byte_exact_and_non_enumerable() {
+        let router = app(tiny_state());
+        let response = router.clone().oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE,"application/json").header("x-conversation-id","known::tiny-llm")
+            .body(Body::from(json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":2,"stream":true}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let original = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/stream?conv_id=known::tiny-llm&from=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            original
+        );
+        let response = request(
+            router.clone(),
+            "/v1/streams/lookup",
+            json!({"conversation_ids":["unknown"]}),
+        )
+        .await;
+        assert_eq!(json_body(response).await, json!([]));
+        let response = request(
+            router.clone(),
+            "/v1/streams/lookup",
+            json!({"conversation_ids":["known"]}),
+        )
+        .await;
+        let body = json_body(response).await;
+        assert_eq!(body[0]["conversation_id"], "known::tiny-llm");
+        assert_eq!(body[0]["is_done"], true);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/stream?conv_id=known::tiny-llm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/stream?conv_id=known::tiny-llm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+async fn assert_declared_output_projection(
+    prefix: &str,
+    generated: &str,
+    cases: &[(Option<&str>, &str, &str)],
+) {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+        }
+    }
+    let path = scratch.path().join("tokenizer.json");
+    let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+    let old = vocab
+        .iter()
+        .find(|(_, id)| id.as_u64() == Some(22))
+        .unwrap()
+        .0
+        .clone();
+    vocab.remove(&old);
+    vocab.insert(generated.into(), json!(22));
+    std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+    std::fs::write(
+        scratch.path().join("tokenizer_config.json"),
+        json!({
+            "chat_template":(["{% for m in messages %}{{ m.content }}{% endfor %}<assistant>", prefix].concat()),
+            "response_template":{"start_anchor":"<assistant>","fields":{
+                "content":{"content":"text"},
+                "reasoning_content":{"open":"<think>","close":"</think>","content":"text"}
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let router = app(AppState::load(scratch.path(), Some("declared-output".into())).unwrap());
+    for &(stop, expected_content, expected_reasoning) in cases {
+        for stream in [false, true] {
+            for logprobs in [false, true] {
+                let mut body = json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1,"temperature":0,
+                "logit_bias":{"22":1000},"stream":stream,"logprobs":logprobs});
+                if let Some(stop) = stop {
+                    body["stop"] = json!(stop);
+                }
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                if stream {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    let mut content = String::new();
+                    let mut reasoning = String::new();
+                    for line in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                        if line == "[DONE]" {
+                            continue;
+                        }
+                        let chunk: Value = serde_json::from_str(line).unwrap();
+                        assert!(chunk.get("error").is_none(), "{chunk}");
+                        content.push_str(
+                            chunk["choices"][0]["delta"]["content"]
+                                .as_str()
+                                .unwrap_or(""),
+                        );
+                        reasoning.push_str(
+                            chunk["choices"][0]["delta"]["reasoning_content"]
+                                .as_str()
+                                .unwrap_or(""),
+                        );
+                    }
+                    assert_eq!(content, expected_content, "{text}");
+                    assert_eq!(reasoning, expected_reasoning, "{text}");
+                } else {
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        value["choices"][0]["message"]["content"], expected_content,
+                        "{value}"
+                    );
+                    assert_eq!(
+                        value["choices"][0]["message"]["reasoning_content"]
+                            .as_str()
+                            .unwrap_or(""),
+                        expected_reasoning,
+                        "{value}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn declared_response_template_projects_real_generation_for_buffered_and_streamed_chat() {
+    assert_declared_output_projection(
+        "",
+        "<think>秘密</think>答案",
+        &[
+            (None, "答案", "秘密"),
+            (Some("密"), "", "秘"),
+            (Some("案"), "答", "秘密"),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ordinary_template_prefill_is_emitted_for_buffered_streamed_and_logprob_chat() {
+    assert_declared_output_projection(
+        "<think>预填",
+        "秘密</think>答案",
+        &[
+            (None, "答案", "预填秘密"),
+            (Some("密"), "", "预填秘"),
+            (Some("案"), "答", "预填秘密"),
+        ],
+    )
+    .await;
+    assert_declared_output_projection(
+        "预填",
+        "答案",
+        &[
+            (None, "预填答案", ""),
+            (Some("案"), "预填答", ""),
+            (Some("答"), "预填", ""),
+        ],
+    )
+    .await;
 }

@@ -165,8 +165,11 @@ serde_yaml = { workspace = true }
 tokenizers = { workspace = true }
 rand = "0.9.5"
 half = { workspace = true, features = ["use-intrinsics"] }
-llguidance = "1.7.6"
-toktrie_hf_tokenizers = "1.7.6"
+regex = "1.12"
+regex-automata = "0.4.16"
+regex-syntax = "0.8.11"
+llguidance = "1.9.1"
+toktrie_hf_tokenizers = "1.9.1"
 
 [target.'cfg(unix)'.dependencies]
 # statvfs(3) for the disk-capacity probe. `libc` is already in this crate's

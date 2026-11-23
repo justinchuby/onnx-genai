@@ -161,10 +161,10 @@ fn native_kv_tensor_spec(info: &TensorInfo) -> anyhow::Result<KvTensorSpec> {
 /// metadata — the runtime never reads a tensor name to decide which port is
 /// key/value, which layer it belongs to, or how past pairs with present.
 ///
-/// `kv_inputs`/`kv_outputs` are equal-length, positionally paired
-/// past<->present lists ordered as consecutive per-layer `[key_i, value_i]`
-/// pairs (the exporter contract, matching `genai-config` `expand_kv`). Layer `l`
-/// therefore binds index `2*l` (key) and `2*l + 1` (value).
+/// Canonical state groups supply role/layer identity and may include growing
+/// records that are not paged K/V. Without those groups, the explicit flat ABI
+/// uses consecutive `[key_i, value_i]` pairs (the exporter contract matching
+/// `genai-config` `expand_kv`). Neither form infers roles from port names.
 ///
 /// Returns `Ok(None)` when the graph carries no explicitly declared paged KV
 /// pairs: either the I/O metadata declares none (a static-cache or non-KV
@@ -179,23 +179,20 @@ fn resolve_kv_layers(
     graph: &dyn GraphIo,
     io: Option<&onnx_genai_metadata::DecoderAbi>,
 ) -> anyhow::Result<Option<Vec<ResolvedKvLayer>>> {
-    let (kv_inputs, kv_outputs) = match io.map(|io| (io.kv_inputs.as_ref(), io.kv_outputs.as_ref()))
-    {
-        Some((Some(inputs), Some(outputs))) => (inputs, outputs),
+    let Some(io) = io else {
+        return Ok(None);
+    };
+    let (kv_inputs, kv_outputs) = match (io.kv_inputs.as_ref(), io.kv_outputs.as_ref()) {
+        (Some(inputs), Some(outputs)) => (inputs, outputs),
         // Metadata is present and explicitly declares no growing KV pairs (a
         // static-cache or non-KV graph): there is no paged bridge to build.
-        Some((None, None)) => return Ok(None),
-        Some((Some(_), None)) | Some((None, Some(_))) => {
+        (None, None) => return Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
             anyhow::bail!("kv_inputs and kv_outputs must be declared together")
         }
-        // No I/O metadata at all: never guess KV pairing from tensor names or
-        // shapes. The engine simply builds no paged cache; KV correctness is
-        // enforced by the decode-path resolver, which fails closed on unpaired
-        // KV state and names the exact missing metadata key.
-        None => return Ok(None),
     };
 
-    let port_layers = pair_kv_ports(kv_inputs, kv_outputs)?;
+    let port_layers = paged_kv_ports(io, kv_inputs, kv_outputs)?;
     if port_layers.is_empty() {
         return Ok(None);
     }
@@ -219,12 +216,101 @@ fn resolve_kv_layers(
 }
 
 /// One layer's four KV port NAMES, before any ONNX-graph lookup.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct KvLayerPortNames {
     key_past: String,
     key_present: String,
     value_past: String,
     value_present: String,
+}
+
+/// Canonical state roles distinguish paged K/V from other growing state such
+/// as compressed records. The flat ABI still carries all of those ports to the
+/// decoder; a paged bridge consumes only the explicitly declared key/value pairs.
+fn paged_kv_ports(
+    io: &onnx_genai_metadata::DecoderAbi,
+    inputs: &[String],
+    outputs: &[String],
+) -> anyhow::Result<Vec<KvLayerPortNames>> {
+    if io.state_groups.is_empty() {
+        return pair_kv_ports(inputs, outputs);
+    }
+    anyhow::ensure!(
+        inputs.len() == outputs.len(),
+        "kv_inputs ({}) and kv_outputs ({}) must have equal length",
+        inputs.len(),
+        outputs.len()
+    );
+    let pairs = inputs
+        .iter()
+        .zip(outputs)
+        .map(|(input, output)| (input.as_str(), output.as_str()))
+        .collect::<std::collections::HashSet<_>>();
+    #[derive(Default)]
+    struct LayerPorts {
+        key: Option<(String, String)>,
+        value: Option<(String, String)>,
+    }
+    let mut layers = std::collections::BTreeMap::<(Option<usize>, String), LayerPorts>::new();
+    let mut classified = std::collections::HashSet::new();
+    for group in &io.state_groups {
+        for port in &group.ports {
+            let pair = (port.input.as_str(), port.output.as_str());
+            if !pairs.contains(&pair) {
+                continue;
+            }
+            classified.insert(pair);
+            let role = port.role.with_context(|| format!("canonical state group '{}' KV port '{}' declares no role; declare key, value, or its actual state role", group.name, port.input))?;
+            use onnx_genai_metadata::StatePortRole;
+            let key = match role {
+                StatePortRole::Key => true,
+                StatePortRole::Value => false,
+                StatePortRole::Combined
+                | StatePortRole::CompressedKv
+                | StatePortRole::IndexKey
+                | StatePortRole::CompressionCarry
+                | StatePortRole::IndexCarry => continue,
+            };
+            let layer = port.layer;
+            let slots = layers.entry((layer, group.name.clone())).or_default();
+            let slot = if key {
+                &mut slots.key
+            } else {
+                &mut slots.value
+            };
+            anyhow::ensure!(
+                slot.is_none(),
+                "canonical state group '{}' layer {layer:?} declares duplicate {role:?} ports; give each key/value pair one declared role",
+                group.name
+            );
+            *slot = Some((port.input.clone(), port.output.clone()));
+        }
+    }
+    for pair in pairs {
+        anyhow::ensure!(
+            classified.contains(&pair),
+            "kv_inputs/kv_outputs pair '{}'=>'{}' has no canonical state-group declaration; declare its state role rather than relying on port order",
+            pair.0,
+            pair.1
+        );
+    }
+    layers
+        .into_iter()
+        .map(|((layer, group), ports)| {
+            let (key_past, key_present) = ports.key.with_context(|| {
+                format!("canonical state group '{group}' layer {layer:?} is missing its key port")
+            })?;
+            let (value_past, value_present) = ports.value.with_context(|| {
+                format!("canonical state group '{group}' layer {layer:?} is missing its value port")
+            })?;
+            Ok(KvLayerPortNames {
+                key_past,
+                key_present,
+                value_past,
+                value_present,
+            })
+        })
+        .collect()
 }
 
 /// Group the flat, positionally-paired `kv_inputs`/`kv_outputs` port lists into
@@ -1597,6 +1683,75 @@ mod tests {
             error.to_string().contains("kv_inputs/kv_outputs"),
             "the error must name the offending key: {error}"
         );
+    }
+
+    #[test]
+    fn canonical_roles_separate_paged_kv_from_compressed_records() -> anyhow::Result<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny-deepseek-v4-csa/inference_metadata.yaml");
+        let metadata = onnx_genai_metadata::load_metadata(&path)?;
+        let io = metadata.decoder_io().context("fixture decoder ABI")?;
+        let inputs = io.kv_inputs.as_ref().context("fixture state inputs")?;
+        let outputs = io.kv_outputs.as_ref().context("fixture state outputs")?;
+        assert!(
+            !inputs.len().is_multiple_of(2),
+            "fixture must include non-paired record ports"
+        );
+        let expected = paged_kv_ports(io, inputs, outputs)?;
+        assert_eq!(expected.len(), 2);
+        assert_eq!(expected[0].key_past, "past_key_values.0.key");
+        assert_eq!(expected[1].value_present, "present.1.value");
+        let mut reordered = io.clone();
+        reordered.kv_inputs.as_mut().unwrap().reverse();
+        reordered.kv_outputs.as_mut().unwrap().reverse();
+        reordered.state_groups.reverse();
+        for group in &mut reordered.state_groups {
+            group.ports.reverse();
+        }
+        assert_eq!(
+            paged_kv_ports(
+                &reordered,
+                reordered.kv_inputs.as_ref().unwrap(),
+                reordered.kv_outputs.as_ref().unwrap()
+            )?,
+            expected,
+            "canonical role/layer identity must win over incidental port order"
+        );
+        let mut unindexed = io.clone();
+        for port in unindexed
+            .state_groups
+            .iter_mut()
+            .flat_map(|group| &mut group.ports)
+        {
+            if port.layer == Some(0)
+                && matches!(
+                    port.role,
+                    Some(
+                        onnx_genai_metadata::StatePortRole::Key
+                            | onnx_genai_metadata::StatePortRole::Value
+                    )
+                )
+            {
+                port.layer = None;
+            }
+        }
+        assert_eq!(
+            paged_kv_ports(&unindexed, inputs, outputs)?,
+            expected,
+            "one unindexed pair in a semantic group needs no invented numeric layer"
+        );
+        let mut missing = io.clone();
+        missing
+            .state_groups
+            .iter_mut()
+            .flat_map(|group| &mut group.ports)
+            .find(|port| port.role == Some(onnx_genai_metadata::StatePortRole::Key))
+            .unwrap()
+            .role = None;
+        let error = paged_kv_ports(&missing, inputs, outputs)
+            .expect_err("missing canonical role must fail closed");
+        assert!(error.to_string().contains("declares no role"), "{error:#}");
+        Ok(())
     }
 
     #[test]

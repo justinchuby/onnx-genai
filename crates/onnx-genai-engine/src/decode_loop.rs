@@ -17,6 +17,7 @@ use onnx_genai_ort::Tokenizer;
 pub(crate) struct DecodeLoopState {
     pub(crate) generated_tokens: Vec<TokenId>,
     pub(crate) generated_text: String,
+    pub(crate) text_decoder: crate::tokenization::TokenTextDecoder,
     pub(crate) step: usize,
     pub(crate) prefix_cache_hit_len: usize,
     pub(crate) logprobs: Option<Vec<TokenLogprob>>,
@@ -46,6 +47,7 @@ impl DecodeLoopState {
         Self {
             generated_tokens: Vec::new(),
             generated_text: String::new(),
+            text_decoder: Default::default(),
             step: 0,
             prefix_cache_hit_len,
             logprobs: top_logprobs.map(|_| Vec::new()),
@@ -212,9 +214,9 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
             let token_id = {
                 let _span = onnx_genai_ort::prof_span!("loop.sampling");
                 if let Some(sampler) = state.custom_sampler.as_deref_mut() {
-                    select_next_token_with_sampler(&mut logits, &context, chain, sampler)
+                    select_next_token_with_sampler(&mut logits, &context, chain, sampler)?
                 } else if let Some(rng_value) = forward.rng_value {
-                    select_next_token(&mut logits, &context, options, chain, rng_value)
+                    select_next_token(&mut logits, &context, options, chain, rng_value)?
                 } else {
                     select_next_token_with_rng(
                         &mut logits,
@@ -222,7 +224,7 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
                         options,
                         chain,
                         &mut state.rng,
-                    )
+                    )?
                 }
             };
             if let (Some(top_logprobs), Some(logprobs)) =
@@ -267,36 +269,37 @@ pub(crate) fn commit_selected_token(
     // decodes exactly as often as an untraced one.
     let mut commit_span = onnx_genai_ort::prof_span!("loop.commit_selected_token");
     commit_span.set_arg("token_id", token_id);
-    let token_text = if callback.is_some() || !chain.is_empty() {
+    let decode_text = callback.is_some() || !chain.is_empty();
+    let mut token_text = if decode_text {
         let _span = onnx_genai_ort::prof_span!("loop.detokenize");
-        tokenizer
-            .decode(&[token_id])
-            .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {e}"))?
+        state.text_decoder.step(tokenizer, token_id)?
     } else {
         String::new()
     };
     if !token_text.is_empty() {
         commit_span.set_arg("token", token_text.clone());
     }
-    if !chain.is_empty() {
-        state.generated_text.push_str(&token_text);
-    }
-    let finish_reason = if chain.is_empty() {
-        // Same question, same answer as the processor path below: a model with
-        // several end tokens must stop on any of them whether or not a
-        // processor chain happens to be configured.
-        options
-            .terminates(token_id)
-            .then_some(FinishReason::EosToken)
+    state.generated_text.push_str(&token_text);
+    let mut context = if chain.is_empty() {
+        ProcessorContext::default()
     } else {
-        let context = ProcessorContext {
+        ProcessorContext {
             prompt_tokens: prompt_tokens.to_vec(),
             generated_tokens: state.generated_tokens.clone(),
             generated_text: state.generated_text.clone(),
             step: state.step,
-        };
-        finish_reason_after_token(token_id, options, chain, &context)
+        }
     };
+    let mut finish_reason = finish_reason_after_token(token_id, options, chain, &context);
+    if decode_text && (finish_reason.is_some() || state.step + 1 >= options.max_new_tokens) {
+        let tail = state.text_decoder.finish(tokenizer)?;
+        state.generated_text.push_str(&tail);
+        token_text.push_str(&tail);
+        if !tail.is_empty() && finish_reason.is_none() && !chain.is_empty() {
+            context.generated_text.push_str(&tail);
+            finish_reason = finish_reason_after_token(token_id, options, chain, &context);
+        }
+    }
     if let Some(callback) = callback {
         callback(GenerateToken {
             token_id,
@@ -524,6 +527,116 @@ mod tests {
     }
 
     #[test]
+    fn terminal_token_projection_matches_committed_history_and_decoder_policy() -> anyhow::Result<()>
+    {
+        use crate::tokenization::{SpecialTokenHandling, TokenTextDecoder};
+        use serde_json::{Value, json};
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json");
+        let original: Value = serde_json::from_slice(&std::fs::read(source)?)?;
+        for registered_special in [false, true] {
+            let mut value = original.clone();
+            if registered_special {
+                value["added_tokens"] = json!([{
+                    "id":3,"content":"<eos>","single_word":false,"lstrip":false,
+                    "rstrip":false,"normalized":false,"special":true
+                }]);
+            }
+            let scratch = tempfile::tempdir()?;
+            let path = scratch.path().join("tokenizer.json");
+            std::fs::write(&path, serde_json::to_vec(&value)?)?;
+            let tokenizer = Tokenizer::from_file(path)?;
+            for stop_on_eos in [false, true] {
+                let options = GenerateOptions {
+                    eos_token_id: Some(3),
+                    stop_on_eos,
+                    max_new_tokens: 2,
+                    ..Default::default()
+                };
+                let mut state = DecodeLoopState::new(0, None, None);
+                let mut events = Vec::new();
+                let mut callback = |token| {
+                    events.push(token);
+                    Ok(())
+                };
+                let finish = commit_selected_token(
+                    &mut state,
+                    &[],
+                    3,
+                    &options,
+                    &ProcessorChain::new(),
+                    &tokenizer,
+                    Some(&mut callback),
+                )?;
+                assert_eq!(finish, stop_on_eos.then_some(FinishReason::EosToken));
+                assert_eq!(state.generated_tokens, [3]);
+                let text = if registered_special { "" } else { "<eos>" };
+                assert_eq!(state.generated_text, text);
+                assert_eq!(events[0].text, text);
+                assert_eq!(events[0].finish_reason, finish);
+                let mut projection = TokenTextDecoder::new(SpecialTokenHandling::Preserve);
+                let mut projected = projection.step(&tokenizer, 3)?;
+                projected.push_str(&projection.finish(&tokenizer)?);
+                assert_eq!(
+                    projected,
+                    tokenizer.decode_with_special_tokens(&state.generated_tokens)?
+                );
+                assert_eq!(projected, "<eos>");
+                if let Some(finish) = finish {
+                    let result =
+                        finish_result(&tokenizer, &state.generated_tokens, finish, 0, None)?;
+                    assert_eq!(result.token_ids, [3]);
+                    assert_eq!(result.text, text);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn text_stop_uses_incremental_sequence_text_instead_of_isolated_tokens() -> anyhow::Result<()> {
+        let tokenizer = tokenizer()?;
+        let options = GenerateOptions {
+            max_new_tokens: 8,
+            stop_sequences: vec![crate::logits::StopSequence::Text("tok22 tok22".into())],
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, Some(&tokenizer), false)?;
+        let mut state = DecodeLoopState::new(0, None, None);
+        let mut chunks = Vec::new();
+        let mut callback = |token: GenerateToken| {
+            chunks.push(token.text);
+            Ok(())
+        };
+        assert_eq!(
+            commit_selected_token(
+                &mut state,
+                &[],
+                22,
+                &options,
+                &chain,
+                &tokenizer,
+                Some(&mut callback)
+            )?,
+            None
+        );
+        assert_eq!(
+            commit_selected_token(
+                &mut state,
+                &[],
+                22,
+                &options,
+                &chain,
+                &tokenizer,
+                Some(&mut callback)
+            )?,
+            Some(FinishReason::StopSequence { index: 0 })
+        );
+        assert_eq!(state.generated_text, "tok22 tok22");
+        assert_eq!(chunks.concat(), state.generated_text);
+        Ok(())
+    }
+    #[test]
     fn sampled_fastpath_error_falls_back_to_seeded_host_sampling() -> anyhow::Result<()> {
         let canonical = canonical_runtime();
         let options = GenerateOptions {
@@ -533,6 +646,15 @@ mod tests {
             top_k: 2,
             top_p: 0.95,
             min_p: 0.1,
+            sampler_order: Some(
+                crate::SamplerSequence::new(vec![
+                    crate::SamplerStage::Temperature,
+                    crate::SamplerStage::TopK,
+                    crate::SamplerStage::TopP,
+                    crate::SamplerStage::MinP,
+                ])
+                .unwrap(),
+            ),
             seed: Some(17),
             ..Default::default()
         };
@@ -547,6 +669,7 @@ mod tests {
             &mut fallback_state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -563,6 +686,7 @@ mod tests {
             &mut host_state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -601,6 +725,7 @@ mod tests {
                 &mut state,
                 &[],
                 crate::pipeline::generation::GenerationRequest {
+                    control: None,
                     options: &options,
                     chain: &chain,
                     tokenizer: &tokenizer,
@@ -631,6 +756,15 @@ mod tests {
             top_k: 2,
             top_p: 0.95,
             min_p: 0.1,
+            sampler_order: Some(
+                crate::SamplerSequence::new(vec![
+                    crate::SamplerStage::Temperature,
+                    crate::SamplerStage::TopK,
+                    crate::SamplerStage::TopP,
+                    crate::SamplerStage::MinP,
+                ])
+                .unwrap(),
+            ),
             seed: Some(17),
             ..Default::default()
         };
@@ -645,6 +779,7 @@ mod tests {
             &mut na_state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -661,6 +796,7 @@ mod tests {
             &mut host_state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -709,6 +845,7 @@ mod tests {
             &mut state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -745,6 +882,7 @@ mod tests {
             &mut plain_state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -768,6 +906,7 @@ mod tests {
             &mut streamed_state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -841,6 +980,7 @@ mod tests {
             &mut state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -892,6 +1032,7 @@ mod tests {
             &mut state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,
@@ -937,6 +1078,7 @@ mod tests {
             &mut state,
             &[],
             crate::pipeline::generation::GenerationRequest {
+                control: None,
                 options: &options,
                 chain: &chain,
                 tokenizer: &tokenizer,

@@ -94,6 +94,8 @@ const GENERATION_COMMITTED: u8 = 3;
 /// cancellation or a caller-provided execution guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationBoundary {
+    BeforeWorkflowNode,
+    AfterDecoderForward,
     AfterLoopSetup,
     BeforeProposer,
     AfterProposer,
@@ -105,19 +107,11 @@ pub enum GenerationBoundary {
     BeforeOutputPublication,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{operation} cannot accept request-scoped generation control for {runtime}; use a \
-     cancellation-capable generation path rather than silently dropping the signal"
-)]
-pub struct GenerationControlUnsupported {
-    pub operation: &'static str,
-    pub runtime: &'static str,
-}
-
 impl std::fmt::Display for GenerationBoundary {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::BeforeWorkflowNode => "before workflow node execution",
+            Self::AfterDecoderForward => "after decoder forward execution",
             Self::AfterLoopSetup => "after loop setup",
             Self::BeforeProposer => "before proposer execution",
             Self::AfterProposer => "after proposer execution",
@@ -129,6 +123,14 @@ impl std::fmt::Display for GenerationBoundary {
             Self::BeforeOutputPublication => "before output publication",
         })
     }
+}
+
+/// Cancellation before a generic workflow transaction commits. The workflow
+/// resolves its provisional state and outputs through the ordinary abort path.
+#[derive(Debug, thiserror::Error)]
+#[error("generation cancelled {boundary}; the provisional workflow turn was aborted")]
+pub struct GenerationCancelled {
+    pub boundary: GenerationBoundary,
 }
 
 /// Request-scoped cancellation and deterministic transaction checkpoints.
@@ -223,6 +225,23 @@ impl GenerationControl {
             self.cancel();
         }
         Ok(self.state.load(Ordering::Acquire) == GENERATION_CANCELLED)
+    }
+
+    pub(crate) fn check(&self, boundary: GenerationBoundary) -> anyhow::Result<()> {
+        if self.observe(boundary)? {
+            return Err(GenerationCancelled { boundary }.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn require_commit(&self) -> anyhow::Result<()> {
+        if !self.begin_commit()? {
+            return Err(GenerationCancelled {
+                boundary: GenerationBoundary::BeforeSemanticCommit,
+            }
+            .into());
+        }
+        Ok(())
     }
 
     pub(crate) fn begin_commit(&self) -> anyhow::Result<bool> {

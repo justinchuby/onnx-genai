@@ -94,7 +94,7 @@ pub use session::{
     capability, ep_selection, resolve_execution_provider, selectable_execution_providers,
 };
 pub use thread_affinity::{OwnerThread, ThreadAccess, ThreadAffinity, ThreadAffinityError};
-pub use tokenizer::Tokenizer;
+pub use tokenizer::{TokenizationOptions, Tokenizer};
 pub use value::{DataType, Value};
 
 /// Human-readable report of the ONNX Runtime shared library selected for this process.

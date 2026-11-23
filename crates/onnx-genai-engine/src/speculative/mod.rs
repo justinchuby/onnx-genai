@@ -21,7 +21,7 @@ use crate::kv_bridge::{
     rewind_draft_state_to_len, rewind_target_state_to_len, trim_overmaterialized_target_kv,
 };
 use crate::logits::{ProcessorChain, ProcessorContext};
-use crate::processors::{ensure_constrained_finish, select_next_token_with_rng};
+use crate::processors::select_next_token_with_rng;
 use crate::sampling::SamplingRng;
 use crate::session::{DraftModel, DraftSession, EngineSession};
 use crate::{
@@ -1451,6 +1451,7 @@ impl SpeculativeProposer for DraftModelProposer<'_> {
 /// output accumulators (generated tokens, text, and log-probabilities), the
 /// sampling RNG, and the optional per-token callback.
 pub(crate) struct SpeculativeLoopState<'state, 'callback> {
+    pub(crate) control: Option<&'state crate::pipeline::GenerationControl>,
     pub(crate) session_id: SessionId,
     pub(crate) state: &'state mut EngineSession,
     pub(crate) options: &'state GenerateOptions,
@@ -1459,6 +1460,7 @@ pub(crate) struct SpeculativeLoopState<'state, 'callback> {
     pub(crate) prefix_cache_hit_len: usize,
     pub(crate) generated_tokens: &'state mut Vec<TokenId>,
     pub(crate) generated_text: &'state mut String,
+    pub(crate) text_decoder: &'state mut crate::tokenization::TokenTextDecoder,
     pub(crate) generated_logprobs: &'state mut Option<Vec<crate::config::TokenLogprob>>,
     pub(crate) rng: &'state mut SamplingRng,
     pub(crate) callback: Option<&'state mut GenerateTokenCallback<'callback>>,
@@ -1471,6 +1473,7 @@ pub(crate) struct SpeculativeLoopState<'state, 'callback> {
 /// what makes the speculative algorithm a *step inside* a declared workflow
 /// rather than a second loop beside one.
 pub(crate) struct SpeculativeBlock<'state, 'callback> {
+    control: Option<&'state crate::pipeline::GenerationControl>,
     session_id: SessionId,
     state: &'state mut EngineSession,
     options: &'state GenerateOptions,
@@ -1479,6 +1482,7 @@ pub(crate) struct SpeculativeBlock<'state, 'callback> {
     prefix_cache_hit_len: usize,
     generated_tokens: &'state mut Vec<TokenId>,
     generated_text: &'state mut String,
+    text_decoder: &'state mut crate::tokenization::TokenTextDecoder,
     generated_logprobs: &'state mut Option<Vec<crate::config::TokenLogprob>>,
     rng: &'state mut SamplingRng,
     callback: Option<&'state mut GenerateTokenCallback<'callback>>,
@@ -1499,6 +1503,16 @@ struct SpeculativeBlockHost<'engine, 'state, 'callback> {
 impl crate::pipeline::WorkflowNodeHost for SpeculativeBlockHost<'_, '_, '_> {
     fn hosted_contracts(&self) -> &'static [&'static str] {
         crate::pipeline::generation::SPECULATIVE_BLOCK_CONTRACTS
+    }
+
+    fn observe_boundary(
+        &mut self,
+        boundary: crate::pipeline::GenerationBoundary,
+    ) -> anyhow::Result<()> {
+        if let Some(control) = self.block.control {
+            control.check(boundary)?;
+        }
+        Ok(())
     }
 
     fn execute_contract_node(
@@ -1689,6 +1703,7 @@ impl Engine {
         loop_state: SpeculativeLoopState<'_, '_>,
     ) -> anyhow::Result<GenerateResult> {
         let SpeculativeLoopState {
+            control,
             session_id,
             state,
             options,
@@ -1697,6 +1712,7 @@ impl Engine {
             prefix_cache_hit_len,
             generated_tokens,
             generated_text,
+            text_decoder,
             generated_logprobs,
             rng,
             callback,
@@ -1740,6 +1756,7 @@ impl Engine {
         let mut host = SpeculativeBlockHost {
             engine: self,
             block: SpeculativeBlock {
+                control,
                 session_id,
                 state,
                 options,
@@ -1748,6 +1765,7 @@ impl Engine {
                 prefix_cache_hit_len,
                 generated_tokens,
                 generated_text,
+                text_decoder,
                 generated_logprobs,
                 rng,
                 callback,
@@ -1774,7 +1792,6 @@ impl Engine {
         let finished = host.finished.take();
         let committed = host.block.generated_tokens.clone();
         let logprobs = host.block.generated_logprobs.clone();
-        let unfinished_text = host.block.generated_text.clone();
         drop(host);
         // The declared emit and the block executor describe the same
         // generation. Checking them against each other is what keeps the emit
@@ -1787,7 +1804,7 @@ impl Engine {
             None => {
                 // The bound ran out rather than the policy stopping. Report it
                 // the way every other exhausted budget is reported.
-                ensure_constrained_finish(options, &unfinished_text, FinishReason::MaxTokens)?;
+
                 self.finish_result(
                     &committed,
                     FinishReason::MaxTokens,
@@ -1809,6 +1826,7 @@ impl Engine {
         block: &mut SpeculativeBlock<'_, '_>,
     ) -> anyhow::Result<Option<GenerateResult>> {
         let SpeculativeBlock {
+            control: _,
             session_id,
             state,
             options,
@@ -1817,6 +1835,7 @@ impl Engine {
             prefix_cache_hit_len,
             generated_tokens,
             generated_text,
+            text_decoder,
             generated_logprobs,
             rng,
             callback,
@@ -1835,7 +1854,6 @@ impl Engine {
 
         if let Some(result) = self.check_speculative_termination(
             generated_tokens,
-            generated_text,
             generated_logprobs,
             state.tokens.len(),
             options,
@@ -1956,6 +1974,7 @@ impl Engine {
             state,
             generated_tokens,
             generated_text,
+            text_decoder,
             generated_logprobs,
             commit_tokens,
             commit_logprobs,
@@ -2027,7 +2046,6 @@ impl Engine {
     fn check_speculative_termination(
         &self,
         generated_tokens: &[TokenId],
-        generated_text: &str,
         generated_logprobs: &Option<Vec<crate::config::TokenLogprob>>,
         token_count: usize,
         options: &GenerateOptions,
@@ -2035,7 +2053,6 @@ impl Engine {
         prefix_cache_hit_len: usize,
     ) -> anyhow::Result<Option<GenerateResult>> {
         if generated_tokens.len() >= options.max_new_tokens {
-            ensure_constrained_finish(options, generated_text, FinishReason::MaxTokens)?;
             return Ok(Some(self.finish_result(
                 generated_tokens,
                 FinishReason::MaxTokens,
@@ -2044,7 +2061,6 @@ impl Engine {
             )?));
         }
         if reached_context_limit(token_count, max_context) {
-            ensure_constrained_finish(options, generated_text, FinishReason::Length)?;
             return Ok(Some(self.finish_result(
                 generated_tokens,
                 FinishReason::Length,
@@ -2356,7 +2372,7 @@ impl Engine {
                 step: step + idx,
             };
             let target_token =
-                select_next_token_with_rng(&mut target_logits[idx], &context, options, chain, rng);
+                select_next_token_with_rng(&mut target_logits[idx], &context, options, chain, rng)?;
             if let (Some(top_logprobs), Some(logprobs)) =
                 (options.top_logprobs, candidate_logprobs.as_mut())
             {
@@ -2460,7 +2476,7 @@ impl Engine {
                 options,
                 chain,
                 rng,
-            );
+            )?;
             if let (Some(top_logprobs), Some(logprobs)) =
                 (options.top_logprobs, commit_logprobs.as_mut())
             {
@@ -2489,6 +2505,7 @@ impl Engine {
         state: &mut EngineSession,
         generated_tokens: &mut Vec<TokenId>,
         generated_text: &mut String,
+        text_decoder: &mut crate::tokenization::TokenTextDecoder,
         generated_logprobs: &mut Option<Vec<crate::config::TokenLogprob>>,
         commit_tokens: Vec<TokenId>,
         commit_logprobs: Option<Vec<crate::config::TokenLogprob>>,
@@ -2517,6 +2534,7 @@ impl Engine {
             let mut commit_state = DecodeLoopState {
                 generated_tokens: std::mem::take(generated_tokens),
                 generated_text: std::mem::take(generated_text),
+                text_decoder: std::mem::take(text_decoder),
                 step: *step,
                 prefix_cache_hit_len,
                 logprobs: generated_logprobs.take(),
@@ -2539,6 +2557,7 @@ impl Engine {
             )?;
             *generated_tokens = commit_state.generated_tokens;
             *generated_text = commit_state.generated_text;
+            *text_decoder = commit_state.text_decoder;
             *generated_logprobs = commit_state.logprobs;
             *step = commit_state.step;
             if let Some(finish_reason) = finish_reason {

@@ -34,6 +34,7 @@ mod metrics;
 mod models_config;
 pub mod multimodal;
 mod registry;
+mod replay;
 mod routes;
 pub mod runtime_args;
 mod session;
@@ -42,12 +43,14 @@ mod sse;
 mod state;
 mod tool_protocol;
 mod types;
+mod webui;
 mod worker;
 
 pub use cli::{ServeArgs, run_serve};
 pub use models_config::{ModelSpec, ModelsConfig, from_models_dir};
 pub use multimodal::MultimodalSpecs;
 pub use registry::EvictionPolicy;
+pub use routes::prompt::{MixedPrompt, PromptPart};
 pub use routes::{build_generate_request, build_generate_request_with_protocol, build_prompt};
 pub use runtime_args::{
     CpuArgs, DeviceChoice, EngineArgs, decode_backend_name, parse_decode_backend, parse_device,
@@ -60,17 +63,90 @@ pub use state::{
 pub use tool_protocol::{ToolProtocol, ToolProtocolError};
 pub use types::{
     AudioSpeechRequest, AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest,
-    ChatCompletionResponse, ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageContentPart,
-    ChatMessageToolCall, ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatToolFunction,
-    ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse,
-    EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat,
-    StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific, Usage,
+    ChatCompletionResponse, ChatContinuation, ChatLogprobs, ChatMessage, ChatMessageContent,
+    ChatMessageContentPart, ChatMessageToolCall, ChatMessageToolCallFunction, ChatTokenLogprob,
+    ChatTool, ChatToolFunction, ChatTopLogprob, CompletionChoice, CompletionLogprobs,
+    CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput,
+    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio,
+    JsonSchemaSpec, ResponseFormat, StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode,
+    ToolChoiceSpecific, Usage,
 };
 
 pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/health", get(routes::health))
+        .route("/v1/health", get(routes::health))
+        .route("/v1/responses", post(routes::transports::responses))
+        .route("/responses", post(routes::transports::responses))
+        .route(
+            "/v1/messages",
+            post(routes::transports::messages).layer(middleware::map_response(
+                routes::transports::anthropic_error_response,
+            )),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(routes::transports::messages_tokens).layer(middleware::map_response(
+                routes::transports::anthropic_error_response,
+            )),
+        )
+        .route(
+            "/v1/responses/input_tokens",
+            post(routes::transports::responses_tokens),
+        )
+        .route(
+            "/responses/input_tokens",
+            post(routes::transports::responses_tokens),
+        )
+        .route("/v1/stream", get(replay::get).delete(replay::delete))
+        .route("/v1/streams/lookup", post(replay::lookup))
+        .route(
+            "/models",
+            get(routes::models)
+                .post(routes::llama::disabled_feature)
+                .delete(routes::llama::disabled_feature),
+        )
+        .route("/models/sse", get(routes::llama::model_events))
+        .route(
+            "/audio/transcriptions",
+            post(routes::audio_transcriptions)
+                .layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
+        .route("/audio/speech", post(routes::audio_speech))
+        .route(
+            "/props",
+            get(routes::llama::props).post(routes::llama::disabled_feature),
+        )
+        .route(
+            "/v1/chat/completions/input_tokens",
+            post(routes::llama::input_tokens),
+        )
+        .route(
+            "/chat/completions/input_tokens",
+            post(routes::llama::input_tokens),
+        )
+        .route("/completion", post(routes::native::completions))
+        .route("/completions", post(routes::native::completions))
+        .route("/infill", post(routes::native::infill))
+        .route("/tts", post(routes::native::tts))
+        .route("/reranking", post(routes::ranking::rerank))
+        .route("/rerank", post(routes::ranking::rerank))
+        .route("/v1/rerank", post(routes::ranking::rerank))
+        .route("/v1/reranking", post(routes::ranking::rerank))
+        .route("/embedding", post(routes::native::embeddings))
+        .route("/embeddings", post(routes::native::embeddings))
+        .route("/tokenize", post(routes::llama::tokenize))
+        .route("/detokenize", post(routes::llama::detokenize))
+        .route("/apply-template", post(routes::llama::apply_template))
+        .route(
+            "/tools",
+            get(routes::llama::disabled_feature).post(routes::llama::disabled_feature),
+        )
+        .route(
+            "/cors-proxy",
+            get(routes::llama::disabled_feature).post(routes::llama::disabled_feature),
+        )
+        .route("/chat/completions", post(routes::chat_completions))
         .route("/v1/models", get(routes::models))
         .route("/v1/status", get(routes::status))
         .route("/v1/resources", get(routes::resources))
@@ -115,6 +191,8 @@ pub fn app(state: AppState) -> Router {
     }
     if state.config.enable_admin_endpoints {
         router = router
+            .route("/models/load", post(routes::llama::load_model))
+            .route("/models/unload", post(routes::llama::unload_model))
             .route("/v1/admin/models", get(routes::admin_list_models))
             .route("/v1/admin/models/{id}/load", post(routes::admin_load_model))
             .route(
@@ -129,8 +207,11 @@ pub fn app(state: AppState) -> Router {
     }
     #[cfg(feature = "metrics")]
     let router = router.route("/metrics", get(routes::prometheus_metrics));
+    let replays = state.replays.clone();
     router
+        .fallback(webui::serve)
         .with_state(state)
+        .layer(middleware::from_fn_with_state(replays, replay::intercept))
         .layer(middleware::from_fn(trace_request))
 }
 

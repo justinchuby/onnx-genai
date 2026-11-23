@@ -1,0 +1,1 @@
+var e=()=>fetch(new URL(`../assets/nerdamer.Cl-GVG6T.js`,import.meta.url).href).then(e=>e.text());export{e as default};

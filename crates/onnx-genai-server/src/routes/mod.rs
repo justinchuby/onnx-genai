@@ -34,7 +34,7 @@ use crate::{
     sse::{
         StopBoundaryBuffer, completion_chunk, completion_done_chunk, content_chunk, done_chunk,
         reasoning_chunk, role_chunk, send_completion_stream_chunk, send_stream_chunk,
-        send_workflow_publications, tool_call_delta_chunks,
+        send_workflow_publications, text_before_stop, tool_call_delta_chunks,
     },
     state::{AppState, DEFAULT_MAX_OUTPUT_TOKENS, ServerConfig},
     types::{
@@ -50,9 +50,14 @@ use crate::{
 mod admin;
 mod completions;
 mod images;
+pub(crate) mod llama;
 mod multimodal;
+pub(crate) mod native;
+pub(crate) mod prompt;
+pub(crate) mod ranking;
 mod sessions;
 mod speech;
+pub(crate) mod transports;
 
 #[cfg(feature = "metrics")]
 pub(crate) use admin::prometheus_metrics;
@@ -100,6 +105,13 @@ struct ModelObject {
     object: &'static str,
     created: u64,
     owned_by: &'static str,
+    status: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    architecture: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_length: Option<usize>,
+    in_cache: bool,
+    can_remove: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -397,6 +409,7 @@ struct ErrorResponse {
 
 #[derive(Debug, Serialize)]
 struct ErrorBody {
+    code: u16,
     message: String,
     #[serde(rename = "type")]
     kind: &'static str,
@@ -412,6 +425,7 @@ pub(crate) struct ApiError {
 
 struct PreparedGenerateRequest {
     request: GenerateRequest,
+    response_prefix: Option<String>,
     prompt_tokens: usize,
 }
 
@@ -428,6 +442,14 @@ pub(crate) enum CompletionGeneration {
         options: GenerateOptions,
     },
 }
+impl CompletionGeneration {
+    fn options_mut(&mut self) -> &mut GenerateOptions {
+        match self {
+            Self::Plain(request) => &mut request.options,
+            Self::Fim { options, .. } => options,
+        }
+    }
+}
 /// `error.type` for a request that conflicts with the state or the capability of
 /// what is loaded.
 ///
@@ -439,17 +461,8 @@ pub(crate) const CONFLICT_ERROR_KIND: &str = "conflict_error";
 pub(crate) const INVALID_REQUEST_ERROR_KIND: &str = "invalid_request_error";
 
 impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-            kind: "server_error",
-            retry_after_secs: None,
-        }
-    }
-
     /// A request the loaded package cannot serve, and no retry will change.
-    fn invalid_request(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
@@ -458,7 +471,7 @@ impl ApiError {
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
@@ -476,11 +489,11 @@ impl ApiError {
         }
     }
 
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
-            kind: "server_error",
+            kind: "not_found_error",
             retry_after_secs: None,
         }
     }
@@ -489,14 +502,14 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
-            kind: "server_error",
+            kind: "permission_error",
             retry_after_secs: None,
         }
     }
 
     /// The request conflicts with the state or the capability of what is
     /// loaded.
-    fn conflict(message: impl Into<String>) -> Self {
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
@@ -505,7 +518,7 @@ impl ApiError {
         }
     }
 
-    fn too_many_requests(message: impl Into<String>) -> Self {
+    pub(crate) fn too_many_requests(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
@@ -584,6 +597,9 @@ pub(crate) fn session_fork_failure(error: anyhow::Error) -> ApiError {
 /// the type rather than the wording is what keeps those answers identical.
 pub(crate) fn package_execution_failure(capability: PackageExecutionError) -> ApiError {
     match capability {
+        PackageExecutionError::NativePromptReplacementUnavailable => {
+            ApiError::conflict(capability.to_string())
+        }
         PackageExecutionError::NoSessionState => ApiError::conflict(capability.to_string()),
         PackageExecutionError::DFlashExecutionUnavailable { .. } => {
             ApiError::conflict(capability.to_string())
@@ -591,7 +607,9 @@ pub(crate) fn package_execution_failure(capability: PackageExecutionError) -> Ap
         PackageExecutionError::CandidateTreeExecutionUnavailable { .. } => {
             ApiError::conflict(capability.to_string())
         }
-        PackageExecutionError::CandidateTreeRawWorkflowApi { .. }
+        PackageExecutionError::PrefillUnavailable { .. }
+        | PackageExecutionError::RuntimeSamplingUnavailable { .. }
+        | PackageExecutionError::CandidateTreeRawWorkflowApi { .. }
         | PackageExecutionError::DFlashRawWorkflowApi { .. } => {
             ApiError::invalid_request(capability.to_string())
         }
@@ -620,6 +638,7 @@ pub(crate) fn generation_failure(error: DriverFailure) -> ApiError {
         // off the engine's own type, so neither status depends on wording.
         DriverFailureKind::PackageExecution(capability) => package_execution_failure(capability),
         DriverFailureKind::WorkerUnavailable => ApiError::unavailable(error.message),
+        DriverFailureKind::InvalidRequest => ApiError::invalid_request(error.message),
         DriverFailureKind::Internal => {
             ApiError::internal(format!("generation failed: {}", error.message))
         }
@@ -648,7 +667,9 @@ where
             Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
                 Err(ApiError::payload_too_large(rejection.body_text()))
             }
-            Err(rejection) => Err(ApiError::bad_request(describe_json_rejection(&rejection))),
+            Err(rejection) => Err(ApiError::invalid_request(describe_json_rejection(
+                &rejection,
+            ))),
         }
     }
 }
@@ -694,6 +715,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(ErrorResponse {
             error: ErrorBody {
+                code: self.status.as_u16(),
                 message: self.message,
                 kind: self.kind,
             },
@@ -768,7 +790,7 @@ fn audio_decoder_prompt(
     language: Option<&str>,
 ) -> Result<Vec<u32>, ApiError> {
     crate::multimodal::audio_decoder_prompt(tokenizer, language)
-        .map_err(|error| ApiError::bad_request(format!("{error:#}")))
+        .map_err(|error| ApiError::invalid_request(format!("{error:#}")))
 }
 
 /// Close a session the registry let go of, on the model that owns it, under the

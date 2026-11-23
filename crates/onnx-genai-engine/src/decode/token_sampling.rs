@@ -422,7 +422,7 @@ pub(crate) fn propose_draft_tokens(
             generated_text: draft_text.clone(),
             step: first_step + offset,
         };
-        let token = select_next_token_with_rng(&mut logits, &context, options, chain, rng);
+        let token = select_next_token_with_rng(&mut logits, &context, options, chain, rng)?;
         proposed.push(token);
         draft_generated.push(token);
         draft_state.tokens.push(token);

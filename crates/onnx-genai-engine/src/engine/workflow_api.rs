@@ -239,19 +239,6 @@ impl Engine {
         // Fail closed on the exact declared protocol before scheduler
         // admission, workflow session binding, or specialized driver state.
         let _ = self.tool_call_observer(&request.tool_call_policy)?;
-        if request.generation_control.is_some()
-            && self
-                .workflow_runtime()
-                .candidate_tree_diagnostic()
-                .is_none()
-            && self.workflow_runtime().dflash_diagnostic().is_none()
-        {
-            return Err(crate::pipeline::GenerationControlUnsupported {
-                operation: "Engine::generate_with_pipeline_callbacks",
-                runtime: "a workflow without a specialized speculative driver",
-            }
-            .into());
-        }
         // A request that binds no tensors is a prompt, and a prompt is served
         // by the ordinary entry point — which admits through the scheduler,
         // reuses a cached prefix, and routes the declared decode step to the
@@ -267,16 +254,38 @@ impl Engine {
                         session,
                         request.request,
                         tool_call_policy,
+                        request.generation_control,
                         on_admitted,
                         callback,
                     ),
                 _ => self.generate_with_tool_policy_callbacks(
                     request.request,
                     tool_call_policy,
+                    request.generation_control,
                     on_admitted,
                     callback,
                 ),
             };
+        }
+        let options = &request.request.options;
+        let unsupported = if options.sampler_order.is_some() {
+            Some("samplers")
+        } else if !options.greedy && options.top_n_sigma > 0.0 {
+            Some("top_n_sigma")
+        } else if !options.greedy
+            && options
+                .dynamic_temperature
+                .is_some_and(|config| config.range > 0.0)
+        {
+            Some("dynatemp_range")
+        } else {
+            None
+        };
+        if let Some(field) = unsupported {
+            return Err(super::PackageExecutionError::RuntimeSamplingUnavailable {
+                field: field.into(),
+            }
+            .into());
         }
         // Everything that reaches here runs the declared workflow: a
         // no-decode-core prompt, and any request carrying tensors or component
@@ -372,7 +381,6 @@ impl Engine {
         }
         crate::pipeline::generation::run_declared_generation(
             runtime,
-            &options,
             tokenizer,
             request,
             None,

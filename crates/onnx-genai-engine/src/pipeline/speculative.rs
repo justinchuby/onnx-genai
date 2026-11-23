@@ -1016,17 +1016,9 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
             .transpose()
             .context("decode committed candidate-tree output before semantic commit")?
             .unwrap_or_default();
-        self.token_text = self
-            .authoritative_tokens
-            .iter()
-            .map(|token| {
-                self.tokenizer
-                    .map(|tokenizer| tokenizer.decode(&[*token]))
-                    .transpose()
-                    .map(|text| text.unwrap_or_default())
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .context("decode candidate-tree token events before semantic commit")?;
+        self.token_text =
+            crate::tokenization::token_texts(self.tokenizer, &self.authoritative_tokens)
+                .context("decode candidate-tree token events before semantic commit")?;
         self.finalize_staged_output("candidate-tree semantic commit")?;
         match self.control.begin_commit() {
             Ok(true) => {
@@ -2657,13 +2649,11 @@ impl WorkflowRuntime {
         // failure is therefore delivery-only: state is already committed and is
         // never semantically rolled back by an external receiver.
         if let Some(callback) = callback.as_mut() {
-            for (index, token) in generated.iter().copied().enumerate() {
+            let pieces = crate::tokenization::token_texts(tokenizer, &generated)?;
+            for (index, (token, text)) in generated.iter().copied().zip(pieces).enumerate() {
                 callback(crate::config::GenerateToken {
                     token_id: token,
-                    text: tokenizer
-                        .map(|tokenizer| tokenizer.decode(&[token]))
-                        .transpose()?
-                        .unwrap_or_default(),
+                    text,
                     finish_reason: (index + 1 == generated.len()).then(|| finish_reason.clone()),
                 })
                 .with_context(|| {

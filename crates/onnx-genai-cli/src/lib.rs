@@ -3,15 +3,14 @@
 //! Subcommands:
 //! - `serve`    — start the OpenAI-compatible HTTP server
 //! - `generate` — one-shot text generation; image and speech generation use the server APIs
-//! - `run`      — interactive generation REPL
 //! - `show`     — inspect a model's resolved files and metadata
 //! - `list`     — list model directories under a models directory
 //! - `version`  — print version and available execution providers
 //!
-//! `generate`, `run`, and `show` accept either a model directory or a config
+//! `generate` and `show` accept either a model directory or a config
 //! file inside it (a file resolves to its parent directory).
 //!
-//! `generate` and `run` accept image and audio input on any package whose
+//! `generate` accepts image and audio input on any package whose
 //! metadata declares the corresponding contract, reusing the same preprocessing
 //! and placeholder-expansion path as the server (`onnx_genai_server::multimodal`)
 //! so both front ends behave identically.
@@ -33,33 +32,23 @@ use std::sync::{Mutex, OnceLock};
 
 use clap::{ArgAction, Args, Parser, Subcommand};
 
-mod commands;
+mod execution;
 mod generate;
-mod interactive;
-mod live_turn;
 mod memory;
 mod model_inspection;
 mod output;
-mod pages;
 mod profile;
 mod transcribe;
-use generate::generate;
-use interactive::run_repl;
 #[cfg(test)]
-use interactive::{
-    InterruptAction, Interrupted, ReplInputMode, apply_context_sized_max_new_tokens,
-    context_exhaustion_error, context_window_is_full, drop_exhausted_repl_turn,
-    initial_repl_show_stats, interrupt_action, is_interrupt_error, repl_input_mode,
-    stage_attachment,
+use execution::{
+    InputMode, Interrupted, apply_context_sized_max_new_tokens, context_exhaustion_error,
+    context_window_is_full, initial_show_stats, input_mode, is_interrupt_error,
 };
+use generate::generate;
 use model_inspection::{list, show, version};
 #[cfg(test)]
 use onnx_genai::engine::EngineDecodeBackend;
-#[cfg(all(test, feature = "native-backend"))]
-use onnx_genai::engine::native_decode_device::NativeDecodeDevice;
 use onnx_genai::{GenerateOptions, SamplingOverrides, StopSequence};
-#[cfg(test)]
-use onnx_genai_server::runtime_args::DeviceChoice;
 use onnx_genai_server::{
     ServeArgs, run_serve,
     runtime_args::{CpuArgs, EngineArgs, decode_backend_name},
@@ -71,12 +60,7 @@ use transcribe::transcribe;
 const CLI_FALLBACK_MAX_NEW_TOKENS: usize = 512;
 
 #[cfg(test)]
-use commands::{
-    ProfileSetting, ReplCommand, ReplLine, command_registry, complete_repl_line,
-    parse_profile_setting, parse_repl_line, render_repl_help,
-};
-#[cfg(test)]
-use onnx_genai::ort::{ChatMessage, profile::TraceVerbosity};
+use onnx_genai::ort::ChatMessage;
 #[cfg(test)]
 use output::{build_turn_prompt, load_chat_template};
 
@@ -102,8 +86,6 @@ enum Commands {
     Serve(Box<ServeArgs>),
     /// Generate text from a single prompt and exit.
     Generate(Box<GenerateArgs>),
-    /// Start an interactive generation REPL (one prompt per line).
-    Run(RunArgs),
     /// Show a model's resolved files and metadata.
     Show(ShowArgs),
     /// List model directories under a models directory.
@@ -115,7 +97,7 @@ enum Commands {
     Version,
 }
 
-/// Shared sampling flags for `generate` and `run`.
+/// Sampling flags for `generate`.
 #[derive(Debug, Args)]
 struct SamplingArgs {
     /// Maximum number of new tokens to generate.
@@ -328,7 +310,7 @@ impl ProfileArgs {
     }
 }
 
-/// Shared multimodal attachment flags for `generate` and `run`.
+/// Multimodal attachment flags for `generate`.
 #[derive(Debug, Args, Default, Clone)]
 struct AttachmentArgs {
     /// Image file sent with the prompt. May be provided multiple times.
@@ -399,28 +381,6 @@ impl GenerateArgs {
             ),
         }
     }
-}
-
-#[derive(Debug, Args)]
-struct RunArgs {
-    /// Model directory, or a config file inside it (e.g. inference_metadata.yaml).
-    model: PathBuf,
-
-    /// Do not show compact per-turn stats by default in an interactive terminal.
-    #[arg(long)]
-    no_stats: bool,
-
-    #[command(flatten)]
-    sampling: SamplingArgs,
-
-    #[command(flatten)]
-    attachments: AttachmentArgs,
-
-    #[command(flatten)]
-    engine: EngineArgs,
-
-    #[command(flatten)]
-    cpu: CpuArgs,
 }
 
 /// Output shape for `transcribe`.
@@ -548,7 +508,7 @@ struct DeferredStderrWriter;
 
 impl Write for DeferredStderrWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if interactive::GENERATING.load(Ordering::SeqCst) {
+        if execution::GENERATING.load(Ordering::SeqCst) {
             DEFERRED_TRACING
                 .get_or_init(|| Mutex::new(Vec::new()))
                 .lock()
@@ -561,7 +521,7 @@ impl Write for DeferredStderrWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if !interactive::GENERATING.load(Ordering::SeqCst) {
+        if !execution::GENERATING.load(Ordering::SeqCst) {
             flush_deferred_tracing()?;
             io::stderr().flush()?;
         }
@@ -600,7 +560,7 @@ pub(crate) struct FlushGuard;
 
 impl Drop for FlushGuard {
     fn drop(&mut self) {
-        interactive::GENERATING.store(false, Ordering::SeqCst);
+        execution::GENERATING.store(false, Ordering::SeqCst);
         let _ = flush_deferred_tracing();
     }
 }
@@ -624,7 +584,6 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                 .map_err(|message| anyhow::anyhow!(message))?;
             generate(*generate_args, prompt, &profiling)
         }
-        Commands::Run(run_args) => run_repl(run_args, &profiling),
         Commands::Transcribe(transcribe_args) => transcribe(*transcribe_args, &profiling),
         Commands::Show(show_args) => show(&show_args.model),
         Commands::List(list_args) => list(&list_args.models_dir),
@@ -645,7 +604,7 @@ mod tests {
         // Simulate a turn in progress: the streaming flag is set and diagnostics
         // have been buffered by the deferred tracing writer instead of reaching
         // stderr live.
-        interactive::GENERATING.store(true, Ordering::SeqCst);
+        execution::GENERATING.store(true, Ordering::SeqCst);
         DEFERRED_TRACING
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
@@ -676,7 +635,7 @@ mod tests {
             "FlushGuard left diagnostics buffered after an early return"
         );
         assert!(
-            !interactive::GENERATING.load(Ordering::SeqCst),
+            !execution::GENERATING.load(Ordering::SeqCst),
             "FlushGuard left the streaming flag set after an early return"
         );
     }
@@ -792,27 +751,6 @@ mod tests {
     }
 
     #[test]
-    fn cpu_cores_is_shared_by_generate_and_run() {
-        let generate =
-            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--cpu-cores", "8"])
-                .unwrap();
-        let run = Cli::try_parse_from(["onnx-genai", "run", "./m", "--cpu-cores", "4"]).unwrap();
-
-        match generate.command {
-            Commands::Generate(args) => {
-                assert_eq!(args.cpu.cpu_cores.map(NonZeroUsize::get), Some(8));
-            }
-            _ => panic!("expected generate command"),
-        }
-        match run.command {
-            Commands::Run(args) => {
-                assert_eq!(args.cpu.cpu_cores.map(NonZeroUsize::get), Some(4));
-            }
-            _ => panic!("expected run command"),
-        }
-    }
-
-    #[test]
     fn cpu_cores_rejects_zero() {
         assert!(
             Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--cpu-cores", "0",])
@@ -870,48 +808,6 @@ mod tests {
     }
 
     #[test]
-    fn context_exhaustion_at_equal_limit_drops_only_current_repl_turn() {
-        let mut history = vec![
-            ChatMessage::user("first question"),
-            ChatMessage::assistant("first answer"),
-            ChatMessage::user("second question"),
-        ];
-
-        let message = drop_exhausted_repl_turn(&mut history, 2048, Some(2048))
-            .expect("equal limit should be exhausted");
-
-        assert!(message.contains("/reset"), "{message}");
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].content, "first question");
-        assert_eq!(history[1].content, "first answer");
-        assert!(
-            !history.iter().any(|message| {
-                message.role.as_str() == "assistant" && message.content.is_empty()
-            })
-        );
-    }
-
-    #[test]
-    fn context_exhaustion_above_limit_drops_only_current_repl_turn() {
-        let mut history = vec![
-            ChatMessage::user("first question"),
-            ChatMessage::assistant("first answer"),
-            ChatMessage::user("second question"),
-        ];
-
-        let message = drop_exhausted_repl_turn(&mut history, 2050, Some(2048))
-            .expect("above limit should be exhausted");
-
-        assert!(message.contains("2050/2048"), "{message}");
-        assert_eq!(history.len(), 2);
-        assert!(
-            !history.iter().any(|message| {
-                message.role.as_str() == "assistant" && message.content.is_empty()
-            })
-        );
-    }
-
-    #[test]
     fn context_exhaustion_one_shot_reports_actionable_error() {
         let limit = context_window_is_full(2048, Some(2048))
             .expect("equal limit should reject one-shot generation");
@@ -923,97 +819,11 @@ mod tests {
     }
 
     #[test]
-    fn context_exhaustion_guard_leaves_healthy_turns_unchanged() {
-        let mut history = vec![ChatMessage::user("still has room")];
-        let mut options = GenerateOptions::default();
-
-        let message = drop_exhausted_repl_turn(&mut history, 2047, Some(2048));
-        let used_fallback =
-            apply_context_sized_max_new_tokens(&mut options, false, 2047, Some(2048));
-
-        assert!(message.is_none());
-        assert!(!used_fallback);
-        assert_eq!(options.max_new_tokens, 2);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content, "still has room");
-    }
-
-    #[test]
-    fn max_context_is_shared_by_generate_and_run() {
-        let generate = Cli::try_parse_from([
-            "onnx-genai",
-            "generate",
-            "./m",
-            "hi",
-            "--max-context",
-            "1024",
-        ])
-        .unwrap();
-        let run =
-            Cli::try_parse_from(["onnx-genai", "run", "./m", "--max-context", "2048"]).unwrap();
-
-        match generate.command {
-            Commands::Generate(args) => {
-                assert_eq!(args.sampling.to_options().max_context, Some(1024));
-            }
-            _ => panic!("expected generate command"),
-        }
-        match run.command {
-            Commands::Run(args) => {
-                assert_eq!(args.sampling.to_options().max_context, Some(2048));
-            }
-            _ => panic!("expected run command"),
-        }
-    }
-
-    #[test]
     fn max_context_rejects_zero() {
         assert!(
             Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--max-context", "0",])
                 .is_err()
         );
-    }
-
-    #[test]
-    fn backend_is_shared_by_generate_run_and_transcribe() {
-        let generate =
-            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--backend", "native"])
-                .unwrap();
-        let run = Cli::try_parse_from(["onnx-genai", "run", "./m", "--backend", "ort"]).unwrap();
-        let transcribe =
-            Cli::try_parse_from(["onnx-genai", "transcribe", "./m", "--backend", "native"])
-                .unwrap();
-
-        match generate.command {
-            Commands::Generate(args) => {
-                assert_eq!(args.engine.backend, EngineDecodeBackend::Native);
-                assert_eq!(
-                    args.engine.to_config().decode_backend,
-                    EngineDecodeBackend::Native
-                );
-            }
-            _ => panic!("expected generate command"),
-        }
-        match run.command {
-            Commands::Run(args) => {
-                assert_eq!(args.engine.backend, EngineDecodeBackend::Ort);
-                assert_eq!(
-                    args.engine.to_config().decode_backend,
-                    EngineDecodeBackend::Ort
-                );
-            }
-            _ => panic!("expected run command"),
-        }
-        match transcribe.command {
-            Commands::Transcribe(args) => {
-                assert_eq!(args.engine.backend, EngineDecodeBackend::Native);
-                assert_eq!(
-                    args.engine.to_config().decode_backend,
-                    EngineDecodeBackend::Native
-                );
-            }
-            _ => panic!("expected transcribe command"),
-        }
     }
 
     #[test]
@@ -1042,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_reuses_repl_parser_error() {
+    fn backend_rejection_explains_supported_values() {
         let error =
             Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--backend", "cuda"])
                 .expect_err("cuda is an execution provider, not a decode backend")
@@ -1056,84 +866,8 @@ mod tests {
     }
 
     #[test]
-    fn sampling_flags_disable_greedy_unless_temperature_is_zero_or_greedy_is_forced() {
-        let stochastic = Cli::try_parse_from([
-            "onnx-genai",
-            "generate",
-            "./m",
-            "hi",
-            "--temperature",
-            "0.7",
-        ])
-        .unwrap();
-        let top_p = Cli::try_parse_from(["onnx-genai", "run", "./m", "--top-p", "0.9"]).unwrap();
-        let top_k =
-            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--top-k", "40"]).unwrap();
-        let temperature_zero =
-            Cli::try_parse_from(["onnx-genai", "generate", "./m", "hi", "--temperature", "0"])
-                .unwrap();
-        let forced_greedy = Cli::try_parse_from([
-            "onnx-genai",
-            "generate",
-            "./m",
-            "hi",
-            "--temperature",
-            "0.7",
-            "--greedy",
-        ])
-        .unwrap();
-
-        match stochastic.command {
-            Commands::Generate(args) => assert!(!args.sampling.to_options().greedy),
-            _ => panic!("expected generate command"),
-        }
-        match top_p.command {
-            Commands::Run(args) => assert!(!args.sampling.to_options().greedy),
-            _ => panic!("expected run command"),
-        }
-        match top_k.command {
-            Commands::Generate(args) => assert!(!args.sampling.to_options().greedy),
-            _ => panic!("expected generate command"),
-        }
-        match temperature_zero.command {
-            Commands::Generate(args) => assert!(args.sampling.to_options().greedy),
-            _ => panic!("expected generate command"),
-        }
-        match forced_greedy.command {
-            Commands::Generate(args) => assert!(args.sampling.to_options().greedy),
-            _ => panic!("expected generate command"),
-        }
-    }
-
-    #[test]
     fn generate_rejects_model_flag() {
         assert!(Cli::try_parse_from(["onnx-genai", "generate", "--model", "./m", "hi"]).is_err());
-    }
-
-    #[test]
-    fn run_accepts_positional_model() {
-        let parsed_command_line = Cli::try_parse_from(["onnx-genai", "run", "./m"]).unwrap();
-
-        match parsed_command_line.command {
-            Commands::Run(args) => assert_eq!(args.model, PathBuf::from("./m")),
-            _ => panic!("expected run command"),
-        }
-    }
-
-    #[test]
-    fn run_rejects_model_flag() {
-        assert!(Cli::try_parse_from(["onnx-genai", "run", "--model", "./m"]).is_err());
-    }
-
-    #[test]
-    fn run_accepts_no_stats_opt_out() {
-        let parsed_command_line =
-            Cli::try_parse_from(["onnx-genai", "run", "./m", "--no-stats"]).unwrap();
-
-        match parsed_command_line.command {
-            Commands::Run(args) => assert!(args.no_stats),
-            _ => panic!("expected run command"),
-        }
     }
 
     #[test]
@@ -1149,49 +883,13 @@ mod tests {
 
     #[test]
     fn tty_split_keeps_pipes_plain_and_stats_tty_only() {
-        assert_eq!(repl_input_mode(true, true), ReplInputMode::Tty);
-        assert_eq!(repl_input_mode(false, true), ReplInputMode::Plain);
-        assert_eq!(repl_input_mode(true, false), ReplInputMode::Plain);
+        assert_eq!(input_mode(true, true), InputMode::Tty);
+        assert_eq!(input_mode(false, true), InputMode::Plain);
+        assert_eq!(input_mode(true, false), InputMode::Plain);
 
-        assert!(initial_repl_show_stats(ReplInputMode::Tty, false));
-        assert!(!initial_repl_show_stats(ReplInputMode::Tty, true));
-        assert!(!initial_repl_show_stats(ReplInputMode::Plain, false));
-    }
-
-    #[test]
-    fn one_ctrl_c_stops_the_generation_and_two_exit() {
-        // Idle prompt: the first press only warns, the second leaves.
-        assert_eq!(
-            interrupt_action(false, false, false),
-            InterruptAction::WarnThenExit
-        );
-        assert_eq!(interrupt_action(false, false, true), InterruptAction::Exit);
-
-        // During a generation: the first press cancels the turn, a second while
-        // it is still unwinding leaves immediately.
-        assert_eq!(
-            interrupt_action(true, false, false),
-            InterruptAction::CancelGeneration
-        );
-        assert_eq!(interrupt_action(true, true, true), InterruptAction::Exit);
-    }
-
-    #[test]
-    fn a_cancelled_turn_leaves_the_exit_armed_for_the_next_press() {
-        // After `run_generation_turn` returns, GENERATING is false again but the
-        // cancelling press already armed the exit, so the next press exits —
-        // "one press stops the generation, two exit".
-        assert_eq!(interrupt_action(false, true, true), InterruptAction::Exit);
-    }
-
-    #[test]
-    fn a_new_prompt_disarms_the_exit() {
-        // `run_repl` clears EXIT_ARMED after each submitted line, so a much
-        // later Ctrl-C warns again instead of quitting outright.
-        assert_eq!(
-            interrupt_action(false, true, false),
-            InterruptAction::WarnThenExit
-        );
+        assert!(initial_show_stats(InputMode::Tty, false));
+        assert!(!initial_show_stats(InputMode::Tty, true));
+        assert!(!initial_show_stats(InputMode::Plain, false));
     }
 
     #[test]
@@ -1222,51 +920,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stage_attachment_requires_a_path() {
-        let error =
-            stage_attachment(None, "image", true).expect_err("a bare /image must report its usage");
-
-        assert!(error.to_string().contains("usage: /image <path>"));
-    }
-
-    #[test]
-    fn stage_attachment_rejects_unsupported_modalities_before_touching_the_disk() {
-        let error = stage_attachment(Some("nonexistent.png".to_string()), "image", false)
-            .expect_err("a text-only model must reject image attachments");
-
-        let message = error.to_string();
-        assert!(message.contains("What:"), "message: {message}");
-        assert!(message.contains("How:"), "message: {message}");
-    }
-
-    #[test]
-    fn stage_attachment_rejects_missing_files() {
-        let error = stage_attachment(
-            Some("definitely-not-a-real-file.png".to_string()),
-            "image",
-            true,
-        )
-        .expect_err("a missing file must fail closed");
-
-        assert!(
-            error.to_string().contains("definitely-not-a-real-file.png"),
-            "the rejected path must be named: {error}"
-        );
-    }
-
-    #[test]
-    fn stage_attachment_accepts_an_existing_file() {
-        let dir = temp_dir("stage-attachment");
-        let path = dir.join("cat.png");
-        fs::write(&path, b"not really a png").unwrap();
-
-        let staged = stage_attachment(Some(path.display().to_string()), "image", true).unwrap();
-
-        assert_eq!(staged, Some(path));
-        fs::remove_dir_all(dir).unwrap();
-    }
-
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::current_dir().unwrap().join(format!(
             "cli-test-{}-{}",
@@ -1289,342 +942,6 @@ mod tests {
         // mirroring how it unwinds through the engine.
         let wrapped = interrupt.context("while generating");
         assert!(is_interrupt_error(&wrapped));
-    }
-
-    #[test]
-    fn repl_loop_continues_on_interrupt_but_propagates_real_errors() {
-        // Mirrors the classification `run_repl` performs on each turn's result:
-        // an interrupt keeps the loop alive; any other error aborts it.
-        fn should_continue(result: anyhow::Result<()>) -> anyhow::Result<bool> {
-            match result {
-                Ok(()) => Ok(true),
-                Err(error) if is_interrupt_error(&error) => Ok(true),
-                Err(error) => Err(error),
-            }
-        }
-
-        assert!(should_continue(Ok(())).unwrap());
-        assert!(should_continue(Err(anyhow::Error::new(Interrupted))).unwrap());
-        assert!(should_continue(Err(anyhow::anyhow!("boom"))).is_err());
-    }
-
-    #[test]
-    fn parse_repl_line_recognizes_control_commands() {
-        assert_eq!(
-            parse_repl_line("/help", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::Help(None))
-        );
-        assert_eq!(
-            parse_repl_line("/reset", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::Reset)
-        );
-        assert_eq!(
-            parse_repl_line("/raw", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::ToggleRaw)
-        );
-    }
-
-    #[test]
-    fn parse_repl_line_recognizes_system_commands() {
-        assert_eq!(
-            parse_repl_line("/system keep answers short", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::System(Some("keep answers short".to_string())))
-        );
-        assert_eq!(
-            parse_repl_line("/system   ", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::System(None))
-        );
-    }
-
-    #[test]
-    fn parse_repl_line_recognizes_image_and_audio_attachments() {
-        assert_eq!(
-            parse_repl_line("/image cat.png", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::Image {
-                path: Some("cat.png".to_string()),
-                prompt: None,
-            })
-        );
-        assert_eq!(
-            parse_repl_line("/image cat.png describe this", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::Image {
-                path: Some("cat.png".to_string()),
-                prompt: Some("describe this".to_string()),
-            })
-        );
-        assert_eq!(
-            parse_repl_line("/audio speech.wav summarize it", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::Audio {
-                path: Some("speech.wav".to_string()),
-                prompt: Some("summarize it".to_string()),
-            })
-        );
-        assert_eq!(
-            parse_repl_line("/audio", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::Audio {
-                path: None,
-                prompt: None,
-            })
-        );
-    }
-
-    #[test]
-    fn parse_repl_line_preserves_prompts_and_rejects_unknown_commands() {
-        assert_eq!(
-            parse_repl_line("  explain this", ReplInputMode::Tty),
-            ReplLine::Prompt("  explain this".to_string())
-        );
-        assert_eq!(
-            parse_repl_line("//literal slash", ReplInputMode::Tty),
-            ReplLine::Prompt("/literal slash".to_string())
-        );
-        assert_eq!(
-            parse_repl_line("/unsupported extra", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::Unknown("/unsupported".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_repl_line_keeps_plain_mode_compatible_with_piped_repl() {
-        assert_eq!(
-            parse_repl_line("//literal slash", ReplInputMode::Plain),
-            ReplLine::Command(ReplCommand::Unknown("//literal".to_string()))
-        );
-        assert_eq!(
-            parse_repl_line("/help anything", ReplInputMode::Plain),
-            ReplLine::Command(ReplCommand::Help(None))
-        );
-        assert_eq!(
-            parse_repl_line("/help anything", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::Help(Some("anything".to_string())))
-        );
-    }
-
-    #[test]
-    fn command_registry_drives_help_and_parser() {
-        let help = render_repl_help();
-        for command in command_registry() {
-            assert!(
-                help.lines().any(|line| line == command.usage),
-                "{} missing from help",
-                command.usage
-            );
-            assert!(
-                !matches!(
-                    parse_repl_line(&format!("/{}", command.name), ReplInputMode::Tty),
-                    ReplLine::Command(ReplCommand::Unknown(_))
-                ),
-                "{} did not parse through registry",
-                command.name
-            );
-        }
-        assert_eq!(
-            help,
-            "/help\n/reset\n/raw\n/stats\n/pages\n/profile [on|off|trace <path>|verbosity <decisions|ops|full>]\n/model [path]\n/session\n/ep [name]\n/backend [auto|ort|native]\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
-        );
-    }
-
-    #[test]
-    fn slash_completion_covers_commands_and_arguments() {
-        let command_names = complete_repl_line("/ba", 3)
-            .into_iter()
-            .map(|item| item.replacement)
-            .collect::<Vec<_>>();
-        assert_eq!(command_names, vec!["/backend"]);
-
-        let backends = complete_repl_line("/backend n", 10)
-            .into_iter()
-            .map(|item| item.replacement)
-            .collect::<Vec<_>>();
-        assert_eq!(backends, vec!["native"]);
-
-        let providers = complete_repl_line("/ep a", 5)
-            .into_iter()
-            .map(|item| item.replacement)
-            .collect::<Vec<_>>();
-        assert!(providers.contains(&"auto".to_string()));
-
-        let verbosity = complete_repl_line("/profile verbosity f", 20)
-            .into_iter()
-            .map(|item| item.replacement)
-            .collect::<Vec<_>>();
-        assert_eq!(verbosity, vec!["full"]);
-    }
-
-    #[test]
-    fn session_control_commands_parse_with_and_without_an_argument() {
-        assert_eq!(
-            parse_repl_line("/profile on", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::Profile(Some("on".to_string())))
-        );
-        assert_eq!(
-            parse_repl_line("/profile", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::Profile(None)),
-            "a bare command reports the current state"
-        );
-        assert_eq!(
-            parse_repl_line("/ep  cuda ", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::ExecutionProvider(Some("cuda".to_string()))),
-            "surrounding whitespace is not part of the name"
-        );
-        assert_eq!(
-            parse_repl_line("/backend native", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::DecodeBackend(Some("native".to_string())))
-        );
-        assert_eq!(
-            parse_repl_line("/model ./m", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::Model(Some("./m".to_string())))
-        );
-        assert_eq!(
-            parse_repl_line("/session", ReplInputMode::Tty),
-            ReplLine::Command(ReplCommand::Session)
-        );
-    }
-
-    #[test]
-    fn session_summary_is_structured_and_redacts_message_content() {
-        let settings =
-            interactive::SessionSettings::new(PathBuf::from("models/tiny"), &EngineArgs::default());
-        let options = GenerateOptions {
-            max_new_tokens: 32,
-            temperature: 0.7,
-            top_p: 0.9,
-            top_k: 40,
-            greedy: false,
-            ..GenerateOptions::default()
-        };
-        let history = vec![
-            ChatMessage::system("private instruction"),
-            ChatMessage::user("private question"),
-            ChatMessage::assistant("private answer"),
-        ];
-        let usage = interactive::SessionUsage {
-            prompt_tokens: 14,
-            generated_tokens: 5,
-            completed_turns: 1,
-        };
-        let sampling_overrides = SamplingOverrides::default();
-        let mut sampling = options;
-        sampling.resolve_sampling_defaults(None, &sampling_overrides);
-
-        let summary = interactive::SessionSummary {
-            settings: &settings,
-            execution_provider: "cpu".to_string(),
-            resolved_decode_backend: EngineDecodeBackend::Ort,
-            sampling,
-            history: &history,
-            usage: &usage,
-        }
-        .to_string();
-
-        assert_eq!(
-            summary,
-            "session\n\
-             \x20\x20model: models/tiny\n\
-             \x20\x20execution provider: cpu\n\
-             \x20\x20decode backend: ort\n\
-             \x20\x20requested backend: auto\n\
-             \x20\x20sampling: max_new_tokens=32 max_context=auto temperature=0.7 top_p=0.9 top_k=40 greedy=false\n\
-             \x20\x20messages: 3 (system: 1, user: 1, assistant: 1)\n\
-             \x20\x20completed turns: 1\n\
-             \x20\x20tokens: prompt=14 generated=5"
-        );
-        assert!(!summary.contains("private"), "{summary}");
-    }
-
-    #[test]
-    fn session_summary_displays_effective_model_sampling_defaults() {
-        let settings =
-            interactive::SessionSettings::new(PathBuf::from("models/tiny"), &EngineArgs::default());
-        let options = GenerateOptions {
-            max_new_tokens: 32,
-            ..GenerateOptions::default()
-        };
-        let defaults = onnx_genai::metadata::GenerationDefaults {
-            do_sample: Some(true),
-            temperature: Some(0.6),
-            top_k: Some(20),
-            top_p: Some(0.95),
-            repetition_penalty: None,
-            num_beams: None,
-            num_return_sequences: None,
-            min_length: None,
-            max_length: None,
-            length_penalty: None,
-            no_repeat_ngram_size: None,
-            diversity_penalty: None,
-            early_stopping: None,
-        };
-        let usage = interactive::SessionUsage::default();
-        let sampling_overrides = SamplingOverrides::default();
-        let mut sampling = options;
-        sampling.resolve_sampling_defaults(Some(&defaults), &sampling_overrides);
-
-        let summary = interactive::SessionSummary {
-            settings: &settings,
-            execution_provider: "cpu".to_string(),
-            resolved_decode_backend: EngineDecodeBackend::Ort,
-            sampling,
-            history: &[],
-            usage: &usage,
-        }
-        .to_string();
-
-        assert!(
-            summary.contains(
-                "sampling: max_new_tokens=32 max_context=auto temperature=0.6 top_p=0.95 top_k=20 greedy=false"
-            ),
-            "{summary}"
-        );
-    }
-
-    #[test]
-    fn session_summary_reports_loaded_provider_status() {
-        let settings =
-            interactive::SessionSettings::new(PathBuf::from("models/tiny"), &EngineArgs::default());
-        let usage = interactive::SessionUsage::default();
-        let summary = interactive::SessionSummary {
-            settings: &settings,
-            execution_provider: "cpu (CPU session fallback); skipped: webgpu, coreml".to_string(),
-            resolved_decode_backend: EngineDecodeBackend::Ort,
-            sampling: GenerateOptions::default(),
-            history: &[],
-            usage: &usage,
-        }
-        .to_string();
-
-        assert!(
-            summary.contains(
-                "execution provider: cpu (CPU session fallback); skipped: webgpu, coreml"
-            ),
-            "{summary}"
-        );
-    }
-
-    #[test]
-    fn interactive_session_preserves_the_requested_native_device() {
-        let args = EngineArgs {
-            backend: EngineDecodeBackend::Native,
-            device: Some(DeviceChoice::Cuda(Some(3))),
-            ..EngineArgs::default()
-        };
-        let settings = interactive::SessionSettings::new(PathBuf::from("models/tiny"), &args);
-
-        let config = settings.to_config();
-        assert_eq!(config.decode_backend, EngineDecodeBackend::Native);
-        // A device only reaches the engine when the native decoder is compiled
-        // in; without it there is nothing that could honor one.
-        #[cfg(feature = "native-backend")]
-        assert_eq!(
-            config.native_device,
-            Some(NativeDecodeDevice::Cuda { index: Some(3) })
-        );
-    }
-
-    #[test]
-    fn parse_repl_line_treats_empty_and_whitespace_lines_as_empty() {
-        assert_eq!(parse_repl_line("", ReplInputMode::Tty), ReplLine::Empty);
-        assert_eq!(parse_repl_line(" \t ", ReplInputMode::Tty), ReplLine::Empty);
     }
 
     #[test]
@@ -1727,55 +1044,46 @@ fn _onnx_genai_server(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::
 }
 
 #[cfg(test)]
-mod profile_setting_tests {
+mod webui_cli_tests {
     use super::*;
-
     #[test]
-    fn parses_every_profile_setting_and_explains_the_rest() {
-        assert_eq!(parse_profile_setting(None), Ok(ProfileSetting::Show));
-        assert_eq!(parse_profile_setting(Some("  ")), Ok(ProfileSetting::Show));
-        assert_eq!(
-            parse_profile_setting(Some("on")),
-            Ok(ProfileSetting::Toggle(true))
-        );
-        assert_eq!(
-            parse_profile_setting(Some("off")),
-            Ok(ProfileSetting::Toggle(false))
-        );
-        assert_eq!(
-            parse_profile_setting(Some("trace  run.json")),
-            Ok(ProfileSetting::Trace(PathBuf::from("run.json")))
-        );
-        assert_eq!(
-            parse_profile_setting(Some("trace off")),
-            Ok(ProfileSetting::NoTrace)
-        );
-        assert_eq!(
-            parse_profile_setting(Some("verbosity full")),
-            Ok(ProfileSetting::Verbosity(TraceVerbosity::Full))
-        );
-        assert_eq!(
-            parse_profile_setting(Some("detail DECISIONS")),
-            Ok(ProfileSetting::Verbosity(TraceVerbosity::Decisions))
-        );
-
-        // A path with spaces survives, since the rest of the line is the path.
-        assert_eq!(
-            parse_profile_setting(Some("trace my traces/run.json")),
-            Ok(ProfileSetting::Trace(PathBuf::from("my traces/run.json")))
-        );
-
-        // Every rejection names the valid choices rather than only refusing.
-        let unknown = parse_profile_setting(Some("bogus")).unwrap_err();
-        assert!(unknown.contains("trace <path>"), "{unknown}");
-        assert!(unknown.contains("verbosity <level>"), "{unknown}");
-
-        let bad_level = parse_profile_setting(Some("verbosity loud")).unwrap_err();
-        for level in ["decisions", "ops", "full"] {
-            assert!(bad_level.contains(level), "{bad_level} should list {level}");
+    fn generate_sampling_flags_preserve_explicit_greedy_choices() {
+        for (flags, greedy) in [
+            (vec!["--temperature", "0.8"], false),
+            (vec!["--top-p", "0.9"], false),
+            (vec!["--top-k", "4"], false),
+            (vec!["--temperature", "0", "--top-k", "4"], true),
+            (vec!["--greedy", "--temperature", "0.8"], true),
+        ] {
+            let args = [vec!["onnx-genai", "generate", "./model", "hello"], flags].concat();
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Commands::Generate(args) = cli.command else {
+                panic!("expected generate");
+            };
+            assert_eq!(args.sampling.to_options().greedy, greedy);
         }
-
-        let no_path = parse_profile_setting(Some("trace")).unwrap_err();
-        assert!(no_path.contains("needs a file"), "{no_path}");
+    }
+    #[test]
+    fn removed_repl_is_not_a_cli_command() {
+        assert!(Cli::try_parse_from(["onnx-genai", "run", "./model"]).is_err());
+    }
+    #[test]
+    fn noninteractive_commands_keep_cpu_and_context_controls() {
+        let cli = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./model",
+            "hello",
+            "--cpu-cores",
+            "4",
+            "--max-context",
+            "128",
+        ])
+        .unwrap();
+        let Commands::Generate(args) = cli.command else {
+            panic!("expected generate");
+        };
+        assert_eq!(args.cpu.cpu_cores.map(NonZeroUsize::get), Some(4));
+        assert_eq!(args.sampling.max_context.map(NonZeroUsize::get), Some(128));
     }
 }

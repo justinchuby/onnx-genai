@@ -64,6 +64,8 @@ pub(crate) struct EngineDriver {
     /// What the loaded package's serialized workflow says, read once at
     /// startup. Facts about the document, not about which executor runs it.
     pub(crate) workflow_facts: WorkflowFacts,
+    pub(crate) runtime_sampling: bool,
+    pub(crate) reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
     /// One lock-free KV mirror per worker. The legacy aggregate fields continue
     /// to report worker 0; debug/status expose this full list.
     pub(crate) worker_kv_telemetry: Arc<Vec<Arc<KvTelemetry>>>,
@@ -192,6 +194,17 @@ pub(crate) enum DriverCommand {
         events: mpsc::Sender<DriverEvent>,
         permit: WorkerPermit,
     },
+    Prefill {
+        request: onnx_genai_engine::PrefillRequest,
+        control: GenerationControl,
+        reply: oneshot::Sender<Result<onnx_genai_engine::PrefillResult, DriverFailure>>,
+        permit: WorkerPermit,
+    },
+    ScorePair {
+        pair: Box<onnx_genai_engine::ranking::PreparedTokenPair>,
+        reply: oneshot::Sender<anyhow::Result<onnx_genai_engine::ranking::RerankingScore>>,
+        permit: WorkerPermit,
+    },
     Embed {
         input_ids: Vec<TokenId>,
         options: EmbeddingOptions,
@@ -233,6 +246,7 @@ pub(crate) enum DriverEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DriverFailureKind {
     Internal,
+    InvalidRequest,
     MemoryOverload,
     WorkerUnavailable,
     /// The caller asked the loaded package for something it cannot serve as
@@ -273,6 +287,15 @@ impl DriverFailure {
     }
 
     pub(crate) fn from_engine_error(error: &anyhow::Error) -> Self {
+        if let Some(prefix) = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<onnx_genai_engine::ConstraintPrefixError>())
+        {
+            return Self {
+                message: prefix.to_string(),
+                kind: DriverFailureKind::InvalidRequest,
+            };
+        }
         let memory_overload = error.chain().any(|source| {
             matches!(
                 source.downcast_ref::<SchedulerAdmissionError>(),
@@ -407,6 +430,8 @@ struct EngineWorkerReady {
     memory_strategy_plan: Arc<MemoryStrategyPlan>,
     memory_accounting: Option<EngineMemoryAccounting>,
     workflow_facts: WorkflowFacts,
+    runtime_sampling: bool,
+    reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
 }
 
 fn prepare_engine_worker<DropProbe>(
@@ -417,7 +442,9 @@ fn prepare_engine_worker<DropProbe>(
     generation_capacity: Arc<Semaphore>,
     drop_probe: DropProbe,
     worker_count: usize,
-) -> (EngineWorkerState<DropProbe>, EngineWorkerReady) {
+) -> anyhow::Result<(EngineWorkerState<DropProbe>, EngineWorkerReady)> {
+    let reranking =
+        onnx_genai_metadata::task_profiles::reranking_contract(engine.metadata())?.map(Arc::new);
     let batching = Arc::new(BatchingReport::from_capability(
         &engine.batching_capability(),
         max_batch,
@@ -438,6 +465,7 @@ fn prepare_engine_worker<DropProbe>(
         declares_generation_loop: engine.workflow_declares_generation_loop(),
     };
     let resource_snapshot = Arc::new(Mutex::new(Some(engine.resource_snapshot())));
+    let runtime_sampling = engine.supports_runtime_sampling();
     let ready = EngineWorkerReady {
         batching,
         kv_telemetry,
@@ -445,8 +473,10 @@ fn prepare_engine_worker<DropProbe>(
         memory_strategy_plan,
         memory_accounting,
         workflow_facts,
+        runtime_sampling,
+        reranking,
     };
-    (
+    Ok((
         EngineWorkerState {
             engine,
             commands: Some(rx),
@@ -460,7 +490,7 @@ fn prepare_engine_worker<DropProbe>(
             _drop_probe: drop_probe,
         },
         ready,
-    )
+    ))
 }
 
 fn worker_start_error(error: WorkerStartError<anyhow::Error>) -> anyhow::Error {
@@ -571,7 +601,7 @@ impl EngineDriver {
                     driver_capacity,
                     drop_probe,
                     worker_count,
-                );
+                )?;
                 Ok((state, (ready_payload, factory, worker_ready)))
             },
             run_engine_driver,
@@ -601,7 +631,7 @@ impl EngineDriver {
                         let engine = factory.build_worker().with_context(|| {
                             format!("failed to construct ORT engine on worker {worker_id}")
                         })?;
-                        Ok(prepare_engine_worker(
+                        prepare_engine_worker(
                             engine,
                             rx,
                             max_batch,
@@ -609,7 +639,7 @@ impl EngineDriver {
                             driver_capacity,
                             (),
                             worker_count,
-                        ))
+                        )
                     },
                     run_engine_driver,
                 )
@@ -636,6 +666,7 @@ impl EngineDriver {
         for (index, ready) in worker_readies.iter().enumerate().skip(1) {
             if ready.batching.supported != first_ready.batching.supported
                 || ready.batching.effective_max_batch != first_ready.batching.effective_max_batch
+                || ready.reranking != first_ready.reranking
                 || ready.workflow_facts.components != first_ready.workflow_facts.components
                 || ready.workflow_facts.graph_components
                     != first_ready.workflow_facts.graph_components
@@ -680,6 +711,8 @@ impl EngineDriver {
                 memory_accounting: first_ready.memory_accounting,
                 batching: first_ready.batching,
                 workflow_facts: first_ready.workflow_facts,
+                runtime_sampling: first_ready.runtime_sampling,
+                reranking: first_ready.reranking,
                 worker_kv_telemetry,
             },
             ready_payload,
@@ -1099,6 +1132,26 @@ impl EngineDriver {
         anyhow::bail!("generation stream ended before result")
     }
 
+    pub(crate) async fn score_pair(
+        &self,
+        pair: onnx_genai_engine::ranking::PreparedTokenPair,
+    ) -> Result<onnx_genai_engine::ranking::RerankingScore, GenerateSubmitError> {
+        let (commands, permit) = self.reserve_stateless_command()?;
+        let (reply, response) = oneshot::channel();
+        commands
+            .send(DriverCommand::ScorePair {
+                pair: Box::new(pair),
+                reply,
+                permit,
+            })
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+        response
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?
+            .map_err(|error| GenerateSubmitError::Failed(DriverFailure::from_engine_error(&error)))
+    }
+
     pub(crate) async fn synthesize_speech(
         &self,
         request: GenerateRequest,
@@ -1172,6 +1225,38 @@ impl EngineDriver {
             .blocking_recv()
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
         Ok(())
+    }
+
+    pub(crate) async fn prefill(
+        &self,
+        request: onnx_genai_engine::PrefillRequest,
+    ) -> Result<onnx_genai_engine::PrefillResult, GenerateSubmitError> {
+        struct CancelOnDrop(GenerationControl);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let (commands, permit) = self.reserve_stateless_command()?;
+        let control = GenerationControl::default();
+        let _cancel = CancelOnDrop(control.clone());
+        let (reply, response) = oneshot::channel();
+        if commands
+            .send(DriverCommand::Prefill {
+                request,
+                control,
+                reply,
+                permit,
+            })
+            .await
+            .is_err()
+        {
+            return Err(GenerateSubmitError::DriverStopped);
+        }
+        response
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?
+            .map_err(GenerateSubmitError::Failed)
     }
 
     pub(crate) async fn generate_fim(
@@ -1809,6 +1894,8 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
                     | DriverCommand::GenerateFim { .. }
                     | DriverCommand::SynthesizeSpeech { .. }
                     | DriverCommand::Embed { .. }
+                    | DriverCommand::ScorePair { .. }
+                    | DriverCommand::Prefill { .. }
             )
         })
         .count()
@@ -2190,6 +2277,33 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             })();
             let _ = reply.send(result);
         }
+        DriverCommand::Prefill {
+            request,
+            control,
+            reply,
+            permit: _permit,
+        } => {
+            let result = engine
+                .prefill_with_callbacks(request, Some(control), None)
+                .map_err(|error| DriverFailure::from_engine_error(&error));
+            if let Ok(result) = &result {
+                crate::metrics::add_prompt_tokens(result.prompt_tokens);
+            }
+            let _ = reply.send(result);
+        }
+        DriverCommand::ScorePair {
+            pair,
+            reply,
+            permit: _permit,
+        } => {
+            if !reply.is_closed() {
+                let result = engine.score_token_pair(*pair);
+                if let Ok(score) = &result {
+                    crate::metrics::add_prompt_tokens(score.prompt_tokens);
+                }
+                let _ = reply.send(result);
+            }
+        }
         DriverCommand::Embed {
             input_ids,
             options,
@@ -2404,15 +2518,7 @@ fn run_generation(
     let cancellation_events = events.clone();
     let generation_control =
         GenerationControl::from_cancellation_probe(move || cancellation_events.is_closed());
-    let specialized_speculation =
-        engine.candidate_tree_diagnostic().is_some() || engine.dflash_diagnostic().is_some();
-    let bound = bound.map(|request| {
-        if specialized_speculation {
-            request.with_generation_control(generation_control.clone())
-        } else {
-            request
-        }
-    });
+    let bound = bound.map(|request| request.with_generation_control(generation_control.clone()));
     let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
@@ -2438,29 +2544,18 @@ fn run_generation(
                 Some(&mut admitted),
                 Some(&mut callback),
             ),
-            (None, session) if specialized_speculation => {
-                let request = PipelineGenerateRequest::new(request)
-                    .with_generation_control(generation_control)
-                    .with_tool_call_policy(tool_call_policy);
-                engine.generate_with_pipeline_callbacks(
-                    match session {
-                        Some(session) => request.with_session_id(session.to_string()),
-                        None => request,
-                    },
-                    Some(&mut admitted),
-                    Some(&mut callback),
-                )
-            }
             (None, Some(session_id)) => engine.generate_in_session_with_tool_policy_callbacks(
                 session_id,
                 request,
                 tool_call_policy,
+                Some(generation_control),
                 Some(&mut admitted),
                 Some(&mut callback),
             ),
             (None, None) => engine.generate_with_tool_policy_callbacks(
                 request,
                 tool_call_policy,
+                Some(generation_control),
                 Some(&mut admitted),
                 Some(&mut callback),
             ),
@@ -3137,6 +3232,8 @@ mod admission_tests {
             .try_send(DriverCommand::ResourceSnapshot(reply))
             .expect("fill command queue");
         let driver = EngineDriver {
+            reranking: None,
+            runtime_sampling: false,
             workflow_facts: crate::driver::WorkflowFacts {
                 components: 0,
                 graph_components: 0,
@@ -3493,6 +3590,8 @@ mod admission_tests {
     async fn a_session_on_an_unknown_worker_is_refused() {
         let (commands, _rx) = mpsc::channel(1);
         let driver = EngineDriver {
+            reranking: None,
+            runtime_sampling: false,
             workflow_facts: WorkflowFacts {
                 components: 0,
                 graph_components: 0,
@@ -3545,6 +3644,8 @@ mod admission_tests {
     async fn a_turn_that_never_reaches_a_worker_releases_its_lease() {
         let (commands, rx) = mpsc::channel(1);
         let driver = EngineDriver {
+            reranking: None,
+            runtime_sampling: false,
             workflow_facts: WorkflowFacts {
                 components: 0,
                 graph_components: 0,

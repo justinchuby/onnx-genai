@@ -20,6 +20,123 @@ use onnx_genai_engine::{
     SessionForkParticipantKind, SessionPosition,
 };
 
+#[test]
+fn authored_sampler_refuses_dynamic_temperature_before_admission() -> anyhow::Result<()> {
+    let mut engine = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let session = engine.create_session()?;
+    let mut request = tokens(&[2, 4, 3], 2);
+    request.options.greedy = false;
+    request.options.temperature = 1.0;
+    request.options.dynamic_temperature = Some(onnx_genai_engine::DynamicTemperatureConfig {
+        range: 0.4,
+        exponent: 1.0,
+    });
+    let mut admitted = false;
+    let error = engine
+        .generate_in_session_with_callbacks(
+            session,
+            request.clone(),
+            Some(&mut || admitted = true),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(
+        onnx_genai_engine::package_execution_error(&error),
+        Some(
+            onnx_genai_engine::PackageExecutionError::RuntimeSamplingUnavailable {
+                field: "dynatemp_range".into()
+            }
+        )
+    );
+    let message = format!("{error:#}");
+    assert!(message.contains("dynatemp_range"), "{message}");
+    assert!(message.contains("runtime-owned token-policy"), "{message}");
+    assert!(!admitted);
+    assert_eq!(engine.session_token_count(session)?, 0);
+    assert!(
+        engine
+            .component_invocations()
+            .values()
+            .all(|&count| count == 0)
+    );
+    // Greedy mode does not ask this graph for a stochastic warper.
+    request.options.greedy = true;
+    assert!(
+        !engine
+            .generate_in_session(session, request)?
+            .token_ids
+            .is_empty()
+    );
+    engine.close_session(session)?;
+    Ok(())
+}
+
+#[test]
+fn authored_workflow_refuses_prompt_only_prefill_without_skipping_steps() -> anyhow::Result<()> {
+    let mut engine = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let mut admitted = false;
+    let error = engine
+        .prefill_with_callbacks(
+            onnx_genai_engine::PrefillRequest {
+                prompt: GeneratePrompt::TokenIds(vec![2, 4, 3]),
+                max_context: None,
+                cold_start: false,
+            },
+            None,
+            Some(&mut || admitted = true),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        onnx_genai_engine::package_execution_error(&error),
+        Some(onnx_genai_engine::PackageExecutionError::PrefillUnavailable { .. })
+    ));
+    assert!(format!("{error:#}").contains("explicit prefill operation"));
+    assert!(!admitted);
+    assert!(
+        engine
+            .component_invocations()
+            .values()
+            .all(|&count| count == 0)
+    );
+    Ok(())
+}
+
+#[test]
+fn authored_sampler_refuses_order_and_sigma_before_admission() -> anyhow::Result<()> {
+    for field in ["samplers", "top_n_sigma"] {
+        let mut engine = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+        let mut request = tokens(&[2, 4, 3], 2);
+        request.options.greedy = false;
+        request.options.temperature = 1.0;
+        if field == "samplers" {
+            request.options.sampler_order =
+                Some(onnx_genai_engine::SamplerSequence::new(vec![]).unwrap());
+        } else {
+            request.options.top_n_sigma = 1.0;
+        }
+        let mut admitted = false;
+        let error = engine
+            .generate_with_callbacks(request, Some(&mut || admitted = true), None)
+            .unwrap_err();
+        assert_eq!(
+            onnx_genai_engine::package_execution_error(&error),
+            Some(
+                onnx_genai_engine::PackageExecutionError::RuntimeSamplingUnavailable {
+                    field: field.into()
+                }
+            )
+        );
+        assert!(!admitted);
+        assert!(
+            engine
+                .component_invocations()
+                .values()
+                .all(|&count| count == 0)
+        );
+    }
+    Ok(())
+}
+
 fn decoder_package() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/onnx_genai_workflows/decoder")
 }

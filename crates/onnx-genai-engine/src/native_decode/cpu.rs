@@ -34,7 +34,104 @@ pub(crate) struct DecodeCpuKvState {
     logical_len: usize,
 }
 
+/// Only live rows are copied; unused physical capacity is not durable state.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CpuKvSnapshot {
+    logical_len: usize,
+    entries: Vec<CpuKvSnapshotEntry>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CpuKvSnapshotEntry {
+    pair: (String, String),
+    shape: Vec<usize>,
+    dtype: DataType,
+    rows: Vec<Vec<u8>>,
+}
+
 impl DecodeCpuKvState {
+    pub(super) fn snapshot_bytes(&self) -> anyhow::Result<u64> {
+        self.bindings.iter().try_fold(0u64, |total, binding| {
+            let (blocks, _, row_bytes) = live_kv_geometry(binding, self.logical_len)?;
+            let bytes = blocks
+                .checked_mul(self.logical_len)
+                .and_then(|rows| rows.checked_mul(row_bytes))
+                .context("CPU KV snapshot live byte count overflow")?;
+            total
+                .checked_add(u64::try_from(bytes)?)
+                .context("CPU KV snapshot total byte count overflow")
+        })
+    }
+
+    pub(super) fn snapshot(&mut self) -> anyhow::Result<CpuKvSnapshot> {
+        let mut entries = Vec::with_capacity(self.bindings.len());
+        for (binding, pair) in self.bindings.iter_mut().zip(&self.pairs) {
+            let (blocks, capacity, row_bytes) = live_kv_geometry(binding, self.logical_len)?;
+            let mut rows = Vec::with_capacity(blocks);
+            for block in 0..blocks {
+                rows.push(
+                    binding
+                        .read_bytes_range(
+                            block_offset(block, capacity, row_bytes),
+                            self.logical_len * row_bytes,
+                        )
+                        .with_context(|| format!("snapshot live CPU KV input '{}'", pair.1))?,
+                );
+            }
+            entries.push(CpuKvSnapshotEntry {
+                pair: pair.clone(),
+                shape: binding.physical_shape().to_vec(),
+                dtype: binding.dtype,
+                rows,
+            });
+        }
+        Ok(CpuKvSnapshot {
+            logical_len: self.logical_len,
+            entries,
+        })
+    }
+
+    pub(super) fn restore_snapshot(&mut self, snapshot: &CpuKvSnapshot) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.bindings.len() == snapshot.entries.len()
+                && self.pairs.len() == snapshot.entries.len(),
+            "CPU KV snapshot binding count differs from the live decoder; restore with the original decoder"
+        );
+        // Check the complete destination before the first write. Capacity may
+        // have grown, but the pair, dtype and non-sequence axes must agree.
+        for ((binding, pair), entry) in self.bindings.iter().zip(&self.pairs).zip(&snapshot.entries)
+        {
+            let (blocks, _, row_bytes) = live_kv_geometry(binding, snapshot.logical_len)?;
+            let shape = binding.physical_shape();
+            anyhow::ensure!(
+                pair == &entry.pair
+                    && binding.dtype == entry.dtype
+                    && shape.len() == entry.shape.len()
+                    && shape
+                        .iter()
+                        .zip(&entry.shape)
+                        .enumerate()
+                        .all(|(axis, (a, b))| axis == 2 || a == b)
+                    && entry.rows.len() == blocks
+                    && entry
+                        .rows
+                        .iter()
+                        .all(|rows| rows.len() == snapshot.logical_len * row_bytes),
+                "CPU KV snapshot for '{}' has mismatched ports, dtype, geometry or live rows; restore with its original decoder",
+                pair.1
+            );
+        }
+        for (binding, entry) in self.bindings.iter_mut().zip(&snapshot.entries) {
+            let (_, capacity, row_bytes) = live_kv_geometry(binding, snapshot.logical_len)?;
+            for (block, rows) in entry.rows.iter().enumerate() {
+                binding
+                    .write_bytes(block_offset(block, capacity, row_bytes), rows)
+                    .with_context(|| format!("restore live CPU KV input '{}'", entry.pair.1))?;
+            }
+        }
+        self.set_logical_len(snapshot.logical_len)
+    }
+
     /// Build persistent CPU KV bindings, or `Ok(None)` when the model is not
     /// eligible for the in-place path (any KV input that is not rank-4 f32 with a
     /// static head geometry, e.g. an f16 cache). `present_to_past` must contain
@@ -251,6 +348,28 @@ impl DecodeCpuKvState {
         self.logical_len = len;
         Ok(())
     }
+}
+
+fn live_kv_geometry(
+    binding: &DeviceIoBinding,
+    live: usize,
+) -> anyhow::Result<(usize, usize, usize)> {
+    let shape = binding.physical_shape();
+    anyhow::ensure!(
+        shape.len() == 4 && live <= shape[2],
+        "CPU KV snapshot requires rank-4 storage with capacity >= {live}, got {shape:?}; grow the cache before restoration"
+    );
+    let blocks = shape[0]
+        .checked_mul(shape[1])
+        .context("CPU KV snapshot batch/head extent overflow")?;
+    let row_bytes = shape[3]
+        .checked_mul(binding.dtype.byte_size())
+        .context("CPU KV snapshot row byte count overflow")?;
+    blocks
+        .checked_mul(shape[2])
+        .and_then(|rows| rows.checked_mul(row_bytes))
+        .context("CPU KV snapshot storage byte count overflow")?;
+    Ok((blocks, shape[2], row_bytes))
 }
 
 /// Byte offset of `block`'s first row in a `[B, H, capacity, Dh]` cache, where
