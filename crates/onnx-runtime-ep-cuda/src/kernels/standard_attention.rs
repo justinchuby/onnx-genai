@@ -86,8 +86,6 @@ use onnx_runtime_ep_api::{
     TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
-#[cfg(test)]
-use onnx_runtime_memory_api::MemoryRole;
 
 use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
@@ -3549,6 +3547,7 @@ mod workspace_governance_tests {
     //! split, and both lifetime classes.
     use super::*;
     use onnx_runtime_ep_api::TensorMetadata;
+    use onnx_runtime_memory_api::MemoryRole;
 
     fn meta(dtype: DataType, shape: &[usize]) -> TensorMetadata<'_> {
         TensorMetadata::new(dtype, shape, true)

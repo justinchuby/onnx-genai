@@ -56,8 +56,6 @@ use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
     EpError, Result, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
-#[cfg(test)]
-use onnx_runtime_memory_api::MemoryRole;
 
 use crate::error::cublas_err;
 
@@ -1454,6 +1452,7 @@ mod raw_workspace_allocation_guard {
     use onnx_runtime_ep_api::DevicePtrMut;
 
     use super::*;
+    use onnx_runtime_memory_api::MemoryRole;
 
     #[test]
     fn exact_requirement_is_persistent_and_shortfall_is_deterministic() {

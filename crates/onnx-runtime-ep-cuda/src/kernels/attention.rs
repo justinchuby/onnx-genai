@@ -66,8 +66,6 @@ use onnx_runtime_ep_api::{
     WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
-#[cfg(test)]
-use onnx_runtime_memory_api::MemoryRole;
 
 use crate::blas::{GemmDtype, GemmEx, WORKSPACE_BYTES, gemm_ex};
 use crate::error::{driver_err, not_implemented};
@@ -1046,6 +1044,7 @@ impl Kernel for AttentionKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onnx_runtime_memory_api::MemoryRole;
 
     fn rt() -> Option<Arc<CudaRuntime>> {
         crate::test_support::maybe_runtime()

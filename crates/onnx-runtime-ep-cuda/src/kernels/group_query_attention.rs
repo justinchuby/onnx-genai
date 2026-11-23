@@ -18,8 +18,6 @@ use onnx_runtime_ep_api::{
     TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
-#[cfg(test)]
-use onnx_runtime_memory_api::MemoryRole;
 
 use crate::error::driver_err;
 use crate::kernels::kv_stride::{KvCachePath, KvCacheStrides};
@@ -3301,6 +3299,7 @@ impl Kernel for GroupQueryAttentionKernel {
 mod tests {
     use super::*;
     use onnx_runtime_ir::{Attribute, NodeId};
+    use onnx_runtime_memory_api::MemoryRole;
 
     fn gqa_node(attrs: &[(&str, Attribute)]) -> Node {
         let mut node = Node::new(NodeId(0), "GroupQueryAttention", vec![], vec![]);

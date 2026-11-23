@@ -2041,3 +2041,13 @@ callback, allocation-counting, concurrent-lane, inherited-workspace and pressure
 regressions remain. All heavy validation holds the shared stable host flock.
 This is an API/state simplification; no new throughput or RSS claim is made.
 Raw logs and source/commit provenance remain under /tmp/nxrt-workspace-role-*.
+
+
+The role cleanup keeps MemoryRole imports inside the CUDA test modules that
+use them. The capture source audit treats the first test-only section as the
+production boundary, so a test-only import above production functions hid
+those functions from its scan. The exact old head reproduces both named
+capture-audit failures (3 pass / 2 fail); the final source passes all five
+capture_sync_contract guards without changing any guard or allowlist. CUDA
+all-target strict Clippy with cuda,gpu-tests and the seven metadata tests also
+pass on this Host-only setup. Records are /tmp/nxrt-workspace-role-capture-*.
