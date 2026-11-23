@@ -66,6 +66,19 @@ impl Consumers {
         uses
     }
 
+    /// First consuming slot satisfying a predicate, in the same order as
+    /// `uses`, without allocating a snapshot.
+    pub(crate) fn first_use_where(
+        &self,
+        mut predicate: impl FnMut(Usage) -> bool,
+    ) -> Option<Usage> {
+        self.uses
+            .iter()
+            .copied()
+            .filter(|&usage| predicate(usage))
+            .min()
+    }
+
     /// Distinct consuming nodes sorted by ascending [`NodeId`].
     pub fn nodes(&self) -> Vec<NodeId> {
         let mut nodes: Vec<_> = self.uses.iter().map(|&(node, _)| node).collect();

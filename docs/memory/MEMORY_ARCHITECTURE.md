@@ -135,6 +135,25 @@ capture-referenced owners never enter the idle cell. Pending device-binding runs
 continue through provider deferred retirement, so zero warm issuer calls are not
 claimed for that path. No per-token completion synchronization is added.
 
+Pending reuse needs a completion proof, not another allocation API. CUDA's
+`begin_device_validation` rejects an outstanding coordinator generation, but a
+successful begin overwrites the old owner slot: it cannot serve as a receipt for
+the previous generation's validation flags. The generic provider default also
+has no such completion guarantee. Consuming a still-pending validation token can
+perform device work, so polling through the consuming operation would introduce
+a new completion boundary. Binding reads consume validation after the existing
+host-transfer boundary, but do not currently publish a generation-specific
+completion receipt back to the executor.
+
+A future reuse change must expose the same generation's completed-and-clean
+receipt before replacing it, preserve failed outcomes, and leave unresolved work
+outside pressure-reclaimable idle storage. It must cover cross-binding and
+cross-executor isolation, stale generations, partial and zero-byte reads, errors,
+and teardown without adding synchronization to the fitting warm path. Until
+then, keep deferred retirement and retain GQA's persistent capacity; do not infer
+completion from DeviceId, a default fence, successful begin, or a prior binding
+read alone.
+
 Installed capture addresses also prevent workspace replacement: preparation or
 runtime refinement that needs larger capacity or alignment must first retire all
 referencing graph slots. This preserves the old owner on refusal. Host contracts

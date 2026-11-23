@@ -133,7 +133,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Relu`, `Sqrt`, `Erf`, `Tanh`, `Sigmoid` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16; half storage widens to f32 compute and narrows once on store (`elementwise.rs`). |
 | `Gelu` | `` | ✅ | **NVRTC-custom** | Standard-domain opset-20 exact or tanh-approximate GELU (`elementwise.rs`). |
 | `SwiGLU`, `GeGLU` | `` | ✅ | **NVRTC-custom** | Opsets 28/29 respectively; identical input shapes, no broadcasting. f16/bf16/f32/f64. |
-| `Expm1`, `Log1p`, `LogCumSumExp` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64. Stable small-value math and log-domain prefix accumulation. |
+| `Expm1`, `Log1p` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64. Stable small-value math in the elementwise kernel family. |
+| `LogCumSumExp` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64. Log-domain prefix accumulation in the cumulative-sum kernel family. |
 | `Pack`, `Unpack` | `` | ✅ | **NVRTC-custom** | Opset 29; fixed-bit and grouped-radix encoding along arbitrary axes, with UINT8/UINT32 words. Eager CUDA only. |
 | `GroupedMatMul` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64, INT32/INT64 routes, either weight layout, optional bias. Eager CUDA only. |
 | `Gelu`, `Silu` | `com.microsoft` | ✅ | **NVRTC-custom** | Contrib activation forms (`elementwise.rs`). |
@@ -200,7 +201,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
 | `Attention` | `com.microsoft` | ✅ | **NVRTC tiled online-softmax + Phase-2a fallback** | Phase-2b fused f32/f16/bf16 prefill, including GQA and additive masks; measured auto-gate retains the cuBLAS baseline where faster. See `CUDA_FLASH_ATTENTION.md`. |
-| `Attention` (opset 23/24) | `` | ✅ | **deterministic CUDA EP fallback** | Standard ONNX SDPA with 3D/4D layouts, GQA, bool/additive masks, and in-op KV cache. f32. |
+| `Attention` (opset 23/24/25) | `` | ✅ | **CUDA row kernel; split-KV on eligible unwindowed decode** | Standard ONNX SDPA with 3D/4D layouts, GQA, bool/additive masks, and KV cache. Opset 25 windows bound the score and value loops; windowed calls retain logical KV extents rather than using mask-derived frozen capacity. f32/f16/bf16. |
 | `RotaryEmbedding` (opset 23) | `` | ✅ | **deterministic CUDA EP fallback** | f32 interleaved/non-interleaved RoPE, partial rotary dimensions, and optional position-id gathering. |
 | `RotaryEmbedding` | `com.microsoft` | ✅ | **NVRTC-custom** | Contrib-domain RoPE registration with shape/dtype/attribute validation in `rotary_embedding.rs`. |
 | `MultiHeadAttention` | `com.microsoft` | ✅ | **cuBLASLt Phase-2a SDPA + NVRTC layout adapters** | Contiguous f32/f16/bf16 separate Q/K/V. Query is BSH; K/V may be BSH or BNSH. Supports optional same-dtype projection bias, broadcast additive attention bias, Int32/Int64 key-padding mask, causal mode, and paired BNSH past/present KV. Q/K/V head sizes must match. Packed QKV/KV, DecoderMaskedMHA inputs, unequal V head size, and mixed float dtypes fail closed. Per-call scratch, a host-resolved padding mask, and a trailing synchronization make graph capture unsupported (`multi_head_attention.rs`). |

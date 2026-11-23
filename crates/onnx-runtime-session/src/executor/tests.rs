@@ -3746,6 +3746,15 @@ fn capacity_form_attention_mask_input_classifier() {
         "a frozen causal additive mask carries the valid length at its last-row frontier, \
          so the causal capacity-form Attention is a valid frozen-mask leaf"
     );
+    causal
+        .attributes
+        .insert("left_window_size".into(), Attribute::Int(-1));
+    assert!(is_capacity_form_attention_mask_input(&causal, 3));
+    causal
+        .attributes
+        .insert("right_window_size".into(), Attribute::Int(0));
+    assert!(!kernel_input_uses_physical_capacity(&causal, 4));
+    assert!(!is_capacity_form_attention_mask_input(&causal, 3));
 
     // A masked `Attention` with no past KV bindings (inputs 4/5 absent) is not a
     // capacity-form leaf regardless of causality.
