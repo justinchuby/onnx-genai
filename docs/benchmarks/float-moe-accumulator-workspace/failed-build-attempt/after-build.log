@@ -1,0 +1,5 @@
+   Compiling onnx-runtime-ep-cpu v0.1.0-dev.6 (/tmp/nxrt-float-moe-accumulator/crates/onnx-runtime-ep-cpu)
+   Compiling onnx-runtime-session v0.1.0-dev.6 (/tmp/nxrt-float-moe-accumulator/crates/onnx-runtime-session)
+error: failed to build archive at `/tmp/nxrt-erf-nan-target/release/deps/libonnx_runtime_ep_cpu-862915b4594f6aae.rlib`: No space left on device (os error 28)
+
+error: could not compile `onnx-runtime-ep-cpu` (lib) due to 1 previous error

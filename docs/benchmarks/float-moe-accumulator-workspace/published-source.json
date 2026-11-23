@@ -1,0 +1,7 @@
+{
+  "timed_source_commit": "47c4973d421e2b2f5f7ed16a2afb34f99a4cbd75",
+  "unchanged_timed_rust": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "074d4ed5d0c7cf61921b2ea192beeaf4e51ab294a4eb804d5b4688743898b4d6"
+  },
+  "after_measurement_changes": "Report artifacts and architecture documentation links only. No Rust changes after the validated/timed checkpoint."
+}

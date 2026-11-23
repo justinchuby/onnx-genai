@@ -828,11 +828,14 @@ pub fn narrow_bf16_slice_into(src: &[f32], dst: &mut [u16]) {
 pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<'a, [f32]>> {
     validate_f32_widen_input(op, view)?;
     let len = view.numel();
-    if view.dtype == DataType::Float32 && view.is_contiguous() {
+    if view.dtype == DataType::Float32
+        && view.is_contiguous()
+        && view.data_ptr::<f32>().is_aligned()
+    {
         if len == 0 {
             return Ok(Cow::Borrowed(&[]));
         }
-        // SAFETY: validated contiguous host Float32 storage lives for this borrow.
+        // SAFETY: validated, aligned contiguous host Float32 storage lives for this borrow.
         let data = unsafe { std::slice::from_raw_parts(view.data_ptr::<f32>(), len) };
         return Ok(Cow::Borrowed(data));
     }
@@ -881,7 +884,11 @@ pub(crate) fn to_dense_f32_widen_into(
     }
     // F16C bulk widen for a contiguous f16 tensor (the KV-cache decode hot path).
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if view.dtype == DataType::Float16 && view.is_contiguous() && f16c::available() {
+    if view.dtype == DataType::Float16
+        && view.is_contiguous()
+        && view.data_ptr::<u16>().is_aligned()
+        && f16c::available()
+    {
         view.validate()?;
         let len = view.numel();
         if len == 0 {
@@ -900,7 +907,11 @@ pub(crate) fn to_dense_f32_widen_into(
     // scalar `dispatch_float!` arm below was paying two allocations and a
     // per-element call for what is one shift.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if view.dtype == DataType::BFloat16 && view.is_contiguous() && bf16x::available() {
+    if view.dtype == DataType::BFloat16
+        && view.is_contiguous()
+        && view.data_ptr::<u16>().is_aligned()
+        && bf16x::available()
+    {
         view.validate()?;
         let len = view.numel();
         if len == 0 {
@@ -922,7 +933,10 @@ pub(crate) fn to_dense_f32_widen_into(
     // (RMSNorm, Swish, Attention, RotaryEmbedding) that go through
     // `to_dense_f32_widen` rather than the direct-read GEMV kernel.
     #[cfg(target_arch = "aarch64")]
-    if view.dtype == DataType::Float16 && view.is_contiguous() {
+    if view.dtype == DataType::Float16
+        && view.is_contiguous()
+        && view.data_ptr::<u16>().is_aligned()
+    {
         view.validate()?;
         let len = view.numel();
         if len == 0 {
@@ -951,7 +965,11 @@ pub(crate) fn to_dense_f32_widen_into(
 pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Result<()> {
     // F16C bulk narrow for a contiguous f16 output (the KV-cache decode hot path).
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if out.dtype == DataType::Float16 && out.is_contiguous() && f16c::available() {
+    if out.dtype == DataType::Float16
+        && out.is_contiguous()
+        && out.data_ptr_mut::<u16>().is_aligned()
+        && f16c::available()
+    {
         out.validate()?;
         let n = out.numel();
         if data.len() != n {
@@ -973,7 +991,11 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
     }
     // Bulk narrow for a contiguous bf16 output; counterpart to the widen above.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if out.dtype == DataType::BFloat16 && out.is_contiguous() && bf16x::available() {
+    if out.dtype == DataType::BFloat16
+        && out.is_contiguous()
+        && out.data_ptr_mut::<u16>().is_aligned()
+        && bf16x::available()
+    {
         out.validate()?;
         let n = out.numel();
         if data.len() != n {
@@ -996,7 +1018,10 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
     // NEON bulk narrow for contiguous f16 output on aarch64.
     // Counterpart to the NEON widen path in `to_dense_f32_widen`.
     #[cfg(target_arch = "aarch64")]
-    if out.dtype == DataType::Float16 && out.is_contiguous() {
+    if out.dtype == DataType::Float16
+        && out.is_contiguous()
+        && out.data_ptr_mut::<u16>().is_aligned()
+    {
         out.validate()?;
         let n = out.numel();
         if data.len() != n {
@@ -1015,7 +1040,10 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
     // Contiguous f32→f32: memcpy directly, skipping both the identity Vec copy
     // and the per-element strided write. This is the hot path for every dense
     // f32 kernel on all architectures.
-    if out.dtype == DataType::Float32 && out.is_contiguous() {
+    if out.dtype == DataType::Float32
+        && out.is_contiguous()
+        && out.data_ptr_mut::<f32>().is_aligned()
+    {
         out.validate()?;
         let n = out.numel();
         if data.len() != n {
@@ -1174,6 +1202,91 @@ fn neon_f32_to_f16_bulk(src: &[f32], dst: &mut [u16]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f32_conversion_accepts_unaligned_contiguous_storage() {
+        let values = [1., -2., 0.5, 16.];
+        check_unaligned_float_conversion(
+            crate::kernels::testutil::Owned::f32(&[4], &values),
+            &values,
+        );
+        let view = TensorView::new(
+            onnx_runtime_ep_api::DevicePtr(values.as_ptr().cast()),
+            DataType::Float32,
+            &[4],
+            &[1],
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        let widened = to_dense_f32_widen("aligned source", &view).unwrap();
+        assert!(matches!(widened, Cow::Borrowed(_)));
+        assert_eq!(widened.as_ptr(), values.as_ptr());
+    }
+
+    #[test]
+    fn other_float_conversion_accepts_unaligned_contiguous_storage() {
+        use crate::kernels::testutil::Owned;
+        let values = [1., -2., 0.5, 16.];
+        for source in [
+            Owned::f16(&[4], &values),
+            Owned::bf16(&[4], &values),
+            Owned::f64(&[4], &[1., -2., 0.5, 16.]),
+        ] {
+            check_unaligned_float_conversion(source, &values);
+        }
+    }
+
+    fn check_unaligned_float_conversion(
+        source: crate::kernels::testutil::Owned,
+        values: &[f32; 4],
+    ) {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::DeviceId;
+        // u64 alignment plus one byte deterministically misaligns every
+        // float type, regardless of the allocator's incidental alignment.
+        let mut storage = [0xa5a5_a5a5_a5a5_a5a5u64; 6];
+        let byte_len = std::mem::size_of_val(&storage);
+        // SAFETY: all bit patterns are valid u64; this uniquely borrowed
+        // byte slice covers exactly the live storage.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<u8>(), byte_len) };
+        for offset in [0, source.dtype.byte_size()] {
+            let start = 1 + offset;
+            let end = start + source.bytes.len();
+            bytes.fill(0xa5);
+            bytes[start..end].copy_from_slice(&source.bytes);
+            {
+                let view = TensorView::new(
+                    DevicePtr(bytes.as_ptr().wrapping_add(1).cast()),
+                    source.dtype,
+                    &[4],
+                    &[1],
+                    DeviceId::cpu(),
+                )
+                .with_byte_offset(offset);
+                let widened = to_dense_f32_widen("unaligned source", &view).unwrap();
+                assert!(matches!(widened, Cow::Owned(_)));
+                assert_eq!(widened.as_ref(), *values);
+                let mut direct = [0.; 4];
+                to_dense_f32_widen_into("unaligned source", &view, &mut direct).unwrap();
+                assert_eq!(direct, *values);
+            }
+            bytes[start..end].fill(0);
+            {
+                let mut out = TensorMut::new(
+                    DevicePtrMut(bytes.as_mut_ptr().wrapping_add(1).cast()),
+                    source.dtype,
+                    &[4],
+                    &[1],
+                    DeviceId::cpu(),
+                )
+                .with_byte_offset(offset);
+                write_dense_f32_narrow("unaligned output", &mut out, values).unwrap();
+            }
+            assert_eq!(&bytes[start..end], source.bytes.as_slice());
+            assert!(bytes[..start].iter().all(|&b| b == 0xa5));
+            assert!(bytes[end..].iter().all(|&b| b == 0xa5));
+        }
+    }
 
     #[test]
     fn direct_widening_preserves_strides_offsets_and_float_values() {

@@ -1,0 +1,21 @@
+{
+  "removed": [
+    {
+      "path": "/tmp/nxrt-moe-accumulator-perf/baseline-probe",
+      "logical_bytes": 13911360,
+      "sha256": "7f5d9d19c76bac512e6d5a6a4fbf7b693d4290c4dac8ea7472d6347f87e026d3"
+    },
+    {
+      "path": "/tmp/nxrt-moe-accumulator-perf/after-probe",
+      "logical_bytes": 13892800,
+      "sha256": "2496298c75de0b5d117abc6074714a844687af671c4d52e51f28887dcc646c12"
+    },
+    {
+      "path": "/tmp/nxrt-moe-accumulator-perf/null-probe",
+      "logical_bytes": 13911360,
+      "sha256": "7f5d9d19c76bac512e6d5a6a4fbf7b693d4290c4dac8ea7472d6347f87e026d3"
+    }
+  ],
+  "logical_bytes": 41715520,
+  "retained": "Raw outputs, batch records, diagnostics, source/probe hashes and source checkpoints remain; these bytes are logical sizes, not measured filesystem savings."
+}

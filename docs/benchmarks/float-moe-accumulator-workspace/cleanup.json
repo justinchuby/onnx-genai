@@ -1,0 +1,35 @@
+{
+  "private_miri_target": "/tmp/nxrt-miri-moe-accumulator-target",
+  "regular_files": 1895,
+  "logical_bytes": 794884549,
+  "before_free_bytes": 140083200,
+  "retained_diagnostics": [
+    {
+      "path": "/tmp/nxrt-moe-accumulator-miri-tree.log",
+      "sha256": "6d69d374a303214dd6a872541798305eb4329e80f70ed4ef88838815ded0c594"
+    },
+    {
+      "path": "/tmp/nxrt-moe-accumulator-miri.log",
+      "sha256": "efdc338b55f990475f83ccc6f144cfee4f85cb49fd9f315a56525307714ef28d"
+    },
+    {
+      "path": "/tmp/nxrt-f32-unaligned-miri.log",
+      "sha256": "038f4b32b6a94d833bb4b4299f341f8c45ec597187fb8d826291089639546e68"
+    },
+    {
+      "path": "/tmp/nxrt-f32-unaligned-miri-final.log",
+      "sha256": "b6609794b0a5113c1d5898a7b0ce105663c38614e5a15cfbd0a1a0bad3874ce3"
+    },
+    {
+      "path": "/tmp/nxrt-moe-unaligned-miri-tree.log",
+      "sha256": "fc66ed8ac899473acdf08f7bdb21f2b5829a6d8b785b96f95aadb9a604bbcaec"
+    },
+    {
+      "path": "/tmp/nxrt-moe-accumulator-miri-tree-fixed.log",
+      "sha256": "3f9ed77db3ddf467099a4596a234c0e3d6a61d338883aa73560f97c476334e05"
+    }
+  ],
+  "cpu_package_clean_exit": 0,
+  "cpu_package_clean_output": "     Removed 1475 files, 4.1GiB total\n",
+  "after_free_bytes": 5283840000
+}

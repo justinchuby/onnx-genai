@@ -79,6 +79,31 @@ and host tests do not validate CUDA mapping, stream ordering, capture/replay or
 throughput. Adoption, pooling, lending and release behavior remain unchanged in
 this cleanup.
 
+### Resource allocation granularity
+
+Admission follows physical ownership and independent reclamation, not each
+logical tensor or operation. Workspace is admitted per concurrent execution lane
+at the graph's planned peak; sequential kernels borrow regions of that lane.
+Prepared weights retain grants per independently published/reclaimed artifact
+(or a jointly used expert group), and KV grows in capacity blocks or batches.
+No per-row, per-tile, per-token or per-expert workspace quota API is needed.
+
+A warm workspace checkout that fits retained capacity makes zero issuer calls,
+including zero-byte requests. Growth, backing creation and actual release are
+accounting events. This does not promise zero locks, zero planning cost or zero
+issuer calls for transient weight-cache admission. Returning a lane to idle
+preserves the charge at its retained physical capacity; a smaller logical view
+does not refund those bytes. Idle capacity can be reclaimed under pressure.
+Pending asynchronous work, active readers and capture pins prevent reuse, and
+quarantined backing retains its charge until physical release is settled.
+
+The EP contract remains metadata planning plus an exclusive workspace borrow;
+common runtime ownership handles admission and pooling. Internal bank partitioning
+is an EP implementation detail, not a collection of separately charged resources.
+Keep release/replacement settlement contracts for asynchronous providers. Further
+run-boundary pooling optimization requires evidence of overhead; request lifetime
+must not implicitly pin a prefill-sized lane throughout decode.
+
 ### CPU compressed-projection scratch
 
 CPU `BlockQuantizedMatMul` and `BlockQuantizedMoE` declare metadata-planned,
@@ -114,8 +139,8 @@ separate existing weight-cache operation. No new public EP API is required.
 ### CPU float MoE projection banks
 
 Float MoE uses the same declared-workspace seam for gather, FC1/optional FC3,
-activation and expert output. One admitted lane contains two disjoint f32
-banks. Non-gated execution reuses A for gather/output and B for FC1/activation.
+activation and expert output. One admitted lane contains two disjoint projection f32
+banks and an output accumulator. Non-gated execution reuses A for gather/output and B for FC1/activation.
 Gated execution reuses A for gather/activation and B for FC1+FC3/output. The
 last read of each phase precedes overwriting its bank; short borrows enforce
 that order. Only actual destination prefixes are initialized for each GEMM.
@@ -128,9 +153,14 @@ conservative bound, especially when gated hidden width dominates intermediate
 width. A reused larger physical lane remains charged at its actual capacity.
 
 The common layer owns admission, pooling and release. There are no per-expert
-quota callbacks. Final accumulation/results, routing, dtype widening and GEMM
-implementation scratch remain separate; other MoE representations retain their
-existing owned-result seam. See the [source-backed CPU evidence](../benchmarks/float-moe-fc-workspace/README.md)
+quota callbacks. A third disjoint region holds exactly rows*hidden f32
+accumulator elements across all expert groups, without a top-k or expert-count
+multiplier. It is cleared once per dispatch and borrowed until the final dtype
+and strided-output write, preserving late-write behavior when input and output
+storage alias. Routing, dtype widening and GEMM implementation scratch remain
+separate; other MoE representations retain their
+existing owned-result seam. See the [projection-bank evidence](../benchmarks/float-moe-fc-workspace/README.md)
+and [accumulator evidence](../benchmarks/float-moe-accumulator-workspace/README.md)
 for zero warm workspace issuer callbacks, tests, memory bounds and qualified
 session timing. Zero callbacks do not imply zero total inference overhead.
 

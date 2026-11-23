@@ -1,0 +1,106 @@
+[
+  {
+    "shape": [
+      8,
+      256,
+      256,
+      1,
+      null,
+      "identity"
+    ],
+    "processes": 9,
+    "full_output_sha256": "52155f2425575cf50a195d0c2fde92b655acf1b5d88d85829c9779a0f3686b16",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      512,
+      1024,
+      1024,
+      4,
+      null,
+      "identity"
+    ],
+    "processes": 9,
+    "full_output_sha256": "b00ce140d04ca85f94742cfe32bb227aca66cd663b971833369f9fbaf7a606cc",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      1,
+      64,
+      64,
+      1,
+      null,
+      "identity"
+    ],
+    "processes": 9,
+    "full_output_sha256": "7d7b52a60d16acb9dedb98dd993e42699c1627143acbc073eaf3e65bc546e5bf",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      512,
+      256,
+      256,
+      4,
+      "0",
+      "identity"
+    ],
+    "processes": 27,
+    "full_output_sha256": "53cda754582b8fc1c61f1e10343eb26f522b7e0c3423b9039fedb7da3e9119cd",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      8,
+      64,
+      128,
+      4,
+      "0",
+      "silu3"
+    ],
+    "processes": 27,
+    "full_output_sha256": "26a0bbd2ba80b71f492557e78f7c56efbe89b7c9ba1ed6b168dbada6f7059ccb",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      512,
+      256,
+      256,
+      4,
+      "0",
+      "swiglu2"
+    ],
+    "processes": 27,
+    "full_output_sha256": "0dee7503e90c0758b2aab82297348adb76faae3efa026b1e233170c8b84beecd",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      8,
+      256,
+      32,
+      1,
+      null,
+      "swiglu0"
+    ],
+    "processes": 27,
+    "full_output_sha256": "17c549844df6ae989c0d4fea2740924757c9303ee4079948558d69eda46d7add",
+    "argmax_equal": true
+  },
+  {
+    "shape": [
+      1,
+      64,
+      128,
+      1,
+      null,
+      "swiglu1"
+    ],
+    "processes": 9,
+    "full_output_sha256": "60d8463e450b458b72c914011dfaface8fc1af70daa24d87a8e0fd2b8fb1b3d7",
+    "argmax_equal": true
+  }
+]
