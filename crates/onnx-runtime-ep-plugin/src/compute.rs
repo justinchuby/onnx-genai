@@ -6686,6 +6686,24 @@ fn after() {}
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    #[test]
+    fn native_registry_unpack_stages_count_for_both_default_domain_spellings() {
+        for domain in ["", onnx_runtime_ir::AI_ONNX_DOMAIN] {
+            let mut node = Node::new(
+                NodeId(0),
+                "Unpack",
+                vec![Some(ValueId(0)), Some(ValueId(1))],
+                vec![ValueId(2)],
+            );
+            node.domain = domain.into();
+            node.version = Some(29);
+            node.attributes.insert("bits".into(), Attribute::Int(4));
+            let rule = ShapeInference::for_node(&node, &[], 1);
+            assert!(matches!(rule, ShapeInference::NativeRegistry { .. }));
+            assert_eq!(host_operand_indices(&rule), &[1]);
+        }
+    }
+
     fn view<'a>(shape: &'a [usize], strides: &'a [i64]) -> TensorView<'a> {
         typed_view(DataType::Float32, shape, strides)
     }
