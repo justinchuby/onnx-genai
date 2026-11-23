@@ -1,0 +1,14 @@
+{
+  "parent": "8a2a3c21e",
+  "tested_head": "871cfe0a5a20429149e0bb2af36729d7ac8c8093",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "838fff0e6670067144ba0e1b8892e4f151de3cba904827b8373a89e20ec9c5e3",
+    "crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs": "38440fcf91632e63ebf268a525d8dc542c9280d10dfbee577a893e47540b694e",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs": "eeb4323d72e29ac5d16b083375cb9a9dc03a0ba4915c66e64cf818e50373198d",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_neon.rs": "394580501bedcd8c8a7b9889001bbe3bacf4a343fb6c696f521d873f4a9399e9",
+    "crates/onnx-runtime-ep-api/src/kernel.rs": "c975305134601f7203782ec532058c5fdad5090454d2af288fc685873dbba737",
+    "crates/onnx-runtime-session/src/executor/dispatch.rs": "f404d07f9d9a81afcfbcf237f9aec268e9412846c7140a3029872cb7bddce87e"
+  },
+  "measured_gather_files_unchanged": true,
+  "measured_patch_reconstruction_verified": true
+}
