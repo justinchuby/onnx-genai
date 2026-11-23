@@ -59,10 +59,12 @@ pub fn recognize_packed(
             .tensor_shape()
             .and_then(|dims| as_static_shape(dims))
     };
-    let Some([m, depth]) = shape(*a).and_then(|dims| dims.try_into().ok()) else {
+    let activation_shape = shape(*a);
+    let Some(&[m, depth]) = activation_shape.as_deref() else {
         return Err("expected static grouped activation shape [M,K]");
     };
-    let Some([route_rows, lanes]) = shape(*idx).and_then(|dims| dims.try_into().ok()) else {
+    let route_shape = shape(*idx);
+    let Some(&[route_rows, lanes]) = route_shape.as_deref() else {
         return Err("expected static grouped route shape [M,lanes]");
     };
     if groups == 0
