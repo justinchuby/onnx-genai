@@ -97,6 +97,56 @@ pub enum DeviceSamplingTransform {
     TopKTopP { top_k: usize, top_p: f32 },
 }
 
+fn compare_candidate_logits(a: usize, b: usize, logits: &[f32]) -> std::cmp::Ordering {
+    logits[a]
+        .is_nan()
+        .cmp(&logits[b].is_nan())
+        .then_with(|| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| a.cmp(&b))
+}
+
+/// Logical candidate identities, allocated only for identity-sensitive stages.
+/// Numeric masks alone do not remove a candidate from this set.
+pub struct SamplingCandidates {
+    indices: Vec<usize>,
+    hard_allowed: Vec<bool>,
+}
+impl SamplingCandidates {
+    fn new(logits: &[f32]) -> Self {
+        Self {
+            indices: (0..logits.len()).collect(),
+            hard_allowed: logits
+                .iter()
+                .map(|v| !v.is_nan() && *v != f32::NEG_INFINITY)
+                .collect(),
+        }
+    }
+    pub fn indices(&self) -> &[usize] {
+        &self.indices
+    }
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+    pub fn retain(&mut self, mut keep: impl FnMut(usize) -> bool) {
+        self.indices.retain(|&id| keep(id));
+    }
+    fn top_k(&mut self, logits: &[f32], k: usize) {
+        if k == 0 || k >= self.len() {
+            return;
+        }
+        self.indices
+            .sort_unstable_by(|&a, &b| compare_candidate_logits(a, b, logits));
+        self.indices.truncate(k);
+    }
+}
+
 /// A logit processor modifies the logit distribution before sampling.
 pub trait LogitProcessor: Send + Sync {
     fn process(&self, logits: &mut [f32], context: &ProcessorContext) -> anyhow::Result<()>;
@@ -110,6 +160,26 @@ pub trait LogitProcessor: Send + Sync {
     /// Stage a selected token. A later process call may rewind this choice
     /// using its generated-token prefix before retrying a branch.
     fn on_selected(&self, _token: TokenId, _context: &ProcessorContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn needs_candidate_identity(&self) -> bool {
+        false
+    }
+    /// Preserve identities by default; a compacting stage must describe removal.
+    fn process_with_candidates(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        candidates: &mut SamplingCandidates,
+    ) -> anyhow::Result<()> {
+        let count = self.process_with_candidate_count(logits, context, candidates.len())?;
+        anyhow::ensure!(
+            count == candidates.len(),
+            "sampling stage '{}' changed candidate count from {} to {count} without an identity contract; implement process_with_candidates for this stage",
+            self.name(),
+            candidates.len()
+        );
         Ok(())
     }
 
@@ -159,6 +229,8 @@ pub struct ProcessorChain {
     processors: Vec<Box<dyn LogitProcessor>>,
     device_transforms: Option<Vec<DeviceSamplingTransform>>,
     track_candidates: bool,
+    track_candidate_ids: bool,
+    optional_start: Option<usize>,
     selection_feedback: bool,
 }
 impl Default for ProcessorChain {
@@ -173,6 +245,8 @@ impl ProcessorChain {
             processors: Vec::new(),
             device_transforms: Some(Vec::new()),
             track_candidates: false,
+            track_candidate_ids: false,
+            optional_start: None,
             selection_feedback: false,
         }
     }
@@ -183,6 +257,7 @@ impl ProcessorChain {
 
     pub fn add(&mut self, processor: Box<dyn LogitProcessor>) {
         self.track_candidates |= processor.needs_candidate_count();
+        self.track_candidate_ids |= processor.needs_candidate_identity();
         self.selection_feedback |= processor.needs_selection_feedback();
         if self.selection_feedback {
             self.device_transforms = None;
@@ -195,6 +270,10 @@ impl ProcessorChain {
             }
         }
         self.processors.push(processor);
+    }
+
+    pub(crate) fn begin_optional_stages(&mut self) {
+        self.optional_start = Some(self.processors.len());
     }
 
     pub(crate) fn device_transforms(&self) -> Option<&[DeviceSamplingTransform]> {
@@ -264,7 +343,26 @@ impl ProcessorChain {
 
     /// Apply processors in insertion order.
     pub fn process(&self, logits: &mut [f32], context: &ProcessorContext) -> anyhow::Result<()> {
-        if self.track_candidates {
+        if self.track_candidate_ids {
+            let (mandatory, optional) = self.processors.split_at(self.optional_start.unwrap_or(0));
+            for processor in mandatory {
+                processor
+                    .process(logits, context)
+                    .with_context(|| format!("mandatory stage '{}' failed", processor.name()))?;
+            }
+            let mut candidates = SamplingCandidates::new(logits);
+            for processor in optional {
+                processor
+                    .process_with_candidates(logits, context, &mut candidates)
+                    .with_context(|| {
+                        format!(
+                            "sampling stage '{}' failed at generated token {}",
+                            processor.name(),
+                            context.generated_tokens.len()
+                        )
+                    })?;
+            }
+        } else if self.track_candidates {
             let mut candidates = logits.len();
             for processor in &self.processors {
                 candidates = processor
@@ -1372,6 +1470,16 @@ impl PartialOrd for TopKLogit {
 }
 
 impl LogitProcessor for TopKProcessor {
+    fn process_with_candidates(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        candidates: &mut SamplingCandidates,
+    ) -> anyhow::Result<()> {
+        candidates.top_k(logits, self.top_k);
+        self.process(logits, context)
+    }
+
     fn preserves_argmax(&self) -> bool {
         true
     }
@@ -1434,6 +1542,26 @@ pub struct TopKTopPProcessor {
 }
 
 impl LogitProcessor for TopKTopPProcessor {
+    fn process_with_candidates(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        candidates: &mut SamplingCandidates,
+    ) -> anyhow::Result<()> {
+        candidates.top_k(logits, self.top_k);
+        let compact = self.top_p < 1.0
+            && logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
+                .is_finite();
+        self.process(logits, context)?;
+        if compact {
+            candidates.retain(|id| logits[id].is_finite());
+        }
+        Ok(())
+    }
+
     fn preserves_argmax(&self) -> bool {
         true
     }
@@ -1542,6 +1670,25 @@ pub struct TopPProcessor {
 }
 
 impl LogitProcessor for TopPProcessor {
+    fn process_with_candidates(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        candidates: &mut SamplingCandidates,
+    ) -> anyhow::Result<()> {
+        let compact = self.top_p < 1.0
+            && logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
+                .is_finite();
+        self.process(logits, context)?;
+        if compact {
+            candidates.retain(|id| logits[id].is_finite());
+        }
+        Ok(())
+    }
+
     fn preserves_argmax(&self) -> bool {
         true
     }
@@ -1601,6 +1748,25 @@ pub struct MinPProcessor {
 }
 
 impl LogitProcessor for MinPProcessor {
+    fn process_with_candidates(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        candidates: &mut SamplingCandidates,
+    ) -> anyhow::Result<()> {
+        let compact = self.min_p > 0.0
+            && logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
+                .is_finite();
+        self.process(logits, context)?;
+        if compact {
+            candidates.retain(|id| logits[id].is_finite());
+        }
+        Ok(())
+    }
+
     fn preserves_argmax(&self) -> bool {
         true
     }
@@ -1654,6 +1820,25 @@ pub struct TopAProcessor {
 }
 
 impl LogitProcessor for TopAProcessor {
+    fn process_with_candidates(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        candidates: &mut SamplingCandidates,
+    ) -> anyhow::Result<()> {
+        let compact = self.top_a > 0.0
+            && logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
+                .is_finite();
+        self.process(logits, context)?;
+        if compact {
+            candidates.retain(|id| logits[id].is_finite());
+        }
+        Ok(())
+    }
+
     fn preserves_argmax(&self) -> bool {
         true
     }
@@ -1701,6 +1886,25 @@ pub struct TypicalPProcessor {
 }
 
 impl LogitProcessor for TypicalPProcessor {
+    fn process_with_candidates(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        candidates: &mut SamplingCandidates,
+    ) -> anyhow::Result<()> {
+        let compact = self.typical_p < 1.0
+            && logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
+                .is_finite();
+        self.process(logits, context)?;
+        if compact {
+            candidates.retain(|id| logits[id].is_finite());
+        }
+        Ok(())
+    }
+
     fn process_with_candidate_count(
         &self,
         logits: &mut [f32],
@@ -1902,6 +2106,295 @@ fn mirostat_v2_keep_count(ranked: &[(usize, f32)], mu: f32) -> usize {
         .max(1)
 }
 
+/// Immutable byte-prefix and declared ending roles shared by repeated stages.
+pub(crate) struct InfillContract {
+    pieces: Vec<Vec<u8>>,
+    positions: HashMap<usize, usize>,
+    prefixes: Vec<std::ops::Range<usize>>,
+    endings: std::collections::BTreeSet<usize>,
+    fallback: usize,
+}
+impl InfillContract {
+    pub(crate) fn new(
+        tokenizer: &onnx_genai_ort::Tokenizer,
+        endings: Vec<TokenId>,
+        fallback: TokenId,
+    ) -> anyhow::Result<Self> {
+        let mut ids: Vec<_> = tokenizer.inner().get_vocab(true).into_values().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut bytes = crate::tokenization::token_pieces(tokenizer, &ids).context(
+            "infill requires lossless tokenizer byte pieces; repair the tokenizer decoder",
+        )?;
+        let specials = tokenizer.inner().get_added_tokens_decoder();
+        for (id, piece) in ids.iter().zip(&mut bytes) {
+            if specials.get(id).is_some_and(|token| token.special) {
+                piece.clear();
+            }
+        }
+        Self::from_pieces(ids, bytes, endings, fallback)
+    }
+    fn from_pieces(
+        ids: Vec<TokenId>,
+        bytes: Vec<Vec<u8>>,
+        endings: Vec<TokenId>,
+        fallback: TokenId,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            ids.len() == bytes.len(),
+            "infill tokenizer byte pieces must match the vocabulary ids"
+        );
+        anyhow::ensure!(
+            !endings.is_empty() && endings.contains(&fallback),
+            "infill requires a declared end-of-turn/EOS fallback in the effective EOS set; declare package.tokenizer.special_tokens.eos_token_id"
+        );
+        let mut entries: Vec<_> = ids.into_iter().zip(bytes).collect();
+        entries.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let positions: HashMap<_, _> = entries
+            .iter()
+            .enumerate()
+            .map(|(position, (id, _))| (*id as usize, position))
+            .collect();
+        anyhow::ensure!(
+            positions.len() == entries.len(),
+            "infill tokenizer byte pieces repeat a token id; repair the tokenizer vocabulary contract"
+        );
+        for id in &endings {
+            anyhow::ensure!(
+                positions.contains_key(&(*id as usize)),
+                "infill ending token {id} is absent from the tokenizer vocabulary; repair the package token facts"
+            );
+        }
+        let pieces: Vec<_> = entries.into_iter().map(|(_, bytes)| bytes).collect();
+        let prefixes = pieces
+            .iter()
+            .map(|piece| {
+                let start = pieces.partition_point(|other| other.as_slice() < piece.as_slice());
+                let end = pieces.partition_point(|other| {
+                    other.as_slice() < piece.as_slice() || other.starts_with(piece)
+                });
+                start..end
+            })
+            .collect();
+        Ok(Self {
+            pieces,
+            positions,
+            prefixes,
+            endings: endings.into_iter().map(|id| id as usize).collect(),
+            fallback: fallback as usize,
+        })
+    }
+}
+
+/// Range minimum over live candidate ranks in lexicographic byte-piece order.
+/// Each merge removes a candidate, so indexed prefix traversal performs at most
+/// O(V) merges and O(V log V) work, retaining upstream's probability-rank order.
+struct LivePrefixRanks {
+    base: usize,
+    nodes: Vec<usize>,
+}
+impl LivePrefixRanks {
+    fn new(size: usize) -> anyhow::Result<Self> {
+        let base = size
+            .max(1)
+            .checked_next_power_of_two()
+            .context("infill vocabulary is too large for the host prefix index")?;
+        let size = base
+            .checked_mul(2)
+            .context("infill prefix index size overflows the host address space")?;
+        Ok(Self {
+            base,
+            nodes: vec![usize::MAX; size],
+        })
+    }
+    fn set(&mut self, position: usize, rank: usize) {
+        let mut at = self.base + position;
+        self.nodes[at] = rank;
+        while at > 1 {
+            at /= 2;
+            self.nodes[at] = self.nodes[2 * at].min(self.nodes[2 * at + 1]);
+        }
+    }
+    fn first(&self, range: std::ops::Range<usize>) -> Option<usize> {
+        let mut left = self.base + range.start;
+        let mut right = self.base + range.end;
+        let mut best = usize::MAX;
+        while left < right {
+            if left % 2 == 1 {
+                best = best.min(self.nodes[left]);
+                left += 1;
+            }
+            if right % 2 == 1 {
+                right -= 1;
+                best = best.min(self.nodes[right]);
+            }
+            left /= 2;
+            right /= 2;
+        }
+        (best != usize::MAX).then_some(best)
+    }
+}
+
+pub(crate) struct InfillProcessor {
+    pub(crate) contract: std::sync::Arc<InfillContract>,
+}
+impl LogitProcessor for InfillProcessor {
+    fn needs_candidate_identity(&self) -> bool {
+        true
+    }
+    fn process(&self, logits: &mut [f32], context: &ProcessorContext) -> anyhow::Result<()> {
+        let mut candidates = SamplingCandidates::new(logits);
+        self.process_with_candidates(logits, context, &mut candidates)
+    }
+    fn process_with_candidate_count(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        count: usize,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            count == logits.len(),
+            "infill requires candidate identities after truncation; execute it through ProcessorChain"
+        );
+        let mut candidates = SamplingCandidates::new(logits);
+        self.process_with_candidates(logits, context, &mut candidates)?;
+        Ok(candidates.len())
+    }
+    fn process_with_candidates(
+        &self,
+        logits: &mut [f32],
+        _context: &ProcessorContext,
+        candidates: &mut SamplingCandidates,
+    ) -> anyhow::Result<()> {
+        let contract = &self.contract;
+        let mut ranked = candidates.indices.clone();
+        ranked.sort_unstable_by(|&a, &b| compare_candidate_logits(a, b, logits));
+        let maximum=ranked.first().map(|&id|logits[id]).filter(|v|v.is_finite()).context("infill has no finite candidate to normalize; reduce penalties/token bans or inspect model logits")?;
+        let mut weights = vec![0.0_f32; logits.len()];
+        let mut total = 0.0_f32;
+        for &id in &ranked {
+            let weight = if logits[id].is_nan() {
+                0.0
+            } else {
+                (logits[id] - maximum).exp()
+            };
+            weights[id] = weight;
+            total += weight;
+        }
+        anyhow::ensure!(
+            total.is_finite() && total > 0.0,
+            "infill candidate normalization failed; provide finite model logits and at least one available token"
+        );
+        let mut text_mass = 0.0;
+        let mut ending_mass = 0.0;
+        for &id in &ranked {
+            weights[id] /= total;
+            if contract.endings.contains(&id) {
+                ending_mass += weights[id];
+            } else {
+                text_mass += weights[id];
+            }
+        }
+        if 3.0 * ending_mass * ranked.len() as f32 > text_mass {
+            candidates
+                .indices
+                .retain(|id| contract.endings.contains(id));
+            for &id in &ranked {
+                if !contract.endings.contains(&id) {
+                    logits[id] = f32::NEG_INFINITY;
+                }
+            }
+            return Ok(());
+        }
+        let mut tree = LivePrefixRanks::new(contract.pieces.len())?;
+        let mut leaves = vec![None; ranked.len()];
+        for (rank, &id) in ranked.iter().enumerate() {
+            if logits[id].is_nan() || logits[id] == f32::NEG_INFINITY {
+                continue;
+            }
+            let leaf=*contract.positions.get(&id).with_context(||format!("infill candidate token {id} has no tokenizer byte piece; repair the tokenizer/model vocabulary contract"))?;
+            leaves[rank] = Some(leaf);
+            tree.set(leaf, rank);
+        }
+        for (rank, &id) in ranked.iter().enumerate() {
+            if logits[id] == f32::NEG_INFINITY || logits[id].is_nan() {
+                continue;
+            }
+            let leaf = leaves[rank].context("infill live candidate lost its byte-piece index")?;
+            if contract.pieces[leaf].is_empty() {
+                continue;
+            }
+            tree.set(leaf, usize::MAX);
+            while let Some(other_rank) = tree.first(contract.prefixes[leaf].clone()) {
+                let other = ranked[other_rank];
+                if weights[other] > weights[id] {
+                    weights[other] += weights[id];
+                    weights[id] = 0.0;
+                    logits[id] = f32::NEG_INFINITY;
+                    break;
+                } else {
+                    weights[id] += weights[other];
+                    weights[other] = 0.0;
+                    logits[other] = f32::NEG_INFINITY;
+                    tree.set(
+                        leaves[other_rank]
+                            .context("infill merged candidate lost its byte-piece index")?,
+                        usize::MAX,
+                    );
+                }
+            }
+            if logits[id] != f32::NEG_INFINITY {
+                tree.set(leaf, rank);
+            }
+        }
+        let mut non_endings = 0;
+        let mut retained_mass = 0.0;
+        ranked.retain(|&id| {
+            let end = contract.endings.contains(&id);
+            let keep = end || weights[id] >= 0.2;
+            if keep {
+                retained_mass += weights[id];
+                if !end {
+                    non_endings += 1;
+                }
+            } else {
+                logits[id] = f32::NEG_INFINITY;
+            }
+            keep
+        });
+        if non_endings == 0 {
+            anyhow::ensure!(
+                contract.fallback < logits.len(),
+                "infill end token {} is outside model logits; repair the tokenizer/model token contract",
+                contract.fallback
+            );
+            anyhow::ensure!(
+                candidates.hard_allowed.get(contract.fallback) == Some(&true),
+                "infill needs end token {} but its input/model logit or a mandatory token/grammar mask excludes it; permit a declared ending token or relax infill filtering",
+                contract.fallback
+            );
+            logits.fill(f32::NEG_INFINITY);
+            logits[contract.fallback] = 1.0;
+            candidates.indices = vec![contract.fallback];
+            return Ok(());
+        }
+        let threshold = 1.0 / (non_endings + 1) as f32;
+        ranked.retain(|&id| {
+            weights[id] /= retained_mass;
+            let keep = contract.endings.contains(&id) || weights[id] >= threshold;
+            if !keep {
+                logits[id] = f32::NEG_INFINITY;
+            }
+            keep
+        });
+        candidates.indices = ranked;
+        Ok(())
+    }
+    fn name(&self) -> &str {
+        "infill"
+    }
+}
+
 /// Request-local adaptive probability transform. The ordinary terminal sampler
 /// supplies the draw; selected-token feedback records original probabilities.
 pub(crate) struct AdaptivePProcessor {
@@ -2039,6 +2532,21 @@ impl XtcProcessor {
 }
 
 impl LogitProcessor for XtcProcessor {
+    fn process_with_candidates(
+        &self,
+        logits: &mut [f32],
+        context: &ProcessorContext,
+        candidates: &mut SamplingCandidates,
+    ) -> anyhow::Result<()> {
+        let masked: Vec<bool> = logits
+            .iter()
+            .map(|v| *v == f32::NEG_INFINITY || v.is_nan())
+            .collect();
+        self.process(logits, context)?;
+        candidates.retain(|id| masked[id] || logits[id] != f32::NEG_INFINITY);
+        Ok(())
+    }
+
     fn process_with_candidate_count(
         &self,
         logits: &mut [f32],
@@ -2441,6 +2949,357 @@ mod tests {
             generated_text: String::new(),
             step: 0,
         }
+    }
+
+    fn infill_fixture(
+        pieces: &[&[u8]],
+        endings: Vec<TokenId>,
+        fallback: TokenId,
+    ) -> std::sync::Arc<InfillContract> {
+        std::sync::Arc::new(
+            InfillContract::from_pieces(
+                (0..pieces.len() as u32).collect(),
+                pieces.iter().map(|p| p.to_vec()).collect(),
+                endings,
+                fallback,
+            )
+            .unwrap(),
+        )
+    }
+
+    // Literal small-input reference of upstream's rank-ordered double loop.
+    fn reference_infill(
+        contract: &InfillContract,
+        logits: &mut [f32],
+        candidates: &mut SamplingCandidates,
+    ) -> anyhow::Result<()> {
+        let mut ids = candidates.indices.clone();
+        ids.sort_unstable_by(|&a, &b| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(&b))
+        });
+        let max = logits[*ids.first().unwrap()];
+        anyhow::ensure!(max.is_finite(), "unusable row");
+        let mut p = vec![0.0; logits.len()];
+        let mut sum = 0.0;
+        for &id in &ids {
+            p[id] = (logits[id] - max).exp();
+            sum += p[id];
+        }
+        let mut text = 0.0;
+        let mut end = 0.0;
+        for &id in &ids {
+            p[id] /= sum;
+            if contract.endings.contains(&id) {
+                end += p[id]
+            } else {
+                text += p[id]
+            }
+        }
+        if 3.0 * end * ids.len() as f32 > text {
+            ids.retain(|id| contract.endings.contains(id));
+            for id in &candidates.indices {
+                if !contract.endings.contains(id) {
+                    logits[*id] = f32::NEG_INFINITY;
+                }
+            }
+            candidates.indices = ids;
+            return Ok(());
+        }
+        for &a in &ids {
+            for &b in &ids {
+                if logits[a] == f32::NEG_INFINITY {
+                    break;
+                }
+                if a == b || logits[b] == f32::NEG_INFINITY {
+                    continue;
+                }
+                let a_bytes = &contract.pieces[contract.positions[&a]];
+                let b_bytes = &contract.pieces[contract.positions[&b]];
+                if !a_bytes.is_empty() && b_bytes.starts_with(a_bytes) {
+                    let (dst, src) = if p[b] > p[a] { (b, a) } else { (a, b) };
+                    p[dst] += p[src];
+                    p[src] = 0.0;
+                    logits[src] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        ids.retain(|id| {
+            let keep = p[*id] >= 0.2 || contract.endings.contains(id);
+            if !keep {
+                logits[*id] = f32::NEG_INFINITY;
+            }
+            keep
+        });
+        let n = ids
+            .iter()
+            .filter(|id| !contract.endings.contains(id))
+            .count();
+        if n == 0 {
+            anyhow::ensure!(
+                candidates.hard_allowed[contract.fallback],
+                "mandatory exclusion"
+            );
+            logits.fill(f32::NEG_INFINITY);
+            logits[contract.fallback] = 1.0;
+            candidates.indices = vec![contract.fallback];
+            return Ok(());
+        }
+        let total: f32 = ids.iter().map(|id| p[*id]).sum();
+        ids.retain(|id| {
+            let keep = p[*id] / total >= 1.0 / (n + 1) as f32 || contract.endings.contains(id);
+            if !keep {
+                logits[*id] = f32::NEG_INFINITY;
+            }
+            keep
+        });
+        candidates.indices = ids;
+        Ok(())
+    }
+
+    #[test]
+    fn infill_end_role_does_not_guess_a_special_token_type() {
+        let tokenizer = onnx_genai_ort::Tokenizer::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+        )
+        .unwrap();
+        let contract = InfillContract::new(&tokenizer, vec![5], 5).unwrap();
+        assert_eq!(contract.pieces[contract.positions[&5]], b"world");
+    }
+
+    #[test]
+    fn infill_ordinary_ending_bytes_participate_in_prefix_merging() {
+        let contract = infill_fixture(&[b"ab", b"a"], vec![1], 1);
+        let mut logits = vec![0.99_f32.ln(), 0.01_f32.ln()];
+        let mut set = SamplingCandidates::new(&logits);
+        InfillProcessor { contract }
+            .process_with_candidates(&mut logits, &ProcessorContext::default(), &mut set)
+            .unwrap();
+        assert_eq!(set.indices, [0, 1]);
+        assert_eq!(
+            logits[1],
+            f32::NEG_INFINITY,
+            "ordinary EOS prefix merges into the higher-probability continuation"
+        );
+        assert_eq!(logits[0], 0.99_f32.ln());
+    }
+
+    #[test]
+    fn infill_identity_contracts_match_compacting_and_mask_only_counts() {
+        fn filters() -> Vec<Box<dyn LogitProcessor>> {
+            vec![
+                Box::new(TopKProcessor { top_k: 2 }),
+                Box::new(TopKProcessor { top_k: 0 }),
+                Box::new(TopKTopPProcessor {
+                    top_k: 2,
+                    top_p: 0.7,
+                }),
+                Box::new(TopKTopPProcessor {
+                    top_k: 0,
+                    top_p: 0.7,
+                }),
+                Box::new(TopPProcessor { top_p: 0.8 }),
+                Box::new(TopPProcessor { top_p: 1.0 }),
+                Box::new(MinPProcessor { min_p: 0.2 }),
+                Box::new(TopAProcessor { top_a: 0.7 }),
+                Box::new(TypicalPProcessor { typical_p: 0.7 }),
+                Box::new(XtcProcessor::new(1.0, 0.2, Some(11))),
+            ]
+        }
+        for (counted, identified) in filters().into_iter().zip(filters()) {
+            let original = vec![0.5_f32.ln(), 0.3_f32.ln(), 0.2_f32.ln(), f32::NEG_INFINITY];
+            let mut old = original.clone();
+            let mut new = original.clone();
+            let expected = counted
+                .process_with_candidate_count(&mut old, &ProcessorContext::default(), 4)
+                .unwrap();
+            let mut set = SamplingCandidates::new(&original);
+            identified
+                .process_with_candidates(&mut new, &ProcessorContext::default(), &mut set)
+                .unwrap();
+            assert_eq!(set.len(), expected, "{}", identified.name());
+            assert_eq!(new, old, "{}", identified.name());
+        }
+        struct MissingIdentity;
+        impl LogitProcessor for MissingIdentity {
+            fn process(&self, _: &mut [f32], _: &ProcessorContext) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "missing_identity"
+            }
+            fn needs_candidate_identity(&self) -> bool {
+                true
+            }
+            fn process_with_candidate_count(
+                &self,
+                _: &mut [f32],
+                _: &ProcessorContext,
+                count: usize,
+            ) -> anyhow::Result<usize> {
+                Ok(count - 1)
+            }
+        }
+        let mut chain = ProcessorChain::new();
+        chain.add(Box::new(MissingIdentity));
+        let error = format!(
+            "{:#}",
+            chain
+                .process(&mut [0.0, 1.0], &ProcessorContext::default())
+                .unwrap_err()
+        );
+        assert!(
+            error.contains("missing_identity") && error.contains("identity contract"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn infill_prefix_index_matches_rank_ordered_reference_with_byte_fragments() {
+        let contract = infill_fixture(
+            &[
+                b"a",
+                b"ab",
+                b"abc",
+                b"abd",
+                b"b",
+                b"a",
+                &[0xc3],
+                &[0xc3, 0xa9],
+                &[0xff],
+                &[0xff, b'x'],
+                b"",
+                b"",
+            ],
+            vec![10, 11],
+            10,
+        );
+        let mut rng = StdRng::seed_from_u64(191);
+        for case in 0..160 {
+            let mut original: Vec<f32> = (0..12).map(|_| rng.random_range(-4..=4) as f32).collect();
+            original[10] = if case % 4 == 0 { 1.0 } else { -20.0 };
+            original[11] = -25.0;
+            if case % 3 == 0 {
+                original[3] = f32::NEG_INFINITY;
+                original[8] = f32::NEG_INFINITY;
+            }
+            let mut expected = original.clone();
+            let mut actual = original.clone();
+            let mut expected_set = SamplingCandidates::new(&original);
+            let mut actual_set = SamplingCandidates::new(&original);
+            reference_infill(&contract, &mut expected, &mut expected_set).unwrap();
+            InfillProcessor {
+                contract: contract.clone(),
+            }
+            .process_with_candidates(&mut actual, &ProcessorContext::default(), &mut actual_set)
+            .unwrap();
+            expected_set.indices.sort_unstable();
+            actual_set.indices.sort_unstable();
+            assert_eq!(actual_set.indices, expected_set.indices, "case {case}");
+            assert_eq!(actual, expected, "case {case}");
+        }
+    }
+
+    #[test]
+    fn infill_fallback_prefers_declared_eot_and_preserves_mandatory_masks() {
+        let contract = infill_fixture(
+            &[b"a", b"b", b"c", b"d", b"e", b"f", b"", b""],
+            vec![6, 7],
+            7,
+        );
+        let original = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -20.0, -20.0];
+        let mut candidates = SamplingCandidates::new(&original);
+        let mut logits = original.clone();
+        TopKProcessor { top_k: 6 }
+            .process_with_candidates(&mut logits, &ProcessorContext::default(), &mut candidates)
+            .unwrap();
+        assert!(!candidates.indices.contains(&7));
+        InfillProcessor {
+            contract: contract.clone(),
+        }
+        .process_with_candidates(&mut logits, &ProcessorContext::default(), &mut candidates)
+        .unwrap();
+        assert_eq!(candidates.indices, [7]);
+        assert_eq!(logits[7], 1.0);
+        assert!(logits[..7].iter().all(|v| *v == f32::NEG_INFINITY));
+        let mut logits = original;
+        logits[7] = f32::NEG_INFINITY;
+        let mut candidates = SamplingCandidates::new(&logits);
+        TopKProcessor { top_k: 6 }
+            .process_with_candidates(&mut logits, &ProcessorContext::default(), &mut candidates)
+            .unwrap();
+        let error = InfillProcessor { contract }
+            .process_with_candidates(&mut logits, &ProcessorContext::default(), &mut candidates)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("mandatory") && error.contains("7"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn infill_identity_tracks_masked_eos_through_dynamic_temperature() {
+        let contract = infill_fixture(&[b"a", b"b", b"", b"d"], vec![2], 2);
+        let make = |top_k| {
+            let mut chain = ProcessorChain::new();
+            chain.begin_optional_stages();
+            if top_k {
+                chain.add(Box::new(TopKProcessor { top_k: 2 }));
+            } else {
+                chain.add(Box::new(TopNSigmaProcessor { n: 0.01 }));
+            }
+            chain.add(Box::new(InfillProcessor {
+                contract: contract.clone(),
+            }));
+            chain.add(Box::new(TemperatureProcessor {
+                temperature: 1.0,
+                dynamic: Some(crate::DynamicTemperatureConfig {
+                    range: 0.5,
+                    exponent: 1.0,
+                }),
+            }));
+            chain
+        };
+        let original = vec![3.0, 3.0, 0.0, -100.0];
+        let mut truncated = original.clone();
+        make(true)
+            .process(&mut truncated, &ProcessorContext::default())
+            .unwrap();
+        assert_eq!(truncated[..2], [2.0, 2.0]);
+        let mut masked = original;
+        make(false)
+            .process(&mut masked, &ProcessorContext::default())
+            .unwrap();
+        let expected = 3.0 / (0.5 + 2.0_f32.ln() / 3.0_f32.ln());
+        assert!((masked[0] - expected).abs() < 1e-5, "{masked:?}");
+    }
+
+    #[test]
+    fn infill_merges_large_duplicate_byte_pieces_with_stable_id_ties() {
+        let mut pieces = vec![b"a".to_vec(); 4096];
+        pieces.push(Vec::new());
+        let contract = std::sync::Arc::new(
+            InfillContract::from_pieces(
+                (0..pieces.len() as u32).collect(),
+                pieces,
+                vec![4096],
+                4096,
+            )
+            .unwrap(),
+        );
+        let mut logits = vec![0.0; 4097];
+        logits[4096] = -100.0;
+        let mut candidates = SamplingCandidates::new(&logits);
+        InfillProcessor { contract }
+            .process_with_candidates(&mut logits, &ProcessorContext::default(), &mut candidates)
+            .unwrap();
+        assert_eq!(candidates.indices, [0, 4096]);
+        assert_eq!(logits[0], 0.0);
+        assert_eq!(logits[4096], -100.0);
     }
 
     #[test]

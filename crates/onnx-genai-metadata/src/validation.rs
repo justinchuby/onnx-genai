@@ -416,6 +416,20 @@ fn validate_token_authority(
         .and_then(|package| package.tokenizer.as_ref())
         .and_then(|tokenizer| tokenizer.special_tokens.as_ref());
     if let Some(tokens) = special_tokens {
+        if tokens.eot_token_id.is_some()
+            && let Err(error) = crate::version::gate_feature_use(
+                version,
+                crate::version::SchemaFeature::PreferredEnding,
+                "package.tokenizer.special_tokens.eot_token_id",
+            )
+        {
+            errors.push(error);
+        }
+        if let Some(eot) = tokens.eot_token_id
+            && !tokens.eos_token_id.contains(&eot)
+        {
+            errors.push(format!("package.tokenizer.special_tokens.eot_token_id {eot} must belong to eos_token_id; declare the end-of-turn token in the package's generation stop set"));
+        }
         let mut unique = BTreeSet::new();
         for id in &tokens.eos_token_id {
             if !unique.insert(id) {

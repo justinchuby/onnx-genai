@@ -5,11 +5,11 @@ use crate::config::{
     FinishReason, GenerateConstraint, GenerateOptions, SamplerSequence, SamplerStage,
 };
 use crate::logits::{
-    AdaptivePProcessor, ConstraintProcessor, DryProcessor, GrammarConstraintKind, JsonConstraint,
-    LlguidanceConstraint, MinPProcessor, MirostatProcessor, PenaltiesProcessor, ProcessorChain,
-    ProcessorContext, ProcessorSignal, StopSequence, StopSequenceProcessor, TemperatureProcessor,
-    TokenId, TopAProcessor, TopKProcessor, TopNSigmaProcessor, TopPProcessor, TypicalPProcessor,
-    XtcProcessor,
+    AdaptivePProcessor, ConstraintProcessor, DryProcessor, GrammarConstraintKind, InfillContract,
+    InfillProcessor, JsonConstraint, LlguidanceConstraint, MinPProcessor, MirostatProcessor,
+    PenaltiesProcessor, ProcessorChain, ProcessorContext, ProcessorSignal, StopSequence,
+    StopSequenceProcessor, TemperatureProcessor, TokenId, TopAProcessor, TopKProcessor,
+    TopNSigmaProcessor, TopPProcessor, TypicalPProcessor, XtcProcessor,
 };
 use crate::sampling::{Sampler, default_sampler_for_options};
 use anyhow::Context;
@@ -97,6 +97,7 @@ pub(crate) fn build_processor_chain(
         }
     }
 
+    chain.begin_optional_stages();
     if let Some(mirostat) = options.mirostat.filter(|_| samples) {
         // Mirostat owns selection policy and, like upstream, replaces the
         // ordered warper list with fixed temperature followed by Mirostat.
@@ -117,8 +118,19 @@ pub(crate) fn build_processor_chain(
         .sampler_order
         .as_ref()
         .map_or(SamplerSequence::DEFAULT, |sequence| sequence.stages());
+    let infill = if samples && stages.contains(&SamplerStage::Infill) {
+        let tokenizer = tokenizer.context("infill sampling requires a declared tokenizer; load a package with tokenizer byte pieces")?;
+        let endings = terminal_token_ids(options);
+        let fallback = options.eot_token_id.or(options.eos_token_id).or_else(||endings.first().copied())
+            .context("infill sampling requires a declared EOS/end-of-turn role; set package.tokenizer.special_tokens.eos_token_id")?;
+        Some(std::sync::Arc::new(InfillContract::new(
+            tokenizer, endings, fallback,
+        )?))
+    } else {
+        None
+    };
     for &stage in stages {
-        append_sampler_stage(&mut chain, options, stage, samples);
+        append_sampler_stage(&mut chain, options, stage, samples, infill.as_ref())?;
     }
     // Adaptive-p owns terminal selection regardless of its listed position;
     // duplicate selectors still create one terminal transform, as upstream.
@@ -133,12 +145,20 @@ fn append_sampler_stage(
     options: &GenerateOptions,
     stage: SamplerStage,
     samples: bool,
-) {
+    infill: Option<&std::sync::Arc<InfillContract>>,
+) -> anyhow::Result<()> {
     if !samples && !matches!(stage, SamplerStage::Penalties | SamplerStage::Dry) {
-        return;
+        return Ok(());
     }
     match stage {
         SamplerStage::AdaptiveP => {}
+        SamplerStage::Infill => {
+            chain.add(Box::new(InfillProcessor {
+                contract: infill
+                    .context("infill sampling contract was not resolved before stage construction")?
+                    .clone(),
+            }));
+        }
         SamplerStage::Penalties => {
             if options.penalty_window != Some(0)
                 && (options.repetition_penalty != 1.0
@@ -231,6 +251,7 @@ fn append_sampler_stage(
             }
         }
     }
+    Ok(())
 }
 
 /// Expand cached typed transforms into the fixed device sampler's operations.

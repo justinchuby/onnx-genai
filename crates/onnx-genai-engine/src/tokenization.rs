@@ -2,6 +2,7 @@
 use anyhow::{Context, bail, ensure};
 use llguidance::toktrie::TokTrie;
 use onnx_genai_ort::Tokenizer;
+use tokenizers::Decoder as _;
 use tokenizers::decoders::DecoderWrapper;
 
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +99,37 @@ fn has_byte_decoder(decoder: &DecoderWrapper) -> bool {
     }
 }
 
+// A vocabulary piece has no first-token context. Metaspace's initial-space
+// stripping belongs to full-text decoding, not byte-prefix matching.
+fn context_free_decoder(decoder: &DecoderWrapper) -> Option<DecoderWrapper> {
+    use tokenizers::pre_tokenizers::metaspace::PrependScheme;
+    match decoder {
+        DecoderWrapper::Metaspace(space) if space.get_prepend_scheme() != PrependScheme::Never => {
+            let mut space = space.clone();
+            space.set_prepend_scheme(PrependScheme::Never);
+            Some(DecoderWrapper::Metaspace(space))
+        }
+        DecoderWrapper::Sequence(sequence) => {
+            let mut changed = false;
+            let decoders = sequence
+                .get_decoders()
+                .iter()
+                .map(|decoder| match context_free_decoder(decoder) {
+                    Some(decoder) => {
+                        changed = true;
+                        decoder
+                    }
+                    None => decoder.clone(),
+                })
+                .collect();
+            changed.then(|| {
+                DecoderWrapper::Sequence(tokenizers::decoders::sequence::Sequence::new(decoders))
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Return exact per-token byte pieces, retaining incomplete UTF-8 fragments.
 ///
 /// Byte codecs use the same vocabulary adapter as constrained decoding. Other
@@ -121,26 +153,33 @@ pub fn token_pieces(tokenizer: &Tokenizer, ids: &[u32]) -> anyhow::Result<Vec<Ve
         .get_decoder()
         .is_some_and(has_byte_decoder)
     {
-        return ids
-            .iter()
-            .map(|id| {
-                tokenizer
-                    .decode_with_special_tokens(&[*id])
-                    .map(String::into_bytes)
-                    .map_err(Into::into)
-            })
-            .collect();
+        let normalized = tokenizer
+            .inner()
+            .get_decoder()
+            .and_then(context_free_decoder);
+        let decoder = normalized
+            .as_ref()
+            .or_else(|| tokenizer.inner().get_decoder());
+        let specials = tokenizer.inner().get_added_tokens_decoder();
+        return ids.iter().zip(spellings).map(|(id,spelling)| {
+            if specials.get(id).is_some_and(|token|token.special) { return Ok(spelling.into_bytes()); }
+            match decoder {
+                Some(decoder)=>decoder.decode(vec![spelling]).map(String::into_bytes)
+                    .map_err(|error|anyhow::anyhow!("token {id} byte-piece decoding failed: {error}; repair the declared tokenizer decoder")),
+                None=>Ok(spelling.into_bytes()),
+            }
+        }).collect();
     }
     let size = tokenizer.inner().get_vocab_size(true);
     for (token, id) in tokenizer.inner().get_vocab(true) {
         ensure!(
             usize::try_from(id).is_ok_and(|id| id < size),
-            "byte piece conversion requires dense vocabulary ids; token {token:?} has id {id} outside the {size} vocabulary entries; use with_pieces=false or repair tokenizer.json"
+            "byte piece conversion requires dense vocabulary ids; token {token:?} has id {id} outside the {size} vocabulary entries; repair tokenizer.json or disable the operation that requires lossless token bytes"
         );
     }
     let vocabulary=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| toktrie_hf_tokenizers::ByteTokenizer::from_tokenizer(tokenizer.inner().clone())))
-        .map_err(|_| anyhow::anyhow!("byte piece conversion rejected invalid tokenizer codec data; use with_pieces=false or repair tokenizer.json"))?
-        .context("byte piece conversion cannot interpret the declared decoder; use with_pieces=false or repair tokenizer.json")?
+        .map_err(|_| anyhow::anyhow!("byte piece conversion rejected invalid tokenizer codec data; repair tokenizer.json or disable the operation that requires lossless token bytes"))?
+        .context("byte piece conversion cannot interpret the declared decoder; repair tokenizer.json or disable the operation that requires lossless token bytes")?
         .token_bytes();
     ids.iter().zip(spellings).map(|(id,spelling)| {
         let bytes=vocabulary.get(usize::try_from(*id)?).with_context(|| format!("token id {id} has no byte vocabulary entry"))?;
@@ -148,7 +187,7 @@ pub fn token_pieces(tokenizer: &Tokenizer, ids: &[u32]) -> anyhow::Result<Vec<Ve
         // that exact marker+spelling frame, never an ordinary 0xff byte piece.
         let bytes=if bytes.first()==Some(&TokTrie::SPECIAL_TOKEN_MARKER) && bytes.get(1..)==Some(spelling.as_bytes()) {&bytes[1..]} else {bytes.as_slice()};
         if bytes.is_empty() && !spelling.is_empty() {
-            bail!("token id {id} ({spelling:?}) has no lossless byte piece for the declared decoder; use with_pieces=false or repair tokenizer.json");
+            bail!("token id {id} ({spelling:?}) has no lossless byte piece for the declared decoder; repair tokenizer.json or disable the operation that requires lossless token bytes");
         }
         Ok(bytes.to_vec())
     }).collect()
@@ -186,6 +225,39 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         Tokenizer::from_file(path).unwrap()
     }
+    #[test]
+    fn metaspace_pieces_preserve_initial_space_without_mutating_text_decoding() {
+        let mut value: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/tiny-llm/tokenizer.json"
+        )))
+        .unwrap();
+        let vocab = value["model"]["vocab"].as_object_mut().unwrap();
+        vocab.remove("world");
+        vocab.remove("the");
+        vocab.remove("tok31");
+        vocab.insert("▁world".into(), json!(5));
+        vocab.insert("world".into(), json!(6));
+        vocab.insert("▁SPECIAL".into(), json!(31));
+        value["decoder"] =
+            json!({"type":"Metaspace","replacement":"▁","prepend_scheme":"always","split":true});
+        value["added_tokens"] = json!([{"id":31,"content":"▁SPECIAL","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}]);
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        assert_eq!(tokenizer.decode_with_special_tokens(&[5]).unwrap(), "world");
+        assert_eq!(
+            token_pieces(&tokenizer, &[5, 6, 31]).unwrap(),
+            vec![
+                b" world".to_vec(),
+                b"world".to_vec(),
+                "▁SPECIAL".as_bytes().to_vec()
+            ]
+        );
+        assert_eq!(tokenizer.decode_with_special_tokens(&[5]).unwrap(), "world");
+    }
+
     #[test]
     fn incremental_text_preserves_unicode_boundaries_and_terminal_fragments() {
         for byte_level in [false, true] {

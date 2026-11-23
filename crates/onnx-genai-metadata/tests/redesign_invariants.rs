@@ -1708,3 +1708,88 @@ fn an_audio_feature_tensor_must_stay_request_aligned() {
         "{errors:?}"
     );
 }
+
+#[test]
+fn preferred_end_of_turn_token_must_belong_to_the_generation_stop_set() {
+    let mut document: serde_yaml::Value = serde_yaml::from_str(include_str!(
+        "../../../tests/fixtures/onnx_genai_workflows/decoder/inference_metadata.yaml"
+    ))
+    .unwrap();
+    document["schema_version"] = serde_yaml::Value::String("v1.9".into());
+    document["pipeline"]["workflow"]["publication_mode"] =
+        serde_yaml::Value::String("commit_only".into());
+    for output in document["pipeline"]["workflow"]["outputs"]
+        .as_mapping_mut()
+        .unwrap()
+        .values_mut()
+    {
+        output["family"] =
+            serde_yaml::to_value(serde_json::json!({"kind":"materialized"})).unwrap();
+    }
+    let mut metadata = parse(&serde_yaml::to_string(&document).unwrap());
+    let facts = metadata
+        .package
+        .as_mut()
+        .unwrap()
+        .tokenizer
+        .as_mut()
+        .unwrap()
+        .special_tokens
+        .as_mut()
+        .unwrap();
+    facts.eot_token_id = Some(facts.eos_token_id[0]);
+    validate_metadata(&metadata).unwrap();
+    let encoded = serde_json::to_value(
+        metadata
+            .package
+            .as_ref()
+            .unwrap()
+            .tokenizer
+            .as_ref()
+            .unwrap()
+            .special_tokens
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(encoded["eot_token_id"].is_u64());
+    document["package"]["tokenizer"]["special_tokens"]["eot_token_id"] =
+        serde_yaml::to_value(encoded["eot_token_id"].clone()).unwrap();
+    document["schema_version"] = serde_yaml::Value::String("v1.8".into());
+    let error = onnx_genai_metadata::parse_metadata(
+        &serde_yaml::to_string(&document).unwrap(),
+        Some("yaml"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("eot_token_id") && error.contains("minimum schema version v1.9"),
+        "{error}"
+    );
+    let mut old = metadata.clone();
+    old.schema_version = Some("v1.8".into());
+    assert!(
+        validate_metadata(&old)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("eot_token_id") && e.contains("minimum schema version v1.9"))
+    );
+    metadata
+        .package
+        .as_mut()
+        .unwrap()
+        .tokenizer
+        .as_mut()
+        .unwrap()
+        .special_tokens
+        .as_mut()
+        .unwrap()
+        .eot_token_id = Some(u32::MAX);
+    let errors = validate_metadata(&metadata).unwrap_err();
+    assert!(
+        errors.iter().any(|e| e.contains("eot_token_id")
+            && e.contains("must belong")
+            && e.contains("stop set")),
+        "{errors:?}"
+    );
+}

@@ -520,3 +520,50 @@ four-token selection, negative/omitted-selector behavior, invalid parameter
 rejection and real sampling-stage failure propagation without a fabricated token.
 Strict engine/server all-target Clippy and native benchmark library/profiling/
 no-model benchmark Clippy pass. Other unchecked delivery requirements remain open.
+
+Infill-selector milestone: the explicitly ordered `infill` stage implements the
+upstream ending-mass check, probability-rank prefix merging, two retention
+thresholds and preferred forced ending. It reuses lossless tokenizer byte pieces,
+including non-UTF-8 fragments, and excludes tokenizer-declared special pieces from prefix merging. A numeric
+ending role alone never changes an ordinary token's byte piece. Immutable lexical prefix ranges are shared across repeated
+stages; a live rank-minimum index visits only prefix-related active candidates.
+Every merge removes one candidate, bounding merging to O(V log V) rather than
+copying upstream's O(V²) nested scan into a public endpoint. A literal small-input
+reference checks rank-order equivalence, ties and byte fragments.
+
+Identity-sensitive chains now carry the actual logical candidate ids in addition
+to cardinality. Top-k/fused-k/p/probability truncations and XTC describe their
+retention; mask-only stages preserve slots. Dynamic temperature after infill
+therefore sees the correct denominator, including retained masked EOS records.
+An extension that changes cardinality without an identity contract fails clearly.
+Chains without such a stage retain their prior count-only/stateless execution.
+
+Package token facts optionally declare `eot_token_id`, constrained to the
+existing EOS set. One validated end-token policy flows through ordinary and
+continuous/static batch paths; explicit EOS overrides remain authoritative.
+The fallback can restore a role excluded by an optional sampler, while the
+input/model and mandatory bias/grammar masks remain binding. Unavailable endings, byte codecs
+and vocabulary inconsistencies report actionable failures. Schema and token
+authority documentation describe the new optional role. Integrated main #2431.
+
+Preferred-ending facts introduce schema v1.9. Both untyped parser presence checks
+and typed metadata validation use the same minimum-version gate; older versions
+remain accepted without the new role. Future-version refusal tests now use v1.10,
+and v1.8 compressed-state documents retain their existing minimum version.
+The true HTTP package declares its publication mode and materialized output
+family when exercising the preferred EOT role, instead of relabeling a legacy
+document with a newer version while omitting its required contracts.
+
+Metaspace byte pieces retain their initial whitespace independently of full-text
+first-token decoding. Decoder normalization is local to piece extraction and
+never mutates the shared tokenizer; registered special spellings remain literal.
+The regression distinguishes space-prefixed and ordinary vocabulary pieces.
+
+Infill validation: full metadata tests passed; full native engine library
+834 passed / 1 inherited ignore, and full server library 400 passed / 2 inherited
+ignores. The HTTP case covers native/legacy/chat endings, real byte-prefix
+selection and a package-declared preferred EOT fallback. After the final
+Metaspace correction, all 3 selected tokenization and 7 selected infill cases
+passed. Strict metadata, engine and server all-target Clippy and native benchmark
+library/profiling/no-model benchmark Clippy passed. These are functional checks
+on this macOS ARM64 host; remaining delivery rows above remain open.

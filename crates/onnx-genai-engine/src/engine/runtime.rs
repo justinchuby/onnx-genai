@@ -935,6 +935,17 @@ impl Engine {
         Ok(Vec::new())
     }
 
+    pub(crate) fn default_end_token_policy(&self) -> anyhow::Result<EndTokenPolicy> {
+        let eot = self
+            .metadata
+            .package
+            .as_ref()
+            .and_then(|p| p.tokenizer.as_ref())
+            .and_then(|t| t.special_tokens.as_ref())
+            .and_then(|t| t.eot_token_id);
+        EndTokenPolicy::new(self.default_eos_token_ids()?, eot)
+    }
+
     /// Apply the model's stop condition to a request.
     ///
     /// Every effective EOS id becomes a stop sequence, not just the first. A
@@ -946,8 +957,7 @@ impl Engine {
     /// package defaults come from
     /// `package.tokenizer.special_tokens.eos_token_id`.
     pub(super) fn apply_eos_defaults(&self, options: &mut GenerateOptions) -> anyhow::Result<()> {
-        apply_eos_policy(options, &self.default_eos_token_ids()?);
-        Ok(())
+        apply_eos_policy(options, &self.default_end_token_policy()?)
     }
 
     /// Effective context limit for a request, combining model metadata,
@@ -6532,25 +6542,51 @@ mod tests {
     }
 }
 
+/// Validated package end-of-generation roles, including the preferred end of turn.
+#[derive(Clone)]
+pub(crate) struct EndTokenPolicy {
+    eos: Vec<TokenId>,
+    eot: Option<TokenId>,
+}
+impl EndTokenPolicy {
+    pub(crate) fn new(eos: Vec<TokenId>, eot: Option<TokenId>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            eot.is_none_or(|id| eos.contains(&id)),
+            "eot_token_id must belong to the package eos_token_id set; declare its end-of-turn role in the stop set"
+        );
+        Ok(Self { eos, eot })
+    }
+}
+
 /// Apply a model's end tokens to a request.
 ///
 /// The one implementation, shared by the single-row path, the continuous batch
 /// manager and static batching. Three copies of this is how a model stops
 /// correctly on one route and runs past its end on another — which is
 /// unobservable from the API and shows up as a serving-only bug.
-pub(crate) fn apply_eos_policy(options: &mut GenerateOptions, ids: &[TokenId]) {
+pub(crate) fn apply_eos_policy(
+    options: &mut GenerateOptions,
+    policy: &EndTokenPolicy,
+) -> anyhow::Result<()> {
     if let Some(id) = options.eos_token_id {
         if !options.eos_token_ids.contains(&id) {
             options.eos_token_ids.push(id);
         }
-        return;
-    }
-    if !options.eos_token_ids.is_empty() {
+    } else if !options.eos_token_ids.is_empty() {
         options.eos_token_id = options.eos_token_ids.first().copied();
-        return;
+    } else {
+        options.eos_token_ids.extend_from_slice(&policy.eos);
+        options.eos_token_id = options.eos_token_ids.first().copied();
     }
-    options.eos_token_ids.extend_from_slice(ids);
-    options.eos_token_id = options.eos_token_ids.first().copied();
+    if let Some(id) = options.eot_token_id {
+        anyhow::ensure!(
+            options.eos_token_ids.contains(&id),
+            "eot_token_id {id} is absent from the effective eos_token_id set; include it in the stop set or omit the override"
+        );
+    } else {
+        options.eot_token_id = policy.eot.filter(|id| options.eos_token_ids.contains(id));
+    }
+    Ok(())
 }
 
 /// The legacy direct decode path cannot be selected.
@@ -6622,5 +6658,33 @@ mod canonical_refusal_tests {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod end_token_policy_tests {
+    use super::*;
+    #[test]
+    fn preferred_end_of_turn_role_respects_request_eos_overrides() {
+        let policy = EndTokenPolicy::new(vec![3, 4], Some(4)).unwrap();
+        let mut defaults = GenerateOptions::default();
+        apply_eos_policy(&mut defaults, &policy).unwrap();
+        assert_eq!(defaults.eos_token_ids, [3, 4]);
+        assert_eq!(defaults.eot_token_id, Some(4));
+        let mut override_ = GenerateOptions {
+            eos_token_id: Some(7),
+            ..Default::default()
+        };
+        apply_eos_policy(&mut override_, &policy).unwrap();
+        assert_eq!(override_.eos_token_ids, [7]);
+        assert_eq!(override_.eot_token_id, None);
+        override_.eot_token_id = Some(4);
+        assert!(
+            apply_eos_policy(&mut override_, &policy)
+                .unwrap_err()
+                .to_string()
+                .contains("effective eos_token_id")
+        );
+        assert!(EndTokenPolicy::new(vec![3], Some(4)).is_err());
     }
 }

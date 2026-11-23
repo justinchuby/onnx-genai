@@ -293,6 +293,20 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
             crate::MetadataError::UnsupportedSchema(error)
         }
     })?;
+    if document
+        .get("package")
+        .and_then(|p| p.get("tokenizer"))
+        .and_then(|t| t.get("special_tokens"))
+        .and_then(|t| t.get("eot_token_id"))
+        .is_some()
+    {
+        crate::version::gate_feature_use(
+            version,
+            crate::version::SchemaFeature::PreferredEnding,
+            "package.tokenizer.special_tokens.eot_token_id",
+        )
+        .map_err(crate::MetadataError::Parse)?;
+    }
     gate_output_protocol_features(document, version)?;
     gate_compressed_state_features(document, version)?;
     reject_retired_streaming_emit(document)?;

@@ -473,6 +473,10 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
         COMPRESSED_STATE_SCHEMA_VERSION,
         "typed compressed-attention record/carry groups with explicit cadence, format, roles, batch geometry, and fail-closed validation",
     ),
+    (
+        crate::version::PREFERRED_ENDING_SCHEMA_VERSION,
+        "preferred `eot_token_id` is a member of the package EOS set, with explicit ending-role inheritance and authoritative request EOS overrides",
+    ),
 ];
 
 /// Look up a built-in extension by its exact declared identity and version.

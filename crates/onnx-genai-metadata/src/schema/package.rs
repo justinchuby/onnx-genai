@@ -100,6 +100,9 @@ pub struct TokenFacts {
     /// Every token id that terminates package-default autoregressive generation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub eos_token_id: Vec<u32>,
+    /// Preferred end-of-turn token (schema v1.9+); must belong to eos_token_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eot_token_id: Option<u32>,
     /// Separator token used by sequence-pair models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sep_token_id: Option<u32>,

@@ -83,7 +83,7 @@ mod model;
 #[cfg(feature = "native-backend")]
 mod placement;
 mod runtime;
-pub(crate) use runtime::apply_eos_policy;
+pub(crate) use runtime::{EndTokenPolicy, apply_eos_policy};
 mod session_fork;
 pub(crate) mod session_state;
 mod speculative_load;

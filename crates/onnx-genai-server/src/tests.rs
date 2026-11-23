@@ -6549,6 +6549,134 @@ mod native_compat {
     }
 
     #[tokio::test]
+    async fn infill_sampler_merges_token_prefixes_and_selects_real_endings() {
+        let router = app(tiny_state());
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    match id {
+                        3 | 5 => json!(1e20),
+                        _ => json!(false),
+                    },
+                )
+            })
+            .collect();
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
+            for seed in 0..8 {
+                let mut body =
+                    json!({"max_tokens":4,"samplers":["infill"],"logit_bias":bias,"seed":seed});
+                if path == "/v1/chat/completions" {
+                    body["messages"] = json!([{"role":"user","content":"world"}]);
+                } else {
+                    body["prompt"] = json!([5]);
+                }
+                if path == "/completion" {
+                    body["return_tokens"] = json!(true);
+                }
+                let response = request(router.clone(), path, body).await;
+                let status = response.status();
+                let value = json_body(response).await;
+                assert_eq!(status, StatusCode::OK, "{path}: {value}");
+                if path == "/completion" {
+                    assert_eq!(value["tokens"], json!([3]), "{value}");
+                    assert_eq!(value["stop_type"], "eos");
+                } else {
+                    assert_eq!(value["choices"][0]["finish_reason"], "stop");
+                    assert_eq!(value["usage"]["completion_tokens"], 1);
+                }
+            }
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        vocab.remove("world");
+        vocab.remove("the");
+        vocab.insert("a".into(), json!(5));
+        vocab.insert("ab".into(), json!(6));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let metadata_path = scratch.path().join("inference_metadata.yaml");
+        let mut metadata: serde_yaml::Value =
+            serde_yaml::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+        metadata["schema_version"] = serde_yaml::Value::String("v1.9".into());
+        metadata["pipeline"]["workflow"]["publication_mode"] =
+            serde_yaml::Value::String("commit_only".into());
+        for output in metadata["pipeline"]["workflow"]["outputs"]
+            .as_mapping_mut()
+            .unwrap()
+            .values_mut()
+        {
+            output["family"] = serde_yaml::to_value(json!({"kind":"materialized"})).unwrap();
+        }
+        metadata["package"]=serde_yaml::to_value(json!({"tokenizer":{"algorithm":"wordlevel","vocab_size":32,"byte_level":false,"artifacts":[{"location":"tokenizer.json"}],"special_tokens":{"eos_token_id":[3,2],"eot_token_id":2}}})).unwrap();
+        std::fs::write(metadata_path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("prefix-fixture".into())).unwrap());
+        let bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    if id == 5 || id == 6 {
+                        json!(1e20)
+                    } else {
+                        json!(false)
+                    },
+                )
+            })
+            .collect();
+        let mut raw_selected_second = false;
+        for seed in 0..16 {
+            for stages in [json!([]), json!(["infill"])] {
+                let response=request(router.clone(),"/completion",json!({"prompt":[5],"max_tokens":1,"samplers":stages,"logit_bias":bias,"seed":seed,"return_tokens":true,"ignore_eos":true})).await;
+                let status = response.status();
+                let value = json_body(response).await;
+                assert_eq!(status, StatusCode::OK, "{value}");
+                if stages == json!(["infill"]) {
+                    assert_eq!(value["tokens"], json!([5]), "{value}");
+                } else {
+                    raw_selected_second |= value["tokens"] == json!([6]);
+                }
+            }
+        }
+        assert!(
+            raw_selected_second,
+            "raw categorical sampling must retain both prefix-related candidates"
+        );
+        let fallback_bias: serde_json::Map<String, Value> = (0..32)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    if [4, 5, 7, 8, 9, 10].contains(&id) {
+                        json!(1e20)
+                    } else if id == 2 || id == 3 {
+                        json!(0)
+                    } else {
+                        json!(false)
+                    },
+                )
+            })
+            .collect();
+        let response=request(router,"/completion",json!({"prompt":[5],"max_tokens":1,"samplers":["infill"],"logit_bias":fallback_bias,"return_tokens":true})).await;
+        let status = response.status();
+        let value = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(
+            value["tokens"],
+            json!([2]),
+            "declared end-of-turn role must take precedence over primary EOS 3: {value}"
+        );
+        assert_eq!(value["stop_type"], "eos");
+    }
+
+    #[tokio::test]
     async fn adaptive_p_selects_low_probability_tokens_through_all_generation_protocols() {
         let router = app(tiny_state());
         let bias: serde_json::Map<String, Value> = (0..32)

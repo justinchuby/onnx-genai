@@ -1234,6 +1234,7 @@ impl AdaptivePConfig {
 pub enum SamplerStage {
     Penalties,
     AdaptiveP,
+    Infill,
     Dry,
     TopNSigma,
     TopK,
@@ -1253,6 +1254,7 @@ impl<'de> Deserialize<'de> for SamplerStage {
         match normalized.as_str() {
             "penalties" => Ok(Self::Penalties),
             "adaptivep" => Ok(Self::AdaptiveP),
+            "infill" => Ok(Self::Infill),
             "dry" => Ok(Self::Dry),
             "topnsigma" => Ok(Self::TopNSigma),
             "topk" => Ok(Self::TopK),
@@ -1263,7 +1265,7 @@ impl<'de> Deserialize<'de> for SamplerStage {
             "xtc" => Ok(Self::Xtc),
             "temperature" | "temp" => Ok(Self::Temperature),
             _ => Err(serde::de::Error::custom(format!(
-                "samplers contains unsupported stage '{value}'; use penalties, adaptive_p, dry, top_n_sigma, top_k, typ_p, top_p, min_p, top_a, xtc or temperature"
+                "samplers contains unsupported stage '{value}'; use penalties, adaptive_p, infill, dry, top_n_sigma, top_k, typ_p, top_p, min_p, top_a, xtc or temperature"
             ))),
         }
     }
@@ -1364,6 +1366,8 @@ pub struct GenerateOptions {
     /// A model may have several package-default end tokens, so callers that
     /// need a multi-id override use [`Self::eos_token_ids`].
     pub eos_token_id: Option<TokenId>,
+    /// Preferred end-of-turn token for infill; must be in the effective EOS set.
+    pub eot_token_id: Option<TokenId>,
     /// A caller's optional multi-id EOS override.
     ///
     /// When neither request field is set, the engine copies the package default
@@ -1424,6 +1428,7 @@ impl Default for GenerateOptions {
             seed: None,
             stop_sequences: Vec::new(),
             eos_token_id: None,
+            eot_token_id: None,
             eos_token_ids: Vec::new(),
             stop_on_eos: true,
             max_context: None,

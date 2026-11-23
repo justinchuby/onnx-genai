@@ -108,7 +108,7 @@ use the common incremental text decoder for their content as well.
 
 Runtime-owned token policies accept an ordered `samplers` array of at most 64
 stages: `penalties`, `dry`, `top_n_sigma`, `top_k`, `typ_p`, `top_p`, `min_p`,
-`top_a`, `xtc`, `temperature` and `adaptive_p`. Case, kebab/compact spellings and upstream
+`top_a`, `xtc`, `temperature`, `infill` and `adaptive_p`. Case, kebab/compact spellings and upstream
 `nucleus`/`temp`/`typ` aliases are accepted. An empty list applies no optional
 stages; omitted stages stay omitted and repeated stages run again. Bias, grammar
 and stop contracts always remain active. The default ordering follows the pinned
@@ -146,7 +146,19 @@ Request-local checkpoints restore the EMA when speculative choices are discarded
 on host and cannot be skipped by a device argmax shortcut. Mirostat takes
 precedence over the ordered selector list, following upstream.
 
-Infill selector stages, thinking budgets, continuation of a final
+`infill` follows the upstream ending-mass test, rank-ordered byte-prefix merges
+and probability thresholds. Logical candidate identities survive preceding
+truncations; mask-only stages retain their slots, including masked ending tokens.
+The preferred forced ending comes from the package's optional
+`tokenizer.special_tokens.eot_token_id` (schema v1.9+), which must also belong to its EOS set;
+otherwise the effective primary EOS is used. Request EOS overrides remain
+binding. A forced ending may replace an optional filter's exclusion, but a
+input model mask, mandatory token ban or grammar exclusion produces an actionable
+error. Ending roles do not imply special-token types: only tokenizer-declared
+special pieces are suppressed during prefix matching.
+The selector requires lossless tokenizer byte pieces and declared ending roles.
+
+Thinking budgets, continuation of a final
 assistant message and other unsupported active controls still return actionable
 request errors.
 Optional progress/control subscription fields from Llama Chat are accepted, but
