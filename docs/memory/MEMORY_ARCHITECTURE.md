@@ -221,6 +221,27 @@ is disabled. Host and NVRTC limits are emitted from one definition, and the
 partial/merge arguments share the same borrowed backing. No extra pool, quota
 transaction, or per-launch allocation is introduced.
 
+### CUDA variadic Sum/Mean temporary storage
+
+Sum/Mean use one prepared workspace with two checked regions: an f32 accumulator
+for the broadcast output and all inputs' shape/stride metadata. Metadata slices
+are offsets into that owner, not separately admitted allocations. The bound is
+`output_numel * sizeof(f32)`, aligned for the following
+`inputs * output_rank * 2 * sizeof(u64)` bytes. Empty outputs need no workspace;
+scalar metadata has zero words. Layout overflow and incomplete backing fail before
+upload or launch.
+
+A single host pack/upload precedes every accumulation launch. This preserves
+input summation order and f32 accumulation for half inputs while removing the
+per-input allocation/upload loop. The kernel no longer synchronizes merely to
+free temporary buffers; normal executor ownership and deferred retirement cover
+successful and failed launches. Capacity is SessionPersistent to avoid admission
+churn on deferred device-binding requests. Contents remain invocation-local.
+Synchronous metadata upload still drains prior compute once, and capture remains
+explicitly unsupported until metadata preparation has a capture-safe contract.
+No new pool, quota interface or issuer callback is introduced in execution.
+CUDA numerical, asynchronous-failure and throughput validation require a device.
+
 ### CPU compressed-projection scratch
 
 CPU `BlockQuantizedMatMul` and `BlockQuantizedMoE` declare metadata-planned,

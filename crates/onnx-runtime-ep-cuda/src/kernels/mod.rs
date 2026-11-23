@@ -1742,7 +1742,7 @@ pub fn build_cuda_registry_with_metrics(
     // Variadic elementwise (nary.rs) — Sum/Mean, f32/f16/bf16 broadcasting.
     reg.register(
         OpKey::new("Sum", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(nary::NaryFactory {
             is_mean: false,
             runtime: runtime.clone(),
@@ -1750,7 +1750,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("Mean", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(nary::NaryFactory {
             is_mean: true,
             runtime: runtime.clone(),
