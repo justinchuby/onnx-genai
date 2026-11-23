@@ -1586,7 +1586,7 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    for opset in [23, 24] {
+    for opset in [23, 24, 25] {
         reg.register(
             OpKey::new("Attention", "", opset),
             onnx_runtime_ep_api::WorkspacePlanning::Metadata,

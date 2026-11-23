@@ -30,7 +30,7 @@ pub use builder::{
     PatternSequence, PatternValue,
 };
 pub use execute::{
-    AttributeCapture, BindingView, BoundaryPolicy, DimensionValue, Match, MatchBudget,
+    AttributeCapture, BindingView, BoundaryPolicy, DimensionValue, EscapingUse, Match, MatchBudget,
     MatchBudgetScope, MatchOptions, MatchSession, ScopedValue, ValueCapture,
 };
 

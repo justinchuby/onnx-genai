@@ -317,7 +317,7 @@ fn qlinear_matmul_cases() -> Vec<Case> {
 
 fn resize_cases() -> Vec<Case> {
     let image = [1.0, 2.0, 4.0, 8.0, 3.0, 5.0];
-    vec![
+    let mut cases = vec![
         Case {
             label: "Resize[nearest,asymmetric,scales,upsample]".into(),
             op: "Resize",
@@ -461,6 +461,95 @@ fn resize_cases() -> Vec<Case> {
             ],
             compare: Compare::Float { tol: 3e-3 },
         },
+    ];
+    cases.extend(resize_symmetric_cases());
+    cases
+}
+
+fn resize_symmetric_cases() -> Vec<Case> {
+    let case = |label: &str,
+                data: Tensor,
+                control,
+                output_shape,
+                mode: &str,
+                axes: Option<Vec<i64>>,
+                sizes| {
+        let mut inputs = vec![data, input(DataType::Float32, &[0], &[] as &[f32])];
+        if sizes {
+            inputs.push(input(DataType::Float32, &[0], &[] as &[f32]));
+        }
+        inputs.push(control);
+        let mut attrs = vec![
+            ("mode", Attribute::String(mode.as_bytes().to_vec())),
+            (
+                "coordinate_transformation_mode",
+                Attribute::String(b"half_pixel_symmetric".to_vec()),
+            ),
+        ];
+        let nearest = mode == "nearest";
+        if nearest {
+            attrs.push(("nearest_mode", Attribute::String(b"floor".to_vec())));
+        }
+        if let Some(axes) = axes {
+            attrs.push(("axes", Attribute::Ints(axes)));
+        }
+        Case {
+            label: label.into(),
+            op: "Resize",
+            domain: "",
+            opset: 19,
+            inputs,
+            outputs: vec![(DataType::Float32, output_shape)],
+            attrs,
+            compare: if nearest {
+                Compare::ExactBytes
+            } else {
+                Compare::Float { tol: 1e-5 }
+            },
+        }
+    };
+    // ONNX backend test vectors from commit 622adf94d4e720142950aa8178f7357d52e63db0.
+    vec![
+        case(
+            "Resize[linear,half-pixel-symmetric,scales,downsample]",
+            float_input(DataType::Float32, &[1, 1, 1, 4], &[1., 2., 3., 4.]),
+            input(DataType::Float32, &[4], &[1.0f32, 1., 1., 0.6]),
+            vec![1, 1, 1, 2],
+            "linear",
+            None,
+            false,
+        ),
+        case(
+            "Resize[linear,half-pixel-symmetric,scales,upsample]",
+            float_input(DataType::Float32, &[1, 1, 2, 2], &[1., 2., 3., 4.]),
+            input(DataType::Float32, &[4], &[1.0f32, 1., 2.3, 2.94]),
+            vec![1, 1, 4, 5],
+            "linear",
+            None,
+            false,
+        ),
+        case(
+            "Resize[nearest,half-pixel-symmetric,scales,negative-axis]",
+            float_input(
+                DataType::Float32,
+                &[2, 4],
+                &[1., 2., 3., 4., 5., 6., 7., 8.],
+            ),
+            input(DataType::Float32, &[1], &[0.6f32]),
+            vec![2, 2],
+            "nearest",
+            Some(vec![-1]),
+            false,
+        ),
+        case(
+            "Resize[linear,half-pixel-symmetric,sizes,reordered-axes]",
+            float_input(DataType::Float32, &[2, 1, 3], &[1., 2., 3., 4., 5., 6.]),
+            input(DataType::Int64, &[2], &[5i64, 1]),
+            vec![1, 1, 5],
+            "linear",
+            Some(vec![-1, 0]),
+            true,
+        ),
     ]
 }
 
@@ -2899,7 +2988,7 @@ fn dedicated_suites_exist_and_name_their_op() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Run one inline case on CUDA and compare to the CPU oracle.
-fn run_case(ep: &CudaExecutionProvider, case: &Case) {
+fn run_case(ep: &CudaExecutionProvider, case: &Case) -> Vec<Vec<u8>> {
     let cuda = run_cuda(
         ep,
         case.op,
@@ -2951,8 +3040,38 @@ fn run_case(ep: &CudaExecutionProvider, case: &Case) {
             }
         }
     }
+    cuda
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn resize_19_symmetric_matches_onnx_and_cpu() {
+    let ep = require_cuda();
+    let cases = resize_symmetric_cases();
+    let expected: [&[f32]; 4] = [
+        &[1.6666667, 3.3333333],
+        &[
+            1., 1.159864, 1.5, 1.840136, 2., 1.5652174, 1.7250813, 2.0652174, 2.4053535, 2.5652175,
+            2.4347825, 2.5946467, 2.9347825, 3.2749186, 3.4347825, 3., 3.159864, 3.5, 3.840136, 4.,
+        ],
+        &[1., 3., 5., 7.],
+        &[2.5, 2.9, 3.5, 4.1, 4.5],
+    ];
+    assert_eq!(cases.len(), expected.len());
+    for (case, expected) in cases.iter().zip(expected) {
+        let output = run_case(&ep, case);
+        assert_close(
+            &case.label,
+            DataType::Float32,
+            &decode_floats(&output[0], DataType::Float32),
+            expected,
+            1e-5,
+        );
+    }
+}
 /// Execute every inline `Sweep` case against the CPU oracle on the real GPU.
 /// Fails loudly on a host without a CUDA device when `gpu-tests` is enabled.
 #[cfg_attr(

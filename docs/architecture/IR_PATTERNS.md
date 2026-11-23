@@ -421,12 +421,21 @@ dispatch and ordinary constant folding remain separate.
 |---|---|
 | CPU | SiLU, quantized-matmul bias, gate/up and sibling projections, Conv/BatchNorm/optional Relu |
 | CUDA | SiLU, reciprocal square root, L2 normalization, bias, SwiGLU/gate-up, residual/RMSNorm projection neighborhoods, activation/decay chains, normalization Cast, bounded QKV paths and existing constant/threshold If recognizers |
-| Shared fusion | Connected chains, shared/split-Sub LayerNorm, exact GELU, masked/unmasked SDPA with optional K transpose |
+| Shared fusion | Connected chains, shared/split-Sub LayerNorm, exact GELU, masked/unmasked SDPA with optional K transpose, affine grouped-matmul nibble decode (`Unpack` or ordered bitwise expansion) |
 
 These are recognizers, not numerical-equivalence proofs. Existing constant,
 axis, dtype/layout, broadcast, alias, liveness and kernel eligibility guards
 remain separate. Rules request `OrtBoundary`; intentionally retained additional
 outputs, such as a residual sum, are explicit returns.
+
+Affine grouped matmul can combine weight and zero-point decoders that share
+intermediates. It matches each decoder structurally and uses
+`MatchSession::first_escaping_use` (also used by `OrtBoundary`) on the exact
+combined rewrite region, retaining the projection output. To investigate a
+specific missed fusion, call `onnx_runtime_optimizer::quantized_grouped::explain_at`
+on the original graph and `GroupedMatMul` node. It reports a topology near
+miss, an eligibility rejection, or the first escaping value and its use,
+without logging every candidate or printing initializer contents.
 
 LayerNorm eligibility proves a square with immutable exponent 2, exact scalar
 coefficient payloads, rank-preserving broadcasts, and matching kept-dimension

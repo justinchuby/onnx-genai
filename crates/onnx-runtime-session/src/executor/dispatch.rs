@@ -261,6 +261,7 @@ impl Executor {
         }
         let dead = std::mem::take(&mut self.plan[pi].dead_after);
         for &vid in &dead {
+            self.string_values.remove(&vid);
             if external.inputs.contains_key(&vid)
                 || external.outputs.contains_key(&vid)
                 || self.pinned.contains(&vid)
@@ -513,6 +514,9 @@ impl Executor {
         // disjoint `&mut self.<field>` borrows the compute path takes (the
         // dispatch never goes through a `&mut self` method while they are held).
         let node_id = self.plan[pi].node_id;
+        if self.plan[pi].managed_strings {
+            return self.exec_host_string_node(pi, resolved, external);
+        }
         let graph_kernel = self.plan[pi].graph_kernel;
         let workspace_planning = self.plan[pi].workspace_planning;
         // Refill the reusable per-executor input-shape scratch first (before the
