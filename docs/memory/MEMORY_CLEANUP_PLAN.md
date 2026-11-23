@@ -235,8 +235,9 @@ GPU/CPU execution splits, capture lifetime and asynchronous release ordering.
 
 `BlockQuantizedMoE` now admits dense execution only when the complete selected
 expert projection set (including an optional third projection) fits
-`ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES`. Otherwise it decodes one weight row per
-explicit Rayon shard and applies that row to every token routed to the expert.
+`ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES`. Otherwise it decodes a bounded tile per
+Rayon shard and reuses it for the expert's tokens. Portable native compute uses
+up to four rows; the existing AVX2/MLAS routes retain one.
 Routing, activation, gates and accumulation share the existing implementation;
 format metadata and the canonical decoder remain the only format authority.
 Zero budget selects streaming without hashing constant identities or building
@@ -244,7 +245,10 @@ dense cache entries. Contiguous packed weights are borrowed; strided inputs copy
 only the selected expert's compressed bytes. Mutable inputs are read each call.
 
 For a projection with input width K and N output features, at most
-`min(Rayon workers, N) * (K + 256)` f32 values are live as decoded-weight scratch.
+`min(Rayon workers, N) * (FEATURE_TILE * K + 256)` f32 values are live as
+decoded-weight storage. FEATURE_TILE is four for portable native compute and one
+for AVX2/MLAS; actual allocations shrink to each shard's feature count. This
+remains call-owned scratch, not a public-workspace or complete process grant.
 This excludes grouped activations, output-sized intermediate storage, compressed
 strided copies and other concurrent calls. The cache budget is an eligibility
 rule, not a process-wide working-memory grant; evicted Arcs can still be held by
@@ -2051,3 +2055,27 @@ capture-audit failures (3 pass / 2 fail); the final source passes all five
 capture_sync_contract guards without changing any guard or allowlist. CUDA
 all-target strict Clippy with cuda,gpu-tests and the seven metadata tests also
 pass on this Host-only setup. Records are /tmp/nxrt-workspace-role-capture-*.
+
+
+### Portable output tiles preserve K order and keep resource operations coarse
+
+The portable NT kernel uses independent 4x4 outputs with unchanged per-output
+f32 K accumulation. BlockQuantizedMatMul/MoE reuse at most four decoded rows per
+worker; AVX2/MLAS and NBits/QMoE retain one. The generic decoder binds one tile
+and one decoder state per shard, reuses them across features, clamps capacity
+to the actual shard width and checks size multiplication before allocation.
+No extra issuer, cache, scheduler or public EP workspace API is introduced.
+This is still call-owned scratch; it is not a complete memory-governance claim.
+
+The initial sixteen-lane K reduction was rejected by a real argmax change.
+The replacement pins that two-ULP boundary and matches scalar output bits across
+micro-tile edges. All 96 default-build public operator runs retain exact output
+bytes and argmaxes. The [full evidence and rejected controls](../benchmarks/portable-nt-microtiles/README.md)
+record process CPU time and absolute RSS on M1 Max, the real 64 MiB derived-weight
+Host cap, retained-grant/cache-hit checks, normal/reference build tests and
+remaining MLAS gaps. Resource-bound review and self-review found no blockers.
+All heavy work shares the stable flock with the llama.cpp chat. A source-path
+confound and too-short control samples were corrected before interpreting the
+final sweep; one remaining failed timing control is excluded, and a focused
+same-binary A/A check resolves the noisy unchanged dense path without claiming
+a speedup there.

@@ -1,5 +1,11 @@
 # CPU block-MoE row streaming
 
+This report records the historical one-row-per-worker implementation and its
+measurements. The later portable NT micro-tile change uses up to four decoded
+rows per worker, sized to the actual shard; AVX2/MLAS retain one. The measurements
+and one-row scratch formula below describe the historical version, not that
+later implementation.
+
 The complete f32 projection set of one selected expert must fit
 `ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES` to use dense execution. Otherwise the
 CPU EP decodes one row per worker shard and reuses it for all grouped tokens.

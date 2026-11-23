@@ -1989,7 +1989,7 @@ impl ExpertProjection for QuantizedExpertProjection<'_, '_> {
         self.source.in_features
     }
     fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
-        super::decoded_projection::linear_decoded_grouped(
+        super::decoded_projection::linear_decoded_grouped::<1, _>(
             "QMoE NBits expert",
             input,
             rows,
@@ -1997,7 +1997,7 @@ impl ExpertProjection for QuantizedExpertProjection<'_, '_> {
             self.out_features(),
             bias,
             || |row, output: &mut [f32]| self.source.decode_expert_row(self.expert, row, output),
-            |input, row, output, rows, k| {
+            |input, row, output, rows, k, _features| {
                 super::matmul::gemm_bt_serial(input, row, output, rows, k, 1)
             },
             super::decoded_projection::rayon_decoded_columns,

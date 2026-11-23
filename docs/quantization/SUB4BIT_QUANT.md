@@ -257,8 +257,9 @@ standardized layouts without changing the meaning of old models.
 The CPU v1 implementation registers this op in `pkg.nxrt`, accepts f32/f16/bf16
 `A`, native uint8 `packed_B`, and an optional same-dtype bias. It computes in
 f32. When the complete dense weight fits the per-kernel cache policy and its
-Host grant is admitted, it uses the shared CPU GEMM. Otherwise it decodes one row per worker shard and reuses that
-row across the flattened token batch, using the same bounded projection helper
+Host grant is admitted, it uses the shared CPU GEMM. Otherwise it decodes a bounded tile per worker shard and reuses it
+across the flattened token batch: up to four rows for portable native compute,
+one for the existing AVX2/MLAS routes, using the same bounded projection helper
 as `BlockQuantizedMoE`. Zero budget selects streaming, avoiding full f32 weight
 expansion and constant-identity hashing. Contiguous packed weights are borrowed;
 strided weights materialize only compressed bytes. Bias, arbitrary leading

@@ -798,9 +798,26 @@ pub(super) fn dequantize_weight_kn(
 }
 
 /// Apply canonical compressed rows without materializing the full f32 weight
-/// matrix. At most one decoded weight row per explicit worker shard is live;
-/// all tokens in the expert group reuse that row before it is overwritten.
+/// matrix. Portable compute keeps at most four decoded rows per worker;
+/// reference/AVX2 routes retain one row. Every tile is reused across tokens.
 pub(super) fn linear_packed_grouped(
+    format: BlockFormat,
+    packed: &[u8],
+    input: &[f32],
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    bias: Option<&[f32]>,
+) -> Result<Vec<f32>> {
+    if super::matmul::serial_projection_is_portable() {
+        linear_packed_tiled::<4>(format, packed, input, rows, in_features, out_features, bias)
+    } else {
+        linear_packed_tiled::<1>(format, packed, input, rows, in_features, out_features, bias)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_packed_tiled<const FEATURE_TILE: usize>(
     format: BlockFormat,
     packed: &[u8],
     input: &[f32],
@@ -828,7 +845,7 @@ pub(super) fn linear_packed_grouped(
         )));
     }
     let decoder = format.decoder();
-    super::decoded_projection::linear_decoded_grouped(
+    super::decoded_projection::linear_decoded_grouped::<FEATURE_TILE, _>(
         "block-quantized projection",
         input,
         rows,
@@ -848,7 +865,16 @@ pub(super) fn linear_packed_grouped(
                 Ok(())
             }
         },
-        |input, row, output, rows, k| super::matmul::gemm_bt_serial(input, row, output, rows, k, 1),
+        // C^T = decoded_rows * input^T writes the column-major tile directly.
+        // Independent decoded rows provide SIMD outputs even for one token.
+        |input, decoded, output, rows, k, features| {
+            if FEATURE_TILE == 1 {
+                // Preserve the established reference/AVX2 operand geometry.
+                super::matmul::gemm_bt_serial(input, decoded, output, rows, k, 1)
+            } else {
+                super::matmul::gemm_bt_serial(decoded, input, output, features, k, rows)
+            }
+        },
         super::decoded_projection::rayon_decoded_columns,
     )
 }

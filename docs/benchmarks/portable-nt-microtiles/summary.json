@@ -1,0 +1,991 @@
+{
+  "scope": "order-preserving candidate; actual public governed CPU EP BlockQuantizedMatMul and BlockQuantizedMoE, MXFP4->f32; default builds with no MLAS feature; synthetic operator inputs, not a model throughput/token benchmark",
+  "platform": "Apple M1 Max / ARM64 / macOS27",
+  "baseline_commit": "85ce6095ea84b906f17359edba40529bcdc525f6",
+  "baseline_main_tree_equivalent": "2db3593a0a64324d19d274791846f832d97c94b4",
+  "sampling": "warm each operator for 50 ms CPU, common repetitions per shape chosen from pilot to target >=20 ms CPU per batch (floor gate 15 ms), same manifest/source path, clean changed packages for each source arm; 9 CPU-time batches per process, median of 3 isolated processes/arm; before-after / after-before / before-after; stable shared flock; Relu warm1000, median9batches x30000 CPU-time control; getrusage absolute process high-water RSS includes setup, not differenced",
+  "rss_scope": "absolute getrusage ru_maxrss sampled at the end of operator warmup/timing, including setup but before later serialization/Relu control; not a peak delta",
+  "source": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs": "d17333bf2056d33307a2ba7cf1ab83f7b6aba83ca42199aa0a8d97325b755caa",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs": "4d80fa429f4777823adb7b3c771ff72ff821ba064bea9a696da8c64032445aad",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "87c38a762e6eebff6b83c7a4d6074c1bab0330cd11137fe3d6975c9c6bec1480",
+    "crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs": "7819b13d41587186b748cd38db20bf2790502530bf517c480db1d2a614e36e79",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul_nbits.rs": "1cbb7a75e13d19390c2c05b659262445469cb25d907724f83e52313b666944c3",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "8ed24ff6aff5101cb16fa6dc5b99dd33a6ea5662d09531eca1d0c106435b216f"
+  },
+  "probe_sha256": "ca6d70a4cc7df22fb83ee77aa8d37cd045e1041d61c155a313833ee1f1b252cd",
+  "driver_sha256": "d6009bc78da290031ccec8f0a803428c534580f0edaaccd5203204aaecf1d4c5",
+  "host_limit_bytes": 67108864,
+  "default_binary_hashes": {
+    "before": "aee7f8e3a6db30886122584eda9edb85207ce9ddea6f29b10a1b426978024e8b",
+    "after": "8c23ece75e50e4d978365cd253a26c3b6eaea6e8e123b997192f4f3540591d10"
+  },
+  "default_operators": [
+    {
+      "kind": "matmul",
+      "mode": "streamed",
+      "rows": 1,
+      "threads": 1,
+      "before": {
+        "cpu_ms": 5.103599999999994,
+        "cpu_ms_range": [
+          5.094533333333333,
+          5.112133333333335
+        ],
+        "control_ms": 25.571999999999928,
+        "control_ms_range": [
+          24.50999999999992,
+          25.65799999999996
+        ],
+        "rss_bytes_range": [
+          9633792,
+          9682944
+        ],
+        "output_sha256": "b04e6ddceeb35706e5a717410d36b7172a2ec8fc71f71fbd5e927c7a3de211f6"
+      },
+      "after": {
+        "cpu_ms": 3.7404666666666713,
+        "cpu_ms_range": [
+          3.735933333333332,
+          3.836200000000008
+        ],
+        "control_ms": 25.236000000000036,
+        "control_ms_range": [
+          24.98199999999995,
+          26.517000000000014
+        ],
+        "rss_bytes_range": [
+          9748480,
+          9781248
+        ],
+        "output_sha256": "b04e6ddceeb35706e5a717410d36b7172a2ec8fc71f71fbd5e927c7a3de211f6"
+      },
+      "speedup": 1.3644286809132518,
+      "control_ratio": 0.9868606288127681,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "matmul",
+      "mode": "streamed",
+      "rows": 4,
+      "threads": 1,
+      "before": {
+        "cpu_ms": 10.273499999999991,
+        "cpu_ms_range": [
+          10.2545,
+          10.374333333333327
+        ],
+        "control_ms": 25.40600000000004,
+        "control_ms_range": [
+          25.143000000000026,
+          26.221999999999856
+        ],
+        "rss_bytes_range": [
+          9715712,
+          9748480
+        ],
+        "output_sha256": "a6bd28082df3a7e01cef7c997f0c3995acbad1cd284ec14a64486e20ba20d81a"
+      },
+      "after": {
+        "cpu_ms": 3.79933333333333,
+        "cpu_ms_range": [
+          3.7975,
+          3.8185000000000024
+        ],
+        "control_ms": 25.173999999999975,
+        "control_ms_range": [
+          23.726999999999997,
+          25.44500000000005
+        ],
+        "rss_bytes_range": [
+          9830400,
+          9879552
+        ],
+        "output_sha256": "a6bd28082df3a7e01cef7c997f0c3995acbad1cd284ec14a64486e20ba20d81a"
+      },
+      "speedup": 2.7040270222846114,
+      "control_ratio": 0.9908682988270461,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "matmul",
+      "mode": "streamed",
+      "rows": 16,
+      "threads": 1,
+      "before": {
+        "cpu_ms": 31.325999999999993,
+        "cpu_ms_range": [
+          30.866500000000013,
+          31.509249999999987
+        ],
+        "control_ms": 25.05399999999991,
+        "control_ms_range": [
+          24.4390000000001,
+          27.339000000000002
+        ],
+        "rss_bytes_range": [
+          9764864,
+          10043392
+        ],
+        "output_sha256": "e69b090ba4bd0ac472c46e110df29385dfe39e105964a6aa3fa831a3070572a0"
+      },
+      "after": {
+        "cpu_ms": 5.517750000000002,
+        "cpu_ms_range": [
+          5.50975,
+          5.558750000000002
+        ],
+        "control_ms": 25.112999999999996,
+        "control_ms_range": [
+          25.034999999999975,
+          25.561999999999973
+        ],
+        "rss_bytes_range": [
+          9863168,
+          10174464
+        ],
+        "output_sha256": "e69b090ba4bd0ac472c46e110df29385dfe39e105964a6aa3fa831a3070572a0"
+      },
+      "speedup": 5.677314122604319,
+      "control_ratio": 1.0023549133870873,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "matmul",
+      "mode": "warm",
+      "rows": 1,
+      "threads": 1,
+      "before": {
+        "cpu_ms": 0.07162379421221861,
+        "cpu_ms_range": [
+          0.06409646302250802,
+          0.07457234726688104
+        ],
+        "control_ms": 25.59900000000004,
+        "control_ms_range": [
+          25.571000000000012,
+          27.06900000000001
+        ],
+        "rss_bytes_range": [
+          18251776,
+          18268160
+        ],
+        "output_sha256": "0689954fc4af8aa0dd1c1bf907c513890cb13090cf9b254cdb1fb96a8360a0fc"
+      },
+      "after": {
+        "cpu_ms": 0.08272990353697768,
+        "cpu_ms_range": [
+          0.06959807073954975,
+          0.08377170418006429
+        ],
+        "control_ms": 25.412000000000045,
+        "control_ms_range": [
+          24.72599999999997,
+          26.219000000000047
+        ],
+        "rss_bytes_range": [
+          18333696,
+          18382848
+        ],
+        "output_sha256": "0689954fc4af8aa0dd1c1bf907c513890cb13090cf9b254cdb1fb96a8360a0fc"
+      },
+      "speedup": 0.8657545959811861,
+      "control_ratio": 0.9926950271494983,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": false,
+      "batch_duration_acceptable": true,
+      "interpretation": "original estimate not interpreted; focused same-binary A/A follow-up finds no measurable difference"
+    },
+    {
+      "kind": "matmul",
+      "mode": "warm",
+      "rows": 4,
+      "threads": 1,
+      "before": {
+        "cpu_ms": 0.1264619883040936,
+        "cpu_ms_range": [
+          0.11747368421052629,
+          0.1416783625730994
+        ],
+        "control_ms": 25.623000000000008,
+        "control_ms_range": [
+          25.15800000000007,
+          26.081999999999937
+        ],
+        "rss_bytes_range": [
+          18464768,
+          18497536
+        ],
+        "output_sha256": "0f55ca984f0c32d972fae4e3d484b7557a50da127027d13d8142c54b05b3b2ca"
+      },
+      "after": {
+        "cpu_ms": 0.1275730994152047,
+        "cpu_ms_range": [
+          0.10071345029239775,
+          0.1330701754385963
+        ],
+        "control_ms": 25.42099999999997,
+        "control_ms_range": [
+          24.247999999999937,
+          26.451000000000114
+        ],
+        "rss_bytes_range": [
+          18382848,
+          18595840
+        ],
+        "output_sha256": "0f55ca984f0c32d972fae4e3d484b7557a50da127027d13d8142c54b05b3b2ca"
+      },
+      "speedup": 0.9912903965161588,
+      "control_ratio": 0.9921164578698811,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "matmul",
+      "mode": "warm",
+      "rows": 16,
+      "threads": 1,
+      "before": {
+        "cpu_ms": 0.13399453551912577,
+        "cpu_ms_range": [
+          0.12595081967213123,
+          0.15965573770491798
+        ],
+        "control_ms": 25.046000000000014,
+        "control_ms_range": [
+          24.90999999999999,
+          26.058999999999997
+        ],
+        "rss_bytes_range": [
+          18333696,
+          18612224
+        ],
+        "output_sha256": "6b13d96e40804f45f401059f03240e4b8ccecbf59d1ce6d05bc11998069632e6"
+      },
+      "after": {
+        "cpu_ms": 0.13316393442622937,
+        "cpu_ms_range": [
+          0.1268087431693989,
+          0.13713114754098363
+        ],
+        "control_ms": 25.094000000000005,
+        "control_ms_range": [
+          24.756,
+          27.506999999999948
+        ],
+        "rss_bytes_range": [
+          18726912,
+          18726912
+        ],
+        "output_sha256": "6b13d96e40804f45f401059f03240e4b8ccecbf59d1ce6d05bc11998069632e6"
+      },
+      "speedup": 1.006237432803974,
+      "control_ratio": 1.001916473688413,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "moe",
+      "mode": "streamed",
+      "rows": 1,
+      "threads": 1,
+      "before": {
+        "cpu_ms": 10.330000000000009,
+        "cpu_ms_range": [
+          10.229733333333346,
+          10.363599999999998
+        ],
+        "control_ms": 24.91299999999996,
+        "control_ms_range": [
+          24.526000000000046,
+          26.577000000000073
+        ],
+        "rss_bytes_range": [
+          14286848,
+          14319616
+        ],
+        "output_sha256": "a33799f0ba01344f099590d74a4cdf86cc13d7299fcce15acbb35acef344a90a"
+      },
+      "after": {
+        "cpu_ms": 7.487333333333328,
+        "cpu_ms_range": [
+          7.471333333333334,
+          7.609266666666673
+        ],
+        "control_ms": 25.39100000000016,
+        "control_ms_range": [
+          24.760000000000115,
+          27.449000000000055
+        ],
+        "rss_bytes_range": [
+          14434304,
+          14450688
+        ],
+        "output_sha256": "a33799f0ba01344f099590d74a4cdf86cc13d7299fcce15acbb35acef344a90a"
+      },
+      "speedup": 1.379663431573326,
+      "control_ratio": 1.019186769959467,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "moe",
+      "mode": "streamed",
+      "rows": 4,
+      "threads": 1,
+      "before": {
+        "cpu_ms": 20.978499999999993,
+        "cpu_ms_range": [
+          20.958833333333313,
+          21.249
+        ],
+        "control_ms": 25.035999999999838,
+        "control_ms_range": [
+          21.541000000000032,
+          25.39899999999995
+        ],
+        "rss_bytes_range": [
+          14450688,
+          14499840
+        ],
+        "output_sha256": "6862a67f8ae1f053fad8b7be7d6fcdb0783bdbcb6bec74b1f4bb4ea3e09154cb"
+      },
+      "after": {
+        "cpu_ms": 7.637999999999997,
+        "cpu_ms_range": [
+          7.615666666666669,
+          7.639166666666669
+        ],
+        "control_ms": 25.463000000000015,
+        "control_ms_range": [
+          21.280999999999995,
+          25.497000000000103
+        ],
+        "rss_bytes_range": [
+          14499840,
+          14516224
+        ],
+        "output_sha256": "6862a67f8ae1f053fad8b7be7d6fcdb0783bdbcb6bec74b1f4bb4ea3e09154cb"
+      },
+      "speedup": 2.746595967530767,
+      "control_ratio": 1.017055440166168,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "moe",
+      "mode": "streamed",
+      "rows": 16,
+      "threads": 1,
+      "before": {
+        "cpu_ms": 63.88900000000001,
+        "cpu_ms_range": [
+          63.831333333333276,
+          65.0466666666667
+        ],
+        "control_ms": 25.253999999999664,
+        "control_ms_range": [
+          21.33100000000021,
+          27.29999999999988
+        ],
+        "rss_bytes_range": [
+          14909440,
+          15220736
+        ],
+        "output_sha256": "395eae9bc79dea3b5034ec31e6678ae439adb99622f5997e7c6188d9a4348d8b"
+      },
+      "after": {
+        "cpu_ms": 11.38066666666665,
+        "cpu_ms_range": [
+          11.337999999999996,
+          11.617000000000006
+        ],
+        "control_ms": 22.085999999999938,
+        "control_ms_range": [
+          21.473999999999993,
+          25.249999999999993
+        ],
+        "rss_bytes_range": [
+          14991360,
+          15368192
+        ],
+        "output_sha256": "395eae9bc79dea3b5034ec31e6678ae439adb99622f5997e7c6188d9a4348d8b"
+      },
+      "speedup": 5.613818756956251,
+      "control_ratio": 0.8745545260156898,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": false,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "excluded: Relu control outside preset +/-10%"
+    },
+    {
+      "kind": "moe",
+      "mode": "warm",
+      "rows": 1,
+      "threads": 1,
+      "before": {
+        "cpu_ms": 3.588500000000001,
+        "cpu_ms_range": [
+          3.5714999999999986,
+          3.6057777777777775
+        ],
+        "control_ms": 24.341999999999974,
+        "control_ms_range": [
+          21.74799999999999,
+          25.89600000000003
+        ],
+        "rss_bytes_range": [
+          31293440,
+          31342592
+        ],
+        "output_sha256": "a33799f0ba01344f099590d74a4cdf86cc13d7299fcce15acbb35acef344a90a"
+      },
+      "after": {
+        "cpu_ms": 1.1113888888888885,
+        "cpu_ms_range": [
+          1.1031666666666675,
+          1.1477222222222219
+        ],
+        "control_ms": 24.812999999999974,
+        "control_ms_range": [
+          20.884999999999987,
+          26.15500000000004
+        ],
+        "rss_bytes_range": [
+          31342592,
+          31375360
+        ],
+        "output_sha256": "a33799f0ba01344f099590d74a4cdf86cc13d7299fcce15acbb35acef344a90a"
+      },
+      "speedup": 3.2288427893026763,
+      "control_ratio": 1.0193492728617206,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "moe",
+      "mode": "warm",
+      "rows": 4,
+      "threads": 1,
+      "before": {
+        "cpu_ms": 14.354866666666668,
+        "cpu_ms_range": [
+          14.338266666666666,
+          14.476799999999997
+        ],
+        "control_ms": 25.66600000000019,
+        "control_ms_range": [
+          24.297000000000235,
+          27.72500000000022
+        ],
+        "rss_bytes_range": [
+          31358976,
+          31391744
+        ],
+        "output_sha256": "6862a67f8ae1f053fad8b7be7d6fcdb0783bdbcb6bec74b1f4bb4ea3e09154cb"
+      },
+      "after": {
+        "cpu_ms": 1.3805333333333336,
+        "cpu_ms_range": [
+          1.3739333333333326,
+          1.4279333333333328
+        ],
+        "control_ms": 25.10899999999999,
+        "control_ms_range": [
+          25.058000000000025,
+          26.53899999999998
+        ],
+        "rss_bytes_range": [
+          31408128,
+          31424512
+        ],
+        "output_sha256": "6862a67f8ae1f053fad8b7be7d6fcdb0783bdbcb6bec74b1f4bb4ea3e09154cb"
+      },
+      "speedup": 10.398058721267143,
+      "control_ratio": 0.9782981376139565,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "moe",
+      "mode": "warm",
+      "rows": 16,
+      "threads": 1,
+      "before": {
+        "cpu_ms": 57.416499999999985,
+        "cpu_ms_range": [
+          57.40499999999999,
+          58.279500000000006
+        ],
+        "control_ms": 25.860999999999912,
+        "control_ms_range": [
+          24.143000000000026,
+          26.009999999999422
+        ],
+        "rss_bytes_range": [
+          31916032,
+          32243712
+        ],
+        "output_sha256": "395eae9bc79dea3b5034ec31e6678ae439adb99622f5997e7c6188d9a4348d8b"
+      },
+      "after": {
+        "cpu_ms": 5.412750000000001,
+        "cpu_ms_range": [
+          5.387000000000003,
+          5.632999999999999
+        ],
+        "control_ms": 25.727,
+        "control_ms_range": [
+          24.51399999999998,
+          26.735999999999983
+        ],
+        "rss_bytes_range": [
+          31866880,
+          32260096
+        ],
+        "output_sha256": "395eae9bc79dea3b5034ec31e6678ae439adb99622f5997e7c6188d9a4348d8b"
+      },
+      "speedup": 10.607639370006,
+      "control_ratio": 0.99481845249604,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "matmul",
+      "mode": "streamed",
+      "rows": 4,
+      "threads": 4,
+      "before": {
+        "cpu_ms": 10.813333333333341,
+        "cpu_ms_range": [
+          10.785666666666671,
+          10.857833333333325
+        ],
+        "control_ms": 25.486999999999927,
+        "control_ms_range": [
+          25.100000000000012,
+          25.90899999999996
+        ],
+        "rss_bytes_range": [
+          9945088,
+          9994240
+        ],
+        "output_sha256": "a6bd28082df3a7e01cef7c997f0c3995acbad1cd284ec14a64486e20ba20d81a"
+      },
+      "after": {
+        "cpu_ms": 4.1065,
+        "cpu_ms_range": [
+          4.105666666666667,
+          4.178333333333335
+        ],
+        "control_ms": 24.836000000000023,
+        "control_ms_range": [
+          21.955000000000002,
+          25.42699999999992
+        ],
+        "rss_bytes_range": [
+          10076160,
+          10108928
+        ],
+        "output_sha256": "a6bd28082df3a7e01cef7c997f0c3995acbad1cd284ec14a64486e20ba20d81a"
+      },
+      "speedup": 2.6332237509639214,
+      "control_ratio": 0.9744575666025854,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "matmul",
+      "mode": "warm",
+      "rows": 4,
+      "threads": 4,
+      "before": {
+        "cpu_ms": 0.1276081871345029,
+        "cpu_ms_range": [
+          0.10219883040935684,
+          0.13000584795321646
+        ],
+        "control_ms": 25.418000000000053,
+        "control_ms_range": [
+          25.061999999999973,
+          27.517999999999986
+        ],
+        "rss_bytes_range": [
+          18546688,
+          18595840
+        ],
+        "output_sha256": "0f55ca984f0c32d972fae4e3d484b7557a50da127027d13d8142c54b05b3b2ca"
+      },
+      "after": {
+        "cpu_ms": 0.13136842105263158,
+        "cpu_ms_range": [
+          0.1259883040935672,
+          0.1485964912280702
+        ],
+        "control_ms": 25.49900000000005,
+        "control_ms_range": [
+          25.007999999999974,
+          25.78899999999995
+        ],
+        "rss_bytes_range": [
+          18497536,
+          18726912
+        ],
+        "output_sha256": "0f55ca984f0c32d972fae4e3d484b7557a50da127027d13d8142c54b05b3b2ca"
+      },
+      "speedup": 0.9713764245014243,
+      "control_ratio": 1.0031867180738059,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "moe",
+      "mode": "streamed",
+      "rows": 4,
+      "threads": 4,
+      "before": {
+        "cpu_ms": 22.14066666666666,
+        "cpu_ms_range": [
+          22.13750000000003,
+          22.215500000000002
+        ],
+        "control_ms": 25.931999999999846,
+        "control_ms_range": [
+          25.131000000000014,
+          27.01399999999987
+        ],
+        "rss_bytes_range": [
+          14663680,
+          14680064
+        ],
+        "output_sha256": "6862a67f8ae1f053fad8b7be7d6fcdb0783bdbcb6bec74b1f4bb4ea3e09154cb"
+      },
+      "after": {
+        "cpu_ms": 8.488666666666665,
+        "cpu_ms_range": [
+          8.4775,
+          8.865999999999985
+        ],
+        "control_ms": 25.884999999999934,
+        "control_ms_range": [
+          24.67800000000009,
+          26.189000000000018
+        ],
+        "rss_bytes_range": [
+          14811136,
+          14843904
+        ],
+        "output_sha256": "6862a67f8ae1f053fad8b7be7d6fcdb0783bdbcb6bec74b1f4bb4ea3e09154cb"
+      },
+      "speedup": 2.60826199638734,
+      "control_ratio": 0.9981875674841928,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    },
+    {
+      "kind": "moe",
+      "mode": "warm",
+      "rows": 4,
+      "threads": 4,
+      "before": {
+        "cpu_ms": 15.1785,
+        "cpu_ms_range": [
+          15.150333333333341,
+          15.264833333333328
+        ],
+        "control_ms": 24.7409999999999,
+        "control_ms_range": [
+          24.62300000000006,
+          26.546999999999876
+        ],
+        "rss_bytes_range": [
+          31539200,
+          31588352
+        ],
+        "output_sha256": "6862a67f8ae1f053fad8b7be7d6fcdb0783bdbcb6bec74b1f4bb4ea3e09154cb"
+      },
+      "after": {
+        "cpu_ms": 4.838166666666662,
+        "cpu_ms_range": [
+          4.786666666666671,
+          4.934666666666661
+        ],
+        "control_ms": 25.490000000000013,
+        "control_ms_range": [
+          25.23800000000004,
+          26.007
+        ],
+        "rss_bytes_range": [
+          31621120,
+          31637504
+        ],
+        "output_sha256": "6862a67f8ae1f053fad8b7be7d6fcdb0783bdbcb6bec74b1f4bb4ea3e09154cb"
+      },
+      "speedup": 3.1372420682765543,
+      "control_ratio": 1.0302736348571244,
+      "max_abs_error": 0.0,
+      "max_scaled_error": 0.0,
+      "argmax_equal": true,
+      "changed_elements": 0,
+      "control_acceptable": true,
+      "dense_null_acceptable": true,
+      "batch_duration_acceptable": true,
+      "interpretation": "eligible; unchanged dense paths are controls, not claimed wins"
+    }
+  ],
+  "unchanged_dense_followup": {
+    "baseline": {
+      "cpu_ms": 0.07647266881028938,
+      "range": [
+        0.06399678456591637,
+        0.09451768488745982
+      ],
+      "rel_control_ms": 25.841999999999977
+    },
+    "null": {
+      "cpu_ms": 0.07567524115755626,
+      "range": [
+        0.06636977491961409,
+        0.08129260450160772
+      ],
+      "rel_control_ms": 25.26299999999998
+    },
+    "candidate": {
+      "cpu_ms": 0.07768810289389072,
+      "range": [
+        0.06672990353697747,
+        0.07919935691318342
+      ],
+      "rel_control_ms": 25.73900000000001
+    },
+    "candidate_over_baseline": 1.0212181410879586,
+    "null_over_baseline": 0.9895723836353698,
+    "absolute_effect_ms": 0.001614147909967889,
+    "largest_within_arm_spread_ms": 0.030520900321543448,
+    "effect_below_within_arm_spread": true,
+    "nonoverlapping_regression": false
+  },
+  "same_binary_serial_entry": [
+    {
+      "m": 1,
+      "k": 4096,
+      "n": 1,
+      "native": {
+        "cpu_ns": 3849.9000000000005,
+        "cpu_range": [
+          3740.7000000000007,
+          3859.899999999999
+        ],
+        "rss_range": [
+          6062080,
+          6078464
+        ]
+      },
+      "mlas": {
+        "cpu_ns": 9026.050000000007,
+        "cpu_range": [
+          8979.2,
+          9120.949999999993
+        ],
+        "rss_range": [
+          6160384,
+          6193152
+        ]
+      }
+    },
+    {
+      "m": 1,
+      "k": 4096,
+      "n": 64,
+      "native": {
+        "cpu_ns": 64020.000000000044,
+        "cpu_range": [
+          62069.999999999905,
+          64870.000000000065
+        ],
+        "rss_range": [
+          7094272,
+          7094272
+        ]
+      },
+      "mlas": {
+        "cpu_ns": 50530.00000000002,
+        "cpu_range": [
+          48799.999999999956,
+          56589.99999999983
+        ],
+        "rss_range": [
+          7208960,
+          7274496
+        ]
+      }
+    },
+    {
+      "m": 4,
+      "k": 1024,
+      "n": 64,
+      "native": {
+        "cpu_ns": 19489.999999999993,
+        "cpu_range": [
+          19459.999999999996,
+          19920.000000000007
+        ],
+        "rss_range": [
+          6307840,
+          6340608
+        ]
+      },
+      "mlas": {
+        "cpu_ns": 11570.000000000018,
+        "cpu_range": [
+          11110.00000000001,
+          11820.000000000025
+        ],
+        "rss_range": [
+          6422528,
+          6438912
+        ]
+      }
+    },
+    {
+      "m": 16,
+      "k": 512,
+      "n": 64,
+      "native": {
+        "cpu_ns": 39900.00000000007,
+        "cpu_range": [
+          38159.99999999986,
+          40319.99999999994
+        ],
+        "rss_range": [
+          6193152,
+          6209536
+        ]
+      },
+      "mlas": {
+        "cpu_ns": 13919.999999999975,
+        "cpu_range": [
+          13400.00000000001,
+          14920.000000000002
+        ],
+        "rss_range": [
+          6307840,
+          6307840
+        ]
+      }
+    }
+  ],
+  "linkage_audit": {
+    "default-before": {
+      "binary_sha256": "aee7f8e3a6db30886122584eda9edb85207ce9ddea6f29b10a1b426978024e8b",
+      "symbol_log_sha256": "5d44fd0a977a2d611a6a95d08861e8c6aeb5143706066670ba0f2dc03359a23a",
+      "total_symbols": 10053,
+      "mlas_symbols": 0
+    },
+    "default-after": {
+      "binary_sha256": "8c23ece75e50e4d978365cd253a26c3b6eaea6e8e123b997192f4f3540591d10",
+      "symbol_log_sha256": "b09773adf7a2ee24c3fef96fffc3e4de5ddcc5ceaaecfb9f4717b541d55f4c58",
+      "total_symbols": 10054,
+      "mlas_symbols": 0
+    },
+    "research-positive": {
+      "binary_sha256": "3626300fafafea7b4166205869177952a5e028bad5a1e15b35a7711c6e4c8bf1",
+      "symbol_log_sha256": "bfb438fa9fea19f6633b3776df1134850be149f8548f5ff1b5de3250591d25ac",
+      "total_symbols": 2264,
+      "mlas_symbols": 37
+    },
+    "default_dependency_tree_has_no_mlas_sys": true,
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n"
+  },
+  "raw_local_prefix": "/tmp/nxrt-serial-*",
+  "family_graduated": false
+}

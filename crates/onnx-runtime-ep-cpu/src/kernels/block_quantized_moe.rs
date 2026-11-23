@@ -15,7 +15,7 @@
 //! The GLM-5.2 IQ/K-quant/Q8 layouts are decoded by the CPU parity oracle.
 //!
 //! The expert's complete f32 projection set is cached when it fits the dense
-//! cache budget. Otherwise, compressed rows are decoded into one reusable row
+//! cache budget. Otherwise, compressed rows are decoded into a bounded reusable tile
 //! per worker shard and applied to every routed token in that expert group.
 //! This bounds temporary decoded weight storage without introducing a second
 //! routing or activation implementation. It is row-streamed f32 computation,

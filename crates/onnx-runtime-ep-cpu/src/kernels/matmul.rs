@@ -1753,6 +1753,34 @@ fn micro_kernel<O: GemmOutputRows + ?Sized>(
     }
 }
 
+// Per-test-thread witnesses live at the actual native/reference compute boundary.
+// Production builds carry neither the counters nor their increments.
+#[cfg(test)]
+std::thread_local! {
+    static SERIAL_PROJECTION_ROUTES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Whether production serial projection reaches the portable native kernel.
+/// Decode tiling uses this once outside the feature loop; reference and AVX2
+/// routes keep their existing operand geometry and numerical reduction.
+pub(super) fn serial_projection_is_portable() -> bool {
+    #[cfg(feature = "mlas")]
+    {
+        false
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            !gemm_bt_avx2::available()
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            true
+        }
+    }
+}
+
 /// Compute one transposed-B product without entering the Rayon scheduler.
 /// Used inside an already partitioned operation to keep scratch ownership and
 /// task counts bounded rather than nesting parallel matrix multiplies.
@@ -1764,6 +1792,43 @@ pub(crate) fn gemm_bt_serial(
     k: usize,
     n: usize,
 ) -> Result<()> {
+    #[cfg(feature = "mlas")]
+    let backend = CpuBackend::Mlas;
+    #[cfg(not(feature = "mlas"))]
+    let backend = CpuBackend::Generic;
+    gemm_bt_serial_with_backend(a, bt, c, rows, k, n, backend)
+}
+
+/// Explicit serial native/reference boundary for projection controls.
+/// Native backends use the runtime-detected built-in NT kernel; Mlas is the
+/// optional research reference. Resolve the backend outside a column loop:
+/// this entry does not read environment variables or enter a scheduler.
+/// Accelerate/XNNPACK require a separate whole-matrix dispatch and are rejected
+/// here rather than silently creating nested library parallelism.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_bt_serial_with_backend(
+    a: &[f32],
+    bt: &[f32],
+    c: &mut [f32],
+    rows: usize,
+    k: usize,
+    n: usize,
+    backend: CpuBackend,
+) -> Result<()> {
+    let native = match backend {
+        CpuBackend::Generic => true,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        CpuBackend::SimdX86 => true,
+        #[cfg(feature = "mlas")]
+        CpuBackend::Mlas => false,
+        #[allow(unreachable_patterns)]
+        other => {
+            return Err(EpError::KernelFailed(format!(
+                "serial transposed GEMM backend {other:?} cannot guarantee caller-owned serial execution here; select Generic native compute or the compiled Mlas research reference"
+            )));
+        }
+    };
     if rows.checked_mul(k) != Some(a.len())
         || n.checked_mul(k) != Some(bt.len())
         || rows.checked_mul(n) != Some(c.len())
@@ -1782,10 +1847,19 @@ pub(crate) fn gemm_bt_serial(
         c.fill(0.0);
         return Ok(());
     }
-    #[cfg(feature = "mlas")]
-    mlas_sys::sgemm(false, true, rows, n, k, 1.0, a, k, bt, k, 0.0, c, n, false);
-    #[cfg(not(feature = "mlas"))]
-    gemm_bt_block(a, bt, c, rows, k, n);
+    if native {
+        gemm_bt_block(a, bt, c, rows, k, n);
+    } else {
+        #[cfg(feature = "mlas")]
+        {
+            #[cfg(test)]
+            SERIAL_PROJECTION_ROUTES.with(|routes| {
+                let (native, reference) = routes.get();
+                routes.set((native, reference + 1));
+            });
+            mlas_sys::sgemm(false, true, rows, n, k, 1.0, a, k, bt, k, 0.0, c, n, false);
+        }
+    }
     Ok(())
 }
 
@@ -2097,8 +2171,12 @@ fn gemm_bt_packed_mt_fits(m: usize, k: usize, threads: usize) -> bool {
 
 /// Compute `c[rows,n] = a[rows,k] * bt[n,k]ᵀ` (overwrite) for one row block,
 /// dispatching to the AVX2+FMA kernel when the host supports it.
-#[cfg(not(feature = "mlas"))]
 fn gemm_bt_block(a: &[f32], bt: &[f32], c: &mut [f32], rows: usize, k: usize, n: usize) {
+    #[cfg(test)]
+    SERIAL_PROJECTION_ROUTES.with(|routes| {
+        let (native, reference) = routes.get();
+        routes.set((native + 1, reference));
+    });
     if rows == 0 || n == 0 {
         return;
     }
@@ -2118,24 +2196,69 @@ fn gemm_bt_block(a: &[f32], bt: &[f32], c: &mut [f32], rows: usize, k: usize, n:
             return;
         }
     }
-    gemm_bt_block_scalar(a, bt, c, rows, k, n);
+    gemm_bt_block_portable(a, bt, c, rows, k, n);
 }
 
-/// Portable scalar reference block: the fallback for non-x86 targets and for x86
-/// without AVX2+FMA. Contains no `unsafe`. Overwrites each `c[i][j]` with the
-/// contiguous dot product `Σ_p a[i][p] * bt[j][p]` (so `k == 0` writes 0).
-#[cfg(not(feature = "mlas"))]
-fn gemm_bt_block_scalar(a: &[f32], bt: &[f32], c: &mut [f32], rows: usize, k: usize, n: usize) {
-    for i in 0..rows {
-        let arow = &a[i * k..i * k + k];
-        let crow = &mut c[i * n..i * n + n];
-        for (j, cv) in crow.iter_mut().enumerate() {
-            let brow = &bt[j * k..j * k + k];
+/// Portable NT micro-tiles vectorize across independent outputs, not K.
+/// Each output retains the original left-to-right f32 accumulation order.
+/// Four rows/columns provide independent chains without fast-math, heap
+/// scratch, nested scheduling or an optional ISA.
+fn gemm_bt_block_portable(a: &[f32], bt: &[f32], c: &mut [f32], rows: usize, k: usize, n: usize) {
+    let full_rows = rows / 4 * 4;
+    let full_cols = n / 4 * 4;
+    for i in (0..full_rows).step_by(4) {
+        let ar = std::array::from_fn::<_, 4, _>(|lane| &a[(i + lane) * k..(i + lane + 1) * k]);
+        for j in (0..full_cols).step_by(4) {
+            let br = std::array::from_fn::<_, 4, _>(|lane| &bt[(j + lane) * k..(j + lane + 1) * k]);
+            let mut acc = [[0.0f32; 4]; 4];
+            for p in 0..k {
+                let av = [ar[0][p], ar[1][p], ar[2][p], ar[3][p]];
+                let bv = [br[0][p], br[1][p], br[2][p], br[3][p]];
+                for (ii, sum) in acc.iter_mut().enumerate() {
+                    for jj in 0..4 {
+                        sum[jj] += av[ii] * bv[jj];
+                    }
+                }
+            }
+            for (ii, sum) in acc.iter().enumerate() {
+                c[(i + ii) * n + j..(i + ii) * n + j + 4].copy_from_slice(sum);
+            }
+        }
+        for j in full_cols..n {
+            let br = &bt[j * k..(j + 1) * k];
+            let mut acc = [0.0f32; 4];
+            for p in 0..k {
+                let b = br[p];
+                for ii in 0..4 {
+                    acc[ii] += ar[ii][p] * b;
+                }
+            }
+            for ii in 0..4 {
+                c[(i + ii) * n + j] = acc[ii];
+            }
+        }
+    }
+    for i in full_rows..rows {
+        let ar = &a[i * k..(i + 1) * k];
+        let cr = &mut c[i * n..(i + 1) * n];
+        for j in (0..full_cols).step_by(4) {
+            let br = std::array::from_fn::<_, 4, _>(|lane| &bt[(j + lane) * k..(j + lane + 1) * k]);
+            let mut acc = [0.0f32; 4];
+            for p in 0..k {
+                let a = ar[p];
+                for jj in 0..4 {
+                    acc[jj] += a * br[jj][p];
+                }
+            }
+            cr[j..j + 4].copy_from_slice(&acc);
+        }
+        for j in full_cols..n {
+            let br = &bt[j * k..(j + 1) * k];
             let mut sum = 0.0f32;
             for p in 0..k {
-                sum += arow[p] * brow[p];
+                sum += ar[p] * br[p];
             }
-            *cv = sum;
+            cr[j] = sum;
         }
     }
 }
@@ -2151,10 +2274,7 @@ fn gemm_bt_block_scalar(a: &[f32], bt: &[f32], c: &mut [f32], rows: usize, k: us
 /// accumulators hide FMA latency. Edge rows (`rows % 4`, which includes the
 /// `m == 1` decode case) and the odd trailing column (`n % 2`) fall to a
 /// four-accumulator contiguous dot product — itself a good GEMV.
-#[cfg(all(
-    not(feature = "mlas"),
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod gemm_bt_avx2 {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
@@ -2350,7 +2470,7 @@ mod gemm_bt_avx2 {
     /// which keeps the *row-block* driver — whose blocks would each re-pack the
     /// same panel — on the unpacked path by construction, single- or
     /// multi-threaded. Threads reach the packed kernel through
-    /// [`super::gemm_bt_panel_parallel`] instead, which hands whole column
+    /// `gemm_bt_panel_parallel` instead, which hands whole column
     /// panels to the pool so each is still packed exactly once.
     const PACK_MIN_BANDS: usize = 12;
     /// Fewest rows the packed kernel will accept, i.e. [`PACK_MIN_BANDS`] full
@@ -2364,7 +2484,7 @@ mod gemm_bt_avx2 {
     /// structural property rather than a lucky one. The row-block driver
     /// therefore reaches the packed kernel only single-threaded, where it is
     /// handed the whole row extent and there are no neighbours. The
-    /// multi-threaded packed path is [`super::gemm_bt_panel_parallel`], which
+    /// multi-threaded packed path is `gemm_bt_panel_parallel`, which
     /// is selected before the row-block driver and distributes whole column
     /// panels, so no panel is packed twice there either.
     const PACK_MIN_ROWS: usize = PMR * PACK_MIN_BANDS;
@@ -2399,12 +2519,14 @@ mod gemm_bt_avx2 {
     /// Rows per micro-tile band, exposed so drivers can cut row blocks on a
     /// band boundary.
     #[inline]
+    #[cfg(not(feature = "mlas"))]
     pub fn band_rows() -> usize {
         PMR
     }
 
     /// Columns per packed micro-panel, exposed for the same reason.
     #[inline]
+    #[cfg(not(feature = "mlas"))]
     pub fn panel_stride() -> usize {
         PNR
     }
@@ -4360,6 +4482,166 @@ fn broadcast_offset(bidx: &[usize], batch: &[usize], batch_strides: &[i64]) -> u
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    #[test]
+    fn portable_projection_preserves_the_two_ulp_argmax_margin() {
+        // Minimized from a rejected public BlockQuantizedMatMul run: changing
+        // the K reduction to 16 lanes tied two logits and flipped the argmax.
+        // The other two rows exercise the four-output native micro-tile.
+        const K: usize = 1024;
+        let mut weights = vec![0.0f32; 4 * K];
+        for (row, feature) in [178usize, 1301].into_iter().enumerate() {
+            let mut state = 0x7a63_51d9u32 ^ 2048u32.rotate_left(9) ^ K as u32;
+            let next = |state: &mut u32| {
+                *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                *state
+            };
+            for _ in 0..feature * (K / 32) * 17 {
+                next(&mut state);
+            }
+            for block in 0..K / 32 {
+                let mut packed = [0u8; 17];
+                packed[0] = 125 + ((next(&mut state) >> 28) % 3) as u8;
+                for byte in &mut packed[1..] {
+                    *byte = (next(&mut state) >> 24) as u8;
+                }
+                let scale = crate::kernels::block_dequant::decode_e8m0_scale(packed[0]);
+                for j in 0..16 {
+                    let start = row * K + block * 32;
+                    weights[start + j] =
+                        crate::kernels::block_dequant::decode_e2m1(packed[1 + j]) * scale;
+                    weights[start + j + 16] =
+                        crate::kernels::block_dequant::decode_e2m1(packed[1 + j] >> 4) * scale;
+                }
+            }
+        }
+        let input: Vec<f32> = (0..K)
+            .map(|p| ((10 * K + p) % 31) as f32 / 1000. - 0.015)
+            .collect();
+        let mut output = [0.0f32; 4];
+        gemm_bt_block_portable(&weights, &input, &mut output, 4, K, 1);
+        assert_eq!(output.map(f32::to_bits), [0x3fd9_6455, 0x3fd9_6457, 0, 0]);
+        assert!(
+            output[1] > output[0],
+            "preserve the baseline's strict winning logit"
+        );
+    }
+
+    #[test]
+    fn portable_projection_retains_each_scalar_k_chain_across_microtile_edges() {
+        let mut state = 0x31c2_7a95u32;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 16) as i16 as f32) / 17003.
+        };
+        for (m, n) in [
+            (0, 5),
+            (5, 0),
+            (1, 1),
+            (3, 3),
+            (4, 4),
+            (5, 7),
+            (8, 9),
+            (13, 5),
+        ] {
+            for k in [0, 1, 7, 15, 16, 17, 31, 33, 65, 257, 4097] {
+                let a: Vec<f32> = (0..m * k).map(|_| next()).collect();
+                let b: Vec<f32> = (0..n * k).map(|_| next()).collect();
+                let expected = naive_bt(&a, &b, m, k, n);
+                let mut actual = vec![f32::NAN; m * n];
+                gemm_bt_block_portable(&a, &b, &mut actual, m, k, n);
+                assert_eq!(
+                    actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "M={m} K={k} N={n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn serial_projection_explicit_backends_match_f64_and_reject_bad_geometry() {
+        #[cfg(not(feature = "mlas"))]
+        let backends = [CpuBackend::Generic];
+        #[cfg(feature = "mlas")]
+        let backends = [CpuBackend::Generic, CpuBackend::Mlas];
+        for backend in backends {
+            for (m, k, n) in [
+                (1, 0, 3),
+                (0, 17, 3),
+                (2, 17, 0),
+                (1, 7, 1),
+                (1, 4097, 5),
+                (4, 33, 9),
+                (17, 64, 3),
+            ] {
+                let a: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 7 % 23) as f32 - 11.) / 16.)
+                    .collect();
+                let b: Vec<f32> = (0..n * k)
+                    .map(|i| ((i * 13 % 29) as f32 - 14.) / 32.)
+                    .collect();
+                let mut c = vec![73.; m * n];
+                let before = SERIAL_PROJECTION_ROUTES.with(|routes| routes.get());
+                gemm_bt_serial_with_backend(&a, &b, &mut c, m, k, n, backend).unwrap();
+                let after = SERIAL_PROJECTION_ROUTES.with(|routes| routes.get());
+                let computes = m != 0 && k != 0 && n != 0;
+                assert_eq!(
+                    (after.0 - before.0, after.1 - before.1),
+                    (
+                        usize::from(computes && backend == CpuBackend::Generic),
+                        usize::from(computes && backend != CpuBackend::Generic),
+                    ),
+                    "{backend:?} M={m} K={k} N={n} must reach its actual compute route once; empty/zero-K must bypass both"
+                );
+                for i in 0..m {
+                    for j in 0..n {
+                        let exact: f64 = (0..k)
+                            .map(|p| a[i * k + p] as f64 * b[j * k + p] as f64)
+                            .sum();
+                        assert!(
+                            (c[i * n + j] as f64 - exact).abs() <= 1e-5 * (1. + exact.abs()),
+                            "{backend:?} M={m} K={k} N={n} got {} expected {exact}",
+                            c[i * n + j]
+                        );
+                    }
+                }
+            }
+            let mut output = [73.];
+            let before = SERIAL_PROJECTION_ROUTES.with(|routes| routes.get());
+            let e = gemm_bt_serial_with_backend(&[1.; 2], &[1.; 3], &mut output, 1, 3, 1, backend)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("geometry mismatch") && e.contains("supply"),
+                "{e}"
+            );
+            assert_eq!(output, [73.]);
+            assert_eq!(SERIAL_PROJECTION_ROUTES.with(|routes| routes.get()), before);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn serial_projection_refuses_a_backend_with_uncontrolled_parallelism() {
+        let mut output = [73.];
+        let e = gemm_bt_serial_with_backend(
+            &[1.; 3],
+            &[1.; 3],
+            &mut output,
+            1,
+            3,
+            1,
+            CpuBackend::Accelerate,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("Accelerate") && e.contains("serial") && e.contains("select Generic"),
+            "{e}"
+        );
+        assert_eq!(output, [73.]);
+    }
 
     #[cfg(feature = "mlas")]
     #[test]
@@ -11558,7 +11840,6 @@ mod tests {
 
     /// Independent scalar oracle for [`gemm_bt`]: `c[i][j] = Σ_p a[i][p]*bt[j][p]`
     /// with left-to-right accumulation, sharing no code with production.
-    #[cfg(not(feature = "mlas"))]
     #[allow(clippy::needless_range_loop)]
     fn naive_bt(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         let mut c = vec![0.0f32; m * n];
@@ -11576,7 +11857,6 @@ mod tests {
 
     /// Small deterministic LCG stream in `[-0.125, 0.125)`, matching the style of
     /// [`matmul_generic_block_boundaries_match_naive_reference`].
-    #[cfg(not(feature = "mlas"))]
     fn lcg_stream(seed: u32) -> impl FnMut() -> f32 {
         let mut state = seed;
         move || {
@@ -11651,12 +11931,11 @@ mod tests {
         assert!(c.iter().all(|&v| v == 0.0), "k == 0 must zero every output");
     }
 
-    /// Pin the portable scalar fallback [`gemm_bt_block_scalar`] (the non-x86 /
+    /// Pin the portable fallback [`gemm_bt_block_portable`] (the non-x86 /
     /// no-AVX2 path) directly against the naive oracle, since the host normally
     /// takes the AVX2 path and would never exercise it.
-    #[cfg(not(feature = "mlas"))]
     #[test]
-    fn gemm_bt_block_scalar_matches_naive_reference() {
+    fn gemm_bt_block_portable_matches_naive_reference() {
         const SHAPES: &[(usize, usize, usize)] = &[(1, 7, 1), (4, 17, 3), (7, 33, 9), (13, 5, 4)];
         for &(m, k, n) in SHAPES {
             let mut ra = lcg_stream(0x0BAD_F00D ^ (k as u32));
@@ -11665,7 +11944,7 @@ mod tests {
             let bt: Vec<f32> = (0..n * k).map(|_| rb()).collect();
             let want = naive_bt(&a, &bt, m, k, n);
             let mut got = vec![f32::NAN; m * n];
-            gemm_bt_block_scalar(&a, &bt, &mut got, m, k, n);
+            gemm_bt_block_portable(&a, &bt, &mut got, m, k, n);
             for (idx, (&g, &w)) in got.iter().zip(&want).enumerate() {
                 assert!(
                     (g - w).abs() <= 1e-3,

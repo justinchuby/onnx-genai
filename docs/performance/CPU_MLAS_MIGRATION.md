@@ -1725,3 +1725,25 @@ half-transpose consumers on other architectures; removing just these attributes
 reproduces the measured MatMul source hash exactly. No Apple code changes after
 timing. Host-lock conformance passes all 124 tests after registering both new
 benchmark invocations. Linux/Windows ARM64 execution remains CI-only locally.
+
+
+## Order-preserving portable NT output tiles
+
+Portable transposed-B projections now vectorize across independent outputs in
+4x4 micro-tiles, keeping each output's scalar K chain. Block-format streaming
+coalesces up to four decoded rows per worker only when that portable kernel is
+selected; existing AVX2/MLAS operand geometry and NBits/QMoE decoded-row bounds
+remain unchanged. The initial K-reassociated candidate was rejected after a
+real argmax flip and replaced with a two-ULP regression and bitwise scalar
+oracles. There is no new cache, quota protocol or per-column issuer call.
+
+The [M1 Max evidence, controls and limits](../benchmarks/portable-nt-microtiles/README.md)
+include same-binary native/reference serial controls followed by actual default
+builds without MLAS. All 96 default operator outputs match the baseline byte
+for byte. Qualified changed-path CPU-time observations improve, but one MoE
+row is excluded by its control and the unchanged dense path requires a focused
+A/A noise check. Larger-row raw native GEMM still trails MLAS. This is a native
+capability increment, not family graduation or whole-model throughput evidence.
+Decoded tiles remain bounded call-owned scratch pending public-workspace
+migration; the per-worker bound increases to at most four rows on portable
+compute. Process RSS is reported as an absolute high-water mark, not savings.
