@@ -133,7 +133,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Relu`, `Sqrt`, `Erf`, `Tanh`, `Sigmoid` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16; half storage widens to f32 compute and narrows once on store (`elementwise.rs`). |
 | `Gelu` | `` | ✅ | **NVRTC-custom** | Standard-domain opset-20 exact or tanh-approximate GELU (`elementwise.rs`). |
 | `SwiGLU`, `GeGLU` | `` | ✅ | **NVRTC-custom** | Opsets 28/29 respectively; identical input shapes, no broadcasting. f16/bf16/f32/f64. |
-| `Expm1`, `Log1p`, `LogCumSumExp` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64. Stable small-value math and log-domain prefix accumulation. |
+| `Expm1`, `Log1p` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64. Stable small-value math in the elementwise kernel family. |
+| `LogCumSumExp` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64. Log-domain prefix accumulation in the cumulative-sum kernel family. |
 | `Pack`, `Unpack` | `` | ✅ | **NVRTC-custom** | Opset 29; fixed-bit and grouped-radix encoding along arbitrary axes, with UINT8/UINT32 words. Eager CUDA only. |
 | `GroupedMatMul` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64, INT32/INT64 routes, either weight layout, optional bias. Eager CUDA only. |
 | `Gelu`, `Silu` | `com.microsoft` | ✅ | **NVRTC-custom** | Contrib activation forms (`elementwise.rs`). |
