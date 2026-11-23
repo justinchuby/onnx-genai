@@ -652,7 +652,11 @@ impl Kernel for QLinearMatMulKernel {
         Ok(true)
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         if inputs.len() != 8 || !inputs[0].present || !inputs[3].present {
             return Err(EpError::KernelFailed("QLinearMatMul workspace needs eight input slots with present A (0) and B (3); provide complete quantized-matmul metadata".into()));
         }
@@ -2625,7 +2629,7 @@ mod tests {
             let mut metadata = [TensorMetadata::new(DataType::Uint8, &[], true); 8];
             metadata[0].shape = a;
             metadata[3].shape = b;
-            kernel.workspace_requirement(&metadata)
+            kernel.workspace_requirement(&metadata, &[])
         };
         for batches in [1, 2, 64] {
             assert_eq!(requirement(&[batches, 2, 3], &[3, 4]).unwrap().bytes, 32);
@@ -2708,7 +2712,7 @@ mod tests {
         let data = workspace_inputs(2);
         let inputs = data.each_ref().map(|value| value.view());
         let metadata = inputs.map(|input| TensorMetadata::new(input.dtype, input.shape, true));
-        let request = kernel.workspace_requirement(&metadata).unwrap();
+        let request = kernel.workspace_requirement(&metadata, &[]).unwrap();
         assert_eq!(request.bytes, 16);
         let mut allocation = provider
             .allocate_workspace(16, request.alignment, request.role())

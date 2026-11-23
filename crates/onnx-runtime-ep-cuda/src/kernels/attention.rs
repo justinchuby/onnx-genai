@@ -977,7 +977,11 @@ impl Kernel for AttentionKernel {
         self.run(inputs, outputs, None)
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         // Prepare-only planning (#747): report the exact governed scratch for the
         // Phase-2a path so the executor reserves it against the device authority
         // before request admission. The fused path uses only shared memory and
@@ -1181,7 +1185,7 @@ mod tests {
         let k = TensorMetadata::new(DataType::Float16, &kv_shape, true);
         let v = TensorMetadata::new(DataType::Float16, &kv_shape, true);
         let req = phase2a
-            .workspace_requirement(&[q, k, v])
+            .workspace_requirement(&[q, k, v], &[])
             .expect("workspace requirement");
         let layout = phase2a_scratch_layout(AttentionDtype::F16, batch, heads, sq, sk).unwrap();
         assert_eq!(req.bytes, layout.bytes() as u64);
@@ -1200,7 +1204,7 @@ mod tests {
         let k = TensorMetadata::new(DataType::Float16, &kv_shape, true);
         let v = TensorMetadata::new(DataType::Float16, &kv_shape, true);
         let fused_req = fused
-            .workspace_requirement(&[q, k, v])
+            .workspace_requirement(&[q, k, v], &[])
             .expect("fused workspace requirement");
         assert_eq!(fused_req.bytes, 0, "fused path needs no governed scratch");
     }

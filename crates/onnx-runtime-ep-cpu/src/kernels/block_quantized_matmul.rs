@@ -267,7 +267,11 @@ impl Kernel for BlockQuantizedMatMulKernel {
         self.packed_b_constant = constant_inputs.get(1).copied().unwrap_or(false);
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         let Some(a) = inputs.first().filter(|a| a.present) else {
             return Err(error(
                 "workspace planning needs present activation A metadata; provide the activation shape",
@@ -2545,14 +2549,17 @@ mod tests {
             weight_cache: WeightCache::new(memory, 0),
         };
         let requirement = kernel
-            .workspace_requirement(&[
-                TensorMetadata::new(DataType::Float32, &[m, k], true),
-                TensorMetadata::new(
-                    DataType::Uint8,
-                    &[n, k.div_ceil(32), MXFP4_BLOCK_BYTES],
-                    true,
-                ),
-            ])
+            .workspace_requirement(
+                &[
+                    TensorMetadata::new(DataType::Float32, &[m, k], true),
+                    TensorMetadata::new(
+                        DataType::Uint8,
+                        &[n, k.div_ceil(32), MXFP4_BLOCK_BYTES],
+                        true,
+                    ),
+                ],
+                &[],
+            )
             .unwrap();
         assert!(requirement.bytes > 0);
         let error = kernel

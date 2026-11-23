@@ -103,6 +103,15 @@ does not refund those bytes. Idle capacity can be reclaimed under pressure.
 Pending asynchronous work, active readers and capture pins prevent reuse, and
 quarantined backing retains its charge until physical release is settled.
 
+The canonical `workspace_requirement(inputs, outputs)` hook describes the views
+that the kernel will actually receive after graph lowering. Output facts retain
+present/absent positions and distinguish unresolved geometry from a known scalar.
+Planning uses the same physical-versus-logical shape rule as dispatch. Output
+capacity, dtype and presence participate in workspace plan caches; external
+binding geometry and strides also invalidate session preparation. A known backing
+capacity alone must not invent an unresolved logical output extent. Output facts
+contain no storage pointer or new owner and require no separate quota protocol.
+
 The EP contract remains metadata planning plus an exclusive workspace borrow;
 common runtime ownership handles admission and pooling. Internal bank partitioning
 is an EP implementation detail, not a collection of separately charged resources.

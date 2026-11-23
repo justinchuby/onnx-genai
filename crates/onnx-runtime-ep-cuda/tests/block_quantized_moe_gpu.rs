@@ -506,7 +506,7 @@ fn run_cpu_node(
             onnx_runtime_ep_api::TensorMetadata::new(input.dtype, input.shape, !input.is_absent())
         })
         .collect();
-    let req = kernel.workspace_requirement(&metadata).unwrap();
+    let req = kernel.workspace_requirement(&metadata, &[]).unwrap();
     assert!(req.alignment <= std::mem::align_of::<u128>());
     let mut scratch = vec![0u128; usize::try_from(req.bytes).unwrap().div_ceil(16)];
     let workspace = (!scratch.is_empty()).then(|| {
@@ -652,7 +652,7 @@ fn run_gpu_node(
         .iter()
         .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
         .collect::<Vec<_>>();
-    let requirement = kernel.workspace_requirement(&metadata)?;
+    let requirement = kernel.workspace_requirement(&metadata, &[])?;
     let workspace_bytes = usize::try_from(requirement.bytes)
         .map_err(|_| onnx_runtime_ep_api::EpError::KernelFailed("workspace too large".into()))?;
     let mut workspace = ep.allocate(workspace_bytes, requirement.alignment)?;
@@ -891,7 +891,7 @@ fn block_quantized_moe_rejects_raw_substituted_and_mutated_projection_views() {
         .iter()
         .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
         .collect::<Vec<_>>();
-    let requirement = kernel.workspace_requirement(&metadata).unwrap();
+    let requirement = kernel.workspace_requirement(&metadata, &[]).unwrap();
     let workspace_bytes = requirement.bytes as usize;
     let mut workspace = ep.allocate(workspace_bytes, requirement.alignment).unwrap();
     let mut output = ep.allocate(32 * 4, 256).unwrap();
@@ -1109,7 +1109,7 @@ fn block_quantized_moe_mixed_decode_capture_replays_without_fallback() {
         .iter()
         .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
         .collect::<Vec<_>>();
-    let requirement = kernel.workspace_requirement(&metadata).unwrap();
+    let requirement = kernel.workspace_requirement(&metadata, &[]).unwrap();
     let workspace_bytes = usize::try_from(requirement.bytes).unwrap();
     let mut workspace = ep.allocate(workspace_bytes, requirement.alignment).unwrap();
     let workspace_ptr = workspace.as_mut_ptr();
@@ -1328,7 +1328,7 @@ fn measure_captured_moe(
         .iter()
         .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
         .collect::<Vec<_>>();
-    let requirement = kernel.workspace_requirement(&metadata).unwrap();
+    let requirement = kernel.workspace_requirement(&metadata, &[]).unwrap();
     let workspace_bytes = usize::try_from(requirement.bytes).unwrap();
     let mut workspace = ep.allocate(workspace_bytes, requirement.alignment).unwrap();
     let workspace_ptr = workspace.as_mut_ptr();
@@ -1962,7 +1962,7 @@ mod route_telemetry_impl {
             .iter()
             .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
             .collect::<Vec<_>>();
-        let requirement = kernel.workspace_requirement(&metadata)?;
+        let requirement = kernel.workspace_requirement(&metadata, &[])?;
         let workspace_bytes = usize::try_from(requirement.bytes).unwrap();
         let mut workspace = ep.allocate(workspace_bytes, requirement.alignment)?;
         kernel.execute_with_workspace(

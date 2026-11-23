@@ -1898,7 +1898,11 @@ impl Kernel for ReduceKernel {
         self.run(inputs, outputs, None)
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         self.workspace_requirement_from_metadata(inputs, self.runtime.is_capturing()?)
     }
 
@@ -1906,6 +1910,7 @@ impl Kernel for ReduceKernel {
         &self,
         inputs: &[TensorView],
         _metadata: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
         let capturing = self.runtime.is_capturing()?;
         let prepared = self.prepare_execution(inputs, capturing)?;

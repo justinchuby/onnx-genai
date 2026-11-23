@@ -224,7 +224,11 @@ impl Kernel for BlockQuantizedMoEKernel {
         }
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         let dims = validate_runtime_shapes(inputs, None, &self.attributes, self.formats)?;
         let layout = self.execution_workspace_layout(dims)?;
         Ok(WorkspaceRequirement {
@@ -1630,7 +1634,10 @@ mod tests {
                 None => TensorMetadata::new(DataType::Float32, &[], false),
             })
             .collect();
-        assert_eq!(kernel.workspace_requirement(&metadata).unwrap().bytes, 0);
+        assert_eq!(
+            kernel.workspace_requirement(&metadata, &[]).unwrap().bytes,
+            0
+        );
         let input = Owned::f32(&[1, 0], &[]);
         let router = Owned::f32(&[1, E], &[4., -4.]);
         let fc1 = Owned::u8(&[E, H, 0, 17], &[]);
@@ -1688,7 +1695,7 @@ mod tests {
             .iter()
             .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
             .collect();
-        let req = kernel.workspace_requirement(&metadata).unwrap();
+        let req = kernel.workspace_requirement(&metadata, &[]).unwrap();
         let mut scratch = vec![29.0f32; req.bytes as usize / 4];
         assert!(!scratch.is_empty());
         let mut output = Owned::zeros_f32(&[1, H]);
@@ -1812,7 +1819,7 @@ mod tests {
                 .iter()
                 .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
                 .collect();
-            let req = kernel.workspace_requirement(&metadata).unwrap();
+            let req = kernel.workspace_requirement(&metadata, &[]).unwrap();
             let l1 = kernel
                 .projection_plan
                 .layout(rows, hidden, fc1_size)
@@ -1889,22 +1896,27 @@ mod tests {
                 None => TensorMetadata::new(DataType::Float32, &[], false),
             })
             .collect();
-        assert_eq!(kernel.workspace_requirement(&metadata).unwrap().bytes, 0);
+        assert_eq!(
+            kernel.workspace_requirement(&metadata, &[]).unwrap().bytes,
+            0
+        );
         metadata[3].present = true;
-        let err = kernel.workspace_requirement(&metadata).unwrap_err();
+        let err = kernel.workspace_requirement(&metadata, &[]).unwrap_err();
         assert!(
             err.to_string().contains("fc1_experts_bias must have shape"),
             "{err}"
         );
         metadata[3].present = false;
         metadata[4].present = false;
-        let err = kernel.workspace_requirement(&metadata).unwrap_err();
+        let err = kernel.workspace_requirement(&metadata, &[]).unwrap_err();
         assert!(
             err.to_string()
                 .contains("required input 4 ('fc2_experts_weights') is absent"),
             "{err}"
         );
-        let err = kernel.workspace_requirement(&metadata[..2]).unwrap_err();
+        let err = kernel
+            .workspace_requirement(&metadata[..2], &[])
+            .unwrap_err();
         assert!(err.to_string().contains("5..=9 positional inputs"), "{err}");
     }
 

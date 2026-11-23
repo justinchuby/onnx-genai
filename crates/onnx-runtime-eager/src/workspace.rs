@@ -133,9 +133,13 @@ impl PreparedKernel {
             .iter()
             .map(|input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()))
             .collect();
-        let requirement = self
-            .kernel
-            .workspace_requirement_for_execution(inputs, &metadata)?;
+        let output_metadata: smallvec::SmallVec<[_; 4]> = outputs
+            .iter()
+            .map(onnx_runtime_ep_api::OutputMetadata::from_view)
+            .collect();
+        let requirement =
+            self.kernel
+                .workspace_requirement_for_execution(inputs, &metadata, &output_metadata)?;
         if requirement.bytes == 0 {
             self.kernel.execute_with_workspace(inputs, outputs, None)?;
             return Ok(());
@@ -301,6 +305,7 @@ mod tests {
         fn workspace_requirement(
             &self,
             _: &[TensorMetadata<'_>],
+            _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
         ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
             Ok(WorkspaceRequirement {
                 bytes: self.0.bytes.load(Ordering::Relaxed) as u64,
@@ -481,6 +486,69 @@ mod tests {
             probe: probe.clone(),
         }));
         (provider, probe, books, pool, manager)
+    }
+
+    struct OutputBoundProbe(Arc<Probe>);
+    impl Kernel for OutputBoundProbe {
+        fn execute(
+            &self,
+            _: &[TensorView],
+            _: &mut [TensorMut],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            panic!("output-bound probe requires prepared workspace")
+        }
+        fn workspace_requirement(
+            &self,
+            _: &[TensorMetadata<'_>],
+            outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+            let [onnx_runtime_ep_api::OutputMetadata::Tensor { shape, .. }] = outputs else {
+                return Err(EpError::KernelFailed(
+                    "resolve the probe output before planning".into(),
+                ));
+            };
+            let bytes = shape.iter().product::<usize>() * 16;
+            self.0.bytes.store(bytes, Ordering::Relaxed);
+            Ok(WorkspaceRequirement {
+                bytes: bytes as u64,
+                alignment: 16,
+                lifetime: self.0.lifetime,
+            })
+        }
+        fn execute_with_workspace(
+            &self,
+            inputs: &[TensorView],
+            outputs: &mut [TensorMut],
+            workspace: Option<WorkspaceView>,
+        ) -> onnx_runtime_ep_api::Result<()> {
+            ProbeKernel(self.0.clone()).execute_with_workspace(inputs, outputs, workspace)
+        }
+    }
+
+    #[test]
+    fn output_workspace_metadata_reaches_eager_admission_and_growth() {
+        let (provider, probe, books, _pool, _manager) =
+            fixture(WorkspaceLifetime::SessionPersistent);
+        let mut kernel = PreparedKernel::new(Box::new(OutputBoundProbe(probe.clone())));
+        for elements in [2, 5, 1] {
+            let shape = [elements];
+            let strides = [1];
+            let mut backing = vec![0f32; elements];
+            let mut outputs = [TensorMut::new(
+                onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+                onnx_runtime_ir::DataType::Float32,
+                &shape,
+                &strides,
+                onnx_runtime_ir::DeviceId::cpu(),
+            )];
+            kernel
+                .execute(&provider, "OutputBound", &[], &mut outputs)
+                .unwrap();
+            assert_eq!(probe.bytes.load(Ordering::Relaxed), elements * 16);
+            assert!(books.inner.used(Tier::Host) >= (elements * 16) as u64);
+        }
+        assert_eq!(probe.allocations.load(Ordering::Relaxed), 2);
+        drop(kernel);
     }
 
     #[test]

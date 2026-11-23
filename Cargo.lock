@@ -2446,6 +2446,7 @@ dependencies = [
  "onnx-runtime-memory-governor",
  "onnx-runtime-ort-testkit",
  "onnx-runtime-shape-inference",
+ "smallvec",
  "windows-sys 0.61.2",
 ]
 

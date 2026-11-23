@@ -652,6 +652,48 @@ impl<'a> TensorMetadata<'a> {
     }
 }
 
+/// Kernel-visible output facts available for workspace planning. An unresolved
+/// shape is distinct from both an omitted output and a known scalar shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputMetadata<'a> {
+    Absent,
+    Unresolved {
+        dtype: DataType,
+    },
+    Tensor {
+        dtype: DataType,
+        shape: std::borrow::Cow<'a, [usize]>,
+    },
+}
+
+impl<'a> OutputMetadata<'a> {
+    pub fn tensor(dtype: DataType, shape: &'a [usize]) -> Self {
+        Self::Tensor {
+            dtype,
+            shape: std::borrow::Cow::Borrowed(shape),
+        }
+    }
+
+    pub fn from_view(view: &TensorMut<'a>) -> Self {
+        if view.is_absent() {
+            Self::Absent
+        } else {
+            Self::tensor(view.dtype, view.shape)
+        }
+    }
+
+    pub fn into_owned(self) -> OutputMetadata<'static> {
+        match self {
+            Self::Absent => OutputMetadata::Absent,
+            Self::Unresolved { dtype } => OutputMetadata::Unresolved { dtype },
+            Self::Tensor { dtype, shape } => OutputMetadata::Tensor {
+                dtype,
+                shape: std::borrow::Cow::Owned(shape.into_owned()),
+            },
+        }
+    }
+}
+
 /// How long prepared kernel workspace remains live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceLifetime {
@@ -959,12 +1001,19 @@ pub trait Kernel: Send + KernelType {
         ))
     }
 
-    /// Report a safe owned-scratch bound for these concrete metadata inputs.
+    /// Report a safe owned-scratch bound for the input and output geometry.
+    /// Output slots describe the views this kernel receives, after any graph
+    /// lowering, and preserve positions marked absent by that caller. Unknown geometry must
+    /// remain Unresolved; output-dependent planners must refuse it clearly.
     /// Runtime layout facts may refine this bound before dispatch. For a fixed
-    /// compiled kernel and metadata this is a stable upper bound: executors may
+    /// compiled kernel and both input/output metadata this is a stable upper bound: executors may
     /// memoize it. It must cover both cold and warm cache residency; values or
     /// layouts that refine the bound belong in the execution-time hook below.
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[crate::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         let _ = inputs;
         Ok(WorkspaceRequirement::NONE)
     }
@@ -983,9 +1032,10 @@ pub trait Kernel: Send + KernelType {
         &self,
         inputs: &[TensorView],
         metadata: &[TensorMetadata<'_>],
+        outputs: &[crate::OutputMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
         let _ = inputs;
-        self.workspace_requirement(metadata)
+        self.workspace_requirement(metadata, outputs)
     }
 
     /// Execute using workspace prepared before request admission.
@@ -1407,5 +1457,82 @@ mod trace_standard_tests {
         assert_eq!(events[0].name, "probe");
 
         set_global_context(None);
+    }
+}
+
+#[cfg(test)]
+mod output_workspace_metadata_tests {
+    use super::*;
+    use crate::EpError;
+
+    #[test]
+    fn output_workspace_metadata_distinguishes_scalar_unknown_and_absent() {
+        let scalar = OutputMetadata::tensor(DataType::Float32, &[]);
+        assert_ne!(scalar, OutputMetadata::Absent);
+        assert_ne!(
+            scalar,
+            OutputMetadata::Unresolved {
+                dtype: DataType::Float32
+            }
+        );
+        let owned = {
+            let shape = vec![2, 7];
+            OutputMetadata::tensor(DataType::Float16, &shape).into_owned()
+        };
+        assert_eq!(owned, OutputMetadata::tensor(DataType::Float16, &[2, 7]));
+    }
+
+    #[test]
+    fn execution_refinement_forwards_output_facts_to_canonical_planner() {
+        struct OutputBound;
+        impl Kernel for OutputBound {
+            fn execute(&self, _: &[TensorView], _: &mut [TensorMut]) -> Result<()> {
+                Ok(())
+            }
+            fn workspace_requirement(
+                &self,
+                _: &[TensorMetadata<'_>],
+                outputs: &[OutputMetadata<'_>],
+            ) -> Result<WorkspaceRequirement> {
+                let [
+                    OutputMetadata::Absent,
+                    OutputMetadata::Tensor {
+                        dtype: DataType::Float32,
+                        shape,
+                    },
+                ] = outputs
+                else {
+                    return Err(EpError::KernelFailed(
+                        "output #1 must have resolved Float32 geometry before preparation".into(),
+                    ));
+                };
+                Ok(WorkspaceRequirement {
+                    bytes: shape.iter().product::<usize>() as u64 * 4,
+                    ..WorkspaceRequirement::NONE
+                })
+            }
+        }
+        let outputs = [
+            OutputMetadata::Absent,
+            OutputMetadata::tensor(DataType::Float32, &[3, 5]),
+        ];
+        assert_eq!(
+            OutputBound
+                .workspace_requirement_for_execution(&[], &[], &outputs)
+                .unwrap()
+                .bytes,
+            60
+        );
+        let unknown = [
+            OutputMetadata::Absent,
+            OutputMetadata::Unresolved {
+                dtype: DataType::Float32,
+            },
+        ];
+        assert!(
+            OutputBound
+                .workspace_requirement_for_execution(&[], &[], &unknown)
+                .is_err()
+        );
     }
 }

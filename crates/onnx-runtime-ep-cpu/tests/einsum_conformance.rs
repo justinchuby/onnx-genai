@@ -180,7 +180,12 @@ impl BackendAdapter for CpuAdapter {
             .map(|input| TensorMetadata::new(input.dtype, input.shape, true))
             .collect::<Vec<_>>();
         let workspace_request = kernel
-            .workspace_requirement(&metadata)
+            .workspace_requirement(
+                &metadata,
+                &[onnx_runtime_ep_api::OutputMetadata::from_view(
+                    &output.view_mut(),
+                )],
+            )
             .map_err(|error| AdapterError(error.to_string()))?;
         assert!(workspace_request.alignment <= std::mem::align_of::<u64>());
         let bytes = usize::try_from(workspace_request.bytes)

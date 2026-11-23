@@ -55,9 +55,9 @@ use onnx_runtime_ep_api::{
     ExecutorArtifactReadinessEpoch, ExecutorArtifactState, ExecutorInstanceId,
     ExecutorRouteResidencyConfig, ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight,
     Kernel, KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
-    expert_weight_groups, lazy_weight_candidates,
+    OutputMetadata, ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata,
+    TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
+    WorkspaceRequirement, WorkspaceView, expert_weight_groups, lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 

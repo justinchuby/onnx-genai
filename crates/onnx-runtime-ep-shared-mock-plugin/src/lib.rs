@@ -491,6 +491,7 @@ impl Kernel for WorkspaceAddKernel {
     fn workspace_requirement(
         &self,
         inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> EpResult<WorkspaceRequirement> {
         // Stands in for the cuBLASLt heuristic search a real CUDA GEMM kernel
         // runs here. The executor must not repeat it for a shape it has already
@@ -794,7 +795,7 @@ mod tests {
         let k = WorkspaceAddKernel;
         let shape = [2usize, 4];
         let meta = TensorMetadata::new(DataType::Float32, &shape, true);
-        let req = k.workspace_requirement(&[meta, meta]).unwrap();
+        let req = k.workspace_requirement(&[meta, meta], &[]).unwrap();
         assert_eq!(req.bytes, 8 * 4);
         assert_eq!(req.alignment, MOCK_WORKSPACE_ALIGNMENT);
     }

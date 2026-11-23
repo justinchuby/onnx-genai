@@ -266,7 +266,7 @@ fn workspace_view_for(
         .iter()
         .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
         .collect::<Vec<_>>();
-    let requirement = kernel.workspace_requirement(&metadata)?;
+    let requirement = kernel.workspace_requirement(&metadata, &[])?;
     if requirement.bytes == 0 {
         return Ok(None);
     }

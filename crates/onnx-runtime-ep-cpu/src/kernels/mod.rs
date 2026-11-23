@@ -2486,7 +2486,12 @@ pub(crate) mod testutil {
                     )
                 })
                 .collect::<Vec<_>>();
-            let requirement = self.workspace_requirement_for_execution(inputs, &metadata)?;
+            let output_metadata = outputs
+                .iter()
+                .map(onnx_runtime_ep_api::OutputMetadata::from_view)
+                .collect::<Vec<_>>();
+            let requirement =
+                self.workspace_requirement_for_execution(inputs, &metadata, &output_metadata)?;
             assert!(requirement.alignment <= std::mem::align_of::<u128>());
             let mut backing = vec![0u128; (requirement.bytes as usize).div_ceil(16)];
             let workspace = (!backing.is_empty()).then(|| {

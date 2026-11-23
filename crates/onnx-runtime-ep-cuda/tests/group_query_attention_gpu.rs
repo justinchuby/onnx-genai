@@ -1598,7 +1598,16 @@ fn benchmark_gqa_case(
     )
     .unwrap()
     .with_backend(backend);
-    let requirement = common::runtime_workspace_requirement(&kernel, &inputs).unwrap();
+    let requirement = common::runtime_workspace_requirement(
+        &kernel,
+        &inputs,
+        &[
+            onnx_runtime_ep_api::OutputMetadata::tensor(dtype, &q_shape),
+            onnx_runtime_ep_api::OutputMetadata::tensor(dtype, &cache_shape),
+            onnx_runtime_ep_api::OutputMetadata::tensor(dtype, &cache_shape),
+        ],
+    )
+    .unwrap();
     let mut workspace = None;
     let workspace_view = common::prepare_workspace(ep, requirement, &mut workspace).unwrap();
     let mut run = || {
