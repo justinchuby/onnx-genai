@@ -1299,7 +1299,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("QMoE", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(qmoe::QMoEFactory::new(host_cache)),
     );
     // Standard-domain LLM/transformer primitives (ai.onnx). Registered at their
