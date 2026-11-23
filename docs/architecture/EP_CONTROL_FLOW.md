@@ -17,6 +17,13 @@ compilation supplies the executor's private artifact namespace. Foreign ORT
 callbacks explicitly use `GraphKernelScope::Unscoped`; providers that require
 executor-owned artifacts must decline that scope.
 
+Ordinary nodes follow the same positional contract through `supports_op`,
+`get_kernel` and execution. A plan preserves every source input slot, including
+trailing `None`; it cannot shorten metadata while leaving the source node intact.
+Absent slots carry `DataType::Undefined` and an empty shape. A present scalar
+also has an empty shape, so shape alone does not determine presence. Operator
+schema/EP checks still reject arity beyond the supported signature.
+
 A claimed `If`, `Loop`, or `Scan` executes the compiled EP kernel. Compilation
 and execution errors propagate; they do not switch to another implementation.
 Unclaimed control flow retains the existing session implementation. No generic

@@ -5562,7 +5562,23 @@ impl ExecutionProvider for WeightDeliveryEp {
         _layouts: &[TensorLayout],
     ) -> KernelMatch {
         if self.optional_input_contract && op.op_type == "OptionalContract" {
-            if input_dtypes == [DataType::Float32, DataType::Undefined, DataType::Bool] {
+            let expected: Vec<_> = op
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    if input.is_none() {
+                        DataType::Undefined
+                    } else if index == 0 {
+                        DataType::Float32
+                    } else {
+                        assert_eq!(index, 2);
+                        DataType::Bool
+                    }
+                })
+                .collect();
+            if input_dtypes == expected && _shapes.len() == op.inputs.len() {
+                self.deliveries.lock().unwrap().push("optional.claim");
                 return KernelMatch::Supported {
                     workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
                     cost: Cost::ZERO,
@@ -5571,7 +5587,7 @@ impl ExecutionProvider for WeightDeliveryEp {
                 };
             }
             return KernelMatch::unsupported(format!(
-                "OptionalContract requires [Float32, Undefined, Bool] input dtypes, got {input_dtypes:?}"
+                "OptionalContract requires {expected:?} positional dtypes and matching shapes, got {input_dtypes:?} and {_shapes:?}"
             ));
         }
         if self.support_index_share_workspace
@@ -5611,6 +5627,20 @@ impl ExecutionProvider for WeightDeliveryEp {
         _shapes: &[Vec<usize>],
         _opset: u64,
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        if self.optional_input_contract && op.op_type == "OptionalContract" {
+            assert_eq!(
+                _shapes.len(),
+                op.inputs.len(),
+                "compilation must preserve every optional slot"
+            );
+            assert_eq!(_shapes[0], [1]);
+            assert!(_shapes[1..].iter().all(Vec::is_empty));
+            self.deliveries.lock().unwrap().push("optional.compile");
+            return Ok(Box::new(OptionalSlotContractKernel {
+                arity: op.inputs.len(),
+                deliveries: Arc::clone(&self.deliveries),
+            }));
+        }
         if self.support_index_share_workspace
             && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && op.op_type == "IndexShare"
@@ -6451,6 +6481,219 @@ fn claim_time_optional_input_dtype_is_undefined_not_silently_float32() {
         executor.is_ok(),
         "an omitted optional input must reach supports_op as DataType::Undefined"
     );
+}
+
+struct OptionalSlotContractKernel {
+    arity: usize,
+    deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl Kernel for OptionalSlotContractKernel {
+    fn execute(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        assert_eq!(
+            inputs.len(),
+            self.arity,
+            "execution must preserve every optional slot"
+        );
+        assert_eq!(inputs[0].dtype, DataType::Float32);
+        assert!(!inputs[0].is_absent());
+        assert!(inputs[1].is_absent());
+        assert_eq!(inputs[1].dtype, DataType::Undefined);
+        assert_eq!(inputs[2].dtype, DataType::Bool);
+        assert!(
+            !inputs[2].is_absent(),
+            "a present scalar with an empty shape is not an omitted input"
+        );
+        for input in &inputs[3..] {
+            assert!(input.is_absent());
+            assert_eq!(input.dtype, DataType::Undefined);
+        }
+        self.deliveries.lock().unwrap().push("optional.execute");
+        // SAFETY: live input/output tensor views are bounded by the executor;
+        // the fixture declares a single f32 result with the same byte extent.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(inputs[0].data_ptr::<u8>(), inputs[0].byte_size())
+        };
+        WeightDeliveryKernel::copy_bytes(bytes, &mut outputs[0])
+    }
+}
+
+#[test]
+fn optional_input_slots_agree_through_claim_compile_and_public_execution() {
+    for encoded in [false, true] {
+        for prepared in [false, true] {
+            for trailing in [false, true] {
+                let mut graph = Graph::new();
+                graph.opset_imports.insert("test.optional".into(), 1);
+                let data = graph.create_named_value("data", DataType::Float32, static_shape([1]));
+                let training =
+                    graph.create_named_value("training", DataType::Bool, static_shape([]));
+                let output =
+                    graph.create_named_value("output", DataType::Float32, static_shape([1]));
+                graph.add_input(data);
+                graph.add_input(training);
+                graph.add_output(output);
+                let mut inputs = vec![Some(data), None, Some(training)];
+                if trailing {
+                    inputs.extend([None, None]);
+                }
+                let mut node = Node::new(NodeId(0), "OptionalContract", inputs, vec![output]);
+                node.domain = "test.optional".into();
+                graph.insert_node(node);
+                let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let mut provider = WeightDeliveryEp::new(false, Arc::clone(&deliveries));
+                provider.optional_input_contract = true;
+                let provider: Arc<dyn ExecutionProvider> = Arc::new(provider);
+                let mut session = if encoded {
+                    let bytes =
+                        onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph))
+                            .unwrap();
+                    crate::InferenceSession::builder()
+                        .model_bytes(&bytes)
+                        .option("optimization", "none")
+                        .execution_provider(provider)
+                        .build()
+                        .unwrap()
+                } else {
+                    crate::InferenceSession::from_graph_with_provider(
+                        graph,
+                        Arc::new(WeightStore::new()),
+                        std::path::Path::new("."),
+                        provider,
+                        None,
+                    )
+                    .unwrap()
+                };
+                let data = Tensor::from_f32(&[1], &[7.25]).unwrap();
+                let training = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
+                let bindings = [("data", &data), ("training", &training)];
+                if prepared {
+                    session
+                        .prepare_with_device_bindings(&bindings, &mut [])
+                        .unwrap();
+                }
+                let output = session.run(&bindings).unwrap();
+                assert_eq!(output[0].to_vec_f32(), [7.25]);
+                let seen = deliveries.lock().unwrap();
+                for phase in ["optional.claim", "optional.compile", "optional.execute"] {
+                    assert!(
+                        seen.contains(&phase),
+                        "missing {phase}; encoded={encoded}, prepared={prepared}, trailing={trailing}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn public_block_moe_accepts_preserved_trailing_optional_inputs() {
+    const H: usize = 32;
+    let mut expected = None;
+    for prepared in [false, true] {
+        for trailing in [0, 2, 4, 5] {
+            let mut graph = Graph::new();
+            graph
+                .opset_imports
+                .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+            let data = graph.create_named_value("data", DataType::Float32, static_shape([1, H]));
+            let router =
+                graph.create_named_value("router", DataType::Float32, static_shape([1, 2]));
+            let output =
+                graph.create_named_value("output", DataType::Float32, static_shape([1, H]));
+            let mut weight = |name: &str| {
+                let shape = vec![2, H, 1, 17];
+                let value = graph.create_named_value(
+                    name,
+                    DataType::Uint8,
+                    static_shape(shape.iter().copied()),
+                );
+                let mut packed = vec![0x22; 2 * H * 17];
+                for block in packed.chunks_exact_mut(17) {
+                    block[0] = 121;
+                }
+                graph.set_initializer(
+                    value,
+                    WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                        DataType::Uint8,
+                        shape,
+                        packed,
+                    )),
+                );
+                value
+            };
+            let fc1 = weight("fc1");
+            let fc2 = weight("fc2");
+            let mut inputs = vec![Some(data), Some(router), Some(fc1), None, Some(fc2)];
+            inputs.extend(std::iter::repeat_n(None, trailing));
+            let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", inputs, vec![output]);
+            node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+            for (name, attr) in [
+                (
+                    "fc1_format",
+                    onnx_runtime_ir::Attribute::String(b"mxfp4".to_vec()),
+                ),
+                (
+                    "fc2_format",
+                    onnx_runtime_ir::Attribute::String(b"mxfp4".to_vec()),
+                ),
+                ("block_layout_version", onnx_runtime_ir::Attribute::Int(1)),
+                (
+                    "activation_type",
+                    onnx_runtime_ir::Attribute::String(b"identity".to_vec()),
+                ),
+                ("k", onnx_runtime_ir::Attribute::Int(1)),
+                (
+                    "normalize_routing_weights",
+                    onnx_runtime_ir::Attribute::Int(1),
+                ),
+            ] {
+                node.attributes.insert(name.into(), attr);
+            }
+            graph.add_input(data);
+            graph.add_input(router);
+            graph.add_output(output);
+            graph.insert_node(node);
+            let bytes = onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph))
+                .unwrap();
+            let built = crate::InferenceSession::builder()
+                .model_bytes(&bytes)
+                .option("optimization", "none")
+                .execution_provider(Arc::new(CpuExecutionProvider::new()))
+                .build();
+            if trailing == 5 {
+                let Err(error) = built else {
+                    panic!("ten positional slots must not be accepted by a nine-input operator");
+                };
+                let message = error.to_string();
+                assert!(
+                    message.contains("expected 5 to 9 positional inputs, got 10"),
+                    "{message}"
+                );
+                continue;
+            }
+            let mut session = built.unwrap();
+            let data = Tensor::from_f32(&[1, H], &[0.125; H]).unwrap();
+            let router = Tensor::from_f32(&[1, 2], &[4., -4.]).unwrap();
+            let bindings = [("data", &data), ("router", &router)];
+            if prepared {
+                session
+                    .prepare_with_device_bindings(&bindings, &mut [])
+                    .unwrap();
+            }
+            let output = session.run(&bindings).unwrap();
+            let values = output[0].to_vec_f32();
+            assert!(values.iter().all(|x| x.is_finite() && *x != 0.));
+            assert_eq!(
+                *expected.get_or_insert_with(|| output[0].as_bytes().to_vec()),
+                output[0].as_bytes()
+            );
+        }
+    }
 }
 
 #[test]
