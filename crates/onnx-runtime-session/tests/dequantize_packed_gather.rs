@@ -218,6 +218,69 @@ fn packed_gather_rejects_integer_output_routes() {
     }
 }
 
+fn rank_one_graph(profile: &str, width: usize, expose_decoded: bool) -> Graph {
+    let elements = width * 3;
+    let bytes = PROFILES
+        .iter()
+        .find_map(|&(name, _, bytes)| (name == profile).then_some(bytes))
+        .unwrap();
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 29);
+    let packed = graph.create_named_value("packed", DataType::Uint8, static_shape([3 * bytes]));
+    let indices = graph.create_named_value("indices", DataType::Int64, static_shape([4]));
+    let decoded = graph.create_named_value("decoded", DataType::Float32, static_shape([elements]));
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+    graph.add_input(packed);
+    graph.add_input(indices);
+    let mut dq = Node::new(
+        NodeId(0),
+        "DequantizePacked",
+        vec![Some(packed)],
+        vec![decoded],
+    );
+    dq.attributes.insert(
+        "format".into(),
+        Attribute::String(format!("gguf:{profile}").into_bytes()),
+    );
+    dq.attributes
+        .insert("shape".into(), Attribute::Ints(vec![elements as i64]));
+    graph.insert_node(dq);
+    let mut gather = Node::new(
+        NodeId(0),
+        "Gather",
+        vec![Some(decoded), Some(indices)],
+        vec![output],
+    );
+    gather.attributes.insert("axis".into(), Attribute::Int(0));
+    graph.insert_node(gather);
+    graph.add_output(output);
+    if expose_decoded {
+        graph.add_output(decoded);
+    }
+    graph
+}
+
+#[test]
+fn packed_gather_rank_one_declines_fusion_and_executes_cleanly() {
+    for &(profile, width, bytes) in PROFILES {
+        let mut private =
+            InferenceSession::from_graph(rank_one_graph(profile, width, false)).unwrap();
+        let mut reference =
+            InferenceSession::from_graph(rank_one_graph(profile, width, true)).unwrap();
+        assert_eq!(ops(&private, dequantize_packed_gather::OP), 0, "{profile}");
+        assert_eq!(ops(&private, "DequantizePacked"), 1, "{profile}");
+        let raw = &corpus(profile, bytes)[..3 * bytes];
+        let weights = Tensor::from_raw(DataType::Uint8, vec![raw.len()], raw).unwrap();
+        let indices =
+            Tensor::from_i64(&[4], &[0, width as i64, (width * 2 + 1) as i64, -1]).unwrap();
+        let input = [("packed", &weights), ("indices", &indices)];
+        let got = private.run(&input).unwrap();
+        let expected = reference.run(&input).unwrap();
+        assert_eq!(got[0].shape, [4], "{profile}");
+        assert_eq!(got[0].as_bytes(), expected[0].as_bytes(), "{profile}");
+    }
+}
+
 #[cfg(feature = "gpu-tests")]
 #[test]
 fn packed_gather_cuda_all_profiles_fp32() {

@@ -197,13 +197,46 @@ pub fn affine_gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> 
 }
 
 pub fn dequantize_packed_gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let op = ctx.node.op_type.clone();
+    let invalid = |detail| ShapeInferError::Invalid {
+        op: op.clone(),
+        detail,
+    };
+    if ctx.num_inputs() != 2
+        || !ctx.has_input(0)
+        || !ctx.has_input(1)
+        || !matches!(ctx.node.outputs.as_slice(), [Some(_)])
+    {
+        return Err(invalid(
+            "DequantizePackedGather requires packed data, indices, and one output".into(),
+        ));
+    }
     let metadata =
-        onnx_runtime_ir::dequantize_packed::Metadata::from_node(ctx.node).map_err(|detail| {
-            ShapeInferError::Invalid {
-                op: ctx.node.op_type.clone(),
-                detail,
-            }
-        })?;
+        onnx_runtime_ir::dequantize_packed::Metadata::from_node(ctx.node).map_err(&invalid)?;
+    onnx_runtime_ir::dequantize_packed_gather::row_geometry(&metadata).map_err(&invalid)?;
+    if let Some(dtype) = ctx.input_dtype(0) {
+        metadata.validate_input_dtype(dtype).map_err(&invalid)?;
+    }
+    if let Some(shape) = ctx.input_shape(0) {
+        metadata
+            .validate_input_rank(shape.len())
+            .map_err(&invalid)?;
+        if let Some(n) = shape[0].as_const() {
+            let len = usize::try_from(n).map_err(|_| {
+                invalid(format!(
+                    "packed input length {n} must be nonnegative and fit usize"
+                ))
+            })?;
+            metadata.validate_packed_bytes(len).map_err(&invalid)?;
+        }
+    }
+    if let Some(dtype) = ctx.input_dtype(1)
+        && !matches!(dtype, DataType::Int32 | DataType::Int64)
+    {
+        return Err(invalid(format!(
+            "indices must be INT32 or INT64, got {dtype:?}"
+        )));
+    }
     let Some(indices) = ctx.input_shape(1) else {
         return Ok(());
     };
