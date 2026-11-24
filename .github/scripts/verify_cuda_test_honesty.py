@@ -91,6 +91,7 @@ EXPECTED_CUDA_TARGETS_BY_DIR = {
             "group_query_attention_gpu",
             "index_share_gpu",
             "indexing_gpu",
+            "interleave_gpu",
             "kv_cache_capacity_append_gpu",
             "linear_attention_gpu",
             "matmul_gpu",
