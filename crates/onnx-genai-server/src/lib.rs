@@ -143,7 +143,7 @@ pub fn app(state: AppState) -> Router {
         .route("/audio/speech", post(routes::audio_speech))
         .route(
             "/props",
-            get(routes::llama::props).post(routes::llama::disabled_feature),
+            get(routes::llama::props).post(routes::llama::post_props),
         )
         .route(
             "/v1/chat/completions/input_tokens",

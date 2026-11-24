@@ -1193,6 +1193,7 @@ fn forced_f16_cublaslt_narrows_once_and_rejects_unregistered_workspace_capture()
             .unwrap();
         execute(EinsumRouteOverride::CudaCublas, &mut cublas_output).unwrap();
         runtime.end_graph_capture().unwrap();
+        ep.wait_for_deferred_releases().unwrap();
         let counts_before_drop = runtime.allocation_counts();
         drop(caller);
         drop(kernel);
@@ -2566,8 +2567,10 @@ fn captured_einsum_resources_outlive_kernel_and_caller_owners() {
     execute_view(view.as_ref(), &mut view_output);
     runtime.end_graph_capture().unwrap();
 
+    ep.wait_for_deferred_releases().unwrap();
+
     let counts_before_drop = runtime.allocation_counts();
-    let pooled_before_drop = runtime.raw_pool_retained_bytes();
+
     drop(caller);
     drop(gemm);
     drop(view);
@@ -2575,11 +2578,6 @@ fn captured_einsum_resources_outlive_kernel_and_caller_owners() {
         runtime.allocation_counts(),
         counts_before_drop,
         "dropping kernels must not free addresses embedded in a live graph"
-    );
-    assert_eq!(
-        runtime.raw_pool_retained_bytes(),
-        pooled_before_drop,
-        "dropping kernels must not return graph-owned addresses to the raw pool"
     );
 
     runtime.replay_graph().unwrap();
@@ -2623,14 +2621,16 @@ fn captured_einsum_resources_outlive_kernel_and_caller_owners() {
         ]
     );
 
+    ep.wait_for_deferred_releases().unwrap();
+
     let counts_before_reset = runtime.allocation_counts();
-    let pooled_before_reset = runtime.raw_pool_retained_bytes();
+
     assert!(runtime.reset_graph().unwrap());
+    ep.wait_for_deferred_releases().unwrap();
     let counts_after_reset = runtime.allocation_counts();
-    let pooled_after_reset = runtime.raw_pool_retained_bytes();
+
     assert!(
-        counts_after_reset.frees > counts_before_reset.frees
-            || pooled_after_reset > pooled_before_reset,
+        counts_after_reset.frees > counts_before_reset.frees,
         "destroying the graph must release its caller workspace and immutable metadata owners"
     );
 
@@ -2723,8 +2723,10 @@ fn materialized_view_failed_rewarm_preserves_capture_ready_snapshot_gpu() {
         )
     };
 
+    ep.wait_for_deferred_releases().unwrap();
+
     let counts_before_failure = runtime.allocation_counts();
-    let pooled_before_failure = runtime.raw_pool_retained_bytes();
+
     runtime.fail_warm_transaction_at_for_test(1);
     let failure = run_b(&mut b_output)
         .expect_err("valid strided view B must fail after staging new metadata");
@@ -2739,10 +2741,10 @@ fn materialized_view_failed_rewarm_preserves_capture_ready_snapshot_gpu() {
         a_resource_id,
         "failed Einsum view rewarm must retain A's metadata owner"
     );
+    ep.wait_for_deferred_releases().unwrap();
     let counts_after_failure = runtime.allocation_counts();
     assert!(
-        counts_after_failure.frees > counts_before_failure.frees
-            || runtime.raw_pool_retained_bytes() > pooled_before_failure,
+        counts_after_failure.frees > counts_before_failure.frees,
         "the rejected Einsum candidate must return its staged allocation exactly once"
     );
 
@@ -2840,6 +2842,7 @@ fn generic_failed_rewarm_preserves_capture_ready_snapshot() {
     );
     #[cfg(feature = "gpu-tests")]
     runtime.fail_warm_transaction_at_for_test(2);
+    ep.wait_for_deferred_releases().unwrap();
     let counts_before_failure = runtime.allocation_counts();
     let failure = run(&b_view, &mut b_output).expect_err("rewarm fault must fail");
     assert!(
@@ -2849,10 +2852,10 @@ fn generic_failed_rewarm_preserves_capture_ready_snapshot() {
         "{failure}"
     );
     assert_eq!(kernel.device_graph_resources()[0].identity(), resource);
+    ep.wait_for_deferred_releases().unwrap();
     assert!(
-        runtime.allocation_counts().frees > counts_before_failure.frees
-            || runtime.raw_pool_retained_bytes() > 0,
-        "the failed candidate must release or pool its private metadata allocation"
+        runtime.allocation_counts().frees > counts_before_failure.frees,
+        "the failed candidate must release or pool its native metadata owner"
     );
     let mut untouched = vec![0u8; 8];
     unsafe {
@@ -3235,6 +3238,7 @@ fn captured_generic_resources_outlive_dropped_kernel() {
         .unwrap();
     execute(kernel.as_ref(), &mut output);
     runtime.end_graph_capture().unwrap();
+    ep.wait_for_deferred_releases().unwrap();
     let counts_before_drop = runtime.allocation_counts();
     drop(kernel);
     assert_eq!(runtime.allocation_counts(), counts_before_drop);
@@ -3327,6 +3331,8 @@ fn captured_optimized_plan_resources_outlive_dropped_kernel() {
         .unwrap();
     execute(kernel.as_ref(), &mut output);
     runtime.end_graph_capture().unwrap();
+
+    ep.wait_for_deferred_releases().unwrap();
 
     let counts_before_drop = runtime.allocation_counts();
     drop(kernel);
@@ -4698,10 +4704,14 @@ fn semantic_einsum_caller_workspace_gpu() {
     let injected = Arc::new(common::ExternalEagerAllocator::new(
         common::require_context("semantic Einsum caller workspace"),
     ));
-    let ep = CudaExecutionProvider::new_default()
-        .unwrap()
-        .with_memory(injected.clone() as Arc<dyn onnx_runtime_memory_api::DeviceAllocator>)
-        .unwrap();
+    let ep = CudaExecutionProvider::from_config(
+        0,
+        onnx_runtime_ep_cuda::CudaProviderConfig {
+            memory: Some(injected.clone() as Arc<dyn onnx_runtime_memory_api::DeviceAllocator>),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let runtime = ep.runtime();
     let (m, k, n, p) = (8, 16, 12, 10);
     let shapes = [vec![m, k], vec![k, n], vec![n, p]];
