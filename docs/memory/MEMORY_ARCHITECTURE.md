@@ -229,6 +229,30 @@ child execution remains scoped execution through the parent's live workspace.
 This bridge adds no allocator, pool, quota ledger, or warm inference callback.
 GQA below now consumes this ownership bridge for its complete borrowed composite.
 
+### CUDA MHA and shared Phase-2a temporary storage
+
+MultiHeadAttention borrows one SessionPersistent composite for query/output BNSH
+staging, temporary hidden K/V, additive mask, padding upload, and Phase-2a
+scores/BLAS. Regions are offsets in one allocation. Declared optional output
+positions and supplied output metadata must agree before present K/V replace
+temporary buffers; known output shapes/dtypes are validated identically during
+planning and execution. Unresolved output shape does not change the bound, which
+comes from input geometry and compiled output presence.
+
+Retention keeps the same funded peak available for fitting device-binding runs,
+including when the existing synchronization policy defers completion. The policy
+is not a completion receipt. Provider fences and settlement still govern growth
+and release; uncertain backing remains charged. Capture stays unsupported, and
+the host padding mask remains an owned Vec outside device workspace accounting.
+
+All three shared Phase-2a callers now pass checked, borrowed scratch. The engine
+validates score capacity against actual invocation geometry before its first
+launch; no raw allocation/free fallback or runtime-private shared BLAS allocation
+remains. A failed synchronous legacy upload latches an additional legacy-stream
+release fence; normal releases retain their existing compute/copy pair. Host
+contracts and Rust GPU-target compilation do not establish CUDA numerical parity,
+actual asynchronous failure behavior or performance.
+
 ### CUDA GQA temporary storage
 
 GQA uses one prepared composite for packed staging, Q/output transposes,
