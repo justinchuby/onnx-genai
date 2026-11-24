@@ -114,8 +114,8 @@ fn rnn_bidirectional_lengths_and_clip() {
                 "activations",
                 Attribute::Strings(vec![b"Relu".to_vec(), b"Affine".to_vec()]),
             ),
-            ("activation_alpha", Attribute::Floats(vec![0., 0.5])),
-            ("activation_beta", Attribute::Floats(vec![0., 0.25])),
+            ("activation_alpha", Attribute::Floats(vec![0.5])),
+            ("activation_beta", Attribute::Floats(vec![0.25])),
             ("clip", Attribute::Float(3.)),
         ];
         let y = [1.5, 1.625, 3., 1.75, 0., 0., 0., 0., 0., 0., 0., 0.];

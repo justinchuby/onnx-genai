@@ -102,8 +102,10 @@ impl Config {
                 "{name} must contain at most {directions} floats"
             ))),
         };
-        let alphas = parameters("activation_alpha")?;
-        let betas = parameters("activation_beta")?;
+        // The lists contain coefficients for activations that consume them,
+        // not placeholders for parameterless activations.
+        let mut alphas = parameters("activation_alpha")?.iter().copied();
+        let mut betas = parameters("activation_beta")?.iter().copied();
         use ActivationKind::*;
         let mut activations = [Activation {
             kind: Tanh,
@@ -135,8 +137,19 @@ impl Config {
             };
             *activation = Activation {
                 kind,
-                alpha: alphas.get(dir).copied().unwrap_or(alpha),
-                beta: betas.get(dir).copied().unwrap_or(beta),
+                alpha: if matches!(
+                    kind,
+                    Affine | LeakyRelu | ThresholdedRelu | ScaledTanh | HardSigmoid | Elu
+                ) {
+                    alphas.next().unwrap_or(alpha)
+                } else {
+                    alpha
+                },
+                beta: if matches!(kind, Affine | ScaledTanh | HardSigmoid) {
+                    betas.next().unwrap_or(beta)
+                } else {
+                    beta
+                },
             };
         }
         Ok(Self {
