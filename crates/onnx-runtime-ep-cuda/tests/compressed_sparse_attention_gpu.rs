@@ -2656,8 +2656,8 @@ fn ratio4_speculative_rollback_restores_accepted_prefix_bit_exact() {
     let seq_scalar = upload_device(&ep, &14i64.to_ne_bytes());
 
     let metrics = ep.csa_metrics().clone();
-    let journal = CsaCheckpointJournal::new(
-        ep.runtime().clone(),
+    let mut journal = CsaCheckpointJournal::new(
+        &ep,
         RATIO4 as u64,
         committed[2].len(),
         committed[4].len(),
@@ -2668,7 +2668,7 @@ fn ratio4_speculative_rollback_restores_accepted_prefix_bit_exact() {
     const GENERATION: u64 = 0xB7;
     let accepted_cursor: u64 = 13;
     // SAFETY: both carry buffers are live and sized to the committed carry bytes.
-    let checkpoint = unsafe {
+    let mut checkpoint = unsafe {
         journal.checkpoint(
             cuptr(main_carry.as_ptr()),
             cuptr(index_carry.as_ptr()),
@@ -2709,12 +2709,9 @@ fn ratio4_speculative_rollback_restores_accepted_prefix_bit_exact() {
     let rollbacks_before = metrics.rollback_count();
     // SAFETY: buffers are the same live carry/scalar allocations checkpointed above.
     let restored_cursors = unsafe {
-        journal.restore_prefix(
-            &checkpoint,
+        checkpoint.restore_prefix(
             accepted_cursor,
             GENERATION,
-            cuptr(main_carry.as_ptr()),
-            cuptr(index_carry.as_ptr()),
             Some(cuptr(seq_scalar.as_ptr())),
         )
     }
@@ -2849,8 +2846,8 @@ fn ratio4_speculative_rollback_discards_completed_block_bit_exact() {
     let index_carry = upload_device(&ep, &committed[4]);
     let seq_scalar = upload_device(&ep, &(ACCEPTED as i64).to_ne_bytes());
     let metrics = ep.csa_metrics().clone();
-    let journal = CsaCheckpointJournal::new(
-        ep.runtime().clone(),
+    let mut journal = CsaCheckpointJournal::new(
+        &ep,
         RATIO4 as u64,
         committed[2].len(),
         committed[4].len(),
@@ -2859,7 +2856,7 @@ fn ratio4_speculative_rollback_discards_completed_block_bit_exact() {
     .expect("journal");
     const GENERATION: u64 = 0xB7_4;
     // SAFETY: carry buffers are live and cover the committed carry state.
-    let checkpoint = unsafe {
+    let mut checkpoint = unsafe {
         journal.checkpoint(
             cuptr(main_carry.as_ptr()),
             cuptr(index_carry.as_ptr()),
@@ -2921,14 +2918,7 @@ fn ratio4_speculative_rollback_discards_completed_block_bit_exact() {
 
     // SAFETY: the checkpoint owns snapshots for these same live carry buffers.
     let restored = unsafe {
-        journal.restore_prefix(
-            &checkpoint,
-            ACCEPTED,
-            GENERATION,
-            cuptr(main_carry.as_ptr()),
-            cuptr(index_carry.as_ptr()),
-            Some(cuptr(seq_scalar.as_ptr())),
-        )
+        checkpoint.restore_prefix(ACCEPTED, GENERATION, Some(cuptr(seq_scalar.as_ptr())))
     }
     .expect("restore completed-block rejection");
     assert_eq!(
@@ -3051,8 +3041,8 @@ fn ratio4_greedy_token_bit_identity_across_draft_verify_correct() {
 
     let main_carry = upload_device(&ep, &committed[2]);
     let index_carry = upload_device(&ep, &committed[4]);
-    let journal = CsaCheckpointJournal::new(
-        ep.runtime().clone(),
+    let mut journal = CsaCheckpointJournal::new(
+        &ep,
         RATIO4 as u64,
         committed[2].len(),
         committed[4].len(),
@@ -3061,7 +3051,7 @@ fn ratio4_greedy_token_bit_identity_across_draft_verify_correct() {
     .expect("journal");
     const GEN: u64 = 42;
     // SAFETY: live carry buffers sized to the committed carry extents.
-    let checkpoint = unsafe {
+    let mut checkpoint = unsafe {
         journal.checkpoint(
             cuptr(main_carry.as_ptr()),
             cuptr(index_carry.as_ptr()),
@@ -3091,16 +3081,7 @@ fn ratio4_greedy_token_bit_identity_across_draft_verify_correct() {
     // Correct: restore and continue.
     // SAFETY: same live buffers as the checkpoint.
     unsafe {
-        journal
-            .restore_prefix(
-                &checkpoint,
-                13,
-                GEN,
-                cuptr(main_carry.as_ptr()),
-                cuptr(index_carry.as_ptr()),
-                None,
-            )
-            .expect("restore");
+        checkpoint.restore_prefix(13, GEN, None).expect("restore");
     }
     let mut restored_state = committed.clone();
     restored_state[2] = download_device(&ep, &main_carry, committed[2].len());
@@ -3218,16 +3199,14 @@ fn csa_composite_checkpoint_rolls_back_all_layers() {
     let carry_a = upload_device(&ep, &bytes_a);
     let carry_b = upload_device(&ep, &bytes_b);
     let metrics = ep.csa_metrics().clone();
-    let journal_a =
-        CsaCheckpointJournal::new(ep.runtime().clone(), 4, bytes_a.len(), 1, metrics.clone())
-            .unwrap();
-    let journal_b =
-        CsaCheckpointJournal::new(ep.runtime().clone(), 4, bytes_b.len(), 1, metrics.clone())
-            .unwrap();
+    let mut journal_a =
+        CsaCheckpointJournal::new(&ep, 4, bytes_a.len(), 1, metrics.clone()).unwrap();
+    let mut journal_b =
+        CsaCheckpointJournal::new(&ep, 4, bytes_b.len(), 1, metrics.clone()).unwrap();
 
     const GEN: u64 = 9;
     // SAFETY: live buffers sized to the committed carry extents.
-    let (ck_a, ck_b) = unsafe {
+    let (mut ck_a, mut ck_b) = unsafe {
         let a = journal_a
             .checkpoint(cuptr(carry_a.as_ptr()), 0, bytes_a.len(), 0, 8, GEN)
             .unwrap();
@@ -3259,12 +3238,8 @@ fn csa_composite_checkpoint_rolls_back_all_layers() {
     // Composite rollback: reject the draft on every layer.
     // SAFETY: same live buffers as each checkpoint.
     unsafe {
-        journal_a
-            .restore_prefix(&ck_a, 8, GEN, cuptr(carry_a.as_ptr()), 0, None)
-            .unwrap();
-        journal_b
-            .restore_prefix(&ck_b, 8, GEN, cuptr(carry_b.as_ptr()), 0, None)
-            .unwrap();
+        ck_a.restore_prefix(8, GEN, None).unwrap();
+        ck_b.restore_prefix(8, GEN, None).unwrap();
     }
 
     assert_eq!(download_device(&ep, &carry_a, bytes_a.len()), bytes_a);
@@ -3272,8 +3247,7 @@ fn csa_composite_checkpoint_rolls_back_all_layers() {
 
     // A generation mismatch must be rejected (identity validation, D6).
     // SAFETY: live buffer.
-    let mismatch =
-        unsafe { journal_a.restore_prefix(&ck_a, 8, GEN + 1, cuptr(carry_a.as_ptr()), 0, None) };
+    let mismatch = unsafe { ck_a.restore_prefix(8, GEN + 1, None) };
     assert!(
         mismatch.is_err(),
         "restore must reject a checkpoint from a different generation"

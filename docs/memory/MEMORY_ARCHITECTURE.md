@@ -1603,6 +1603,56 @@ unregistered caller capture refusal, numerical parity and replay after kernel
 drop. CUDA execution and throughput remain unmeasured. The new Host layout/bind
 and capture-owner checks are not claimed to have zero cost.
 
+### Checkpoint snapshots have one dedicated native owner and an exclusive token
+
+`CsaCheckpointJournal` now borrows its provider and owns one native
+`WorkspaceAllocation` containing checked 256B-aligned main/index regions. It
+must not borrow the reusable compute peak: saved carry data spans multiple
+operator executions. Allocate the journal once per runner/request and reuse it across checkpoint
+windows; dropping a token only releases its borrow. Zero capacity causes no
+allocation. Snapshot and restore contain no allocation or
+quota API calls; retirement uses the existing provider release/settlement path.
+The raw allocation pair and raw free Drop are removed.
+
+`checkpoint(&mut journal)` returns a non-Copy, non-Clone
+`CsaCheckpoint<'journal, 'provider>` with an exclusive journal borrow and the
+original carry spans. Restore is a method on that token, not an operation taking
+an arbitrary journal/token pair. A still-used token prevents a new snapshot
+from overwriting its storage, including when the sequence generation is
+unchanged. Positive and compile-fail documentation examples verify that borrow
+contract on the Host. Independent journals can each have a live token; this does
+not imply transaction atomicity across layers.
+
+Both operations validate sizes/spans and reject actual stream capture before
+copying. Restore validates generation, accepted prefix, optional int64 scalar
+conversion and nonoverlap with snapshot storage before the first write. Zero
+capacity stays zero, not a hidden one-byte carry. A zero compression ratio is
+rejected. The unsafe caller still guarantees live carry/cursor memory in the
+provider's context, correct producer ordering and exclusive access during
+copies. Saved raw addresses are not Rust ownership proofs for external state.
+Device errors may leave a partial restore; callers stop inference and explicitly
+retry the held token or retire the window. Success metrics advance only after
+all copies and the optional scalar write complete.
+
+The provider borrow keeps the release queue alive. Explicit consuming
+`release()` transfers the dedicated owner once; Drop uses the same path only
+when ownership remains. Success means retirement was accepted, not immediate
+quota return. Failed release/preflight does not retry a consumed owner and
+native quarantine preserves charges. Release during capture is invalid and
+keeps native ownership charged rather than issuing an unsafe copy/free. Normal
+callers retire after the speculative window and observe provider settlement.
+
+Host tests cover checked capacities, empty spans, overlap/wrap and restore
+preflight. GPU fixtures compile exact bounded carry restores, same-address
+journal reuse only after token release, capture refusals, unchanged native
+allocation identities/charges during the window, zero-capacity construction,
+explicit release and Drop fallback with Released settlement. Negative restore
+cases read back dirty carries/cursor to detect partial mutation; allocation
+fingerprints alone are not evidence of zero issuer callbacks. Code inspection
+establishes that quota calls are confined to construction/retirement. No CUDA
+execution or throughput measurement was available. The existing synchronous
+D2D/H2D policy is preserved; Host binding/capture-query cost remains unmeasured.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
@@ -1633,8 +1683,7 @@ call; it owns the governed workspace preparation path
 | file/line | owner | byte formula | size source | lifetime class | status |
 |---|---|---|---|---|---|
 | `kernels/attention.rs:830-831` | legacy `Attention` Phase-2a scores + cuBLASLt workspace | `align256(batch * num_heads * sq * sk * elem_size) + WORKSPACE_BYTES` | prompt/cache dependent score matrix + static cuBLASLt ceiling | step-scoped | **governed by #753** inside one composite workspace; direct-execute compatibility/opt-out fallback remains raw |
-| `kernels/csa_checkpoint.rs:126` | CSA checkpoint main carry snapshot | `main_carry_bytes.max(1)` | config/state shape | session-persistent | raw bypass |
-| `kernels/csa_checkpoint.rs:127` | CSA checkpoint index carry snapshot | `index_carry_bytes.max(1)` | config/state shape | session-persistent | raw bypass |
+| `kernels/csa_checkpoint.rs` | CSA main/index checkpoint snapshots | checked dedicated native composite | declared carry capacities | journal lifetime | native owner and structured retirement |
 | `kernels/compressed_sparse_attention.rs` | CSA computational scratch | checked caller composite | live query rows / declared and physical record capacity | SessionPersistent caller peak | private manager and charge removed; native owner settlement |
 | `kernels/elementwise.rs:699` | elementwise scalar/shape metadata upload | `metadata_bytes.len()` | op arity/rank | step-scoped | raw bypass |
 | `kernels/fused_gemm.rs` | fused GEMM cuBLASLt workspace | selected heuristic `workspaceSize` (ceiling `WORKSPACE_BYTES`) | shape/dtype/algorithm dependent | session-persistent shared peak | **governed by #799** via the shared exact plan/execute helper + prepared workspace |
