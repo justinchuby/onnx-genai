@@ -5,17 +5,18 @@ use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
 
 pub fn infer_space_depth(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let node = ctx.node;
     let invalid = |detail| ShapeInferError::Invalid {
-        op: ctx.node.op_type.clone(),
+        op: node.op_type.clone(),
         detail,
     };
-    let params = SpaceDepth::parse(ctx.node, ctx.opset(&ctx.node.domain)).map_err(invalid)?;
+    let params = SpaceDepth::parse(node, ctx.opset(&node.domain)).map_err(invalid)?;
     let Some(input) = ctx.input_type(0).cloned() else {
         return Ok(());
     };
     if input.rank() != 4 {
         return Err(ShapeInferError::InvalidRank {
-            op: ctx.node.op_type.clone(),
+            op: node.op_type.clone(),
             index: 0,
             rank: input.rank(),
             detail: SpaceDepth::rank_error(input.rank()),
