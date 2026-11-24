@@ -338,6 +338,23 @@ fn decode_gemv_loop_rows_aligned(k: usize) -> bool {
     k.is_multiple_of(GEMV_F16_ACTIVATION_VECTOR_ELEMENTS)
 }
 
+/// Only scale operands may use immutable BF16 conversion storage. Other
+/// operands retain per-call staging even when a graph happens to freeze them.
+fn bf16_scale_slots(gate_up_swiglu: bool) -> &'static [usize] {
+    if gate_up_swiglu { &[2, 4] } else { &[2] }
+}
+
+fn bf16_scale_input_is_cacheable(
+    constant_inputs: &[bool],
+    gate_up_swiglu: bool,
+    index: usize,
+    dtype: DataType,
+) -> bool {
+    dtype == DataType::BFloat16
+        && bf16_scale_slots(gate_up_swiglu).contains(&index)
+        && constant_inputs.get(index) == Some(&true)
+}
+
 fn marlin_weight_inputs_are_constant(constant_inputs: &[bool], gate_up_swiglu: bool) -> bool {
     if gate_up_swiglu {
         constant_inputs.get(1) == Some(&true) && constant_inputs.get(3) == Some(&true)
@@ -6973,8 +6990,8 @@ pub struct MatMulNBitsKernel {
     /// Repacked immutable weights owned by this kernel. Owner scoping prevents a
     /// later kernel from hitting stale contents when CUDA reuses an address.
     marlin_repack_cache: marlin_gemm::RepackCache,
-    /// Session-lifetime graph constants. Only immutable weights may enter the
-    /// owner-scoped Marlin repack cache.
+    /// Session-lifetime graph constants. Only proven immutable inputs may enter
+    /// the owner-scoped weight-repack or BF16 scale-conversion caches.
     constant_inputs: [bool; 8],
     /// Set when this node's bias input came from folding a standalone `Add`
     /// (see [`crate::optimizer::MATMUL_NBITS_FOLDED_BIAS_ATTR`]). The fp16 GEMV
@@ -6999,8 +7016,8 @@ pub struct MatMulNBitsKernel {
     last_call_capture_safe: AtomicBool,
     /// Reusable Float16 staging arena for the BFloat16 activation path.
     bf16_scratch: Mutex<Bf16Scratch>,
-    /// Persistent Float16 staging of the BFloat16 *constant* inputs (scales,
-    /// gamma) so they are cast once rather than re-cast every decode step.
+    /// Persistent Float16 staging of proven immutable BFloat16 scales, so they
+    /// are cast once rather than re-cast every decode step.
     bf16_const_cache: Mutex<Bf16ConstCache>,
 }
 
@@ -7051,10 +7068,7 @@ impl MatMulNBitsKernel {
             )));
         }
         if inputs[0].dtype == DataType::Float16 {
-            if self.gate_up_swiglu {
-                return self.run_f16_gate_up_swiglu(inputs, outputs, workspace);
-            }
-            return self.run_f16(inputs, outputs, workspace);
+            return self.dispatch_f16(inputs, outputs, workspace);
         }
         if inputs[0].dtype == DataType::BFloat16 {
             return self.run_bf16(inputs, outputs, workspace);
@@ -7543,6 +7557,21 @@ impl MatMulNBitsKernel {
         Ok(blas::governed_workspace_requirement(bytes))
     }
 
+    /// Route already-initialized FP16 execution without resetting resources.
+    /// BF16 staging holds its arena borrow while entering this same dispatch.
+    fn dispatch_f16(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        if self.gate_up_swiglu {
+            self.run_f16_gate_up_swiglu(inputs, outputs, workspace)
+        } else {
+            self.run_f16(inputs, outputs, workspace)
+        }
+    }
+
     /// BFloat16-activation path. The tuned int4/int8 GEMV/GEMM kernels are
     /// implemented for Float16 and Float32 activations only, so BFloat16 inputs
     /// are staged through Float16: every BFloat16 operand (activation, scales,
@@ -7554,7 +7583,8 @@ impl MatMulNBitsKernel {
     /// weights (the memory-bound term in decode) keep their int4/int8 layout, so
     /// the extra work is a handful of pointwise casts per node. Float16 losslessly
     /// represents the post-normalization magnitudes MatMulNBits consumes here.
-    /// The per-call scratch means this path is not graph-capture safe.
+    /// Capture eligibility follows the selected FP16 route and its retained
+    /// staging resources; conversion contents are refreshed for dynamic inputs.
     fn run_bf16(
         &self,
         inputs: &[TensorView],
@@ -7564,19 +7594,13 @@ impl MatMulNBitsKernel {
         require_dtype("A", inputs[0].dtype, DataType::BFloat16)?;
         require_dtype("Y", outputs[0].dtype, DataType::BFloat16)?;
 
-        // The scale slots are immutable weights (general path: input 2; the
-        // gate/up SwiGLU fusion adds a second scale at input 4). They dominate
-        // the BFloat16 staging traffic (~25% of the int4 weight bytes/token for
-        // Muse-Glimmer), so stage them once into the persistent const cache and
-        // reuse across decode steps. Every other BFloat16 input is either the
-        // per-step activation (input 0) or a per-token residual bound into the
-        // bias slot — both genuinely dynamic — so they keep going through the
-        // per-call arena. Caching keys on the weight pointer + element count and
-        // never uses pointer identity for the dynamic slots (a reused activation
-        // buffer has a stable pointer but changing contents).
-        let cache_slots: &[usize] = if self.gate_up_swiglu { &[2, 4] } else { &[2] };
+        // A scale role alone is not an immutability proof: externally bound
+        // scales may change at the same device address. Only the session's
+        // positional graph-constant facts permit persistent conversion reuse.
+        // Dynamic scales join activation/residual staging and are cast each call.
+        let cache_slots = bf16_scale_slots(self.gate_up_swiglu);
         let is_cached = |index: usize, dtype: DataType| {
-            dtype == DataType::BFloat16 && cache_slots.contains(&index)
+            bf16_scale_input_is_cacheable(&self.constant_inputs, self.gate_up_swiglu, index, dtype)
         };
 
         // Lay out per-call Float16 regions inside the reusable arena: one region
@@ -7702,7 +7726,10 @@ impl MatMulNBitsKernel {
             taken: false,
         });
         let previous = BF16_DIRECT_OUT.with(|cell| cell.replace(offer));
-        let run_result = self.run(&f16_inputs, std::slice::from_mut(&mut y_f16), workspace);
+        // Do not re-enter `run`: its per-call reset would relock the live arena
+        // and clear the resource-use facts required by graph capture.
+        let run_result =
+            self.dispatch_f16(&f16_inputs, std::slice::from_mut(&mut y_f16), workspace);
         let settled = BF16_DIRECT_OUT.with(|cell| cell.replace(previous));
         run_result?;
         if !settled.is_some_and(|offer| offer.taken) {
@@ -7715,11 +7742,8 @@ impl MatMulNBitsKernel {
                 out_n,
             )?;
         }
-        // Capture-safety is inherited from the staged fp16 run: the M==1 decode
-        // GEMV is capture-safe, and the staging casts add only allocation-free,
-        // sync-free stream launches against the persistent arena (which is grown
-        // once, before capture). Prefill (M>1) leaves the flag cleared. So the
-        // flag `run` set during recursion is exactly right — do not override it.
+        // Preserve the capture-eligibility flag set by the selected FP16 route.
+        // Staging casts are stream-ordered against retained arena/constant owners.
         drop(arena);
         Ok(())
     }
@@ -11330,6 +11354,61 @@ mod tests {
     use onnx_runtime_ir::{DataType, DeviceId};
 
     use super::*;
+
+    #[test]
+    fn bf16_staging_preserves_call_resource_initialization() {
+        let source = include_str!("matmul_nbits.rs");
+        let body = source
+            .split_once("    fn run_bf16(")
+            .unwrap()
+            .1
+            .split_once("    /// Direct fp16-activation")
+            .unwrap()
+            .0;
+        assert!(
+            !body.contains("self.run("),
+            "BF16 must not relock its live arena through top-level call initialization"
+        );
+        assert!(body.contains("self.dispatch_f16("));
+    }
+
+    #[test]
+    fn bf16_scale_cache_requires_exact_constant_proof_and_operand_role() {
+        for fused in [false, true] {
+            for index in 0..10 {
+                assert!(!bf16_scale_input_is_cacheable(
+                    &[],
+                    fused,
+                    index,
+                    DataType::BFloat16
+                ));
+                assert!(!bf16_scale_input_is_cacheable(
+                    &[false; 8],
+                    fused,
+                    index,
+                    DataType::BFloat16
+                ));
+                let eligible = index == 2 || (fused && index == 4);
+                assert_eq!(
+                    bf16_scale_input_is_cacheable(&[true; 8], fused, index, DataType::BFloat16),
+                    eligible
+                );
+                for dtype in [DataType::Float16, DataType::Float32, DataType::Uint8] {
+                    assert!(!bf16_scale_input_is_cacheable(
+                        &[true; 8], fused, index, dtype
+                    ));
+                }
+                let mut facts = [false; 8];
+                if index < facts.len() {
+                    facts[index] = true;
+                }
+                assert_eq!(
+                    bf16_scale_input_is_cacheable(&facts, fused, index, DataType::BFloat16),
+                    eligible
+                );
+            }
+        }
+    }
 
     #[test]
     fn marlin_repack_requires_constant_weight_inputs() {
@@ -20081,14 +20160,15 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// and the tuned fp16 GEMV then reads identical scales. This test runs the
     /// bf16 path twice (cache miss, then cache hit) and compares it, bit for bit,
     /// to a reference that stages every bf16 input to Float16 inline.
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
     #[test]
     fn bf16_scale_cache_is_bit_exact_to_inline_staging() {
         use half::bf16;
 
-        let Some(runtime) = runtime() else {
-            eprintln!("skipping MatMulNBits bf16 scale-cache test: CUDA runtime unavailable");
-            return;
-        };
+        let runtime = runtime().expect("BF16 scale-cache parity requires a CUDA runtime");
 
         let k = 256usize;
         let n = 64usize;
@@ -20319,6 +20399,176 @@ extern "C" __global__ void ref_silu_mul_f16(
                 want[index].to_bits(),
                 "cached bf16 scale path diverged from inline staging at column {index}"
             );
+        }
+    }
+
+    /// Same-pointer mutation must be observed for ordinary scales and either
+    /// member of a gate/up pair when only its sibling is immutable.
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
+    #[test]
+    fn bf16_scale_updates_same_address_for_dynamic_and_mixed_constant_pairs() {
+        use half::bf16;
+        let runtime = runtime().expect("dynamic BF16 scales regression requires a CUDA runtime");
+        runtime
+            .require_nvrtc_half_headers("dynamic BF16 scales regression")
+            .unwrap();
+        let (k, n, block_size) = (256usize, 8usize, 32usize);
+        let blocks = k / block_size;
+        let activation = vec![bf16::ONE; k];
+        // q=9 with implicit zero-point 8 produces one per weight.
+        let packed = vec![0x99u8; n * blocks * block_size / 2];
+        let scales = vec![bf16::from_f32(0.25); n * blocks];
+        let updated_scales = vec![bf16::from_f32(0.5); n * blocks];
+        let a_dev = runtime.alloc_raw(k * 2).unwrap();
+        let b_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let gate_scale_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+        let up_scale_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+        let y_dev = runtime.alloc_raw(n * 2).unwrap();
+        let device = DeviceId::cuda(0);
+        let a_shape = [1, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, blocks, block_size / 2];
+        let b_strides = [(blocks * block_size / 2) as i64, (block_size / 2) as i64, 1];
+        let scale_shape = [n, blocks];
+        let scale_strides = [blocks as i64, 1];
+        let y_shape = [1, n];
+        let y_strides = [n as i64, 1];
+        // SAFETY: buffers cover the full typed host slices.
+        unsafe {
+            runtime.htod(as_bytes(&activation), a_dev).unwrap();
+            runtime.htod(&packed, b_dev).unwrap();
+        }
+        for (fused, dynamic_slot) in [(false, 2), (true, 2), (true, 4)] {
+            unsafe {
+                runtime.htod(as_bytes(&scales), gate_scale_dev).unwrap();
+                runtime.htod(as_bytes(&scales), up_scale_dev).unwrap();
+            }
+            let mut kernel = MatMulNBitsKernel {
+                runtime: runtime.clone(),
+                k,
+                n,
+                bits: 4,
+                block_size,
+                accuracy_level: 0,
+                accuracy4_workspace: None,
+                round_affine_weights: false,
+                marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+                constant_inputs: [false; 8],
+                fold_bias_post_round: false,
+                gate_up_swiglu: fused,
+                decomposed_silu: false,
+                rmsnorm_prologue: false,
+                rmsnorm_epsilon: 1e-5,
+                last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            };
+            if fused {
+                let mut constants = [false; 8];
+                constants[if dynamic_slot == 2 { 4 } else { 2 }] = true;
+                kernel.set_constant_inputs(&constants);
+            }
+            let mut inputs = vec![
+                TensorView::new(
+                    device_ptr(a_dev),
+                    DataType::BFloat16,
+                    &a_shape,
+                    &a_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(b_dev),
+                    DataType::Uint8,
+                    &b_shape,
+                    &b_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(gate_scale_dev),
+                    DataType::BFloat16,
+                    &scale_shape,
+                    &scale_strides,
+                    device,
+                ),
+            ];
+            if fused {
+                inputs.extend([
+                    TensorView::new(
+                        device_ptr(b_dev),
+                        DataType::Uint8,
+                        &b_shape,
+                        &b_strides,
+                        device,
+                    ),
+                    TensorView::new(
+                        device_ptr(up_scale_dev),
+                        DataType::BFloat16,
+                        &scale_shape,
+                        &scale_strides,
+                        device,
+                    ),
+                ]);
+            }
+            let scale_address = if dynamic_slot == 2 {
+                gate_scale_dev
+            } else {
+                up_scale_dev
+            };
+            for (iteration, expected) in if fused {
+                [4096.0, 8192.0]
+            } else {
+                [64.0, 128.0]
+            }
+            .into_iter()
+            .enumerate()
+            {
+                if iteration == 1 {
+                    // Same allocation and shape; only the mutable operand's contents change.
+                    unsafe {
+                        runtime
+                            .htod(as_bytes(&updated_scales), scale_address)
+                            .unwrap();
+                    }
+                }
+                let mut output = [TensorMut::new(
+                    device_ptr_mut(y_dev),
+                    DataType::BFloat16,
+                    &y_shape,
+                    &y_strides,
+                    device,
+                )];
+                kernel.run(&inputs, &mut output, None).unwrap();
+                runtime.synchronize().unwrap();
+                let mut got = vec![bf16::ZERO; n];
+                unsafe {
+                    runtime.dtoh(as_bytes_mut(&mut got), y_dev).unwrap();
+                }
+                for value in got {
+                    assert_eq!(
+                        value,
+                        bf16::from_f32(expected),
+                        "fused={fused}, dynamic_slot={dynamic_slot}, iteration={iteration}"
+                    );
+                }
+                assert_eq!(
+                    kernel.bf16_const_cache.lock().unwrap().slots.len(),
+                    usize::from(fused)
+                );
+                assert_eq!(
+                    kernel.device_graph_resources().len(),
+                    1 + usize::from(fused),
+                    "staging owners must remain marked used after FP16 dispatch"
+                );
+            }
+        }
+        // SAFETY: every launch above completed; each allocation is retired once.
+        unsafe {
+            for pointer in [a_dev, b_dev, gate_scale_dev, up_scale_dev, y_dev] {
+                runtime.free_raw(pointer).unwrap();
+            }
         }
     }
 

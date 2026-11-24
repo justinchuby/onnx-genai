@@ -221,6 +221,24 @@ is disabled. Host and NVRTC limits are emitted from one definition, and the
 partial/merge arguments share the same borrowed backing. No extra pool, quota
 transaction, or per-launch allocation is introduced.
 
+### CUDA quantized MatMul BF16 staging
+
+Persistent BF16-to-FP16 scale conversions require the existing positional
+`constant_inputs` proof. A scale role, stable pointer or shape alone cannot prove
+immutability. Ordinary input 2 and fused gate/up inputs 2/4 are checked
+independently; unproven scales join invocation-local activation/output staging
+and are converted each call. The session supplies constant facts once after
+kernel construction. Immutable scale reuse retains its existing fast path.
+
+Staged BF16 execution enters the common FP16 dispatcher directly. It must not
+re-enter top-level call initialization while holding the staging arena lock:
+that would relock the same mutex and clear the arena/constant resource-use facts.
+Capture ownership enumeration must retain both owners actually used by the call.
+This corrects conversion eligibility and resource marking; the private staging
+arena, persistent conversion backing and raw prefill temporaries still need
+separate migration to governed ownership. No new cache, issuer or EP interface
+is introduced. Device numerical, capture and throughput validation remain pending.
+
 ### CUDA variadic Sum/Mean temporary storage
 
 Sum/Mean use one prepared workspace with two checked regions: an f32 accumulator
