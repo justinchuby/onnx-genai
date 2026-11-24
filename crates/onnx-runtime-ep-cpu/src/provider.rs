@@ -598,6 +598,13 @@ impl ExecutionProvider for CpuExecutionProvider {
                 op.op_type
             );
         }
+        if op.op_type == "LpPool"
+            && domain == "ai.onnx"
+            && let Some(&dtype) = input_dtypes.first()
+            && let Err(reason) = onnx_runtime_ir::lp_pool::validate_dtype(opset, dtype)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         // Structural kernel limits belong to the versioned factory selected
         // above, alongside the parser that creation uses. No operator-name
         // dispatch table is needed here to keep those two boundaries aligned.

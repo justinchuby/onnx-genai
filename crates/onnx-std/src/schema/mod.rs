@@ -432,6 +432,8 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/global_lp_pool_v2.yaml"),
     include_str!("../../schemas/standard/global_lp_pool.yaml"),
     include_str!("../../schemas/standard/global_max_pool.yaml"),
+    include_str!("../../schemas/standard/lp_pool_v18.yaml"),
+    include_str!("../../schemas/standard/lp_pool.yaml"),
     include_str!("../../schemas/standard/resize.yaml"),
     include_str!("../../schemas/standard/quantize_linear.yaml"),
     include_str!("../../schemas/standard/dequantize_linear.yaml"),
@@ -765,10 +767,28 @@ type_constraints:
     }
 
     #[test]
+    fn lp_pool_schema_widens_only_at_opset_22() {
+        let registry = SchemaRegistry::builtins();
+        let v18 = registry.lookup("LpPool", "", 21).unwrap();
+        let v22 = registry.lookup("LpPool", "", 22).unwrap();
+        assert_eq!(v18.since_version, 18);
+        assert_eq!(v22.since_version, 22);
+        assert_eq!(v18.attributes, v22.attributes);
+        assert_eq!(
+            v18.type_constraints[0].allowed,
+            ["float16", "float32", "float64"]
+        );
+        assert_eq!(
+            v22.type_constraints[0].allowed,
+            ["bfloat16", "float16", "float32", "float64"]
+        );
+    }
+
+    #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 120);
-        assert_eq!(registry.iter().count(), 149);
+        assert_eq!(registry.schemas.len(), 121);
+        assert_eq!(registry.iter().count(), 151);
         for (op, prior, prior_indices) in [
             ("GatherND", 13, "tensor(int64)"),
             ("ScatterND", 18, "tensor(int64)"),
