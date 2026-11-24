@@ -171,17 +171,41 @@ fn run<T: Number>(
     let mut panel = vec![T::default(); k * tile];
     let mut tmp = vec![T::default(); m * tile];
     let mut neighbors = vec![Neighbors::default(); g.axes.len()];
+    // At a split conv-group boundary the next group starts in the same offset
+    // group. Retain all taps for that one offset group if scratch stays bounded.
+    let reuse_stencils = g.axes.len() == 2
+        && output_channels > m
+        && g.input_per_group % g.input_per_offset_group != 0
+        && g.kernel_spatial.saturating_mul(tile)
+            <= 65536 / std::mem::size_of::<Option<Bilinear<T>>>();
     let mut bilinear = if g.axes.len() == 2 {
-        vec![None; tile]
+        vec![
+            None;
+            if reuse_stencils {
+                g.kernel_spatial * tile
+            } else {
+                tile
+            }
+        ]
     } else {
         Vec::new()
     };
+    let groups = output_channels / m;
+    let tiles = spatial.div_ceil(tile);
+    let (outer, inner) = if reuse_stencils {
+        (tiles, groups)
+    } else {
+        (groups, tiles)
+    };
     for batch in 0..g.output[0] {
-        for group in 0..output_channels / m {
-            let first = group * g.input_per_group;
-            let last = first + g.input_per_group;
-            for start in (0..spatial).step_by(tile) {
+        for i in 0..outer {
+            let mut cached_og = None;
+            for j in 0..inner {
+                let (group, tile_index) = if reuse_stencils { (j, i) } else { (i, j) };
+                let start = tile_index * tile;
                 let n = tile.min(spatial - start);
+                let first = group * g.input_per_group;
+                let last = first + g.input_per_group;
                 let mut c = first;
                 while c < last {
                     let og = c / g.input_per_offset_group;
@@ -193,15 +217,21 @@ fn run<T: Number>(
                             let kh = j / w.kernel * h.dilation;
                             let kw = j % w.kernel * w.dilation;
                             let offset_plane = mask_plane * 2;
-                            for (p, entry) in bilinear[..n].iter_mut().enumerate() {
-                                let point = start + p;
-                                let y = ((point / w.output) * h.stride + kh) as f64 - h.pad as f64
-                                    + offsets[offset_plane + point].into();
-                                let x = ((point % w.output) * w.stride + kw) as f64 - w.pad as f64
-                                    + offsets[offset_plane + spatial + point].into();
-                                *entry = axis_neighbors(y, h.input, w.input)
-                                    .zip(axis_neighbors(x, w.input, 1))
-                                    .map(|(r, c)| Bilinear::new(r, c));
+                            let slot = if reuse_stencils { j * tile } else { 0 };
+                            let stencils = &mut bilinear[slot..][..n];
+                            if cached_og != Some(og) {
+                                for (p, entry) in stencils.iter_mut().enumerate() {
+                                    let point = start + p;
+                                    let y = ((point / w.output) * h.stride + kh) as f64
+                                        - h.pad as f64
+                                        + offsets[offset_plane + point].into();
+                                    let x = ((point % w.output) * w.stride + kw) as f64
+                                        - w.pad as f64
+                                        + offsets[offset_plane + spatial + point].into();
+                                    *entry = axis_neighbors(y, h.input, w.input)
+                                        .zip(axis_neighbors(x, w.input, 1))
+                                        .map(|(r, c)| Bilinear::new(r, c));
+                                }
                             }
                             let modulation = mask.map(|v| &v[mask_plane + start..][..n]);
                             for ic in c..end {
@@ -209,7 +239,8 @@ fn run<T: Number>(
                                 let source = &x[plane..][..g.input_spatial];
                                 let row =
                                     &mut panel[((ic - first) * g.kernel_spatial + j) * n..][..n];
-                                for (p, (dst, stencil)) in row.iter_mut().zip(&bilinear).enumerate()
+                                for (p, (dst, stencil)) in
+                                    row.iter_mut().zip(&*stencils).enumerate()
                                 {
                                     let value = stencil.map_or(T::default(), |s| s.sample(source));
                                     *dst = modulation.map_or(value, |m| value * m[p]);
@@ -238,6 +269,7 @@ fn run<T: Number>(
                             }
                         }
                     }
+                    cached_og = reuse_stencils.then_some(og);
                     c = end;
                 }
                 T::multiply(

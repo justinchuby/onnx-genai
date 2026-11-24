@@ -98,6 +98,46 @@ fn cases() -> Vec<Case> {
                 ("offset_group", Attribute::Int(3)),
             ],
         },
+        // The middle offset group straddles the two convolution groups.
+        // Its samples are shared, but each group still reads its own channels.
+        Case {
+            opset: 22,
+            inputs: vec![
+                float_input(
+                    Float32,
+                    &[1, 6, 1, 3],
+                    &[
+                        2., 4., 6., 6., 8., 10., 10., 12., 14., 14., 16., 18., 18., 20., 22., 22.,
+                        24., 26.,
+                    ],
+                ),
+                float_input(
+                    Float32,
+                    &[2, 3, 1, 2],
+                    &[1., 2., 1., 2., 1., 2., 1., 2., 1., 2., 1., 2.],
+                ),
+                float_input(
+                    Float32,
+                    &[1, 12, 1, 2],
+                    &[
+                        0., 0., 0., 0., 0., 0., -1., -1., 0., 0., 0.5, 0.5, 0., 0., 0., 0., 0., 0.,
+                        -1., -0.5, 0., 0., 1., 1.,
+                    ],
+                ),
+                absent_input(Float32),
+                float_input(
+                    Float32,
+                    &[1, 6, 1, 2],
+                    &[1., 2., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.],
+                ),
+            ],
+            output: (Float32, vec![1, 2, 1, 2]),
+            expected: vec![59., 89., 143., 95.],
+            attrs: vec![
+                ("group", Attribute::Int(2)),
+                ("offset_group", Attribute::Int(3)),
+            ],
+        },
         // Trilinear at half-pixel in all axes of a singleton input: 8/8.
         Case {
             opset: 19,
