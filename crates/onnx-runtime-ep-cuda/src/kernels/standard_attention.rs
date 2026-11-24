@@ -2624,8 +2624,9 @@ impl Kernel for StandardAttentionKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         self.composite_workspace_requirement(inputs, outputs)
+            .map(onnx_runtime_ep_api::WorkspacePreparation::Ready)
     }
 
     fn execute_with_workspace(
@@ -2671,7 +2672,9 @@ fn execute_prepared(
         .iter()
         .map(OutputMetadata::from_view)
         .collect::<Vec<_>>();
-    let requirement = kernel.workspace_requirement(&metadata, &out)?;
+    let requirement = kernel
+        .workspace_requirement(&metadata, &out)
+        .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)?;
     let owner = crate::runtime::GraphDeviceAllocation::allocate(
         &kernel.runtime,
         requirement.bytes as usize,
@@ -3343,7 +3346,11 @@ mod alias_tests {
                 OutputMetadata::tensor(DataType::Float32, &present),
                 OutputMetadata::tensor(DataType::Float32, &present),
             ];
-            kernel.workspace_requirement(&inputs, &outputs).unwrap()
+            kernel
+                .workspace_requirement(&inputs, &outputs)
+                .unwrap()
+                .require_ready()
+                .unwrap()
         };
         let bytes = requirement(&first, 1)
             .bytes

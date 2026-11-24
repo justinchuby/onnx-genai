@@ -239,6 +239,7 @@ impl PreparedKernel {
                     &case.output_shape,
                 )],
             )
+            .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
             .expect("benchmark workspace planning must succeed");
         assert!(request.alignment <= std::mem::align_of::<u64>());
         let bytes = usize::try_from(request.bytes).expect("benchmark workspace is addressable");

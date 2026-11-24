@@ -711,10 +711,12 @@ impl Kernel for DsaIndexSelectKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         let dims = self.validate_metadata(inputs)?;
         dsa_index_select_workspace_layout(dims)?;
-        Ok(WorkspaceRequirement::NONE)
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement::NONE,
+        ))
     }
 
     fn supports_strided_input(&self, _index: usize) -> bool {

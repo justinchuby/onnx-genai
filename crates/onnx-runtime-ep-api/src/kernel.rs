@@ -173,7 +173,8 @@ impl KernelMatch {
 pub enum WorkspacePlanning {
     /// Every legal specialization uses no executor-owned scratch.
     None,
-    /// A specialization may need scratch; resolve metadata before admission.
+    /// A specialization may need scratch. Metadata resolves a requirement or
+    /// explicitly defers it until real bindings/values exist before admission.
     Metadata,
 }
 
@@ -736,6 +737,26 @@ impl WorkspaceRequirement {
     }
 }
 
+/// Metadata preparation can resolve a real requirement or defer until storage
+/// origins or runtime values exist. Deferred is never an admitted zero request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspacePreparation {
+    Ready(WorkspaceRequirement),
+    Deferred,
+}
+
+impl WorkspacePreparation {
+    /// Require a completed preparation at a metadata-only admission boundary.
+    pub fn require_ready(self) -> Result<WorkspaceRequirement> {
+        match self {
+            Self::Ready(requirement) => Ok(requirement),
+            Self::Deferred => Err(crate::EpError::KernelFailed(
+                "workspace preparation requires live tensor bindings or runtime values; provide actual input/output views to execution-time planning before admitting or launching the kernel".into(),
+            )),
+        }
+    }
+}
+
 /// Executor-owned prepared workspace handed to a kernel for one dispatch.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkspaceView {
@@ -1106,7 +1127,8 @@ pub trait Kernel: Send + KernelType {
     /// Report a safe owned-scratch bound for the input and output geometry.
     /// Output slots describe the views this kernel receives, after any graph
     /// lowering, and preserve positions marked absent by that caller. Unknown geometry must
-    /// remain Unresolved; output-dependent planners must refuse it clearly.
+    /// remain Unresolved. Return Deferred when values or storage origins are
+    /// needed; Ready(NONE) means a proven zero requirement, never unknown.
     /// Runtime layout facts may refine this bound before dispatch. For a fixed
     /// compiled kernel and both input/output metadata this is a stable upper bound: executors may
     /// memoize it. It must cover both cold and warm cache residency; values or
@@ -1115,12 +1137,18 @@ pub trait Kernel: Send + KernelType {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[crate::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<WorkspacePreparation> {
         let _ = inputs;
-        Ok(WorkspaceRequirement::NONE)
+        Ok(WorkspacePreparation::Ready(WorkspaceRequirement::NONE))
     }
 
-    /// Refine the workspace requirement with runtime-visible tensor inputs.
+    /// Refine the workspace requirement with real input and output views.
+    /// Output storage is uninitialized: inspect geometry and pointer alignment,
+    /// never read output values. The caller keeps exclusive kernel execution
+    /// ownership through this refinement, admission and the following launch.
+    /// `cached` contains only the same kernel's metadata-only preparation;
+    /// address/value-dependent refinements must not enter a geometry cache.
+    /// None asks the default to query metadata once; Some avoids that query.
     ///
     /// Prepare-only reservation walks have only [`TensorMetadata`], so
     /// [`Kernel::workspace_requirement`] remains the planning hook. Execution
@@ -1129,15 +1157,21 @@ pub trait Kernel: Send + KernelType {
     /// input tensor). Metadata presence is logical: a lazy initializer can be
     /// present in metadata while its TensorView is absent. Check the view before
     /// reading bytes; metadata alone never grants readable storage. The default
-    /// preserves the metadata-only contract.
+    /// preserves a ready metadata-only contract and refuses unresolved Deferred.
     fn workspace_requirement_for_execution(
         &self,
         inputs: &[TensorView],
+        outputs: &[TensorMut],
         metadata: &[TensorMetadata<'_>],
-        outputs: &[crate::OutputMetadata<'_>],
+        output_metadata: &[crate::OutputMetadata<'_>],
+        cached: Option<WorkspacePreparation>,
     ) -> Result<WorkspaceRequirement> {
-        let _ = inputs;
-        self.workspace_requirement(metadata, outputs)
+        let _ = (inputs, outputs);
+        match cached {
+            Some(preparation) => preparation,
+            None => self.workspace_requirement(metadata, output_metadata)?,
+        }
+        .require_ready()
     }
 
     /// Execute using workspace prepared before request admission.
@@ -1568,6 +1602,120 @@ mod output_workspace_metadata_tests {
     use crate::EpError;
 
     #[test]
+    fn workspace_preparation_keeps_zero_distinct_from_deferred_and_uses_cached_facts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted(AtomicUsize);
+        impl Kernel for Counted {
+            fn execute(&self, _: &[TensorView], _: &mut [TensorMut]) -> Result<()> {
+                Ok(())
+            }
+            fn workspace_requirement(
+                &self,
+                _: &[TensorMetadata<'_>],
+                _: &[OutputMetadata<'_>],
+            ) -> Result<WorkspacePreparation> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(WorkspacePreparation::Ready(WorkspaceRequirement::NONE))
+            }
+        }
+        let kernel = Counted(AtomicUsize::new(0));
+        let zero = WorkspacePreparation::Ready(WorkspaceRequirement::NONE);
+        assert_ne!(zero, WorkspacePreparation::Deferred);
+        assert_eq!(
+            kernel
+                .workspace_requirement_for_execution(&[], &[], &[], &[], Some(zero))
+                .unwrap(),
+            WorkspaceRequirement::NONE
+        );
+        assert_eq!(kernel.0.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            kernel
+                .workspace_requirement_for_execution(&[], &[], &[], &[], None)
+                .unwrap(),
+            WorkspaceRequirement::NONE
+        );
+        assert_eq!(kernel.0.load(Ordering::Relaxed), 1);
+        let error = kernel
+            .workspace_requirement_for_execution(
+                &[],
+                &[],
+                &[],
+                &[],
+                Some(WorkspacePreparation::Deferred),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("live tensor bindings"), "{error}");
+        assert_eq!(
+            kernel.0.load(Ordering::Relaxed),
+            1,
+            "cached deferred must not requery or pretend to be zero"
+        );
+    }
+
+    #[test]
+    fn workspace_execution_refinement_receives_real_output_origin_and_metadata() {
+        struct Bound;
+        impl Kernel for Bound {
+            fn execute(&self, _: &[TensorView], _: &mut [TensorMut]) -> Result<()> {
+                Ok(())
+            }
+            fn workspace_requirement(
+                &self,
+                _: &[TensorMetadata<'_>],
+                _: &[OutputMetadata<'_>],
+            ) -> Result<WorkspacePreparation> {
+                Ok(WorkspacePreparation::Deferred)
+            }
+            fn workspace_requirement_for_execution(
+                &self,
+                _: &[TensorView],
+                outputs: &[TensorMut],
+                _: &[TensorMetadata<'_>],
+                metadata: &[OutputMetadata<'_>],
+                cached: Option<WorkspacePreparation>,
+            ) -> Result<WorkspaceRequirement> {
+                assert_eq!(cached, Some(WorkspacePreparation::Deferred));
+                let [output] = outputs else {
+                    return Err(crate::EpError::KernelFailed("bound planner requires one actual output allocation; do not substitute unresolved geometry".into()));
+                };
+                assert_eq!(metadata, [OutputMetadata::from_view(output)]);
+                let origin = output.data.0 as usize + output.byte_offset;
+                Ok(WorkspaceRequirement {
+                    bytes: origin.trailing_zeros() as u64,
+                    ..WorkspaceRequirement::NONE
+                })
+            }
+        }
+        let mut backing = [0u64; 4];
+        let mut output = TensorMut::new(
+            crate::DevicePtrMut(backing.as_mut_ptr().cast()),
+            DataType::Float32,
+            &[1],
+            &[1],
+            crate::DeviceId::cpu(),
+        );
+        output.byte_offset = 4;
+        let metadata = [OutputMetadata::from_view(&output)];
+        let expected = (output.data.0 as usize + 4).trailing_zeros() as u64;
+        let kernel = Bound;
+        let preparation = kernel.workspace_requirement(&[], &metadata).unwrap();
+        assert_eq!(preparation, WorkspacePreparation::Deferred);
+        assert!(preparation.require_ready().is_err());
+        let requirement = kernel
+            .workspace_requirement_for_execution(&[], &[output], &[], &metadata, Some(preparation))
+            .unwrap();
+        assert_eq!(requirement.bytes, expected);
+        assert!(
+            kernel
+                .workspace_requirement_for_execution(&[], &[], &[], &metadata, Some(preparation))
+                .unwrap_err()
+                .to_string()
+                .contains("actual output allocation")
+        );
+    }
+
+    #[test]
     fn output_workspace_metadata_distinguishes_scalar_unknown_and_absent() {
         let scalar = OutputMetadata::tensor(DataType::Float32, &[]);
         assert_ne!(scalar, OutputMetadata::Absent);
@@ -1595,7 +1743,7 @@ mod output_workspace_metadata_tests {
                 &self,
                 _: &[TensorMetadata<'_>],
                 outputs: &[OutputMetadata<'_>],
-            ) -> Result<WorkspaceRequirement> {
+            ) -> Result<WorkspacePreparation> {
                 let [
                     OutputMetadata::Absent,
                     OutputMetadata::Tensor {
@@ -1608,10 +1756,10 @@ mod output_workspace_metadata_tests {
                         "output #1 must have resolved Float32 geometry before preparation".into(),
                     ));
                 };
-                Ok(WorkspaceRequirement {
+                Ok(WorkspacePreparation::Ready(WorkspaceRequirement {
                     bytes: shape.iter().product::<usize>() as u64 * 4,
                     ..WorkspaceRequirement::NONE
-                })
+                }))
             }
         }
         let outputs = [
@@ -1620,7 +1768,7 @@ mod output_workspace_metadata_tests {
         ];
         assert_eq!(
             OutputBound
-                .workspace_requirement_for_execution(&[], &[], &outputs)
+                .workspace_requirement_for_execution(&[], &[], &[], &outputs, None)
                 .unwrap()
                 .bytes,
             60
@@ -1633,7 +1781,7 @@ mod output_workspace_metadata_tests {
         ];
         assert!(
             OutputBound
-                .workspace_requirement_for_execution(&[], &[], &unknown)
+                .workspace_requirement_for_execution(&[], &[], &[], &unknown, None)
                 .is_err()
         );
     }

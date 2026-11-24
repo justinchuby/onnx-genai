@@ -88,16 +88,18 @@ impl Kernel for DeferredValidationKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
-        Ok(WorkspaceRequirement {
-            bytes: (self.workspace_bytes.load(Ordering::Relaxed)
-                * inputs
-                    .first()
-                    .map_or(0, |input| input.shape.iter().product::<usize>()))
-                as u64,
-            alignment: 64,
-            lifetime: WorkspaceLifetime::StepScoped,
-        })
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspacePreparation> {
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: (self.workspace_bytes.load(Ordering::Relaxed)
+                    * inputs
+                        .first()
+                        .map_or(0, |input| input.shape.iter().product::<usize>()))
+                    as u64,
+                alignment: 64,
+                lifetime: WorkspaceLifetime::StepScoped,
+            },
+        ))
     }
 
     fn execute_with_workspace(
@@ -5316,7 +5318,7 @@ impl Kernel for WeightDeliveryKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspacePreparation> {
         let rows = inputs
             .first()
             .and_then(|input| input.shape.first())
@@ -5329,11 +5331,13 @@ impl Kernel for WeightDeliveryKernel {
                 .checked_mul(rows)
                 .ok_or_else(|| EpError::KernelFailed("test workspace overflow".into()))?
         };
-        Ok(WorkspaceRequirement {
-            bytes,
-            alignment: if rows >= 4 { 512 } else { 256 },
-            lifetime: WorkspaceLifetime::SessionPersistent,
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes,
+                alignment: if rows >= 4 { 512 } else { 256 },
+                lifetime: WorkspaceLifetime::SessionPersistent,
+            },
+        ))
     }
 
     fn execute(
@@ -5408,12 +5412,14 @@ impl Kernel for WorkspaceOnlyKernel {
         &self,
         _inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
-        Ok(WorkspaceRequirement {
-            bytes: self.bytes,
-            alignment: 256,
-            lifetime: WorkspaceLifetime::SessionPersistent,
-        })
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspacePreparation> {
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: self.bytes,
+                alignment: 256,
+                lifetime: WorkspaceLifetime::SessionPersistent,
+            },
+        ))
     }
 
     fn execute(
@@ -17297,10 +17303,13 @@ fn completed_workspace_capture_refuses_eager_growth_and_alignment_changes() {
 }
 
 struct OutputWorkspaceProbeEp {
+    deferred: bool,
     cpu: CpuExecutionProvider,
     plans: Arc<std::sync::Mutex<Vec<Vec<OutputMetadata<'static>>>>>,
 }
 struct OutputWorkspaceProbeKernel {
+    deferred: bool,
+    origin: AtomicUsize,
     slots: Vec<bool>,
     plans: Arc<std::sync::Mutex<Vec<Vec<OutputMetadata<'static>>>>>,
 }
@@ -17334,7 +17343,10 @@ impl Kernel for OutputWorkspaceProbeKernel {
         &self,
         _: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
-    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspacePreparation> {
+        if self.deferred {
+            return Ok(onnx_runtime_ep_api::WorkspacePreparation::Deferred);
+        }
         let bytes = self.bytes(outputs)?;
         self.plans.lock().unwrap().push(
             outputs
@@ -17343,8 +17355,52 @@ impl Kernel for OutputWorkspaceProbeKernel {
                 .map(OutputMetadata::into_owned)
                 .collect(),
         );
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes,
+                alignment: 8,
+                ..WorkspaceRequirement::NONE
+            },
+        ))
+    }
+    fn workspace_requirement_for_execution(
+        &self,
+        _: &[TensorView],
+        outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        facts: &[OutputMetadata<'_>],
+        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        if !self.deferred {
+            return match cached {
+                Some(preparation) => preparation,
+                None => self.workspace_requirement(metadata, facts)?,
+            }
+            .require_ready();
+        }
+        assert!(
+            !outputs.is_empty(),
+            "deferred native planner must receive actual output storage"
+        );
+        let actual = outputs
+            .iter()
+            .map(OutputMetadata::from_view)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, facts);
+        let output = outputs.iter().find(|output| !output.is_absent()).unwrap();
+        self.origin.store(
+            output.data.0 as usize + output.byte_offset,
+            Ordering::Relaxed,
+        );
+        self.plans.lock().unwrap().push(
+            actual
+                .iter()
+                .cloned()
+                .map(OutputMetadata::into_owned)
+                .collect(),
+        );
         Ok(WorkspaceRequirement {
-            bytes,
+            bytes: self.bytes(&actual)?,
             alignment: 8,
             ..WorkspaceRequirement::NONE
         })
@@ -17360,6 +17416,13 @@ impl Kernel for OutputWorkspaceProbeKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> onnx_runtime_ep_api::Result<()> {
+        if self.deferred {
+            let output = outputs.iter().find(|output| !output.is_absent()).unwrap();
+            assert_eq!(
+                self.origin.load(Ordering::Relaxed),
+                output.data.0 as usize + output.byte_offset
+            );
+        }
         let facts = outputs
             .iter()
             .map(OutputMetadata::from_view)
@@ -17417,6 +17480,8 @@ impl ExecutionProvider for OutputWorkspaceProbeEp {
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
         if matches!(node.op_type.as_str(), "Attention" | "OutputWorkspaceProbe") {
             Ok(Box::new(OutputWorkspaceProbeKernel {
+                deferred: self.deferred,
+                origin: AtomicUsize::new(0),
                 slots: node.outputs.iter().map(Option::is_some).collect(),
                 plans: self.plans.clone(),
             }))
@@ -17467,8 +17532,50 @@ impl ExecutionProvider for OutputWorkspaceProbeEp {
 }
 
 #[test]
+fn deferred_workspace_strict_prepare_does_not_publish_memo_or_poison_eager_execution() {
+    let ep = Arc::new(OutputWorkspaceProbeEp {
+        deferred: true,
+        cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
+        plans: Default::default(),
+    });
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([3]));
+    graph.add_output(output);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "OutputWorkspaceProbe",
+        vec![],
+        vec![output],
+    ));
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    let error = executor
+        .prepare_with_device_bindings(&[], &mut [])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("node #0") && error.contains("live tensor bindings"),
+        "{error}"
+    );
+    assert!(executor.workspace_preparation_memo.is_none());
+    assert!(!executor.workspace_preparation_required);
+    assert!(executor.step_workspace.is_none());
+    assert!(executor.persistent_workspace.is_none());
+    for _ in 0..3 {
+        assert_eq!(executor.run(&[]).unwrap()[0].as_bytes(), &[0x5A; 12]);
+    }
+    assert_eq!(ep.plans.lock().unwrap().len(), 3);
+    assert!(
+        executor.workspace_preparation_memo.is_none(),
+        "a successful runtime call must not manufacture a complete metadata-only memo"
+    );
+}
+
+#[test]
 fn output_workspace_metadata_tracks_physical_bindings_and_memo() {
     let ep = Arc::new(OutputWorkspaceProbeEp {
+        deferred: false,
         cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
         plans: Default::default(),
     });
@@ -17542,6 +17649,7 @@ fn output_workspace_metadata_tracks_physical_bindings_and_memo() {
 #[test]
 fn output_workspace_metadata_matches_lowered_trailing_outputs() {
     let ep = Arc::new(OutputWorkspaceProbeEp {
+        deferred: false,
         cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
         plans: Default::default(),
     });
@@ -17571,6 +17679,7 @@ fn output_workspace_metadata_matches_lowered_trailing_outputs() {
 #[test]
 fn output_workspace_metadata_reaches_nested_control_flow_preparation() {
     let ep = Arc::new(OutputWorkspaceProbeEp {
+        deferred: false,
         cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
         plans: Default::default(),
     });

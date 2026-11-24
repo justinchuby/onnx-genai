@@ -305,7 +305,7 @@ impl Kernel for MoEKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         let required = |index: usize, name: &str| {
             inputs
                 .get(index)
@@ -328,17 +328,19 @@ impl Kernel for MoEKernel {
         }
         let fc2 = required(4, "fc2_experts_weights")?;
         require_shape("fc2_experts_weights", fc2.shape, 3)?;
-        Ok(WorkspaceRequirement {
-            bytes: self
-                .workspace_layout(
-                    input.shape,
-                    fc2.shape[2],
-                    inputs.get(6).is_some_and(|v| v.present),
-                )?
-                .bytes() as u64,
-            alignment: std::mem::align_of::<f32>(),
-            ..WorkspaceRequirement::NONE
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: self
+                    .workspace_layout(
+                        input.shape,
+                        fc2.shape[2],
+                        inputs.get(6).is_some_and(|v| v.present),
+                    )?
+                    .bytes() as u64,
+                alignment: std::mem::align_of::<f32>(),
+                ..WorkspaceRequirement::NONE
+            },
+        ))
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -1943,7 +1945,11 @@ mod tests {
                     .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
                     .collect();
                 let req = one
-                    .install(|| kernel.workspace_requirement(&metadata, &[]))
+                    .install(|| {
+                        kernel
+                            .workspace_requirement(&metadata, &[])
+                            .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
+                    })
                     .unwrap();
                 assert_eq!(req.bytes, bytes as u64);
                 let plan = RoutingPlan::build(&router_values, ROWS, E, K, true);
@@ -2030,16 +2036,18 @@ mod tests {
     fn execution_workspace_metadata_checks_empty_singleton_dtype_and_overflow() {
         let kernel = workspace_kernel(MOE_GROUPED_MIN_WORK);
         let requirement = |shape: &[usize], dtype, present| {
-            kernel.workspace_requirement(
-                &[
-                    TensorMetadata::new(dtype, shape, present),
-                    TensorMetadata::new(dtype, &[], false),
-                    TensorMetadata::new(dtype, &[], false),
-                    TensorMetadata::new(dtype, &[], false),
-                    TensorMetadata::new(dtype, &[4, 4, 4], true),
-                ],
-                &[],
-            )
+            kernel
+                .workspace_requirement(
+                    &[
+                        TensorMetadata::new(dtype, shape, present),
+                        TensorMetadata::new(dtype, &[], false),
+                        TensorMetadata::new(dtype, &[], false),
+                        TensorMetadata::new(dtype, &[], false),
+                        TensorMetadata::new(dtype, &[4, 4, 4], true),
+                    ],
+                    &[],
+                )
+                .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
         };
         for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
             assert_eq!(requirement(&[0, 4], dtype, true).unwrap().bytes, 0);
@@ -2063,6 +2071,7 @@ mod tests {
         assert!(
             kernel
                 .workspace_requirement(&[], &[])
+                .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
                 .unwrap_err()
                 .to_string()
                 .contains("input 0")
@@ -2073,6 +2082,7 @@ mod tests {
                     &[TensorMetadata::new(DataType::Float32, &[3, 4], true)],
                     &[]
                 )
+                .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
                 .unwrap_err()
                 .to_string()
                 .contains("fc2_experts_weights")
@@ -2182,7 +2192,11 @@ mod tests {
                             .iter()
                             .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
                             .collect();
-                        let req = kernel.workspace_requirement(&metadata, &[]).unwrap();
+                        let req = kernel
+                            .workspace_requirement(&metadata, &[])
+                            .unwrap()
+                            .require_ready()
+                            .unwrap();
                         let bound = if hidden == 0 {
                             0
                         } else {

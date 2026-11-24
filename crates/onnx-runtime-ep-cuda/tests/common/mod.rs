@@ -43,12 +43,13 @@ pub fn runtime_workspace_requirement(
     kernel: &dyn Kernel,
     inputs: &[TensorView],
     outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    output_views: &[TensorMut],
 ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
     let metadata = inputs
         .iter()
         .map(|input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()))
         .collect::<Vec<_>>();
-    kernel.workspace_requirement_for_execution(inputs, &metadata, outputs)
+    kernel.workspace_requirement_for_execution(inputs, output_views, &metadata, outputs, None)
 }
 
 /// Ensure `workspace` satisfies `requirement`, reusing or replacing it through
@@ -97,7 +98,7 @@ pub fn execute_kernel(
         .iter()
         .map(onnx_runtime_ep_api::OutputMetadata::from_view)
         .collect::<Vec<_>>();
-    let requirement = runtime_workspace_requirement(kernel, inputs, &output_metadata)?;
+    let requirement = runtime_workspace_requirement(kernel, inputs, &output_metadata, outputs)?;
     let workspace_view = prepare_workspace(ep, requirement, workspace)?;
     kernel.execute_with_workspace(inputs, outputs, workspace_view)
 }
@@ -457,7 +458,7 @@ pub fn execute_cpu_kernel(
         .iter()
         .map(onnx_runtime_ep_api::OutputMetadata::from_view)
         .collect::<Vec<_>>();
-    let requirement = runtime_workspace_requirement(kernel, inputs, &output_metadata)?;
+    let requirement = runtime_workspace_requirement(kernel, inputs, &output_metadata, outputs)?;
     let mut owner = if requirement.bytes == 0 {
         None
     } else {

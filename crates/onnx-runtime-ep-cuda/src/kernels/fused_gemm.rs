@@ -322,8 +322,9 @@ impl Kernel for FusedEpilogueKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         self.workspace_requirement_for(inputs)
+            .map(onnx_runtime_ep_api::WorkspacePreparation::Ready)
     }
 
     fn execute_with_workspace(

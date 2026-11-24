@@ -627,7 +627,6 @@ impl Executor {
                 "workspace preparation with persistent device bindings",
             ));
         }
-        self.workspace_preparation_required = true;
         let external = self.prepare_external_bindings_mode(bindings, true)?;
         let symbols = self.bind_symbols(inputs, &external)?;
         let stats = self.cache.stats();
@@ -645,7 +644,9 @@ impl Executor {
             && std::env::var_os("ONNX_GENAI_LOG_WORKSPACE_BOUND").is_none()
         {
             let (persistent, step) = (memo.persistent, memo.step);
-            return self.reserve_prepared_workspaces(persistent, step);
+            let requirement = self.reserve_prepared_workspaces(persistent, step)?;
+            self.workspace_preparation_required = true;
+            return Ok(requirement);
         }
         // Track one peak per lifetime class: session-persistent and step-scoped
         // scratch live in separate executor slots, so a single peak cannot stand
@@ -772,7 +773,15 @@ impl Executor {
             } else {
                 workspace_output_metadata(&self.graph, node, &symbols, Some(&external))
             };
-            let requirement = kernel.workspace_requirement(&metadata, &output_metadata)?;
+            let requirement = kernel
+                .workspace_requirement(&metadata, &output_metadata)?
+                .require_ready()
+                .map_err(|cause| {
+                    SessionError::Internal(format!(
+                        "prepare-only workspace for node #{} ('{}::{}') cannot complete: {cause}",
+                        node.id.0, node.domain, node.op_type
+                    ))
+                })?;
             if requirement.bytes == 0 {
                 continue;
             }
@@ -818,6 +827,7 @@ impl Executor {
             persistent: peak_persistent,
             step: peak_step,
         });
+        self.workspace_preparation_required = true;
         Ok(result)
     }
 
@@ -977,7 +987,15 @@ impl Executor {
             } else {
                 workspace_output_metadata(graph, node, symbols, None)
             };
-            let requirement = kernel.workspace_requirement(&metadata, &output_metadata)?;
+            let requirement = kernel
+                .workspace_requirement(&metadata, &output_metadata)?
+                .require_ready()
+                .map_err(|cause| {
+                    SessionError::Internal(format!(
+                        "prepare-only workspace for node #{} ('{}::{}') cannot complete: {cause}",
+                        node.id.0, node.domain, node.op_type
+                    ))
+                })?;
             if requirement.bytes == 0 {
                 continue;
             }

@@ -603,6 +603,13 @@ fn matmul_private_and_executor_workspace_authorities_are_disjoint_gpu() {
             DataType::Float32,
             &output_shape,
         )],
+        &[TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            device,
+        )],
     )
     .unwrap();
     assert_eq!(
@@ -727,6 +734,13 @@ fn matmul_private_and_executor_workspace_authorities_are_disjoint_gpu() {
         &[onnx_runtime_ep_api::OutputMetadata::tensor(
             DataType::Float32,
             &batched_output_shape,
+        )],
+        &[TensorMut::new(
+            DevicePtrMut(batched_output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &batched_output_shape,
+            &batched_output_strides,
+            device,
         )],
     )
     .unwrap();

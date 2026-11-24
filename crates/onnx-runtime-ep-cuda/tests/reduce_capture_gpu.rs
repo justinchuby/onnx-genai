@@ -689,6 +689,7 @@ fn cudnn_rewarm_failure_preserves_a(mode: CudnnRewarmFailure) {
                 kernel.as_ref(),
                 &b_inputs,
                 &[onnx_runtime_ep_api::OutputMetadata::tensor(dtype, &b_out)],
+                &[],
             )
             .expect_err("signature-B cuDNN workspace query must hit the injected failure");
             assert!(
@@ -703,6 +704,7 @@ fn cudnn_rewarm_failure_preserves_a(mode: CudnnRewarmFailure) {
                 kernel.as_ref(),
                 &b_inputs,
                 &[onnx_runtime_ep_api::OutputMetadata::tensor(dtype, &b_out)],
+                &[],
             )
             .expect("query signature-B cuDNN workspace");
             assert!(

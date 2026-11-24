@@ -1329,9 +1329,19 @@ fn matmul_nbits_gpu_accuracy4_m1_capture_replay_is_bit_exact() {
             DataType::Float32,
             &output_shape,
         )];
-        let requirement =
-            common::runtime_workspace_requirement(kernel.as_ref(), &input_views, &output_metadata)
-                .unwrap();
+        let requirement = common::runtime_workspace_requirement(
+            kernel.as_ref(),
+            &input_views,
+            &output_metadata,
+            &[TensorMut::new(
+                DevicePtrMut(output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                device,
+            )],
+        )
+        .unwrap();
         let mut workspace = None;
         let workspace_view = common::prepare_workspace(&ep, requirement, &mut workspace).unwrap();
         assert!(workspace_view.is_some());

@@ -16,7 +16,7 @@ use onnx_runtime_ep_api::{
     ExecutorArtifactPending, ExecutorArtifactPolicy, ExecutorArtifactReadinessEpoch,
     ExecutorArtifactReport, ExecutorArtifactState, ExecutorInstanceId,
     ExecutorRouteResidencyConfig, Fence, Kernel, KernelMatch, Result as EpResult, TensorMetadata,
-    TensorMut, TensorView, ViewOutput, WorkspaceRequirement,
+    TensorMut, TensorView, ViewOutput,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{
@@ -311,7 +311,7 @@ impl Kernel for FinalizationCheckingKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> EpResult<WorkspaceRequirement> {
+    ) -> EpResult<onnx_runtime_ep_api::WorkspacePreparation> {
         self.inner.workspace_requirement(inputs, &[])
     }
 

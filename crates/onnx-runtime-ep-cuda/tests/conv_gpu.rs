@@ -592,6 +592,7 @@ fn cudnn_conv_prepared_workspace_reuses_the_injected_allocator_and_captures() {
         ];
         let requirement = kernel
             .workspace_requirement(&metadata, &[])
+            .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
             .expect("workspace requirement");
         if requirement.bytes == 0 {
             continue;
@@ -702,6 +703,7 @@ fn cudnn_conv_prepared_workspace_reuses_the_injected_allocator_and_captures() {
         ];
         kernel
             .workspace_requirement(&prospective_metadata, &[])
+            .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
             .expect("prospective Conv workspace query must stage without replacing the warm");
 
         let kernels: [&dyn onnx_runtime_ep_api::Kernel; 1] = [kernel.as_ref()];

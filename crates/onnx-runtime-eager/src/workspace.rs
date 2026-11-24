@@ -137,9 +137,13 @@ impl PreparedKernel {
             .iter()
             .map(onnx_runtime_ep_api::OutputMetadata::from_view)
             .collect();
-        let requirement =
-            self.kernel
-                .workspace_requirement_for_execution(inputs, &metadata, &output_metadata)?;
+        let requirement = self.kernel.workspace_requirement_for_execution(
+            inputs,
+            outputs,
+            &metadata,
+            &output_metadata,
+            None,
+        )?;
         if requirement.bytes == 0 {
             self.kernel.execute_with_workspace(inputs, outputs, None)?;
             return Ok(());
@@ -306,12 +310,14 @@ mod tests {
             &self,
             _: &[TensorMetadata<'_>],
             _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-        ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
-            Ok(WorkspaceRequirement {
-                bytes: self.0.bytes.load(Ordering::Relaxed) as u64,
-                alignment: self.0.alignment.load(Ordering::Relaxed),
-                lifetime: self.0.lifetime,
-            })
+        ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspacePreparation> {
+            Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+                WorkspaceRequirement {
+                    bytes: self.0.bytes.load(Ordering::Relaxed) as u64,
+                    alignment: self.0.alignment.load(Ordering::Relaxed),
+                    lifetime: self.0.lifetime,
+                },
+            ))
         }
         fn execute_with_workspace(
             &self,
@@ -501,7 +507,7 @@ mod tests {
             &self,
             _: &[TensorMetadata<'_>],
             outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-        ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspacePreparation> {
             let [onnx_runtime_ep_api::OutputMetadata::Tensor { shape, .. }] = outputs else {
                 return Err(EpError::KernelFailed(
                     "resolve the probe output before planning".into(),
@@ -509,11 +515,13 @@ mod tests {
             };
             let bytes = shape.iter().product::<usize>() * 16;
             self.0.bytes.store(bytes, Ordering::Relaxed);
-            Ok(WorkspaceRequirement {
-                bytes: bytes as u64,
-                alignment: 16,
-                lifetime: self.0.lifetime,
-            })
+            Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+                WorkspaceRequirement {
+                    bytes: bytes as u64,
+                    alignment: 16,
+                    lifetime: self.0.lifetime,
+                },
+            ))
         }
         fn execute_with_workspace(
             &self,
@@ -523,6 +531,101 @@ mod tests {
         ) -> onnx_runtime_ep_api::Result<()> {
             ProbeKernel(self.0.clone()).execute_with_workspace(inputs, outputs, workspace)
         }
+    }
+
+    struct DeferredOutputProbe {
+        probe: Arc<Probe>,
+        origin: std::sync::atomic::AtomicUsize,
+    }
+    impl Kernel for DeferredOutputProbe {
+        fn execute(
+            &self,
+            _: &[TensorView],
+            _: &mut [TensorMut],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            panic!("deferred output probe requires admitted scratch")
+        }
+        fn workspace_requirement(
+            &self,
+            _: &[TensorMetadata<'_>],
+            _: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspacePreparation> {
+            Ok(onnx_runtime_ep_api::WorkspacePreparation::Deferred)
+        }
+        fn workspace_requirement_for_execution(
+            &self,
+            _: &[TensorView],
+            outputs: &[TensorMut],
+            _: &[TensorMetadata<'_>],
+            metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+            cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+        ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+            assert!(cached.is_none());
+            let [output] = outputs else {
+                return Err(EpError::KernelFailed(
+                    "deferred eager plan requires one actual output buffer".into(),
+                ));
+            };
+            assert_eq!(
+                metadata,
+                [onnx_runtime_ep_api::OutputMetadata::from_view(output)]
+            );
+            let origin = output.data.0 as usize + output.byte_offset;
+            self.origin.store(origin, Ordering::Relaxed);
+            let bytes = if output.byte_offset == 0 { 64 } else { 80 };
+            self.probe.bytes.store(bytes, Ordering::Relaxed);
+            Ok(WorkspaceRequirement {
+                bytes: bytes as u64,
+                alignment: 16,
+                lifetime: WorkspaceLifetime::SessionPersistent,
+            })
+        }
+        fn execute_with_workspace(
+            &self,
+            inputs: &[TensorView],
+            outputs: &mut [TensorMut],
+            workspace: Option<WorkspaceView>,
+        ) -> onnx_runtime_ep_api::Result<()> {
+            assert_eq!(
+                outputs[0].data.0 as usize + outputs[0].byte_offset,
+                self.origin.load(Ordering::Relaxed)
+            );
+            ProbeKernel(self.probe.clone()).execute_with_workspace(inputs, outputs, workspace)
+        }
+    }
+
+    #[test]
+    fn deferred_workspace_output_bindings_reach_eager_admission_without_warm_issuer_calls() {
+        let (provider, probe, books, _pool, _manager) =
+            fixture(WorkspaceLifetime::SessionPersistent);
+        let mut kernel = PreparedKernel::new(Box::new(DeferredOutputProbe {
+            probe: probe.clone(),
+            origin: AtomicUsize::new(0),
+        }));
+        let mut backing = [0u64; 8];
+        for offset in [0, 4, 4, 0] {
+            let mut output = TensorMut::new(
+                onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+                onnx_runtime_ir::DataType::Float32,
+                &[1],
+                &[1],
+                onnx_runtime_ir::DeviceId::cpu(),
+            );
+            output.byte_offset = offset;
+            let before = books.callbacks();
+            let warmed = probe.allocations.load(Ordering::Relaxed) >= 2;
+            kernel
+                .execute(&provider, "DeferredOutputProbe", &[], &mut [output])
+                .unwrap();
+            if warmed {
+                assert_eq!(
+                    books.callbacks(),
+                    before,
+                    "fitting deferred refinement must not request or return quota"
+                );
+            }
+        }
+        assert_eq!(probe.allocations.load(Ordering::Relaxed), 2);
     }
 
     #[test]

@@ -93,18 +93,20 @@ impl Kernel for IfKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         let Some(captured) = inputs.get(1).filter(|input| {
             input.present && input.dtype == DataType::Float32 && input.shape.len() == 1
         }) else {
             return Err(EpError::KernelFailed("shared mock If workspace requires a present rank-one float32 capture in input slot 1; provide complete boundary metadata".into()));
         };
         let layout = std::alloc::Layout::array::<f32>(captured.shape[0]).map_err(|_| EpError::KernelFailed("shared mock If captured input exceeds addressable workspace capacity; reduce the input extent".into()))?;
-        Ok(WorkspaceRequirement {
-            bytes: layout.size() as u64,
-            alignment: layout.align(),
-            ..WorkspaceRequirement::NONE
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: layout.size() as u64,
+                alignment: layout.align(),
+                ..WorkspaceRequirement::NONE
+            },
+        ))
     }
     fn execute_kernel_sized(
         &self,

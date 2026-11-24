@@ -284,7 +284,7 @@ impl Kernel for BlockQuantizedMatMulKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         let Some(a) = inputs.first().filter(|a| a.present) else {
             return Err(error(
                 "workspace planning needs present activation A metadata; provide the activation shape",
@@ -292,11 +292,13 @@ impl Kernel for BlockQuantizedMatMulKernel {
         };
         let rows = self.projection_rows(a.shape)?;
         let layout = self.projection_plan.layout(rows, self.k, self.n)?;
-        Ok(WorkspaceRequirement {
-            bytes: layout.bytes() as u64,
-            alignment: layout.alignment(),
-            ..WorkspaceRequirement::NONE
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: layout.bytes() as u64,
+                alignment: layout.alignment(),
+                ..WorkspaceRequirement::NONE
+            },
+        ))
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -2573,6 +2575,8 @@ mod tests {
                 ],
                 &[],
             )
+            .unwrap()
+            .require_ready()
             .unwrap();
         assert!(requirement.bytes > 0);
         let error = kernel

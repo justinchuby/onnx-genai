@@ -133,6 +133,8 @@ fn native_qgemm_compensation_allocations_do_not_scale_with_batches() {
                         &y_shape,
                     )],
                 )
+                .unwrap()
+                .require_ready()
                 .unwrap();
             assert_eq!(
                 requirement.bytes,
