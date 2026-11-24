@@ -1189,9 +1189,9 @@ impl Default for CudaProviderConfig {
 }
 
 /// One selected native allocation domain, independent of graph/execution state.
-/// This is owned inline by the provider for now; artifact installation is a later
-/// step. Runtime is borrowed only during admission, not retained in this state.
-struct CudaAllocationDomain {
+/// The provider and retained artifacts share ownership; runtime holds only Weak.
+/// Runtime is borrowed during admission, never retained in this state.
+pub(crate) struct CudaAllocationDomain {
     // Release selected allocator references before registration and its pins.
     memory: CudaMemory,
     memory_binding: CudaMemoryBinding,
@@ -1208,6 +1208,52 @@ struct CudaAllocationDomain {
 }
 
 impl CudaAllocationDomain {
+    pub(crate) fn counter_handles(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (Arc::clone(&self.ep_allocations), Arc::clone(&self.ep_frees))
+    }
+
+    pub(crate) fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    pub(crate) fn retire_owned(&self, buffer: DeviceBuffer) -> Result<()> {
+        if buffer.is_borrowed() {
+            return Ok(());
+        }
+        let ownership = match buffer.into_bound_ownership() {
+            Ok(owner) => owner,
+            Err(foreign) => {
+                // Fail closed: without binding-issued ownership there is no
+                // generation to validate, so freeing would be a pointer-only
+                // retry over an address this provider cannot prove it owns. The
+                // buffer is dropped without being freed, which leaks rather than
+                // risking a double free.
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep: refusing to free a {} byte buffer on CUDA device {} that carries no \
+                     binding-issued ownership; this provider only releases allocations its own \
+                     bound allocator issued",
+                    foreign.len(),
+                    self.device.index
+                )));
+            }
+        };
+        let binding_identity = ownership.owner().identity().binding();
+        let known_mechanism =
+            binding_identity.mechanism() == self.memory_binding.mechanism.identity();
+        if binding_identity.provider_context() != self.memory_binding.context.identity()
+            || !known_mechanism
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: refusing to enqueue release for allocation {:?} on CUDA device {}: its \
+                 provider context/mechanism is not owned by this execution provider, so this \
+                 provider's stream fences and accounting observer cannot order or settle it",
+                ownership.owner().identity(),
+                self.device.index
+            )));
+        }
+        enqueue_native_release(&self.release_queue, ownership, self.release_accounting())
+    }
+
     fn new(
         device: DeviceId,
         memory: CudaMemory,
@@ -1284,7 +1330,7 @@ impl CudaAllocationDomain {
     /// Shared cold admission for independently owned native storage. Workspace
     /// release-barrier waiting stays with the workspace caller; immutable weights
     /// do not wait for an unrelated lane. No second allocator or quota ledger.
-    fn allocate_governed(
+    pub(crate) fn allocate_governed(
         &self,
         runtime: &CudaRuntime,
         size: usize,
@@ -1646,7 +1692,7 @@ pub struct CudaExecutionProvider {
         std::sync::OnceLock<onnx_runtime_memory_governor::MappedHolderRegistration>,
     /// Selected allocator and native accounting. Declared after mapped reclaim
     /// registration so its teardown still observes the complete memory domain.
-    allocation_domain: CudaAllocationDomain,
+    allocation_domain: Arc<CudaAllocationDomain>,
     /// Executor-scoped route-residency lifecycle state. Sibling/base/MTP
     /// executors may share this EP, but each owns an independent finalization
     /// outcome, boundary, and retained bank artifacts.
@@ -2106,14 +2152,14 @@ impl CudaExecutionProvider {
             offload_policy,
             residency,
             mapped_reclaim_registration: std::sync::OnceLock::new(),
-            allocation_domain: CudaAllocationDomain::new(
+            allocation_domain: Arc::new(CudaAllocationDomain::new(
                 DeviceId::cuda(ordinal),
                 memory,
                 memory_binding,
                 governor.clone(),
                 attribution,
                 release_queue,
-            ),
+            )),
             route_residency_config,
             artifact_provider_id,
             route_executors: Mutex::new(HashMap::new()),
@@ -2159,6 +2205,9 @@ impl CudaExecutionProvider {
                     ))
                 })?;
         }
+        provider
+            .runtime
+            .install_allocation_domain(&provider.allocation_domain)?;
         construction_queue_guard.disarm();
         Ok(provider)
     }
@@ -4969,44 +5018,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         // interleaved pointer baked into a captured graph.
         self.runtime
             .invalidate_interleaved_for(crate::runtime::cuptr(buffer.as_ptr()), buffer.len());
-        let ownership = match buffer.into_bound_ownership() {
-            Ok(owner) => owner,
-            Err(foreign) => {
-                // Fail closed: without binding-issued ownership there is no
-                // generation to validate, so freeing would be a pointer-only
-                // retry over an address this provider cannot prove it owns. The
-                // buffer is dropped without being freed, which leaks rather than
-                // risking a double free.
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep: refusing to free a {} byte buffer on CUDA device {} that carries no \
-                     binding-issued ownership; this provider only releases allocations its own \
-                     bound allocator issued",
-                    foreign.len(),
-                    self.device.index
-                )));
-            }
-        };
-        let binding_identity = ownership.owner().identity().binding();
-        let known_mechanism = binding_identity.mechanism()
-            == self.allocation_domain.memory_binding.mechanism.identity();
-        if binding_identity.provider_context()
-            != self.allocation_domain.memory_binding.context.identity()
-            || !known_mechanism
-        {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: refusing to enqueue release for allocation {:?} on CUDA device {}: its \
-                 provider context/mechanism is not owned by this execution provider, so this \
-                 provider's stream fences and accounting observer cannot order or settle it",
-                ownership.owner().identity(),
-                self.device.index
-            )));
-        }
-        enqueue_native_release(
-            &self.allocation_domain.release_queue,
-            ownership,
-            self.allocation_domain.release_accounting(),
-        )
-        .map(|()| 0)
+        self.allocation_domain.retire_owned(buffer).map(|()| 0)
     }
 
     fn wait_for_deferred_releases(&self) -> Result<()> {
@@ -5627,14 +5639,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         // of them is how the capture-safety assertions stopped observing
         // anything without ever going red.
         let counts = self.runtime.allocation_counts();
-        Some((
-            counts.allocations
-                + self
-                    .allocation_domain
-                    .ep_allocations
-                    .load(Ordering::Relaxed),
-            counts.frees + self.allocation_domain.ep_frees.load(Ordering::Relaxed),
-        ))
+        Some((counts.allocations, counts.frees))
     }
 
     fn raw_device_allocation_site_stats(
@@ -6516,6 +6521,192 @@ extern "C" __global__ void spin_delay(long long spin) {
             4,
         );
         (queue, ready)
+    }
+
+    /// Host backing with an explicit test-only Device identity. No CUDA call is
+    /// made; the real manager, domain, graph owner and settlement core are used.
+    #[derive(Debug)]
+    struct HostArtifactAllocator;
+    impl DeviceAllocator for HostArtifactAllocator {
+        fn device(&self) -> onnx_runtime_memory_api::DeviceKey {
+            onnx_runtime_memory_api::DeviceKey::device(0)
+        }
+        fn allocate(
+            &self,
+            bytes: usize,
+            align: usize,
+        ) -> std::result::Result<NonNull<u8>, onnx_runtime_memory_api::MemoryError> {
+            onnx_runtime_memory_api::HostAllocator.allocate(bytes, align)
+        }
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+            // SAFETY: this allocator delegates each exact live layout to HostAllocator.
+            unsafe { onnx_runtime_memory_api::HostAllocator.deallocate(ptr, bytes, align) };
+        }
+    }
+
+    fn host_artifact_domain(queue: Arc<CudaDeferredReleaseQueue>) -> Arc<CudaAllocationDomain> {
+        use onnx_runtime_memory_api::DeviceKey;
+        use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor, MemoryGovernor};
+        let key = DeviceKey::device(0);
+        let manager = ProcessMemoryManager::new().unwrap();
+        let context = manager
+            .register_provider_context(key, "artifact test context", Arc::new(WorkspaceTestPin))
+            .unwrap();
+        let governor: Arc<dyn MemoryGovernor + Send + Sync> = Arc::new(LedgerGovernor::new(
+            LeaseLedger::new_for_device(key, 4096, 0, 0),
+        ));
+        let authority = manager
+            .register_authority(
+                key,
+                "artifact test authority",
+                Arc::new(WorkspaceTestPin),
+                Arc::clone(&governor),
+            )
+            .unwrap();
+        let allocator: Arc<dyn DeviceAllocator> = Arc::new(HostArtifactAllocator);
+        let binding = CudaExecutionProvider::bind_allocator(
+            manager,
+            context,
+            authority,
+            None,
+            0,
+            Arc::clone(&allocator),
+        )
+        .unwrap();
+        Arc::new(CudaAllocationDomain::new(
+            DeviceId::cuda(0),
+            CudaMemory::Injected(allocator),
+            binding,
+            Some(governor),
+            Arc::new(CudaMappedAttribution::default()),
+            queue,
+        ))
+    }
+
+    #[test]
+    fn graph_artifact_pins_domain_and_settles_only_after_its_last_graph_pin_and_both_fences() {
+        let (queue, ready) = native_release_queue(false);
+        let domain = host_artifact_domain(Arc::clone(&queue));
+        let buffer = domain
+            .allocate_transaction(
+                128,
+                16,
+                std::slice::from_ref(&(0..128)),
+                MemoryRole::Weights,
+                true,
+            )
+            .unwrap();
+        let wait = buffer.managed_settlement_wait().unwrap();
+        let manager = domain.memory_binding.manager.clone();
+        let counters = domain.counter_handles();
+        assert_eq!(
+            counters.0.load(Ordering::Relaxed),
+            1,
+            "cold native admission must be visible"
+        );
+        let weak = Arc::downgrade(&domain);
+        let artifact = Arc::new(crate::runtime::GraphDeviceAllocation::from_owned(
+            buffer,
+            Arc::clone(&domain),
+            Weak::new(),
+            128,
+        ));
+        let resource = crate::runtime::GraphDeviceAllocation::device_graph_resource(&artifact);
+        let identity = resource.identity();
+        for _ in 0..4 {
+            assert_eq!(
+                crate::runtime::GraphDeviceAllocation::device_graph_resource(&artifact).identity(),
+                identity
+            );
+        }
+        assert_eq!(
+            counters.0.load(Ordering::Relaxed),
+            1,
+            "warm graph pins cannot admit storage"
+        );
+        drop(artifact);
+        drop(domain);
+        assert!(
+            weak.upgrade().is_some(),
+            "the graph retains the actual allocation domain"
+        );
+        assert_eq!(queue.stats().accepted, 0);
+        drop(resource);
+        assert!(
+            weak.upgrade().is_none(),
+            "the release queue must not retain the domain or runtime"
+        );
+        assert_eq!(wait.status(), AllocationSettlementStatus::Pending);
+        assert_eq!(
+            manager.snapshot().unwrap().allocations[0].charged_bytes,
+            128
+        );
+        queue.poll();
+        assert_eq!(counters.1.load(Ordering::Relaxed), 0);
+        ready[0].store(true, Ordering::Release);
+        queue.poll();
+        assert_eq!(counters.1.load(Ordering::Relaxed), 0);
+        ready[1].store(true, Ordering::Release);
+        queue.poll();
+        assert_eq!(wait.status(), AllocationSettlementStatus::Released);
+        assert_eq!(
+            counters.0.load(Ordering::Relaxed),
+            1,
+            "retired domain counters remain cumulative"
+        );
+        assert_eq!(counters.1.load(Ordering::Relaxed), 1);
+        assert!(manager.snapshot().unwrap().allocations.is_empty());
+        queue.poll();
+        assert_eq!(counters.1.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn graph_artifact_retirement_failure_retains_charge_and_never_retries_consumed_owner() {
+        for fail_recording in [false, true] {
+            let (queue, _) = native_release_queue(fail_recording);
+            let domain = host_artifact_domain(Arc::clone(&queue));
+            let buffer = domain
+                .allocate_transaction(
+                    128,
+                    16,
+                    std::slice::from_ref(&(0..128)),
+                    MemoryRole::Weights,
+                    true,
+                )
+                .unwrap();
+            let wait = buffer.managed_settlement_wait().unwrap();
+            if !fail_recording {
+                queue.close();
+            }
+            let mut artifact = crate::runtime::GraphDeviceAllocation::from_owned(
+                buffer,
+                Arc::clone(&domain),
+                Weak::new(),
+                128,
+            );
+            let error = artifact
+                .release()
+                .expect_err("refused ownership must remain charged");
+            assert!(error.to_string().contains("quarantined"), "{error}");
+            assert!(matches!(
+                wait.status(),
+                AllocationSettlementStatus::Retained(_)
+            ));
+            assert_eq!(
+                domain
+                    .memory_binding
+                    .manager
+                    .snapshot()
+                    .unwrap()
+                    .allocations[0]
+                    .charged_bytes,
+                128
+            );
+            artifact.release().unwrap();
+            drop(artifact);
+            assert_eq!(domain.ep_frees.load(Ordering::Relaxed), 0);
+            assert_eq!(queue.stats().accepted, 0);
+        }
     }
 
     #[test]

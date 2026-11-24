@@ -1683,8 +1683,9 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
         &b_input_strides,
         device,
     )];
+    ep.wait_for_deferred_releases().unwrap();
     let counts_before_failure = runtime.allocation_counts();
-    let pooled_before_failure = runtime.raw_pool_retained_bytes();
+
     let syncs_before_failure = runtime.forced_synchronization_count();
     runtime.fail_warm_transaction_at_for_test(1);
     let failure = kernel
@@ -1715,10 +1716,10 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
         syncs_before_failure + 1,
         "persistent metadata replacement must drain old readers even when the staged upload fails and eager sync is deferred"
     );
+    ep.wait_for_deferred_releases().unwrap();
     let counts_after_failure = runtime.allocation_counts();
     assert!(
-        counts_after_failure.frees > counts_before_failure.frees
-            || runtime.raw_pool_retained_bytes() > pooled_before_failure,
+        counts_after_failure.frees > counts_before_failure.frees,
         "the rejected Transpose candidate must return its staged allocation exactly once"
     );
 
@@ -1754,12 +1755,14 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
     );
     drop(b_resource);
 
+    ep.wait_for_deferred_releases().unwrap();
+
     let counts_before_drop = runtime.allocation_counts();
-    let pooled_before_drop = runtime.raw_pool_retained_bytes();
+
     drop(kernel);
+    ep.wait_for_deferred_releases().unwrap();
     assert!(
-        runtime.allocation_counts().frees > counts_before_drop.frees
-            || runtime.raw_pool_retained_bytes() > pooled_before_drop,
+        runtime.allocation_counts().frees > counts_before_drop.frees,
         "dropping the kernel must release only its newer eager metadata owner"
     );
 
@@ -1772,12 +1775,14 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
     };
     assert_eq!(actual, raw(&[1_f32, 4., 2., 5., 3., 6.]));
 
+    ep.wait_for_deferred_releases().unwrap();
+
     let counts_before_reset = runtime.allocation_counts();
-    let pooled_before_reset = runtime.raw_pool_retained_bytes();
+
     assert!(runtime.reset_graph().unwrap());
+    ep.wait_for_deferred_releases().unwrap();
     assert!(
-        runtime.allocation_counts().frees > counts_before_reset.frees
-            || runtime.raw_pool_retained_bytes() > pooled_before_reset,
+        runtime.allocation_counts().frees > counts_before_reset.frees,
         "reset must release the older metadata owner retained by the graph"
     );
 
@@ -2047,15 +2052,16 @@ fn slice_captured_metadata_outlives_rewarm_and_kernel_drop() {
     };
     assert_eq!(actual, raw(&[3_f32, 1., 11., 9.]));
 
+    ep.wait_for_deferred_releases().unwrap();
+
     let counts_before_reset = runtime.allocation_counts();
-    let pooled_before_reset = runtime.raw_pool_retained_bytes();
+
     assert!(runtime.reset_graph().unwrap());
-    let driver_frees = runtime.allocation_counts().frees - counts_before_reset.frees;
-    let retained = runtime.raw_pool_retained_bytes() - pooled_before_reset;
+    ep.wait_for_deferred_releases().unwrap();
     assert_eq!(
-        driver_frees * 512 + retained,
-        512,
-        "graph retirement must return exactly one 512-byte artifact class, either to the driver or existing pool"
+        runtime.allocation_counts().frees - counts_before_reset.frees,
+        1,
+        "graph retirement must settle exactly one native metadata owner"
     );
 
     ep.deallocate(a_data_buffer).unwrap();
