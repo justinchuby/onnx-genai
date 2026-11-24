@@ -14,7 +14,10 @@ fn autoload_default() -> bool {
     true
 }
 
-async fn queried_model(state: &AppState, query: &ModelQuery) -> Result<Arc<ModelHandle>, ApiError> {
+pub(super) async fn queried_model(
+    state: &AppState,
+    query: &ModelQuery,
+) -> Result<Arc<ModelHandle>, ApiError> {
     if let Some(handle) = state
         .registry
         .lookup_loaded(&query.model)
@@ -45,7 +48,7 @@ pub(crate) async fn props(
         return Ok(Json(json!({
             "role": "router", "ui": true, "ui_settings": {},
             "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": true, "resumable_streams": true},
-            "cors_proxy_enabled": state.config.mcp_proxy_policy.is_enabled(), "endpoint_slots": false,
+            "cors_proxy_enabled": state.config.mcp_proxy_policy.is_enabled(), "endpoint_slots": true,
             "endpoint_props": false, "endpoint_metrics": cfg!(feature = "metrics"),
             "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION"))
         })));
@@ -87,7 +90,7 @@ pub(crate) async fn props(
         },
         "chat_template": handle.chat_template.as_ref().map_or("", |t| t.source()),
         "chat_template_caps": {},
-        "endpoint_slots": false, "endpoint_props": false,
+        "endpoint_slots": handle.engine.native_slot.is_some(), "endpoint_props": false,
         "endpoint_metrics": cfg!(feature = "metrics"),
         "ui": true, "ui_settings": {}, "is_sleeping": false,
         "cors_proxy_enabled": state.config.mcp_proxy_policy.is_enabled(),
@@ -234,6 +237,7 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
                 .as_i64()
                 .is_some_and(|n| n == -1 || usize::try_from(n).is_ok()),
             "backend_sampling" => value == false,
+            "id_slot" => matches!(value.as_i64(), Some(-1 | 0)),
             "n" => value == 1,
             "user" => value.is_string(),
             _ => false,
@@ -346,4 +350,20 @@ pub(super) async fn count_input_tokens(
     validate_extensions(request)?;
     let handle = resolve_model(&state.registry, &request.model).await?;
     super::completions::count_model_input_tokens(request, &handle, &state.config).await
+}
+
+/// An explicit slot selects a physical executor, independently of conversation IDs.
+pub(super) fn validate_slot_selection(
+    request: &ChatCompletionRequest,
+    handle: &ModelHandle,
+) -> Result<(), ApiError> {
+    if request.extensions.get("id_slot").is_some_and(|v| v == 0)
+        && handle.engine.native_slot.is_none()
+    {
+        return Err(ApiError::invalid_request(format!(
+            "id_slot=0 is unavailable for model '{}'; select a serial Native executor, use id_slot=-1 for automatic selection, or omit id_slot",
+            handle.id
+        )));
+    }
+    Ok(())
 }

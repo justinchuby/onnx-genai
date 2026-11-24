@@ -849,6 +849,16 @@ pub enum DecisionSource {
     Unavailable,
 }
 
+/// Operator policy for portable Native state files. Optional server features
+/// must not prevent unrelated workflow/reference models from loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NativeStateFilePolicy {
+    #[default]
+    Disabled,
+    WhenSupported,
+    Required,
+}
+
 /// Engine configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -876,7 +886,7 @@ pub struct EngineConfig {
     pub native_decode_batch: Option<usize>,
     /// Compute a content identity at load to admit portable Native state files.
     /// Hashes model/declared external weights once; disabled by default.
-    pub native_state_files: bool,
+    pub native_state_files: NativeStateFilePolicy,
     /// Decoder-wide numeric precision for the native decode session
     /// (see [`onnx_runtime_session::DecodePrecision`]). Defaults to
     /// [`DecodePrecision::Model`](onnx_runtime_session::DecodePrecision::Model)
@@ -937,7 +947,7 @@ impl Default for EngineConfig {
             decode_backend: EngineDecodeBackend::Native,
             native_device: None,
             native_decode_batch: None,
-            native_state_files: false,
+            native_state_files: NativeStateFilePolicy::Disabled,
             #[cfg(feature = "native-backend")]
             decode_precision: onnx_runtime_session::DecodePrecision::Model,
             page_size: 16,

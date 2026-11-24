@@ -580,6 +580,7 @@ pub(crate) async fn chat_completions(
     validate_request(&request, &state.config)?;
     super::llama::validate_extensions(&request)?;
     let handle = resolve_model(&state.registry, &request.model).await?;
+    super::llama::validate_slot_selection(&request, &handle)?;
     request.model = handle.id.clone();
     let requested_session_id = session_id_from_headers(&headers)?;
     // The session header names a conversation. Which runtime state continues it
@@ -1940,6 +1941,7 @@ pub(crate) fn prepare_completion(
     handle: &ModelHandle,
     output_cap: usize,
 ) -> Result<PreparedCompletion, ApiError> {
+    super::llama::validate_slot_selection(&request.sampling, handle)?;
     let mut options = build_generate_options_with_tokenizer(
         &request.sampling,
         &handle.tokenizer,

@@ -250,7 +250,7 @@ impl NativeDecodeSession {
             self.supports_past_snapshots(),
             "Native state files require host-owned state; select the original host-state executor"
         );
-        let identity = self.state_identity.context("Native state files are disabled for this model; reload with EngineConfig.native_state_files=true")?;
+        let identity = self.state_identity.context("Native state files are disabled for this model; reload with EngineConfig.native_state_files=Required")?;
         let mut header = [0_u8; HEADER as usize];
         reader
             .read_exact(&mut header)
@@ -419,8 +419,12 @@ impl NativeDecodeSession {
                 expected.remove(pair.1.as_str());
             }
         }
+        let empty = manifest.len == 0
+            && manifest.tokens.is_empty()
+            && manifest.past.is_empty()
+            && manifest.hidden.is_none();
         anyhow::ensure!(
-            expected.len() == manifest.past.len(),
+            empty || expected.len() == manifest.past.len(),
             "Native state tensor count differs from the model; restore the original state file"
         );
         for spec in &manifest.past {

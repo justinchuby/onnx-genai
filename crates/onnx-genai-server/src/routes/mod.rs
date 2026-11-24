@@ -57,6 +57,7 @@ pub(crate) mod prompt;
 pub(crate) mod proxy;
 pub(crate) mod ranking;
 mod sessions;
+pub(crate) mod slots;
 mod speech;
 pub(crate) mod transports;
 

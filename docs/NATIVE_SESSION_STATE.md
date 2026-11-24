@@ -2,7 +2,9 @@
 
 The Native engine can save and restore its committed host-owned decoder state,
 including across engine instances and server restarts. Enable
-`EngineConfig.native_state_files` when loading the model. This opts into a
+`EngineConfig.native_state_files = NativeStateFilePolicy::Required` when loading
+the model. `WhenSupported` enables files only for supported decoders and lets
+unrelated workflow/reference models load normally; `Disabled` is the default. This opts into a
 load-time SHA-256 content identity; the default remains disabled and does not
 hash model weights for this feature. Model package artifacts must remain
 immutable during loading, as required by the runtime's weight mappings.
@@ -64,6 +66,26 @@ an nxrt format; llama.cpp binary prompt-cache files are not interchangeable.
 The checksum detects corruption; model identity checks compatibility, not an
 artifact producer's identity.
 
-The llama.cpp `/slots` HTTP transport, operator save-directory policy and
-worker-owned slot routing remain unfinished. This engine API alone does not
-advertise `endpoint_slots=true`.
+The server exposes `GET /slots` for an admitted single-sequence Native decoder.
+Its slot ID is 0; queue capacity and logical conversation count do not create
+additional slots. `is_processing` follows the owner thread, and `n_past` is the
+last completed task's retained physical cursor. `fail_on_no_slot=1` returns 503
+while that executor is busy. Unsupported executors return 501 and advertise
+`endpoint_slots=false` in model properties.
+
+Start with `--slot-save-path DIRECTORY` to enable
+`POST /slots/0?action=save|restore|erase`. Save/restore take a JSON `filename`;
+erase takes no filename. Actions queue on the model's owner thread, so a save
+waits for an active generation to finish. Restores populate the private cache
+used by stateless requests; named conversation histories remain independent.
+The file codec remains nxrt-specific, not llama.cpp binary-compatible.
+
+Filenames must be plain names within the opened capability directory. Atomic
+staging preserves an existing file on failure; files are private on Unix.
+One server owns each directory through a process lock. Defaults bound each
+file to 4 GiB, the directory to 16 GiB and entries to 128; configure these with
+`--slot-save-max-file-bytes`, `--slot-save-max-total-bytes` and
+`--slot-save-max-files`. Atomic replacements need space for both old and staged
+files. These bounds include other directory entries, so use a dedicated
+directory. A process crash may leave a staging file, counted against the bounds;
+remove it while the server is stopped after checking its provenance.

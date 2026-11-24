@@ -55,6 +55,8 @@ model inspection, profiling and command-line streaming remain available.
 | GET | `/models/sse` | Initial state and changes to committed model load status; one-second polling, no invented progress |
 | POST | `/models/load`, `/models/unload` | Configured model IDs; requires `--enable-admin-endpoints` |
 | GET, POST | `/cors-proxy` | Optional HTTP(S) MCP transport; explicit forwarding headers, checked and pinned target addresses, bounded streaming |
+| GET | `/slots` | Actual serial Native slot status; model/autoload selection and fail-on-busy polling |
+| POST | `/slots/{id_slot}?action=save\|restore\|erase` | Owner-thread state actions under opt-in bounded `--slot-save-path`; nxrt state file encoding |
 | GET | `/metrics` | Existing nxrt Prometheus metrics when compiled with `metrics`; names are not llama metric aliases |
 
 `/props?model=ID&autoload=false` never loads a model. The default is
@@ -415,7 +417,7 @@ This is a functional Llama Chat integration, not a claim of complete llama-serve
 parity. These upstream protocols are still unimplemented:
 
 - Multimodal reranking, realtime audio/WebSocket inference and `/v1/systemone`.
-- Slot save/restore and LoRA hot swapping.
+- Device-state/multi-sequence slot persistence and LoRA hot swapping.
 - GGUF/Hugging Face model downloads and deletion.
 
 `/tools`, model download/delete and mutable `/props` remain disabled. The MCP

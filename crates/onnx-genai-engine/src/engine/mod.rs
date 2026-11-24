@@ -75,7 +75,11 @@ mod model;
 #[cfg(feature = "native-backend")]
 mod native_session_snapshot;
 #[cfg(feature = "native-backend")]
+mod native_slot;
+#[cfg(feature = "native-backend")]
 mod native_state_identity;
+#[cfg(feature = "native-backend")]
+pub use native_slot::NativeSlotState;
 #[cfg(feature = "native-backend")]
 mod placement;
 mod runtime;
@@ -101,7 +105,9 @@ pub(crate) use metadata::*;
 pub use model::Engine;
 pub(crate) use model::*;
 #[cfg(feature = "native-backend")]
-pub use native_session_snapshot::{NativeSessionSnapshot, NativeStateFileSummary};
+pub use native_session_snapshot::{
+    NativeSessionSnapshot, NativeStateFileReadError, NativeStateFileSummary,
+};
 #[cfg(feature = "native-backend")]
 pub(crate) use placement::plan_static_weight_placement;
 pub use session_fork::{

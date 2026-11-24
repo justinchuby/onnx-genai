@@ -390,6 +390,7 @@ pub struct AppState {
     pub(crate) sessions: SessionRegistry,
     pub(crate) completion_controls: crate::completion_control::CompletionControls,
     pub(crate) proxy_connections: std::sync::Arc<tokio::sync::Semaphore>,
+    pub(crate) slot_storage: Option<Arc<crate::slot_storage::SlotStorage>>,
     pub(crate) config: ServerConfig,
 }
 
@@ -492,6 +493,11 @@ pub struct ServerConfig {
     /// These endpoints load and unload models at runtime and should only be exposed
     /// on loopback-bound instances or behind an authenticated reverse proxy.
     pub enable_admin_endpoints: bool,
+    /// Operator directory enabling llama.cpp slot state actions.
+    pub slot_save_path: Option<std::path::PathBuf>,
+    pub slot_save_max_file_bytes: std::num::NonZeroU64,
+    pub slot_save_max_total_bytes: std::num::NonZeroU64,
+    pub slot_save_max_files: std::num::NonZeroUsize,
     /// Maximum number of models kept loaded in memory at once. `None` (the default)
     /// means unlimited. When set, loading an additional model beyond the cap evicts
     /// the least-recently-used loaded model (never dropping below one model).
@@ -528,6 +534,13 @@ impl Default for ServerConfig {
             max_batch: None,
             enable_debug_endpoints: false,
             enable_admin_endpoints: false,
+            slot_save_path: None,
+            slot_save_max_file_bytes: std::num::NonZeroU64::new(4 * 1024 * 1024 * 1024)
+                .expect("positive slot file bound"),
+            slot_save_max_total_bytes: std::num::NonZeroU64::new(16 * 1024 * 1024 * 1024)
+                .expect("positive slot directory bound"),
+            slot_save_max_files: std::num::NonZeroUsize::new(128)
+                .expect("positive slot file count"),
             max_loaded_models: None,
             eviction_policy: EvictionPolicy::Lru,
             engine_config: EngineConfig::default(),
@@ -536,7 +549,14 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    fn validate(self) -> anyhow::Result<Self> {
+    fn validate(mut self) -> anyhow::Result<Self> {
+        if self.slot_save_path.is_some()
+            && self.engine_config.native_state_files
+                == onnx_genai_engine::NativeStateFilePolicy::Disabled
+        {
+            self.engine_config.native_state_files =
+                onnx_genai_engine::NativeStateFilePolicy::WhenSupported;
+        }
         anyhow::ensure!(
             self.mcp_proxy_max_connections.get() <= tokio::sync::Semaphore::MAX_PERMITS,
             "ui_mcp_proxy_max_connections exceeds this host's semaphore capacity; configure at most {} connections",
@@ -600,6 +620,21 @@ impl AppState {
         config: ServerConfig,
     ) -> anyhow::Result<Self> {
         let config = config.validate()?;
+        let slot_storage = config
+            .slot_save_path
+            .as_ref()
+            .map(|path| {
+                crate::slot_storage::SlotStorage::open(
+                    path,
+                    crate::slot_storage::SlotStorageLimits {
+                        file_bytes: config.slot_save_max_file_bytes.get(),
+                        total_bytes: config.slot_save_max_total_bytes.get(),
+                        files: config.slot_save_max_files.get(),
+                    },
+                )
+                .map(Arc::new)
+            })
+            .transpose()?;
         let model_id = model_id.unwrap_or_else(|| infer_model_id(model_dir));
         let spec = ModelSpec {
             id: model_id,
@@ -610,6 +645,7 @@ impl AppState {
         let registry = ModelRegistry::from_specs(std::slice::from_ref(&spec), config.clone())?;
         Ok(Self {
             registry,
+            slot_storage,
             replays: crate::replay::ReplayRegistry::new(
                 config.max_replay_streams,
                 config.replay_buffer_bytes,
@@ -637,9 +673,25 @@ impl AppState {
             anyhow::bail!("at least one model spec is required");
         }
         let config = config.validate()?;
+        let slot_storage = config
+            .slot_save_path
+            .as_ref()
+            .map(|path| {
+                crate::slot_storage::SlotStorage::open(
+                    path,
+                    crate::slot_storage::SlotStorageLimits {
+                        file_bytes: config.slot_save_max_file_bytes.get(),
+                        total_bytes: config.slot_save_max_total_bytes.get(),
+                        files: config.slot_save_max_files.get(),
+                    },
+                )
+                .map(Arc::new)
+            })
+            .transpose()?;
         let registry = ModelRegistry::from_specs(&specs, config.clone())?;
         Ok(Self {
             registry,
+            slot_storage,
             replays: crate::replay::ReplayRegistry::new(
                 config.max_replay_streams,
                 config.replay_buffer_bytes,

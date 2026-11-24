@@ -30,9 +30,9 @@ The supported surface and explicit limitations are documented in
 - [ ] Capability-backed ranking, adapter and slot/state operations; audit the engine boundary before introducing transport support.
 - [ ] Optional tools/MCP proxy, model catalogue/download semantics and audio transports; preserve explicit configuration and resource bounds.
 - [ ] Full compatibility matrix and executable conformance tests.
-- [ ] Fresh full checks, adversarial self-review, PR description update, CI and merge.
+- [ ] Fresh full checks, adversarial self-review, PR description update and merge (CI is currently blocked; user authorized merging after local verification).
 
-## Native slot-state foundation
+## Native slot state and HTTP transport
 
 The engine now exposes owned `NativeSessionSnapshot` captures and transactional
 restore into existing sessions. These preserve executable state (live in-place
@@ -43,14 +43,20 @@ are bound to the original engine instance/generation and remain valid after the
 source conversation advances, resets or closes. Restore failures undo physical
 writes; failed undo poisons the affected conversations until reset.
 
-This is a prerequisite for slot persistence, not an implemented `/slots` API.
-Inactive histories and device state are explicitly refused. Bounded, checksummed
+Inactive histories and device state are explicitly refused as snapshot sources. Bounded, checksummed
 [Native state files](NATIVE_SESSION_STATE.md) now preserve that boundary across
 engine instances/restarts after load-time model/weight/metadata/tokenizer identity
 validation. Strict schema, layout, cursor, token and checksum checks precede
 transactional publication. CPU live KV can restore into a smaller initial
-capacity. Worker-owned slot identities, operator file admission and HTTP
-save/restore/erase remain required. Capability advertisement stays false.
+capacity. `GET /slots` now exposes the actual serial Native lane (ID 0),
+including owner-thread busy status and the last completed task's retained cursor.
+`POST /slots/0?action=save|restore|erase` uses the same owner queue and requires
+`--slot-save-path`. Plain filenames, a pinned capability directory, private
+atomic staging, exclusive process ownership and file/directory/count quotas
+bound filesystem access. Model properties advertise slots only for admitted
+executors. Device/multi-sequence persistence and Native fork plans remain open.
+Real HTTP tests cover empty/generated cache round trips, continued generation,
+busy polling and queued save, corruption, disabled storage and slot selection.
 
 ## Design constraints
 
@@ -130,7 +136,7 @@ non-padding token usage and positive document/token budgets are covered by real
 ONNX HTTP tests. An actual raw-logit workflow is rejected with repair guidance;
 no embedding similarity is substituted for cross-encoder scores. Metadata guards
 cover ambiguous/unsupported profiles, vector scores and mismatched fixed inputs.
-Adapter and slot/state work in the shared delivery row remains outstanding.
+Adapter and device/multi-sequence slot persistence work in the shared delivery row remains outstanding.
 
 Reranking checkpoint: full server library 379 passed / 2 inherited ignores;
 metadata library 76 passed; both real engine ranking tests passed, including

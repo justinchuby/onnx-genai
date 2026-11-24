@@ -30,6 +30,7 @@ mod kv_commit;
 mod load;
 mod paged_gqa;
 mod state_file;
+pub(crate) use state_file::DecodedState;
 pub use state_file::NativeStateFileLimits;
 mod tensor;
 pub use csa::{
@@ -853,6 +854,68 @@ impl NativeDecodeSession {
                 .context("native hidden-state snapshot byte count overflow")?,
         )
         .context("native complete state snapshot byte count overflow")
+    }
+
+    pub(crate) fn empty_snapshot_memory_bytes(&self) -> anyhow::Result<u64> {
+        let mut result = 0_u64;
+        if let Some(cpu) = &self.cpu_kv {
+            for (pair, shape, _) in cpu.state_layout() {
+                let blocks = shape[0]
+                    .checked_mul(shape[1])
+                    .context("empty CPU KV snapshot block count overflow")?;
+                result = result
+                    .checked_add(
+                        u64::try_from(blocks)?
+                            .checked_mul(std::mem::size_of::<Vec<u8>>() as u64)
+                            .context("empty CPU KV snapshot metadata size overflow")?,
+                    )
+                    .and_then(|n| {
+                        n.checked_add(
+                            (pair.0.len() + pair.1.len() + std::mem::size_of_val(shape) + 128)
+                                as u64,
+                        )
+                    })
+                    .context("empty CPU KV snapshot memory size overflow")?;
+            }
+        }
+        Ok(result)
+    }
+    pub(crate) fn empty_past_snapshot(&self) -> anyhow::Result<NativePastSnapshot> {
+        anyhow::ensure!(
+            self.supports_past_snapshots(),
+            "empty Native snapshots require host-owned state"
+        );
+        let cpu_kv = self
+            .cpu_kv
+            .as_ref()
+            .map(|cpu| -> anyhow::Result<_> {
+                let mut entries = Vec::new();
+                for (pair, shape, dtype) in cpu.state_layout() {
+                    let blocks = shape[0]
+                        .checked_mul(shape[1])
+                        .context("empty CPU KV snapshot block count overflow")?;
+                    let mut shape = shape.to_vec();
+                    shape[2] = 0;
+                    entries.push(cpu::CpuKvSnapshotEntry {
+                        pair: pair.clone(),
+                        shape,
+                        dtype,
+                        rows: vec![Vec::new(); blocks],
+                    });
+                }
+                Ok(cpu::CpuKvSnapshot {
+                    logical_len: 0,
+                    entries,
+                })
+            })
+            .transpose()?;
+        Ok(NativePastSnapshot {
+            past: HashMap::new(),
+            len: 0,
+            bytes: 0,
+            last_hidden: None,
+            cpu_kv,
+        })
     }
 
     pub(crate) fn snapshot_past(&mut self) -> anyhow::Result<NativePastSnapshot> {

@@ -6787,7 +6787,7 @@ mod llama_compat {
         assert_eq!(props["model_alias"], "tiny-llm");
         assert_eq!(props["modalities"]["vision"], false);
         assert!(props["chat_template"].is_string());
-        assert_eq!(props["endpoint_slots"], false);
+        assert_eq!(props["endpoint_slots"], handle.engine.native_slot.is_some());
         assert_eq!(
             handle
                 .last_request_at
@@ -9845,4 +9845,263 @@ async fn ordinary_template_prefill_is_emitted_for_buffered_streamed_and_logprob_
         ],
     )
     .await;
+}
+
+#[cfg(feature = "native-backend")]
+mod native_slots_http {
+    use super::*;
+    async fn call(
+        router: axum::Router,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    fn state(path: Option<PathBuf>) -> AppState {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-native-engine");
+        AppState::load_with_config(
+            &fixture,
+            Some("native".into()),
+            ServerConfig {
+                slot_save_path: path,
+                engine_config: EngineConfig {
+                    decode_backend: EngineDecodeBackend::Native,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn empty_slot_round_trip_uses_real_state_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = app(state(Some(dir.path().into())));
+        let (status, slots) = call(router.clone(), "GET", "/slots", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{slots}");
+        assert_eq!(slots[0]["id"], 0);
+        assert_eq!(slots[0]["is_processing"], false);
+        let (_, props) = call(router.clone(), "GET", "/props", Value::Null).await;
+        assert_eq!(props["endpoint_slots"], true);
+        let (status, saved) = call(
+            router.clone(),
+            "POST",
+            "/slots/0?action=save",
+            json!({"filename":"cache.bin"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["n_saved"], 0);
+        assert!(saved["n_written"].as_u64().unwrap() > 88);
+        assert!(dir.path().join("cache.bin").exists());
+        let (status, restored) = call(
+            router.clone(),
+            "POST",
+            "/slots/0?action=restore",
+            json!({"filename":"cache.bin"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{restored}");
+        assert_eq!(saved["n_written"], restored["n_read"]);
+        let (status, erased) = call(router, "POST", "/slots/0?action=erase", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{erased}");
+        assert_eq!(erased["n_erased"], 0);
+    }
+    #[tokio::test]
+    async fn rejects_invalid_actions_paths_and_missing_or_corrupt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = app(state(Some(dir.path().into())));
+        for (path, body, expected) in [
+            ("/slots/0?action=other", json!({}), StatusCode::BAD_REQUEST),
+            (
+                "/slots/9?action=save",
+                json!({"filename":"cache"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/slots/0?action=save",
+                json!({"filename":"../escape"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            ("/slots/0?action=save", json!({}), StatusCode::BAD_REQUEST),
+            (
+                "/slots/0?action=restore",
+                json!({"filename":"missing"}),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let (status, body) = call(router.clone(), "POST", path, body).await;
+            assert_eq!(status, expected, "{path}: {body}");
+        }
+        std::fs::write(dir.path().join("corrupt"), b"broken").unwrap();
+        let (status, body) = call(
+            router.clone(),
+            "POST",
+            "/slots/0?action=restore",
+            json!({"filename":"corrupt"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (_, slots) = call(router, "GET", "/slots", Value::Null).await;
+        assert_eq!(slots[0]["n_past"], 0);
+    }
+    #[tokio::test]
+    async fn actions_require_operator_storage_configuration() {
+        let (status, body) =
+            call(app(state(None)), "POST", "/slots/0?action=erase", json!({})).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--slot-save-path")
+        );
+    }
+    #[tokio::test]
+    async fn busy_slot_is_visible_and_save_waits_for_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(Some(dir.path().into()));
+        let driver = state
+            .registry
+            .lookup_loaded("")
+            .unwrap()
+            .unwrap()
+            .engine
+            .clone();
+        let router = app(state);
+        let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        driver
+            .workers
+            .primary_sender()
+            .unwrap()
+            .send(DriverCommand::Block {
+                entered,
+                release: release_rx,
+            })
+            .await
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (status, slots) = call(router.clone(), "GET", "/slots", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(slots[0]["is_processing"], true);
+        let (status, _) = call(
+            router.clone(),
+            "GET",
+            "/slots?fail_on_no_slot=1",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let task = tokio::spawn(call(
+            router.clone(),
+            "POST",
+            "/slots/0?action=save",
+            json!({"filename":"queued"}),
+        ));
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+        let (status, body) = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(dir.path().join("queued").exists());
+        let (_, slots) = call(router, "GET", "/slots", Value::Null).await;
+        assert_eq!(slots[0]["is_processing"], false);
+    }
+    #[tokio::test]
+    async fn generated_cache_round_trips_and_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = app(state(Some(dir.path().into())));
+        let request =
+            json!({"prompt":[0],"n_predict":3,"temperature":0,"ignore_eos":true,"id_slot":0});
+        let (status, generated) =
+            call(router.clone(), "POST", "/completion", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{generated}");
+        let (_, before) = call(router.clone(), "GET", "/slots", Value::Null).await;
+        assert!(before[0]["n_past"].as_u64().unwrap() > 0);
+        let (status, saved) = call(
+            router.clone(),
+            "POST",
+            "/slots/0?action=save",
+            json!({"filename":"generated"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert!(saved["n_saved"].as_u64().unwrap() > 1);
+        let (status, erased) =
+            call(router.clone(), "POST", "/slots/0?action=erase", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{erased}");
+        assert_eq!(erased["n_erased"], before[0]["n_past"]);
+        let (status, restored) = call(
+            router.clone(),
+            "POST",
+            "/slots/0?action=restore",
+            json!({"filename":"generated"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{restored}");
+        assert_eq!(restored["n_restored"], saved["n_saved"]);
+        let (_, after) = call(router.clone(), "GET", "/slots", Value::Null).await;
+        assert_eq!(after[0]["n_past"], before[0]["n_past"]);
+        let (status, resumed) = call(router, "POST", "/completion", request).await;
+        assert_eq!(status, StatusCode::OK, "{resumed}");
+        assert_eq!(generated["content"], resumed["content"]);
+    }
+    #[tokio::test]
+    async fn explicit_slot_selection_requires_an_actual_lane() {
+        let router = app(state(None));
+        for id in [json!(1), json!(-2), json!("0")] {
+            let (status, body) = call(
+                router.clone(),
+                "POST",
+                "/completion",
+                json!({"prompt":[0],"n_predict":1,"id_slot":id}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
+        let (status, body) = call(
+            app(AppState::load_with_config(
+                &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm"),
+                None,
+                ServerConfig {
+                    engine_config: EngineConfig {
+                        decode_backend: EngineDecodeBackend::Ort,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap()),
+            "POST",
+            "/completion",
+            json!({"prompt":[0],"n_predict":1,"id_slot":0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("id_slot=0")
+        );
+    }
 }
