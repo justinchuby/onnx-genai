@@ -2006,28 +2006,26 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(indexing::GatherElementsFactory),
     );
-    rec.register(
-        OpKey::new("GatherND", "", 11),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(indexing::GatherNDFactory),
-    );
-    // ScatterElements gained its reduction attribute at opset 16.
-    rec.register(
-        OpKey::new("ScatterElements", "", 11),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(indexing::ScatterElementsFactory),
-    );
-    rec.register(
-        OpKey::new("ScatterElements", "", 16),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(indexing::ScatterElementsFactory),
-    );
+    for version in [11, 29] {
+        rec.register(
+            OpKey::new("GatherND", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(indexing::GatherNDFactory),
+        );
+    }
+    for version in [11, 16, 18, 29] {
+        rec.register(
+            OpKey::new("ScatterElements", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(indexing::ScatterElementsFactory(version)),
+        );
+    }
     // ScatterND gained reduction at opset 16 and max/min reductions at opset 18.
-    for version in [11, 16, 18] {
+    for version in [11, 16, 18, 29] {
         rec.register(
             OpKey::new("ScatterND", "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(indexing::ScatterNDFactory),
+            Box::new(indexing::ScatterNDFactory(version)),
         );
     }
     rec.register(
@@ -3501,7 +3499,9 @@ mod tests {
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
         // The EP-owned affine and GGUF Gather and grouped-projection fusions each add one.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 117 + mlas_registrations);
+        // Opset 29 adds the three indexing revisions; ScatterElements also
+        // gets a distinct opset 18 registration for max/min.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 121 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")

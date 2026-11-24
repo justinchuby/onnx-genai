@@ -2998,6 +2998,69 @@ fn scatter_elements_non_default_axis_preserves_data_shape() {
 }
 
 #[test]
+fn scatter_opset29_checks_reduction_and_known_update_dimensions() {
+    let mean = Attribute::String(b"mean".to_vec());
+    let nd = with_attr(node("ScatterND", 3, 1), "reduction", mean.clone());
+    let nd_inputs = |updates| {
+        vec![
+            tin(DataType::Float32, vec![c(2), c(3)]),
+            tin(DataType::Int32, vec![c(4), c(0)]),
+            tin(DataType::Float32, updates),
+        ]
+    };
+    assert_eq!(
+        out_shape(&run(&nd, nd_inputs(vec![c(4), c(2), c(3)]), 29)),
+        vec![c(2), c(3)]
+    );
+    assert!(
+        try_run(&nd, nd_inputs(vec![c(4), c(2), c(3)]), 28)
+            .unwrap_err()
+            .to_string()
+            .contains("requires opset 29")
+    );
+    assert!(
+        try_run(&nd, nd_inputs(vec![c(4), c(3), c(2)]), 29)
+            .unwrap_err()
+            .to_string()
+            .contains("updates dimension 3 at axis 1 must be 2")
+    );
+
+    let elements = with_attr(node("ScatterElements", 3, 1), "reduction", mean);
+    for (dtype, index_shape, updates_shape, error) in [
+        (
+            DataType::Float32,
+            vec![c(5), c(3)],
+            vec![c(4), c(3)],
+            "updates dimension",
+        ),
+        (
+            DataType::Float32,
+            vec![c(5), c(4)],
+            vec![c(5), c(4)],
+            "non-scatter axis 1",
+        ),
+        (
+            DataType::Bool,
+            vec![c(5), c(3)],
+            vec![c(5), c(3)],
+            "integer or floating-point",
+        ),
+    ] {
+        let err = try_run(
+            &elements,
+            vec![
+                tin(dtype, vec![c(2), c(3)]),
+                tin(DataType::Int32, index_shape),
+                tin(dtype, updates_shape),
+            ],
+            29,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains(error), "{err}");
+    }
+}
+
+#[test]
 fn scatter_deprecated_alias_preserves_data_shape_and_dtype() {
     let n = with_attr(node("Scatter", 3, 1), "axis", Attribute::Int(1));
     let outs = run(

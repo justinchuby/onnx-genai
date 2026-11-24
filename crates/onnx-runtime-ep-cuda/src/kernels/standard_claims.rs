@@ -4,7 +4,24 @@
 //! matrices. Keep their placement checks in sync with those runtime limits so a
 //! node is never claimed only to fail while constructing or executing a kernel.
 
+use onnx_runtime_ir::scatter::{ScatterReduction, validate_nd_index_type};
 use onnx_runtime_ir::{Attribute, DataType, Node, Shape};
+
+pub(crate) fn unsupported_reason_at_opset(
+    node: &Node,
+    opset: u64,
+    input_shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> Option<String> {
+    let result = match node.op_type.as_str() {
+        "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
+        "GatherND" => gather_nd(node, opset, input_dtypes),
+        _ => return unsupported_reason(node, input_shapes, input_dtypes),
+    };
+    result
+        .err()
+        .map(|reason| format!("{}: {reason}", node.op_type))
+}
 
 pub(crate) fn unsupported_reason(
     node: &Node,
@@ -19,15 +36,12 @@ pub(crate) fn unsupported_reason(
         "Trilu" => trilu(node, input_dtypes),
         "Gather" => gather(node, input_dtypes),
         "GatherElements" => gather_elements(node, input_dtypes),
-        "ScatterElements" => scatter_elements(node, input_dtypes),
-        "ScatterND" => scatter_nd(node, input_dtypes),
         "HannWindow" | "HammingWindow" | "BlackmanWindow" => window(node, input_dtypes),
         "Where" => where_op(node, input_dtypes),
         "Expand" => expand(node, input_dtypes),
         "ConstantOfShape" => constant_of_shape(node, input_dtypes),
         "Gelu" => gelu(node, input_dtypes),
         "OneHot" => one_hot(node, input_dtypes),
-        "GatherND" => gather_nd(node, input_dtypes),
         "SpaceToDepth" => space_to_depth(node, input_dtypes),
         "EyeLike" => eye_like(node, input_dtypes),
         "ReduceProd" | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum"
@@ -595,15 +609,10 @@ fn gather_elements(node: &Node, input_dtypes: &[DataType]) -> Result<(), String>
     require_dtype(input_dtypes, 1, DataType::Int64, "indices")
 }
 
-fn gather_nd(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn gather_nd(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 2, 1, 1)?;
     require_fixed_width(input_dtypes, 0, "data")?;
-    require_one_of(
-        input_dtypes,
-        1,
-        &[DataType::Int32, DataType::Int64],
-        "indices",
-    )?;
+    validate_nd_index_type("GatherND", opset, input_dtypes[1])?;
     if node
         .attr("batch_dims")
         .is_some_and(|attribute| !matches!(attribute.as_int(), Some(value) if value >= 0))
@@ -661,7 +670,7 @@ fn eye_like(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     Ok(())
 }
 
-fn scatter_elements(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn scatter(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 3, 1, 1)?;
     require_one_of(
         input_dtypes,
@@ -674,49 +683,18 @@ fn scatter_elements(node: &Node, input_dtypes: &[DataType]) -> Result<(), String
         ],
         "data",
     )?;
-    require_one_of(
-        input_dtypes,
-        1,
-        &[DataType::Int32, DataType::Int64],
-        "indices",
-    )?;
-    require_dtype(input_dtypes, 2, input_dtypes[0], "updates")?;
-    scatter_reduction(node)
-}
-
-fn scatter_reduction(node: &Node) -> Result<(), String> {
-    match node.attr("reduction") {
-        None => Ok(()),
-        Some(attribute)
-            if matches!(
-                attribute.as_str(),
-                Some("none" | "add" | "mul" | "max" | "min")
-            ) =>
-        {
-            Ok(())
-        }
-        Some(_) => {
-            Err("attribute 'reduction' must be one of 'none', 'add', 'mul', 'max', or 'min'".into())
-        }
+    if node.op_type == "ScatterND" {
+        validate_nd_index_type("ScatterND", opset, input_dtypes[1])?;
+    } else {
+        require_one_of(
+            input_dtypes,
+            1,
+            &[DataType::Int32, DataType::Int64],
+            "indices",
+        )?;
     }
-}
-
-fn scatter_nd(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
-    required_arity(node, input_dtypes, 3, 1, 1)?;
-    require_one_of(
-        input_dtypes,
-        0,
-        &[
-            DataType::Float16,
-            DataType::Float32,
-            DataType::BFloat16,
-            DataType::Int64,
-        ],
-        "data",
-    )?;
-    require_dtype(input_dtypes, 1, DataType::Int64, "indices")?;
     require_dtype(input_dtypes, 2, input_dtypes[0], "updates")?;
-    scatter_reduction(node)
+    ScatterReduction::parse(node, opset).map(|_| ())
 }
 
 fn window(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {

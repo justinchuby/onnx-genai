@@ -396,6 +396,7 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/arg_min.yaml"),
     include_str!("../../schemas/standard/gather_elements.yaml"),
     include_str!("../../schemas/standard/gather_nd.yaml"),
+    include_str!("../../schemas/standard/gather_nd_v29.yaml"),
     include_str!("../../schemas/standard/equal.yaml"),
     include_str!("../../schemas/standard/greater.yaml"),
     include_str!("../../schemas/standard/less.yaml"),
@@ -414,7 +415,9 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/tile.yaml"),
     include_str!("../../schemas/standard/pad.yaml"),
     include_str!("../../schemas/standard/scatter_nd.yaml"),
+    include_str!("../../schemas/standard/scatter_nd_v29.yaml"),
     include_str!("../../schemas/standard/scatter_elements.yaml"),
+    include_str!("../../schemas/standard/scatter_elements_v29.yaml"),
     include_str!("../../schemas/standard/constant_of_shape.yaml"),
     include_str!("../../schemas/standard/max_pool.yaml"),
     include_str!("../../schemas/standard/average_pool.yaml"),
@@ -742,13 +745,26 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 115);
-        assert_eq!(registry.iter().count(), 129);
+        assert_eq!(registry.schemas.len(), 118);
+        assert_eq!(registry.iter().count(), 132);
+        for (op, prior, prior_indices) in [
+            ("GatherND", 13, "tensor(int64)"),
+            ("ScatterND", 18, "tensor(int64)"),
+            ("ScatterElements", 18, "Tind"),
+        ] {
+            let earlier = registry.lookup(op, "", 28).unwrap();
+            assert_eq!(earlier.since_version, prior);
+            assert_eq!(earlier.inputs[1].type_str, prior_indices);
+            let current = registry.lookup(op, "", 29).unwrap();
+            assert_eq!(current.since_version, 29);
+            assert_eq!(current.inputs[1].type_str, "Tind");
+        }
         for op in ["LinearAttention", "CausalConvWithState"] {
             assert!(registry.lookup(op, "", 26).is_none());
             assert_eq!(registry.lookup(op, "", 28).unwrap().since_version, 27);
             assert!(registry.lookup(op, "", 29).is_none());
         }
+
         assert_eq!(registry.lookup("Range", "", 26).unwrap().since_version, 11);
         assert_eq!(registry.lookup("Range", "", 27).unwrap().since_version, 27);
 

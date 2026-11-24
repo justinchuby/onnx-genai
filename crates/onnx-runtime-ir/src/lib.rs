@@ -67,6 +67,7 @@ pub mod packed_routed;
 pub mod pattern;
 pub mod quantized_grouped;
 pub mod quantized_matmul;
+pub mod scatter;
 pub mod standard_math;
 
 /// Descriptor for the same vendored schema that defines [`onnx`].

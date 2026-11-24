@@ -204,6 +204,17 @@ fn run_warmed_capture(
     outputs: &[(DataType, Vec<usize>)],
     attrs: &[(&str, Attribute)],
 ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    with_warmed_capture(op, opset, inputs, outputs, attrs, |_| {})
+}
+
+fn with_warmed_capture(
+    op: &str,
+    opset: u64,
+    inputs: &[Tensor],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+    inspect: impl FnOnce(&CudaExecutionProvider),
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
     let (graph, node_id) = graph(op, opset, inputs, outputs, attrs);
     let model = Model::new(&graph);
@@ -307,6 +318,7 @@ fn run_warmed_capture(
     assert_eq!(ep.runtime().allocation_counts(), allocation_counts);
     ep.runtime().replay_graph().unwrap();
     let replay = download(&output_buffers);
+    inspect(&ep);
     assert!(ep.runtime().reset_graph().unwrap());
 
     drop(input_views);
@@ -888,7 +900,11 @@ fn scatter(reduction: &str) -> Vec<f32> {
     };
     let out = run(
         "ScatterElements",
-        if reduction == "none" { 11 } else { 16 },
+        match reduction {
+            "none" => 11,
+            "max" | "min" => 18,
+            _ => 16,
+        },
         &[
             tensor(DataType::Float32, &[3], &[10_f32, 20., 30.]),
             tensor(DataType::Int64, &[3], &[1_i64, 1, -3]),
@@ -911,6 +927,216 @@ fn scatter_elements_all_reductions_are_ordered_and_deterministic() {
     assert_eq!(scatter("mul"), vec![40., 120., 30.]);
     assert_eq!(scatter("max"), vec![10., 20., 30.]);
     assert_eq!(scatter("min"), vec![4., 2., 30.]);
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+#[test]
+fn scatter_opset29_mean_includes_original_and_preserves_untouched_values() {
+    let attrs = [("reduction", Attribute::String(b"mean".to_vec()))];
+    let outputs = [(DataType::Float32, vec![2, 2])];
+    let inputs = [
+        tensor(DataType::Float32, &[2, 2], &[1_f32, 2., -0., 4.]),
+        tensor(DataType::Int32, &[2, 1], &[0_i32, -2]),
+        tensor(DataType::Float32, &[2, 2], &[3_f32, 4., 5., 6.]),
+    ];
+    let expected = vec![raw(&[3_f32, 4., -0., 4.])];
+    let (eager, replay) = run_warmed_capture("ScatterND", 29, &inputs, &outputs, &attrs);
+    assert_eq!(eager, expected);
+    assert_eq!(replay, expected);
+    assert_eq!(
+        run_cpu("ScatterND", 29, &inputs, &outputs, &attrs),
+        expected
+    );
+
+    let inputs = [
+        tensor(DataType::Float32, &[1, 4], &[1_f32, 2., 3., 4.]),
+        tensor(DataType::Int32, &[1, 6], &[0_i32, 1, 0, 1, -2, 1]),
+        tensor(DataType::Float32, &[1, 6], &[1_f32, 2., 3., 4., 5., 6.]),
+    ];
+    let outputs = [(DataType::Float32, vec![1, 4])];
+    let attrs = [
+        ("axis", Attribute::Int(-1)),
+        ("reduction", Attribute::String(b"mean".to_vec())),
+    ];
+    let expected = vec![raw(&[5_f32 / 3., 3.5, 4., 4.])];
+    let (eager, replay) = run_warmed_capture("ScatterElements", 29, &inputs, &outputs, &attrs);
+    assert_eq!(eager, expected);
+    assert_eq!(replay, expected);
+    assert_eq!(
+        run_cpu("ScatterElements", 29, &inputs, &outputs, &attrs),
+        expected
+    );
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+#[test]
+fn scatter_opset29_integer_mean_is_exact_and_truncates_toward_zero() {
+    let attrs = [("reduction", Attribute::String(b"mean".to_vec()))];
+    let outputs = [(DataType::Int64, vec![4])];
+    let data = [-2_i64, i64::MAX, i64::MIN, 8];
+    let updates = [
+        -3_i64,
+        -3,
+        i64::MAX,
+        i64::MAX - 2,
+        i64::MIN,
+        i64::MIN + 2,
+        i64::MIN,
+        i64::MAX,
+    ];
+    let expected = vec![raw(&[-2_i64, i64::MAX - 1, i64::MIN + 1, 2])];
+    for (op, shape) in [("ScatterElements", &[8][..]), ("ScatterND", &[8, 1][..])] {
+        let inputs = [
+            tensor(DataType::Int64, &[4], &data),
+            tensor(DataType::Int64, shape, &[0_i64, -4, 1, 1, 2, 2, 3, 3]),
+            tensor(DataType::Int64, &[8], &updates),
+        ];
+        assert_eq!(run(op, 29, &inputs, &outputs, &attrs), expected);
+        assert_eq!(run_cpu(op, 29, &inputs, &outputs, &attrs), expected);
+    }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+#[test]
+fn scatter_opset29_int32_nd_add_and_empty_tuple_mean() {
+    let outputs = [(DataType::Float32, vec![2, 2])];
+    let inputs = [
+        tensor(DataType::Float32, &[2, 2], &[1_f32, 2., 3., 4.]),
+        tensor(DataType::Int32, &[2, 1], &[0_i32, -2]),
+        tensor(DataType::Float32, &[2, 2], &[3_f32, 4., 5., 6.]),
+    ];
+    let add = [("reduction", Attribute::String(b"add".to_vec()))];
+    let expected = vec![raw(&[9_f32, 12., 3., 4.])];
+    assert_eq!(run("ScatterND", 29, &inputs, &outputs, &add), expected);
+    let mean = [("reduction", Attribute::String(b"mean".to_vec()))];
+    let inputs = [
+        tensor(DataType::Float32, &[2, 2], &[1_f32, 2., 3., 4.]),
+        tensor::<i32>(DataType::Int32, &[2, 0], &[]),
+        tensor(
+            DataType::Float32,
+            &[2, 2, 2],
+            &[3_f32, 4., 5., 6., 5., 6., 7., 8.],
+        ),
+    ];
+    let expected = vec![raw(&[3_f32, 4., 5., 6.])];
+    assert_eq!(run("ScatterND", 29, &inputs, &outputs, &mean), expected);
+    assert_eq!(run_cpu("ScatterND", 29, &inputs, &outputs, &mean), expected);
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+#[test]
+fn scatter_opset29_claims_admit_mean_and_new_nd_index_type_only_since_29() {
+    let cpu = CpuExecutionProvider::new();
+    let cuda = CudaExecutionProvider::new_default().unwrap();
+    for op in ["ScatterND", "ScatterElements", "GatherND"] {
+        let is_gather = op == "GatherND";
+        let data = || tensor(DataType::Float32, &[2, 2], &[1_f32, 2., 3., 4.]);
+        let indices = if op == "ScatterElements" {
+            tensor(DataType::Int32, &[2, 2], &[0_i32, 0, 1, 1])
+        } else {
+            tensor(DataType::Int32, &[2, 1], &[0_i32, -1])
+        };
+        let mut inputs = vec![data(), indices];
+        let mut attrs = Vec::new();
+        if !is_gather {
+            inputs.push(data());
+            attrs.push(("reduction", Attribute::String(b"mean".to_vec())));
+        }
+        let outputs = [(DataType::Float32, vec![2, 2])];
+        let (graph, id) = graph(op, 29, &inputs, &outputs, &attrs);
+        let shapes = inputs
+            .iter()
+            .map(|t| static_shape(t.shape.iter().copied()))
+            .collect::<Vec<_>>();
+        let dtypes = inputs.iter().map(|t| t.dtype).collect::<Vec<_>>();
+        for ep in [&cpu as &dyn ExecutionProvider, &cuda] {
+            let node = graph.node(id);
+            assert!(matches!(
+                ep.supports_op(node, 29, &shapes, &dtypes, &[]),
+                KernelMatch::Supported { .. }
+            ));
+            let decline = ep.supports_op(node, 28, &shapes, &dtypes, &[]);
+            assert!(
+                matches!(decline, KernelMatch::Unsupported { reason } if reason.contains("opset 29"))
+            );
+        }
+    }
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+#[ignore = "CUDA event probe; run on an idle device under the benchmark lock"]
+fn scatter_opset29_mean_gpu_timing() {
+    use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+
+    for (op, rows, width) in [
+        ("ScatterND", 16, 64),
+        ("ScatterND", 16_384, 64),
+        ("ScatterElements", 16, 64),
+        ("ScatterElements", 16_384, 64),
+        ("ScatterND", 16, 64),
+    ] {
+        // Two updates to each destination in the first half, leaving the
+        // second half untouched. Both operators run the same amount of work.
+        let n = rows * width;
+        let shape = [rows, width];
+        let (index_shape, index_values) = if op == "ScatterND" {
+            (
+                vec![rows, 1],
+                (0..rows).map(|i| (i / 2) as i32).collect::<Vec<_>>(),
+            )
+        } else {
+            (
+                shape.to_vec(),
+                (0..n).map(|i| ((i % width) / 2) as i32).collect(),
+            )
+        };
+        let inputs = [
+            tensor(DataType::Float32, &shape, &vec![1_f32; n]),
+            tensor(DataType::Int32, &index_shape, &index_values),
+            tensor(DataType::Float32, &shape, &vec![4_f32; n]),
+        ];
+        let mut attrs = vec![("reduction", Attribute::String(b"mean".to_vec()))];
+        if op == "ScatterElements" {
+            attrs.push(("axis", Attribute::Int(-1)));
+        }
+        let outputs = [(DataType::Float32, shape.to_vec())];
+        let (_, actual) = with_warmed_capture(op, 29, &inputs, &outputs, &attrs, |ep| {
+            let runtime = ep.runtime();
+            let stream = runtime.stream();
+            let start = stream.context().new_event(Some(CU_EVENT_DEFAULT)).unwrap();
+            let end = stream.context().new_event(Some(CU_EVENT_DEFAULT)).unwrap();
+            // Batch graph replays between device events; no upload, download,
+            // JIT, allocation or CPU index validation in the measured interval.
+            const REPLAYS: usize = 256;
+            let time = || {
+                start.record(stream).unwrap();
+                for _ in 0..REPLAYS {
+                    runtime.replay_graph().unwrap();
+                }
+                end.record(stream).unwrap();
+                f64::from(start.elapsed_ms(&end).unwrap()) * 1_000.0 / REPLAYS as f64
+            };
+            let ramp = std::time::Instant::now();
+            while ramp.elapsed().as_secs() < 8 {
+                std::hint::black_box(time());
+            }
+            let mut samples = (0..7).map(|_| time()).collect::<Vec<_>>();
+            samples.sort_by(f64::total_cmp);
+            println!("{op} {rows}x{width} f32 mean graph us: {samples:.3?}");
+        });
+        let want = (0..n)
+            .map(|i| {
+                let touched = if op == "ScatterND" {
+                    i / width < rows / 2
+                } else {
+                    i % width < width / 2
+                };
+                if touched { 3_f32 } else { 1_f32 }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, vec![raw(&want)]);
+    }
 }
 
 #[cfg_attr(
