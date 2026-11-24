@@ -96,7 +96,13 @@ fn candidate(
         match eligibility::replacement(g, root, &|v| literal(g, ctx, v), &decode, &mut region) {
             Ok(node) => node,
             Err(Rejection::Matcher(error)) => return Err(error.into()),
-            Err(reason) => return Ok(Err(reason)),
+            Err(reason) => match onnx_runtime_ir::quantized_grouped::recognize_packed(g, root) {
+                Ok((dead, node)) => {
+                    region = dead;
+                    node
+                }
+                Err(_) => return Ok(Err(reason)),
+            },
         };
     for v in replacement.inputs.iter().flatten().copied() {
         if g.value(v)
@@ -150,7 +156,7 @@ pub fn explain_at(graph: &Graph, ctx: &PassContext, anchor: NodeId) -> Result<St
         }
     };
     let detail = match outcome {
-        Ok(_) => "eligible for affine fusion".into(),
+        Ok((_, replacement)) => format!("eligible for {} fusion", replacement.op_type),
         Err(Rejection::Structure { value, reason }) => match value {
             Some(value) => format!("structural nonmatch at {}: {reason}", describe(value)),
             None => format!("structural nonmatch: {reason}"),

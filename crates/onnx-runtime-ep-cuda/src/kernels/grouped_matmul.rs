@@ -1,11 +1,16 @@
-use std::{ffi::c_void, sync::Arc};
+use std::{
+    ffi::c_void,
+    sync::{Arc, OnceLock},
+};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::packed_routed::{AffineGrouped, fail, group_layout, validate};
+use onnx_runtime_ep_api::packed_routed::{
+    AffineGrouped, fail, group_layout, packed_group_layout, validate,
+};
 use onnx_runtime_ep_api::{
     CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
 };
-use onnx_runtime_ir::{DataType, Node, packed_routed::Op};
+use onnx_runtime_ir::{DataType, Node, dequantize_packed::Metadata, packed_routed::Op};
 
 use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
@@ -14,6 +19,60 @@ const SOURCE: &str = concat!(
     include_str!("packed_kernel_prelude.cuh"),
     include_str!("grouped_matmul.cu")
 );
+const PACKED_ENTRY_I32: &str = "packed_grouped_i32";
+const PACKED_ENTRY_I64: &str = "packed_grouped_i64";
+const PACKED_SOURCE: &str = r#"
+template<typename I>
+__device__ void packed_grouped(
+    const B* x, const B* packed, const B* indices, B* y, unsigned* status,
+    U routes, U lanes, U groups, U selections, U k, U n,
+    int width, int bytes, int kind)
+{
+    const U blocks = k / (U)width;
+    GRID(i, n == 0 ? routes : lanes) {
+        const U route = n == 0 ? i : i / n;
+        const I group = read<I>(indices, route);
+        if (group < 0 || (U)group >= groups) {
+            atomicOr(status, 1u);
+            continue;
+        }
+        if (n == 0) continue;
+        const U token = route / selections;
+        const U column = i % n;
+        const U row = (U)group * n + column;
+        float sum = 0.0f;
+        for (U j = 0; j < k; ++j) {
+            const U block = j / (U)width;
+            const B* data = packed + (row * blocks + block) * (U)bytes;
+            sum += read<float>(x, token * k + j)
+                 * decode_onnx_gguf(data, kind, (int)(j % (U)width));
+        }
+        write<float>(y, i, sum);
+    }
+}
+
+#define PACKED_GROUP_ENTRY(I, NAME) \
+extern "C" __global__ void NAME( \
+    const B* x, const B* packed, const B* indices, B* y, unsigned* status, \
+    U routes, U lanes, U groups, U selections, U k, U n, \
+    int width, int bytes, int kind) \
+{ \
+    packed_grouped<I>(x, packed, indices, y, status, routes, lanes, groups, \
+                      selections, k, n, width, bytes, kind); \
+}
+PACKED_GROUP_ENTRY(int, packed_grouped_i32)
+PACKED_GROUP_ENTRY(long long, packed_grouped_i64)
+"#;
+
+fn packed_source() -> &'static str {
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE.get_or_init(|| {
+        let mut source = super::dequantize_packed::decoder_source().to_owned();
+        source.push_str(include_str!("packed_kernel_prelude.cuh"));
+        source.push_str(PACKED_SOURCE);
+        source
+    })
+}
 
 pub(super) struct Factory(pub Arc<CudaRuntime>);
 
@@ -132,6 +191,112 @@ impl Kernel for Affine {
         if status & 1 != 0 {
             return Err(fail(
                 op,
+                format!(
+                    "group_indices contains a value outside [0, {}); provide valid expert IDs",
+                    l.groups
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct PackedFactory(pub Arc<CudaRuntime>);
+
+impl KernelFactory for PackedFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(Packed {
+            metadata: Metadata::from_node(node).map_err(|detail| {
+                EpError::KernelFailed(format!("cuda_ep PackedGroupedMatMul: {detail}"))
+            })?,
+            runtime: self.0.clone(),
+        }))
+    }
+}
+
+struct Packed {
+    metadata: Metadata,
+    runtime: Arc<CudaRuntime>,
+}
+
+impl Kernel for Packed {
+    fn capture_support(&self) -> CaptureSupport {
+        CaptureSupport::unsupported(
+            "packed grouped projection reads route validation status on the host",
+        )
+    }
+
+    fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
+        let l = packed_group_layout(&self.metadata, x, y)?;
+        if x.iter().any(|tensor| !tensor.is_contiguous()) || !y[0].is_contiguous() {
+            return Err(EpError::KernelFailed(
+                "cuda_ep PackedGroupedMatMul: inputs and output must use contiguous storage".into(),
+            ));
+        }
+        if l.routes == 0 {
+            return Ok(());
+        }
+        let flag = GraphDeviceAllocation::allocate(&self.runtime, 4)?;
+        let status = flag.ptr();
+        // SAFETY: fresh live four-byte result flag.
+        unsafe { self.runtime.htod(&[0; 4], status)? };
+        let ptr = |tensor: &TensorView| cuptr(tensor.data_ptr::<u8>() as *const c_void);
+        let activation = ptr(&x[0]);
+        let packed = ptr(&x[1]);
+        let indices = ptr(&x[2]);
+        let output = cuptr(y[0].data_ptr_mut::<u8>() as *const c_void);
+        let (routes, lanes, groups, selections, k, n) = (
+            l.routes as u64,
+            l.lanes as u64,
+            l.groups as u64,
+            l.selections as u64,
+            l.k as u64,
+            l.n as u64,
+        );
+        let (width, bytes) = self.metadata.format().block();
+        let width = i32::try_from(width).map_err(|_| {
+            EpError::KernelFailed("cuda_ep PackedGroupedMatMul: block width exceeds i32".into())
+        })?;
+        let bytes = i32::try_from(bytes).map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep PackedGroupedMatMul: block byte count exceeds i32".into(),
+            )
+        })?;
+        let kind = super::dequantize_packed::decoder_kind(self.metadata.format());
+        let entry = if x[2].dtype == DataType::Int32 {
+            PACKED_ENTRY_I32
+        } else {
+            PACKED_ENTRY_I64
+        };
+        let function = self
+            .runtime
+            .nvrtc_function("packed_grouped", packed_source(), entry)?;
+        let stream = self.runtime.stream();
+        let mut launch = stream.launch_builder(&function);
+        launch
+            .arg(&activation)
+            .arg(&packed)
+            .arg(&indices)
+            .arg(&output)
+            .arg(&status)
+            .arg(&routes)
+            .arg(&lanes)
+            .arg(&groups)
+            .arg(&selections)
+            .arg(&k)
+            .arg(&n)
+            .arg(&width)
+            .arg(&bytes)
+            .arg(&kind);
+        // SAFETY: validated contiguous tensors cover all indexed lanes and ABI matches.
+        unsafe { launch.launch(launch_config(l.lanes.max(l.routes))) }
+            .map_err(|error| driver_err(&format!("launch {entry}"), error))?;
+        let mut bytes = [0; 4];
+        // SAFETY: the live flag covers exactly four bytes.
+        unsafe { self.runtime.dtoh(&mut bytes, status)? };
+        if u32::from_ne_bytes(bytes) != 0 {
+            return Err(fail(
+                Op::GroupedMatMul { transposed: true },
                 format!(
                     "group_indices contains a value outside [0, {}); provide valid expert IDs",
                     l.groups

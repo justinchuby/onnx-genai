@@ -2550,6 +2550,24 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "grouped_matmul_gpu.rs",
         "native CPU and CUDA routing, dtype, bias and input validation vectors",
     ));
+    for (op, suite) in [
+        ("AffineQuantizedGather", "session:affine_gather.rs"),
+        (
+            "AffineQuantizedGroupedMatMul",
+            "session:quantized_grouped.rs",
+        ),
+        (
+            "DequantizePackedGather",
+            "session:dequantize_packed_gather.rs",
+        ),
+        ("PackedGroupedMatMul", "session:packed_grouped.rs"),
+    ] {
+        p.push(dedicated(
+            op,
+            suite,
+            "native session graph selection and numerical parity",
+        ));
+    }
     p.push(dedicated(
         "MatMulNBits",
         "matmul_nbits_gpu.rs",
@@ -2982,7 +3000,15 @@ fn dedicated_suites_exist_and_name_their_op() {
     let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     for entry in conformance_profile() {
         if let Coverage::Dedicated { suite, note } = entry.coverage {
-            let path = tests_dir.join(suite);
+            let path = match suite.strip_prefix("session:") {
+                Some(file) => tests_dir
+                    .join("..")
+                    .join("..")
+                    .join("onnx-runtime-session")
+                    .join("tests")
+                    .join(file),
+                None => tests_dir.join(suite),
+            };
             let src = std::fs::read_to_string(&path).unwrap_or_else(|error| {
                 panic!(
                     "dedicated suite {suite} for op {:?} could not be read at {}: {error}",
