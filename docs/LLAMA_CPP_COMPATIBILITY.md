@@ -39,7 +39,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/detokenize` | `tokens`, optional `model`; preserves special tokens, rejects absent vocabulary IDs |
 | POST | `/apply-template` | Chat request fields; same prompt renderer as chat inference |
 | POST | `/v1/chat/completions`, `/chat/completions` | Buffered/streaming text, tools, reasoning, declared image/audio inputs |
-| POST | `/control` | End the current reasoning block of an armed live chat/legacy completion |
+| POST | `/v1/chat/completions/control` | End the current reasoning block of an armed live chat/legacy completion |
 | POST | `/v1/completions` | OpenAI text/token/mixed prompt batches, shared controls, declared text FIM and optional stream usage |
 | POST | `/v1/embeddings` | Existing OpenAI embedding contract |
 | POST | `/completion`, `/completions`, `/infill` | Native buffered/streaming completion, bounded text/token/mixed batches, declared FIM metadata |
@@ -118,7 +118,7 @@ requiring an enabled reasoning budget. It is not echoed in newly generated text.
 Anthropic `thinking.type=enabled` maps `budget_tokens` through the same counter,
 with the upstream default of 10,000 when omitted. Optional control hints on a
 model with no usable reasoning protocol leave its ordinary chat behavior intact.
-`POST /control` accepts `{"id":"<completion-id>","action":"reasoning_end"}`
+`POST /v1/chat/completions/control` accepts `{"id":"<completion-id>","action":"reasoning_end"}`
 for live chat and legacy completion IDs. Requests must opt in with
 `reasoning_control=true` and resolve a usable reasoning protocol to be armed.
 Unknown/finished IDs and unarmed completions return `success:false`; missing IDs
@@ -129,6 +129,10 @@ Registrations are bounded by `max_queue_depth` across the server and released
 when their generation consumer ends; replay readers share their producer's
 registration. Native completions retain budget support but do not publish a
 completion ID for manual control.
+In router mode, control requests require a configured `model` id and can only
+signal completions owned by that model. Unknown models return 404; a known model
+with no matching active completion returns `success:false` without loading it.
+Single-model mode ignores the optional model name, matching llama-server.
 
 Legacy `/v1/completions` uses the same generation-control parser, validation,
 token biases, model sampling defaults and context admission as chat/native
@@ -411,7 +415,7 @@ This is a functional Llama Chat integration, not a claim of complete llama-serve
 parity. These upstream protocols are still unimplemented:
 
 - Multimodal reranking, realtime audio/WebSocket inference and `/v1/systemone`.
-- Slot save/restore, LoRA hot swapping and realtime reasoning control.
+- Slot save/restore and LoRA hot swapping.
 - GGUF/Hugging Face model downloads and deletion.
 
 `/tools`, model download/delete and mutable `/props` remain disabled. The MCP

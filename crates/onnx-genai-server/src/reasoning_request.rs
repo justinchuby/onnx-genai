@@ -680,16 +680,22 @@ mod tests {
         let budget = options.reasoning_budget.as_ref().unwrap();
         let registration = state
             .completion_controls
-            .register("chatcmpl-control-test", Some(budget.control()))
+            .register(
+                "chatcmpl-control-test",
+                crate::completion_control::ActiveCompletion::new(&handle, Some(budget.control())),
+            )
             .unwrap();
         let unarmed = state
             .completion_controls
-            .register("chatcmpl-unarmed", None)
+            .register(
+                "chatcmpl-unarmed",
+                crate::completion_control::ActiveCompletion::new(&handle, None),
+            )
             .unwrap();
         async fn control(router: axum::Router, body: Value) -> (axum::http::StatusCode, Value) {
             let response = router
                 .oneshot(
-                    axum::http::Request::post("/control")
+                    axum::http::Request::post("/v1/chat/completions/control")
                         .header("content-type", "application/json")
                         .body(axum::body::Body::from(body.to_string()))
                         .unwrap(),
@@ -721,7 +727,7 @@ mod tests {
         assert_eq!(
             control(
                 router.clone(),
-                json!({"id":"chatcmpl-control-test","action":"reasoning_end"})
+                json!({"id":"chatcmpl-control-test","action":"reasoning_end","model":"ignored-in-single-model-mode"})
             )
             .await
             .1,
@@ -772,10 +778,14 @@ mod tests {
             max_queue_depth: 1,
             ..Default::default()
         });
+        let handle = state.registry.lookup_loaded("").unwrap().unwrap();
         let router = crate::app(state.clone());
         let occupied = state
             .completion_controls
-            .register("occupied", None)
+            .register(
+                "occupied",
+                crate::completion_control::ActiveCompletion::new(&handle, None),
+            )
             .unwrap();
         let response = post(
             router.clone(),
@@ -830,7 +840,7 @@ mod tests {
                 let response = router
                     .clone()
                     .oneshot(
-                        axum::http::Request::post("/control")
+                        axum::http::Request::post("/v1/chat/completions/control")
                             .header("content-type", "application/json")
                             .body(axum::body::Body::from(
                                 json!({"id":id,"action":"reasoning_end"}).to_string(),
@@ -849,7 +859,10 @@ mod tests {
                 // A one-entry registry admits the next request after completion.
                 let guard = state
                     .completion_controls
-                    .register("released", None)
+                    .register(
+                        "released",
+                        crate::completion_control::ActiveCompletion::new(&handle, None),
+                    )
                     .unwrap();
                 drop(guard);
             }
