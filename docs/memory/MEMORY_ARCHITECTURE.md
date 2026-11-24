@@ -1051,6 +1051,47 @@ and submit work; they implement no pool, budget or retirement policy. Control fl
 borrows the root owner through `ChildWorkspaceLoan`. This uses the existing APIs;
 no per-region grants, extra allocator layer or parallel plan cache is needed.
 
+### One optional bound preparation phase
+
+Execution preparation returns `WorkspaceExecutionPreparation::Ready(requirement)`
+or `Bind(prefix_requirement)`. Metadata-only `WorkspacePreparation` remains a
+separate Ready/Deferred contract; a physical-address-dependent decision cannot
+enter that geometry cache. Existing one-phase kernels return Ready.
+
+The shared `resolve` method drives the caller's existing admission operation.
+Ready has no bound-hook call. Bind admits a real prefix, calls
+`workspace_requirement_for_bound_execution` exactly once, then admits the final
+composite if the requirement grew. Both admissions use the same lifetime lane;
+there is no second owner, pool, per-region ticket or retry loop. Zero bytes skip
+admission entirely, including a zero-byte prefix. Such a prefix still declares
+the final lifetime/alignment: StepScoped NONE cannot change into Persistent.
+
+The complete prepare/bind/admit/execute sequence has exclusive kernel ownership.
+The prefix contains uninitialized scratch: bound preparation may inspect actual
+addresses and select host algorithms, but cannot upload metadata, submit device
+work, or establish live resources depending on a provisional address. Final
+admission may move backing. The final requirement includes every prefix byte,
+retains its offsets and lifetime, and preserves or strengthens alignment. The
+kernel must prove algorithm compatibility across relocation and check it when
+binding the final workspace; immutable address-bearing metadata is generated
+only from that final binding. Kernels requiring address stability across these
+phases cannot use this finite protocol.
+
+Session, synchronous Eager and the ORT Compute bridge use the same resolver with
+their existing physical owners. Failure during bound preparation or final
+admission never launches the kernel. Eager consumes a Step owner on every error
+path and preserves both a planning/execution error and a consuming release error.
+Persistent/root capacity retains the existing retirement and physical accounting
+contract. A fitting warm Ready plan bypasses the bound hook and issuer work.
+
+Host tests use real governed backing across all three callers, exercise cold
+prefix/final growth, retryable preparation failures, refused final admission,
+consuming cleanup, warm zero issuer callbacks and final physical settlement.
+The ORT bridge keeps its existing conservative policy: any Compute error retires
+that state; retry uses a new state. The resolver does not weaken retirement.
+The seam itself does not migrate semantic Einsum scratch; its producer still
+needs actual bound BLAS planning and final-address metadata publication.
+
 ### Einsum direct GEMM borrows caller scratch
 
 Einsum now refines Deferred requirements from actual input/output addresses before
@@ -1065,8 +1106,8 @@ cases require no scratch.
 The semantic multi-step route is **not migrated**: its arithmetic and BLAS scratch
 still use private owners, and its caller requirement NONE describes only that
 current API behavior. `CudaEinsumRecipe` separates pure host tree/slot planning from
-the bound device snapshot. Full migration needs a canonical bound-workspace
-refinement: obtain actual arithmetic addresses, select ActualAddress BLAS plans,
+the bound device snapshot. Full migration must connect that recipe to the
+canonical Bind phase: obtain actual arithmetic addresses, select ActualAddress BLAS plans,
 admit the serial BLAS tail, and revalidate address contracts after any relocation.
 No fabricated scratch pointer, TypedMinimum substitution or blind workspace upper
 bound closes that gap. Immutable metadata and installed graph pins must be formed

@@ -462,8 +462,9 @@ impl Kernel for DftKernel {
         _metadata: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
         _cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
         self.workspace_for(&self.resolve_from_views(inputs)?)
+            .map(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready)
     }
 
     fn execute_with_workspace(

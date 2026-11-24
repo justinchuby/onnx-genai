@@ -1914,14 +1914,16 @@ impl Kernel for ReduceKernel {
         _metadata: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
         _cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
         let capturing = self.runtime.is_capturing()?;
         let prepared = self.prepare_execution(inputs, capturing)?;
         let requirement = prepared.workspace;
         *self.prepared_execution.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep ReduceSum: prepared-execution lock was poisoned".into())
         })? = Some(prepared);
-        Ok(requirement)
+        Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
+            requirement,
+        ))
     }
 
     fn execute_with_workspace(

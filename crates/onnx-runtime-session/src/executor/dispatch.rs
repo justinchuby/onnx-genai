@@ -1981,13 +1981,24 @@ impl KernelDispatchContext<'_> {
                 TensorMetadata::new(view.dtype, view.shape, !view.is_absent())
             })
             .collect();
-        let requirement = kernel.workspace_requirement_for_execution(
+        let preparation = kernel.workspace_requirement_for_execution(
             views,
             output_views,
             &metadata,
             output_metadata,
             None,
         )?;
+        preparation.resolve(kernel, |requirement| {
+            self.admit_kernel_workspace(node, workspace_planning, requirement)
+        })
+    }
+
+    fn admit_kernel_workspace(
+        &mut self,
+        node: &Node,
+        workspace_planning: onnx_runtime_ep_api::WorkspacePlanning,
+        requirement: WorkspaceRequirement,
+    ) -> Result<Option<WorkspaceView>> {
         if requirement.bytes != 0
             && workspace_planning == onnx_runtime_ep_api::WorkspacePlanning::None
         {
@@ -2088,7 +2099,7 @@ impl KernelDispatchContext<'_> {
                 prepared.buffer.len(),
             ))
         };
-        Ok((requirement, workspace))
+        Ok(workspace)
     }
 
     /// Run the kernel over the bound input/output views (routing lazy-weight
