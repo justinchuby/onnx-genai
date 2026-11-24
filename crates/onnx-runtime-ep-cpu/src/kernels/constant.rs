@@ -5,7 +5,7 @@
 //! numeric `value_float`, `value_floats`, `value_int`, and `value_ints` forms.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, Node, TensorData};
+use onnx_runtime_ir::{Attribute, DataType, Node, TensorData};
 
 use super::{check_arity, write_dense_bytes};
 
@@ -33,11 +33,22 @@ impl KernelFactory for ConstantFactory {
 
 fn decode_value(node: &Node) -> Option<ConstantValue> {
     if let Some(Attribute::Tensor(t)) = node.attr("value") {
-        return Some(if t.dtype.is_sub_byte() {
-            ConstantValue::Packed(t.clone())
-        } else {
-            ConstantValue::ByteAligned(t.data.clone())
-        });
+        // Only the packed types in the pinned ONNX Constant schema. The IR also
+        // represents FLOAT6, which that schema does not admit.
+        return Some(
+            if matches!(
+                t.dtype,
+                DataType::Int4
+                    | DataType::Uint4
+                    | DataType::Float4E2M1
+                    | DataType::Int2
+                    | DataType::Uint2
+            ) {
+                ConstantValue::Packed(t.clone())
+            } else {
+                ConstantValue::ByteAligned(t.data.clone())
+            },
+        );
     }
     decode_numeric_bytes(node).map(ConstantValue::ByteAligned)
 }
@@ -117,7 +128,7 @@ mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::{DevicePtrMut, ExecutionProvider};
-    use onnx_runtime_ir::{DataType, DeviceId, NodeId, compute_contiguous_strides};
+    use onnx_runtime_ir::{DeviceId, NodeId, compute_contiguous_strides};
 
     use crate::CpuExecutionProvider;
 
