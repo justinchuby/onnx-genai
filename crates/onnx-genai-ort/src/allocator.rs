@@ -1,14 +1,12 @@
 //! ORT Allocator and MemoryInfo.
 
-use std::ffi::CString;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::thread_affinity::{OwnerThread, ThreadAccess, ThreadAffinity};
 use crate::{OrtError, Result, Session};
 
 /// Memory type (CPU or device).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryType {
     /// CPU memory accessible by the device.
     CpuInput,
@@ -19,7 +17,7 @@ pub enum MemoryType {
 }
 
 /// Allocator type.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocatorType {
     /// Device allocator (e.g., CUDA allocator).
     Device,
@@ -27,181 +25,9 @@ pub enum AllocatorType {
     Arena,
 }
 
-/// Describes where memory lives.
-pub struct MemoryInfo {
-    ptr: NonNull<onnx_genai_ort_sys::OrtMemoryInfo>,
-    pub device_name: String,
-    pub device_id: i32,
-    pub memory_type: MemoryType,
-}
-
-impl MemoryInfo {
-    /// Create CPU memory info.
-    pub fn cpu() -> Result<Self> {
-        let mut ptr = std::ptr::null_mut();
-        let api = crate::error::api()?;
-        let create = api
-            .CreateCpuMemoryInfo
-            .ok_or(OrtError::ApiUnavailable("CreateCpuMemoryInfo"))?;
-        // SAFETY: `ptr` is a valid out-parameter. ORT initializes it on success;
-        // this wrapper owns it and releases it in Drop.
-        crate::error::check_status(unsafe {
-            create(
-                onnx_genai_ort_sys::OrtArenaAllocator,
-                onnx_genai_ort_sys::OrtMemTypeDefault,
-                &mut ptr,
-            )
-        })?;
-        Ok(Self {
-            ptr: NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
-            device_name: "Cpu".to_string(),
-            device_id: 0,
-            memory_type: MemoryType::Default,
-        })
-    }
-
-    /// Create CPU memory info describing a *device* allocator rather than an
-    /// arena.
-    ///
-    /// [`MemoryInfo::cpu`] reports `OrtArenaAllocator`, which ORT refuses to
-    /// accept in `RegisterAllocator`: the arena kind is reserved for its own
-    /// internal arena implementations. A custom CPU allocator must describe
-    /// itself this way even when it does its own pooling internally.
-    pub fn cpu_device() -> Result<Self> {
-        let mut ptr = std::ptr::null_mut();
-        let api = crate::error::api()?;
-        let create = api
-            .CreateCpuMemoryInfo
-            .ok_or(OrtError::ApiUnavailable("CreateCpuMemoryInfo"))?;
-        // SAFETY: `ptr` is a valid out-parameter; the handle is owned here.
-        crate::error::check_status(unsafe {
-            create(
-                onnx_genai_ort_sys::OrtDeviceAllocator,
-                onnx_genai_ort_sys::OrtMemTypeDefault,
-                &mut ptr,
-            )
-        })?;
-        Ok(Self {
-            ptr: NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
-            device_name: "Cpu".to_string(),
-            device_id: 0,
-            memory_type: MemoryType::Default,
-        })
-    }
-
-    /// Whether this memory info describes an arena allocator.
-    pub(crate) fn is_arena(&self) -> Result<bool> {
-        let api = crate::error::api()?;
-        let get = api
-            .MemoryInfoGetType
-            .ok_or(OrtError::ApiUnavailable("MemoryInfoGetType"))?;
-        let mut kind = onnx_genai_ort_sys::OrtInvalidAllocator;
-        // SAFETY: `self.ptr` is a live handle; `kind` is a valid out-parameter.
-        crate::error::check_status(unsafe { get(self.ptr.as_ptr(), &mut kind) })?;
-        Ok(kind == onnx_genai_ort_sys::OrtArenaAllocator)
-    }
-
-    /// Create CUDA device memory info.
-    #[cfg(feature = "cuda")]
-    pub fn cuda(device_id: i32) -> Result<Self> {
-        Self::new_device("Cuda", device_id, MemoryType::Default)
-    }
-
-    /// Create DirectML device memory info.
-    pub fn dml(device_id: i32) -> Result<Self> {
-        Self::new_device("DML", device_id, MemoryType::Default)
-    }
-
-    /// Create WebGPU device memory info matching the ORT WebGPU EP allocator.
-    ///
-    /// The WebGPU EP registers its `GpuBufferAllocator` with an `OrtMemoryInfo`
-    /// named `WebGPU_Buffer` on a `GPU`/`DEFAULT`/`VendorIds::NONE` device (see
-    /// ORT `core/providers/webgpu/allocator.{h,cc}`). The legacy
-    /// `CreateCpuMemoryInfo`/`CreateMemoryInfo` C API only recognizes a fixed set
-    /// of device names and rejects `WebGPU_Buffer` ("Specified device is not
-    /// supported. Try CreateMemoryInfo_V2."), so we use `CreateMemoryInfo_V2`
-    /// with an explicit device type to construct a matching handle.
-    pub fn webgpu() -> Result<Self> {
-        const WEBGPU_BUFFER: &str = "WebGPU_Buffer";
-        let name = CString::new(WEBGPU_BUFFER)
-            .map_err(|_| OrtError::InvalidArgument("memory device name contains NUL".into()))?;
-        let mut ptr = std::ptr::null_mut();
-        let api = crate::error::api()?;
-        let create = api
-            .CreateMemoryInfo_V2
-            .ok_or(OrtError::ApiUnavailable("CreateMemoryInfo_V2"))?;
-        // SAFETY: `name` is NUL-terminated and lives for the call; `ptr` is a
-        // valid out-parameter. Parameters mirror the WebGPU EP's own
-        // `GpuBufferAllocator` OrtMemoryInfo so `CreateAllocator` can match it:
-        // device type GPU, vendor id NONE (0), device id 0, default memory type,
-        // default alignment (0), device allocator.
-        crate::error::check_status(unsafe {
-            create(
-                name.as_ptr(),
-                onnx_genai_ort_sys::OrtMemoryInfoDeviceType_GPU,
-                0,
-                0,
-                onnx_genai_ort_sys::OrtDeviceMemoryType_DEFAULT,
-                0,
-                onnx_genai_ort_sys::OrtDeviceAllocator,
-                &mut ptr,
-            )
-        })?;
-        Ok(Self {
-            ptr: NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
-            device_name: WEBGPU_BUFFER.to_string(),
-            device_id: 0,
-            memory_type: MemoryType::Default,
-        })
-    }
-
-    fn new_device(device_name: &str, device_id: i32, memory_type: MemoryType) -> Result<Self> {
-        let name = CString::new(device_name)
-            .map_err(|_| OrtError::InvalidArgument("memory device name contains NUL".into()))?;
-        let mut ptr = std::ptr::null_mut();
-        let api = crate::error::api()?;
-        let create = api
-            .CreateMemoryInfo
-            .ok_or(OrtError::ApiUnavailable("CreateMemoryInfo"))?;
-        let mem_type = match memory_type {
-            MemoryType::CpuInput => onnx_genai_ort_sys::OrtMemTypeCPUInput,
-            MemoryType::CpuOutput => onnx_genai_ort_sys::OrtMemTypeCPUOutput,
-            MemoryType::Default => onnx_genai_ort_sys::OrtMemTypeDefault,
-        };
-        // SAFETY: `name` is NUL-terminated and lives for the call; `ptr` is a
-        // valid out-parameter. The returned pointer is owned by this wrapper.
-        crate::error::check_status(unsafe {
-            create(
-                name.as_ptr(),
-                onnx_genai_ort_sys::OrtDeviceAllocator,
-                device_id,
-                mem_type,
-                &mut ptr,
-            )
-        })?;
-        Ok(Self {
-            ptr: NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
-            device_name: device_name.to_string(),
-            device_id,
-            memory_type,
-        })
-    }
-
-    pub(crate) fn as_ptr(&self) -> *const onnx_genai_ort_sys::OrtMemoryInfo {
-        self.ptr.as_ptr()
-    }
-}
-
-impl Drop for MemoryInfo {
-    fn drop(&mut self) {
-        if let Ok(api) = crate::error::api()
-            && let Some(release) = api.ReleaseMemoryInfo
-        {
-            // SAFETY: `ptr` is owned by this wrapper and released exactly once here.
-            unsafe { release(self.ptr.as_ptr()) };
-        }
-    }
-}
+mod memory_info;
+pub use memory_info::MemoryInfo;
+pub(crate) use memory_info::ResolvedMemoryInfo;
 
 /// Where an [`Allocator`] came from, which decides both who releases it and
 /// how long the session behind it has to stay alive.
@@ -243,7 +69,7 @@ impl AllocatorOrigin<'_> {
 /// documented as thread-safe and is guarded as [`ThreadAffinity::Shared`].
 pub struct Allocator<'s> {
     ptr: *mut onnx_genai_ort_sys::OrtAllocator,
-    pub memory_info: MemoryInfo,
+    memory_info: MemoryInfo,
     affinity: OwnerThread,
     origin: AllocatorOrigin<'s>,
 }
@@ -269,6 +95,12 @@ impl Allocator<'static> {
 }
 
 impl<'s> Allocator<'s> {
+    /// The immutable placement description for this allocator. It cannot be
+    /// replaced independently of the allocator's actual memory resource.
+    pub fn memory_info(&self) -> &MemoryInfo {
+        &self.memory_info
+    }
+
     /// Create an allocator for `session` that allocates on the device described
     /// by `memory_info` (e.g. the WebGPU EP's `WebGPU_Buffer` device).
     ///
@@ -312,7 +144,9 @@ impl<'s> Allocator<'s> {
         // SAFETY: `session` is a valid ORT session pointer and `memory_info` is a
         // valid handle; `ptr` is an out-parameter. On success ORT transfers an
         // owned allocator that this wrapper releases in Drop.
-        crate::error::check_status(unsafe { create(session, memory_info.as_ptr(), &mut ptr) })?;
+        crate::error::check_status(unsafe {
+            create(session, memory_info.resolve()?.as_ptr(), &mut ptr)
+        })?;
         Ok(Self {
             ptr,
             memory_info,
