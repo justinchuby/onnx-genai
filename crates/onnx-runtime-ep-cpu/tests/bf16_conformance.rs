@@ -21,6 +21,7 @@
 mod common;
 
 use common::{FloatDType, Tensor};
+use half::bf16;
 use onnx_runtime_ep_api::{ExecutionProvider, TensorMut, TensorView};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
@@ -476,6 +477,81 @@ fn no_op_rejects_bf16_at_runtime() {
             out.len(),
             case.out_shape
         );
+    }
+}
+
+#[test]
+fn opset_22_activations_match_independent_bf16_goldens() {
+    let values = vec![-2.0, -0.5, 0.0, 0.5, 2.0];
+    let cases = [
+        (
+            OpCase {
+                op: "Elu",
+                domain: "",
+                opset: 22,
+                attrs: vec![("alpha", Attribute::Float(1.0))],
+                inputs: vec![Inp::F(vec![5], values.clone())],
+                out_shape: vec![5],
+                abs_tol: 0.0,
+            },
+            values
+                .iter()
+                .map(|&x| if x >= 0.0 { x } else { x.exp_m1() })
+                .collect::<Vec<_>>(),
+        ),
+        (
+            OpCase {
+                op: "HardSigmoid",
+                domain: "",
+                opset: 22,
+                attrs: vec![
+                    ("alpha", Attribute::Float(0.2)),
+                    ("beta", Attribute::Float(0.5)),
+                ],
+                inputs: vec![Inp::F(vec![5], values.clone())],
+                out_shape: vec![5],
+                abs_tol: 0.0,
+            },
+            values
+                .iter()
+                .map(|&x| (0.2 * x + 0.5).clamp(0.0, 1.0))
+                .collect(),
+        ),
+        (
+            OpCase {
+                op: "Selu",
+                domain: "",
+                opset: 22,
+                attrs: vec![],
+                inputs: vec![Inp::F(vec![5], values.clone())],
+                out_shape: vec![5],
+                abs_tol: 0.0,
+            },
+            values
+                .iter()
+                .map(|&x| 1.050701 * if x >= 0.0 { x } else { 1.6732632 * x.exp_m1() })
+                .collect(),
+        ),
+        (
+            unary("Softplus", 22, values.clone(), 0.0),
+            values.iter().map(|&x| (1.0 + x.exp()).ln()).collect(),
+        ),
+        (
+            unary("Softsign", 22, values.clone(), 0.0),
+            values.iter().map(|&x| x / (1.0 + x.abs())).collect(),
+        ),
+    ];
+
+    for (case, expected) in &cases {
+        let actual = run_case(case, FloatDType::Bf16);
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            let expected = bf16::from_f32(expected).to_f32();
+            assert!(
+                (actual - expected).abs() <= 0.02,
+                "{}[{index}]: got {actual}, expected bf16 golden {expected}",
+                case.op
+            );
+        }
     }
 }
 
