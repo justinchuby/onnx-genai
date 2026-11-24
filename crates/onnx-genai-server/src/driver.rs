@@ -214,7 +214,7 @@ pub(crate) enum DriverCommand {
         permit: WorkerPermit,
     },
     ScorePair {
-        pair: Box<onnx_genai_engine::ranking::PreparedTokenPair>,
+        pair: Box<onnx_genai_engine::ranking::PreparedRerankingPair>,
         reply: oneshot::Sender<anyhow::Result<onnx_genai_engine::ranking::RerankingScore>>,
         permit: WorkerPermit,
     },
@@ -1216,7 +1216,7 @@ impl EngineDriver {
 
     pub(crate) async fn score_pair(
         &self,
-        pair: onnx_genai_engine::ranking::PreparedTokenPair,
+        pair: onnx_genai_engine::ranking::PreparedRerankingPair,
     ) -> Result<onnx_genai_engine::ranking::RerankingScore, GenerateSubmitError> {
         let (commands, permit) = self.reserve_stateless_command()?;
         let (reply, response) = oneshot::channel();
@@ -2403,7 +2403,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             if !reply.is_closed() {
                 let result = engine.decide(*request);
                 if let Ok(result) = &result {
-                    crate::metrics::add_prompt_tokens(result.prompt_tokens);
+                    crate::metrics::add_prompt_tokens(result.prompt_tokens());
                 }
                 let _ = reply.send(result);
             }
@@ -2414,7 +2414,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             permit: _permit,
         } => {
             if !reply.is_closed() {
-                let result = engine.score_token_pair(*pair);
+                let result = engine.score_reranking_pair(*pair);
                 if let Ok(score) = &result {
                     crate::metrics::add_prompt_tokens(score.prompt_tokens);
                 }

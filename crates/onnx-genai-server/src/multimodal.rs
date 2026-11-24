@@ -441,6 +441,15 @@ fn derive_specs(
             )
         })
         .collect::<Vec<_>>();
+    // A preprocessing program is executable workflow data, not authority for
+    // the chat/audio frontends. Task profiles may own application-sourced
+    // images independently; only runtime Media roles grant these bindings.
+    if media_inputs.is_empty() {
+        return Ok(MultimodalSpecs {
+            vision: None,
+            audio: None,
+        });
+    }
     let encoded_media = media_inputs
         .iter()
         .find(|(_, input)| input.contract.dtype == "uint8" && input.contract.rank() == 1);
