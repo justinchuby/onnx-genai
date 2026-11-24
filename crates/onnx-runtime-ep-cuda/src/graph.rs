@@ -124,6 +124,39 @@ impl Drop for CapturedGraph {
     }
 }
 
+/// Test-only ownership lease for raw driver timing of one installed graph.
+/// The graph, executable and real resource pins remain owned until this lease
+/// and the runtime installation retire. No production EP protocol uses it.
+#[cfg(feature = "gpu-tests")]
+pub struct CapturedGraphBenchmark {
+    graph: Arc<CapturedGraph>,
+}
+
+#[cfg(feature = "gpu-tests")]
+impl CapturedGraphBenchmark {
+    /// Caller must keep this lease alive until every raw launch has completed.
+    /// The returned handle must never be destroyed by the caller.
+    pub fn raw_exec(&self) -> CUgraphExec {
+        self.graph.graph_exec
+    }
+
+    pub fn node_count(&self) -> Result<usize> {
+        self.graph
+            .stream
+            .context()
+            .bind_to_thread()
+            .map_err(|error| driver_err("bind graph benchmark context", error))?;
+        let mut count = 0;
+        // SAFETY: this lease owns the live graph throughout the driver query.
+        unsafe {
+            cudarc::driver::sys::cuGraphGetNodes(self.graph.graph, std::ptr::null_mut(), &mut count)
+        }
+        .result()
+        .map_err(|error| driver_err("count graph benchmark nodes", error))?;
+        Ok(count)
+    }
+}
+
 /// Owns the captured graph segments installed on one EP runtime stream.
 ///
 /// Capture mutation stays behind the lifecycle mutex. Completed executables are
@@ -191,6 +224,20 @@ unsafe impl Send for CudaGraphLifecycle {}
 unsafe impl Sync for CudaGraphLifecycle {}
 
 impl CudaGraphLifecycle {
+    #[cfg(feature = "gpu-tests")]
+    pub(crate) fn benchmark_graph(&self) -> Result<CapturedGraphBenchmark> {
+        let replay = self.replay.load_full().ok_or_else(|| EpError::KernelFailed("CUDA graph benchmark requires an installed graph; warm and capture the graph first".into()))?;
+        if replay.segments.len() != 1 {
+            return Err(EpError::KernelFailed(format!(
+                "CUDA graph benchmark requires one whole graph, found {} segments; use the segmented replay API instead",
+                replay.segments.len()
+            )));
+        }
+        Ok(CapturedGraphBenchmark {
+            graph: replay.segments[0].clone(),
+        })
+    }
+
     pub(crate) fn new(
         stream: Arc<CudaStream>,
         owner: DeviceGraphOwner,

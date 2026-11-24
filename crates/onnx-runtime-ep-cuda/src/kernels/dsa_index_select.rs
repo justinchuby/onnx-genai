@@ -26,24 +26,13 @@
 //!
 //! ## Capture support
 //!
-//! The op *produces* the `selected_indices` tensor — it consumes no index input
-//! — so there is no host D2H validation to skip and no capture-error latch: the
-//! kernel never synchronizes the stream or copies to the host on any path. After
-//! a warmed eager execution has sized the kernel-owned persistent workspace
-//! (the per-row score and allowed-mask scratch keep stable device addresses
-//! across warmup → capture → replay) and compiled the NVRTC kernel, the launch
-//! path is legal to record into a CUDA graph and replay with only device-buffer
-//! contents changing:
-//!
-//!   * No `stream.synchronize()` on the capturing path.
-//!   * No per-call `cudaMalloc`/`cudaFree`: a kernel-owned slot grows before
-//!     capture and keeps a fixed address through capture and replay. This is the
-//!     same path under native execution and the ORT plugin C ABI.
-//!   * No host round-trip of any kind.
-//!
-//! Capture stays gated off until such a warmup has run (mirroring
-//! [`super::index_share`]); until then [`capture_support`] reports the missing
-//! precondition.
+//! Scores and allowed-mask storage borrow one caller-funded persistent lane.
+//! Metadata preparation reports the checked geometry peak; no kernel-owned
+//! arena, allocation counter or resource pin is maintained here. Recording
+//! requires a real caller owner pin covering the complete used span, and a
+//! successful eager warmup compiles the pipeline before capture. Every score
+//! and allow bit read by selection is rewritten on each invocation. The eager
+//! completion boundary is preserved; recording never adds a host round trip.
 //!
 //! ## Claim-time gating
 //!
@@ -57,16 +46,15 @@
 use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::error::driver_err;
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, cuptr};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    CaptureSupport, DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata,
-    TensorMut, TensorView, WorkspaceRequirement,
+    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceLayout, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -390,75 +378,37 @@ struct Dims {
     key_seq: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct WorkspaceLayout {
-    bytes: usize,
-    scores_offset: usize,
-    allowed_offset: usize,
-}
-
-impl WorkspaceLayout {
-    fn ptr_at(self, workspace: CUdeviceptr, offset: usize) -> CUdeviceptr {
-        workspace + offset as CUdeviceptr
-    }
-
-    fn scores(self, workspace: CUdeviceptr) -> CUdeviceptr {
-        self.ptr_at(workspace, self.scores_offset)
-    }
-
-    fn allowed(self, workspace: CUdeviceptr) -> CUdeviceptr {
-        self.ptr_at(workspace, self.allowed_offset)
-    }
-}
-
-fn align_up(value: usize, alignment: usize) -> Result<usize> {
-    let mask = alignment
-        .checked_sub(1)
-        .ok_or_else(|| error("workspace alignment underflow"))?;
-    value
-        .checked_add(mask)
-        .map(|value| value & !mask)
-        .ok_or_else(|| error("DsaIndexSelect workspace size overflow"))
-}
-
-fn append_workspace_segment(offset: &mut usize, bytes: usize) -> Result<usize> {
-    let start = align_up(*offset, WORKSPACE_ALIGNMENT)?;
-    *offset = start
-        .checked_add(bytes.max(1))
-        .ok_or_else(|| error("DsaIndexSelect workspace size overflow"))?;
-    Ok(start)
-}
-
-fn dsa_index_select_workspace_layout(dims: Dims) -> Result<WorkspaceLayout> {
+fn dsa_index_select_workspace_layout(dims: Dims) -> Result<WorkspaceLayout<2>> {
     let rows = dims
         .batch
         .checked_mul(dims.q_seq)
-        .ok_or_else(|| error("DsaIndexSelect workspace row count overflow"))?;
+        .ok_or_else(|| error("workspace row count overflow; reduce batch or query sequence"))?;
     let cells = rows
         .checked_mul(dims.key_seq)
-        .ok_or_else(|| error("DsaIndexSelect workspace cell count overflow"))?;
-    let scores_bytes = cells
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| error("DsaIndexSelect score workspace byte count overflow"))?;
-    let allowed_bytes = cells; // one u8 per score cell
-
-    let mut offset = 0usize;
-    let scores_offset = append_workspace_segment(&mut offset, scores_bytes)?;
-    let allowed_offset = append_workspace_segment(&mut offset, allowed_bytes)?;
-    let bytes = align_up(offset, WORKSPACE_ALIGNMENT)?;
-    Ok(WorkspaceLayout {
-        bytes,
-        scores_offset,
-        allowed_offset,
-    })
+        .ok_or_else(|| error("workspace cell count overflow; reduce sequence dimensions"))?;
+    let scores = std::alloc::Layout::array::<f32>(cells).and_then(|layout| layout.align_to(WORKSPACE_ALIGNMENT)).map_err(|_| error("score workspace byte count exceeds addressable capacity; reduce sequence dimensions"))?;
+    let allowed =
+        std::alloc::Layout::from_size_align(cells, WORKSPACE_ALIGNMENT).map_err(|_| {
+            error("allowed-mask workspace exceeds addressable capacity; reduce sequence dimensions")
+        })?;
+    WorkspaceLayout::new([scores, allowed])
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DsaWorkspaceStats {
-    pub allocations: u64,
-    pub releases: u64,
-    pub live_bytes: u64,
-    pub last_ptr: u64,
+fn dsa_workspace_requirement(
+    top_k: usize,
+    inputs: &[TensorMetadata<'_>],
+) -> Result<WorkspaceRequirement> {
+    let dims = DsaIndexSelectKernel::validate_metadata(top_k, inputs)?;
+    let layout = dsa_index_select_workspace_layout(dims)?;
+    Ok(if layout.bytes() == 0 {
+        WorkspaceRequirement::NONE
+    } else {
+        WorkspaceRequirement {
+            bytes: layout.bytes() as u64,
+            alignment: layout.alignment(),
+            lifetime: WorkspaceLifetime::SessionPersistent,
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -470,43 +420,11 @@ pub struct DsaLaunchStats {
     pub last_selection_grid_x: u64,
 }
 
-static DSA_WORKSPACE_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-static DSA_WORKSPACE_RELEASES: AtomicU64 = AtomicU64::new(0);
-static DSA_WORKSPACE_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
-static DSA_WORKSPACE_LAST_PTR: AtomicU64 = AtomicU64::new(0);
 static DSA_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
 static DSA_SCORE_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 static DSA_SELECTION_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 static DSA_LAST_SCORE_GRID_X: AtomicU64 = AtomicU64::new(0);
 static DSA_LAST_SELECTION_GRID_X: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(feature = "gpu-tests")]
-static DSA_TEST_CAPTURE_REPLAYS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-tests")]
-static DSA_TEST_CAPTURE_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-tests")]
-static DSA_TEST_CAPTURED_REPLAYS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-tests")]
-static DSA_TEST_CAPTURE_ERROR: AtomicU64 = AtomicU64::new(0);
-
-pub fn dsa_workspace_stats() -> DsaWorkspaceStats {
-    DsaWorkspaceStats {
-        allocations: DSA_WORKSPACE_ALLOCATIONS.load(Ordering::Relaxed),
-        releases: DSA_WORKSPACE_RELEASES.load(Ordering::Relaxed),
-        live_bytes: DSA_WORKSPACE_LIVE_BYTES.load(Ordering::Relaxed),
-        last_ptr: DSA_WORKSPACE_LAST_PTR.load(Ordering::Relaxed),
-    }
-}
-
-pub fn reset_dsa_workspace_stats() -> bool {
-    if DSA_WORKSPACE_LIVE_BYTES.load(Ordering::Acquire) != 0 {
-        return false;
-    }
-    DSA_WORKSPACE_ALLOCATIONS.store(0, Ordering::Relaxed);
-    DSA_WORKSPACE_RELEASES.store(0, Ordering::Relaxed);
-    DSA_WORKSPACE_LAST_PTR.store(0, Ordering::Relaxed);
-    true
-}
 
 pub fn dsa_launch_stats() -> DsaLaunchStats {
     DsaLaunchStats {
@@ -524,93 +442,6 @@ pub fn reset_dsa_launch_stats() {
     DSA_SELECTION_LAUNCHES.store(0, Ordering::Relaxed);
     DSA_LAST_SCORE_GRID_X.store(0, Ordering::Relaxed);
     DSA_LAST_SELECTION_GRID_X.store(0, Ordering::Relaxed);
-}
-
-#[cfg(feature = "gpu-tests")]
-pub fn set_dsa_plugin_capture_replays_for_test(replays: u64) {
-    DSA_TEST_CAPTURE_REPLAYS.store(replays, Ordering::Release);
-    DSA_TEST_CAPTURE_COUNT.store(0, Ordering::Relaxed);
-    DSA_TEST_CAPTURED_REPLAYS.store(0, Ordering::Relaxed);
-    DSA_TEST_CAPTURE_ERROR.store(0, Ordering::Relaxed);
-}
-
-#[cfg(feature = "gpu-tests")]
-pub fn dsa_plugin_capture_stats_for_test() -> (u64, u64, u64) {
-    (
-        DSA_TEST_CAPTURE_COUNT.load(Ordering::Acquire),
-        DSA_TEST_CAPTURED_REPLAYS.load(Ordering::Acquire),
-        DSA_TEST_CAPTURE_ERROR.load(Ordering::Acquire),
-    )
-}
-
-#[derive(Clone, Debug)]
-struct DsaWorkspace {
-    runtime: Arc<CudaRuntime>,
-    allocation: Option<Arc<DsaWorkspaceAllocation>>,
-    bytes: usize,
-}
-
-#[derive(Debug)]
-struct DsaWorkspaceAllocation {
-    allocation: Arc<GraphDeviceAllocation>,
-    bytes: usize,
-}
-
-impl Drop for DsaWorkspaceAllocation {
-    fn drop(&mut self) {
-        DSA_WORKSPACE_RELEASES.fetch_add(1, Ordering::Relaxed);
-        DSA_WORKSPACE_LIVE_BYTES.fetch_sub(self.bytes as u64, Ordering::Release);
-    }
-}
-
-impl DsaWorkspace {
-    fn new(runtime: Arc<CudaRuntime>) -> Self {
-        Self {
-            runtime,
-            allocation: None,
-            bytes: 0,
-        }
-    }
-
-    fn reserve(&mut self, bytes: usize) -> Result<CUdeviceptr> {
-        let bytes = bytes.max(1);
-        if self.bytes >= bytes
-            && let Some(allocation) = self.allocation.as_ref()
-        {
-            let ptr = allocation.allocation.ptr();
-            DSA_WORKSPACE_LAST_PTR.store(ptr, Ordering::Relaxed);
-            return Ok(ptr);
-        }
-        if self.runtime.is_capturing()? {
-            return Err(error(format!(
-                "workspace requires {bytes} bytes during CUDA graph capture; warm the fixed shape before capture"
-            )));
-        }
-
-        if self.allocation.is_some() {
-            self.runtime.drain_for_unmap()?;
-        }
-        let allocation = Arc::new(DsaWorkspaceAllocation {
-            allocation: GraphDeviceAllocation::allocate(&self.runtime, bytes)?,
-            bytes,
-        });
-        self.runtime
-            .staged_warm_cache_mutation("DsaIndexSelect workspace allocation")?;
-
-        let ptr = allocation.allocation.ptr();
-        self.allocation = Some(allocation);
-        self.bytes = bytes;
-        DSA_WORKSPACE_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        DSA_WORKSPACE_LIVE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-        DSA_WORKSPACE_LAST_PTR.store(ptr, Ordering::Release);
-        Ok(ptr)
-    }
-
-    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
-        self.allocation.as_ref().map(|allocation| {
-            DeviceGraphResource::new(Arc::as_ptr(allocation) as usize, Arc::clone(allocation))
-        })
-    }
 }
 
 pub struct DsaIndexSelectFactory {
@@ -672,7 +503,6 @@ impl DsaIndexSelectFactory {
             top_k,
             scale,
             weights_scale,
-            workspace: Mutex::new(DsaWorkspace::new(self.runtime.clone())),
             max_grid_x,
             warmed: AtomicBool::new(false),
             executions: AtomicU64::new(0),
@@ -690,10 +520,9 @@ pub struct DsaIndexSelectKernel {
     top_k: usize,
     scale: f32,
     weights_scale: f32,
-    workspace: Mutex<DsaWorkspace>,
     max_grid_x: Option<u32>,
     /// Set after a successful eager execution has compiled the NVRTC kernel and
-    /// sized the persistent workspace, the precondition for CUDA-graph capture.
+    /// used the prepared caller workspace, the precondition for CUDA-graph capture.
     warmed: AtomicBool,
     executions: AtomicU64,
     score_launches: AtomicU64,
@@ -704,7 +533,16 @@ pub struct DsaIndexSelectKernel {
 
 impl Kernel for DsaIndexSelectKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.execute_impl(inputs, outputs)
+        self.execute_impl(inputs, outputs, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.execute_impl(inputs, outputs, workspace)
     }
 
     fn workspace_requirement(
@@ -712,24 +550,13 @@ impl Kernel for DsaIndexSelectKernel {
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
-        let dims = self.validate_metadata(inputs)?;
-        dsa_index_select_workspace_layout(dims)?;
         Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
-            WorkspaceRequirement::NONE,
+            dsa_workspace_requirement(self.top_k, inputs)?,
         ))
     }
 
     fn supports_strided_input(&self, _index: usize) -> bool {
         false
-    }
-
-    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.workspace
-            .lock()
-            .ok()
-            .and_then(|workspace| workspace.device_graph_resource())
-            .into_iter()
-            .collect()
     }
 
     fn capture_support(&self) -> CaptureSupport {
@@ -738,25 +565,13 @@ impl Kernel for DsaIndexSelectKernel {
         } else {
             CaptureSupport::unsupported(
                 "requires a warmed fixed-shape eager DsaIndexSelect pass to compile the NVRTC \
-                 kernel and size the kernel-owned workspace",
+                 kernel with prepared caller workspace",
             )
         }
     }
 }
 
 impl DsaIndexSelectKernel {
-    #[doc(hidden)]
-    pub fn workspace_snapshot(&self) -> (u64, usize) {
-        let workspace = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            workspace
-                .allocation
-                .as_ref()
-                .map_or(0, |allocation| allocation.allocation.ptr()),
-            workspace.bytes,
-        )
-    }
-
     #[doc(hidden)]
     pub fn launch_snapshot(&self) -> DsaLaunchStats {
         DsaLaunchStats {
@@ -768,36 +583,30 @@ impl DsaIndexSelectKernel {
         }
     }
 
-    fn execute_impl(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn execute_impl(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.warmed.store(false, Ordering::Relaxed);
         if inputs.len() != 4 {
             return Err(error(format!("expected 4 inputs, got {}", inputs.len())));
         }
         if outputs.len() != 1 {
             return Err(error(format!("expected 1 output, got {}", outputs.len())));
         }
-        for (index, name) in INPUT_NAMES.iter().enumerate() {
-            if inputs[index].is_absent() {
-                return Err(error(format!(
-                    "required input {index} ('{name}') is absent"
-                )));
-            }
-        }
-        let dtype = require_floating_dtype(&inputs[0], 0)?;
-        for index in [1, 2] {
-            if inputs[index].dtype != dtype {
-                return Err(error(format!(
-                    "input {index} ('{}') dtype {:?} must match query dtype {dtype:?}",
-                    INPUT_NAMES[index], inputs[index].dtype
-                )));
-            }
-        }
-        // The additive bias is an f32 mask whose -inf / finfo.min fill magnitude
-        // is only meaningful in f32.
-        if inputs[3].dtype != DataType::Float32 {
-            return Err(error(format!(
-                "input 3 ('attention_bias') dtype {:?} unsupported; expected Float32",
-                inputs[3].dtype
-            )));
+        let metadata: [_; 4] = std::array::from_fn(|index| {
+            TensorMetadata::new(
+                inputs[index].dtype,
+                inputs[index].shape,
+                !inputs[index].is_absent(),
+            )
+        });
+        let dims = Self::validate_metadata(self.top_k, &metadata)?;
+        let dtype = inputs[0].dtype;
+        if outputs[0].is_absent() {
+            return Err(error("required output 0 ('selected_indices') is absent"));
         }
         if outputs[0].dtype != DataType::Int64 {
             return Err(error(format!(
@@ -817,7 +626,6 @@ impl DsaIndexSelectKernel {
             return Err(error("output 0 ('selected_indices') must be contiguous"));
         }
 
-        let dims = self.derive_dims(inputs)?;
         let expected_out = [dims.batch, 1, dims.q_seq, self.top_k];
         if outputs[0].shape != expected_out {
             return Err(error(format!(
@@ -829,40 +637,30 @@ impl DsaIndexSelectKernel {
         let capturing = self.runtime.is_capturing()?;
 
         let layout = dsa_index_select_workspace_layout(dims)?;
-        let mut published_workspace = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
-        let mut workspace_candidate = published_workspace.clone();
-        let workspace_ptr = workspace_candidate.reserve(layout.bytes)?;
+        let [scores, allowed] = layout.bind(workspace).map_err(|source| EpError::Backend {
+            operation: "bind caller workspace for DsaIndexSelect scores and allowed mask",
+            source: Box::new(source),
+        })?;
+        if capturing && layout.bytes() != 0 {
+            let used = WorkspaceView::new(
+                workspace
+                    .expect("nonempty layout binding required backing")
+                    .ptr(),
+                layout.bytes(),
+            );
+            self.runtime.require_registered_workspace_capture(
+                used,
+                "DsaIndexSelect scores and allowed mask",
+            )?;
+        }
 
         let query_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let key_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
         let weights_ptr = cuptr(inputs[2].data_ptr::<u8>() as *const c_void);
         let bias_ptr = cuptr(inputs[3].data_ptr::<u8>() as *const c_void);
         let out_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        let scores_ptr = layout.scores(workspace_ptr);
-        let allowed_ptr = layout.allowed(workspace_ptr);
-
-        #[cfg(feature = "gpu-tests")]
-        {
-            let test_replays = DSA_TEST_CAPTURE_REPLAYS.swap(0, Ordering::AcqRel);
-            if test_replays != 0 {
-                let result = self.execute_capture_replay_test_seam(
-                    query_ptr,
-                    key_ptr,
-                    weights_ptr,
-                    bias_ptr,
-                    scores_ptr,
-                    allowed_ptr,
-                    out_ptr,
-                    dims,
-                    dtype_code(dtype)?,
-                    test_replays,
-                );
-                if result.is_ok() && !capturing {
-                    *published_workspace = workspace_candidate;
-                }
-                return result;
-            }
-        }
+        let scores_ptr = cuptr(scores.ptr().0);
+        let allowed_ptr = cuptr(allowed.ptr().0);
 
         self.launch_pipeline(
             query_ptr,
@@ -876,107 +674,57 @@ impl DsaIndexSelectKernel {
             dtype_code(dtype)?,
         )?;
 
-        if capturing {
-            Ok(())
-        } else {
-            // Eager completion barrier; also the point at which the NVRTC kernel
-            // is guaranteed compiled and the workspace sized, so capture may now
-            // record this kernel with stable device addresses.
+        if !capturing {
+            // Preserve the existing eager completion boundary. Shared capacity
+            // ownership/admission belongs to the caller, not this kernel.
             self.runtime.synchronize()?;
-            *published_workspace = workspace_candidate;
-            self.warmed.store(true, Ordering::Relaxed);
-            Ok(())
         }
-    }
-
-    #[cfg(feature = "gpu-tests")]
-    #[allow(clippy::too_many_arguments)]
-    fn execute_capture_replay_test_seam(
-        &self,
-        query_ptr: CUdeviceptr,
-        key_ptr: CUdeviceptr,
-        weights_ptr: CUdeviceptr,
-        bias_ptr: CUdeviceptr,
-        scores_ptr: CUdeviceptr,
-        allowed_ptr: CUdeviceptr,
-        out_ptr: CUdeviceptr,
-        dims: Dims,
-        dtype: i32,
-        replays: u64,
-    ) -> Result<()> {
-        self.launch_pipeline(
-            query_ptr,
-            key_ptr,
-            weights_ptr,
-            bias_ptr,
-            scores_ptr,
-            allowed_ptr,
-            out_ptr,
-            dims,
-            dtype,
-        )?;
-        self.runtime.drain_for_unmap()?;
-        self.warmed.store(true, Ordering::Release);
-        self.runtime.reset_graph()?;
-        // SAFETY: this isolated GPU probe owns the runtime and has no session
-        // validation generation.
-        unsafe { self.runtime.reset_capture_error_for_isolated_test() }?;
-        self.runtime.begin_graph_capture(&[self])?;
-        if let Err(error) = self.launch_pipeline(
-            query_ptr,
-            key_ptr,
-            weights_ptr,
-            bias_ptr,
-            scores_ptr,
-            allowed_ptr,
-            out_ptr,
-            dims,
-            dtype,
-        ) {
-            let _ = self.runtime.abort_graph_capture();
-            return Err(error);
-        }
-        if let Err(error) = self.runtime.end_graph_capture() {
-            let _ = self.runtime.abort_graph_capture();
-            return Err(error);
-        }
-        for _ in 0..replays {
-            self.runtime.replay_graph()?;
-        }
-        self.runtime.drain_for_unmap()?;
-        let capture_error = u64::from(self.runtime.check_capture_error()?);
-        self.runtime.reset_graph()?;
-        DSA_TEST_CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed);
-        DSA_TEST_CAPTURED_REPLAYS.fetch_add(replays, Ordering::Relaxed);
-        DSA_TEST_CAPTURE_ERROR.store(capture_error, Ordering::Release);
+        self.warmed.store(true, Ordering::Relaxed);
         Ok(())
     }
 
-    fn validate_metadata(&self, inputs: &[TensorMetadata<'_>]) -> Result<Dims> {
+    fn validate_metadata(top_k: usize, inputs: &[TensorMetadata<'_>]) -> Result<Dims> {
         if inputs.len() != 4 {
             return Err(error(format!(
                 "expected 4 input metadata entries, got {}",
                 inputs.len()
             )));
         }
+        for (index, input) in inputs.iter().enumerate() {
+            if !input.present {
+                return Err(error(format!(
+                    "required input {index} ('{}') is absent",
+                    INPUT_NAMES[index]
+                )));
+            }
+            if (index < 3
+                && !matches!(
+                    input.dtype,
+                    DataType::Float32 | DataType::Float16 | DataType::BFloat16
+                ))
+                || (index == 3 && input.dtype != DataType::Float32)
+            {
+                return Err(error(format!(
+                    "input {index} ('{}') has unsupported dtype {:?}; query/key/weights require floating storage and attention_bias requires Float32",
+                    INPUT_NAMES[index], input.dtype
+                )));
+            }
+            if index < 3 && input.dtype != inputs[0].dtype {
+                return Err(error(format!(
+                    "input {index} ('{}') dtype {:?} must match query {:?}",
+                    INPUT_NAMES[index], input.dtype, inputs[0].dtype
+                )));
+            }
+        }
         let query = inputs[0].shape;
         let key = inputs[1].shape;
         let weights = inputs[2].shape;
         let bias = inputs[3].shape;
-        self.resolve_dims(query, key, weights, bias)
-    }
-
-    fn derive_dims(&self, inputs: &[TensorView]) -> Result<Dims> {
-        self.resolve_dims(
-            inputs[0].shape,
-            inputs[1].shape,
-            inputs[2].shape,
-            inputs[3].shape,
-        )
+        Self::resolve_dims(top_k, query, key, weights, bias)
     }
 
     fn resolve_dims(
-        &self,
+        top_k: usize,
         query: &[usize],
         key: &[usize],
         weights: &[usize],
@@ -1034,7 +782,7 @@ impl DsaIndexSelectKernel {
         checked_elements("key", &[dims.batch, dims.key_seq, dims.head_dim])?;
         checked_elements("weights", &[dims.batch, dims.q_seq, dims.heads])?;
         checked_elements("attention_bias", &[dims.batch, dims.q_seq, dims.key_seq])?;
-        checked_elements("selected_indices", &[dims.batch, dims.q_seq, self.top_k])?;
+        checked_elements("selected_indices", &[dims.batch, dims.q_seq, top_k])?;
         Ok(dims)
     }
 
@@ -1172,19 +920,6 @@ fn require_eq(what: &str, left: usize, right: usize) -> Result<()> {
     Ok(())
 }
 
-fn require_floating_dtype(input: &TensorView, index: usize) -> Result<DataType> {
-    if !matches!(
-        input.dtype,
-        DataType::Float32 | DataType::Float16 | DataType::BFloat16
-    ) {
-        return Err(error(format!(
-            "input {index} ('{}') dtype {:?} unsupported; expected Float32, Float16, or BFloat16",
-            INPUT_NAMES[index], input.dtype
-        )));
-    }
-    Ok(input.dtype)
-}
-
 fn dtype_code(dtype: DataType) -> Result<i32> {
     match dtype {
         DataType::Float32 => Ok(0),
@@ -1247,6 +982,107 @@ mod tests {
         })
         .expect_err("rows*key_seq overflow must be typed-rejected");
         assert!(format!("{cell_overflow}").contains("cell count overflow"));
+    }
+
+    fn metadata(dtype: DataType) -> [TensorMetadata<'static>; 4] {
+        [
+            TensorMetadata::new(dtype, &[1, 4, 2, 8], true),
+            TensorMetadata::new(dtype, &[1, 12, 8], true),
+            TensorMetadata::new(dtype, &[1, 4, 2], true),
+            TensorMetadata::new(DataType::Float32, &[1, 1, 4, 12], true),
+        ]
+    }
+
+    #[test]
+    fn workspace_requirement_reports_the_real_shared_peak_for_every_storage_dtype() {
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let requirement = dsa_workspace_requirement(4, &metadata(dtype)).unwrap();
+            assert_eq!((requirement.bytes, requirement.alignment), (304, 256));
+            assert_eq!(requirement.lifetime, WorkspaceLifetime::SessionPersistent);
+        }
+    }
+
+    #[test]
+    fn workspace_partitions_scores_and_allowed_without_overlapping_or_owned_storage() {
+        let dims =
+            DsaIndexSelectKernel::validate_metadata(4, &metadata(DataType::Float32)).unwrap();
+        let layout = dsa_index_select_workspace_layout(dims).unwrap();
+        let base = onnx_runtime_ep_api::DevicePtrMut(0x1000usize as *mut _);
+        let [scores, allowed] = layout.bind(Some(WorkspaceView::new(base, 4096))).unwrap();
+        assert_eq!((scores.bytes(), allowed.bytes()), (192, 48));
+        assert_eq!(scores.ptr().0 as usize, 0x1000);
+        assert_eq!(allowed.ptr().0 as usize, 0x1100);
+        for view in [
+            None,
+            Some(WorkspaceView::new(base, 303)),
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(0x1001usize as *mut _),
+                304,
+            )),
+        ] {
+            let error = layout.bind(view).unwrap_err().to_string();
+            assert!(error.contains("304 bytes aligned to 256"), "{error}");
+        }
+    }
+
+    #[test]
+    fn zero_cells_need_no_scratch_even_when_selection_must_emit_sentinels() {
+        for dims in [
+            Dims {
+                batch: 0,
+                q_seq: 4,
+                heads: 2,
+                head_dim: 8,
+                key_seq: 12,
+            },
+            Dims {
+                batch: 1,
+                q_seq: 4,
+                heads: 2,
+                head_dim: 8,
+                key_seq: 0,
+            },
+        ] {
+            let layout = dsa_index_select_workspace_layout(dims).unwrap();
+            assert_eq!(layout.bytes(), 0);
+            layout.bind(None).unwrap();
+        }
+    }
+
+    #[test]
+    fn metadata_requirement_rejects_missing_mixed_and_inconsistent_facts() {
+        let mut inputs = metadata(DataType::Float32);
+        inputs[0].present = false;
+        assert!(
+            dsa_workspace_requirement(4, &inputs)
+                .unwrap_err()
+                .to_string()
+                .contains("required input 0")
+        );
+        inputs = metadata(DataType::BFloat16);
+        inputs[3].dtype = DataType::Float16;
+        assert!(
+            dsa_workspace_requirement(4, &inputs)
+                .unwrap_err()
+                .to_string()
+                .contains("attention_bias")
+        );
+        inputs = metadata(DataType::BFloat16);
+        inputs[1].dtype = DataType::Float32;
+        assert!(
+            dsa_workspace_requirement(4, &inputs)
+                .unwrap_err()
+                .to_string()
+                .contains("must match query")
+        );
+        inputs = metadata(DataType::Float32);
+        inputs[3].shape = &[1, 1, 4, 13];
+        assert!(
+            dsa_workspace_requirement(4, &inputs)
+                .unwrap_err()
+                .to_string()
+                .contains("bias/key seq")
+        );
     }
 
     #[test]

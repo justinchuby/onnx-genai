@@ -1,4 +1,8 @@
-"""Real ORT CUDA-plugin session validation for pkg.nxrt::DsaIndexSelect v1."""
+"""Real ORT CUDA-plugin Compute validation for pkg.nxrt::DsaIndexSelect v1.
+
+Owned-workspace graph replay and physical retirement are Rust GPU fixtures;
+Compute cannot manufacture a capture owner from its borrowed workspace view.
+"""
 
 import ctypes
 import gc
@@ -142,16 +146,6 @@ def main() -> int:
     plugin_path = os.path.abspath(sys.argv[1])
     plugin = ctypes.CDLL(plugin_path)
 
-    reset_workspace = plugin.nxrt_cuda_reset_dsa_workspace_stats
-    reset_workspace.argtypes = []
-    reset_workspace.restype = ctypes.c_bool
-    set_capture_replays = plugin.nxrt_cuda_set_dsa_capture_replays_for_test
-    set_capture_replays.argtypes = [ctypes.c_uint64]
-    set_capture_replays.restype = None
-    workspace_allocations = bind_u64(plugin, "nxrt_cuda_dsa_workspace_allocations")
-    workspace_releases = bind_u64(plugin, "nxrt_cuda_dsa_workspace_releases")
-    workspace_live_bytes = bind_u64(plugin, "nxrt_cuda_dsa_workspace_live_bytes")
-    workspace_last_ptr = bind_u64(plugin, "nxrt_cuda_dsa_workspace_last_ptr")
     executions = bind_u64(plugin, "nxrt_cuda_dsa_executions")
     score_launches = bind_u64(plugin, "nxrt_cuda_dsa_score_launches")
     selection_launches = bind_u64(plugin, "nxrt_cuda_dsa_selection_launches")
@@ -162,9 +156,6 @@ def main() -> int:
     reset_launches = plugin.nxrt_cuda_reset_dsa_launch_stats
     reset_launches.argtypes = []
     reset_launches.restype = None
-    capture_count = bind_u64(plugin, "nxrt_cuda_dsa_capture_count_for_test")
-    captured_replays = bind_u64(plugin, "nxrt_cuda_dsa_captured_replays_for_test")
-    capture_error = bind_u64(plugin, "nxrt_cuda_dsa_capture_error_for_test")
     compiled_nodes = bind_u64(plugin, "nxrt_ep_compiled_node_count")
     workspace_placement_queries = bind_u64(
         plugin, "nxrt_ep_workspace_placement_queries"
@@ -173,7 +164,6 @@ def main() -> int:
     reset_placement_queries.argtypes = []
     reset_placement_queries.restype = None
 
-    assert reset_workspace(), "workspace accounting was not idle before session creation"
     reset_launches()
     reset_placement_queries()
     os.environ["ONNX_GENAI_CUDA_RAW_POOL_BYTES"] = "0"
@@ -199,35 +189,21 @@ def main() -> int:
         expected, np.array([[[[0, 2], [1, 2]]]], dtype=np.int64)
     )
 
-    set_capture_replays(3)
-    (captured_output,) = session.run(None, feeds)
-    np.testing.assert_array_equal(captured_output, expected)
+    (first_output,) = session.run(None, feeds)
+    np.testing.assert_array_equal(first_output, expected)
     assert compiled_nodes() >= 1, "real ORT session did not compile DsaIndexSelect on cuda_ep"
-    assert capture_count() == 1, "session execution did not record one CUDA graph"
-    assert captured_replays() == 3, "session execution did not replay the graph three times"
-    assert capture_error() == 0, "valid capture/replay poisoned the CUDA capture-error latch"
-    assert workspace_allocations() == 1
-    assert workspace_releases() == 0
-    assert workspace_live_bytes() == 512
-    assert workspace_placement_queries() == 0
-    assert executions() == score_launches() == selection_launches() == 2
+    assert workspace_placement_queries() == 0, "Persistent caller workspace must not query ORT operand placement"
+    assert executions() == score_launches() == selection_launches() == 1
     assert last_score_grid_x() == 1
     assert last_selection_grid_x() == 2
-    first_ptr = workspace_last_ptr()
-    assert first_ptr != 0
 
     for _ in range(3):
         (output,) = session.run(None, feeds)
         np.testing.assert_array_equal(output, expected)
-        assert workspace_last_ptr() == first_ptr
-        assert workspace_allocations() == 1
-        assert workspace_live_bytes() == 512
-    assert executions() == score_launches() == selection_launches() == 5
+    assert executions() == score_launches() == selection_launches() == 4
 
-    del captured_output, output, session, options
+    del first_output, output, session, options
     gc.collect()
-    assert workspace_live_bytes() == 0, "session teardown leaked DSA workspace bytes"
-    assert workspace_allocations() == workspace_releases() == 1
 
     for storage, dtype in [(TensorProto.FLOAT16, np.float16)]:
         low_options = ort.SessionOptions()
@@ -246,8 +222,6 @@ def main() -> int:
         del low_output, low_session, low_options
         gc.collect()
 
-    assert workspace_live_bytes() == 0
-    assert workspace_allocations() == workspace_releases() == 2
 
     for storage, dtype in [
         (TensorProto.FLOAT, np.float32),
@@ -302,9 +276,7 @@ def main() -> int:
         del overflow_output, overflow_session, overflow_options
         gc.collect()
 
-    assert workspace_live_bytes() == 0
-    assert workspace_allocations() == workspace_releases() == 4
-    assert executions() == score_launches() == selection_launches() == 8
+    assert executions() == score_launches() == selection_launches() == 7
 
     real_options = ort.SessionOptions()
     real_options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
@@ -331,23 +303,17 @@ def main() -> int:
     }
     real_expected = np.arange(2048, dtype=np.int64).reshape(1, 1, 1, 2048)
     before_real_executions = executions()
-    set_capture_replays(3)
     (real_output,) = real_session.run(None, real_feeds)
     np.testing.assert_array_equal(real_output, real_expected)
-    assert capture_count() == 1
-    assert captured_replays() == 3
-    assert capture_error() == 0
-    assert executions() - before_real_executions == 2
+    for _ in range(2):
+        (real_output,) = real_session.run(None, real_feeds)
+        np.testing.assert_array_equal(real_output, real_expected)
+    assert executions() - before_real_executions == 3
     assert executions() == score_launches() == selection_launches()
     assert last_score_grid_x() == 8
     assert last_selection_grid_x() == 1
-    assert workspace_live_bytes() == 10240
-    real_ptr = workspace_last_ptr()
-    assert real_ptr != 0
     del real_output, real_session, real_options
     gc.collect()
-    assert workspace_live_bytes() == 0
-    assert workspace_allocations() == workspace_releases() == 5
 
     bf16_options = ort.SessionOptions()
     bf16_options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
@@ -371,14 +337,13 @@ def main() -> int:
     assert compiled_nodes() == compiled_before_newer_import + 1
     del newer_import_output, newer_import_session, newer_import_options
     gc.collect()
-    assert workspace_live_bytes() == 0
-    assert workspace_allocations() == workspace_releases() == 6
 
     print(
         "PASS: real CUDA-plugin session ran f32/f16 v1 with canonical overflow-NaN "
-        "CPU parity, claimed bf16, captured/replayed real H=32 D=128 T=top_k=2048 "
-        "with 8 score CTAs + 1 selection CTA and stable workspace, released all "
-        "workspace at teardown, and resolved an opset-2 import to v1 semantics"
+        "CPU parity, claimed bf16, repeatedly computed H=32 D=128 T=top_k=2048 "
+        "with 8 score CTAs + 1 selection CTA using admitted caller workspace, "
+        "and resolved an opset-2 import to v1 semantics. Owned capture/replay "
+        "and physical retirement are validated by the Rust GPU fixtures."
     )
     return 0
 
