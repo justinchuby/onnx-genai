@@ -171,6 +171,11 @@ fn run<T: Number>(
     let mut panel = vec![T::default(); k * tile];
     let mut tmp = vec![T::default(); m * tile];
     let mut neighbors = vec![Neighbors::default(); g.axes.len()];
+    let mut bilinear = if g.axes.len() == 2 {
+        vec![None; tile]
+    } else {
+        Vec::new()
+    };
     for batch in 0..g.output[0] {
         for group in 0..output_channels / m {
             let first = group * g.input_per_group;
@@ -184,6 +189,34 @@ fn run<T: Number>(
                     for j in 0..g.kernel_spatial {
                         let mask_plane =
                             (batch * g.mask_channels + og * g.kernel_spatial + j) * spatial;
+                        if let [h, w] = g.axes.as_slice() {
+                            let kh = j / w.kernel * h.dilation;
+                            let kw = j % w.kernel * w.dilation;
+                            let offset_plane = mask_plane * 2;
+                            for (p, entry) in bilinear[..n].iter_mut().enumerate() {
+                                let point = start + p;
+                                let y = ((point / w.output) * h.stride + kh) as f64 - h.pad as f64
+                                    + offsets[offset_plane + point].into();
+                                let x = ((point % w.output) * w.stride + kw) as f64 - w.pad as f64
+                                    + offsets[offset_plane + spatial + point].into();
+                                *entry = axis_neighbors(y, h.input, w.input)
+                                    .zip(axis_neighbors(x, w.input, 1))
+                                    .map(|(r, c)| Bilinear::new(r, c));
+                            }
+                            let modulation = mask.map(|v| &v[mask_plane + start..][..n]);
+                            for ic in c..end {
+                                let plane = (batch * g.input_channels + ic) * g.input_spatial;
+                                let source = &x[plane..][..g.input_spatial];
+                                let row =
+                                    &mut panel[((ic - first) * g.kernel_spatial + j) * n..][..n];
+                                for (p, (dst, stencil)) in row.iter_mut().zip(&bilinear).enumerate()
+                                {
+                                    let value = stencil.map_or(T::default(), |s| s.sample(source));
+                                    *dst = modulation.map_or(value, |m| value * m[p]);
+                                }
+                            }
+                            continue;
+                        }
                         for p in 0..n {
                             let point = start + p;
                             let offset = (batch * g.offset_channels
@@ -236,6 +269,56 @@ struct Neighbors {
     frac: f64,
 }
 
+#[derive(Clone, Copy)]
+struct Bilinear<T> {
+    indices: [usize; 4],
+    row: [T; 2],
+    col: [T; 2],
+}
+
+impl<T: Number> Bilinear<T> {
+    #[inline]
+    fn new(row: Neighbors, col: Neighbors) -> Self {
+        let index = |r: Option<usize>, c| r.zip(c).map_or(usize::MAX, |(r, c)| r + c);
+        Self {
+            indices: [
+                index(row.lo, col.lo),
+                index(row.lo, col.hi),
+                index(row.hi, col.lo),
+                index(row.hi, col.hi),
+            ],
+            row: [T::from_f64(1.0 - row.frac), T::from_f64(row.frac)],
+            col: [T::from_f64(1.0 - col.frac), T::from_f64(col.frac)],
+        }
+    }
+
+    #[inline]
+    fn sample(self, x: &[T]) -> T {
+        let [a, b, c, d] = self.indices.map(|i| x.get(i).copied().unwrap_or_default());
+        (a * self.col[0] + b * self.col[1]) * self.row[0]
+            + (c * self.col[0] + d * self.col[1]) * self.row[1]
+    }
+}
+
+#[inline]
+fn axis_neighbors(position: f64, size: usize, pitch: usize) -> Option<Neighbors> {
+    if size == 0 || !(position > -1.0 && position < size as f64) {
+        return None;
+    }
+    if position < 0.0 {
+        return Some(Neighbors {
+            lo: None,
+            hi: Some(0),
+            frac: position + 1.0,
+        });
+    }
+    let low = position as usize;
+    let lo = Some(low * pitch);
+    let frac = position - low as f64;
+    let hi = (frac != 0.0 && low + 1 < size).then(|| (low + 1) * pitch);
+    Some(Neighbors { lo, hi, frac })
+}
+
 fn stencil<T: Number>(
     g: &Geometry,
     offsets: &[T],
@@ -251,26 +334,10 @@ fn stencil<T: Number>(
         point /= a.output;
         kernel /= a.kernel;
         let position = center + offsets[offset + d * g.output_spatial].into();
-        if a.input == 0 || !(position > -1.0 && position < a.input as f64) {
+        let Some(axis) = axis_neighbors(position, a.input, pitch) else {
             return false;
-        }
-        let floor = position.floor();
-        let lo = if floor < 0.0 {
-            None
-        } else {
-            Some(floor as usize * pitch)
         };
-        let frac = position - floor;
-        let hi = if frac != 0.0 && floor + 1.0 < a.input as f64 {
-            Some(if floor < 0.0 {
-                0
-            } else {
-                (floor as usize + 1) * pitch
-            })
-        } else {
-            None
-        };
-        neighbors[d] = Neighbors { lo, hi, frac };
+        neighbors[d] = axis;
         pitch *= a.input;
     }
     true
@@ -290,20 +357,6 @@ fn sample<T: Number>(x: &[T], axes: &[Neighbors], base: usize) -> T {
             a.hi.map_or(T::default(), |i| x[base + i]),
             a.frac,
         ),
-        [a, b] => {
-            let row = |r| {
-                blend(
-                    b.lo.map_or(T::default(), |i| x[base + r + i]),
-                    b.hi.map_or(T::default(), |i| x[base + r + i]),
-                    b.frac,
-                )
-            };
-            blend(
-                a.lo.map_or(T::default(), row),
-                a.hi.map_or(T::default(), row),
-                a.frac,
-            )
-        }
         [a, rest @ ..] => blend(
             a.lo.map_or(T::default(), |i| sample(x, rest, base + i)),
             a.hi.map_or(T::default(), |i| sample(x, rest, base + i)),
