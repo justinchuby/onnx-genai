@@ -333,6 +333,10 @@ pub fn output_dtype_constraints_for_op(
     }
 }
 
+pub(crate) fn celu_dtypes(opset: u64) -> &'static [DataType] {
+    if opset >= 28 { FLOAT_DTYPES } else { F32_ONLY }
+}
+
 /// Determine the supported dtypes for a given (op_type, domain) based on the
 /// actual kernel dispatch implementation. Fail closed: unknown ops get f32 only.
 pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
@@ -1094,7 +1098,11 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
                 domain: key.domain.clone(),
                 since_version: key.since_version,
                 end_version: reg.explicit_end_version(key),
-                supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
+                supported_dtypes: if key.domain.is_empty() && key.op_type == "Celu" {
+                    celu_dtypes(key.since_version)
+                } else {
+                    supported_dtypes_for_op(&key.op_type, &key.domain)
+                },
                 supports_raw_tensor_abi,
             }
         })
@@ -1856,10 +1864,16 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     // Celu is opset 12, Mish opset 18 -- registering at their introducing
     // opset keeps older models routing to whatever handled them before.
-    rec.register(
+    rec.register_through(
         OpKey::new("Celu", "", 12),
+        27,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(activations::CeluFactory),
+    );
+    rec.register(
+        OpKey::new("Celu", "", 28),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(activations::Celu28Factory),
     );
     rec.register(
         OpKey::new("Mish", "", 18),

@@ -472,6 +472,15 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "Celu"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Some(&dtype) = input_dtypes.first()
+        {
+            let allowed = crate::kernels::celu_dtypes(opset);
+            if !allowed.contains(&dtype) {
+                deny!("Celu at opset {opset}: X dtype {dtype:?} is unsupported; use {allowed:?}");
+            }
+        }
         if let Some(reason) = onnx_runtime_ep_api::gemm::unsupported_reason(
             op,
             opset,

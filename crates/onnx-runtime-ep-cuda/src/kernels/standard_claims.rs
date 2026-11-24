@@ -16,6 +16,8 @@ pub(crate) fn unsupported_reason_at_opset(
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
+        "Celu" => required_arity(node, input_dtypes, 1, 1, 1)
+            .and_then(|()| require_one_of(input_dtypes, 0, super::celu_dtypes(opset), "X")),
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result

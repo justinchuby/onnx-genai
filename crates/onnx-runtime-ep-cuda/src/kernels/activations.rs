@@ -15,7 +15,7 @@ use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
-const MODULE: &str = "wave4_activations_float_v4";
+const MODULE: &str = "wave4_activations_float_v5";
 
 const SRC: &str = r#"
 #if __has_include(<cuda_fp16.h>) && __has_include(<cuda_bf16.h>)
@@ -92,6 +92,38 @@ DEFINE_FOR_TYPE(float, f32)
 DEFINE_FOR_TYPE(__half, f16)
 DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
 #endif
+
+// Celu-28 materializes each intermediate in the tensor dtype. For 16-bit
+// types, compute in float and explicitly round each node's result.
+template <typename T> __device__ float round_celu(float v) {
+    return load_float<T>(store_float<T>(v));
+}
+
+#define DEFINE_CELU28(TYPE, SUFFIX) \
+extern "C" __global__ void celu28_##SUFFIX( \
+    const TYPE* x, TYPE* y, const int n, const float alpha, const float unused) { \
+    const float a = round_celu<TYPE>(alpha); \
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) { \
+        const float z = round_celu<TYPE>(__fdiv_rn(load_float<TYPE>(x[i]), a)); \
+        const float elu = z < 0.0f ? round_celu<TYPE>(round_celu<TYPE>(expf(z)) - 1.0f) : z; \
+        y[i] = store_float<TYPE>(a * elu); \
+    } \
+}
+DEFINE_CELU28(float, f32)
+#ifdef NXRT_HAS_CUDA_HALF_HEADERS
+DEFINE_CELU28(__half, f16)
+DEFINE_CELU28(__nv_bfloat16, bf16)
+#endif
+
+extern "C" __global__ void celu28_f64(
+    const double* x, double* y, const int n, const float alpha, const float unused) {
+    const double a = (double)alpha;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const double z = __ddiv_rn(x[i], a);
+        const double elu = z < 0.0 ? exp(z) - 1.0 : z;
+        y[i] = a * elu;
+    }
+}
 "#;
 
 // Integer Clip (opset-11 min/max arrive as inputs). Kept in a separate module
@@ -122,6 +154,7 @@ enum FloatDtype {
     F32,
     F16,
     Bf16,
+    F64,
 }
 
 impl FloatDtype {
@@ -141,6 +174,7 @@ impl FloatDtype {
             Self::F32 => "f32",
             Self::F16 => "f16",
             Self::Bf16 => "bf16",
+            Self::F64 => "f64",
         }
     }
 }
@@ -155,6 +189,7 @@ pub enum ActivationOp {
     Selu { alpha: f32, gamma: f32 },
     ThresholdedRelu { alpha: f32 },
     Celu { alpha: f32 },
+    Celu28 { alpha: f32 },
     Swish { alpha: f32 },
 }
 
@@ -169,6 +204,7 @@ impl ActivationOp {
             Self::Selu { .. } => "selu",
             Self::ThresholdedRelu { .. } => "thresholded_relu",
             Self::Celu { .. } => "celu",
+            Self::Celu28 { .. } => "celu28",
             Self::Swish { .. } => "swish",
         }
     }
@@ -186,7 +222,7 @@ impl ActivationOp {
             Self::Softsign => "Softsign",
             Self::Selu { .. } => "Selu",
             Self::ThresholdedRelu { .. } => "ThresholdedRelu",
-            Self::Celu { .. } => "Celu",
+            Self::Celu { .. } | Self::Celu28 { .. } => "Celu",
             Self::Swish { .. } => "Swish",
         }
     }
@@ -197,6 +233,7 @@ impl ActivationOp {
             | Self::Elu { alpha }
             | Self::ThresholdedRelu { alpha }
             | Self::Celu { alpha }
+            | Self::Celu28 { alpha }
             | Self::Swish { alpha } => (alpha, 0.0),
             Self::HardSigmoid { alpha, beta } => (alpha, beta),
             Self::Clip { min, max } => (min, max),
@@ -209,6 +246,27 @@ impl ActivationOp {
 pub struct ActivationFactory {
     pub name: &'static str,
     pub runtime: Arc<CudaRuntime>,
+}
+
+pub struct Celu28Factory {
+    pub runtime: Arc<CudaRuntime>,
+}
+
+impl KernelFactory for Celu28Factory {
+    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let alpha = match node.attr("alpha") {
+            None => 1.0,
+            Some(attr) => attr.as_float().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep Celu-28: 'alpha' must be an ONNX FLOAT attribute".into(),
+                )
+            })?,
+        };
+        Ok(Box::new(ActivationKernel {
+            op: ActivationOp::Celu28 { alpha },
+            runtime: self.runtime.clone(),
+        }))
+    }
 }
 
 impl KernelFactory for ActivationFactory {
@@ -436,8 +494,16 @@ impl ActivationKernel {
         }
 
         let x = &inputs[0];
-        let dtype = FloatDtype::from_onnx(op, "input", x.dtype)?;
-        if dtype != FloatDtype::F32 {
+        let dtype = match (self.op, x.dtype) {
+            (ActivationOp::Celu28 { .. }, DataType::Float64) => FloatDtype::F64,
+            (ActivationOp::Celu { .. }, dtype) if dtype != DataType::Float32 => {
+                return Err(not_implemented(format!(
+                    "Celu-12 with X dtype {dtype:?}; use Float32"
+                )));
+            }
+            _ => FloatDtype::from_onnx(op, "input", x.dtype)?,
+        };
+        if matches!(dtype, FloatDtype::F16 | FloatDtype::Bf16) {
             self.runtime.require_nvrtc_half_headers(op)?;
         }
         if outputs[0].dtype != x.dtype {
@@ -504,14 +570,16 @@ impl ActivationKernel {
                 ActivationOp::HardSigmoid { .. } | ActivationOp::Softsign => 3,
                 ActivationOp::Elu { .. } | ActivationOp::Selu { .. } => 4,
                 // Celu: div + exp + sub + mul + max + min + add ≈ 5 flops
-                ActivationOp::Celu { .. } | ActivationOp::Swish { .. } => 5,
+                ActivationOp::Celu { .. }
+                | ActivationOp::Celu28 { .. }
+                | ActivationOp::Swish { .. } => 5,
             };
             (n as u64).saturating_mul(per_element)
         });
         let mut builder = self.runtime.stream().launch_builder(&func);
         builder.arg(&x_ptr).arg(&y_ptr).arg(&n_i).arg(&p0).arg(&p1);
         // SAFETY: every entry in SRC has the same (x, y, n, p0, p1) signature;
-        // x/y cover n contiguous f32 elements, validated above.
+        // x/y cover n contiguous elements of the validated dtype.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
         if self.runtime.is_capturing()? {
             return Ok(());

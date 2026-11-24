@@ -89,6 +89,17 @@ enumerates every default-domain op in `PHASE1_OPS`, and proves unsupported
 classification with a synthetic `Celu` case; it does not yet cover all dtypes,
 shapes, attributes, opsets, optional inputs, or contrib-domain fused kernels.
 
+## Native Celu coverage
+
+The standalone CPU and CUDA EPs register `Celu-28` for Float16, BFloat16,
+Float32, and Float64, with alpha and intermediate results rounded in the
+tensor dtype. Opsets 12–27 retain the legacy Float32 implementation. The
+focused `celu28_native_cpu_matches_typed_schema` and
+`celu28_native_cuda_matches_typed_schema` tests compare against golden results
+from the [pinned ONNX function](https://github.com/onnx/onnx/blob/622adf94d4e720142950aa8178f7357d52e63db0/onnx/defs/math/defs.cc#L398-L422).
+The CUDA test requires `gpu-tests` and CUDA device execution; it cannot pass
+via CPU fallback.
+
 ## Diagnostic finding
 
 The runner preserves the current nxrt diagnostic:

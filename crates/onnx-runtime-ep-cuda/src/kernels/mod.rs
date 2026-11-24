@@ -436,6 +436,20 @@ pub struct CudaOpDescriptor {
 
 /// Float compute types the CUDA kernels handle (cuBLASLt + custom kernels).
 static CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+const CELU28_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Float64,
+];
+
+fn celu_dtypes(opset: u64) -> &'static [DataType] {
+    if opset >= 28 {
+        CELU28_DTYPES
+    } else {
+        &[DataType::Float32]
+    }
+}
 
 /// DFT data/output are f32; its optional length and axis inputs are i64.
 static CUDA_DFT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
@@ -562,6 +576,7 @@ static CUDA_EINSUM_DTYPES: &[DataType] = &[
 /// kernels. Fail closed to the float compute set for unrecognised ops.
 pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     match (op_type, domain) {
+        ("Celu", "") => CELU28_DTYPES,
         ("Gemm", "" | "ai.onnx") => gemm::DTYPES,
         ("BitCast", "") => BIT_CAST_TYPES,
         ("CumProd", "") => CUM_PROD_TYPES,
@@ -739,7 +754,11 @@ pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpD
             domain: key.domain.clone(),
             since_version: key.since_version,
             end_version: registry.explicit_end_version(key),
-            supported_dtypes: cuda_supported_dtypes_for_op(&key.op_type, &key.domain),
+            supported_dtypes: if key.domain.is_empty() && key.op_type == "Celu" {
+                celu_dtypes(key.since_version)
+            } else {
+                cuda_supported_dtypes_for_op(&key.op_type, &key.domain)
+            },
         })
         .collect();
     // Deterministic order so the advertisement is stable across runs.
@@ -1583,11 +1602,19 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    reg.register(
+    reg.register_through(
         OpKey::new("Celu", "", 12),
+        27,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(ActivationFactory {
             name: "Celu",
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Celu", "", 28),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(activations::Celu28Factory {
             runtime: runtime.clone(),
         }),
     );

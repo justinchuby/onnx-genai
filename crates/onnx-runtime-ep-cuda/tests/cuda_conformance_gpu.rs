@@ -57,8 +57,9 @@ use std::path::Path;
 use common::{
     Tensor, assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda,
 };
+use onnx_runtime_ep_api::ExecutionProvider;
 use onnx_runtime_ep_cuda::{CUDA_COVERED_OPS, CudaExecutionProvider};
-use onnx_runtime_ir::{Attribute, DataType};
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId, static_shape};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Profile model
@@ -2866,8 +2867,8 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(dedicated("Elu", "activations_gpu.rs", "alpha-driven"));
     p.push(dedicated(
         "Celu",
-        "activations_gpu.rs",
-        "scalar oracle parity across alpha values and NaN inputs",
+        "cuda_conformance_gpu.rs",
+        "Celu-28 typed function golden results and legacy f32 version boundary",
     ));
     p.push(dedicated(
         "Mish",
@@ -3309,5 +3310,86 @@ fn opset26_native_cuda_conformance() {
     let ep = require_cuda();
     for case in bitcast_cases().into_iter().chain(cumprod_cases()) {
         run_case(&ep, &case);
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+    #[test]
+    fn celu28_native_cuda_matches_typed_schema() {
+        let ep = require_cuda();
+        let run = |opset, x: Tensor, alpha: Option<f32>| {
+            let output = [(x.dtype, x.shape.clone())];
+            let attr: Vec<_> = alpha
+                .into_iter()
+                .map(|a| ("alpha", Attribute::Float(a)))
+                .collect();
+            run_cuda(&ep, "Celu", "", opset, &[x], &output, &attr).remove(0)
+        };
+        // Pinned ONNX 622adf94: Celu-28 expanded through Elu-22, via NumPy
+        // with round-to-nearest-even after each typed node (not op_celu.py).
+        let x = [-0.001, -0.01, -0.5, 100.125, -0.0, f32::NEG_INFINITY];
+        let node = Node::new(NodeId(0), "Celu", vec![Some(ValueId(0))], vec![ValueId(1)]);
+        for (dtype, expected) in [
+            (
+                DataType::Float16,
+                [0x9533u16, 0xa133, 0xb6a4, 0x5641, 0x8000, 0xbd33],
+            ),
+            (
+                DataType::BFloat16,
+                [0, 0xbc26, 0xbed5, 0x42c8, 0x8000, 0xbfa6],
+            ),
+        ] {
+            let y = run(28, float_input(dtype, &[6], &x), Some(1.3));
+            assert_eq!(y, common::raw(&expected), "{dtype:?}");
+        }
+
+        for dtype in [DataType::Float16, DataType::BFloat16, DataType::Float64] {
+            let old = ep.supports_op(&node, 27, &[static_shape([6])], &[dtype], &[]);
+            assert!(old.reason().unwrap().contains("Float32"), "{dtype:?}");
+        }
+        let x = [-0.001, -0.01, -0.5, 100.125, -0.0, f64::INFINITY, f64::NAN];
+        let y = run(28, input(DataType::Float64, &[7], &x), Some(1.3));
+        let y: Vec<_> = y
+            .chunks_exact(8)
+            .map(|b| f64::from_ne_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(y.len(), 7);
+        for (got, expected) in y.iter().zip([
+            -0.000999615483201602,
+            -0.009961636890103128,
+            -0.4150738794389706,
+            100.12500000000001,
+        ]) {
+            assert!(
+                (got - expected).abs() <= 2e-15,
+                "got {got}, want {expected}"
+            );
+        }
+        assert_eq!(y[4].to_bits(), (-0.0f64).to_bits());
+        assert_eq!(y[5], f64::INFINITY);
+        assert!(y[6].is_nan());
+
+        for opset in [12, 27, 28, 29] {
+            let y = run(
+                opset,
+                float_input(DataType::Float32, &[2], &[-2.0, -0.0]),
+                None,
+            );
+            let y = decode_floats(&y, DataType::Float32);
+            assert!((y[0] - (-0.864_664_73)).abs() < 2e-7);
+            assert_eq!(y[1].is_sign_negative(), opset >= 28);
+        }
+        for (dtype, alpha, expected) in [
+            (DataType::Float32, -2.0, 1.264_241_2),
+            (DataType::Float32, 0.0, f32::NAN),
+            (DataType::Float16, 1e-10, f32::NAN),
+        ] {
+            let y = run(28, float_input(dtype, &[1], &[2.0]), Some(alpha));
+            let y = decode_floats(&y, dtype)[0];
+            assert!(if expected.is_nan() {
+                y.is_nan()
+            } else {
+                (y - expected).abs() < 2e-7
+            });
+        }
     }
 }
