@@ -293,6 +293,7 @@ pub fn input_dtype_constraints_for_op(
     static TEXT_STRING_INPUT: &[(usize, &[DataType])] = &[(0, STRING_ONLY)];
     static STRING_CONCAT_INPUTS: &[(usize, &[DataType])] = &[(0, STRING_ONLY), (1, STRING_ONLY)];
     match (op_type, domain) {
+        ("ReverseSequence", "") => onnx_runtime_ep_api::reverse_sequence::INPUT_DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::INPUT_DTYPES,
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
@@ -365,6 +366,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("Dropout", "")
         | ("Unique", "") => ALL_DTYPES,
 
+        ("ReverseSequence", "") => onnx_runtime_ep_api::reverse_sequence::DTYPES,
         ("StringConcat", "") => STRING_ONLY,
         ("RegexFullMatch", "") => STRING_BOOL_DTYPES,
         ("StringSplit", "") => STRING_I64_DTYPES,
@@ -687,6 +689,7 @@ pub mod reduce;
 pub mod reduce_ops;
 pub mod relu;
 pub mod reshape;
+mod reverse_sequence;
 pub mod rmsnorm;
 pub mod rotary_embedding;
 pub mod sdpa;
@@ -2015,6 +2018,13 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(movement_ops::TriluFactory),
     );
     // Indexed data movement and sequence construction.
+    for version in onnx_runtime_ep_api::reverse_sequence::VERSIONS {
+        rec.register(
+            OpKey::new("ReverseSequence", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(reverse_sequence::ReverseSequenceFactory(version)),
+        );
+    }
     rec.register(
         OpKey::new("GatherElements", "", 11),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3529,7 +3539,8 @@ mod tests {
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
         // Opset-28 Cast adds one registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 124 + mlas_registrations);
+        // ReverseSequence registers both schema revisions.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 126 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")

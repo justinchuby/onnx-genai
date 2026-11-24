@@ -237,6 +237,8 @@ mod cuda_impl {
                     onnx_runtime_ir::dequantize_packed::INPUT_DTYPES
                 } else if d.domain.is_empty() && d.op_type == "CumProd" {
                     onnx_runtime_ir::opset26::CUM_PROD_INPUT_TYPES
+                } else if d.domain.is_empty() && d.op_type == "ReverseSequence" {
+                    onnx_runtime_ep_api::reverse_sequence::INPUT_DTYPES
                 } else {
                     &[]
                 },

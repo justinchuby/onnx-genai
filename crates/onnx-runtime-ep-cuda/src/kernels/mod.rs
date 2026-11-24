@@ -121,6 +121,7 @@ pub mod quantization;
 pub mod range;
 pub mod reduce;
 pub mod resize;
+mod reverse_sequence;
 pub mod rotary_embedding;
 pub mod shape;
 pub mod size;
@@ -365,6 +366,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "ArgMin",
     "GatherND",
     "SpaceToDepth",
+    "ReverseSequence",
     "EyeLike",
     "Pad",
     "Range",
@@ -567,6 +569,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("CumProd", "") => CUM_PROD_TYPES,
         ("DFT", "") => CUDA_DFT_DTYPES,
         ("STFT", "") => CUDA_STFT_DTYPES,
+        ("ReverseSequence", "" | "ai.onnx") => onnx_runtime_ep_api::reverse_sequence::DTYPES,
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
@@ -953,6 +956,16 @@ pub fn build_cuda_registry_with_metrics(
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(structural::GatherNdFactory {
                 runtime: runtime.clone(),
+            }),
+        );
+    }
+    for version in onnx_runtime_ep_api::reverse_sequence::VERSIONS {
+        reg.register(
+            OpKey::new("ReverseSequence", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(reverse_sequence::ReverseSequenceFactory {
+                runtime: runtime.clone(),
+                version,
             }),
         );
     }
@@ -2443,6 +2456,14 @@ mod tests {
             CUDA_STFT_DTYPES,
             "STFT must advertise f32 data/window plus Int32/Int64 scalar inputs"
         );
+    }
+
+    #[test]
+    fn reverse_sequence_cuda_registration_advertises_complex_and_lengths() {
+        let advertised = cuda_supported_dtypes_for_op("ReverseSequence", "");
+        assert!(advertised.contains(&DataType::Complex128));
+        assert!(advertised.contains(&DataType::Int64));
+        assert!(!advertised.contains(&DataType::String));
     }
 
     #[test]

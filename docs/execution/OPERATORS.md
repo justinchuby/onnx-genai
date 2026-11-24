@@ -107,6 +107,7 @@ rounding. The CUDA plugin declines runtime-valued shape reads for `Range`.
 | InstanceNormalization | 6 | Style transfer, diffusion. |
 | DepthToSpace | 1 | Super-resolution, diffusion. |
 | SpaceToDepth | 1 | |
+| ReverseSequence | 10, 28 | Fixed-width tensors; BF16 since 28. Mixed managed-string/Int64 inputs are not supported. |
 | GridSample | 20 | |
 | DeformConv | 19, 22 | Native CPU and CUDA. Opset 22 adds bfloat16; CUDA supports up to 32 spatial axes. |
 | Compress | 9 | |

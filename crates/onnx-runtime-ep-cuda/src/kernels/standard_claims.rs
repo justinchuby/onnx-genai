@@ -16,6 +16,14 @@ pub(crate) fn unsupported_reason_at_opset(
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
+        "ReverseSequence" => {
+            return onnx_runtime_ep_api::reverse_sequence::unsupported_reason(
+                node,
+                opset,
+                input_shapes,
+                input_dtypes,
+            );
+        }
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result
