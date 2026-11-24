@@ -906,6 +906,8 @@ fn dtype_name(dtype: DataType) -> &'static str {
         DataType::Float8E8M0 => "float8_e8m0",
         DataType::Uint2 => "uint2",
         DataType::Int2 => "int2",
+        DataType::Float6E2M3 => "float6e2m3",
+        DataType::Float6E3M2 => "float6e3m2",
     }
 }
 

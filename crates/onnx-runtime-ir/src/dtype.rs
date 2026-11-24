@@ -34,6 +34,8 @@ pub enum DataType {
     Float8E8M0 = 24,
     Uint2 = 25,
     Int2 = 26,
+    Float6E2M3 = 27,
+    Float6E3M2 = 28,
 }
 
 impl DataType {
@@ -53,7 +55,13 @@ impl DataType {
             | Self::Float8E5M2
             | Self::Float8E5M2FNUZ
             | Self::Float8E8M0 => 1,
-            Self::Int4 | Self::Uint4 | Self::Float4E2M1 | Self::Int2 | Self::Uint2 => 0,
+            Self::Int4
+            | Self::Uint4
+            | Self::Float4E2M1
+            | Self::Int2
+            | Self::Uint2
+            | Self::Float6E2M3
+            | Self::Float6E3M2 => 0,
             Self::String | Self::Undefined => 0, // variable-width / no concrete storage
         }
     }
@@ -63,6 +71,7 @@ impl DataType {
         match self {
             Self::Int4 | Self::Uint4 | Self::Float4E2M1 => 4,
             Self::Int2 | Self::Uint2 => 2,
+            Self::Float6E2M3 | Self::Float6E3M2 => 6,
             other => other.byte_size() * 8,
         }
     }
@@ -81,6 +90,8 @@ impl DataType {
                 | Self::Float8E5M2FNUZ
                 | Self::Float8E8M0
                 | Self::Float4E2M1
+                | Self::Float6E2M3
+                | Self::Float6E3M2
         )
     }
 
@@ -108,12 +119,13 @@ impl DataType {
         matches!(self, Self::Complex64 | Self::Complex128)
     }
 
-    /// Whether elements are packed multiple-per-byte.
+    /// Whether elements are stored in a packed sub-byte bit stream.
     pub fn is_sub_byte(self) -> bool {
-        matches!(
-            self,
-            Self::Int4 | Self::Uint4 | Self::Float4E2M1 | Self::Int2 | Self::Uint2
-        )
+        matches!(self.bit_size(), 1..=7)
+    }
+
+    pub fn is_float6(self) -> bool {
+        matches!(self, Self::Float6E2M3 | Self::Float6E3M2)
     }
 
     /// Number of bytes needed to store `count` elements, accounting for
@@ -141,11 +153,19 @@ impl DataType {
         if self == Self::Undefined {
             None
         } else if self.is_sub_byte() {
-            let elements_per_byte = 8 / self.bit_size();
-            Some(count / elements_per_byte + usize::from(!count.is_multiple_of(elements_per_byte)))
+            let bits = self.bit_size();
+            // Split into groups of eight so neither intermediate can overflow.
+            Some(count / 8 * bits + (count % 8 * bits).div_ceil(8))
         } else {
             count.checked_mul(self.byte_size())
         }
+    }
+
+    /// Whether an ONNX FLOAT6 stream has nonzero unused high bits in its
+    /// final byte. Check the payload's exact byte length separately.
+    pub fn has_invalid_float6_padding(self, count: usize, payload: &[u8]) -> bool {
+        let used = (count % 4) * 6 % 8;
+        self.is_float6() && used != 0 && payload.last().is_some_and(|&last| last >> used != 0)
     }
 
     /// Convert from the raw ONNX `TensorProto.DataType` integer.
@@ -181,6 +201,8 @@ impl DataType {
             24 => Self::Float8E8M0,
             25 => Self::Uint2,
             26 => Self::Int2,
+            27 => Self::Float6E2M3,
+            28 => Self::Float6E3M2,
             _ => return None,
         })
     }
@@ -214,6 +236,16 @@ mod tests {
         assert_eq!(DataType::Int4.storage_bytes(5), 3);
         assert_eq!(DataType::Int2.storage_bytes(5), 2);
         assert_eq!(DataType::Float32.storage_bytes(4), 16);
+        for dtype in [DataType::Float6E2M3, DataType::Float6E3M2] {
+            assert_eq!(
+                (0..=5).map(|n| dtype.storage_bytes(n)).collect::<Vec<_>>(),
+                [0, 1, 2, 3, 3, 4]
+            );
+            assert_eq!(
+                dtype.checked_storage_bytes(usize::MAX),
+                Some(usize::MAX - usize::MAX / 4)
+            );
+        }
     }
 
     #[test]
@@ -337,6 +369,8 @@ mod tests {
             (DataType::Float8E8M0, 24),
             (DataType::Uint2, 25),
             (DataType::Int2, 26),
+            (DataType::Float6E2M3, 27),
+            (DataType::Float6E3M2, 28),
         ];
         for &(dt, raw) in table {
             assert_eq!(dt.to_onnx(), raw, "{dt:?} to_onnx mismatch");
@@ -370,7 +404,7 @@ mod tests {
     #[test]
     fn unknown_raw_values_return_none() {
         // UNDEFINED and out-of-range/future values.
-        for raw in [0, 27, 100, 9999, -1, i32::MAX, i32::MIN] {
+        for raw in [0, 29, 100, 9999, -1, i32::MAX, i32::MIN] {
             assert_eq!(DataType::from_onnx(raw), None, "raw {raw} should be None");
         }
     }

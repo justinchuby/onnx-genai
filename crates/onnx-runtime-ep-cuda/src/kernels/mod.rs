@@ -1719,12 +1719,13 @@ pub fn build_cuda_registry_with_metrics(
     );
 
     // Cast / CastLike (NVRTC element-wise dtype conversion).
-    for op_type in ["Cast", "CastLike"] {
+    for (op_type, version) in [("Cast", 1), ("CastLike", 1), ("Cast", 28)] {
         reg.register(
-            OpKey::new(op_type, "", 1),
+            OpKey::new(op_type, "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(cast::CastFactory {
                 runtime: runtime.clone(),
+                float6: version >= 28,
             }),
         );
     }
