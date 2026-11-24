@@ -338,7 +338,8 @@ record what each wave landed and are not a statement about today.
 
 <!-- CUDA_CPU_ONLY_GAPS_START -->
 
-- `ai.onnx`: none.
+- Deliberately CPU-only: `ai.onnx::RegexFullMatch`, `ai.onnx::StringConcat`,
+  and `ai.onnx::StringSplit`.
 - Open implementation gap: `com.microsoft::FusedAttention`.
 - Deliberate non-gaps: `com.microsoft::MoE` and
   `com.microsoft::PackedMultiHeadAttention`.
@@ -370,8 +371,13 @@ batch.
 For `com.microsoft`, `FusedAttention` is the only open CPU-only implementation
 gap. `MoE` and `PackedMultiHeadAttention` are deliberate non-gaps explained
 below. `BiasGelu`, `FastGelu`, and `QuickGelu` are covered by `fused_gelu.rs`.
-CUDA additionally exposes `com.microsoft::Attention`. There are no
-standard-domain CPU-only gaps.
+CUDA additionally exposes `com.microsoft::Attention`.
+
+The three standard-domain text operators listed above consume managed string
+tensors, which stay on the host. There are no CUDA kernels for these operators.
+Standalone nxrt can still place eligible numeric subgraphs on CUDA when CPU
+fallback is allowed; strict CUDA placement rejects graphs that require these
+text operators.
 
 `com.microsoft::MoE` (the float/unquantized form, with dense f32/f16/bf16 FC
 weight tensors) is present in the CPU EP but is **not a real CUDA gap**: no
