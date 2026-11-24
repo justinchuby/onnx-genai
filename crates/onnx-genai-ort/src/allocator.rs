@@ -202,3 +202,5 @@ impl Drop for Allocator<'_> {
         }
     }
 }
+
+pub(crate) use memory_info::MemoryDescriptor;

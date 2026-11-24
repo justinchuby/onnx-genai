@@ -1449,11 +1449,6 @@ impl Engine {
         // MTP is the one native proposer kind; the effective mode is decided
         // below once the MTP loader has reported.
         let shared_kv_mode = SpeculativeMode::None;
-        let environment = Arc::new({
-            let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
-            Environment::new("onnx-genai-engine")
-                .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
-        });
         if matches!(&config.speculative_mode, SpeculativeMode::Mtp(_))
             && !metadata.speculative.as_ref().is_some_and(|contract| {
                 matches!(
@@ -1473,10 +1468,9 @@ impl Engine {
         // loads on the ORT `environment` (ORT CUDA EP), seeded from the native
         // hybrid target's declared hidden output. Yields `None` for every
         // non-MTP model, preserving the plain native load path exactly.
-        let (mtp, mtp_mode) = load_native_mtp_proposer(
+        let mtp_resources = load_native_mtp_proposer(
             &metadata,
             &model_directory,
-            &environment,
             session_options,
             match native_device.cuda_index() {
                 Some(index) => crate::speculative::DraftProjectionDevice::Cuda {
@@ -1495,6 +1489,13 @@ impl Engine {
                         .as_ref()
                         .is_some_and(|contract| contract.distribution_preserving)),
         )?;
+        let (mtp, mtp_mode, environment) = match mtp_resources {
+            Some(resources) => {
+                let mode = SpeculativeMode::Mtp(resources.model.config.clone());
+                (Some(resources.model), mode, Some(resources.environment))
+            }
+            None => (None, SpeculativeMode::None, None),
+        };
         // A model runs at most one proposer kind; shared-KV drafting and MTP are
         // mutually exclusive, so at most one of these may be anything but
         // `None`.
@@ -1554,7 +1555,7 @@ impl Engine {
             last_speculative_stats: SpeculativeStats::default(),
             connector,
             _shared_memory_plan: None,
-            _environment: Some(environment),
+            _environment: environment,
         })
     }
 
@@ -2859,35 +2860,36 @@ fn build_mtp_model_from_resolved(
     })
 }
 
-/// Resolve and build a native-backend MTP proposer from the package's
-/// workflow-native declaration.
-///
-/// Returns the loaded [`MtpModel`] (the pure-attention MTP head runs on the ORT
-/// `environment`; only the hybrid GDN target needs the native EP) together with
-/// the [`SpeculativeMode::Mtp`] the engine should adopt. Yields `None` /
-/// [`SpeculativeMode::None`] when the declaration selects another proposal
-/// form, so non-MTP models keep their exact existing load path.
+/// The legacy MTP head and the environment that must outlive its session.
+#[cfg(feature = "native-backend")]
+struct NativeMtpResources {
+    model: MtpModel,
+    environment: Arc<Environment>,
+}
+
+/// Resolve an enabled metadata-declared MTP head and its owned ORT environment.
+/// The caller derives [`SpeculativeMode::Mtp`] from the loaded model. Yields
+/// `None` before initializing ORT for other proposal forms or disabled speculation.
 #[cfg(feature = "native-backend")]
 fn load_native_mtp_proposer(
     metadata: &InferenceMetadata,
     model_directory: &ModelDirectory,
-    environment: &Environment,
     session_options: &SessionOptions,
     draft_projection: crate::speculative::DraftProjectionDevice,
     requested_drafts: usize,
     enabled: bool,
-) -> anyhow::Result<(Option<MtpModel>, SpeculativeMode)> {
+) -> anyhow::Result<Option<NativeMtpResources>> {
     if !enabled {
-        return Ok((None, SpeculativeMode::None));
+        return Ok(None);
     }
     let Some(speculative) = metadata.speculative.as_ref() else {
-        return Ok((None, SpeculativeMode::None));
+        return Ok(None);
     };
     if !matches!(
         speculative.proposal_execution,
         onnx_genai_metadata::SpeculativeProposalExecution::Mtp { .. }
     ) {
-        return Ok((None, SpeculativeMode::None));
+        return Ok(None);
     };
     // The native target exposes no ORT `Session` to interrogate for the target
     // vocabulary (that is the point of the native EP). The head borrows the
@@ -2931,15 +2933,21 @@ fn load_native_mtp_proposer(
     // The int4 shared LM-head is projected on the same device as the native
     // target: CUDA when the target is on CUDA, otherwise the CPU int4 kernel.
     // This projection runs during proposal, outside the captured decode step.
+    // Ordinary Native loading must never initialize an ORT environment just
+    // because this optional legacy proposer is compiled into the engine.
+    let environment = Arc::new(Environment::new("onnx-genai-native-mtp-head")
+        .context("load the legacy ORT MTP head for this package; install an ORT reference runtime or use a package without an ORT-backed MTP head")?);
     let mtp = build_mtp_model_from_resolved(
         resolved,
-        environment,
+        &environment,
         &head_session_options,
         model_directory,
         Some(draft_projection),
     )?;
-    let mode = SpeculativeMode::Mtp(mtp.config.clone());
-    Ok((Some(mtp), mode))
+    Ok(Some(NativeMtpResources {
+        model: mtp,
+        environment,
+    }))
 }
 
 /// Validate the target decoder's hidden-state seed output against the target

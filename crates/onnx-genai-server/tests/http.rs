@@ -2090,3 +2090,56 @@ fn fixture_tokenizer() -> onnx_genai_ort::Tokenizer {
     )
     .unwrap()
 }
+
+#[cfg(feature = "native-backend")]
+#[tokio::test]
+async fn native_http_generation_does_not_load_ort() {
+    const CHILD: &str = "NXRT_NATIVE_HTTP_NO_ORT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_http_generation_does_not_load_ort",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("ONNX_GENAI_BACKEND")
+            .env("ONNX_GENAI_EP", "cpu")
+            .env(
+                "ONNX_GENAI_ORT_LIB",
+                "/missing/nxrt-native-http-test/onnxruntime",
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let config = ServerConfig::default();
+    assert_eq!(
+        config.decode_backend,
+        onnx_genai_engine::EngineDecodeBackend::Native
+    );
+    let router = test_app_with_config(config).await;
+    let response = post_json(
+        router.clone(),
+        "/completion",
+        json!({"prompt":"hi", "n_predict":1, "temperature":0}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["tokens_predicted"], 1, "{body}");
+    let response = post_json(router, "/v1/chat/completions", json!({"messages":[{"role":"user","content":"hi"}], "max_tokens":1, "temperature":0, "stream":true})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let stream = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(stream.contains("chat.completion.chunk"), "{stream}");
+    assert!(stream.contains("data: [DONE]"), "{stream}");
+}

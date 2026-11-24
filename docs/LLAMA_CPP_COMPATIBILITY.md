@@ -6,6 +6,11 @@ comparisons: use `--backend ort` or `EngineDecodeBackend::Ort`. Native failures
 remain visible instead of automatically switching production requests to ORT.
 The opt-in auto selector is also a reference/testing mode.
 
+Native workflow tensor construction, host access and no-copy aliases do not load
+ORT. A missing-library subprocess covers default Native CPU binary generation;
+ORT sessions/bindings resolve tensor views explicitly. The optional MTP head
+and Python launcher's eager preload remain separate isolation work.
+
 The server embeds the official Llama Chat frontend with a small capability adapter from
 [llama.cpp commit 8d60873dfb8619f2b5ed31adfbab07cccb40db5c](https://github.com/ggml-org/llama.cpp/tree/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/ui/apps/chat).
 The integration patch gates automatically attached browser tools using the

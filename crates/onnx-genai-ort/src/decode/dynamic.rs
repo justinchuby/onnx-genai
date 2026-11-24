@@ -760,7 +760,7 @@ impl<'a> DecodeSession<'a> {
                         pair.past
                     ))
                 })?;
-                borrowed_outputs.push(value.raw_ptr_addr());
+                borrowed_outputs.push(value.raw_ptr_addr()?);
                 self.binding.bind_output(output, value)?;
             } else {
                 self.binding

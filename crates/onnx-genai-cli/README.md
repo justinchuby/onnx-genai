@@ -8,9 +8,11 @@ pip install onnx-genai-server            # Native CPU default (all platforms)
 pip install 'onnx-genai-server[cuda]'    # ORT CUDA reference runtime (Windows/Linux)
 ```
 
-The current workflow tensor bridge still requires the ONNX Runtime library,
-including when model computation runs on Native. The launcher loads it from
-the installed `onnxruntime` wheel; removing this bridge dependency is ongoing.
+Workflow tensors retain their storage without constructing ORT handles. Native
+CPU binary generation is tested with an unavailable ORT library; explicit ORT
+bindings materialize reference views over the same storage. The optional MTP
+head still uses ORT, and the Python launcher still preloads the installed
+`onnxruntime` wheel. Removing those remaining dependencies is ongoing.
 The `cuda` extra supplies the ORT reference runtime. Native CUDA execution uses
 a build with `--features native-cuda`.
 

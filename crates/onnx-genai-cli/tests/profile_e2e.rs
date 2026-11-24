@@ -37,11 +37,12 @@ fn scratch(name: &str) -> PathBuf {
     directory
 }
 
-fn run_cli(arguments: &[&str]) -> String {
+fn run_cli(arguments: &[&str], environment: &[(&str, &str)]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
         .args(arguments)
         .env_remove("ONNX_GENAI_BACKEND")
         .env("ONNX_GENAI_EP", "cpu")
+        .envs(environment.iter().copied())
         .output()
         .expect("the onnx-genai binary must start");
     assert!(
@@ -68,20 +69,23 @@ fn generate_profile_provider_comes_from_explicit_ort_reference_run() {
     let directory = scratch("generate-ort");
     let profile = directory.join("profile.json");
 
-    run_cli(&[
-        "--profile-json",
-        &profile.display().to_string(),
-        "generate",
-        &fixture("tiny-llm").display().to_string(),
-        "hi",
-        "--backend",
-        "ort",
-        "--max-new-tokens",
-        "1",
-        "--no-stats",
-        "--cpu-cores",
-        "1",
-    ]);
+    run_cli(
+        &[
+            "--profile-json",
+            &profile.display().to_string(),
+            "generate",
+            &fixture("tiny-llm").display().to_string(),
+            "hi",
+            "--backend",
+            "ort",
+            "--max-new-tokens",
+            "1",
+            "--no-stats",
+            "--cpu-cores",
+            "1",
+        ],
+        &[],
+    );
 
     assert_eq!(profile_execution_provider(&profile), "cpu");
     std::fs::remove_dir_all(directory).expect("the scratch directory must be removed");
@@ -94,18 +98,24 @@ fn generate_profile_provider_comes_from_explicit_ort_reference_run() {
 fn generate_defaults_to_native_and_profiles_the_actual_backend() {
     let directory = scratch("generate-native");
     let profile = directory.join("profile.json");
-    run_cli(&[
-        "--profile-json",
-        &profile.display().to_string(),
-        "generate",
-        &fixture("tiny-llm").display().to_string(),
-        "hi",
-        "--max-new-tokens",
-        "1",
-        "--no-stats",
-        "--cpu-cores",
-        "1",
-    ]);
+    run_cli(
+        &[
+            "--profile-json",
+            &profile.display().to_string(),
+            "generate",
+            &fixture("tiny-llm").display().to_string(),
+            "hi",
+            "--max-new-tokens",
+            "1",
+            "--no-stats",
+            "--cpu-cores",
+            "1",
+        ],
+        &[(
+            "ONNX_GENAI_ORT_LIB",
+            "/missing/nxrt-native-reference-test/onnxruntime",
+        )],
+    );
     assert_eq!(profile_execution_provider(&profile), "native");
     let value: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&profile).expect("Native profile must be written"),
