@@ -1532,6 +1532,7 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop() {
 fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
     let ep = require_cuda();
     let runtime = ep.runtime();
+    runtime.set_defer_eager_sync(true);
     let device = ep.device_id();
     let perm = [2_i64, 0, 1];
     let a_input_shape = [2usize, 1, 3];
@@ -1575,6 +1576,15 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
     };
 
     run_a().unwrap();
+    let warm_allocations = runtime.allocation_counts();
+    let warm_transfers = runtime.transfer_counts();
+    let warm_syncs = runtime.forced_synchronization_count();
+    for _ in 0..8 {
+        run_a().unwrap();
+    }
+    assert_eq!(runtime.allocation_counts(), warm_allocations);
+    assert_eq!(runtime.transfer_counts(), warm_transfers);
+    assert_eq!(runtime.forced_synchronization_count(), warm_syncs);
     let a_resource = kernel.device_graph_resources();
     assert_eq!(a_resource.len(), 1);
     let a_resource_id = a_resource[0].identity();
@@ -1601,6 +1611,7 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
     )];
     let counts_before_failure = runtime.allocation_counts();
     let pooled_before_failure = runtime.raw_pool_retained_bytes();
+    let syncs_before_failure = runtime.forced_synchronization_count();
     runtime.fail_warm_transaction_at_for_test(1);
     let failure = kernel
         .execute(
@@ -1625,6 +1636,11 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
         a_resource_id,
         "failed Transpose rewarm must retain shape A's metadata owner"
     );
+    assert_eq!(
+        runtime.forced_synchronization_count(),
+        syncs_before_failure + 1,
+        "persistent metadata replacement must drain old readers even when the staged upload fails and eager sync is deferred"
+    );
     let counts_after_failure = runtime.allocation_counts();
     assert!(
         counts_after_failure.frees > counts_before_failure.frees
@@ -1636,6 +1652,7 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
     runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
     run_a().unwrap();
     runtime.end_graph_capture().unwrap();
+    let syncs_before_rewarm = runtime.forced_synchronization_count();
 
     kernel
         .execute(
@@ -1649,6 +1666,11 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
             )],
         )
         .unwrap();
+    assert_eq!(
+        runtime.forced_synchronization_count(),
+        syncs_before_rewarm + 1,
+        "successful persistent metadata replacement must use the same mandatory drain"
+    );
     let b_resource = kernel.device_graph_resources();
     assert_eq!(b_resource.len(), 1);
     assert_ne!(

@@ -289,7 +289,7 @@ impl Kernel for GatherNdKernel {
         let mut dimensions_cache = self.dimensions.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep GatherND: metadata lock poisoned".into())
         })?;
-        let dimensions_candidate = dimensions_cache.stage(&dimensions, "GatherND")?;
+        let dimensions_candidate = dimensions_cache.stage(&dimensions, "GatherND metadata")?;
         let dimension_ptr = dimensions_candidate.ptr("GatherND")?;
 
         let function = self

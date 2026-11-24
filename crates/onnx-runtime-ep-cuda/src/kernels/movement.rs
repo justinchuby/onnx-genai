@@ -11,8 +11,9 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
 use super::elementwise::{broadcast_strides, u64_bytes};
+use crate::device_metadata::DeviceMetadataCache;
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
 
@@ -236,89 +237,49 @@ fn host_ints(runtime: &CudaRuntime, view: &TensorView, op: &str) -> Result<Vec<i
     })
 }
 
+fn persistent_metadata_payload(values: &[u64]) -> Vec<u8> {
+    let sentinel = [0u64];
+    u64_bytes(if values.is_empty() { &sentinel } else { values }).to_vec()
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct PersistentMetadata {
-    runtime: Arc<CudaRuntime>,
-    values: Option<Vec<u64>>,
-    allocation: Option<Arc<GraphDeviceAllocation>>,
+    storage: DeviceMetadataCache<Vec<u64>>,
 }
 
 impl PersistentMetadata {
     pub(super) fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
-            runtime,
-            values: None,
-            allocation: None,
+            storage: DeviceMetadataCache::new(runtime),
         }
     }
 
-    pub(super) fn stage(&self, values: &[u64], op: &str) -> Result<Self> {
+    pub(super) fn stage(&self, values: &[u64], label: &str) -> Result<Self> {
         let mut candidate = self.clone();
-        candidate.prepare(values, op)?;
+        candidate.storage.get_or_prepare(
+            label,
+            |cached| cached.as_slice() == values,
+            || Ok((values.to_vec(), persistent_metadata_payload(values))),
+        )?;
         Ok(candidate)
     }
 
-    fn prepare(&mut self, values: &[u64], op: &str) -> Result<CUdeviceptr> {
-        if self.values.as_deref() == Some(values) {
-            let ptr = self.allocation.as_ref().map_or_else(
-                || {
-                    Err(EpError::KernelFailed(format!(
-                        "cuda_ep {op}: cached persistent metadata lost its device allocation"
-                    )))
-                },
-                |allocation| Ok(allocation.ptr()),
-            )?;
-            if self.runtime.is_capturing()? {
-                self.runtime.require_registered_address_capture(
-                    self.device_graph_resource()
-                        .expect("cached metadata allocation is present")
-                        .identity(),
-                    "persistent kernel metadata",
-                )?;
-            }
-            return Ok(ptr);
-        }
-        if self.runtime.is_capturing()? {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep {op}: shape changed during CUDA graph capture; warm the exact shape first"
-            )));
-        }
-        let scalar_metadata = [0_u64];
-        let bytes = u64_bytes(if values.is_empty() {
-            &scalar_metadata
-        } else {
-            values
-        });
-        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes.len())?;
-        unsafe { self.runtime.htod(bytes, allocation.ptr()) }?;
-        self.runtime
-            .staged_warm_cache_mutation(&format!("{op} metadata allocation/upload"))?;
-        self.values = Some(values.to_vec());
-        let ptr = allocation.ptr();
-        self.allocation = Some(allocation);
-        Ok(ptr)
-    }
-
     pub(super) fn ptr(&self, op: &str) -> Result<CUdeviceptr> {
-        self.allocation.as_ref().map_or_else(
-            || {
-                Err(EpError::KernelFailed(format!(
-                    "cuda_ep {op}: staged persistent metadata has no device allocation"
-                )))
-            },
-            |allocation| Ok(allocation.ptr()),
-        )
+        self.storage.allocation().map(|allocation| allocation.ptr()).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "cuda_ep {op}: persistent metadata has not been prepared; stage the exact metadata before launching or capturing"
+            ))
+        })
     }
 
     pub(super) fn allocation_bytes(&self) -> usize {
-        self.allocation
-            .as_ref()
+        self.storage
+            .allocation()
             .map_or(0, |allocation| allocation.bytes())
     }
 
     pub(super) fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
-        let allocation = self.allocation.as_ref()?;
-        Some(GraphDeviceAllocation::device_graph_resource(allocation))
+        self.storage.device_graph_resource()
     }
 }
 
@@ -718,7 +679,7 @@ impl Kernel for ExpandKernel {
         let mut metadata_cache = self.metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep Expand: metadata lock was poisoned".into())
         })?;
-        let metadata_candidate = metadata_cache.stage(&metadata, "Expand")?;
+        let metadata_candidate = metadata_cache.stage(&metadata, "Expand metadata")?;
         let metadata_ptr = metadata_candidate.ptr("Expand")?;
         launch_persistent_metadata(
             &self.runtime,
@@ -852,7 +813,7 @@ impl Kernel for TransposeKernel {
         let mut persistent = self.metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep Transpose: metadata lock was poisoned".into())
         })?;
-        let metadata_candidate = persistent.stage(&metadata, "Transpose")?;
+        let metadata_candidate = persistent.stage(&metadata, "Transpose metadata")?;
         let metadata_ptr = metadata_candidate.ptr("Transpose")?;
         let metadata_bytes = metadata_candidate.allocation_bytes();
         launch_persistent_metadata(
@@ -1097,7 +1058,7 @@ impl Kernel for SliceKernel {
             .dims
             .lock()
             .map_err(|_| EpError::KernelFailed("cuda_ep Slice: dims lock was poisoned".into()))?;
-        let dims_candidate = dims_cache.stage(&dims, "Slice")?;
+        let dims_candidate = dims_cache.stage(&dims, "Slice metadata")?;
         let dims_ptr = dims_candidate.ptr("Slice")?;
         let stride_bits = strides
             .iter()
@@ -1106,7 +1067,7 @@ impl Kernel for SliceKernel {
         let mut strides_cache = self.strides.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep Slice: strides lock was poisoned".into())
         })?;
-        let strides_candidate = strides_cache.stage(&stride_bits, "Slice")?;
+        let strides_candidate = strides_cache.stage(&stride_bits, "Slice metadata")?;
         let strides_ptr = strides_candidate.ptr("Slice")?;
         let input_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
@@ -1260,7 +1221,7 @@ impl Kernel for TileKernel {
         let mut metadata_cache = self.metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep Tile: metadata lock was poisoned".into())
         })?;
-        let metadata_candidate = metadata_cache.stage(&metadata, "Tile")?;
+        let metadata_candidate = metadata_cache.stage(&metadata, "Tile metadata")?;
         let metadata_ptr = metadata_candidate.ptr("Tile")?;
         launch_persistent_metadata(
             &self.runtime,
@@ -1788,5 +1749,21 @@ impl Kernel for SplitKernel {
                 "Split static plan lock was poisoned",
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn persistent_payload_preserves_initialized_scalar_and_signed_bits() {
+        assert_eq!(persistent_metadata_payload(&[]), 0u64.to_ne_bytes());
+        let bytes = persistent_metadata_payload(&[3, (-2i64) as u64, 11]);
+        let signed = bytes
+            .chunks_exact(8)
+            .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(signed, [3, -2, 11]);
     }
 }

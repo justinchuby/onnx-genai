@@ -112,6 +112,15 @@ impl<K> DeviceMetadataCache<K> {
             .as_ref()
             .map(|current| GraphDeviceAllocation::device_graph_resource(&current.allocation))
     }
+
+    /// Borrow the prepared binding without introducing another owner or
+    /// independently cached pointer/extent. Graph retention uses the resource
+    /// method above rather than cloning this allocation into kernel state.
+    pub(crate) fn allocation(&self) -> Option<&GraphDeviceAllocation> {
+        self.current
+            .as_ref()
+            .map(|current| current.allocation.as_ref())
+    }
 }
 
 #[cfg(test)]

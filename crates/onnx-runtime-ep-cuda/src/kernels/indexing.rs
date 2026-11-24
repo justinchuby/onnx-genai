@@ -12,9 +12,11 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::scatter::{ScatterReduction as Reduction, validate_nd_index_type};
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
+use super::elementwise::u64_bytes;
 use super::movement::PersistentMetadata;
+use crate::device_metadata::DeviceMetadataCache;
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
 pub const SCATTER_CAPTURE_ERROR_INDEX: u32 = 256;
@@ -544,22 +546,37 @@ fn validate_nd_indices(
     Ok(())
 }
 
-fn upload_meta(runtime: &Arc<CudaRuntime>, values: &[usize]) -> Result<Arc<GraphDeviceAllocation>> {
-    let values = values.iter().map(|&v| v as u64).collect::<Vec<_>>();
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            values.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(values.as_slice()),
-        )
-    };
-    let allocation = GraphDeviceAllocation::allocate(runtime, bytes.len().max(1))?;
-    if !bytes.is_empty()
-        && let Err(error) = unsafe { runtime.htod(bytes, allocation.ptr()) }
-    {
-        return Err(error);
-    }
-    runtime.staged_warm_cache_mutation("indexing metadata allocation/upload")?;
-    Ok(allocation)
+fn scatter_elements_metadata_bytes(data_shape: &[usize], indices_shape: &[usize]) -> Vec<u8> {
+    let mut values = compute_contiguous_strides(indices_shape)
+        .into_iter()
+        .map(|value| value as u64)
+        .collect::<Vec<_>>();
+    values.extend(
+        compute_contiguous_strides(data_shape)
+            .into_iter()
+            .map(|value| value as u64),
+    );
+    values.extend(data_shape.iter().map(|&value| value as u64));
+    u64_bytes(&values).to_vec()
+}
+
+fn gather_elements_metadata_bytes(data_shape: &[usize], indices_shape: &[usize]) -> Vec<u8> {
+    let mut values = indices_shape
+        .iter()
+        .map(|&value| value as u64)
+        .collect::<Vec<_>>();
+    values.extend(
+        compute_contiguous_strides(indices_shape)
+            .into_iter()
+            .map(|value| value as u64),
+    );
+    values.extend(
+        compute_contiguous_strides(data_shape)
+            .into_iter()
+            .map(|value| value as u64),
+    );
+    values.extend(data_shape.iter().map(|&value| value as u64));
+    u64_bytes(&values).to_vec()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -570,75 +587,34 @@ struct ScatterMetadataKey {
 
 #[derive(Clone, Debug)]
 struct ScatterMetadataCache {
-    runtime: Arc<CudaRuntime>,
-    key: Option<ScatterMetadataKey>,
-    allocation: Option<Arc<GraphDeviceAllocation>>,
+    storage: DeviceMetadataCache<ScatterMetadataKey>,
 }
 
 impl ScatterMetadataCache {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
-            runtime,
-            key: None,
-            allocation: None,
+            storage: DeviceMetadataCache::new(runtime),
         }
     }
 
     fn prepare(&mut self, data_shape: &[usize], indices_shape: &[usize]) -> Result<CUdeviceptr> {
-        let key = ScatterMetadataKey {
-            data_shape: data_shape.to_vec(),
-            indices_shape: indices_shape.to_vec(),
-        };
-        if self.key.as_ref() == Some(&key) {
-            let ptr = self.allocation.as_ref().map_or_else(
-                || {
-                    Err(EpError::KernelFailed(
-                        "cuda_ep ScatterElements: cached metadata lost its device allocation"
-                            .into(),
-                    ))
-                },
-                |allocation| Ok(allocation.ptr()),
-            )?;
-            if self.runtime.is_capturing()? {
-                self.runtime.require_registered_address_capture(
-                    self.device_graph_resource()
-                        .expect("cached ScatterElements allocation is present")
-                        .identity(),
-                    "ScatterElements metadata",
-                )?;
-            }
-            return Ok(ptr);
-        }
-        if self.runtime.is_capturing()? {
-            return Err(EpError::KernelFailed(
-                "cuda_ep ScatterElements: shape changed during CUDA graph capture; warm the exact shape first".into(),
-            ));
-        }
-        if self.allocation.is_some() {
-            self.runtime.drain_for_unmap()?;
-        }
-
-        let mut meta = compute_contiguous_strides(indices_shape)
-            .into_iter()
-            .map(|value| value as usize)
-            .collect::<Vec<_>>();
-        meta.extend(
-            compute_contiguous_strides(data_shape)
-                .into_iter()
-                .map(|value| value as usize),
-        );
-        meta.extend(data_shape.iter().copied());
-        let allocation = upload_meta(&self.runtime, &meta)?;
-        let ptr = allocation.ptr();
-        self.key = Some(key);
-        self.allocation = Some(allocation);
-        Ok(ptr)
+        self.storage.get_or_prepare(
+            "ScatterElements metadata",
+            |key| key.data_shape == data_shape && key.indices_shape == indices_shape,
+            || {
+                Ok((
+                    ScatterMetadataKey {
+                        data_shape: data_shape.to_vec(),
+                        indices_shape: indices_shape.to_vec(),
+                    },
+                    scatter_elements_metadata_bytes(data_shape, indices_shape),
+                ))
+            },
+        )
     }
 
     fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
-        self.allocation
-            .as_ref()
-            .map(GraphDeviceAllocation::device_graph_resource)
+        self.storage.device_graph_resource()
     }
 }
 
@@ -667,76 +643,34 @@ struct GatherElementsMetadataKey {
 
 #[derive(Clone, Debug)]
 struct GatherElementsMetadataCache {
-    runtime: Arc<CudaRuntime>,
-    key: Option<GatherElementsMetadataKey>,
-    allocation: Option<Arc<GraphDeviceAllocation>>,
+    storage: DeviceMetadataCache<GatherElementsMetadataKey>,
 }
 
 impl GatherElementsMetadataCache {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
-            runtime,
-            key: None,
-            allocation: None,
+            storage: DeviceMetadataCache::new(runtime),
         }
     }
 
     fn prepare(&mut self, data_shape: &[usize], indices_shape: &[usize]) -> Result<CUdeviceptr> {
-        let key = GatherElementsMetadataKey {
-            data_shape: data_shape.to_vec(),
-            indices_shape: indices_shape.to_vec(),
-        };
-        if self.key.as_ref() == Some(&key) {
-            let ptr = self.allocation.as_ref().map_or_else(
-                || {
-                    Err(EpError::KernelFailed(
-                        "cuda_ep GatherElements: cached metadata lost its device allocation".into(),
-                    ))
-                },
-                |allocation| Ok(allocation.ptr()),
-            )?;
-            if self.runtime.is_capturing()? {
-                self.runtime.require_registered_address_capture(
-                    self.device_graph_resource()
-                        .expect("cached GatherElements allocation is present")
-                        .identity(),
-                    "GatherElements metadata",
-                )?;
-            }
-            return Ok(ptr);
-        }
-        if self.runtime.is_capturing()? {
-            return Err(EpError::KernelFailed(
-                "cuda_ep GatherElements: shape changed during CUDA graph capture; warm the exact shape first".into(),
-            ));
-        }
-        if self.allocation.is_some() {
-            self.runtime.drain_for_unmap()?;
-        }
-
-        let mut meta = indices_shape.to_vec();
-        meta.extend(
-            compute_contiguous_strides(indices_shape)
-                .into_iter()
-                .map(|value| value as usize),
-        );
-        meta.extend(
-            compute_contiguous_strides(data_shape)
-                .into_iter()
-                .map(|value| value as usize),
-        );
-        meta.extend(data_shape.iter().copied());
-        let allocation = upload_meta(&self.runtime, &meta)?;
-        let ptr = allocation.ptr();
-        self.key = Some(key);
-        self.allocation = Some(allocation);
-        Ok(ptr)
+        self.storage.get_or_prepare(
+            "GatherElements metadata",
+            |key| key.data_shape == data_shape && key.indices_shape == indices_shape,
+            || {
+                Ok((
+                    GatherElementsMetadataKey {
+                        data_shape: data_shape.to_vec(),
+                        indices_shape: indices_shape.to_vec(),
+                    },
+                    gather_elements_metadata_bytes(data_shape, indices_shape),
+                ))
+            },
+        )
     }
 
     fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
-        self.allocation
-            .as_ref()
-            .map(GraphDeviceAllocation::device_graph_resource)
+        self.storage.device_graph_resource()
     }
 }
 
@@ -1229,7 +1163,7 @@ impl ScatterNdKernel {
         let mut metadata_cache = self.metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep ScatterND: metadata lock was poisoned".into())
         })?;
-        let metadata_candidate = metadata_cache.stage(&metadata_values, "ScatterND")?;
+        let metadata_candidate = metadata_cache.stage(&metadata_values, "ScatterND metadata")?;
         let metadata_ptr = metadata_candidate.ptr("ScatterND")?;
         // Empty slices still require tuple validation, but never access values.
         let output_ptr = if slice_length == 0 {
@@ -1598,6 +1532,28 @@ impl Kernel for ScatterElementsKernel {
 mod workspace_tests {
     use super::*;
     use onnx_runtime_ep_api::DevicePtrMut;
+
+    #[test]
+    fn indexed_metadata_preserves_the_distinct_kernel_table_abis() {
+        let decode = |bytes: Vec<u8>| {
+            bytes
+                .chunks_exact(8)
+                .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let scatter = decode(scatter_elements_metadata_bytes(&[2, 3], &[1, 2]));
+        assert_eq!(
+            scatter,
+            [2, 1, 3, 1, 2, 3],
+            "ScatterElements consumes index strides, data strides, data dimensions"
+        );
+        let gather = decode(gather_elements_metadata_bytes(&[2, 3], &[1, 2]));
+        assert_eq!(
+            gather,
+            [1, 2, 2, 1, 3, 1, 2, 3],
+            "GatherElements also consumes leading index dimensions"
+        );
+    }
 
     fn metadata<'a>(
         dtype: DataType,
