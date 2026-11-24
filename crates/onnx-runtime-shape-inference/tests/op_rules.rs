@@ -767,24 +767,6 @@ fn recurrent_only_sets_declared_outputs() {
             assert_eq!(outputs.len(), output_count, "{op}");
             assert!(outputs.iter().all(|output| output.type_info.is_some()));
         }
-
-        #[test]
-        fn rnn_infers_optional_hidden_size_from_recurrent_weights() {
-            let outputs = run(
-                &node("RNN", 3, 2),
-                vec![
-                    f32in(vec![c(5), c(3), c(7)]),
-                    f32in(vec![c(1), sym(90), c(7)]),
-                    f32in(vec![c(1), sym(90), sym(90)]),
-                ],
-                22,
-            );
-            assert_eq!(out_shape(&outputs), vec![c(5), c(1), c(3), sym(90)]);
-            assert_eq!(
-                outputs[1].type_info.as_ref().unwrap().shape,
-                vec![c(1), c(3), sym(90)]
-            );
-        }
     }
 
     for op in ["RNN", "GRU"] {
@@ -797,6 +779,24 @@ fn recurrent_only_sets_declared_outputs() {
         assert!(outputs[1].type_info.is_some(), "{op} Y_h");
         assert!(outputs[2].type_info.is_none(), "{op} has no Y_c");
     }
+}
+
+#[test]
+fn rnn_infers_optional_hidden_size_from_recurrent_weights() {
+    let outputs = run(
+        &node("RNN", 3, 2),
+        vec![
+            f32in(vec![c(5), c(3), c(7)]),
+            f32in(vec![c(1), sym(90), c(7)]),
+            f32in(vec![c(1), sym(90), sym(90)]),
+        ],
+        22,
+    );
+    assert_eq!(out_shape(&outputs), vec![c(5), c(1), c(3), sym(90)]);
+    assert_eq!(
+        outputs[1].type_info.as_ref().unwrap().shape,
+        vec![c(1), c(3), sym(90)]
+    );
 }
 
 #[test]

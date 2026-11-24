@@ -308,6 +308,37 @@ mod tests {
     }
 
     #[test]
+    fn rnn_consumes_coefficients_only_for_activations_that_use_them() {
+        let mut node = node();
+        node.attributes.extend([
+            (
+                "direction".into(),
+                Attribute::String(b"bidirectional".to_vec()),
+            ),
+            (
+                "activations".into(),
+                Attribute::Strings(vec![b"Relu".to_vec(), b"Affine".to_vec()]),
+            ),
+            ("activation_alpha".into(), Attribute::Floats(vec![0.5])),
+            ("activation_beta".into(), Attribute::Floats(vec![0.25])),
+        ]);
+        let x = Owned::f32(&[1, 1, 1], &[1.]);
+        let w = Owned::f32(&[2, 1, 1], &[1., 1.]);
+        let r = Owned::zeros_f32(&[2, 1, 1]);
+        let mut unused = Owned::zeros_f32(&[1, 2, 1, 1]);
+        let mut yh = Owned::zeros_f32(&[2, 1, 1]);
+        let k = CpuExecutionProvider::new()
+            .get_kernel(&node, &[], 22)
+            .unwrap();
+        k.execute(
+            &[x.view(), w.view(), r.view()],
+            &mut [unused.view_mut().mark_absent(), yh.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(to_dense::<f32>(&yh.view()).unwrap(), [1., 0.75]);
+    }
+
+    #[test]
     fn rnn_zero_time_and_opset_dtype_gate() {
         let ep = CpuExecutionProvider::new();
         let mut node = node();
