@@ -670,6 +670,41 @@ Host, not executed; device arithmetic, lifetime behavior and performance remain
 unmeasured. Its retained-artifact owner now uses the provider's native domain
 for admission, ownership and structured deferred settlement.
 
+### Immutable int4 interleave ownership
+
+Interleave conversion requires explicit constant-input metadata for packed B.
+Dynamic packed weights use the ordinary GEMV, including in-place updates at an
+address already present in the conversion cache. Paged weights also bypass the
+optimization because their source retirement does not invalidate this cache.
+
+Each runtime cache entry owns a native allocation with role Weights, admitted
+through the provider's selected domain. Removing a source key marks its entry
+invalid before unlocking, then drops the cache's owner outside the lock. This
+also handles offset views and multiple lengths of one source allocation.
+Last-owner retirement uses the existing compute/copy completion queue; there
+is no cache-specific raw free, global drain, or retired-pointer collection.
+Failed conversions and racing duplicate conversions follow that same path.
+
+A kernel retains one prepared entry. Warm execution borrows its ArcSwap guard
+and checks source signature, runtime identity and validity, without a shared
+cache lookup or quota request/return. A changed entry publishes only after
+successful GEMV submission. Graph resources pin the owning entry, so source
+invalidation and a later kernel binding cannot overwrite an old graph's bytes.
+A kernel can retain an invalid entry until rebinding or destruction; graphs can
+retain it until retirement. Source invalidation therefore revokes cache reuse,
+not necessarily physical residency immediately. No cross-kernel invalidation
+registry or second accounting ledger is introduced.
+
+Actual stream-capture observation requires the precise registered entry owner;
+a missing pin, capture-time preparation or failed submission propagates an
+error and clears capture readiness. The new capture-status query and ArcSwap
+read cost have not been measured. Deterministic Host tests cover recycled
+addresses, old graph pins, recursive retirement outside cache locks and failed
+submitted conversion. The GPU fixture covers native wiring, dynamic in-place
+updates, warm allocation counters, missing pins and independent graph replay;
+it is compiled/listed here, not executed on this CPU-only host. CUDA arithmetic,
+asynchronous execution and throughput still require a device runner.
+
 ### CUDA quantized MatMul accuracy-4 decode activation scratch
 
 The F32 single-row int4 accuracy-4 block-32 route borrows padded int8 activation
@@ -749,8 +784,8 @@ workspace retirement, and partial submission errors retain the original
 provider's deferred-release/settlement contract. BF16_DIRECT_OUT restoration
 remains before error propagation.
 
-The immutable conversion cache and Marlin caches still require separate
-governed-ownership work. This migration adds no pool,
+Immutable conversion and Marlin artifacts use the native allocation domain;
+interleave ownership is described above. Workspace migration adds no pool,
 quota protocol or public EP trait hook. The generic ORT adapter now serves
 nonzero SessionPersistent requests through its registered state-owned lane;
 see the [adapter contract](#ort-persistent-workspace-adapter). Native sessions
