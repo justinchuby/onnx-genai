@@ -1,5 +1,9 @@
 #![cfg(feature = "cuda")]
 
+#[cfg(feature = "gpu-tests")]
+#[path = "packed_shape_only/cases.rs"]
+mod packed_shape_only_cases;
+
 use std::sync::Arc;
 
 use onnx_runtime_ep_api::{
@@ -12,6 +16,33 @@ use onnx_runtime_ir::{DataType, Graph, Node, NodeId, Shape, TensorLayout, static
 use onnx_runtime_loader::WeightStore;
 use onnx_runtime_session::Tensor;
 use onnx_runtime_session::hetero::{ProviderPlacement, execute, plan};
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA; enable gpu-tests")]
+fn packed_shape_only_cuda_no_fallback() {
+    #[cfg(feature = "gpu-tests")]
+    {
+        use onnx_runtime_session::InferenceSession;
+        use std::path::Path;
+
+        let ep = Arc::new(CudaExecutionProvider::initialized(0).expect("initialize physical CUDA"));
+        packed_shape_only_cases::assert_transport(
+            |graph| {
+                InferenceSession::from_graph_with_provider(
+                    graph,
+                    Arc::new(WeightStore::new()),
+                    Path::new("."),
+                    ep.clone(),
+                    None,
+                )
+                .expect("build native CUDA shape-only session")
+            },
+            DeviceId::cuda(0),
+        );
+    }
+    #[cfg(not(feature = "gpu-tests"))]
+    panic!("requires CUDA; enable gpu-tests");
+}
 
 struct CudaDecliningAbs {
     inner: CudaExecutionProvider,

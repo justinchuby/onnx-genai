@@ -265,10 +265,14 @@ CUDA_PLUGIN_EXPECTED_TESTS = frozenset(
 )
 SESSION_PACKAGE = "onnx-runtime-session"
 SESSION_HETERO_TARGET = "hetero_cuda_gpu"
+SESSION_HETERO_SOURCE = ROOT / "crates" / SESSION_PACKAGE / "tests" / f"{SESSION_HETERO_TARGET}.rs"
 SESSION_BASE_FEATURES = "cuda,cuda-13000"
 SESSION_GPU_FEATURES = "gpu-tests,cuda-13000"
 SESSION_HETERO_EXPECTED_TESTS = frozenset(
-    {"cuda_cpu_cuda_chain_executes_on_both_real_providers"}
+    {
+        "cuda_cpu_cuda_chain_executes_on_both_real_providers",
+        "packed_shape_only_cuda_no_fallback",
+    }
 )
 ENGINE_PACKAGE = "onnx-genai-engine"
 ENGINE_DEFAULT_OFF_TARGET = "native_cuda_default_off_state_capture_gpu"
@@ -381,9 +385,14 @@ def policed_cuda_targets() -> list[Path]:
     reporting on a set nobody checks -- so the enumeration is shared to make
     that divergence unrepresentable rather than merely unlikely.
     """
-    return [
+    targets = [
         path for targets in policed_cuda_targets_by_dir().values() for path in targets
     ]
+    # This session target is built separately from the CUDA crate inventories.
+    # Check its test attributes here too; the named census reports a missing file.
+    if SESSION_HETERO_SOURCE.is_file():
+        targets.append(SESSION_HETERO_SOURCE)
+    return targets
 
 
 # `ignore` as an attribute token, not as English. The first version of this
@@ -1224,6 +1233,18 @@ def named_inventory_errors(
             f"{label}: test(s) are not recorded in the expected inventory: {unexpected}"
         )
     return errors
+
+
+def session_source_inventory_errors() -> list[str]:
+    path = SESSION_HETERO_SOURCE
+    names = (
+        frozenset(item.name for item in test_items(path.read_text(encoding="utf-8")))
+        if path.is_file()
+        else frozenset()
+    )
+    return named_inventory_errors(
+        str(path.relative_to(ROOT)), names, SESSION_HETERO_EXPECTED_TESTS
+    )
 
 
 def expected_test_inventory_errors(
@@ -2211,13 +2232,14 @@ def main() -> int:
 
     if args.source_scan:
         by_dir = policed_cuda_targets_by_dir()
-        policed = [path for targets in by_dir.values() for path in targets]
+        policed = policed_cuda_targets()
         source_errors = (
             scan_source_for_missing_ignores()
             + scan_source_for_inventory_drift()
             + scan_source_for_suite_isolation()
             + census_errors(by_dir)
             + expected_cuda_target_errors(by_dir)
+            + session_source_inventory_errors()
             + expected_always_run_source_errors()
         )
         if source_errors:
@@ -2244,6 +2266,7 @@ def main() -> int:
         + scan_source_for_suite_isolation()
         + census_errors(policed_cuda_targets_by_dir())
         + expected_cuda_target_errors(policed_cuda_targets_by_dir())
+        + session_source_inventory_errors()
         + expected_always_run_source_errors()
     )
     for crate in CUDA_CRATES:
