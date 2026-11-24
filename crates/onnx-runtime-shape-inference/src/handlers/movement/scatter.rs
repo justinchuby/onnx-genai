@@ -1,4 +1,7 @@
-use onnx_runtime_ir::{Attribute, DataType, scatter::ScatterReduction};
+use onnx_runtime_ir::{
+    Attribute, DataType,
+    scatter::{ScatterReduction, validate_nd_index_type},
+};
 
 use crate::context::InferenceContext;
 use crate::dim_expr::DimExpr;
@@ -42,23 +45,23 @@ pub fn scatter_elements(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
                 detail: format!("input must have the same rank {} as data", data.rank()),
             });
         }
-        if let Some(indices) = ctx.input_shape(1) {
-            for (i, (index_dim, data_dim)) in indices.iter().zip(&data.shape).enumerate() {
-                if i != axis
-                    && let (Some(a), Some(b)) = (index_dim.as_const(), data_dim.as_const())
-                    && a > b
-                {
-                    return Err(ShapeInferError::Invalid {
-                        op: ctx.op().into(),
-                        detail: format!(
-                            "indices dimension {a} exceeds data dimension {b} at non-scatter axis {i}"
-                        ),
-                    });
-                }
+    }
+    if let Some(indices) = ctx.input_shape(1) {
+        for (i, (index_dim, data_dim)) in indices.iter().zip(&data.shape).enumerate() {
+            if i != axis
+                && let (Some(a), Some(b)) = (index_dim.as_const(), data_dim.as_const())
+                && a > b
+            {
+                return Err(ShapeInferError::Invalid {
+                    op: ctx.op().into(),
+                    detail: format!(
+                        "indices dimension {a} exceeds data dimension {b} at non-scatter axis {i}"
+                    ),
+                });
             }
-            if let Some(updates) = ctx.input_shape(2) {
-                check_known_dims(ctx.op(), updates, indices.iter())?;
-            }
+        }
+        if let Some(updates) = ctx.input_shape(2) {
+            check_known_dims(ctx.op(), updates, indices.iter())?;
         }
     }
     ctx.set_output_type(0, data);
@@ -71,6 +74,14 @@ pub fn scatter_nd(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         return Ok(());
     };
     validate_reduction(ctx, data.dtype)?;
+    if let Some(indices) = ctx.input_type(1) {
+        validate_nd_index_type("ScatterND", ctx.opset(&ctx.node.domain), indices.dtype).map_err(
+            |detail| ShapeInferError::Invalid {
+                op: ctx.op().into(),
+                detail,
+            },
+        )?;
+    }
     if data.rank() == 0 {
         return Err(ShapeInferError::InvalidRank {
             op: "ScatterND".into(),

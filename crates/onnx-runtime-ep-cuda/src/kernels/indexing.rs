@@ -320,6 +320,16 @@ DEFINE_SCATTER_ND_TYPES(__nv_bfloat16, bf16, scatter_nd_float_impl)
 using U64 = unsigned long long;
 struct FloatMean { double sum; U64 count; };
 struct IntMean { U64 low, high, count; };
+template <typename Data> __device__ Data scatter_mean_store(double value);
+template <> __device__ float scatter_mean_store<float>(double value) { return (float)value; }
+#ifdef NXRT_HAS_CUDA_HALF_HEADERS
+template <> __device__ __half scatter_mean_store<__half>(double value) {
+  return __double2half(value);
+}
+template <> __device__ __nv_bfloat16 scatter_mean_store<__nv_bfloat16>(double value) {
+  return __double2bfloat16(value);
+}
+#endif
 template <typename Data> struct Mean {
   using State = FloatMean;
   static __device__ void add(State* state, Data value) {
@@ -327,8 +337,8 @@ template <typename Data> struct Mean {
     atomicAdd(&state->count, 1ull);
   }
   static __device__ Data finish(State state, Data original) {
-    return state.count == 0 ? original : scatter_store<Data>(
-        (float)((state.sum + (double)scatter_load(original)) / (state.count + 1)));
+    return state.count == 0 ? original : scatter_mean_store<Data>(
+        (state.sum + (double)scatter_load(original)) / (state.count + 1));
   }
 };
 
@@ -378,7 +388,26 @@ __device__ void scatter_mean_impl(
     const U64* meta, int rank, int axis_or_depth, U64 elements, U64 slice_length,
     unsigned int* capture_error) {
   const U64 stride = (U64)blockDim.x * gridDim.x;
-  for (U64 i = (U64)blockDim.x * blockIdx.x + threadIdx.x; i < elements; i += stride) {
+  const U64 thread = (U64)blockDim.x * blockIdx.x + threadIdx.x;
+  if (Nd && slice_length >= warpSize) {
+    // One lookup per tuple rather than per element, with coalesced slice I/O.
+    const unsigned int lane = threadIdx.x % warpSize;
+    const U64 tuples = elements / slice_length;
+    for (U64 tuple = thread / warpSize; tuple < tuples; tuple += stride / warpSize) {
+      U64 at = 0;
+      int valid = 0;
+      if (lane == 0) {
+        valid = scatter_nd_offset(indices, tuple, meta, rank, axis_or_depth, &at);
+        if (!valid && capture_error) atomicOr(capture_error, 8192u);
+      }
+      if (!__shfl_sync(0xffffffffu, valid, 0)) continue;
+      at = __shfl_sync(0xffffffffu, at, 0);
+      for (U64 element = lane; element < slice_length; element += warpSize)
+        Mean<Data>::add(states + at + element, updates[tuple * slice_length + element]);
+    }
+    return;
+  }
+  for (U64 i = thread; i < elements; i += stride) {
     U64 at;
     if (Nd) {
       const U64 tuple = i / slice_length;
@@ -1141,17 +1170,17 @@ impl Kernel for ScatterNdKernel {
             .ok_or_else(|| {
                 EpError::KernelFailed("cuda_ep ScatterND: slice length overflow".into())
             })?;
-        if !mean || tuples == 0 || slice_length == 0 {
+        if tuples != 0
+            && let Some(d) = data.shape[..index_depth].iter().position(|&n| n == 0)
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep ScatterND: nonempty index tuples cannot address zero-length data dimension {d}"
+            )));
+        }
+        if !mean || tuples == 0 {
             copy_scatter_data(&self.runtime, data, output)?;
         }
-        if tuples == 0 || slice_length == 0 {
-            // With an empty data axis no mean kernel can latch an invalid index.
-            // Nonempty index tensors in this case must fail before touching output.
-            if data.numel() == 0 && indices.numel() != 0 {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep ScatterElements: indices must be empty when data axis {axis} has length zero"
-                )));
-            }
+        if tuples == 0 || (slice_length == 0 && index_depth == 0) {
             if !capturing {
                 *warmed_signature = Some(signature);
             }
@@ -1168,13 +1197,22 @@ impl Kernel for ScatterNdKernel {
         })?;
         let metadata_candidate = metadata_cache.stage(&metadata_values, "ScatterND")?;
         let metadata_ptr = metadata_candidate.ptr("ScatterND")?;
-        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        // Empty slices still require tuple validation, but never access values.
+        let output_ptr = if slice_length == 0 {
+            0
+        } else {
+            cuptr(output.data_ptr_mut::<u8>() as *const c_void)
+        };
         let indices_ptr = if index_depth == 0 {
             0
         } else {
             cuptr(indices.data_ptr::<u8>() as *const c_void)
         };
-        let updates_ptr = cuptr(updates.data_ptr::<u8>() as *const c_void);
+        let updates_ptr = if slice_length == 0 {
+            0
+        } else {
+            cuptr(updates.data_ptr::<u8>() as *const c_void)
+        };
         let data_rank = i32::try_from(data.shape.len())
             .map_err(|_| EpError::KernelFailed("cuda_ep ScatterND: rank exceeds i32".into()))?;
         let index_depth = i32::try_from(index_depth).map_err(|_| {
@@ -1188,7 +1226,7 @@ impl Kernel for ScatterNdKernel {
         } else {
             0
         };
-        if mean {
+        if mean && slice_length != 0 {
             self.mean.launch(
                 &self.runtime,
                 capturing,
@@ -1334,6 +1372,11 @@ impl Kernel for ScatterElementsKernel {
                     "cuda_ep ScatterElements: indices dimension exceeds data at axis {d}"
                 )));
             }
+        }
+        if data.shape[axis] == 0 && indices.numel() != 0 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep ScatterElements: indices must be empty when data axis {axis} has length zero"
+            )));
         }
         let capturing = self.runtime.is_capturing()?;
         let signature = ScatterCaptureSignature {

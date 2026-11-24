@@ -204,7 +204,7 @@ fn run_warmed_capture(
     outputs: &[(DataType, Vec<usize>)],
     attrs: &[(&str, Attribute)],
 ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-    with_warmed_capture(op, opset, inputs, outputs, attrs, |_| {})
+    with_warmed_capture(op, opset, inputs, outputs, attrs, 1, |_| {})
 }
 
 fn with_warmed_capture(
@@ -213,6 +213,7 @@ fn with_warmed_capture(
     inputs: &[Tensor],
     outputs: &[(DataType, Vec<usize>)],
     attrs: &[(&str, Attribute)],
+    nodes_per_graph: usize,
     inspect: impl FnOnce(&CudaExecutionProvider),
 ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
@@ -313,7 +314,9 @@ fn with_warmed_capture(
     ep.runtime()
         .begin_graph_capture(&[kernel.as_ref()])
         .unwrap();
-    execute(&mut output_buffers);
+    for _ in 0..nodes_per_graph {
+        execute(&mut output_buffers);
+    }
     ep.runtime().end_graph_capture().unwrap();
     assert_eq!(ep.runtime().allocation_counts(), allocation_counts);
     ep.runtime().replay_graph().unwrap();
@@ -1021,6 +1024,46 @@ fn scatter_opset29_int32_nd_add_and_empty_tuple_mean() {
     let expected = vec![raw(&[3_f32, 4., 5., 6.])];
     assert_eq!(run("ScatterND", 29, &inputs, &outputs, &mean), expected);
     assert_eq!(run_cpu("ScatterND", 29, &inputs, &outputs, &mean), expected);
+
+    let empty_slice = [
+        tensor::<f32>(DataType::Float32, &[2, 0], &[]),
+        tensor(DataType::Int32, &[1, 1], &[-1_i32]),
+        tensor::<f32>(DataType::Float32, &[1, 0], &[]),
+    ];
+    let (eager, replay) = run_warmed_capture(
+        "ScatterND",
+        29,
+        &empty_slice,
+        &[(DataType::Float32, vec![2, 0])],
+        &mean,
+    );
+    assert_eq!(eager, vec![Vec::<u8>::new()]);
+    assert_eq!(replay, eager);
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+#[test]
+fn scatter_opset29_half_mean_rounds_directly() {
+    let inputs = [
+        tensor(DataType::Float16, &[1], &[f16::from_f32(228.125)]),
+        tensor(DataType::Int32, &[2], &[0_i32, -1]),
+        tensor(
+            DataType::Float16,
+            &[2],
+            &[f16::from_f32(847.), f16::from_bits(0x8234)],
+        ),
+    ];
+    let attrs = [("reduction", Attribute::String(b"mean".to_vec()))];
+    let outputs = [(DataType::Float16, vec![1])];
+    let expected = vec![raw(&[0x5d99_u16])];
+    assert_eq!(
+        run("ScatterElements", 29, &inputs, &outputs, &attrs),
+        expected
+    );
+    assert_eq!(
+        run_cpu("ScatterElements", 29, &inputs, &outputs, &attrs),
+        expected
+    );
 }
 
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
@@ -1101,21 +1144,22 @@ fn scatter_opset29_mean_gpu_timing() {
             attrs.push(("axis", Attribute::Int(-1)));
         }
         let outputs = [(DataType::Float32, shape.to_vec())];
-        let (_, actual) = with_warmed_capture(op, 29, &inputs, &outputs, &attrs, |ep| {
+        const NODES: usize = 32;
+        let (_, actual) = with_warmed_capture(op, 29, &inputs, &outputs, &attrs, NODES, |ep| {
             let runtime = ep.runtime();
             let stream = runtime.stream();
             let start = stream.context().new_event(Some(CU_EVENT_DEFAULT)).unwrap();
             let end = stream.context().new_event(Some(CU_EVENT_DEFAULT)).unwrap();
             // Batch graph replays between device events; no upload, download,
             // JIT, allocation or CPU index validation in the measured interval.
-            const REPLAYS: usize = 256;
+            const REPLAYS: usize = 32;
             let time = || {
                 start.record(stream).unwrap();
                 for _ in 0..REPLAYS {
                     runtime.replay_graph().unwrap();
                 }
                 end.record(stream).unwrap();
-                f64::from(start.elapsed_ms(&end).unwrap()) * 1_000.0 / REPLAYS as f64
+                f64::from(start.elapsed_ms(&end).unwrap()) * 1_000.0 / (NODES * REPLAYS) as f64
             };
             let ramp = std::time::Instant::now();
             while ramp.elapsed().as_secs() < 8 {
