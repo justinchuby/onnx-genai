@@ -360,7 +360,7 @@ Both declare `SessionPersistent` for all shapes, and both `execute()` and
 
 | Kernel | Site |
 |---|---|
-| `com.microsoft` `Attention` cuBLASLt/softmax scratch | `attention.rs:973`, registered at `kernels/mod.rs:946` |
+| `com.microsoft` `Attention` cuBLASLt/softmax scratch | `attention.rs` (`blas_softmax_scratch_layout`), registered in `kernels/mod.rs` via `AttentionFactory` |
 | default-domain `Attention` (opset 23/24/25) = `StandardAttention`, prefill / batched | `standard_attention.rs`, registered in `kernels/mod.rs` |
 
 These are the only paths where this change does something observable on

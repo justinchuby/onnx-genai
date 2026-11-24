@@ -50,8 +50,10 @@ tiles. The general f32/f16/bf16 kernel widens storage to f32 and uses an
 | causal / non-causal | yes | as above |
 | additive mask | shared, per-batch, or per-`(batch,head)` planes | as above |
 | decode (`Sq == 1`) | cuBLASLt/softmax fallback | always |
-| `D > 128`, unsupported dtype/layout/mask | cuBLASLt/softmax fallback | always |
-| longer prefill | fused can be forced for memory-bounded use | cuBLASLt/softmax is faster today |
+| `D > 128` with otherwise valid inputs | cuBLASLt/softmax fallback | always |
+| longer prefill | fused can be forced for memory-bounded use | cuBLASLt/softmax is faster on the measured shapes |
+
+Both routes reject unsupported dtypes, layouts, and masks during input validation.
 
 `AttentionKernel::new` applies the measured heuristic.
 `AttentionKernel::new_fused` and `new_blas_softmax` are parity/benchmark controls.
