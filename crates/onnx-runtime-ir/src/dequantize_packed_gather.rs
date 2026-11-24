@@ -293,19 +293,21 @@ mod tests {
         let err = recognize(&graph, graph.node(gather), &|_| false).unwrap_err();
         assert!(err.contains("whole number of 64-element"), "{err}");
 
+        let big = 1usize << 30;
+        let big_attr = 1i64 << 30;
         graph
             .value_mut(packed)
             .set_tensor_facts(DataType::Uint8, static_shape([0]));
         graph
             .value_mut(decoded)
-            .set_tensor_facts(DataType::Float32, static_shape([0, i64::MAX as usize, 64]));
+            .set_tensor_facts(DataType::Float32, static_shape([0, big, big, 64]));
         graph
             .value_mut(output)
-            .set_tensor_facts(DataType::Float32, static_shape([2, i64::MAX as usize, 64]));
-        graph
-            .node_mut(dq_id)
-            .attributes
-            .insert("shape".into(), Attribute::Ints(vec![0, i64::MAX, 64]));
+            .set_tensor_facts(DataType::Float32, static_shape([2, big, big, 64]));
+        graph.node_mut(dq_id).attributes.insert(
+            "shape".into(),
+            Attribute::Ints(vec![0, big_attr, big_attr, 64]),
+        );
         let err = recognize(&graph, graph.node(gather), &|_| false).unwrap_err();
         assert!(err.contains("overflows host indexing"), "{err}");
     }

@@ -237,7 +237,7 @@ fn dequantize_packed_gather_enforces_row_block_and_operand_contracts() {
             "whole number of 32-element",
         ),
         (
-            packed_gather(vec![0, i64::MAX, 32]),
+            packed_gather(vec![0, 1 << 30, 1 << 30, 32]),
             tin(DataType::Uint8, vec![c(0)]),
             tin(DataType::Int64, vec![c(2)]),
             "overflows host indexing",
