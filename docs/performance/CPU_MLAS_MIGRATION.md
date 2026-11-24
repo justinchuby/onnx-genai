@@ -1800,3 +1800,25 @@ costs about 0.75 ns more per call. Workspace requirements/backing stay unchanged
 Native still trails MLAS by about 1.48–2.04x in the paired shapes; the family
 remains ungraduated and the optional research reference remains. No full-model,
 CUDA or universal memory/performance conclusion follows from these fixtures.
+
+
+## ARM64 Softmax loop reuse
+
+The native NEON row core now uses four independent maximum chains, two
+independent exponential vectors while retaining the original vector sum order,
+and four-vector normalization. Maximum unrolling requires a complete 16-element
+tile; shorter rows avoid initializing/merging unused maximum chains. Scalar
+seams, runtime ISA detection, gradual underflow, nonfinite handling and exact
+in-place/disjoint-output behavior remain. The historical body is a compile-time
+test control; no production toggle, heap scratch, cache or quota operation is
+introduced.
+
+[Controlled M1 Max evidence](../benchmarks/arm64-softmax-loop-unroll/README.md)
+records rejected short-window clocks, matched-entry and outlining controls, and
+accepted whole-process CPU accounting. The original process matrix qualifies
+15/16 cells; one predeclared independent focused repeat qualifies the remaining
+cell while retaining its original failure. Qualified larger-row fixed-work
+processes use about 19–26% less CPU; this includes setup/validation and is not
+pure kernel or LLM throughput. Full native hashes match the old arithmetic.
+MLAS still wins the larger reference comparisons, so Softmax remains
+ungraduated and its optional reference remains. Other ISAs are unchanged.

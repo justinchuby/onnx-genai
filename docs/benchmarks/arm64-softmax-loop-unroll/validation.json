@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "base_commit": "22c060d6118bfa9f2ab397dceb5f3f5e49b8e192",
+  "measurement_parent": "4aae0c84dbfc056754b3f467dddfc23902132fbc",
+  "measurement_binary_sha256": "f5b3b4b946617ca6a2f573a6619f0e6b1909029b33ef3f4270af6f3b05b8edc3",
+  "runtime_source_matches_measured": true,
+  "final_rust_source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon.rs": "a03ec3cdfa7f7df5fae4a48328593adc6eb5283b62dc4ed828fedf6524565da8",
+    "crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon_unroll_tests.rs": "c03a94589e69ebfa830200e086f7488479836b3fa09efc924537ebaeb2ca3aba",
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "6eda0ba2fc04d5423ac110fa867c3894f6a01150bbe80c21a76f27befacecba7"
+  },
+  "checks": {
+    "native-full.log": {
+      "exit": 0,
+      "passed": 2056,
+      "ignored": 21,
+      "sha256": "a569f33c80c5ff878e0c3c7ddeeb9cad9e2fb6dd595bf7d02fb4499a1cf154e9"
+    },
+    "mlas-full.log": {
+      "exit": 0,
+      "passed": 2098,
+      "ignored": 37,
+      "sha256": "5c3d2aac17aa6fcb024cfde438da4d2fea98c64f650375266684d24c07e57c02"
+    },
+    "differential.log": {
+      "exit": 0,
+      "passed": 2,
+      "ignored": 0,
+      "sha256": "8dda18731b9ca214e768ad66a3e4077a953a5f6f596f02077d1cb45b59f9ebe9"
+    },
+    "moe-oracle-exact.log": {
+      "exit": 0,
+      "passed": 1,
+      "ignored": 0,
+      "sha256": "6708110a8f9b56a124e8a181e9dc4c3ad8a50151215753ed580bef9dac16acb0"
+    },
+    "native-clippy.log": {
+      "exit": 0,
+      "strict_all_targets": true,
+      "sha256": "9a48a6e9265cfa13c0557445b18d07b48280e035a8ac3fd3b171263e771cf17f"
+    },
+    "mlas-clippy.log": {
+      "exit": 0,
+      "strict_all_targets": true,
+      "sha256": "ebcb55b952a2c273ba2147060c5e88250ad67be25ba437be77383fe714c19787"
+    }
+  },
+  "fmt_all_check_exit": 0,
+  "diff_check_exit": 0,
+  "readers": {
+    "main": {
+      "processes": 528,
+      "qualified": 15,
+      "cells": 16,
+      "synthetic_malformed_controls_rejected": 9
+    },
+    "focused": {
+      "processes": 36,
+      "qualified": 1,
+      "cells": 1,
+      "synthetic_malformed_controls_rejected": 9
+    }
+  },
+  "scope": "Host CPU execution only. No CUDA or end-to-end inference performance claim. Final changes after measurement: diagnostic redundant-cast lint cleanup and runtime-input MoE test oracle; measured NEON runtime source unchanged."
+}
