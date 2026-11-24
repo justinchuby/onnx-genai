@@ -12,6 +12,25 @@ topologically ordered convex partitions through one ordinary child `Executor`
 per partition. The existing `HeterogeneousPlan` remains the authority for node
 assignment, partition boundaries, and cross-provider transfers.
 
+Standalone Rust callers can configure initialized native EPs with
+`SessionBuilder::execution_providers(ExecutionProviderOrder::new(primary).then(secondary))`
+or `InferenceSession::from_graph_with_providers`. Built-in and caller-supplied
+providers use the same `ExecutionProvider` contract. The session does not search
+for installed providers. Existing single-provider callers keep their placement behavior.
+
+For top-level numeric tensor graphs, the ordered path selects the first
+configured EP that covers the whole graph. If none does, `ONNX_GENAI_HETERO=1`
+permits eligible static splits across the configured EPs and the CPU fallback.
+If splitting is ineligible, the session uses the existing CUDA-to-CPU fallback,
+or an explicitly configured CPU fallback for other primaries. Provider build
+errors are not retried on another provider. Text, control flow, sequences, and
+compiled EPContext graphs retain their existing placement rules. The loader
+still uses the primary EP to decide which model-local calls to retain for
+fusion; secondary-only function retention is outside this slice.
+
+The flag is not a speed guarantee: automatic numeric splitting needs
+transfer-cost and end-to-end measurements across representative graphs and devices.
+
 The highest-priority provider that supports a node owns it. Unsupported-by-all
 errors report the node/domain/opset, provider order, and each provider's decline
 reason. Quantized GEMM prefill is no longer a forced CPU case: implemented CUDA
