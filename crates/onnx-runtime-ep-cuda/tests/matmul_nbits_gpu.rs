@@ -1221,154 +1221,225 @@ fn matmul_nbits_gpu_gemv_streams_random_packed_int4() {
 #[test]
 fn matmul_nbits_gpu_accuracy4_m1_capture_replay_is_bit_exact() {
     let ep = require_cuda();
-    let (k, n, block_size) = (1003usize, 37usize, 32usize);
-    let blocks = k.div_ceil(block_size);
-    let blob_size = block_size / 2;
-    let mut state = 0xb63a_0975_4c21_d8efu64;
-    let initial: Vec<f32> = (0..k)
-        .map(|_| (random_u32(&mut state) as f32 / u32::MAX as f32 - 0.5) * 4.0)
-        .collect();
-    let mutated: Vec<f32> = (0..k)
-        .map(|_| (random_u32(&mut state) as f32 / u32::MAX as f32 - 0.5) * 6.0)
-        .collect();
-    let packed: Vec<u8> = (0..n * blocks * blob_size)
-        .map(|_| random_u32(&mut state) as u8)
-        .collect();
-    let scales: Vec<f32> = (0..n * blocks)
-        .map(|_| 0.002 + (random_u32(&mut state) as f32 / u32::MAX as f32) * 0.08)
-        .collect();
+    for asymmetric in [false, true] {
+        let (k, n, block_size) = (1003usize, 37usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+        let blob_size = block_size / 2;
+        let mut state = 0xb63a_0975_4c21_d8efu64;
+        let initial: Vec<f32> = (0..k)
+            .map(|_| (random_u32(&mut state) as f32 / u32::MAX as f32 - 0.5) * 4.0)
+            .collect();
+        let mutated: Vec<f32> = (0..k)
+            .map(|_| (random_u32(&mut state) as f32 / u32::MAX as f32 - 0.5) * 6.0)
+            .collect();
+        let packed: Vec<u8> = (0..n * blocks * blob_size)
+            .map(|_| random_u32(&mut state) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..n * blocks)
+            .map(|_| 0.002 + (random_u32(&mut state) as f32 / u32::MAX as f32) * 0.08)
+            .collect();
 
-    let mut graph = Graph::new();
-    graph.opset_imports.insert("com.microsoft".into(), 1);
-    let a = graph.create_named_value("A", DataType::Float32, static_shape([1, k]));
-    let b = graph.create_named_value("B", DataType::Uint8, static_shape([n, blocks, blob_size]));
-    let scales_value =
-        graph.create_named_value("scales", DataType::Float32, static_shape([n, blocks]));
-    for value in [a, b, scales_value] {
-        graph.add_input(value);
-    }
-    let output = graph.create_named_value("Y", DataType::Float32, static_shape([1, n]));
-    let mut node = Node::new(
-        NodeId(0),
-        "MatMulNBits",
-        vec![Some(a), Some(b), Some(scales_value)],
-        vec![output],
-    );
-    node.domain = "com.microsoft".into();
-    node.attributes.insert("K".into(), Attribute::Int(k as i64));
-    node.attributes.insert("N".into(), Attribute::Int(n as i64));
-    node.attributes.insert("bits".into(), Attribute::Int(4));
-    node.attributes
-        .insert("block_size".into(), Attribute::Int(block_size as i64));
-    node.attributes
-        .insert("accuracy_level".into(), Attribute::Int(4));
-    let node = graph.insert_node(node);
-    graph.add_output(output);
-    let model = Model::new(&graph);
-    let kernel = ep.get_kernel(model.graph.node(node), &[], 1).unwrap();
-    assert!(!kernel.cuda_graph_compatible());
-
-    let runtime = ep.runtime();
-    let device = ep.device_id();
-    let inputs = [
-        tensor(DataType::Float32, &[1, k], &initial),
-        tensor(DataType::Uint8, &[n, blocks, blob_size], &packed),
-        tensor(DataType::Float32, &[n, blocks], &scales),
-    ];
-    let mut input_buffers = Vec::<DeviceBuffer>::new();
-    for input in &inputs {
-        let buffer = ep.allocate(input.bytes.len(), 256).unwrap();
-        // SAFETY: allocation size equals the source byte length.
-        unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr())).unwrap() };
-        input_buffers.push(buffer);
-    }
-    let input_strides: Vec<_> = inputs
-        .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
-        .collect();
-    let input_views: Vec<_> = inputs
-        .iter()
-        .zip(&input_buffers)
-        .zip(&input_strides)
-        .map(|((input, buffer), strides)| {
-            TensorView::new(
-                DevicePtr(buffer.as_ptr()),
-                input.dtype,
-                &input.shape,
-                strides,
-                device,
+        let zp_row_bytes = blocks.div_ceil(2);
+        let zero_points = vec![0x68u8; n * zp_row_bytes];
+        let mut graph = Graph::new();
+        graph.opset_imports.insert("com.microsoft".into(), 1);
+        let a = graph.create_named_value("A", DataType::Float32, static_shape([1, k]));
+        let b =
+            graph.create_named_value("B", DataType::Uint8, static_shape([n, blocks, blob_size]));
+        let scales_value =
+            graph.create_named_value("scales", DataType::Float32, static_shape([n, blocks]));
+        for value in [a, b, scales_value] {
+            graph.add_input(value);
+        }
+        let zero_point_value = asymmetric.then(|| {
+            graph.create_named_value(
+                "zero_points",
+                DataType::Uint8,
+                static_shape([n, zp_row_bytes]),
             )
-        })
-        .collect();
-    let mut output_buffer = ep.allocate(n * 4, 256).unwrap();
-    let output_shape = [1, n];
-    let output_strides = compute_contiguous_strides(&output_shape);
-    macro_rules! execute {
-        () => {{
-            let output_view = TensorMut::new(
-                DevicePtrMut(output_buffer.as_mut_ptr()),
-                DataType::Float32,
-                &output_shape,
-                &output_strides,
-                device,
-            );
-            kernel.execute(&input_views, &mut [output_view]).unwrap();
-        }};
+        });
+        if let Some(value) = zero_point_value {
+            graph.add_input(value);
+        }
+        let mut node_inputs = vec![Some(a), Some(b), Some(scales_value)];
+        if let Some(value) = zero_point_value {
+            node_inputs.push(Some(value));
+        }
+        let output = graph.create_named_value("Y", DataType::Float32, static_shape([1, n]));
+        let mut node = Node::new(NodeId(0), "MatMulNBits", node_inputs, vec![output]);
+        node.domain = "com.microsoft".into();
+        node.attributes.insert("K".into(), Attribute::Int(k as i64));
+        node.attributes.insert("N".into(), Attribute::Int(n as i64));
+        node.attributes.insert("bits".into(), Attribute::Int(4));
+        node.attributes
+            .insert("block_size".into(), Attribute::Int(block_size as i64));
+        node.attributes
+            .insert("accuracy_level".into(), Attribute::Int(4));
+        let node = graph.insert_node(node);
+        graph.add_output(output);
+        let model = Model::new(&graph);
+        let factory_counts = ep.runtime().allocation_counts();
+        let kernel = ep.get_kernel(model.graph.node(node), &[], 1).unwrap();
+        assert_eq!(
+            ep.runtime().allocation_counts(),
+            factory_counts,
+            "factory construction must not allocate activation scratch"
+        );
+        assert!(!kernel.cuda_graph_compatible());
+
+        let runtime = ep.runtime();
+        let device = ep.device_id();
+        let mut inputs = vec![
+            tensor(DataType::Float32, &[1, k], &initial),
+            tensor(DataType::Uint8, &[n, blocks, blob_size], &packed),
+            tensor(DataType::Float32, &[n, blocks], &scales),
+        ];
+        if asymmetric {
+            inputs.push(tensor(DataType::Uint8, &[n, zp_row_bytes], &zero_points));
+        }
+        let mut input_buffers = Vec::<DeviceBuffer>::new();
+        for input in &inputs {
+            let buffer = ep.allocate(input.bytes.len(), 256).unwrap();
+            // SAFETY: allocation size equals the source byte length.
+            unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr())).unwrap() };
+            input_buffers.push(buffer);
+        }
+        let input_strides: Vec<_> = inputs
+            .iter()
+            .map(|input| compute_contiguous_strides(&input.shape))
+            .collect();
+        let input_views: Vec<_> = inputs
+            .iter()
+            .zip(&input_buffers)
+            .zip(&input_strides)
+            .map(|((input, buffer), strides)| {
+                TensorView::new(
+                    DevicePtr(buffer.as_ptr()),
+                    input.dtype,
+                    &input.shape,
+                    strides,
+                    device,
+                )
+            })
+            .collect();
+        let mut output_buffer = ep.allocate(n * 4, 256).unwrap();
+        let output_shape = [1, n];
+        let output_strides = compute_contiguous_strides(&output_shape);
+        let output_metadata = [onnx_runtime_ep_api::OutputMetadata::tensor(
+            DataType::Float32,
+            &output_shape,
+        )];
+        let requirement =
+            common::runtime_workspace_requirement(kernel.as_ref(), &input_views, &output_metadata)
+                .unwrap();
+        let mut workspace = None;
+        let workspace_view = common::prepare_workspace(&ep, requirement, &mut workspace).unwrap();
+        assert!(workspace_view.is_some());
+        macro_rules! execute_result {
+            ($view:expr) => {{
+                let output_view = TensorMut::new(
+                    DevicePtrMut(output_buffer.as_mut_ptr()),
+                    DataType::Float32,
+                    &output_shape,
+                    &output_strides,
+                    device,
+                );
+                kernel.execute_with_workspace(&input_views, &mut [output_view], $view)
+            }};
+        }
+        macro_rules! execute {
+            () => {
+                execute_result!(workspace_view).unwrap()
+            };
+        }
+        assert!(
+            execute_result!(None)
+                .unwrap_err()
+                .to_string()
+                .contains("prepare the complete MatMulNBits requirement")
+        );
+        assert!(!kernel.cuda_graph_compatible());
+        execute!();
+        assert!(kernel.cuda_graph_compatible());
+        let mutated_bytes = typed_bytes(&mutated);
+        // SAFETY: the first input allocation exactly covers the activation bytes.
+        unsafe {
+            runtime
+                .htod(&mutated_bytes, cuptr(input_buffers[0].as_ptr()))
+                .unwrap()
+        };
+        execute!();
+        let mut eager = vec![0u8; n * 4];
+        // SAFETY: the output allocation exactly covers `eager`.
+        unsafe {
+            runtime
+                .dtoh(&mut eager, cuptr(output_buffer.as_ptr()))
+                .unwrap()
+        };
+
+        let initial_bytes = typed_bytes(&initial);
+        // SAFETY: the first input allocation exactly covers the activation bytes.
+        unsafe {
+            runtime
+                .htod(&initial_bytes, cuptr(input_buffers[0].as_ptr()))
+                .unwrap()
+        };
+        let allocation_counts = runtime.allocation_counts();
+        runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+        let missing_pin = execute_result!(workspace_view).unwrap_err().to_string();
+        runtime.abort_graph_capture().unwrap();
+        assert!(
+            missing_pin.contains("real workspace owner"),
+            "{missing_pin}"
+        );
+        assert!(!kernel.cuda_graph_compatible());
+        execute!();
+        let pin = workspace
+            .as_ref()
+            .unwrap()
+            .device_graph_resource()
+            .unwrap()
+            .expect("prepared workspace must carry a real provider owner");
+        runtime
+            .begin_graph_capture_with_resources(&[kernel.as_ref()], vec![pin])
+            .unwrap();
+        execute!();
+        runtime.end_graph_capture().unwrap();
+        assert!(runtime.has_graph_executable().unwrap());
+
+        // SAFETY: the first input allocation exactly covers the activation bytes.
+        unsafe {
+            runtime
+                .htod(&mutated_bytes, cuptr(input_buffers[0].as_ptr()))
+                .unwrap()
+        };
+        for _ in 0..3 {
+            let view = workspace_view.unwrap();
+            // SAFETY: the caller allocation covers the entire offered workspace.
+            unsafe {
+                runtime
+                    .htod(&vec![0xff; view.bytes()], cuptr(view.ptr().0.cast_const()))
+                    .unwrap()
+            };
+            runtime.replay_graph().unwrap();
+            let mut replayed = vec![0u8; n * 4];
+            // SAFETY: output_buffer holds exactly n f32 output values.
+            unsafe {
+                runtime
+                    .dtoh(&mut replayed, cuptr(output_buffer.as_ptr()))
+                    .unwrap()
+            };
+            assert_eq!(replayed, eager, "asymmetric={asymmetric}");
+        }
+        assert_eq!(runtime.allocation_counts(), allocation_counts);
+        assert!(runtime.reset_graph().unwrap());
+        ep.deallocate_workspace(workspace.take().unwrap()).unwrap();
+        drop(input_views);
+        for buffer in input_buffers {
+            ep.deallocate(buffer).unwrap();
+        }
+        ep.deallocate(output_buffer).unwrap();
     }
-
-    execute!();
-    assert!(kernel.cuda_graph_compatible());
-    let mutated_bytes = typed_bytes(&mutated);
-    // SAFETY: the first input allocation exactly covers the activation bytes.
-    unsafe {
-        runtime
-            .htod(&mutated_bytes, cuptr(input_buffers[0].as_ptr()))
-            .unwrap()
-    };
-    execute!();
-    let mut eager = vec![0u8; n * 4];
-    // SAFETY: the output allocation exactly covers `eager`.
-    unsafe {
-        runtime
-            .dtoh(&mut eager, cuptr(output_buffer.as_ptr()))
-            .unwrap()
-    };
-
-    let initial_bytes = typed_bytes(&initial);
-    // SAFETY: the first input allocation exactly covers the activation bytes.
-    unsafe {
-        runtime
-            .htod(&initial_bytes, cuptr(input_buffers[0].as_ptr()))
-            .unwrap()
-    };
-    let allocation_counts = runtime.allocation_counts();
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
-    execute!();
-    runtime.end_graph_capture().unwrap();
-    assert!(runtime.has_graph_executable().unwrap());
-
-    // SAFETY: the first input allocation exactly covers the activation bytes.
-    unsafe {
-        runtime
-            .htod(&mutated_bytes, cuptr(input_buffers[0].as_ptr()))
-            .unwrap()
-    };
-    runtime.replay_graph().unwrap();
-    let mut replayed = vec![0u8; n * 4];
-    // SAFETY: the output allocation exactly covers `replayed`.
-    unsafe {
-        runtime
-            .dtoh(&mut replayed, cuptr(output_buffer.as_ptr()))
-            .unwrap()
-    };
-    assert_eq!(replayed, eager);
-    assert_eq!(runtime.allocation_counts(), allocation_counts);
-    assert!(runtime.reset_graph().unwrap());
-    drop(input_views);
-    for buffer in input_buffers {
-        ep.deallocate(buffer).unwrap();
-    }
-    ep.deallocate(output_buffer).unwrap();
 }
 
 #[cfg_attr(
