@@ -1189,6 +1189,7 @@ impl NativeDecodeSession {
             compressed_state_stats.telemetry_updates = u64::from(device_allocations > 0);
         }
         Ok(Self {
+            state_identity: None,
             session,
             step_inputs,
             logits,

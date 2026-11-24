@@ -45,7 +45,9 @@ mod text_projection;
 pub mod tokenization;
 
 #[cfg(feature = "native-backend")]
-pub use engine::NativeSessionSnapshot;
+pub use engine::{NativeSessionSnapshot, NativeStateFileSummary};
+#[cfg(feature = "native-backend")]
+pub use native_decode::NativeStateFileLimits;
 
 pub use onnx_genai_scheduler::SchedulerAdmissionError;
 

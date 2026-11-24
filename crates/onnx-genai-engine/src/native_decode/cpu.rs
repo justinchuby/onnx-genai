@@ -37,19 +37,27 @@ pub(crate) struct DecodeCpuKvState {
 /// Only live rows are copied; unused physical capacity is not durable state.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CpuKvSnapshot {
-    logical_len: usize,
-    entries: Vec<CpuKvSnapshotEntry>,
+    pub(super) logical_len: usize,
+    pub(super) entries: Vec<CpuKvSnapshotEntry>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct CpuKvSnapshotEntry {
-    pair: (String, String),
-    shape: Vec<usize>,
-    dtype: DataType,
-    rows: Vec<Vec<u8>>,
+pub(super) struct CpuKvSnapshotEntry {
+    pub(super) pair: (String, String),
+    pub(super) shape: Vec<usize>,
+    pub(super) dtype: DataType,
+    pub(super) rows: Vec<Vec<u8>>,
 }
 
 impl DecodeCpuKvState {
+    pub(super) fn state_layout(
+        &self,
+    ) -> impl Iterator<Item = (&(String, String), &[usize], DataType)> {
+        self.pairs
+            .iter()
+            .zip(&self.bindings)
+            .map(|(pair, binding)| (pair, binding.physical_shape(), binding.dtype))
+    }
     pub(super) fn snapshot_bytes(&self) -> anyhow::Result<u64> {
         self.bindings.iter().try_fold(0u64, |total, binding| {
             let (blocks, _, row_bytes) = live_kv_geometry(binding, self.logical_len)?;
@@ -91,7 +99,7 @@ impl DecodeCpuKvState {
         })
     }
 
-    pub(super) fn restore_snapshot(&mut self, snapshot: &CpuKvSnapshot) -> anyhow::Result<()> {
+    pub(super) fn validate_snapshot_layout(&self, snapshot: &CpuKvSnapshot) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.bindings.len() == snapshot.entries.len()
                 && self.pairs.len() == snapshot.entries.len(),
@@ -101,8 +109,12 @@ impl DecodeCpuKvState {
         // have grown, but the pair, dtype and non-sequence axes must agree.
         for ((binding, pair), entry) in self.bindings.iter().zip(&self.pairs).zip(&snapshot.entries)
         {
-            let (blocks, _, row_bytes) = live_kv_geometry(binding, snapshot.logical_len)?;
+            let (blocks, _, row_bytes) = live_kv_geometry(binding, 0)?;
             let shape = binding.physical_shape();
+            let live_bytes = snapshot
+                .logical_len
+                .checked_mul(row_bytes)
+                .context("CPU KV snapshot live row size overflow")?;
             anyhow::ensure!(
                 pair == &entry.pair
                     && binding.dtype == entry.dtype
@@ -113,13 +125,18 @@ impl DecodeCpuKvState {
                         .enumerate()
                         .all(|(axis, (a, b))| axis == 2 || a == b)
                     && entry.rows.len() == blocks
-                    && entry
-                        .rows
-                        .iter()
-                        .all(|rows| rows.len() == snapshot.logical_len * row_bytes),
+                    && entry.rows.iter().all(|rows| rows.len() == live_bytes),
                 "CPU KV snapshot for '{}' has mismatched ports, dtype, geometry or live rows; restore with its original decoder",
                 pair.1
             );
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_snapshot(&mut self, snapshot: &CpuKvSnapshot) -> anyhow::Result<()> {
+        self.validate_snapshot_layout(snapshot)?;
+        for binding in &self.bindings {
+            live_kv_geometry(binding, snapshot.logical_len)?;
         }
         for (binding, entry) in self.bindings.iter_mut().zip(&snapshot.entries) {
             let (_, capacity, row_bytes) = live_kv_geometry(binding, snapshot.logical_len)?;

@@ -44,9 +44,13 @@ source conversation advances, resets or closes. Restore failures undo physical
 writes; failed undo poisons the affected conversations until reset.
 
 This is a prerequisite for slot persistence, not an implemented `/slots` API.
-Inactive histories and device state are explicitly refused. Persistent format,
-model identity validation, worker-owned slot identities, file admission and
-HTTP save/restore/erase remain required. Capability advertisement stays false.
+Inactive histories and device state are explicitly refused. Bounded, checksummed
+[Native state files](NATIVE_SESSION_STATE.md) now preserve that boundary across
+engine instances/restarts after load-time model/weight/metadata/tokenizer identity
+validation. Strict schema, layout, cursor, token and checksum checks precede
+transactional publication. CPU live KV can restore into a smaller initial
+capacity. Worker-owned slot identities, operator file admission and HTTP
+save/restore/erase remain required. Capability advertisement stays false.
 
 ## Design constraints
 
