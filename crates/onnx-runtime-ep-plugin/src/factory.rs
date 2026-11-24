@@ -55,6 +55,7 @@ pub struct ExportedFactory {
     /// Optional native stream handle for device EPs. Returned from
     /// `DeviceSyncStream::GetHandle`. For CUDA, this would be `cudaStream_t`.
     pub stream_handle: *mut std::os::raw::c_void,
+    workspace_execution: Option<crate::workspace::OrderedWorkspace>,
     /// Custom operator domains contributed by this factory. ORT borrows these
     /// pointers until the factory is released.
     pub custom_op_domains: Vec<*mut ort::OrtCustomOpDomain>,
@@ -193,6 +194,7 @@ fn build_factory(
         device_allocators: Mutex::new(HashMap::new()),
         shared_ep: None,
         stream_handle: ptr::null_mut(),
+        workspace_execution: None,
         custom_op_domains: Vec::new(),
     })
 }
@@ -419,6 +421,42 @@ pub unsafe fn create_ep_factories_for_shared_ep(
     factory.stream_handle = stream_handle;
 
     unsafe { emit_factory(factory, out_factories, max_factories, out_num) };
+    ok_status()
+}
+
+/// A non-synchronizing execution-domain check run once per Compute, before any
+/// upload or kernel. It must not reenter Compute or allocation callbacks. Device
+/// integrations use this to reject external capture without caller-owned pins.
+pub type WorkspaceExecutionGuard = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// Register ordered use of persistent workspace for this factory's providers.
+/// No workspace is allocated here. Unregistered factories still support ORT
+/// step scratch, but reject nonzero persistent requests.
+///
+/// # Safety
+/// `factory` must be a live factory returned by this module, before creating EPs.
+/// For every compiled kernel, all workspace accesses (including helper streams
+/// and error paths) must complete synchronously or be ordered in one execution
+/// domain before subsequent uses on that compute state. Provider replacement and
+/// release must settle all outstanding uses before recycling backing. If a native
+/// stream is advertised, that domain must match it. Host locks, host-accessible
+/// memory and nonnull stream pointers alone do not establish these guarantees.
+/// If external graph capture is possible, `preflight` must reject it before any
+/// submission until a real graph-owned workspace pin contract is implemented.
+/// A rejected preflight retires the compute state; recreate it after correcting
+/// the execution mode. Synchronous providers may omit the callback.
+pub unsafe fn register_ordered_workspace_execution(
+    factory: *mut ort::OrtEpFactory,
+    preflight: Option<WorkspaceExecutionGuard>,
+) -> *mut ort::OrtStatus {
+    if factory.is_null() {
+        return fail_status(
+            "Register workspace execution: factory is null; register after successful factory creation and before CreateEp",
+        );
+    }
+    let exported = unsafe { &mut *factory.cast::<ExportedFactory>() };
+    exported.workspace_execution =
+        Some(unsafe { crate::workspace::OrderedWorkspace::new(preflight) });
     ok_status()
 }
 
@@ -893,6 +931,7 @@ unsafe extern "C" fn factory_create_ep(
         // this EP can trust it to say whether ORT's tensors are host-resident.
         let mut exported_ep = exported_ep;
         exported_ep.host_accessible = exported.device_support.host_accessible;
+        exported_ep.workspace_execution = exported.workspace_execution.clone();
 
         let ep_ptr = Box::into_raw(exported_ep);
         unsafe { *out_ep = ep_ptr.cast::<ort::OrtEp>() };
@@ -1281,6 +1320,8 @@ mod tests {
         shutdown_result: Result<(), &'static str>,
         initialize_result: Result<(), &'static str>,
         panic_on_shutdown: bool,
+        allocations: Arc<AtomicUsize>,
+        reject_allocations: Arc<std::sync::atomic::AtomicBool>,
         deallocations: Arc<AtomicUsize>,
         drains: Arc<AtomicUsize>,
     }
@@ -1332,6 +1373,12 @@ mod tests {
             Err(EpError::KernelFailed("mock".into()))
         }
         fn allocate(&self, size: usize, alignment: usize) -> EpResult<DeviceBuffer> {
+            self.allocations.fetch_add(1, Ordering::SeqCst);
+            if self.reject_allocations.load(Ordering::SeqCst) {
+                return Err(EpError::KernelFailed(
+                    "planned workspace allocation failure".into(),
+                ));
+            }
             let layout = std::alloc::Layout::from_size_align(size.max(1), alignment)
                 .map_err(|error| EpError::KernelFailed(error.to_string()))?;
             let pointer = unsafe { std::alloc::alloc(layout) };
@@ -1388,6 +1435,8 @@ mod tests {
             shutdown_result,
             initialize_result: Ok(()),
             panic_on_shutdown: false,
+            allocations: Arc::new(AtomicUsize::new(0)),
+            reject_allocations: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deallocations: Arc::new(AtomicUsize::new(0)),
             drains: Arc::new(AtomicUsize::new(0)),
         });
@@ -1418,6 +1467,8 @@ mod tests {
             shutdown_result: Ok(()),
             initialize_result,
             panic_on_shutdown: false,
+            allocations: Arc::new(AtomicUsize::new(0)),
+            reject_allocations: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deallocations: Arc::clone(deallocations),
             drains: Arc::clone(drains),
         })
@@ -1503,6 +1554,8 @@ mod tests {
             shutdown_result: result,
             initialize_result: Ok(()),
             panic_on_shutdown,
+            allocations: Arc::new(AtomicUsize::new(0)),
+            reject_allocations: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deallocations: Arc::new(AtomicUsize::new(0)),
             drains: Arc::new(AtomicUsize::new(0)),
         }))
@@ -1679,6 +1732,172 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    struct LaneFixture {
+        allocations: Arc<AtomicUsize>,
+        deallocations: Arc<AtomicUsize>,
+        reject: Arc<std::sync::atomic::AtomicBool>,
+        provider: crate::ep::EpHandle,
+    }
+    impl LaneFixture {
+        fn new() -> Self {
+            let allocations = Arc::new(AtomicUsize::new(0));
+            let deallocations = Arc::new(AtomicUsize::new(0));
+            let reject = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let facade = ExportedEp::new(Box::new(CountingEp {
+                shutdowns: Arc::new(AtomicUsize::new(0)),
+                drops: Arc::new(AtomicUsize::new(0)),
+                shutdown_result: Ok(()),
+                initialize_result: Ok(()),
+                panic_on_shutdown: false,
+                allocations: allocations.clone(),
+                deallocations: deallocations.clone(),
+                reject_allocations: reject.clone(),
+                drains: Arc::new(AtomicUsize::new(0)),
+            }));
+            Self {
+                allocations,
+                deallocations,
+                reject,
+                provider: facade.ep.clone(),
+            }
+        }
+        fn lane(&self) -> crate::workspace::WorkspaceLane {
+            // SAFETY: this fixture's CPU allocations are used synchronously.
+            crate::workspace::WorkspaceLane::new(
+                Some(self.provider.clone()),
+                Some(unsafe { crate::workspace::OrderedWorkspace::new(None) }),
+            )
+        }
+    }
+
+    #[test]
+    fn persistent_workspace_lane_warm_fit_and_peak_preserve_capacity_and_alignment() {
+        let fixture = LaneFixture::new();
+        let mut lane = fixture.lane();
+        let first = lane.borrow(128, 16).unwrap();
+        for _ in 0..32 {
+            assert_eq!(lane.borrow(32, 8).unwrap().ptr().0, first.ptr().0);
+        }
+        assert_eq!(fixture.allocations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.deallocations.load(Ordering::SeqCst), 0);
+        lane.borrow(16, 64).unwrap();
+        for _ in 0..32 {
+            lane.borrow(128, 16).unwrap();
+        }
+        assert_eq!(
+            fixture.allocations.load(Ordering::SeqCst),
+            2,
+            "alignment growth must preserve peak capacity"
+        );
+        assert_eq!(fixture.deallocations.load(Ordering::SeqCst), 1);
+        drop(lane);
+        assert_eq!(fixture.deallocations.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn persistent_workspace_lane_growth_failure_consumes_old_once_and_refuses_retry() {
+        let fixture = LaneFixture::new();
+        let mut lane = fixture.lane();
+        lane.borrow(32, 16).unwrap();
+        fixture.reject.store(true, Ordering::SeqCst);
+        assert!(
+            lane.borrow(64, 16)
+                .unwrap_err()
+                .contains("planned workspace allocation failure")
+        );
+        assert_eq!(fixture.deallocations.load(Ordering::SeqCst), 1);
+        fixture.reject.store(false, Ordering::SeqCst);
+        assert!(
+            lane.borrow(16, 16)
+                .unwrap_err()
+                .contains("recreate the session")
+        );
+        assert_eq!(
+            fixture.allocations.load(Ordering::SeqCst),
+            2,
+            "failed old owner cannot be revived"
+        );
+        drop(lane);
+        assert_eq!(
+            fixture.deallocations.load(Ordering::SeqCst),
+            1,
+            "no duplicate release after consuming replacement"
+        );
+    }
+
+    #[test]
+    fn persistent_workspace_lane_requires_registration_and_real_provider() {
+        let fixture = LaneFixture::new();
+        let mut unknown =
+            crate::workspace::WorkspaceLane::new(Some(fixture.provider.clone()), None);
+        assert!(
+            unknown
+                .borrow(16, 16)
+                .unwrap_err()
+                .contains("registered execution ordering")
+        );
+        let mut missing = crate::workspace::WorkspaceLane::new(
+            None,
+            Some(unsafe { crate::workspace::OrderedWorkspace::new(None) }),
+        );
+        assert!(
+            missing
+                .borrow(16, 16)
+                .unwrap_err()
+                .contains("originating provider")
+        );
+        assert_eq!(fixture.allocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn persistent_workspace_lane_retired_execution_keeps_owner_until_release() {
+        let fixture = LaneFixture::new();
+        let mut lane = fixture.lane();
+        lane.borrow(64, 16).unwrap();
+        lane.retire("planned upload failure");
+        assert!(
+            lane.borrow(8, 8)
+                .unwrap_err()
+                .contains("planned upload failure")
+        );
+        assert_eq!(fixture.deallocations.load(Ordering::SeqCst), 0);
+        drop(lane);
+        assert_eq!(fixture.deallocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn persistent_workspace_lane_concurrent_states_never_alias() {
+        let fixture = LaneFixture::new();
+        let mut first = fixture.lane();
+        let mut second = fixture.lane();
+        let a = first.borrow(64, 16).unwrap();
+        let b = second.borrow(64, 16).unwrap();
+        assert_ne!(a.ptr().0, b.ptr().0);
+        let lane = Arc::new(Mutex::new(first));
+        let active = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let lane = lane.clone();
+                let active = active.clone();
+                scope.spawn(move || {
+                    for _ in 0..16 {
+                        let mut guard = lane.lock().unwrap();
+                        let view = guard.borrow(64, 16).unwrap();
+                        assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                        unsafe {
+                            std::ptr::write_bytes(view.ptr().0.cast::<u8>(), 7, view.bytes());
+                        }
+                        assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                    }
+                });
+            }
+        });
+        assert_eq!(fixture.allocations.load(Ordering::SeqCst), 2);
+        drop(lane);
+        drop(second);
+        assert_eq!(fixture.deallocations.load(Ordering::SeqCst), 2);
     }
 
     /// Normal teardown: ORT releases every other surface first, so the factory

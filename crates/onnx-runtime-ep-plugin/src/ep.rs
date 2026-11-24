@@ -191,6 +191,7 @@ pub struct ExportedEp {
     /// Defaults to `false` ("assume device"), the conservative direction: an EP
     /// built by a path that does not set it keeps the full memory-info scan.
     pub host_accessible: bool,
+    pub(crate) workspace_execution: Option<crate::workspace::OrderedWorkspace>,
 }
 
 /// Owns an `OrtKernelRegistry*` allocated via ORT's EP API.
@@ -230,6 +231,19 @@ impl Drop for OrtKernelRegistryHolder {
 }
 
 impl ExportedEp {
+    /// Wrap compiled kernel entries with this provider's lifetime, registered
+    /// execution ordering and tensor placement. The compiler attaches optional
+    /// routing and boundary-input staging before publishing the compute info.
+    pub fn wrap_compiled_kernels(
+        &self,
+        entries: Vec<crate::compute::CompiledKernelEntry>,
+    ) -> ExportedComputeInfo {
+        let mut info = ExportedComputeInfo::new(entries, Some(self.ep.clone()));
+        info.workspace_execution = self.workspace_execution.clone();
+        info.set_host_accessible(self.host_accessible);
+        info
+    }
+
     pub fn new(ep: Box<dyn ExecutionProvider>) -> Self {
         Self::new_with_registry(ep, None)
     }
@@ -317,6 +331,7 @@ impl ExportedEp {
             kernel_registry: registry,
             registry_entries: entries,
             host_accessible: false,
+            workspace_execution: None,
         }
     }
 }
@@ -1112,13 +1127,7 @@ fn ep_compile_inner(
             continue;
         }
 
-        // Wrap kernels in OrtNodeComputeInfo.
-        let mut info = ExportedComputeInfo::new(entries, Some(exported.ep.clone()));
-
-        // Placement is a property of the EP, decided by the factory when it
-        // registered the allocator; pass it down so `Compute` never has to ask
-        // ORT where a routed subgraph's intermediates belong.
-        info.set_host_accessible(exported.host_accessible);
+        let mut info = exported.wrap_compiled_kernels(entries);
 
         // Attach device staging so an interspersed CPU→device partition can
         // upload host-resident boundary inputs before launching (#982).

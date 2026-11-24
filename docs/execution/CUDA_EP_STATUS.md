@@ -23,10 +23,15 @@ Batty (Engine — PR #830 revision 4), Gaff (Review — evidence harness, revisi
 > below describe their pinned revisions. Native dynamic BF16 MatMul staging now
 > borrows governed workspace; the private `Bf16Scratch` arena has been removed.
 > See [the current memory contract](../memory/MEMORY_ARCHITECTURE.md#cuda-quantized-matmul-bf16-staging).
-> The generic ORT adapter still declines nonzero `SessionPersistent` requirements.
-> It does not yet serve the migrated BF16 path; caller-owned persistent workspace
-> support remains adapter integration work, with no raw fallback. This source
-> migration has not been validated on CUDA hardware.
+> The generic ORT adapter now serves nonzero `SessionPersistent` requests through
+> one provider-owned lane per ComputeState after explicit ordering registration.
+> Warm fitting requests make zero provider/issuer calls. CUDA performs one actual
+> stream-capture status query per Compute and rejects external capture without
+> caller-owned pins; no device synchronization is added. Host C ABI tests use
+> real governed backing, but this adapter change has not run on CUDA hardware,
+> and the status-query performance cost remains unmeasured. See the
+> [adapter contract](../memory/MEMORY_ARCHITECTURE.md#ort-persistent-workspace-adapter).
+> The decline ledger below remains historical evidence for its pinned revisions.
 
 ---
 

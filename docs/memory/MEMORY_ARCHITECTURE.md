@@ -160,37 +160,46 @@ referencing graph slots. This preserves the old owner on refusal. Host contracts
 cover the ownership, pressure and failure paths; CUDA execution and throughput
 still require a device runner.
 
-### ORT persistent workspace adapter: integration boundary
+### ORT persistent workspace adapter
 
-The ORT adapter currently serves `StepScoped` workspace from ORT scratch and
-still declines `SessionPersistent` backing. Native workspace migration does not
-establish plugin support. Compiled info and each compute state now retain the
-original provider independently; facade release cannot shut down an owned
-provider before those references end. Kernel resources drop before that final
-provider reference. Shared factory owners retain their existing teardown policy.
+The ORT adapter serves `StepScoped` workspace from ORT scratch and nonzero
+`SessionPersistent` workspace from the original provider only after explicit
+execution-domain registration. Unknown ordering is an actionable error, never
+`None` or a downgrade to ORT scratch. Compiled info and each compute state retain
+the provider independently. Facade release cannot shut down an owned provider
+before those references end; kernel resources drop before the final reference.
+Shared factory owners retain their existing teardown policy.
 
-The planned adapter owns one workspace lane per `ComputeState`, with exclusive
-access throughout `Compute`. Sequential nodes reuse the same capacity; concurrent
-states own independent capacity. Fitting requests borrow views without provider
-or issuer calls. Only growth uses the existing consuming `replace_workspace`
-operation, and teardown uses the original provider's release path. A failed
-replacement must not resurrect a consumed owner or refund unsettled storage.
-No per-node pool, quota ledger or new kernel resource protocol is needed.
+One exclusive workspace lane belongs to each `ComputeState`. Sequential nodes
+borrow the same retained peak; concurrent states own independent backing. Fitting
+requests make no provider or issuer calls. Growth preserves both capacity and
+alignment high-water marks using the existing consuming `replace_workspace`;
+teardown releases through the original provider. Failed replacement cannot
+resurrect a consumed owner or refund unsettled storage. Any failed Compute
+retires its lane, and a panic poisons its host lock, preventing later submissions.
+No per-node pool, quota ledger or new kernel resource protocol is added.
 
-Host exclusivity does not establish device execution order. Persistent reuse
-requires an explicit registration contract: synchronous completion, or one
-ordered execution domain covering every use of the workspace, including helper
-streams through explicit dependencies. The current shared-provider reference and
-native stream handle alone do not establish that contract. Unknown ordering must
-reject persistent requests; it must not add per-token synchronization. Growth and
-release still respect provider settlement and capture ownership.
+Host exclusivity does not prove device ordering. The unsafe factory registration
+contract requires synchronous completion or a fixed ordered execution domain
+covering all workspace uses, including dependencies from helper streams and error
+paths. Built-in CPU and CUDA plugins register explicitly. CUDA binds the proof
+and its preflight closure to the same constructed runtime and compute stream.
+Before uploads or execution, once per Compute, the closure queries the actual
+stream capture state and rejects active/unknown capture: ORT external graphs do
+not yet carry caller-workspace pins. This is a driver status query, not a device
+synchronization or provider/issuer call; its GPU performance cost is unmeasured.
+CPU requires no preflight callback. Provider settlement remains mandatory for
+growth and release even when device submissions are ordered.
 
-Keep the shared-provider mutex out of ORT callbacks and pressure callbacks.
-A responder that reacquires the same provider mutex during allocation would
-deadlock. Do not register a new pressure responder through that wrapper until
-its release capability can run without reentering the outer mutex. These adapter
-steps remain implementation work; Host lifecycle tests are not CUDA ordering or
-performance evidence.
+The adapter does not enroll retained state lanes in a new pressure responder.
+Shared-provider locking stays confined to backing creation/replacement/release,
+outside ORT callbacks. A responder that reentered that mutex during allocation
+would deadlock; idle-state pressure reclamation needs a release capability that
+does not reenter the outer mutex. State teardown returns backing to the existing
+provider path, whose retained physical pool stays charged until actual release.
+Host C ABI tests use real governed backing, zero-byte issuer positive controls,
+serial peak reuse, failure retirement and preflight refusal. They do not prove
+CUDA execution, asynchronous ordering, capture behavior or throughput.
 
 ### Workspace capture ownership
 
@@ -309,10 +318,10 @@ remains before error propagation.
 
 The immutable conversion cache, Marlin caches and generic f32 dequantized weights
 still require separate governed-ownership work. This migration adds no pool,
-quota protocol or public EP hook. The generic ORT adapter still declines
-nonzero SessionPersistent requirements; serving this migrated path there needs
-caller-owned persistent workspace integration. Native sessions and explicit
-workspace callers provide that ownership today. Device numerical, capture and
+quota protocol or public EP trait hook. The generic ORT adapter now serves
+nonzero SessionPersistent requests through its registered state-owned lane;
+see the [adapter contract](#ort-persistent-workspace-adapter). Native sessions
+and explicit workspace callers retain their existing ownership paths. Device numerical, capture and
 throughput validation remain pending; Host contracts and target compilation
 cannot prove them.
 
