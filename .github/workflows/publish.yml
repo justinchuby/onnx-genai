@@ -403,7 +403,7 @@ jobs:
     runs-on: ${{ matrix.platform.os }}
     env:
       CIBW_ARCHS: ${{ matrix.platform.archs }}
-      CIBW_BUILD: "cp311-*"
+      CIBW_BUILD: "cp312-*"
       CIBW_SKIP: "*-musllinux_*"
       # Do NOT vendor libonnxruntime. Windows/macOS wheel tags are already valid
       # for PyPI, so skip repair there; on Linux auditwheel retags the wheel
@@ -423,7 +423,7 @@ jobs:
           submodules: recursive
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
       # Keep release publishing on Rust stable deliberately: this follows Rust's
       # stability promise without freezing security fixes.
       - name: Install Rust stable toolchain
@@ -441,6 +441,10 @@ jobs:
       - name: Select build features
         shell: bash
         run: |
+          if [ "${{ matrix.package }}" = "onnx-genai-server" ]; then
+            # Native CLI startup requires no installed ORT wheel on any platform.
+            echo "CIBW_TEST_SKIP=" >> "$GITHUB_ENV"
+          fi
           if [ "${{ matrix.platform.cuda }}" != "true" ]; then
             echo "CIBW_CONFIG_SETTINGS=" >> "$GITHUB_ENV"
           elif [ "${{ matrix.package }}" = "onnx-genai-server" ]; then
@@ -448,6 +452,10 @@ jobs:
           else
             echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=cuda" >> "$GITHUB_ENV"
           fi
+
+      - name: Check Native CLI optional-library discovery
+        if: matrix.package == 'onnx-genai-server'
+        run: python -m unittest discover -s crates/onnx-genai-cli/tests -p test_python_launcher.py -v
 
       - name: Build and smoke-test wheel
         uses: pypa/cibuildwheel@v4.3.5

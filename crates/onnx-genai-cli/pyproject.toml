@@ -1,54 +1,39 @@
-# onnx-genai-server — the `onnx-genai` command-line tool + OpenAI-compatible
-# server, packaged via maturin.
-#
-# Installs a single `onnx-genai` console command (serve / generate / show /
-# list / version). The command runs in-process through the compiled
-# `_onnx_genai_server` extension module; a Python console entry point
-# (`onnx_genai_server:main`) loads the ONNX Runtime shared library from the
-# installed `onnxruntime` / `onnxruntime-gpu` wheel first, so ONNX Runtime is NOT
-# bundled — the tool uses whichever execution providers the user installed.
-#
-# Wheel: stable ABI `abi3`, tagged `cp310-abi3`. The ABI floor is 3.10, but the
-# supported minimum is Python 3.11 (enforced by requires-python and the
-# `onnxruntime` dependency, which ships no cp310 wheels).
+# Native-default CLI/server wheel. ORT libraries are optional reference/test
+# dependencies and are discovered without loading their Python packages.
+# Standard wheel: abi3-py310, built on CPython 3.12.
 [build-system]
 requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
 name = "onnx-genai-server"
-description = "onnx-genai command-line tool and OpenAI-compatible server (ONNX Runtime backend)"
-requires-python = ">=3.11"
+description = "Native ONNX command-line generation tool and OpenAI-compatible server"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Justin Chu" }]
 readme = "README.md"
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "License :: OSI Approved :: MIT License",
 ]
-# Default runtime: the CPU ONNX Runtime wheel on every platform, which the
-# launcher discovers to supply libonnxruntime. macOS additionally pulls the MLX
-# execution-provider plugin so Apple Silicon is fast out of the box. Install the
-# `cuda` extra (Windows/Linux) to swap in the GPU ONNX Runtime + CUDA runtime.
-dependencies = [
-    "onnxruntime>=1.32,<2",
-    "onnxruntime-ep-mlx>=0.27 ; platform_system == 'Darwin'",
-]
+# Native CPU execution has no Python runtime dependency.
+dependencies = []
 dynamic = ["version"]
 
 [project.optional-dependencies]
-# `pip install onnx-genai-server[cuda]` (Windows/Linux x86_64): CUDA is not
-# bundled — this pulls the GPU ONNX Runtime plus its CUDA 13 / cuDNN 9 pip
-# runtime. onnxruntime-gpu installs the same `onnxruntime` import package as the
-# CPU wheel, so it effectively replaces the default CPU runtime.
-cuda = ["onnxruntime-gpu[cuda,cudnn]>=1.32,<2 ; platform_system == 'Windows' or platform_system == 'Linux'"]
+# Reference testing only. ORT 1.32 wheels require Python 3.11+.
+ort = ["onnxruntime>=1.32,<2"]
+ort-cuda = ["onnxruntime-gpu[cuda,cudnn]>=1.32,<2 ; platform_system == 'Windows' or platform_system == 'Linux'"]
+# Explicit plugin installation; the launcher discovers its path without import.
+mlx = ["onnxruntime-ep-mlx>=0.27 ; platform_system == 'Darwin'"]
 
 [project.scripts]
-# The compiled CLI runs in-process; this launcher preloads ONNX Runtime first.
+# The compiled CLI selects the backend; Python supplies optional path hints.
 onnx-genai = "onnx_genai_server:main"
 
 [project.urls]
@@ -64,14 +49,11 @@ features = ["python", "pyo3/abi3-py310", "pyo3/extension-module"]
 strip = true
 
 [tool.cibuildwheel]
-# Build once on CPython 3.11 (our supported minimum). maturin emits a single
-# cp310-abi3 wheel from the abi3 feature; requires-python (>=3.11) keeps it off
-# 3.10 at install time.
-build = "cp311-*"
+# One CPython 3.12 build, usable on standard CPython 3.10+ via abi3.
+build = "cp312-*"
 skip = "*-musllinux_*"
-# Run the installed command to prove it loads ONNX Runtime from the onnxruntime
-# wheel and dispatches into the compiled CLI.
-test-command = "onnx-genai version"
+# Smoke-test the installed Native-default command with no ORT dependency.
+test-command = 'python "{project}/tests/python_wheel_smoke.py" "{project}/../../tests/fixtures/tiny-llm"'
 
 [tool.cibuildwheel.linux]
 # Linux wheel builds run inside a manylinux container, so provision Rust and
