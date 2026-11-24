@@ -450,13 +450,21 @@ fn compute_add_end_to_end() {
         shape_inference: ShapeInference::ElementwiseBroadcast,
         input_slots: vec![Some(0), Some(1)],
     };
-    let mut info = ExportedComputeInfo::new(vec![entry]);
+    let mut info = ExportedComputeInfo::new(vec![entry], None);
     let compute_fn = info.vtable.Compute.expect("Compute is null");
     let info_ptr = &mut info.vtable as *mut ort::OrtNodeComputeInfo;
     // Use a dummy kernel context pointer — our mocks use thread-local state.
     let dummy_ctx = 0xDEAD_BEEFusize as *mut ort::OrtKernelContext;
 
-    let status = unsafe { compute_fn(info_ptr, ptr::null_mut(), dummy_ctx) };
+    let mut compute_state = ptr::null_mut();
+    assert!(
+        unsafe { info.vtable.CreateState.unwrap()(info_ptr, ptr::null_mut(), &mut compute_state) }
+            .is_null()
+    );
+    let status = unsafe { compute_fn(info_ptr, compute_state, dummy_ctx) };
+    unsafe {
+        info.vtable.ReleaseState.unwrap()(info_ptr, compute_state);
+    }
     assert!(
         status.is_null(),
         "Compute returned error status (expected success for Add)"
@@ -514,13 +522,21 @@ fn compute_add_broadcast() {
         shape_inference: ShapeInference::ElementwiseBroadcast,
         input_slots: vec![Some(0), Some(1)],
     };
-    let mut info = ExportedComputeInfo::new(vec![entry]);
+    let mut info = ExportedComputeInfo::new(vec![entry], None);
 
     let compute_fn = info.vtable.Compute.unwrap();
     let info_ptr = &mut info.vtable as *mut ort::OrtNodeComputeInfo;
     let dummy_ctx = 0xDEAD_BEEFusize as *mut ort::OrtKernelContext;
 
-    let status = unsafe { compute_fn(info_ptr, ptr::null_mut(), dummy_ctx) };
+    let mut compute_state = ptr::null_mut();
+    assert!(
+        unsafe { info.vtable.CreateState.unwrap()(info_ptr, ptr::null_mut(), &mut compute_state) }
+            .is_null()
+    );
+    let status = unsafe { compute_fn(info_ptr, compute_state, dummy_ctx) };
+    unsafe {
+        info.vtable.ReleaseState.unwrap()(info_ptr, compute_state);
+    }
     assert!(status.is_null(), "Compute returned error for broadcast Add");
 
     STATE.with(|s| {
@@ -646,11 +662,19 @@ fn run_node(
         },
         input_slots: slots,
     };
-    let mut info = ExportedComputeInfo::new(vec![entry]);
+    let mut info = ExportedComputeInfo::new(vec![entry], None);
     let compute_fn = info.vtable.Compute.unwrap();
     let info_ptr = &mut info.vtable as *mut ort::OrtNodeComputeInfo;
     let dummy_ctx = 0xDEAD_BEEFusize as *mut ort::OrtKernelContext;
-    let status = unsafe { compute_fn(info_ptr, ptr::null_mut(), dummy_ctx) };
+    let mut compute_state = ptr::null_mut();
+    assert!(
+        unsafe { info.vtable.CreateState.unwrap()(info_ptr, ptr::null_mut(), &mut compute_state) }
+            .is_null()
+    );
+    let status = unsafe { compute_fn(info_ptr, compute_state, dummy_ctx) };
+    unsafe {
+        info.vtable.ReleaseState.unwrap()(info_ptr, compute_state);
+    }
     let ok = status.is_null();
     let (seen_in, seen_out) = SEEN.with(|c| {
         let c = c.borrow();

@@ -442,7 +442,11 @@ impl Kernel for DftKernel {
         self.run(inputs, outputs, None)
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         match self.resolve_from_metadata(inputs)? {
             Some(spec) => self.workspace_for(&spec),
             None => Ok(WorkspaceRequirement::NONE),
@@ -453,6 +457,7 @@ impl Kernel for DftKernel {
         &self,
         inputs: &[TensorView],
         _metadata: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
         self.workspace_for(&self.resolve_from_views(inputs)?)
     }

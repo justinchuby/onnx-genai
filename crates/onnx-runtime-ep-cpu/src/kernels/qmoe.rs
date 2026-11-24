@@ -158,7 +158,11 @@ fn grouped_input_workspace_bytes(shape: &[usize]) -> Result<usize> {
 }
 
 impl Kernel for QMoEKernel {
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         let input = inputs
             .first()
             .filter(|input| input.present)
@@ -2248,7 +2252,7 @@ mod tests {
                 .iter()
                 .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
                 .collect::<Vec<_>>();
-            let req = kernel.workspace_requirement(&metadata).unwrap();
+            let req = kernel.workspace_requirement(&metadata, &[]).unwrap();
             assert_eq!(
                 req.bytes, BYTES as u64,
                 "serial expert groups reuse input size, without k or E multiplication"
@@ -2311,20 +2315,23 @@ mod tests {
         let kernel = overflow_test_kernel();
         assert!(
             kernel
-                .workspace_requirement(&[])
+                .workspace_requirement(&[], &[])
                 .unwrap_err()
                 .to_string()
                 .contains("input 0")
         );
         for shape in [&[2, 3][..], &[1, 2, 3][..]] {
             let req = kernel
-                .workspace_requirement(&[TensorMetadata::new(DataType::Float32, shape, true)])
+                .workspace_requirement(&[TensorMetadata::new(DataType::Float32, shape, true)], &[])
                 .unwrap();
             assert_eq!(req.bytes, 24);
         }
         assert_eq!(
             kernel
-                .workspace_requirement(&[TensorMetadata::new(DataType::Float32, &[0, 16], true)])
+                .workspace_requirement(
+                    &[TensorMetadata::new(DataType::Float32, &[0, 16], true)],
+                    &[]
+                )
                 .unwrap()
                 .bytes,
             0
@@ -2332,7 +2339,10 @@ mod tests {
         for shape in [&[1, 16][..], &[1, 1, 16][..]] {
             assert_eq!(
                 kernel
-                    .workspace_requirement(&[TensorMetadata::new(DataType::Float32, shape, true)])
+                    .workspace_requirement(
+                        &[TensorMetadata::new(DataType::Float32, shape, true)],
+                        &[]
+                    )
                     .unwrap()
                     .bytes,
                 0
@@ -2345,7 +2355,7 @@ mod tests {
             TensorMetadata::new(DataType::Float32, &[usize::MAX, 2], true),
             TensorMetadata::new(DataType::Float32, &[isize::MAX as usize, 1], true),
         ] {
-            assert!(kernel.workspace_requirement(&[input]).is_err());
+            assert!(kernel.workspace_requirement(&[input], &[]).is_err());
         }
     }
 

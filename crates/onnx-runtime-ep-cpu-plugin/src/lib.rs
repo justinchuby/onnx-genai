@@ -153,7 +153,7 @@ pub unsafe extern "C" fn CreateEpFactories(
         // Runtime makes into the library.
         disable_persistent_decode_pool();
         let entries = build_kernel_registry_entries();
-        unsafe {
+        let status = unsafe {
             onnx_runtime_ep_plugin::factory::create_ep_factories_with_registry(
                 api_base,
                 out_factories_raw,
@@ -162,6 +162,23 @@ pub unsafe extern "C" fn CreateEpFactories(
                 || Box::new(CpuExecutionProvider::new()),
                 entries,
             )
+        };
+        if status.is_null()
+            && !out_factories_raw.is_null()
+            && max_factories > 0
+            && !out_num_raw.is_null()
+            && unsafe { *out_num_raw } > 0
+        {
+            // SAFETY: CPU kernels and their host workers join before returning;
+            // replacement/release use the same synchronous CPU provider.
+            unsafe {
+                onnx_runtime_ep_plugin::factory::register_ordered_workspace_execution(
+                    *out_factories_raw,
+                    None,
+                )
+            }
+        } else {
+            status
         }
     }));
     match result {

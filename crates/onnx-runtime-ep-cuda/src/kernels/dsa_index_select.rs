@@ -707,7 +707,11 @@ impl Kernel for DsaIndexSelectKernel {
         self.execute_impl(inputs, outputs)
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         let dims = self.validate_metadata(inputs)?;
         dsa_index_select_workspace_layout(dims)?;
         Ok(WorkspaceRequirement::NONE)

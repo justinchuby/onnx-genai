@@ -251,7 +251,10 @@ fn measure(device: &str, build: impl Fn(Graph) -> InferenceSession) {
 
 #[test]
 #[ignore = "release performance probe; hold the shared host lock"]
+#[allow(clippy::assertions_on_constants)]
 fn packed_fusion_cpu_release_ab() {
+    // Keep the ignored benchmark debug-compilable while rejecting debug runs.
+    // A const assertion would fail every debug all-target check before selection.
     assert!(!cfg!(debug_assertions), "use a release build");
     measure("cpu", |g| InferenceSession::from_graph(g).unwrap());
 }

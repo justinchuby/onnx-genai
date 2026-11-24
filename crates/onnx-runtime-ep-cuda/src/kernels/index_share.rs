@@ -704,7 +704,11 @@ impl Kernel for IndexShareKernel {
         ))
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         let dims = self.validate_metadata(inputs)?;
         let dtype = inputs
             .first()

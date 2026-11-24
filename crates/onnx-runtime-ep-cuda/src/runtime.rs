@@ -45,6 +45,49 @@ pub struct CudaAllocationCounts {
     pub frees: u64,
 }
 
+/// Both caller and kernel workspace pins obey the same provider-context rule.
+/// Enumerate kernel resources once, before capture starts, and retain real pins.
+fn collect_owned_capture_resources(
+    kernels: &[&dyn Kernel],
+    mut resources: Vec<DeviceGraphResource>,
+    context: onnx_runtime_memory_api::ProviderContextIdentity,
+) -> Result<Vec<DeviceGraphResource>> {
+    resources.extend(
+        kernels
+            .iter()
+            .flat_map(|kernel| kernel.device_graph_resources()),
+    );
+    for resource in &resources {
+        if let Some(span) = resource.workspace_span() {
+            span.require_context(context)?;
+        }
+    }
+    resources.sort_unstable_by_key(DeviceGraphResource::identity);
+    resources.dedup_by_key(|resource| resource.identity());
+    Ok(resources)
+}
+
+fn require_workspace_capture_pin(
+    resources: Option<&[DeviceGraphResource]>,
+    workspace: onnx_runtime_ep_api::WorkspaceView,
+    label: &str,
+) -> Result<()> {
+    let address = workspace.ptr().0 as usize;
+    if resources.is_some_and(|resources| {
+        resources.iter().any(|resource| {
+            resource
+                .workspace_span()
+                .is_some_and(|span| span.covers(address, workspace.bytes()))
+        })
+    }) {
+        return Ok(());
+    }
+    Err(EpError::KernelFailed(format!(
+        "cuda_ep: capture did not retain one real workspace owner covering {label} at {address:#x} for {} bytes; pass WorkspaceAllocation::device_graph_resource through owned capture or begin_graph_capture_with_resources and retain the backing until graph retirement",
+        workspace.bytes()
+    )))
+}
+
 /// Immutable owner for a kernel-private allocation whose address may be
 /// embedded in a CUDA graph.
 ///
@@ -762,7 +805,7 @@ pub struct CudaRuntime {
     owned_graphs_write: Mutex<()>,
     registered_capture_active: AtomicBool,
     unregistered_capture_active: AtomicBool,
-    active_capture_resource_ids: ArcSwapOption<Vec<usize>>,
+    active_capture_resources: ArcSwapOption<Vec<DeviceGraphResource>>,
     blas: CublasLt,
     cudnn: CudnnBackend,
     ordinal: u32,
@@ -1108,7 +1151,7 @@ impl CudaRuntime {
             owned_graphs_write: Mutex::new(()),
             registered_capture_active: AtomicBool::new(false),
             unregistered_capture_active: AtomicBool::new(false),
-            active_capture_resource_ids: ArcSwapOption::empty(),
+            active_capture_resources: ArcSwapOption::empty(),
             blas,
             cudnn,
             ordinal,
@@ -2003,12 +2046,7 @@ impl CudaRuntime {
     ) -> Result<()> {
         resources.sort_unstable_by_key(DeviceGraphResource::identity);
         resources.dedup_by_key(|resource| resource.identity());
-        let resource_ids = Arc::new(
-            resources
-                .iter()
-                .map(DeviceGraphResource::identity)
-                .collect(),
-        );
+        let capture_resources = Arc::new(resources.clone());
         self.registered_capture_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| {
@@ -2023,7 +2061,7 @@ impl CudaRuntime {
                 .store(false, Ordering::Release);
             return Err(error);
         }
-        self.active_capture_resource_ids.store(Some(resource_ids));
+        self.active_capture_resources.store(Some(capture_resources));
         Ok(())
     }
 
@@ -2032,7 +2070,7 @@ impl CudaRuntime {
         let result = self.graph_slot(slot).end_current();
         self.registered_capture_active
             .store(false, Ordering::Release);
-        self.active_capture_resource_ids.store(None);
+        self.active_capture_resources.store(None);
         result
     }
 
@@ -2041,7 +2079,7 @@ impl CudaRuntime {
         let result = self.graph_slot(slot).abort_current();
         self.registered_capture_active
             .store(false, Ordering::Release);
-        self.active_capture_resource_ids.store(None);
+        self.active_capture_resources.store(None);
         result
     }
 
@@ -2116,20 +2154,12 @@ impl CudaRuntime {
         slot: DeviceGraphSlot,
         continuation: Option<DeviceGraphToken>,
         kernels: &[&dyn Kernel],
+        resources: Vec<DeviceGraphResource>,
+        context: onnx_runtime_memory_api::ProviderContextIdentity,
     ) -> Result<DeviceGraphToken> {
         crate::capture::require_subgraph_graph_capturable(kernels)?;
-        let mut resources: Vec<DeviceGraphResource> = kernels
-            .iter()
-            .flat_map(|kernel| kernel.device_graph_resources())
-            .collect();
-        resources.sort_unstable_by_key(DeviceGraphResource::identity);
-        resources.dedup_by_key(|resource| resource.identity());
-        let resource_ids = Arc::new(
-            resources
-                .iter()
-                .map(DeviceGraphResource::identity)
-                .collect(),
-        );
+        let resources = collect_owned_capture_resources(kernels, resources, context)?;
+        let capture_resources = Arc::new(resources.clone());
         self.registered_capture_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| {
@@ -2155,7 +2185,7 @@ impl CudaRuntime {
                 return Err(error);
             }
         };
-        self.active_capture_resource_ids.store(Some(resource_ids));
+        self.active_capture_resources.store(Some(capture_resources));
         Ok(token)
     }
 
@@ -2170,7 +2200,7 @@ impl CudaRuntime {
             .end(token);
         self.registered_capture_active
             .store(false, Ordering::Release);
-        self.active_capture_resource_ids.store(None);
+        self.active_capture_resources.store(None);
         result
     }
 
@@ -2181,7 +2211,7 @@ impl CudaRuntime {
         };
         self.registered_capture_active
             .store(false, Ordering::Release);
-        self.active_capture_resource_ids.store(None);
+        self.active_capture_resources.store(None);
         result
     }
 
@@ -2899,10 +2929,14 @@ impl CudaRuntime {
         }
         if self.registered_capture_active.load(Ordering::Acquire)
             && !self
-                .active_capture_resource_ids
+                .active_capture_resources
                 .load()
                 .as_ref()
-                .is_some_and(|ids| ids.contains(&identity))
+                .is_some_and(|resources| {
+                    resources
+                        .iter()
+                        .any(|resource| resource.identity() == identity)
+                })
         {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep: active CUDA graph capture did not retain the ownership token for \
@@ -2910,6 +2944,27 @@ impl CudaRuntime {
             )));
         }
         Ok(())
+    }
+
+    /// Require a registered owner for a borrowed workspace before embedding it
+    /// in a capture. Call only on the capture path; raw/unregistered capture
+    /// must never turn an address or arbitrary token into ownership permission.
+    pub(crate) fn require_registered_workspace_capture(
+        &self,
+        workspace: onnx_runtime_ep_api::WorkspaceView,
+        label: &str,
+    ) -> Result<()> {
+        let resources = self.active_capture_resources.load();
+        let registered = self.registered_capture_active.load(Ordering::Acquire);
+        require_workspace_capture_pin(
+            if registered {
+                resources.as_ref().map(|resources| resources.as_slice())
+            } else {
+                None
+            },
+            workspace,
+            label,
+        )
     }
 
     /// Number of CUDA graph lifecycle mutex acquisitions by this runtime.
@@ -4581,5 +4636,147 @@ extern "C" __global__ void slow_copy(const float* in, float* out, unsigned long 
         for result in results {
             unsafe { runtime.free_raw(result) }.unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_capture_resources_tests {
+    use super::*;
+    use onnx_runtime_ep_api::{TensorMut, TensorView};
+    use onnx_runtime_memory_api::{BindingRegistry, DeviceKey, HostAllocator};
+
+    fn binding() -> onnx_runtime_memory_api::MemoryBinding {
+        let registry = BindingRegistry::new().unwrap();
+        let context = registry
+            .register_provider_context(DeviceKey::HOST, Arc::new(()))
+            .unwrap();
+        let authority = registry
+            .register_authority(DeviceKey::HOST, Arc::new(()))
+            .unwrap();
+        let mechanism = registry
+            .register_allocator(context, authority, Arc::new(HostAllocator))
+            .unwrap();
+        registry.select(mechanism).unwrap();
+        registry.bind(DeviceKey::HOST).unwrap()
+    }
+
+    #[test]
+    fn workspace_capture_requires_a_real_pin_for_the_complete_used_extent() {
+        let binding = binding();
+        let owner = binding.allocate_owning(128, 16).unwrap();
+        let view = onnx_runtime_ep_api::WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(owner.as_ptr().as_ptr().cast()),
+            128,
+        );
+        let pin = DeviceGraphResource::for_workspace(&owner).unwrap();
+        let resources = [pin];
+        require_workspace_capture_pin(Some(&resources), view, "GQA metadata").unwrap();
+        let subview = onnx_runtime_ep_api::WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(owner.as_ptr().as_ptr().wrapping_add(16).cast()),
+            12,
+        );
+        require_workspace_capture_pin(Some(&resources), subview, "metadata rows").unwrap();
+        let oversized = onnx_runtime_ep_api::WorkspaceView::new(view.ptr(), 129);
+        assert!(
+            require_workspace_capture_pin(Some(&resources), oversized, "full GQA workspace")
+                .is_err()
+        );
+        drop(resources);
+        owner.release_now().unwrap();
+    }
+
+    #[test]
+    fn workspace_capture_refuses_unregistered_fake_and_wrapping_ranges() {
+        let binding = binding();
+        let owner = binding.allocate_owning(64, 16).unwrap();
+        let view = onnx_runtime_ep_api::WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(owner.as_ptr().as_ptr().cast()),
+            64,
+        );
+        let fake = [DeviceGraphResource::new(
+            view.ptr().0 as usize,
+            Arc::new(()),
+        )];
+        for resources in [None, Some(&[][..]), Some(&fake[..])] {
+            let error = require_workspace_capture_pin(resources, view, "GQA prepared metadata")
+                .unwrap_err();
+            assert!(error.to_string().contains("one real workspace owner"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("WorkspaceAllocation::device_graph_resource")
+            );
+        }
+        let real = [DeviceGraphResource::for_workspace(&owner).unwrap()];
+        let wrapping = onnx_runtime_ep_api::WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(usize::MAX as *mut c_void),
+            2,
+        );
+        assert!(
+            require_workspace_capture_pin(Some(&real), wrapping, "GQA prepared metadata").is_err()
+        );
+        drop(real);
+        owner.release_now().unwrap();
+    }
+
+    struct ResourceKernel {
+        resource: DeviceGraphResource,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Kernel for ResourceKernel {
+        fn execute(&self, _: &[TensorView], _: &mut [TensorMut]) -> Result<()> {
+            Ok(())
+        }
+        fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            vec![self.resource.clone()]
+        }
+    }
+
+    #[test]
+    fn workspace_capture_checks_kernel_and_caller_context_after_single_enumeration() {
+        let local = binding();
+        let foreign = binding();
+        let local_owner = local.allocate_owning(64, 16).unwrap();
+        let foreign_owner = foreign.allocate_owning(64, 16).unwrap();
+        let pin = DeviceGraphResource::for_workspace(&local_owner).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut kernel = ResourceKernel {
+            resource: DeviceGraphResource::for_workspace(&foreign_owner).unwrap(),
+            calls: calls.clone(),
+        };
+        let error = collect_owned_capture_resources(
+            &[&kernel],
+            vec![pin.clone()],
+            local.identity().provider_context(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("allocate capture workspace through this provider")
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        kernel.resource = pin.clone();
+        let resources = collect_owned_capture_resources(
+            &[&kernel],
+            vec![pin.clone()],
+            local.identity().provider_context(),
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(resources.len(), 1);
+        assert!(
+            resources[0]
+                .workspace_span()
+                .unwrap()
+                .covers(local_owner.as_ptr().as_ptr() as usize, 64)
+        );
+        drop(resources);
+        drop(kernel);
+        drop(pin);
+        foreign_owner.release_now().unwrap();
+        local_owner.release_now().unwrap();
     }
 }

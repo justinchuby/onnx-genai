@@ -22,8 +22,8 @@ use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::HostToDeviceCopier;
 use onnx_runtime_ep_api::kernel::validate_kernel_sized_outputs;
 use onnx_runtime_ep_api::kernel::{
-    Kernel, KernelSizedOutput, KernelSizedOutputMetadata, KernelSizedOutputPolicy, TensorMetadata,
-    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    Kernel, KernelSizedOutput, KernelSizedOutputMetadata, KernelSizedOutputPolicy, OutputMetadata,
+    TensorMetadata, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, DeviceId, Node};
@@ -1126,25 +1126,45 @@ impl OperandKey {
 }
 
 /// Owned copy of the metadata a [`WorkspaceRequirement`] was computed from.
-type WorkspaceSignature = Vec<OperandKey>;
+#[derive(PartialEq, Eq)]
+struct WorkspaceSignature {
+    inputs: Vec<OperandKey>,
+    outputs: Vec<OutputMetadata<'static>>,
+}
 
-fn signature_matches(signature: &WorkspaceSignature, metadata: &[TensorMetadata<'_>]) -> bool {
-    signature.len() == metadata.len()
+fn signature_matches(
+    signature: &WorkspaceSignature,
+    metadata: &[TensorMetadata<'_>],
+    outputs: &[OutputMetadata<'_>],
+) -> bool {
+    signature.inputs.len() == metadata.len()
         && signature
+            .inputs
             .iter()
             .zip(metadata)
             .all(|(key, meta)| key.matches(meta))
+        && signature.outputs == outputs
 }
 
-fn signature_of(metadata: &[TensorMetadata<'_>]) -> WorkspaceSignature {
-    metadata
-        .iter()
-        .map(|meta| OperandKey {
-            dtype: meta.dtype,
-            present: meta.present,
-            shape: meta.shape.to_vec(),
-        })
-        .collect()
+fn signature_of(
+    metadata: &[TensorMetadata<'_>],
+    outputs: &[OutputMetadata<'_>],
+) -> WorkspaceSignature {
+    WorkspaceSignature {
+        inputs: metadata
+            .iter()
+            .map(|meta| OperandKey {
+                dtype: meta.dtype,
+                present: meta.present,
+                shape: meta.shape.to_vec(),
+            })
+            .collect(),
+        outputs: outputs
+            .iter()
+            .cloned()
+            .map(OutputMetadata::into_owned)
+            .collect(),
+    }
 }
 
 /// How many distinct operand signatures one node remembers a plan for.
@@ -1155,87 +1175,22 @@ fn signature_of(metadata: &[TensorMetadata<'_>]) -> WorkspaceSignature {
 /// avoids. Overflow is a miss, never a wrong answer.
 const WORKSPACE_PLAN_CACHE_CAPACITY: usize = 8;
 
-/// Memoizes `Kernel::workspace_requirement` per node, keyed by the exact
-/// operand metadata the requirement was derived from.
-///
-/// # Why this exists
-///
-/// `prepare_workspace` must ask the kernel what it needs before it can decide
-/// whether it can serve it. For the cuBLASLt-backed CUDA kernels (`MatMul`,
-/// `Gemm`, `FusedEpilogue`, `MatMulNBits`' f32 dequant path) answering that
-/// question runs a full `cublasLtMatmulAlgoGetHeuristic` search — and because
-/// those kernels declare `WorkspaceLifetime::SessionPersistent`, which this
-/// executor declines, the kernel then plans a *second* time inside its own
-/// `execute`. Every node of every decode step paid for two heuristic searches
-/// and used one.
-///
-/// The kernel-side re-plan cannot be removed from here: `plan_gemm` returns the
-/// selected algorithm and matrix layouts, not just a byte count, and the kernel
-/// re-derives and re-validates the size it was handed rather than trusting the
-/// executor. So the duplicate is removed on the executor side instead, by not
-/// re-asking a question whose answer cannot have changed.
-///
-/// # What this is worth, stated exactly
-///
-/// The baseline matters. On `main` the executor never called
-/// `workspace_requirement` at all, so:
-///
-/// * versus the uncached version of this seam, the second search per dispatch
-///   is gone;
-/// * versus `main`, the steady state is approximately **neutral** — a repeated
-///   operand signature costs a `Mutex` acquire plus a linear scan of at most
-///   [`WORKSPACE_PLAN_CACHE_CAPACITY`] entries, and each *new* signature still
-///   costs one heuristic search `main` never paid;
-/// * the kernel-side plan inside `blas::governed_gemm` is untouched and still
-///   happens once per dispatch.
-///
-/// Hit rate follows the shapes, not the kernel. A stable geometry hits after
-/// the first dispatch. A growing-KV `StepScoped` attention, whose operand
-/// shapes change every decode step, can miss on **every** step; the cache is
-/// then bounded overhead (one extra search per step) rather than a saving.
-/// Only shapes that recur — fixed geometries, and the many decode GEMMs whose
-/// cuBLASLt signature is stable across steps — benefit.
-///
-/// # Correctness
-///
-/// * The key is the full operand metadata (dtype, presence, shape) for every
-///   operand, so a hit is only possible when the kernel would be asked exactly
-///   the same question. Dynamic shapes, dtype changes and optional-input
-///   presence changes are all misses.
-/// * Nothing is shared between nodes: each `CompiledKernelEntry` gets its own
-///   cache, so one node's plan can never be served to another.
-/// * The lock is never held across the kernel call, so concurrent `Run`s on the
-///   same session plan in parallel; a duplicated concurrent computation is
-///   harmless because it produces the same value.
-/// * Planning errors are never cached — a failing `workspace_requirement` is
-///   re-raised on every dispatch, exactly as before.
-/// * A poisoned lock is recovered with `PoisonError::into_inner`, matching
-///   `EpHandle::with` and `release_ep_factory_with_teardown`: a panic in some
-///   unrelated dispatch must not turn every later dispatch into a hard error.
-///
-/// # What this assumes of the kernel
-///
-/// That `workspace_requirement` is a function of the operand metadata alone for
-/// a given kernel instance. That is the contract the native session executor
-/// already relies on (it plans once during prepare and reuses the reservation
-/// for every later `Run`), and it holds for every kernel in this workspace.
-/// A kernel that violates it is not silently mis-served: the CUDA consumers
-/// re-derive their requirement in `execute_with_workspace` and reject a
-/// workspace that is too small (`governed_workspace_ptr`, `std_attention_carve`,
-/// `gqa` sub-range carving) rather than reading past the end.
-/// A signature that has been observed more than once, published for lock-free
-/// reads (#1077 lever 3).
-///
-/// Written at most once per node, through [`OnceLock`], and only for a
-/// signature that has already been served from the locked cache — that is, one
-/// that recurs. Reading it costs an acquire load and an operand-wise compare;
-/// it takes no lock and allocates nothing.
+/// A recurring signature published once for lock-free reads. OnceLock keeps
+/// the immutable metadata and requirement alive for all subsequent comparisons.
 #[derive(Debug)]
 struct HotPlan {
     operands: Box<[OperandKey]>,
+    outputs: Box<[OutputMetadata<'static>]>,
     requirement: WorkspaceRequirement,
 }
 
+/// Memoizes workspace requirements per kernel using exact operand/output facts.
+/// A metadata hit avoids this adapter's planning work; kernel-side algorithm
+/// planning remains independent. Errors are not cached, and the cache lock is
+/// released before planning or execution. The requirement must be a function of
+/// these metadata for this kernel instance, as in the native executor contract.
+/// Stable signatures can hit; growing-KV geometries may miss each step. This is
+/// not a measured throughput claim.
 struct WorkspacePlanCache {
     /// Lock-free fast path. See [`HotPlan`].
     ///
@@ -1286,9 +1241,14 @@ impl WorkspacePlanCache {
     }
 
     /// The lock-free hit test, against already-built metadata.
-    fn hot_hit(&self, metadata: &[TensorMetadata<'_>]) -> Option<WorkspaceRequirement> {
+    fn hot_hit(
+        &self,
+        metadata: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Option<WorkspaceRequirement> {
         let hot = self.hot.get()?;
-        (hot.operands.len() == metadata.len()
+        (hot.outputs.as_ref() == outputs
+            && hot.operands.len() == metadata.len()
             && hot
                 .operands
                 .iter()
@@ -1301,9 +1261,14 @@ impl WorkspacePlanCache {
     ///
     /// Identical in effect to [`WorkspacePlanCache::hot_hit`] on the metadata
     /// built from `inputs`, but it does not build that `Vec`.
-    fn hot_hit_views(&self, inputs: &[TensorView<'_>]) -> Option<WorkspaceRequirement> {
+    fn hot_hit_views(
+        &self,
+        inputs: &[TensorView<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Option<WorkspaceRequirement> {
         let hot = self.hot.get()?;
-        (hot.operands.len() == inputs.len()
+        (hot.outputs.as_ref() == outputs
+            && hot.operands.len() == inputs.len()
             && hot
                 .operands
                 .iter()
@@ -1315,7 +1280,12 @@ impl WorkspacePlanCache {
     /// Publish a recurring signature to the lock-free slot, if it is still
     /// empty. Losing the race is harmless: the winner is equally valid, and
     /// this dispatch already has its answer.
-    fn publish_hot(&self, metadata: &[TensorMetadata<'_>], requirement: WorkspaceRequirement) {
+    fn publish_hot(
+        &self,
+        metadata: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+        requirement: WorkspaceRequirement,
+    ) {
         #[cfg(test)]
         if self.suppress_hot {
             return;
@@ -1323,8 +1293,10 @@ impl WorkspacePlanCache {
         if self.hot.get().is_some() {
             return;
         }
+        let signature = signature_of(metadata, outputs);
         let _ = self.hot.set(HotPlan {
-            operands: signature_of(metadata).into_boxed_slice(),
+            operands: signature.inputs.into_boxed_slice(),
+            outputs: signature.outputs.into_boxed_slice(),
             requirement,
         });
     }
@@ -1338,43 +1310,49 @@ impl WorkspacePlanCache {
     fn get_or_plan_views(
         &self,
         inputs: &[TensorView<'_>],
+        outputs: &[OutputMetadata<'_>],
         plan: impl FnOnce(&[TensorMetadata<'_>]) -> Result<WorkspaceRequirement, String>,
     ) -> Result<WorkspaceRequirement, String> {
-        if let Some(hit) = self.hot_hit_views(inputs) {
+        if let Some(hit) = self.hot_hit_views(inputs, outputs) {
             return Ok(hit);
         }
         let metadata: Vec<TensorMetadata<'_>> = inputs
             .iter()
             .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
             .collect();
-        self.get_or_plan(&metadata, || plan(&metadata))
+        self.get_or_plan(&metadata, outputs, || plan(&metadata))
     }
 
     /// Look up the plan for `metadata`, computing and remembering it on a miss.
     fn get_or_plan(
         &self,
         metadata: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
         plan: impl FnOnce() -> Result<WorkspaceRequirement, String>,
     ) -> Result<WorkspaceRequirement, String> {
-        if let Some(hit) = self.hot_hit(metadata) {
+        if let Some(hit) = self.hot_hit(metadata, outputs) {
             return Ok(hit);
         }
-        if let Some(hit) = self.lookup(metadata) {
+        if let Some(hit) = self.lookup(metadata, outputs) {
             // Second sighting: this signature recurs, so it is the one worth
             // publishing.
-            self.publish_hot(metadata, hit);
+            self.publish_hot(metadata, outputs, hit);
             return Ok(hit);
         }
         let requirement = plan()?;
-        self.remember(signature_of(metadata), requirement);
+        self.remember(signature_of(metadata, outputs), requirement);
         Ok(requirement)
     }
 
-    fn lookup(&self, metadata: &[TensorMetadata<'_>]) -> Option<WorkspaceRequirement> {
+    fn lookup(
+        &self,
+        metadata: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Option<WorkspaceRequirement> {
         let mut plans = self.plans.lock().unwrap_or_else(PoisonError::into_inner);
         let idx = plans
             .iter()
-            .position(|(signature, _)| signature_matches(signature, metadata))?;
+            .position(|(signature, _)| signature_matches(signature, metadata, outputs))?;
         let requirement = plans[idx].1;
         // Move-to-front so the hot signature stays ahead of a one-off prefill
         // shape once the cache is full.
@@ -1428,6 +1406,9 @@ pub struct ExportedComputeInfo {
     pub vtable: ort::OrtNodeComputeInfo,
     /// The compiled kernel entries for this subgraph (in topological order).
     pub entries: Vec<CompiledKernelEntry>,
+    /// Kernels are Send, not Sync. Independent states of the same compiled info
+    /// must serialize host execution as well as retaining disjoint workspaces.
+    execution: Mutex<()>,
     /// Optional routing table for multi-node fused subgraphs.
     pub routing: Option<SubgraphRouting>,
     /// One [`WorkspacePlanCache`] per entry in `entries`, same index. Built in
@@ -1466,6 +1447,11 @@ pub struct ExportedComputeInfo {
     /// right answer -- whether to borrow ORT's threads or use our own -- is
     /// the opposite for each. See `onnx_runtime_ep_api::host_parallel`.
     host_pool_probe: std::sync::atomic::AtomicU32,
+    /// Drop after kernels and other compute-owned resources. Production compile
+    /// always retains the original provider; standalone synthetic kernels may
+    /// omit it and cannot request provider-owned persistent workspace.
+    provider: Option<crate::ep::EpHandle>,
+    pub(crate) workspace_execution: Option<crate::workspace::OrderedWorkspace>,
 }
 
 /// Everything `Compute` needs to stage host-resident boundary inputs onto the
@@ -1519,11 +1505,11 @@ impl Drop for ReconstructedMemInfo {
 
 /// Per-session state created by `CreateState`.
 struct ComputeState {
-    _placeholder: u8,
+    workspace: Mutex<crate::workspace::WorkspaceLane>,
 }
 
 impl ExportedComputeInfo {
-    pub fn new(entries: Vec<CompiledKernelEntry>) -> Self {
+    pub fn new(entries: Vec<CompiledKernelEntry>, provider: Option<crate::ep::EpHandle>) -> Self {
         let workspace_plans = entries.iter().map(|_| WorkspacePlanCache::new()).collect();
         Self {
             vtable: ort::OrtNodeComputeInfo {
@@ -1533,11 +1519,14 @@ impl ExportedComputeInfo {
                 ReleaseState: Some(compute_release_state),
             },
             entries,
+            execution: Mutex::new(()),
             routing: None,
             workspace_plans,
             device_staging: None,
             host_accessible: false,
             host_pool_probe: std::sync::atomic::AtomicU32::new(0),
+            provider,
+            workspace_execution: None,
         }
     }
 
@@ -1585,7 +1574,7 @@ impl ExportedComputeInfo {
 
 /// CreateState: allocate per-session compute state.
 unsafe extern "C" fn compute_create_state(
-    _info: *mut ort::OrtNodeComputeInfo,
+    info: *mut ort::OrtNodeComputeInfo,
     _compute_context: *mut ort::OrtNodeComputeContext,
     out_state: *mut *mut c_void,
 ) -> *mut ort::OrtStatus {
@@ -1593,7 +1582,22 @@ unsafe extern "C" fn compute_create_state(
         if out_state.is_null() {
             return fail_status("CreateState: out_state is null");
         }
-        let state = Box::new(ComputeState { _placeholder: 0 });
+        if info.is_null() {
+            unsafe {
+                *out_state = std::ptr::null_mut();
+            }
+            return fail_status(
+                "CreateState: compute info is null; use the callback from a compiled node compute info",
+            );
+        }
+        // SAFETY: ORT passes the compute info that owns this callback.
+        let exported = unsafe { &*info.cast::<ExportedComputeInfo>() };
+        let state = Box::new(ComputeState {
+            workspace: Mutex::new(crate::workspace::WorkspaceLane::new(
+                exported.provider.clone(),
+                exported.workspace_execution.clone(),
+            )),
+        });
         unsafe { *out_state = Box::into_raw(state).cast::<c_void>() };
         ok_status()
     }));
@@ -2340,157 +2344,32 @@ unsafe fn stage_host_boundary_inputs(
 // Governed kernel workspace
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Resolve a kernel's declared [`WorkspaceRequirement`] into the concrete
-/// [`WorkspaceView`] handed to `execute_with_workspace` for one dispatch.
-///
-/// # Why ORT scratch, and not EP allocate/free
-///
-/// The workspace has to live on the device the kernel runs on. The mechanism
-/// that was hardware-validated on H200 in #832 for fused-subgraph intermediates
-/// is [`alloc_scratch`] (`OrtApi::KernelContext_GetScratchBuffer`), so
-/// workspaces reuse exactly that path: ORT owns the bytes for the duration of
-/// the `Compute` call, which is precisely a step-scoped workspace's lifetime,
-/// and this executor never issues a device free. A per-dispatch
-/// `ExecutionProvider::allocate`/`deallocate` pair would instead put a
-/// synchronous `cuMemAlloc`/`cuMemFree` on every node of every decode step —
-/// the exact cost #832 removed from `MatMulNBits` with a cached grow-only
-/// arena — and a device free is illegal during CUDA-graph capture.
-///
-/// # Where the workspace is placed
-///
-/// Against the memory info of **this node's own ORT-bound inputs**, derived by
-/// [`operand_mem_info`], not against input 0 of the fused subgraph. "Operands"
-/// here means kernel-context *inputs* only: nothing consults output placement,
-/// and no claim is made about it. When the node binds several ORT inputs they
-/// are compared with `OrtApi::CompareMemoryInfo` and a disagreement is an
-/// error, not a guess. A node whose inputs are all intermediate buffers
-/// inherits the subgraph-level memory info those buffers were allocated from,
-/// which is the same device by construction.
-///
-/// The derivation is **lazy**: it runs below, after the zero-byte and
-/// `StepScoped` gates, so a node with no workspace requirement and a node whose
-/// `SessionPersistent` request is declined resolve no placement at all. The
-/// gates are on the *requirement*, not on the device — a node that genuinely
-/// needs a step-scoped workspace resolves placement wherever it runs.
-/// [`workspace_placement_queries`] counts the resolutions that do run.
-///
-/// Every failure to determine the device is a hard error *for a request that
-/// needs serving*, never a silent host allocation: a device kernel handed host
-/// memory dereferences it as device memory.
-///
-/// # Alignment
-///
-/// ORT makes no promise about the alignment of a scratch block beyond the
-/// allocator's own, so a stricter request is satisfied by **checked
-/// over-allocation** (`bytes + alignment - 1`) followed by align-up inside the
-/// returned block. Every arithmetic step is checked and the aligned window is
-/// re-verified to lie inside the allocation before it is handed out.
-/// [`alloc_scratch`] already rejects a null block, so there is exactly one
-/// null check on this path.
-///
-/// # Planning cost
-///
-/// The requirement is memoized per node by [`WorkspacePlanCache`], keyed on the
-/// exact operand metadata. Be precise about what that buys:
-///
-/// * It removes **this seam's own** repeat search. Without the cache, a
-///   `SessionPersistent` declarer whose `workspace_requirement` runs a cuBLASLt
-///   heuristic search (`MatMul`, `Gemm`, `FusedEpilogue`, `MatMulNBits`' f32
-///   dequant path) paid for that search here on *every* dispatch, had the
-///   result declined, and then planned again inside its own `execute`.
-/// * It does **not** remove the kernel-side plan. `blas::governed_gemm` still
-///   plans once per dispatch inside `execute`; nothing here reaches into it.
-/// * So against `main` — which never called `workspace_requirement` at all —
-///   the steady state is approximately **neutral**, not a halving: a repeated
-///   operand signature costs a lock plus a short linear scan, and each *new*
-///   signature costs one extra heuristic search that `main` did not perform.
-/// * Hit rate is a property of the shapes. A stable geometry (fixed batch and
-///   sequence length) hits; a growing-KV `StepScoped` attention whose operand
-///   shapes change every decode step can **miss on every step**, and then the
-///   cache is pure overhead bounded by one extra search per step.
-///
-/// See [`WorkspacePlanCache`] for the correctness argument.
-///
-/// # Lifetimes
-///
-/// * [`WorkspaceLifetime::StepScoped`] — served from ORT scratch, as above.
-///   The step-scoped consumers in `onnx-runtime-ep-cuda` are the default-domain
-///   `Attention` Phase-2a scratch and `StandardAttention` whenever it is *not*
-///   a single-token, single-batch decode (`batch == 1 && q_seq == 1`) — i.e.
-///   prefill and batched dispatch.
-/// * [`WorkspaceLifetime::SessionPersistent`] — **explicitly declined**
-///   (`Ok(None)`), never downgraded. ORT reclaims scratch when `Compute`
-///   returns, so serving a persistent request from it would hand the kernel
-///   memory that is recycled behind its back on the next `Run`. There is no
-///   session-persistent device arena at this seam, so the request is passed
-///   through as `None` and the kernel decides. This seam must not guess.
-///
-/// ## What declining actually does, per declarer
-///
-/// Declining is **not** uniformly a self-owned fallback. Every
-/// `SessionPersistent` declarer in `onnx-runtime-ep-cuda`, and what each does
-/// with `None`:
-///
-/// * **Self-owned fallback — correct, no error.**
-///   * `GroupQueryAttention` (`group_query_attention.rs`): the composite
-///     request (scores, packed Q/K/V staging, BSH↔BNSH transposes) is served
-///     from its own pooled `GqaWorkspace` slots.
-///   * `StandardAttention` (`standard_attention.rs`), single-token single-batch
-///     decode only — every other geometry is `StepScoped` and *is* served: the
-///     score and staged-K/V scratch is pooled or per-call inside `run`.
-///   * `DsaIndexSelect` (`dsa_index_select.rs`) declares no external workspace:
-///     its kernel-owned slot grows only outside capture and remains pointer-stable
-///     from warmup through graph replay, so the plugin and native executors use
-///     the same production path.
-///   * `MatMulNBits` bf16 activations: the `Bf16Scratch` staging arena is
-///     always self-owned and is listed here only because it is easy to assume
-///     otherwise — that path declares [`WorkspaceRequirement::NONE`], so it is
-///     unaffected by the decline in either direction.
-/// * **Hard error, but only when the cuBLASLt heuristic asks for bytes.**
-///   `MatMul`, `Gemm`, `FusedEpilogue` and `MatMulNBits`' f32
-///   dequant-cuBLASLt path all route through
-///   `blas::governed_workspace_requirement`, which reports
-///   [`WorkspaceRequirement::NONE`] when the heuristic selects **0** bytes and
-///   `SessionPersistent` otherwise. On the declined path
-///   `blas::governed_workspace_ptr` returns `Ok(0)` for a 0-byte requirement
-///   and errors — *"governed cuBLASLt workspace requires N bytes, but none was
-///   supplied"* — for a non-zero one. Which of the two happens is a property of
-///   the algorithm cuBLASLt picks for that shape, dtype, device and library
-///   version, not a static property of the kernel; many decode-shaped GEMMs
-///   select 0 bytes and are unaffected.
-/// * **Unconditional hard error.** `BlockQuantizedMoE`
-///   (`block_quantized_moe.rs`) and `IndexShare` (`index_share.rs`) declare
-///   `SessionPersistent` for every geometry and have no self-owned path; both
-///   their `execute` and their `execute_with_workspace(None)` return an error.
-///
-/// Declining is what preserves #832's H200-validated plugin path: on `main`
-/// the executor called bare `Kernel::execute`, and
-/// [`Kernel::execute_with_workspace`] defaults to forwarding there, so `None`
-/// reproduces `main` node for node — including for the kernels that error,
-/// which error on `main` too. Hard-failing here instead would have turned every
-/// GQA-bearing model into a plugin-path error on hardware that runs it today.
-/// The cost of declining is that `BlockQuantizedMoE`, `IndexShare`, and any
-/// GEMM whose heuristic asks for workspace bytes remain **incompatible with the
-/// plugin path**; making them work needs a real session-persistent device arena
-/// at this seam, which is future work and is not claimed here.
+/// Plan one node's workspace using exact input/output metadata. Step-scoped
+/// storage uses ORT scratch on this node's operand placement. Persistent storage
+/// borrows the originating provider's state-owned lane; registered execution
+/// ordering and exclusive Compute access permit sequential nodes to share peak
+/// capacity without allocating, freeing or issuing quota calls on a warm fit.
 ///
 /// # Safety
-///
-/// `api`, `ctx` and `placement.subgraph_fallback` (when `Some`) must be valid.
+/// `api`, `ctx` and placement references must be live for this call. The caller
+/// retains exclusive lane access through every kernel use of the returned view.
 unsafe fn prepare_workspace(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
     placement: PlacementSources<'_>,
     kernel: &dyn Kernel,
-    plans: &WorkspacePlanCache,
-    inputs: &[TensorView<'_>],
+    workspace: (&WorkspacePlanCache, &mut crate::workspace::WorkspaceLane),
+    operands: (&[TensorView<'_>], &[OutputMetadata<'_>]),
     node_label: impl std::fmt::Display + Copy,
 ) -> Result<Option<WorkspaceView>, String> {
-    let requirement: WorkspaceRequirement = plans.get_or_plan_views(inputs, |metadata| {
-        kernel
-            .workspace_requirement(metadata)
-            .map_err(|e| format!("{node_label}: workspace_requirement failed: {e}"))
-    })?;
+    let (plans, lane) = workspace;
+    let (inputs, outputs) = operands;
+    let requirement: WorkspaceRequirement =
+        plans.get_or_plan_views(inputs, outputs, |metadata| {
+            kernel
+                .workspace_requirement(metadata, outputs)
+                .map_err(|e| format!("{node_label}: workspace_requirement failed: {e}"))
+        })?;
     if requirement.bytes == 0 {
         return Ok(None);
     }
@@ -2502,27 +2381,25 @@ unsafe fn prepare_workspace(
              which is not a non-zero power of two"
         ));
     }
-    if requirement.lifetime != WorkspaceLifetime::StepScoped {
-        // Explicit decline, never a downgrade. ORT reclaims a
-        // `KernelContext_GetScratchBuffer` block when `Compute` returns, so
-        // serving a `SessionPersistent` request from it would hand the kernel
-        // memory that is recycled behind its back the moment it reuses the
-        // pointer on the next `Run`.
-        return Ok(None);
-    }
-
     let bytes = usize::try_from(requirement.bytes).map_err(|_| {
         format!(
             "{node_label}: workspace requirement of {} bytes exceeds usize on this target",
             requirement.bytes
         )
     })?;
+    if requirement.lifetime == WorkspaceLifetime::SessionPersistent {
+        return lane
+            .borrow(bytes, alignment)
+            .map(Some)
+            .map_err(|error| format!("{node_label}: {error}"));
+    }
+
     let total =
         workspace_block_bytes(bytes, alignment).map_err(|e| format!("{node_label}: {e}"))?;
 
     // Placement is resolved *here*, past every gate, and not by the caller.
     // Resolving it costs up to `2n` ORT FFI calls plus `n-1` comparisons, and
-    // for a zero-byte requirement or a declined `SessionPersistent` request the
+    // for a zero-byte requirement or a provider-owned persistent request the
     // answer is never used. Every dispatch used to pay it; now only a dispatch
     // that is actually about to be served does.
     let mem_info = match unsafe { operand_mem_info(api, ctx, placement) } {
@@ -2668,16 +2545,11 @@ fn align_workspace_window(
 ///
 /// # Workspace contract
 ///
-/// Every dispatch goes through [`prepare_workspace`] →
-/// [`Kernel::execute_with_workspace`], never bare [`Kernel::execute`]. A kernel
-/// declaring a non-zero [`WorkspaceLifetime::StepScoped`] requirement gets
-/// correctly-aligned scratch on the memory device reported by **that node's own
-/// ORT-bound operands** (see [`operand_mem_info`]), taken from ORT
-/// (`KernelContext_GetScratchBuffer`) and reclaimed by ORT when `Compute`
-/// returns — the same mechanism #832 validated on an H200 for fused subgraph
-/// intermediates. A [`WorkspaceLifetime::SessionPersistent`] request is
-/// **declined** (`None`), never downgraded to recycled step-scoped memory; see
-/// [`prepare_workspace`] for the per-kernel consequences of that decline.
+/// Every dispatch plans its exact node input/output metadata once per signature.
+/// Step-scoped requests use node-placed ORT scratch; persistent requests use the
+/// state-owned provider lane only when execution ordering was registered.
+/// Unknown ordering is an actionable error, never a downgrade to ORT scratch.
+///
 /// Kernels declaring [`WorkspaceRequirement::NONE`] behave exactly as before:
 /// `execute_with_workspace`'s default forwards to `execute`.
 ///
@@ -2691,17 +2563,43 @@ fn align_workspace_window(
 /// and `kernel_context` a valid `OrtKernelContext*`.
 unsafe extern "C" fn compute_execute(
     info: *mut ort::OrtNodeComputeInfo,
-    _state: *mut c_void,
+    state: *mut c_void,
     kernel_context: *mut ort::OrtKernelContext,
 ) -> *mut ort::OrtStatus {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::dispatch_probe::count(crate::dispatch_probe::Event::ComputeExecute);
         let entry_probe = crate::dispatch_probe::Phase::CallbackEntry.enter();
-        if info.is_null() || kernel_context.is_null() {
+        if info.is_null() || state.is_null() || kernel_context.is_null() {
             return fail_status("Compute: null argument");
         }
 
         let exported = unsafe { &*(info.cast::<ExportedComputeInfo>()) };
+        // Lock order is compiled info, then state. A kernel panic retires the
+        // shared kernel instance for every state, including previously idle ones.
+        let _execution = match exported.execution.lock() {
+            Ok(execution) => execution,
+            Err(_) => {
+                return fail_status(
+                    "Compute: shared compiled kernels were poisoned by a prior panic; recreate the session before submitting work from any state",
+                );
+            }
+        };
+        // Serialize host submission as well as borrowing. Registration proves
+        // device ordering separately; this lock is not a completion fence.
+        let state = unsafe { &*state.cast::<ComputeState>() };
+        let mut workspace_lane = match state.workspace.lock() {
+            Ok(lane) => lane,
+            Err(_) => {
+                return fail_status(
+                    "Compute: persistent workspace lane was poisoned by a prior panic; recreate the session before submitting more work",
+                );
+            }
+        };
+
+        if let Err(error) = workspace_lane.begin_compute() {
+            workspace_lane.retire(&error);
+            return fail_status(&format!("Compute: {error}"));
+        }
 
         if exported.entries.is_empty() {
             return fail_status("Compute: no kernels compiled for this subgraph");
@@ -2738,7 +2636,7 @@ unsafe extern "C" fn compute_execute(
         // *borrowed* for its duration rather than moved out and put back. The
         // recycle is the guard's `Drop`, so it happens on every exit -- the
         // early `return`s below included, and an unwinding kernel too.
-        with_run_scratch(|scratch| {
+        let status = with_run_scratch(|scratch| {
             let RunScratch {
                 inputs,
                 owned: owned_outputs,
@@ -2979,8 +2877,14 @@ unsafe extern "C" fn compute_execute(
                                         },
                                     },
                                     &*entry.kernel,
-                                    plans,
-                                    &kernel_inputs,
+                                    (plans, &mut workspace_lane),
+                                    (
+                                        &kernel_inputs,
+                                        &unresolved_workspace_outputs(
+                                            &requested_outputs,
+                                            &entry.output_dtypes,
+                                        ),
+                                    ),
                                     format_args!(
                                         "Compute: node {node_idx} kernel-sized device workspace"
                                     ),
@@ -3209,8 +3113,14 @@ unsafe extern "C" fn compute_execute(
                                     },
                                 },
                                 &*entry.kernel,
-                                plans,
-                                &kernel_inputs,
+                                (plans, &mut workspace_lane),
+                                (
+                                    &kernel_inputs,
+                                    &unresolved_workspace_outputs(
+                                        &requested_outputs,
+                                        &entry.output_dtypes,
+                                    ),
+                                ),
                                 format_args!(
                                     "Compute: node {node_idx} host-owned dynamic-output workspace"
                                 ),
@@ -3629,8 +3539,8 @@ unsafe extern "C" fn compute_execute(
                                 },
                             },
                             &*entry.kernel,
-                            plans,
-                            &kernel_inputs,
+                            (plans, &mut workspace_lane),
+                            (&kernel_inputs, &workspace_outputs(all_output_views)),
                             format_args!("Compute: node {node_idx}"),
                         )
                     } {
@@ -3774,8 +3684,14 @@ unsafe extern "C" fn compute_execute(
                                     },
                                 },
                                 &*entry.kernel,
-                                plans,
-                                kernel_inputs,
+                                (plans, &mut workspace_lane),
+                                (
+                                    kernel_inputs,
+                                    &unresolved_workspace_outputs(
+                                        &requested_outputs,
+                                        &entry.output_dtypes,
+                                    ),
+                                ),
                                 "Compute: node 0 kernel-sized device workspace",
                             )
                         } {
@@ -3866,8 +3782,14 @@ unsafe extern "C" fn compute_execute(
                                 },
                             },
                             &*entry.kernel,
-                            plans,
-                            kernel_inputs,
+                            (plans, &mut workspace_lane),
+                            (
+                                kernel_inputs,
+                                &unresolved_workspace_outputs(
+                                    &requested_outputs,
+                                    &entry.output_dtypes,
+                                ),
+                            ),
                             "Compute: node 0 host-owned dynamic-output workspace",
                         )
                     } {
@@ -4098,8 +4020,8 @@ unsafe extern "C" fn compute_execute(
                             },
                         },
                         &*entry.kernel,
-                        plans,
-                        kernel_inputs,
+                        (plans, &mut workspace_lane),
+                        (kernel_inputs, &workspace_outputs(output_views)),
                         "Compute: node 0",
                     )
                 } {
@@ -4135,7 +4057,11 @@ unsafe extern "C" fn compute_execute(
             // Every `TensorView` borrowing the scratch is out of scope by here.
             // Returning it is the guard's business, not this function's.
             ok_status()
-        })
+        });
+        if !status.is_null() {
+            workspace_lane.retire("a previous Compute reported an execution, upload or validation error; inspect the original ORT diagnostic");
+        }
+        status
     }));
     result.unwrap_or_else(|_| fail_status("Compute: internal panic"))
 }
@@ -6373,7 +6299,7 @@ mod tests {
     }
 
     fn kernel_sized_info() -> ExportedComputeInfo {
-        let mut info = ExportedComputeInfo::new(Vec::new());
+        let mut info = ExportedComputeInfo::new(Vec::new(), None);
         info.set_host_accessible(true);
         info
     }
@@ -6483,7 +6409,7 @@ mod tests {
             &[1],
             DeviceId::cpu(),
         );
-        let device_output_info = ExportedComputeInfo::new(Vec::new());
+        let device_output_info = ExportedComputeInfo::new(Vec::new(), None);
         let error = run_kernel_sized(
             &device_output_info,
             &kernel,
@@ -9058,14 +8984,25 @@ fn after() {}
     #[test]
     fn create_and_release_state_lifecycle() {
         let mut state_ptr: *mut c_void = std::ptr::null_mut();
-        let status = unsafe {
-            compute_create_state(std::ptr::null_mut(), std::ptr::null_mut(), &mut state_ptr)
-        };
+        let mut info = ExportedComputeInfo::new(Vec::new(), None);
+        let status =
+            unsafe { compute_create_state(&mut info.vtable, std::ptr::null_mut(), &mut state_ptr) };
         assert!(status.is_null(), "ok_status returns null");
         assert!(!state_ptr.is_null());
         unsafe {
             compute_release_state(std::ptr::null_mut(), state_ptr);
         }
+    }
+
+    #[test]
+    fn create_state_null_info_never_publishes_a_state() {
+        let mut state = std::ptr::dangling_mut::<c_void>();
+        let _status =
+            unsafe { compute_create_state(std::ptr::null_mut(), std::ptr::null_mut(), &mut state) };
+        assert!(
+            state.is_null(),
+            "missing compute info must fail before allocating/publishing state"
+        );
     }
 
     #[test]
@@ -9208,7 +9145,9 @@ fn after() {}
         use std::ffi::c_void;
 
         // Construct a state pointer the same way create_state would.
-        let state = Box::new(ComputeState { _placeholder: 0 });
+        let state = Box::new(ComputeState {
+            workspace: Mutex::new(crate::workspace::WorkspaceLane::new(None, None)),
+        });
         let raw: *mut c_void = Box::into_raw(state).cast::<c_void>();
 
         // Exercise the catch_unwind guard for the normal (non-panic) path.
@@ -10233,6 +10172,58 @@ mod workspace_plan_cache_tests {
     /// the hot one -- silently restoring the expensive planning call the cache
     /// exists to avoid. Asserted on observed planning calls, not on cache
     /// state.
+
+    #[test]
+    fn changed_output_facts_cannot_hit_locked_or_published_workspace_plan() {
+        use super::*;
+        for locked in [false, true] {
+            let cache = if locked {
+                WorkspacePlanCache::locked_only()
+            } else {
+                WorkspacePlanCache::new()
+            };
+            let inputs = [TensorMetadata::new(DataType::Float32, &[2], true)];
+            let small = [OutputMetadata::tensor(DataType::Float32, &[4])];
+            let large = [OutputMetadata::tensor(DataType::Float32, &[9])];
+            let calls = AtomicUsize::new(0);
+            let query = |outputs: &[OutputMetadata<'_>], bytes| {
+                cache
+                    .get_or_plan(&inputs, outputs, || {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        Ok(WorkspaceRequirement {
+                            bytes,
+                            ..WorkspaceRequirement::NONE
+                        })
+                    })
+                    .unwrap()
+                    .bytes
+            };
+            assert_eq!(query(&small, 16), 16);
+            assert_eq!(query(&small, 999), 16); // publishes the recurring small plan
+            assert_eq!(query(&large, 36), 36);
+            assert_eq!(query(&small, 999), 16);
+            assert_eq!(query(&[OutputMetadata::Absent], 0), 0);
+            assert_eq!(
+                query(
+                    &[OutputMetadata::Unresolved {
+                        dtype: DataType::Float32
+                    }],
+                    64
+                ),
+                64
+            );
+            assert_eq!(
+                query(&[OutputMetadata::tensor(DataType::Float32, &[])], 4),
+                4
+            );
+            assert_eq!(
+                query(&[OutputMetadata::tensor(DataType::Float16, &[4])], 8),
+                8
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 6);
+        }
+    }
+
     #[test]
     fn a_repeatedly_used_signature_survives_eviction() {
         // Locked path on purpose: the lock-free slot would serve the repeat
@@ -10242,7 +10233,7 @@ mod workspace_plan_cache_tests {
 
         let hot_shape = vec![1usize];
         let hot = [meta(DataType::Float32, &hot_shape, true)];
-        cache.get_or_plan(&hot, || planner.plan(&hot)).unwrap();
+        cache.get_or_plan(&hot, &[], || planner.plan(&hot)).unwrap();
 
         // Fill the rest of the cache. `hot` is now at the back, next to evict.
         let cold: Vec<Vec<usize>> = (2..=WORKSPACE_PLAN_CACHE_CAPACITY)
@@ -10250,12 +10241,12 @@ mod workspace_plan_cache_tests {
             .collect();
         for sh in &cold {
             let m = [meta(DataType::Float32, sh, true)];
-            cache.get_or_plan(&m, || planner.plan(&m)).unwrap();
+            cache.get_or_plan(&m, &[], || planner.plan(&m)).unwrap();
         }
 
         // Using `hot` again is the access that must promote it.
         let before = planner.calls();
-        cache.get_or_plan(&hot, || planner.plan(&hot)).unwrap();
+        cache.get_or_plan(&hot, &[], || planner.plan(&hot)).unwrap();
         assert_eq!(
             planner.calls(),
             before,
@@ -10266,11 +10257,11 @@ mod workspace_plan_cache_tests {
         let evictor_shape = vec![WORKSPACE_PLAN_CACHE_CAPACITY + 1];
         let evictor = [meta(DataType::Float32, &evictor_shape, true)];
         cache
-            .get_or_plan(&evictor, || planner.plan(&evictor))
+            .get_or_plan(&evictor, &[], || planner.plan(&evictor))
             .unwrap();
 
         let before = planner.calls();
-        let got = cache.get_or_plan(&hot, || planner.plan(&hot)).unwrap();
+        let got = cache.get_or_plan(&hot, &[], || planner.plan(&hot)).unwrap();
         assert_eq!(
             planner.calls(),
             before,
@@ -10291,11 +10282,11 @@ mod workspace_plan_cache_tests {
         let metadata = [meta(DataType::Float32, &shape, true)];
 
         let first = cache
-            .get_or_plan(&metadata, || planner.plan(&metadata))
+            .get_or_plan(&metadata, &[], || planner.plan(&metadata))
             .expect("plan");
         for _ in 0..16 {
             let again = cache
-                .get_or_plan(&metadata, || planner.plan(&metadata))
+                .get_or_plan(&metadata, &[], || planner.plan(&metadata))
                 .expect("plan");
             assert_eq!(
                 again, first,
@@ -10321,10 +10312,10 @@ mod workspace_plan_cache_tests {
         let small_meta = [meta(DataType::Float32, &small, true)];
         let large_meta = [meta(DataType::Float32, &large, true)];
         let small_req = cache
-            .get_or_plan(&small_meta, || planner.plan(&small_meta))
+            .get_or_plan(&small_meta, &[], || planner.plan(&small_meta))
             .expect("plan");
         let large_req = cache
-            .get_or_plan(&large_meta, || planner.plan(&large_meta))
+            .get_or_plan(&large_meta, &[], || planner.plan(&large_meta))
             .expect("plan");
 
         assert_eq!(small_req.bytes, 4 * 8 * 4);
@@ -10338,13 +10329,13 @@ mod workspace_plan_cache_tests {
         // And both remain individually correct once cached.
         assert_eq!(
             cache
-                .get_or_plan(&small_meta, || planner.plan(&small_meta))
+                .get_or_plan(&small_meta, &[], || planner.plan(&small_meta))
                 .expect("plan"),
             small_req
         );
         assert_eq!(
             cache
-                .get_or_plan(&large_meta, || planner.plan(&large_meta))
+                .get_or_plan(&large_meta, &[], || planner.plan(&large_meta))
                 .expect("plan"),
             large_req
         );
@@ -10363,10 +10354,10 @@ mod workspace_plan_cache_tests {
         let f32_meta = [meta(DataType::Float32, &shape, true)];
         let f16_meta = [meta(DataType::Float16, &shape, true)];
         let f32_req = cache
-            .get_or_plan(&f32_meta, || planner.plan(&f32_meta))
+            .get_or_plan(&f32_meta, &[], || planner.plan(&f32_meta))
             .expect("plan");
         let f16_req = cache
-            .get_or_plan(&f16_meta, || planner.plan(&f16_meta))
+            .get_or_plan(&f16_meta, &[], || planner.plan(&f16_meta))
             .expect("plan");
 
         assert_eq!(f32_req.bytes, 64 * 4);
@@ -10399,10 +10390,10 @@ mod workspace_plan_cache_tests {
             meta(DataType::Float32, &bias, false),
         ];
         let with = cache
-            .get_or_plan(&with_bias, || planner.plan(&with_bias))
+            .get_or_plan(&with_bias, &[], || planner.plan(&with_bias))
             .expect("plan");
         let without = cache
-            .get_or_plan(&without_bias, || planner.plan(&without_bias))
+            .get_or_plan(&without_bias, &[], || planner.plan(&without_bias))
             .expect("plan");
 
         assert_eq!(with.bytes, 16 * 4 * 2);
@@ -10428,10 +10419,10 @@ mod workspace_plan_cache_tests {
             meta(DataType::Float32, &shape, true),
         ];
         let one_req = cache
-            .get_or_plan(&one, || planner.plan(&one))
+            .get_or_plan(&one, &[], || planner.plan(&one))
             .expect("plan");
         let two_req = cache
-            .get_or_plan(&two, || planner.plan(&two))
+            .get_or_plan(&two, &[], || planner.plan(&two))
             .expect("plan");
 
         assert_eq!(one_req.bytes, 8 * 4);
@@ -10455,7 +10446,7 @@ mod workspace_plan_cache_tests {
             for shape in &shapes {
                 let metadata = [meta(DataType::Float32, shape.as_slice(), true)];
                 let got = cache
-                    .get_or_plan(&metadata, || planner.plan(&metadata))
+                    .get_or_plan(&metadata, &[], || planner.plan(&metadata))
                     .expect("plan");
                 assert_eq!(
                     got.bytes,
@@ -10485,7 +10476,7 @@ mod workspace_plan_cache_tests {
         let hot_meta = [meta(DataType::Float32, &hot, true)];
 
         cache
-            .get_or_plan(&hot_meta, || planner.plan(&hot_meta))
+            .get_or_plan(&hot_meta, &[], || planner.plan(&hot_meta))
             .expect("plan");
         let after_hot = planner.calls();
 
@@ -10494,11 +10485,11 @@ mod workspace_plan_cache_tests {
             let cold = [n];
             let cold_meta = [meta(DataType::Float32, &cold, true)];
             cache
-                .get_or_plan(&cold_meta, || planner.plan(&cold_meta))
+                .get_or_plan(&cold_meta, &[], || planner.plan(&cold_meta))
                 .expect("plan");
             // Touch the hot signature between cold ones, as decode does.
             cache
-                .get_or_plan(&hot_meta, || planner.plan(&hot_meta))
+                .get_or_plan(&hot_meta, &[], || planner.plan(&hot_meta))
                 .expect("plan");
         }
         assert_eq!(
@@ -10520,7 +10511,7 @@ mod workspace_plan_cache_tests {
 
         for expected in 1..=3 {
             let err = cache
-                .get_or_plan(&metadata, || {
+                .get_or_plan(&metadata, &[], || {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Err("cuBLASLt heuristic found no algorithm".to_string())
                 })
@@ -10554,7 +10545,7 @@ mod workspace_plan_cache_tests {
                         let shape = [id * 32];
                         let metadata = [meta(DataType::Float32, shape.as_slice(), true)];
                         let got = cache
-                            .get_or_plan(&metadata, || planner.plan(&metadata))
+                            .get_or_plan(&metadata, &[], || planner.plan(&metadata))
                             .expect("plan");
                         assert_eq!(
                             got.bytes,
@@ -10591,7 +10582,7 @@ mod workspace_plan_cache_tests {
         let shape = [12usize];
         let metadata = [meta(DataType::Float32, &shape, true)];
         cache
-            .get_or_plan(&metadata, || planner.plan(&metadata))
+            .get_or_plan(&metadata, &[], || planner.plan(&metadata))
             .expect("plan");
 
         let poisoner = {
@@ -10604,7 +10595,7 @@ mod workspace_plan_cache_tests {
         assert!(poisoner.join().is_err(), "the poisoning thread must panic");
 
         let got = cache
-            .get_or_plan(&metadata, || planner.plan(&metadata))
+            .get_or_plan(&metadata, &[], || planner.plan(&metadata))
             .expect("a poisoned lock must not fail the dispatch");
         assert_eq!(got.bytes, 12 * 4);
         assert_eq!(
@@ -10696,7 +10687,7 @@ mod workspace_plan_cache_tests {
         let inputs = [view(&data, DataType::Float32, &shape, &strides)];
 
         cache
-            .get_or_plan_views(&inputs, |m| planner.plan(m))
+            .get_or_plan_views(&inputs, &[], |m| planner.plan(m))
             .expect("plan");
         assert!(
             cache.hot.get().is_none(),
@@ -10704,7 +10695,7 @@ mod workspace_plan_cache_tests {
         );
 
         cache
-            .get_or_plan_views(&inputs, |m| planner.plan(m))
+            .get_or_plan_views(&inputs, &[], |m| planner.plan(m))
             .expect("plan");
         assert!(
             cache.hot.get().is_some(),
@@ -10713,7 +10704,7 @@ mod workspace_plan_cache_tests {
 
         let before = planner.calls();
         let got = cache
-            .get_or_plan_views(&inputs, |_| {
+            .get_or_plan_views(&inputs, &[], |_| {
                 panic!("the published plan must not be re-planned")
             })
             .expect("served from the lock-free slot");
@@ -10734,7 +10725,7 @@ mod workspace_plan_cache_tests {
         let inputs = [view(&data, DataType::Float32, &shape, &strides)];
         for _ in 0..2 {
             cache
-                .get_or_plan_views(&inputs, |m| planner.plan(m))
+                .get_or_plan_views(&inputs, &[], |m| planner.plan(m))
                 .expect("plan");
         }
         assert!(cache.hot.get().is_some(), "signature must be published");
@@ -10749,7 +10740,7 @@ mod workspace_plan_cache_tests {
                 let strides = [1i64];
                 let inputs = [view(&data, DataType::Float32, &shape, &strides)];
                 let got = cache
-                    .get_or_plan_views(&inputs, |_| panic!("must not re-plan"))
+                    .get_or_plan_views(&inputs, &[], |_| panic!("must not re-plan"))
                     .expect("served");
                 let _ = tx.send(got.bytes);
             })
@@ -10775,12 +10766,12 @@ mod workspace_plan_cache_tests {
 
         let p = [view(&data, DataType::Float32, &prefill, &strides)];
         cache
-            .get_or_plan_views(&p, |m| planner.plan(m))
+            .get_or_plan_views(&p, &[], |m| planner.plan(m))
             .expect("plan");
         let d = [view(&data, DataType::Float32, &decode, &strides)];
         for _ in 0..2 {
             cache
-                .get_or_plan_views(&d, |m| planner.plan(m))
+                .get_or_plan_views(&d, &[], |m| planner.plan(m))
                 .expect("plan");
         }
 
@@ -10809,7 +10800,7 @@ mod workspace_plan_cache_tests {
             let inputs = [view(&data, DataType::Float32, &hot_shape, &strides[..1])];
             for _ in 0..2 {
                 cache
-                    .get_or_plan_views(&inputs, |m| planner.plan(m))
+                    .get_or_plan_views(&inputs, &[], |m| planner.plan(m))
                     .expect("plan");
             }
             assert!(cache.hot.get().is_some(), "publication precondition failed");
@@ -10823,7 +10814,7 @@ mod workspace_plan_cache_tests {
             let other_shape = [4usize];
             let other = [view(&data, DataType::Float32, &other_shape, &strides[..1])];
             let got = cache
-                .get_or_plan_views(&other, |m| planner.plan(m))
+                .get_or_plan_views(&other, &[], |m| planner.plan(m))
                 .expect("plan");
             assert_eq!(
                 got.bytes,
@@ -10838,7 +10829,7 @@ mod workspace_plan_cache_tests {
             publish(&cache, &planner);
             let other = [view(&data, DataType::Float16, &hot_shape, &strides[..1])];
             let got = cache
-                .get_or_plan_views(&other, |m| planner.plan(m))
+                .get_or_plan_views(&other, &[], |m| planner.plan(m))
                 .expect("plan");
             assert_eq!(
                 got.bytes,
@@ -10853,7 +10844,7 @@ mod workspace_plan_cache_tests {
             publish(&cache, &planner);
             let other = [TensorView::absent(DataType::Float32)];
             let got = cache
-                .get_or_plan_views(&other, |m| planner.plan(m))
+                .get_or_plan_views(&other, &[], |m| planner.plan(m))
                 .expect("plan");
             assert_eq!(
                 got.bytes, 1,
@@ -10870,7 +10861,7 @@ mod workspace_plan_cache_tests {
                 view(&data, DataType::Float32, &hot_shape, &strides[..1]),
             ];
             let got = cache
-                .get_or_plan_views(&other, |m| planner.plan(m))
+                .get_or_plan_views(&other, &[], |m| planner.plan(m))
                 .expect("plan");
             assert_eq!(
                 got.bytes,
@@ -10898,7 +10889,7 @@ mod workspace_plan_cache_tests {
                     let shape = [n * 2];
                     let inputs = [view(&data, DataType::Float32, &shape, &strides)];
                     let got = cache
-                        .get_or_plan_views(&inputs, |m| planner.plan(m))
+                        .get_or_plan_views(&inputs, &[], |m| planner.plan(m))
                         .expect("plan");
                     assert_eq!(
                         got.bytes as usize,
@@ -11138,7 +11129,7 @@ mod mem_info_cost {
     /// correctness.
     #[test]
     fn compute_info_assumes_device_placement_until_told_otherwise() {
-        let mut info = ExportedComputeInfo::new(Vec::new());
+        let mut info = ExportedComputeInfo::new(Vec::new(), None);
         assert!(
             !info.host_accessible,
             "default must be the conservative 'assume device', so an unset \
@@ -11285,4 +11276,27 @@ mod mem_info_cost {
             "the actual device input, not the fallback recipe"
         );
     }
+}
+
+fn workspace_outputs<'a>(views: &[TensorMut<'a>]) -> smallvec::SmallVec<[OutputMetadata<'a>; 4]> {
+    views.iter().map(OutputMetadata::from_view).collect()
+}
+
+fn unresolved_workspace_outputs(
+    requested: &[bool],
+    dtypes: &[DataType],
+) -> smallvec::SmallVec<[OutputMetadata<'static>; 4]> {
+    requested
+        .iter()
+        .enumerate()
+        .map(|(index, requested)| {
+            if *requested {
+                OutputMetadata::Unresolved {
+                    dtype: dtypes.get(index).copied().unwrap_or(DataType::Undefined),
+                }
+            } else {
+                OutputMetadata::Absent
+            }
+        })
+        .collect()
 }

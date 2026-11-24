@@ -1,7 +1,7 @@
 //! Capture-safe, bf16 **flash-decode** single-token (`Sq=1`) GQA attention.
 //!
 //! This is the bf16 sibling of [`super::gqa_decode`]. Where the f32 kernel
-//! assigns **one warp per query row** (only ~4 CTAs/layer for Qwen's 14 heads),
+//! assigns **one warp per query row** (few CTAs with few query heads),
 //! this kernel launches up to sixteen multi-warp CTAs per query head. Each CTA
 //! owns a contiguous KV slice and writes a partial online-softmax state; a
 //! second kernel merges those states in fixed split order. Q/K/V and the output
@@ -19,7 +19,7 @@
 //!     and finished with a `__shfl_xor_sync` butterfly (every lane owns `acc` for
 //!     its `head2` slots);
 //!   * warp 0 merges the CTA's warp states and writes one partial state to
-//!     module-global scratch;
+//!     caller-prepared scratch;
 //!   * the merge kernel combines splits with the standard flash rescale and
 //!     writes the normalized bf16 output.
 //!
@@ -34,18 +34,16 @@
 //! The launch path is legal to record inside a CUDA graph and to replay with
 //! only device-buffer contents changing:
 //!   * No `stream.synchronize()` or any device sync on the launch path.
-//!   * No per-call `cudaMalloc`/`cudaFree`. Cross-CTA scratch is a fixed
-//!     module-global allocation created when NVRTC loads the module, before
-//!     capture; per-CTA scratch is dynamic shared memory.
+//!   * No per-call `cudaMalloc`/`cudaFree`. Cross-CTA scratch borrows admitted
+//!     caller-owned workspace; per-CTA scratch is dynamic shared memory.
 //!   * Fixed launch geometry uses the maximum split count. The device-resident
 //!     valid length, combined with a host-computed occupancy target that sizes
 //!     the split count to fill the multiprocessors, selects between 1 and 16
 //!     active splits, so replay observes updated lengths without a host round
 //!     trip or graph update. Inactive split CTAs return before loading Q/K/V.
-//!   * The worst-case module-global scratch is 8,421,376 bytes
-//!     (`256 rows * 16 splits * 514 floats * 4 bytes`). It is shared by all GQA
-//!     layers under the runtime's single-stream execution invariant; concurrent
-//!     streams would require per-stream scratch.
+//!   * Partial states occupy `min(rows, row_cap) * 16 * (head_dim + 2)` f32s.
+//!     The row cap affects each row independently; later rows execute direct.
+//!     Independent execution lanes supply their own disjoint backing.
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -75,7 +73,7 @@ const MAX_H2PL: usize = 8;
 /// the flash merge cheap (a 4-way reduction in shared memory).
 const WARPS_PER_BLOCK: u32 = 4;
 const WARP_SIZE: u32 = 32;
-pub(super) const MAX_SPLITS: usize = 16;
+use super::gqa_decode::MAX_SPLITS;
 const MERGE_DIM_SPLITS: usize = 4;
 
 /// Whether the bf16 flash-decode kernel handles this shape. Single query token
@@ -101,18 +99,7 @@ const DECODE_SRC: &str = r#"
 #define GQA_WARP_SIZE 32
 #define GQA_MAX_H2PL 8   // __nv_bfloat162 slots per lane (widest tier); head_dim <= 2 * 8 * 32 == 512
 #define GQA_MAX_HEAD_SIZE 512
-#define GQA_MAX_SPLITS 16
 #define GQA_MERGE_DIM_SPLITS 4
-#define GQA_MAX_SCRATCH_ROWS 256
-#define GQA_SCRATCH_STRIDE (GQA_MAX_HEAD_SIZE + 2)
-
-// Module globals are allocated when the NVRTC module is loaded, before graph
-// capture. All GQA layers share the same stream and therefore reuse this
-// scratch sequentially. The 8,421,376-byte allocation is sized for the full
-// 256-row, 16-split worst case. Concurrent streams would need separate scratch.
-// Shapes above the row cap retain the old one-CTA path.
-__device__ __align__(16) float gqa_split_scratch[
-    GQA_MAX_SCRATCH_ROWS * GQA_MAX_SPLITS * GQA_SCRATCH_STRIDE];
 
 // Keep every active split doing at least this many keys. Splitting a short
 // sequence into more pieces than this adds merge and launch latency without
@@ -154,7 +141,7 @@ __device__ __forceinline__ void gqa_decode_bf16_impl(
     const int local_window,
     const float softcap,
     const int single_split_direct,
-    const int split_fill)
+    const int split_fill, float* __restrict__ scratch)
 {
     // Dynamic shared layout: warp_max[warps], warp_sum[warps], then
     // warp_acc[warps * head_size] (fp32 partial value accumulators per warp).
@@ -303,8 +290,8 @@ __device__ __forceinline__ void gqa_decode_bf16_impl(
     __nv_bfloat162* out2 = reinterpret_cast<__nv_bfloat162*>(output + q_base);
     float* split_state = direct_output
         ? nullptr
-        : gqa_split_scratch
-            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+        : scratch
+            + ((long)row * GQA_MAX_SPLITS + split) * (head_size + 2);
     if (lane == 0 && !direct_output) {
         split_state[0] = global_max;
         split_state[1] = denom;
@@ -348,11 +335,11 @@ extern "C" __global__ void gqa_decode_attention_bf16_h2pl##H2PL(             \
     const int query_heads, const int kv_heads, const int query_seq,          \
     const int head_size, const int cache_capacity, const int group_size,     \
     const float scale, const int local_window, const float softcap,          \
-    const int single_split_direct, const int split_fill) {                   \
+    const int single_split_direct, const int split_fill, float* __restrict__ scratch) {                   \
     gqa_decode_bf16_impl<H2PL>(query, key, value, output, total_lengths,      \
         batch, query_heads, kv_heads, query_seq, head_size, cache_capacity,   \
         group_size, scale, local_window, softcap, single_split_direct,        \
-        split_fill);                                                          \
+        split_fill, scratch);                                                          \
 }
 
 GQA_DECODE_BF16_ENTRIES(1)
@@ -373,7 +360,7 @@ extern "C" __global__ void gqa_decode_attention_bf16_merge(
     const int head_size,
     const int local_window,
     const int single_split_direct,
-    const int split_fill)
+    const int split_fill, float* __restrict__ scratch)
 {
     __shared__ float split_weight[GQA_MAX_SPLITS];
     __shared__ float inverse_sum_shared;
@@ -400,14 +387,14 @@ extern "C" __global__ void gqa_decode_attention_bf16_merge(
     if (lane == 0) {
         float global_max = __int_as_float(0xff800000);
         for (int split = 0; split < active_splits; ++split) {
-            const float* state = gqa_split_scratch
-                + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+            const float* state = scratch
+                + ((long)row * GQA_MAX_SPLITS + split) * (head_size + 2);
             global_max = fmaxf(global_max, state[0]);
         }
         float denom = 0.0f;
         for (int split = 0; split < active_splits; ++split) {
-            const float* state = gqa_split_scratch
-                + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+            const float* state = scratch
+                + ((long)row * GQA_MAX_SPLITS + split) * (head_size + 2);
             const float weight = expf(state[0] - global_max);
             split_weight[split] = weight;
             denom += state[1] * weight;
@@ -427,8 +414,8 @@ extern "C" __global__ void gqa_decode_attention_bf16_merge(
         float ox = 0.0f;
         float oy = 0.0f;
         for (int split = 0; split < active_splits; ++split) {
-            const float* state = gqa_split_scratch
-                + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+            const float* state = scratch
+                + ((long)row * GQA_MAX_SPLITS + split) * (head_size + 2);
             const float weight = split_weight[split];
             ox += state[2 + 2 * j] * weight;
             oy += state[2 + 2 * j + 1] * weight;
@@ -467,11 +454,21 @@ pub(super) fn run(
     local_window: i32,
     softcap: f32,
     kv_strides: &KvCacheStrides,
+    workspace: Option<onnx_runtime_ep_api::WorkspaceView>,
 ) -> Result<()> {
+    let [scratch_view] = super::gqa_decode::scratch_layout(batch, num_heads, query_seq, head_dim)?
+        .bind(workspace)?;
+    let scratch = crate::runtime::cuptr(scratch_view.ptr().0.cast_const());
+
     runtime.require_nvrtc_half_headers("gqa_decode_attention_bf16")?;
     kv_strides.require_converted_path_support(KvCachePath::Bf16DecodeRead)?;
     let module_key = kv_strides.decode_module_key_bf16()?;
-    let decode_src = format!("{}{}", kv_strides.decode_prelude(), DECODE_SRC);
+    let decode_src = format!(
+        "{}{}{}",
+        kv_strides.decode_prelude(),
+        super::gqa_decode::SPLIT_K_HEADER,
+        DECODE_SRC
+    );
 
     let as_i32 = |name: &str, value: usize| {
         i32::try_from(value).map_err(|_| {
@@ -563,10 +560,11 @@ pub(super) fn run(
         .arg(&local_window)
         .arg(&softcap)
         .arg(&single_split_direct)
-        .arg(&split_fill_i);
+        .arg(&split_fill_i)
+        .arg(&scratch);
     // SAFETY: the selected `h2pl` entry matches this argument ABI; all buffers were sized by the
     // caller (present K/V span `cache_capacity` rows, query/output span
-    // `query_seq` tokens). Scratch is fixed module-global plus dynamic shared
+    // `query_seq` tokens). Scratch is borrowed prepared backing plus dynamic shared
     // memory, and the kernel never device-syncs, so the launch is legal to record
     // into and replay from a CUDA graph.
     unsafe {
@@ -589,10 +587,11 @@ pub(super) fn run(
         .arg(&dim_i)
         .arg(&local_window)
         .arg(&single_split_direct)
-        .arg(&split_fill_i);
+        .arg(&split_fill_i)
+        .arg(&scratch);
     // SAFETY: the partial launch immediately above writes every active split
-    // state consumed by this same-stream merge launch. Module-global scratch is
-    // persistent for the loaded module and both launches are graph-recordable.
+    // state consumed by this same-stream merge launch. The caller retains prepared scratch
+    // through both launches and any installed graph that references it.
     unsafe {
         merge_builder.launch(LaunchConfig {
             grid_dim: (merge_grid_x, 1, 1),
@@ -746,6 +745,8 @@ mod tests {
         let value_dev = runtime.alloc_raw(v_bf16.len() * 2).unwrap();
         let output_dev = runtime.alloc_raw(num_heads * head_dim * 2).unwrap();
         let totals_dev = runtime.alloc_raw(batch * 4).unwrap();
+        let scratch =
+            super::super::gqa_decode::TestScratch::new(&runtime, batch, num_heads, 1, head_dim);
 
         // SAFETY: device buffers were sized to hold each source slice.
         unsafe {
@@ -785,6 +786,7 @@ mod tests {
                 0,
                 0.0,
                 &KvCacheStrides::head_major_bnsh(),
+                Some(scratch.view()),
             )
             .unwrap();
 
@@ -813,6 +815,7 @@ mod tests {
                 0,
                 0.0,
                 &KvCacheStrides::head_major_bnsh(),
+                Some(scratch.view()),
             )
             .unwrap();
             let mut repeated_bf16 = vec![bf16::ZERO; num_heads * head_dim];
@@ -856,7 +859,9 @@ mod tests {
             "bf16 split-K launch path must not allocate or free device memory"
         );
 
-        runtime.begin_graph_capture(&[]).unwrap();
+        runtime
+            .begin_graph_capture_with_resources(&[], vec![scratch.resource()])
+            .unwrap();
         run(
             &runtime,
             batch,
@@ -875,6 +880,7 @@ mod tests {
             0,
             0.0,
             &KvCacheStrides::head_major_bnsh(),
+            Some(scratch.view()),
         )
         .unwrap();
         runtime.end_graph_capture().unwrap();
@@ -987,6 +993,8 @@ mod tests {
             let value_dev = runtime.alloc_raw(v_bf16.len() * 2).unwrap();
             let output_dev = runtime.alloc_raw(num_heads * head_dim * 2).unwrap();
             let totals_dev = runtime.alloc_raw(batch * 4).unwrap();
+            let scratch =
+                super::super::gqa_decode::TestScratch::new(&runtime, batch, num_heads, 1, head_dim);
             // SAFETY: device buffers were sized to hold each source slice.
             unsafe {
                 runtime.htod(as_bytes(&q_bf16), query_dev).unwrap();
@@ -1019,6 +1027,7 @@ mod tests {
                     0,
                     0.0,
                     &KvCacheStrides::head_major_bnsh(),
+                    Some(scratch.view()),
                 )
                 .unwrap();
                 let mut got = vec![bf16::ZERO; num_heads * head_dim];
@@ -1123,6 +1132,8 @@ mod tests {
             let value_dev = runtime.alloc_raw(v_bf16.len() * 2).unwrap();
             let output_dev = runtime.alloc_raw(num_heads * head_dim * 2).unwrap();
             let totals_dev = runtime.alloc_raw(batch * 4).unwrap();
+            let scratch =
+                super::super::gqa_decode::TestScratch::new(&runtime, batch, num_heads, 1, head_dim);
             // SAFETY: device buffers were sized to hold each source slice.
             unsafe {
                 runtime.htod(as_bytes(&q_bf16), query_dev).unwrap();
@@ -1156,6 +1167,7 @@ mod tests {
                     0,
                     0.0,
                     &KvCacheStrides::head_major_bnsh(),
+                    Some(scratch.view()),
                 )
                 .unwrap();
                 let mut got = vec![bf16::ZERO; num_heads * head_dim];
