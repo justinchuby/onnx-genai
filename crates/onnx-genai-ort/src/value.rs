@@ -385,7 +385,7 @@ impl Value {
                  which needs {needed}; ORT would read past the end of the allocation"
             )));
         }
-        let host_accessible = memory_info.device_name == "Cpu";
+        let host_accessible = memory_info.is_host_accessible();
         let ptr = create_tensor_with_data_in(data, bytes, shape, dtype, memory_info)?;
         Ok(Self {
             ptr,
@@ -1826,7 +1826,7 @@ fn create_tensor_with_data_in(
     dtype: DataType,
     memory_info: &MemoryInfo,
 ) -> Result<NonNull<onnx_genai_ort_sys::OrtValue>> {
-    create_tensor_with_data_at(memory_info.as_ptr(), data, bytes, shape, dtype)
+    create_tensor_with_data_at(memory_info.resolve()?.as_ptr(), data, bytes, shape, dtype)
 }
 
 fn create_tensor_with_data_at(

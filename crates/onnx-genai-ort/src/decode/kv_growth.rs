@@ -111,7 +111,7 @@ fn grow_kv_value_cuda(
         // non-zero via ONNX_GENAI_CUDA_DEVICE); without this the barriers could
         // target the wrong device. Restored on drop.
         let _device_guard =
-            crate::cuda_rt::DeviceGuard::set(device_allocator.memory_info.device_id)?;
+            crate::cuda_rt::DeviceGuard::set(device_allocator.memory_info().device_id())?;
         // The prior decode step's KV writes run on the ORT CUDA EP's stream and
         // may still be in flight; block until they land before we read the old
         // buffer, so the copied prefix is complete rather than partially written.

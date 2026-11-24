@@ -152,7 +152,11 @@ impl<'s> IoBinding<'s> {
         // SAFETY: binding and memory info are valid ORT handles; `name` is
         // NUL-terminated and lives for the call.
         crate::error::check_status(unsafe {
-            bind(self.ptr.as_ptr(), name.as_ptr(), memory_info.as_ptr())
+            bind(
+                self.ptr.as_ptr(),
+                name.as_ptr(),
+                memory_info.resolve()?.as_ptr(),
+            )
         })
     }
 
