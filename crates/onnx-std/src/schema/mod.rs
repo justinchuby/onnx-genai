@@ -1654,7 +1654,6 @@ type_constraints:
     common_schema_test!(neg_schema_matches_opset_13, "Neg", 13, 1, 1);
     common_schema_test!(abs_schema_matches_opset_13, "Abs", 13, 1, 1);
     common_schema_test!(mod_schema_matches_opset_13, "Mod", 13, 2, 1);
-    common_schema_test!(mod_schema_matches_opset_28, "Mod", 28, 2, 1);
 
     #[test]
     fn mod_schema_preserves_numeric_types_and_default_across_opset_28() {
@@ -1663,6 +1662,8 @@ type_constraints:
         let new = registry.lookup("Mod", "", 28).unwrap();
         assert_eq!(old.since_version, 13);
         assert_eq!(new.since_version, 28);
+        assert_eq!(new.inputs.len(), 2);
+        assert_eq!(new.outputs.len(), 1);
         assert_eq!(
             old.type_constraints[0].allowed,
             new.type_constraints[0].allowed
