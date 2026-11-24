@@ -1381,7 +1381,8 @@ jobs:
       # Besides the broad EP/memory inventory, this compiles and lists the
       # exact production targets that had been absent from CI:
       # onnx-runtime-ep-cuda-plugin/cuda_unique_ort_e2e with `cuda`, and
-      # onnx-runtime-session/hetero_cuda_gpu both without and with `gpu-tests`.
+      # onnx-runtime-session/hetero_cuda_gpu and modern_shape_size both without
+      # and with `gpu-tests`.
       # The base hetero inventory is executed only to prove its device test is
       # ignored; both feature-enabled GPU paths are compile/list-only because
       # GitHub-hosted runners have no CUDA device.
