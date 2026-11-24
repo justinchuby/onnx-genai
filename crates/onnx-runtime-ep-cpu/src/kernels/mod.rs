@@ -1556,11 +1556,6 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(cast::CastFactory { float6: true }),
     );
     rec.register(
-        OpKey::new("Float6Projection", "pkg.nxrt", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::Float6Projection),
-    );
-    rec.register(
         OpKey::new("CastLike", "", 15),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(cast::CastLikeFactory),
@@ -3511,8 +3506,8 @@ mod tests {
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
         // The EP-owned affine and GGUF Gather and grouped-projection fusions each add one.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        // Opset-28 Cast and the packed FLOAT6 projection add two registrations.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 119 + mlas_registrations);
+        // Opset-28 Cast adds one registration.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 118 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")

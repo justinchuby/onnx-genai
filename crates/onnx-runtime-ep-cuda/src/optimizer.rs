@@ -299,7 +299,6 @@ pub(crate) fn cuda_optimization_passes(
         // fusions above (and the ~90 fp32→fp32 export casts per forward), rewiring
         // consumers onto the pre-cast value. Byte-identical, shape/dtype-driven.
         Box::new(CudaDropIdentityCast),
-        Box::new(onnx_runtime_optimizer::float6_projection::Float6ProjectionFusion),
         Box::new(
             onnx_runtime_optimizer::quantized_matmul::AffineMatMulFusion {
                 single_row_only: true,

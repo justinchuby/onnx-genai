@@ -1692,11 +1692,11 @@ and use supported encodings.
   ONNX inline and ordinary external data can use a
   zero-padded final byte; ONNX `int32_data` uses one unsigned code per
   element. On native CPU and CUDA, opset 28 `Cast` widens contiguous
-  FLOAT6 to FP16, BF16, FP32 or FP64. For single-row FP32 `MatMul` with an
-  immutable `[K,N]` FLOAT6 RHS, positive `K,N`, `N` divisible by four,
-  and no other user of the widened weight, both providers can consume the
-  packed bytes directly without allocating the widened matrix. This is not support for quantizing
-  to FLOAT6, `DequantizeLinear` on FLOAT6, or direct FLOAT6 arithmetic.
+  FLOAT6 to FP16, BF16, FP32 or FP64; CPU also supports strided views.
+  The loader keeps the initializer packed. A graph can feed the widened
+  result to `MatMul`, but this materializes the widened weight at execution
+  rather than projecting directly from packed bytes. Quantizing to FLOAT6,
+  `DequantizeLinear` on FLOAT6, and direct FLOAT6 arithmetic are not supported.
 * **GGUF:** accepts little-endian v2 and v3. Dense `F32`, `F16`, `BF16`,
   `F64`, and `I8`/`I16`/`I32`/`I64` map to their exact ONNX scalar dtype.
   GGML's first dimension is contiguous; the ONNX shape is the reversed
