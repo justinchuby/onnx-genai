@@ -164,7 +164,15 @@ fn run_gpu_matmul_f32(
     let kernel = ep
         .get_kernel(&node, &[a_shape.to_vec(), b_shape.to_vec()], 17)
         .unwrap();
-    kernel.execute(&[a_view, b_view], &mut [out_view]).unwrap();
+    let mut workspace = None;
+    common::execute_kernel(
+        ep,
+        kernel.as_ref(),
+        &[a_view, b_view],
+        &mut [out_view],
+        &mut workspace,
+    )
+    .unwrap();
 
     let mut out_bytes = vec![0u8; out_len * 4];
     // SAFETY: c_buf holds `out_len` f32 = out_len*4 bytes.
@@ -172,6 +180,9 @@ fn run_gpu_matmul_f32(
         rt.dtoh(&mut out_bytes, cuptr(c_buf.as_ptr())).unwrap();
     }
 
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
     ep.deallocate(a_buf).unwrap();
     ep.deallocate(b_buf).unwrap();
     ep.deallocate(c_buf).unwrap();
@@ -408,19 +419,22 @@ fn matmul_f32_gemv_is_capture_safe_after_warmup_gpu() {
     let kernel = ep
         .get_kernel(&node, &[a_shape.to_vec(), b_shape.to_vec()], 17)
         .unwrap();
+    let workspace = std::cell::RefCell::new(None);
     let execute = |c_buf: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        kernel
-            .execute(
-                &[a_view.clone(), b_view.clone()],
-                &mut [TensorMut::new(
-                    DevicePtrMut(c_buf.as_mut_ptr()),
-                    DataType::Float32,
-                    &c_shape,
-                    &c_strides,
-                    dev,
-                )],
-            )
-            .unwrap();
+        common::execute_kernel(
+            &ep,
+            kernel.as_ref(),
+            &[a_view.clone(), b_view.clone()],
+            &mut [TensorMut::new(
+                DevicePtrMut(c_buf.as_mut_ptr()),
+                DataType::Float32,
+                &c_shape,
+                &c_strides,
+                dev,
+            )],
+            &mut workspace.borrow_mut(),
+        )
+        .unwrap();
     };
 
     execute(&mut c_buf);
@@ -428,11 +442,7 @@ fn matmul_f32_gemv_is_capture_safe_after_warmup_gpu() {
         kernel.capture_support().is_supported(),
         "warmed f32 M==1 signature must advertise capture support"
     );
-    let warmed_resources = kernel
-        .device_graph_resources()
-        .iter()
-        .map(|resource| resource.identity())
-        .collect::<Vec<_>>();
+    assert!(kernel.device_graph_resources().is_empty());
     let b_m = 2usize;
     let b_a: Vec<f32> = (0..b_m * k)
         .map(|i| (i.wrapping_mul(29) % 211) as f32 / 211.0 - 0.5)
@@ -456,7 +466,9 @@ fn matmul_f32_gemv_is_capture_safe_after_warmup_gpu() {
         dev,
     );
     let execute_b = |b_c_buf: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        kernel.execute(
+        common::execute_kernel(
+            &ep,
+            kernel.as_ref(),
             &[b_a_view.clone(), b_view.clone()],
             &mut [TensorMut::new(
                 DevicePtrMut(b_c_buf.as_mut_ptr()),
@@ -465,39 +477,45 @@ fn matmul_f32_gemv_is_capture_safe_after_warmup_gpu() {
                 &b_c_strides,
                 dev,
             )],
+            &mut workspace.borrow_mut(),
         )
     };
 
     let counts_before_failure = rt.allocation_counts();
-    let pooled_before_failure = rt.raw_pool_retained_bytes();
     rt.fail_warm_transaction_at_for_test(1);
     let failure = execute_b(&mut b_c_buf).unwrap_err().to_string();
     assert!(
-        failure.contains("injected staged warm-cache failure after MatMul dense plan"),
+        failure.contains("injected staged warm-cache failure after MatMul dense host-plan"),
         "{failure}"
     );
     assert!(
-        kernel.capture_support().is_supported(),
-        "a failed replacement call must preserve the successful MatMul warm"
+        !kernel.capture_support().is_supported(),
+        "a failed refinement must revoke capture readiness before admission"
     );
+    assert!(kernel.device_graph_resources().is_empty());
     assert_eq!(
-        kernel
-            .device_graph_resources()
-            .iter()
-            .map(|resource| resource.identity())
-            .collect::<Vec<_>>(),
-        warmed_resources,
-        "MatMul capture eligibility and resources must remain one successful snapshot"
+        rt.allocation_counts(),
+        counts_before_failure,
+        "host planning must not allocate private device scratch"
     );
-    let counts_after_failure = rt.allocation_counts();
-    assert!(
-        counts_after_failure.allocations == counts_before_failure.allocations
-            || counts_after_failure.frees > counts_before_failure.frees
-            || rt.raw_pool_retained_bytes() > pooled_before_failure,
-        "the failed dense-plan candidate must return any workspace exactly once"
-    );
+    // Prepare both host plans and the shared physical high-water mark before
+    // installing any graph; neither route may grow that owner afterwards.
+    execute_b(&mut b_c_buf).unwrap();
+    execute(&mut c_buf);
     let allocations = rt.allocation_counts();
-    rt.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    let pins = workspace
+        .borrow()
+        .as_ref()
+        .map(|owner| {
+            owner
+                .device_graph_resource()
+                .unwrap()
+                .expect("real workspace owner")
+        })
+        .into_iter()
+        .collect();
+    rt.begin_graph_capture_with_resources(&[kernel.as_ref()], pins)
+        .unwrap();
     execute(&mut c_buf);
     assert!(
         rt.is_capturing().unwrap(),
@@ -525,6 +543,9 @@ fn matmul_f32_gemv_is_capture_safe_after_warmup_gpu() {
     assert!(approx_eq(&replay, &expected, 1e-4));
     assert!(rt.reset_graph().unwrap());
 
+    if let Some(workspace) = workspace.into_inner() {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
     ep.deallocate(a_buf).unwrap();
     ep.deallocate(b_buf).unwrap();
     ep.deallocate(c_buf).unwrap();
@@ -537,13 +558,13 @@ fn matmul_f32_gemv_is_capture_safe_after_warmup_gpu() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn matmul_private_and_executor_workspace_authorities_are_disjoint() {
+fn matmul_dense_plans_borrow_one_caller_workspace() {
     #[cfg(feature = "gpu-tests")]
-    matmul_private_and_executor_workspace_authorities_are_disjoint_gpu();
+    matmul_dense_plans_borrow_one_caller_workspace_gpu();
 }
 
 #[cfg(feature = "gpu-tests")]
-fn matmul_private_and_executor_workspace_authorities_are_disjoint_gpu() {
+fn matmul_dense_plans_borrow_one_caller_workspace_gpu() {
     let injected = Arc::new(common::ExternalEagerAllocator::new(
         common::require_context("MatMul workspace-authority test"),
     ));
@@ -562,7 +583,7 @@ fn matmul_private_and_executor_workspace_authorities_are_disjoint_gpu() {
     let b = vec![1.0f32; k * n];
     let a_buffer = ep.allocate(a.len() * 4, 256).unwrap();
     let b_buffer = ep.allocate(b.len() * 4, 256).unwrap();
-    let mut output_buffer = ep.allocate(m * n * 4, 256).unwrap();
+    let mut output_buffer = ep.allocate(m * n * 4 + 4, 256).unwrap();
     unsafe {
         runtime
             .htod(f32_bytes(&a), cuptr(a_buffer.as_ptr()))
@@ -595,254 +616,220 @@ fn matmul_private_and_executor_workspace_authorities_are_disjoint_gpu() {
         .get_kernel(&node, &[a_shape.to_vec(), b_shape.to_vec()], 17)
         .unwrap();
 
-    let external_after_tensors = injected.cumemalloc_calls();
-    let requirement = common::runtime_workspace_requirement(
-        kernel.as_ref(),
-        &inputs,
-        &[onnx_runtime_ep_api::OutputMetadata::tensor(
-            DataType::Float32,
-            &output_shape,
-        )],
-        &[TensorMut::new(
-            DevicePtrMut(output_buffer.as_mut_ptr()),
-            DataType::Float32,
-            &output_shape,
-            &output_strides,
-            device,
-        )],
-    )
-    .unwrap();
-    assert_eq!(
-        requirement.bytes, 0,
-        "the single-matrix private-plan route must not reserve executor workspace"
-    );
-    let mut executor_workspace = None;
-    assert!(
-        common::prepare_workspace(&ep, requirement, &mut executor_workspace)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        injected.cumemalloc_calls(),
-        external_after_tensors,
-        "planning the private route must not allocate through the executor allocator"
-    );
-
-    kernel
-        .execute_with_workspace(
-            &inputs,
-            &mut [TensorMut::new(
+    macro_rules! output {
+        () => {
+            TensorMut::new(
                 DevicePtrMut(output_buffer.as_mut_ptr()),
                 DataType::Float32,
                 &output_shape,
                 &output_strides,
                 device,
-            )],
-            None,
-        )
-        .unwrap();
-    runtime.synchronize().unwrap();
-    assert_eq!(
-        injected.cumemalloc_calls(),
-        external_after_tensors,
-        "the private route must not allocate an executor-owned workspace"
-    );
-    let resources = kernel.device_graph_resources();
-    assert_eq!(
-        resources.len(),
-        1,
-        "this constrained shape must use one private cuBLASLt workspace"
-    );
-    let private_workspace_id = resources[0].identity();
-    drop(resources);
-
-    let counts_before_capture = runtime.allocation_counts();
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
-    kernel
-        .execute_with_workspace(
-            &inputs,
-            &mut [TensorMut::new(
-                DevicePtrMut(output_buffer.as_mut_ptr()),
-                DataType::Float32,
-                &output_shape,
-                &output_strides,
-                device,
-            )],
-            None,
-        )
-        .unwrap();
-    assert_eq!(
-        runtime.allocation_counts(),
-        counts_before_capture,
-        "capturing the private route must reuse its warmed workspace"
-    );
-    runtime.end_graph_capture().unwrap();
-    assert_eq!(
-        runtime.allocation_counts(),
-        counts_before_capture,
-        "installing the graph must not replace the private workspace"
-    );
-    assert_eq!(
-        kernel.device_graph_resources()[0].identity(),
-        private_workspace_id,
-        "capture must retain the exact private workspace used during warmup"
-    );
-
-    let batch = 2usize;
-    // Keep an inner singleton batch axis so this route executes two ordinary
-    // GEMMs. That gives it the same non-zero cuBLASLt scratch requirement as
-    // the private 2-D plan while still requiring executor authority because
-    // there are two matrices overall.
-    let batched_a_shape = [batch, 1, m, k];
-    let batched_b_shape = [batch, 1, k, n];
-    let batched_output_shape = [batch, 1, m, n];
-    let batched_a = vec![1.0f32; batch * m * k];
-    let batched_b = vec![1.0f32; batch * k * n];
-    let batched_a_buffer = ep.allocate(batched_a.len() * 4, 256).unwrap();
-    let batched_b_buffer = ep.allocate(batched_b.len() * 4, 256).unwrap();
-    let mut batched_output_buffer = ep.allocate(batch * m * n * 4, 256).unwrap();
-    unsafe {
-        runtime
-            .htod(f32_bytes(&batched_a), cuptr(batched_a_buffer.as_ptr()))
-            .unwrap();
-        runtime
-            .htod(f32_bytes(&batched_b), cuptr(batched_b_buffer.as_ptr()))
-            .unwrap();
+            )
+        };
     }
-    let batched_a_strides = compute_contiguous_strides(&batched_a_shape);
-    let batched_b_strides = compute_contiguous_strides(&batched_b_shape);
-    let batched_output_strides = compute_contiguous_strides(&batched_output_shape);
-    let batched_inputs = [
-        TensorView::new(
-            DevicePtr(batched_a_buffer.as_ptr()),
-            DataType::Float32,
-            &batched_a_shape,
-            &batched_a_strides,
-            device,
-        ),
-        TensorView::new(
-            DevicePtr(batched_b_buffer.as_ptr()),
-            DataType::Float32,
-            &batched_b_shape,
-            &batched_b_strides,
-            device,
-        ),
-    ];
-    let batched_requirement = common::runtime_workspace_requirement(
-        kernel.as_ref(),
-        &batched_inputs,
-        &[onnx_runtime_ep_api::OutputMetadata::tensor(
-            DataType::Float32,
-            &batched_output_shape,
-        )],
-        &[TensorMut::new(
-            DevicePtrMut(batched_output_buffer.as_mut_ptr()),
-            DataType::Float32,
-            &batched_output_shape,
-            &batched_output_strides,
-            device,
-        )],
-    )
-    .unwrap();
+    macro_rules! refine {
+        () => {
+            common::runtime_workspace_requirement(
+                kernel.as_ref(),
+                &inputs,
+                &[onnx_runtime_ep_api::OutputMetadata::tensor(
+                    DataType::Float32,
+                    &output_shape,
+                )],
+                &[output!()],
+            )
+            .unwrap()
+        };
+    }
+    macro_rules! execute {
+        ($view:expr) => {
+            kernel.execute_with_workspace(&inputs, &mut [output!()], $view)
+        };
+    }
+    let external_after_tensors = injected.cumemalloc_calls();
+    let runtime_before_planning = runtime.allocation_counts();
+    let requirement = refine!();
     assert!(
-        batched_requirement.bytes > 0,
-        "the constrained batched shape must request executor workspace"
+        requirement.bytes > 0,
+        "this scratch regression needs a non-zero cuBLASLt requirement"
     );
-    injected.fail_next_allocation();
-    let allocation_error =
-        common::prepare_workspace(&ep, batched_requirement, &mut executor_workspace)
-            .expect_err("the constrained allocator must intercept executor workspace allocation");
-    assert!(
-        allocation_error
-            .to_string()
-            .contains("injected workspace allocation failure"),
-        "{allocation_error}"
-    );
-    let calls_before_workspace = injected.cumemalloc_calls();
-    let workspace_view =
-        common::prepare_workspace(&ep, batched_requirement, &mut executor_workspace).unwrap();
-    assert!(workspace_view.is_some());
     assert_eq!(
-        injected.cumemalloc_calls(),
-        calls_before_workspace + 1,
-        "the batched route must allocate exactly one executor workspace"
+        requirement.lifetime,
+        onnx_runtime_ep_api::WorkspaceLifetime::SessionPersistent
     );
-    let runtime_counts_before_batched = runtime.allocation_counts();
-    kernel
-        .execute_with_workspace(
-            &batched_inputs,
-            &mut [TensorMut::new(
-                DevicePtrMut(batched_output_buffer.as_mut_ptr()),
-                DataType::Float32,
-                &batched_output_shape,
-                &batched_output_strides,
-                device,
-            )],
-            workspace_view,
-        )
-        .unwrap();
-    runtime.synchronize().unwrap();
     assert_eq!(
         runtime.allocation_counts(),
-        runtime_counts_before_batched,
-        "the batched route must use executor workspace instead of allocating private scratch"
+        runtime_before_planning,
+        "the candidate contains host descriptors only"
     );
+    assert_eq!(injected.cumemalloc_calls(), external_after_tensors);
+    assert!(!kernel.capture_support().is_supported());
+    let mut workspace = None;
+    injected.fail_next_allocation();
+    let error = common::prepare_workspace(&ep, requirement, &mut workspace)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("injected workspace allocation failure"),
+        "{error}"
+    );
+    assert!(
+        !kernel.capture_support().is_supported(),
+        "quota failure cannot leave capture proof or trigger fallback"
+    );
+    let requirement = refine!();
+    let mut view = common::prepare_workspace(&ep, requirement, &mut workspace)
+        .unwrap()
+        .unwrap();
+    assert_eq!(injected.cumemalloc_calls(), external_after_tensors + 1);
+    let error = execute!(None).unwrap_err().to_string();
+    assert!(error.contains("workspace needs"), "{error}");
+    assert!(!kernel.capture_support().is_supported());
+    refine!();
+    let short = onnx_runtime_ep_api::WorkspaceView::new(view.ptr(), requirement.bytes as usize - 1);
+    assert!(
+        execute!(Some(short))
+            .unwrap_err()
+            .to_string()
+            .contains("workspace needs")
+    );
+    refine!();
+    execute!(Some(view)).unwrap();
+    assert!(kernel.capture_support().is_supported());
     assert!(
         kernel.device_graph_resources().is_empty(),
-        "the batched route must not publish a private workspace owner"
+        "all physical ownership belongs to the caller lane"
     );
-
-    let counts_before_drop = runtime.allocation_counts();
-    let pooled_before_drop = runtime.raw_pool_retained_bytes();
+    let counts = runtime.allocation_counts();
+    let external = injected.cumemalloc_calls();
+    for _ in 0..8 {
+        let repeated = refine!();
+        assert_eq!(repeated, requirement);
+        common::prepare_workspace(&ep, repeated, &mut workspace).unwrap();
+        execute!(Some(view)).unwrap();
+    }
+    assert_eq!(runtime.allocation_counts(), counts);
+    assert_eq!(
+        injected.cumemalloc_calls(),
+        external,
+        "warm fit must reuse the caller owner"
+    );
+    // Establish both nodes' peak before installing a graph; the owner is
+    // frozen throughout replay, even if two heuristic choices differ in size.
+    let other = ep
+        .get_kernel(&node, &[a_shape.to_vec(), b_shape.to_vec()], 17)
+        .unwrap();
+    runtime.synchronize().unwrap();
+    common::execute_kernel(
+        &ep,
+        other.as_ref(),
+        &inputs,
+        &mut [output!()],
+        &mut workspace,
+    )
+    .unwrap();
+    let owner = workspace.as_mut().unwrap();
+    view = onnx_runtime_ep_api::WorkspaceView::new(DevicePtrMut(owner.as_mut_ptr()), owner.len());
+    refine!();
+    execute!(Some(view)).unwrap();
+    let counts = runtime.allocation_counts();
+    let external = injected.cumemalloc_calls();
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    refine!();
+    let missing_pin = execute!(Some(view)).unwrap_err().to_string();
+    runtime.abort_graph_capture().unwrap();
+    assert!(
+        missing_pin.contains("real workspace owner"),
+        "{missing_pin}"
+    );
+    assert!(!kernel.capture_support().is_supported());
+    refine!();
+    execute!(Some(view)).unwrap();
+    let pin = workspace
+        .as_ref()
+        .unwrap()
+        .device_graph_resource()
+        .unwrap()
+        .expect("real caller workspace pin");
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], vec![pin])
+        .unwrap();
+    refine!();
+    execute!(Some(view)).unwrap();
+    runtime.end_graph_capture().unwrap();
+    assert_eq!(runtime.allocation_counts(), counts);
+    // Another node borrows the same physical owner between replays. Scratch is
+    // disposable, so neither cached plan may rely on its previous contents.
+    for _ in 0..3 {
+        unsafe {
+            runtime
+                .htod(&vec![0xff; view.bytes()], cuptr(view.ptr().0.cast_const()))
+                .unwrap();
+        }
+        common::execute_kernel(
+            &ep,
+            other.as_ref(),
+            &inputs,
+            &mut [output!()],
+            &mut workspace,
+        )
+        .unwrap();
+        runtime.replay_graph().unwrap();
+        let mut output = vec![0u8; m * n * 4];
+        unsafe {
+            runtime
+                .dtoh(&mut output, cuptr(output_buffer.as_ptr()))
+                .unwrap();
+        }
+        assert!(bytes_to_f32(&output).iter().all(|&value| value == k as f32));
+    }
+    assert_eq!(runtime.allocation_counts(), counts);
+    assert_eq!(injected.cumemalloc_calls(), external);
+    drop(other);
     drop(kernel);
-    assert_eq!(
-        runtime.allocation_counts(),
-        counts_before_drop,
-        "dropping MatMul must not free a private workspace retained by a live graph"
-    );
-    assert_eq!(
-        runtime.raw_pool_retained_bytes(),
-        pooled_before_drop,
-        "a graph-retained private workspace must not return to the raw pool"
-    );
     runtime.replay_graph().unwrap();
     runtime.synchronize().unwrap();
-    let mut output = vec![0u8; m * n * 4];
+    assert_eq!(
+        runtime.allocation_counts(),
+        counts,
+        "dropping kernels owns no device scratch"
+    );
+    assert!(runtime.reset_graph().unwrap());
+    // A weaker-aligned output subview must be planned from its element origin,
+    // including byte_offset, rather than the aligned backing allocation.
+    let offset_kernel = ep
+        .get_kernel(&node, &[a_shape.to_vec(), b_shape.to_vec()], 17)
+        .unwrap();
+    let mut shifted = output!();
+    shifted.byte_offset = 4;
+    common::execute_kernel(
+        &ep,
+        offset_kernel.as_ref(),
+        &inputs,
+        &mut [shifted],
+        &mut workspace,
+    )
+    .unwrap();
+    let mut shifted_output = vec![0u8; m * n * 4];
     unsafe {
         runtime
-            .dtoh(&mut output, cuptr(output_buffer.as_ptr()))
+            .dtoh(
+                &mut shifted_output,
+                cuptr(output_buffer.as_ptr().cast::<u8>().wrapping_add(4).cast()),
+            )
             .unwrap();
     }
     assert!(
-        bytes_to_f32(&output).iter().all(|&value| value == k as f32),
-        "captured private-workspace MatMul produced an unexpected result"
+        bytes_to_f32(&shifted_output)
+            .iter()
+            .all(|&value| value == k as f32)
     );
-    let counts_before_reset = runtime.allocation_counts();
-    let pooled_before_reset = runtime.raw_pool_retained_bytes();
-    assert!(runtime.reset_graph().unwrap());
-    let counts_after_reset = runtime.allocation_counts();
-    let pooled_after_reset = runtime.raw_pool_retained_bytes();
-    assert!(
-        counts_after_reset.frees > counts_before_reset.frees
-            || pooled_after_reset > pooled_before_reset,
-        "resetting the graph must release private workspace owner {private_workspace_id}"
-    );
-
-    if let Some(workspace) = executor_workspace.take() {
-        ep.deallocate_workspace(workspace).unwrap();
-    }
-    for buffer in [batched_a_buffer, batched_b_buffer, batched_output_buffer] {
-        ep.deallocate(buffer).unwrap();
-    }
+    ep.deallocate_workspace(workspace.take().unwrap()).unwrap();
     for buffer in [a_buffer, b_buffer, output_buffer] {
         ep.deallocate(buffer).unwrap();
     }
-    common::drain_releases(&ep, "MatMul workspace-authority teardown");
-    assert_eq!(
-        injected.frees(),
-        injected.cumemalloc_calls(),
-        "all constrained allocator tensor/workspace charges must settle"
-    );
+    common::drain_releases(&ep, "MatMul caller-workspace teardown");
+    assert_eq!(injected.frees(), injected.cumemalloc_calls());
 }
 
 /// Run one dense fp16 MatMul on the GPU and return the host result as f32.
@@ -908,7 +895,15 @@ fn run_gpu_matmul_f16(
     let kernel = ep
         .get_kernel(&node, &[a_shape.to_vec(), b_shape.to_vec()], 17)
         .unwrap();
-    kernel.execute(&[a_view, b_view], &mut [out_view]).unwrap();
+    let mut workspace = None;
+    common::execute_kernel(
+        ep,
+        kernel.as_ref(),
+        &[a_view, b_view],
+        &mut [out_view],
+        &mut workspace,
+    )
+    .unwrap();
     // The M==1 fp16 path takes the capturable GEMV; assert the kernel advertises it.
     if a_shape[a_shape.len() - 2] == 1 {
         assert!(
@@ -923,6 +918,9 @@ fn run_gpu_matmul_f16(
         rt.dtoh(&mut out_bytes, cuptr(c_buf.as_ptr())).unwrap();
     }
 
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
     ep.deallocate(a_buf).unwrap();
     ep.deallocate(b_buf).unwrap();
     ep.deallocate(c_buf).unwrap();

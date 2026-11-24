@@ -23,6 +23,8 @@
 //! `LayeredMmap`/`MmapRegionSource` shape) rather than imported — the same
 //! convention that file documents.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -944,6 +946,7 @@ struct ComputeProxy {
     b: onnx_runtime_ep_api::DeviceBuffer,
     c: onnx_runtime_ep_api::DeviceBuffer,
     kernel: Box<dyn onnx_runtime_ep_api::Kernel>,
+    workspace: Option<onnx_runtime_ep_api::WorkspaceAllocation>,
     m: usize,
     k: usize,
     n: usize,
@@ -963,6 +966,7 @@ impl ComputeProxy {
             b,
             c,
             kernel,
+            workspace: None,
             m,
             k,
             n,
@@ -1002,13 +1006,22 @@ impl ComputeProxy {
             &out_strides,
             dev,
         );
-        self.kernel
-            .execute(&[a_view, b_view], &mut [out_view])
-            .unwrap();
+        common::execute_kernel(
+            ep,
+            self.kernel.as_ref(),
+            &[a_view, b_view],
+            &mut [out_view],
+            &mut self.workspace,
+        )
+        .unwrap();
     }
 
     fn teardown(self, ep: &CudaExecutionProvider) {
         use onnx_runtime_ep_api::ExecutionProvider;
+        ep.runtime().synchronize().unwrap();
+        if let Some(workspace) = self.workspace {
+            ep.deallocate_workspace(workspace).unwrap();
+        }
         ep.deallocate(self.a).unwrap();
         ep.deallocate(self.b).unwrap();
         ep.deallocate(self.c).unwrap();

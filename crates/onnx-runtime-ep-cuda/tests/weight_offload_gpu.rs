@@ -27,6 +27,8 @@
 //!   CUDA_VISIBLE_DEVICES=0 taskset -c 1 \
 //!     cargo test -p onnx-runtime-ep-cuda --test weight_offload_gpu
 
+mod common;
+
 use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, ExecutionProvider, ExternalMmapRegion, LazyDeviceWeightBinder,
     LazyWeight, LazyWeightBoundary, MmapRegionSource, ResidentWeight, TensorMut, TensorView,
@@ -134,12 +136,23 @@ fn run_matmul_with_b_ptr(
     let kernel = ep
         .get_kernel(&node, &[a_shape.to_vec(), b_shape.to_vec()], 17)
         .unwrap();
-    kernel.execute(&[a_view, b_view], &mut [out_view]).unwrap();
+    let mut workspace = None;
+    common::execute_kernel(
+        ep,
+        kernel.as_ref(),
+        &[a_view, b_view],
+        &mut [out_view],
+        &mut workspace,
+    )
+    .unwrap();
 
     let mut out_bytes = vec![0u8; m * n * 4];
     // SAFETY: `c_buf` holds `m*n` f32 = m*n*4 bytes.
     unsafe { rt.dtoh(&mut out_bytes, cuptr(c_buf.as_ptr())).unwrap() }
 
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
     ep.deallocate(a_buf).unwrap();
     ep.deallocate(c_buf).unwrap();
     out_bytes
