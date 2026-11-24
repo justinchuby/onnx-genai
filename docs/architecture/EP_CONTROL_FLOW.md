@@ -29,6 +29,12 @@ and execution errors propagate; they do not switch to another implementation.
 Unclaimed control flow retains the existing session implementation. No generic
 control-flow interpreter was added to the EP layer.
 
+The session's Loop/Scan transport copies fixed-width element bit patterns,
+including packed two- and four-bit tensors. Scan slices and stacked Loop/Scan
+outputs pack elements contiguously, without padding between rows or iterations.
+This transport is host-orchestrated; it does not imply packed arithmetic or
+whole-graph CUDA placement.
+
 ## Lexical dependencies
 
 The IR owns capture analysis through `Graph::required_outer_names` and

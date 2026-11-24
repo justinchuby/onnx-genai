@@ -1,6 +1,7 @@
 use onnx_runtime_ir::DataType;
 
 use crate::Tensor;
+use crate::tensor::copy_storage_elements;
 
 use super::{
     SeqTensor, SequenceError, SequenceResult, SequenceValue, addressable, checked_add, checked_mul,
@@ -306,103 +307,81 @@ pub fn concat(sequence: &SequenceValue, axis: i64, new_axis: bool) -> SequenceRe
     SeqTensor::new(tensor)
 }
 
-/// Stack already-validated contiguous element bytes along a new axis.
+/// Stack successive byte-padded slices along a new axis, without transferring
+/// their per-slice padding into the result.
 pub(crate) fn stack_new_axis(
-    elements: &[&[u8]],
+    slices: &[u8],
+    slice_count: usize,
     elem_shape: &[usize],
     axis: usize,
-    esize: usize,
+    reverse: bool,
+    dtype: DataType,
 ) -> SequenceResult<(Vec<usize>, Vec<u8>)> {
-    const OP: &str = "ConcatFromSequence";
-    if axis > elem_shape.len() || esize == 0 {
+    const OP: &str = "Loop/Scan";
+    if axis > elem_shape.len() || dtype.bit_size() == 0 {
         return Err(SequenceError::InvalidSplit {
             op: OP,
-            reason: "invalid new axis or element byte size".to_string(),
+            reason: format!("cannot stack shape {elem_shape:?} and dtype {dtype:?} at axis {axis}"),
         });
     }
     let outer = checked_product(OP, "stack outer element count", &elem_shape[..axis])?;
-    let inner_elements = checked_product(OP, "stack inner element count", &elem_shape[axis..])?;
-    let inner = checked_mul(
+    let inner = checked_product(OP, "stack inner element count", &elem_shape[axis..])?;
+    let slice_numel = checked_mul(OP, "stack slice element count", outer, inner, elem_shape)?;
+    let slice_bytes = dtype
+        .checked_storage_bytes(slice_numel)
+        .ok_or_else(|| overflow(OP, "stack slice byte count", elem_shape))?;
+    let source_bytes = checked_mul(
         OP,
-        "stack inner byte count",
-        inner_elements,
-        esize,
+        "stack source byte count",
+        slice_count,
+        slice_bytes,
         elem_shape,
     )?;
-    let source_bytes = checked_mul(OP, "stack source byte count", outer, inner, elem_shape)?;
     addressable(OP, "stack source byte count", source_bytes, elem_shape)?;
-    for element in elements {
-        if element.len() != source_bytes {
-            return Err(SequenceError::ByteLengthMismatch {
-                op: OP,
-                dtype: DataType::Uint8,
-                shape: clone_shape(OP, elem_shape)?,
-                expected: source_bytes,
-                actual: element.len(),
-            });
-        }
+    if slices.len() != source_bytes {
+        return Err(SequenceError::InvalidSplit {
+            op: OP,
+            reason: format!(
+                "{slice_count} slices of dtype {dtype:?}, shape {elem_shape:?} require \
+                 {source_bytes} bytes, got {}",
+                slices.len()
+            ),
+        });
     }
     let output_rows = checked_mul(
         OP,
         "stacked tensor output row count",
-        elements.len(),
+        slice_count,
         outer,
         elem_shape,
     )?;
-    let output_bytes = checked_mul(
+    let output_numel = checked_mul(
         OP,
-        "stack output byte count",
+        "stack output element count",
         output_rows,
         inner,
         elem_shape,
     )?;
+    let output_bytes = dtype
+        .checked_storage_bytes(output_numel)
+        .ok_or_else(|| overflow(OP, "stack output byte count", elem_shape))?;
     let mut bytes = zeroed_bytes(OP, "stack output", output_bytes, elem_shape)?;
-    if inner != 0 {
-        for (element_index, element) in elements.iter().enumerate() {
+    if output_numel != 0 {
+        for (slice_index, slice) in slices.chunks_exact(slice_bytes).enumerate() {
+            let output_index = if reverse {
+                slice_count - 1 - slice_index
+            } else {
+                slice_index
+            };
             for outer_index in 0..outer {
-                let source_offset = checked_mul(
-                    OP,
-                    "stack source byte offset",
-                    outer_index,
+                copy_storage_elements(
+                    dtype,
+                    slice,
+                    outer_index * inner,
+                    &mut bytes,
+                    (outer_index * slice_count + output_index) * inner,
                     inner,
-                    elem_shape,
-                )?;
-                let source_end = checked_add(
-                    OP,
-                    "stack source byte range",
-                    source_offset,
-                    inner,
-                    elem_shape,
-                )?;
-                let destination_row = checked_add(
-                    OP,
-                    "stack destination row",
-                    checked_mul(
-                        OP,
-                        "stack destination outer offset",
-                        outer_index,
-                        elements.len(),
-                        elem_shape,
-                    )?,
-                    element_index,
-                    elem_shape,
-                )?;
-                let destination_offset = checked_mul(
-                    OP,
-                    "stack destination byte offset",
-                    destination_row,
-                    inner,
-                    elem_shape,
-                )?;
-                let destination_end = checked_add(
-                    OP,
-                    "stack destination byte range",
-                    destination_offset,
-                    inner,
-                    elem_shape,
-                )?;
-                bytes[destination_offset..destination_end]
-                    .copy_from_slice(&element[source_offset..source_end]);
+                );
             }
         }
     }
@@ -419,7 +398,7 @@ pub(crate) fn stack_new_axis(
             bytes: shape_capacity.saturating_mul(std::mem::size_of::<usize>()),
         })?;
     output_shape.extend_from_slice(&elem_shape[..axis]);
-    output_shape.push(elements.len());
+    output_shape.push(slice_count);
     output_shape.extend_from_slice(&elem_shape[axis..]);
     Ok((output_shape, bytes))
 }
