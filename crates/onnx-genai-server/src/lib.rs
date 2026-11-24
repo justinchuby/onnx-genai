@@ -140,6 +140,7 @@ pub fn app(state: AppState) -> Router {
         .route("/tts", post(routes::native::tts))
         .route("/reranking", post(routes::ranking::rerank))
         .route("/rerank", post(routes::ranking::rerank))
+        .route("/v1/systemone", post(routes::decision::decide))
         .route("/v1/rerank", post(routes::ranking::rerank))
         .route("/v1/reranking", post(routes::ranking::rerank))
         .route("/embedding", post(routes::native::embeddings))

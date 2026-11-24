@@ -1850,3 +1850,18 @@ there are no compatibility aliases for these prerelease options.
 tool/proxy routes return JSON 404. OpenAI/Anthropic/Responses tool-call transport,
 model tool-protocol admission and tool-result messages remain in scope. External
 harnesses execute calls and supply results to the next inference request.
+
+### Non-generative SystemOne workflow and transport
+
+The decision v1 profile declares an actual probability-head workflow, tokenizer
+features and model-authored prompt/answer policies. A schema v1.10 gate applies
+in parser and typed admission. `/v1/systemone` routes choice/score/noul requests
+through bounded engine workers with zero generation tokens, accurate multi-variant
+input usage and actionable shape/calibration errors. Canonical leases retain
+converted probabilities through engine-result ownership. A native ONNX fixture
+changes its decisions with the input; it does not simulate a chat answer.
+
+This increment does not establish all upstream decision-model conformance.
+Multimodal inputs, per-model request defaults, joint/packed heads and shared
+workflow entry points remain required; [SystemOne](SYSTEMONE.md) records the
+current executable contract and explicit gaps. Server tools remain out of scope.

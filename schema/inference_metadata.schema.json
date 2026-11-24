@@ -1604,6 +1604,65 @@
       ],
       "type": "string"
     },
+    "DecisionConfidence": {
+      "enum": [
+        "uniform_margin",
+        "mode_distance",
+        "normalized_entropy",
+        "maximum_probability"
+      ],
+      "type": "string"
+    },
+    "DecisionScore": {
+      "enum": [
+        "expected_level",
+        "median_level"
+      ],
+      "type": "string"
+    },
+    "DecisionSpec": {
+      "additionalProperties": false,
+      "description": "Model-authored decision semantics; calibration belongs to the workflow.",
+      "properties": {
+        "choice_confidence": {
+          "$ref": "#/$defs/DecisionConfidence"
+        },
+        "max_options": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "prompt_template": {
+          "description": "Jinja context: state, instructions, type, options (key/description), variant.",
+          "type": "string"
+        },
+        "score": {
+          "$ref": "#/$defs/DecisionScore"
+        },
+        "score_confidence": {
+          "$ref": "#/$defs/DecisionConfidence"
+        },
+        "variants": {
+          "$ref": "#/$defs/DecisionVariants"
+        }
+      },
+      "required": [
+        "prompt_template",
+        "max_options",
+        "variants",
+        "choice_confidence",
+        "score_confidence",
+        "score"
+      ],
+      "type": "object"
+    },
+    "DecisionVariants": {
+      "enum": [
+        "direct",
+        "reverse_average"
+      ],
+      "type": "string"
+    },
     "DecodingVocabulary": {
       "additionalProperties": false,
       "description": "Source of the class-id -> string mapping used to render a transcript.",
@@ -4594,6 +4653,17 @@
       "additionalProperties": false,
       "description": "One executable task profile that shares the package's common facts.\n\nGenerative and non-generative tasks live in one document. Each profile\ncarries its own version and a requirement class so a strict reader can skip\nan optional profile it does not understand while still rejecting unknown\ncore fields.",
       "properties": {
+        "decision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit non-generative decision prompting and answer interpretation."
+        },
         "decoding": {
           "anyOf": [
             {

@@ -477,6 +477,10 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
         crate::version::PREFERRED_ENDING_SCHEMA_VERSION,
         "preferred `eot_token_id` is a member of the package EOS set, with explicit ending-role inheritance and authoritative request EOS overrides",
     ),
+    (
+        crate::version::DECISION_SCHEMA_VERSION,
+        "Non-generative decision profiles: explicit prompting, tokenizer inputs, calibrated probability heads and answer policies; no architecture inference.",
+    ),
 ];
 
 /// Look up a built-in extension by its exact declared identity and version.

@@ -102,6 +102,7 @@ pub(crate) async fn props(
             "lora": handle.engine.adapters.is_some(),
             "lora_embeddings": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.embeddings),
             "lora_sessions": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.sessions),
+            "decision": handle.engine.decision.is_some(),
             "reranking": handle.engine.reranking.is_some()
         }
     });
