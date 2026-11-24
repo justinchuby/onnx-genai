@@ -6668,11 +6668,11 @@ fn take_bf16_direct_out(staging: CUdeviceptr, elements: usize) -> Option<CUdevic
 /// every other node is untouched.
 ///
 /// It stays opt-in because the speedup is bought with memory, not for free:
-/// [`ensure_interleaved`] allocates a SECOND copy of every routed weight and
-/// keys the cache off the ORIGINAL packed pointer, which ORT owns and does not
-/// free while the session runs. So the routed int4 weights are resident TWICE
-/// for the life of the runtime that built them, which is what releases them
-/// (see [`crate::interleave_cache`]). Measured +8.6% on H200 (211.9 → 230.0
+/// [`CudaRuntime::prepare_interleaved_int4`] allocates a SECOND copy of each routed weight and
+/// keys the cache off the ORIGINAL proven immutable packed pointer. Source
+/// retirement invalidates the key; prepared kernels and captured graphs may
+/// retain the derived owner until their last use (see [`crate::interleave_cache`]).
+/// Measured +8.6% on H200 (211.9 → 230.0
 /// tok/s, glm base); on a 20 GB int4 model that costs ~20 GB extra VRAM, which is
 /// why it must NOT be defaulted on for the memory-tight consumer cards that would
 /// otherwise benefit most from the instruction-count win.
@@ -6709,19 +6709,14 @@ fn use_scales_f16_zp_splitk_pf() -> bool {
 /// type that owns that allocator. The rules and their falsifiers are in
 /// [`crate::interleave_cache`]; the device work is here because the interleave
 /// pass is a kernel in this module's NVRTC source.
-impl crate::interleave_cache::InterleaveDevice for CudaRuntime {
+impl crate::interleave_cache::InterleaveDevice for Arc<CudaRuntime> {
+    type Allocation = NativeDeviceAllocation;
     fn interleave_device_id(&self) -> u64 {
         self.runtime_id()
     }
 
-    fn interleave_alloc(&self, bytes: usize) -> Result<CUdeviceptr> {
-        self.alloc_raw(bytes)
-    }
-
-    unsafe fn interleave_free(&self, ptr: CUdeviceptr) {
-        // SAFETY: forwarded under the caller's obligation that `ptr` came from
-        // `interleave_alloc` above and is freed once.
-        let _ = unsafe { self.free_raw(ptr) };
+    fn interleave_alloc(&self, bytes: usize) -> Result<NativeDeviceAllocation> {
+        NativeDeviceAllocation::allocate(self, bytes, onnx_runtime_memory_api::MemoryRole::Weights)
     }
 
     fn interleave_build(&self, src: CUdeviceptr, dst: CUdeviceptr, bytes: usize) -> Result<()> {
@@ -6734,10 +6729,6 @@ impl crate::interleave_cache::InterleaveDevice for CudaRuntime {
 
     fn interleave_frees_are_observed(&self) -> bool {
         !self.weights_may_be_paged()
-    }
-
-    fn interleave_drain_before_free(&self) -> Result<()> {
-        self.drain_for_unmap()
     }
 }
 
@@ -6773,22 +6764,18 @@ fn launch_interleave_int4(
     .map_err(|err| driver_err("launch MatMulNBits int4 interleave", err))
 }
 
-/// Ensure the offline-interleaved copy of the `bytes`-byte packed weight buffer
-/// at `packed` exists on device, running the device interleave once and caching
-/// the result on `runtime`. Returns `(interleaved_ptr, warm)`; `warm == true`
-/// means the buffer was already cached (no allocation / interleave / sync this
-/// call, so it is CUDA-graph capture-safe). A cold miss while capturing is
-/// rejected so the caller falls back to the non-interleaved path rather than
-/// allocating inside a capture.
-///
-/// The entry is keyed by `(packed, bytes)` and lives no longer than `runtime`,
-/// which is what makes a device address a valid identity for it.
+/// Pointer snapshots for device cache identity tests; production retains the owner.
+#[cfg(test)]
 fn ensure_interleaved(
     runtime: &Arc<CudaRuntime>,
     packed: CUdeviceptr,
     bytes: usize,
 ) -> Result<(CUdeviceptr, bool)> {
-    runtime.ensure_interleaved_int4(packed, bytes)
+    let source =
+        crate::interleave_cache::ImmutablePackedWeight::from_input(packed, bytes, true).unwrap();
+    runtime
+        .prepare_interleaved_int4(source)
+        .map(|(entry, warm)| (entry.ptr(), warm))
 }
 
 fn use_f16_symmetric_splitk(
@@ -7102,6 +7089,7 @@ impl KernelFactory for MatMulNBitsFactory {
                 == Some(1),
             marlin_repack_cache: marlin_gemm::RepackCache::new(self.runtime.clone()),
             constant_inputs: [false; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: node
                 .attr(crate::optimizer::MATMUL_NBITS_FOLDED_BIAS_ATTR)
                 .and_then(onnx_runtime_ir::Attribute::as_int)
@@ -7373,6 +7361,9 @@ pub struct MatMulNBitsKernel {
     /// Session-lifetime graph constants. Only proven immutable inputs may enter
     /// the owner-scoped weight-repack or BF16 scale-conversion caches.
     constant_inputs: [bool; MATMUL_MAX_INPUTS],
+    /// One prepared conversion, shared with the runtime cache and graph pins.
+    /// Warm loads borrow the ArcSwap guard without cache locks or quota work.
+    interleaved_weight: arc_swap::ArcSwapOption<crate::interleave_cache::InterleaveEntry>,
     /// Set when this node's bias input came from folding a standalone `Add`
     /// (see [`crate::optimizer::MATMUL_NBITS_FOLDED_BIAS_ATTR`]). The fp16 GEMV
     /// then reproduces the two-op `fp16(fp16(acc) + bias)` rounding.
@@ -7400,13 +7391,20 @@ pub struct MatMulNBitsKernel {
 }
 
 impl MatMulNBitsKernel {
+    fn finish_call(&self, result: Result<()>) -> Result<()> {
+        if result.is_err() {
+            self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        }
+        result
+    }
+
     fn marlin_weight_inputs_constant(&self) -> bool {
         marlin_weight_inputs_are_constant(&self.constant_inputs, self.gate_up_swiglu)
     }
 
     fn release_marlin_repack_for_decode(&self) {
         // The Marlin repack is a second, tensor-core-layout copy of this op's
-        // weights, allocated raw (invisible to the VMM arena) and only read by
+        // weights, governed by the native allocation domain and only read by
         // the M > 1 tensor-core GEMM. At decode it is pure device overhead:
         // measured at ~384 MiB on a 1.8B model whose weights are under 1 GiB.
         //
@@ -10696,25 +10694,59 @@ impl MatMulNBitsKernel {
             None
         };
         let orig_packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
-        let interleave_on = interleave_dequant_enabled() && self.bits == 4 && zero_points.is_none();
-        let (entry, packed_ptr) = if interleave_on && let Some(target) = interleaved_entry {
-            let bytes = self.n.saturating_mul(k_blocks).saturating_mul(blob_size);
-            match ensure_interleaved(&self.runtime, orig_packed_ptr, bytes) {
-                Ok((iptr, warm)) => {
-                    if !warm {
-                        self.last_call_capture_safe.store(false, Ordering::Relaxed);
-                    }
-                    onnx_runtime_ep_api::record_kernel_variant_stage!(
-                        "dequant",
-                        "interleaved_biased",
-                        "TRT-LLM interleaved+biased int4 dequant: offline nibble-interleave + \
-                         folded symmetric -8 bias drops the per-block sub.f16x2 and the prmt.b32 \
-                         activation reorder (byte-identical to the fp32 wide/multicol/split-K path)"
-                    );
-                    (target, iptr)
-                }
-                Err(_) => (entry, orig_packed_ptr),
+        // Address-keyed conversion is sound only for immutable packed B and
+        // sources whose retirement invalidates the cache. Dynamic inputs keep
+        // the ordinary kernel even if a constant previously used this address.
+        let interleave_on = interleave_dequant_enabled()
+            && self.bits == 4
+            && zero_points.is_none()
+            && !self.runtime.weights_may_be_paged();
+        let mut candidate = None;
+        let source = if interleave_on && interleaved_entry.is_some() {
+            let bytes = self
+                .n
+                .checked_mul(k_blocks)
+                .and_then(|v| v.checked_mul(blob_size))
+                .ok_or_else(|| {
+                    error("immutable packed B byte length overflows usize; reduce N or K")
+                })?;
+            crate::interleave_cache::ImmutablePackedWeight::from_input(
+                orig_packed_ptr,
+                bytes,
+                self.constant_inputs[1],
+            )
+        } else {
+            None
+        };
+        let cached = source.map(|_| self.interleaved_weight.load());
+        let (entry, packed_ptr) = if let (Some(target), Some(source)) = (interleaved_entry, source)
+        {
+            let (owner, warm) = if let Some(owner) =
+                cached.as_ref().and_then(|guard| guard.as_ref())
+                && owner.matches(source, self.runtime.runtime_id())
+            {
+                (owner, true)
+            } else {
+                let (prepared, warm) = self.runtime.prepare_interleaved_int4(source)?;
+                (&*candidate.insert(prepared), warm)
+            };
+            // Actual driver capture status also catches externally begun
+            // capture. Missing ownership is an error, never a silent fallback.
+            if self.runtime.is_capturing()? {
+                self.runtime.require_captured_address_owner(
+                    crate::interleave_cache::InterleaveEntry::identity(owner),
+                    "MatMulNBits immutable interleaved packed B",
+                )?;
             }
+            if !warm {
+                self.last_call_capture_safe.store(false, Ordering::Relaxed);
+            }
+            onnx_runtime_ep_api::record_kernel_variant_stage!(
+                "dequant",
+                "interleaved_biased",
+                "TRT-LLM interleaved+biased int4 dequant over proven immutable packed B"
+            );
+            (target, owner.ptr())
         } else {
             (entry, orig_packed_ptr)
         };
@@ -10883,7 +10915,11 @@ impl MatMulNBitsKernel {
                 &format!("launch MatMulNBits fp16 GEMV ({})", selection.reason),
                 err,
             )
-        })
+        })?;
+        if let Some(owner) = candidate {
+            self.interleaved_weight.store(Some(owner));
+        }
+        Ok(())
     }
 
     /// General fp16 GEMV whose input activation is RMS-normalized in-kernel
@@ -11763,13 +11799,14 @@ impl MatMulNBitsKernel {
 
 impl Kernel for MatMulNBitsKernel {
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        self.interleaved_weight.store(None);
         for (index, is_constant) in self.constant_inputs.iter_mut().enumerate() {
             *is_constant = constant_inputs.get(index).copied().unwrap_or(false);
         }
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs, None)
+        self.finish_call(self.run(inputs, outputs, None))
     }
 
     fn workspace_requirement(
@@ -11787,7 +11824,7 @@ impl Kernel for MatMulNBitsKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
-        self.run(inputs, outputs, workspace)
+        self.finish_call(self.run(inputs, outputs, workspace))
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -11800,6 +11837,9 @@ impl Kernel for MatMulNBitsKernel {
             && let Some(resource) = cache.device_graph_resource()
         {
             resources.push(resource);
+        }
+        if let Some(owner) = self.interleaved_weight.load().as_ref() {
+            resources.push(crate::interleave_cache::InterleaveEntry::device_graph_resource(owner));
         }
         resources
     }
@@ -12976,6 +13016,7 @@ mod tests {
                         round_affine_weights: false,
                         marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                         constant_inputs: [false; 8],
+                        interleaved_weight: arc_swap::ArcSwapOption::empty(),
                         fold_bias_post_round: false,
                         gate_up_swiglu: gate_up,
                         decomposed_silu: false,
@@ -13420,6 +13461,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -13683,6 +13725,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -13968,6 +14011,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: true,
             decomposed_silu: decomposed,
@@ -14455,6 +14499,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -14660,6 +14705,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -14708,17 +14754,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 .dtoh(as_bytes_mut(&mut got_f16), output_dev)
                 .unwrap();
             runtime.free_raw(activation_dev).unwrap();
-            // NOTE: `packed_dev` is intentionally NOT freed. The interleave
-            // cache is keyed by (source pointer, byte length); freeing the
-            // packed buffer would return its address to `alloc_raw`'s size-class
-            // free list, and the next same-size allocation on this runtime would
-            // get it back with different contents behind the same key. Every
-            // case here shares one runtime, so leaking the small test buffer is
-            // what keeps each weight's address its own. Production weights are
-            // graph initializers, which the executor never frees mid-session --
-            // and the cache now dies with the runtime, so an address cannot
-            // carry an entry into a later session either (#1726 class).
-            // (Real allocations are reclaimed on process exit.)
+            runtime.invalidate_interleaved_for(packed_dev, packed.len());
+            runtime.free_raw(packed_dev).unwrap();
             runtime.free_raw(scales_dev).unwrap();
             runtime.free_raw(output_dev).unwrap();
         }
@@ -15248,6 +15285,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -15688,6 +15726,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -16412,6 +16451,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -16567,6 +16607,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
@@ -17164,6 +17205,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
@@ -17440,6 +17482,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
                 decomposed_silu: false,
@@ -18114,6 +18157,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -18376,6 +18420,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -18649,6 +18694,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -18668,6 +18714,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: true,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -18930,6 +18977,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
@@ -19318,6 +19366,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -19805,6 +19854,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -19824,6 +19874,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: true,
             decomposed_silu: false,
@@ -20381,6 +20432,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
                 decomposed_silu: false,
@@ -20400,6 +20452,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
                 decomposed_silu: false,
@@ -20765,6 +20818,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             round_affine_weights: false,
                             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                             constant_inputs: [true; 8],
+                            interleaved_weight: arc_swap::ArcSwapOption::empty(),
                             fold_bias_post_round: false,
                             gate_up_swiglu: true,
                             decomposed_silu: decomposed,
@@ -21220,6 +21274,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: fold,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
@@ -21590,6 +21645,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -21838,6 +21894,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -22105,6 +22162,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
@@ -22301,6 +22359,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [false; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: fused,
                 decomposed_silu: false,
@@ -22805,6 +22864,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                     round_affine_weights: false,
                     marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                     constant_inputs: [true; 8],
+                    interleaved_weight: arc_swap::ArcSwapOption::empty(),
                     fold_bias_post_round: false,
                     gate_up_swiglu: false,
                     decomposed_silu: false,
