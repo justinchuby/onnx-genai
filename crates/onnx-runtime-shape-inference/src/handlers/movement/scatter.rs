@@ -1,4 +1,7 @@
-use onnx_runtime_ir::Attribute;
+use onnx_runtime_ir::{
+    Attribute, DataType,
+    scatter::{ScatterReduction, validate_nd_index_type},
+};
 
 use crate::context::InferenceContext;
 use crate::dim_expr::DimExpr;
@@ -6,7 +9,7 @@ use crate::error::ShapeInferError;
 use crate::handlers::checked_axis;
 
 /// `ScatterElements` and deprecated `Scatter`: output type and shape are those
-/// of the data input. Axis and reduction attributes do not affect inference.
+/// of the data input.
 pub fn scatter_elements(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(data) = ctx.input_type(0).cloned() else {
         return Ok(());
@@ -24,10 +27,13 @@ pub fn scatter_elements(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
         .attr("axis")
         .and_then(Attribute::as_int)
         .unwrap_or(0);
-    checked_axis(axis, data.rank()).ok_or_else(|| ShapeInferError::Invalid {
+    let axis = checked_axis(axis, data.rank()).ok_or_else(|| ShapeInferError::Invalid {
         op: ctx.op().into(),
         detail: format!("axis {axis} is out of range for rank {}", data.rank()),
     })?;
+    if ctx.op() == "ScatterElements" {
+        validate_reduction(ctx, data.dtype)?;
+    }
     for index in [1, 2] {
         if let Some(rank) = ctx.input_rank(index)
             && rank != data.rank()
@@ -40,6 +46,24 @@ pub fn scatter_elements(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
             });
         }
     }
+    if let Some(indices) = ctx.input_shape(1) {
+        for (i, (index_dim, data_dim)) in indices.iter().zip(&data.shape).enumerate() {
+            if i != axis
+                && let (Some(a), Some(b)) = (index_dim.as_const(), data_dim.as_const())
+                && a > b
+            {
+                return Err(ShapeInferError::Invalid {
+                    op: ctx.op().into(),
+                    detail: format!(
+                        "indices dimension {a} exceeds data dimension {b} at non-scatter axis {i}"
+                    ),
+                });
+            }
+        }
+        if let Some(updates) = ctx.input_shape(2) {
+            check_known_dims(ctx.op(), updates, indices.iter())?;
+        }
+    }
     ctx.set_output_type(0, data);
     Ok(())
 }
@@ -49,6 +73,15 @@ pub fn scatter_nd(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(data) = ctx.input_type(0).cloned() else {
         return Ok(());
     };
+    validate_reduction(ctx, data.dtype)?;
+    if let Some(indices) = ctx.input_type(1) {
+        validate_nd_index_type("ScatterND", ctx.opset(&ctx.node.domain), indices.dtype).map_err(
+            |detail| ShapeInferError::Invalid {
+                op: ctx.op().into(),
+                detail,
+            },
+        )?;
+    }
     if data.rank() == 0 {
         return Err(ShapeInferError::InvalidRank {
             op: "ScatterND".into(),
@@ -103,8 +136,54 @@ pub fn scatter_nd(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                 });
             }
         }
+        if let Some(updates) = ctx.input_shape(2) {
+            check_known_dims(
+                ctx.op(),
+                updates,
+                indices[..indices.len() - 1]
+                    .iter()
+                    .chain(&data.shape[index_depth..]),
+            )?;
+        }
     }
     ctx.set_output_type(0, data);
+    Ok(())
+}
+
+fn check_known_dims<'a>(
+    op: &str,
+    actual: &[DimExpr],
+    expected: impl Iterator<Item = &'a DimExpr>,
+) -> Result<(), ShapeInferError> {
+    for (axis, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        if let (Some(actual), Some(expected)) = (actual.as_const(), expected.as_const())
+            && actual != expected
+        {
+            return Err(ShapeInferError::Invalid {
+                op: op.into(),
+                detail: format!("updates dimension {actual} at axis {axis} must be {expected}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_reduction(ctx: &InferenceContext, dtype: DataType) -> Result<(), ShapeInferError> {
+    let opset = ctx.opset(&ctx.node.domain);
+    let invalid = |detail| ShapeInferError::Invalid {
+        op: ctx.op().into(),
+        detail,
+    };
+    if ScatterReduction::parse(ctx.node, opset).map_err(invalid)? == ScatterReduction::Mean
+        && matches!(
+            dtype,
+            DataType::Bool | DataType::String | DataType::Complex64 | DataType::Complex128
+        )
+    {
+        return Err(invalid(format!(
+            "reduction 'mean' needs integer or floating-point data, got {dtype:?}; cast data and updates to a supported dtype"
+        )));
+    }
     Ok(())
 }
 
