@@ -2,8 +2,7 @@ use super::*;
 
 /// The `[shape, strides, byte_offset]` storage-bounds gate (Holden's
 /// precondition). Uses [`view_in_bounds`] for fixed-width dtypes and a
-/// `storage_bytes` check for sub-byte packed dtypes (which have no integral
-/// per-element byte size).
+/// signed bit-range check for sub-byte packed dtypes.
 pub(super) fn view_bounds(
     shape: &[usize],
     strides: &[i64],
@@ -12,8 +11,11 @@ pub(super) fn view_bounds(
     buffer_len: usize,
 ) -> Result<()> {
     let esize = dtype.byte_size();
+    if dtype.is_sub_byte() {
+        return packed_view_bounds(shape, strides, byte_offset, dtype, buffer_len);
+    }
     if esize == 0 {
-        // Sub-byte (int4/uint4) or variable-width: size via `storage_bytes`.
+        // Preserve the existing size check for variable-width dtypes.
         let storage_bytes =
             onnx_runtime_ir::checked_expected_bytes(dtype, shape).ok_or_else(|| {
                 SessionError::ShapeOverflow {
@@ -40,6 +42,68 @@ pub(super) fn view_bounds(
         return Ok(());
     }
     view_in_bounds(shape, strides, byte_offset, esize, buffer_len)?;
+    Ok(())
+}
+
+fn packed_view_bounds(
+    shape: &[usize],
+    strides: &[i64],
+    byte_offset: usize,
+    dtype: DataType,
+    buffer_len: usize,
+) -> Result<()> {
+    let invalid =
+        |reason| SessionError::from(onnx_runtime_ep_api::EpError::InvalidTensorView { reason });
+    if shape.len() != strides.len() {
+        return Err(invalid(format!(
+            "packed {dtype:?} view rank mismatch: shape has {} dims, strides has {} entries",
+            shape.len(),
+            strides.len()
+        )));
+    }
+    let overflow = || SessionError::ShapeOverflow {
+        value: "sub-byte tensor view".into(),
+        dims: shape.to_vec(),
+    };
+    let (lo, hi) = if shape.contains(&0) {
+        (byte_offset as i128, byte_offset)
+    } else {
+        onnx_runtime_ir::checked_expected_bytes(dtype, shape).ok_or_else(overflow)?;
+        let (min, max) = shape
+            .iter()
+            .zip(strides)
+            .try_fold((0i128, 0i128), |(min, max), (&dim, &stride)| {
+                let extent = (dim - 1) as i128 * i128::from(stride);
+                Some((
+                    min.checked_add(extent.min(0))?,
+                    max.checked_add(extent.max(0))?,
+                ))
+            })
+            .ok_or_else(overflow)?;
+        let bits = dtype.bit_size() as i128;
+        // The byte containing the last bit is inclusive, even for a code
+        // spanning two bytes. Negative offsets must round down.
+        let first = min.checked_mul(bits).ok_or_else(overflow)?.div_euclid(8);
+        let last = max
+            .checked_mul(bits)
+            .and_then(|n| n.checked_add(bits - 1))
+            .ok_or_else(overflow)?
+            .div_euclid(8);
+        let lo = (byte_offset as i128)
+            .checked_add(first)
+            .ok_or_else(overflow)?;
+        let hi = (byte_offset as i128)
+            .checked_add(last)
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(overflow)?;
+        (lo, hi)
+    };
+    if lo < 0 || hi > buffer_len {
+        return Err(invalid(format!(
+            "packed {dtype:?} view addresses bytes [{lo}, {hi}) outside its {buffer_len}-byte backing; check shape, strides and byte offset"
+        )));
+    }
     Ok(())
 }
 

@@ -10878,6 +10878,15 @@ fn sub_byte_view_bounds_rejects_offset_overflow() {
 }
 
 #[test]
+fn sub_byte_view_bounds_respects_signed_element_strides() {
+    assert!(view_bounds(&[2], &[100], 0, DataType::Uint4, 1).is_err());
+    assert!(view_bounds(&[2], &[100], 0, DataType::Uint4, 51).is_ok());
+    assert!(view_bounds(&[2, 2], &[1, -2], 1, DataType::Uint4, 2).is_ok());
+    assert!(view_bounds(&[2, 2], &[1, -2], 0, DataType::Uint4, 2).is_err());
+    assert!(view_bounds(&[2], &[0], 0, DataType::Int2, 1).is_ok());
+}
+
+#[test]
 fn device_binding_validation_rejects_geometry_overflow() {
     let element_count = usize::MAX / 4;
     let error = bindings::required_binding_bytes(DataType::Float64, &[element_count], "huge");
