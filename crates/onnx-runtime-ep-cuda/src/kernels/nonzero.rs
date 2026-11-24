@@ -4,11 +4,17 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspacePreparation, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
+
+use super::metadata_workspace::MetadataWorkspace;
+const METADATA_WORDS_PER_AXIS: usize = 1;
 
 const COORD_SOURCE: &str = r#"
 #include <cuda_fp16.h>
@@ -55,11 +61,21 @@ struct NonZeroKernel {
     runtime: Arc<CudaRuntime>,
 }
 
-impl Kernel for NonZeroKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+impl NonZeroKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if inputs.len() != 1 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(
                 "cuda_ep NonZero: expected 1 input and 1 output".into(),
+            ));
+        }
+        if self.runtime.is_capturing()? {
+            return Err(not_implemented(
+                "NonZero during CUDA graph capture: borrowed coordinate strides require an eager host upload",
             ));
         }
         let input = &inputs[0];
@@ -95,48 +111,79 @@ impl Kernel for NonZeroKernel {
                 .checked_mul(input.shape[axis + 1] as u64)
                 .ok_or_else(|| EpError::KernelFailed("NonZero stride overflow".into()))?;
         }
-        let bytes: Vec<u8> = strides.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let strides_ptr = self.runtime.alloc_raw(bytes.len())?;
-        if let Err(error) = unsafe { self.runtime.htod(&bytes, strides_ptr) } {
-            unsafe { self.runtime.free_raw(strides_ptr) }?;
-            return Err(error);
+        let strides_ptr = MetadataWorkspace::for_rank(
+            "NonZero",
+            rank,
+            METADATA_WORDS_PER_AXIS,
+            &OutputMetadata::from_view(output),
+        )?
+        .upload(&self.runtime, workspace, &strides)?;
+        let function = self.runtime.nvrtc_function(
+            "nonzero_serial_v1",
+            COORD_SOURCE,
+            &format!("nonzero_{suffix}"),
+        )?;
+        let x = cuptr(input.data_ptr::<u8>() as *const c_void);
+        let y = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let n = input.numel() as u64;
+        let rank = rank as u64;
+        let expected = expected as u64;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&x)
+            .arg(&y)
+            .arg(&strides_ptr)
+            .arg(&n)
+            .arg(&rank)
+            .arg(&expected);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            })
         }
-        let result = (|| {
-            let function = self.runtime.nvrtc_function(
-                "nonzero_serial_v1",
-                COORD_SOURCE,
-                &format!("nonzero_{suffix}"),
-            )?;
-            let x = cuptr(input.data_ptr::<u8>() as *const c_void);
-            let y = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-            let n = input.numel() as u64;
-            let rank = rank as u64;
-            let expected = expected as u64;
-            let mut builder = self.runtime.stream().launch_builder(&function);
-            builder
-                .arg(&x)
-                .arg(&y)
-                .arg(&strides_ptr)
-                .arg(&n)
-                .arg(&rank)
-                .arg(&expected);
-            unsafe {
-                builder.launch(LaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (1, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-            }
-            .map_err(|error| driver_err("launch NonZero", error))?;
-            self.runtime.synchronize()
-        })();
-        unsafe { self.runtime.free_raw(strides_ptr) }?;
-        result
+        .map_err(|error| driver_err("launch NonZero", error))?;
+        self.runtime.synchronize()
     }
+}
 
+impl Kernel for NonZeroKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        if inputs.len() != 1 || outputs.len() != 1 || !inputs[0].present {
+            return Err(EpError::KernelFailed(
+                "cuda_ep NonZero: workspace planning requires one present input and one output"
+                    .into(),
+            ));
+        }
+        let rank = if inputs[0].shape.contains(&0) {
+            0
+        } else {
+            inputs[0].shape.len()
+        };
+        Ok(WorkspacePreparation::Ready(
+            MetadataWorkspace::for_rank("NonZero", rank, METADATA_WORDS_PER_AXIS, &outputs[0])?
+                .requirement(),
+        ))
+    }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "NonZero allocates and uploads per-call coordinate-stride metadata",
+            "NonZero uploads borrowed coordinate strides from the host on each eager call",
         )
     }
 }

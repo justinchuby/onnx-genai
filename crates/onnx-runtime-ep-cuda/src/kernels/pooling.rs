@@ -3,13 +3,19 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspacePreparation, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::cudnn::{CudnnBufferPair, CudnnPoolingMode, CudnnPoolingSpec, CudnnTensorType};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
+
+use super::metadata_workspace::MetadataWorkspace;
+const METADATA_WORDS_PER_AXIS: usize = 6;
 
 const BLOCK: u32 = 256;
 const LP_SOURCE: &str = r#"
@@ -530,19 +536,6 @@ fn positive_spatial(
     Ok(values.into_iter().map(|value| value as u64).collect())
 }
 
-fn upload_u64(runtime: &CudaRuntime, values: &[u64]) -> Result<CUdeviceptr> {
-    let bytes = values
-        .iter()
-        .flat_map(|value| value.to_ne_bytes())
-        .collect::<Vec<_>>();
-    let pointer = runtime.alloc_raw(bytes.len())?;
-    if let Err(error) = unsafe { runtime.htod(&bytes, pointer) } {
-        let _ = unsafe { runtime.free_raw(pointer) };
-        return Err(error);
-    }
-    Ok(pointer)
-}
-
 fn lp_dtype(dtype: DataType) -> Result<i32> {
     match dtype {
         DataType::Float32 => Ok(0),
@@ -554,11 +547,21 @@ fn lp_dtype(dtype: DataType) -> Result<i32> {
     }
 }
 
-impl Kernel for LpPoolKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+impl LpPoolKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if inputs.len() != 1 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(
                 "cuda_ep LpPool: expected 1 input and 1 output".into(),
+            ));
+        }
+        if self.runtime.is_capturing()? {
+            return Err(not_implemented(
+                "LpPool during CUDA graph capture: borrowed shape metadata requires an eager host upload",
             ));
         }
         let input = &inputs[0];
@@ -678,7 +681,13 @@ impl Kernel for LpPoolKernel {
             .chain(&pads[..rank])
             .copied()
             .collect::<Vec<_>>();
-        let metadata_pointer = upload_u64(&self.runtime, &metadata)?;
+        let metadata_pointer = MetadataWorkspace::for_rank(
+            "LpPool",
+            rank,
+            METADATA_WORDS_PER_AXIS,
+            &OutputMetadata::from_view(output),
+        )?
+        .upload(&self.runtime, workspace, &metadata)?;
         let function = self
             .runtime
             .nvrtc_function("lp_pool_v1", LP_SOURCE, "lp_pool")?;
@@ -714,14 +723,47 @@ impl Kernel for LpPoolKernel {
             })
         }
         .map_err(|error| driver_err("launch LpPool", error));
-        let sync = launch.and_then(|_| self.runtime.synchronize());
-        let free = unsafe { self.runtime.free_raw(metadata_pointer) };
-        sync.and(free)
+        launch.and_then(|_| self.runtime.synchronize())
     }
+}
 
+impl Kernel for LpPoolKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        if inputs.len() != 1
+            || outputs.len() != 1
+            || !inputs[0].present
+            || inputs[0].shape.len() < 3
+        {
+            return Err(EpError::KernelFailed("cuda_ep LpPool: workspace planning requires one present input of rank >= 3 and one output".into()));
+        }
+        Ok(WorkspacePreparation::Ready(
+            MetadataWorkspace::for_rank(
+                "LpPool",
+                inputs[0].shape.len() - 2,
+                METADATA_WORDS_PER_AXIS,
+                &outputs[0],
+            )?
+            .requirement(),
+        ))
+    }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "LpPool allocates, uploads, and frees per-call shape metadata",
+            "LpPool uploads borrowed shape metadata from the host on each eager call",
         )
     }
 }
