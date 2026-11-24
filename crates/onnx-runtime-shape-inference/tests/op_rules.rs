@@ -429,6 +429,33 @@ fn out_dtype(outs: &[NodeIo]) -> DataType {
 }
 
 #[test]
+fn roi_align_22_infers_symbolic_shape_and_checks_schema() {
+    let n = with_attr(node("RoiAlign", 3, 1), "output_width", Attribute::Int(3));
+    let inputs = |count, index_type| {
+        vec![
+            NodeIo::typed(TypeInfo::new(
+                DataType::BFloat16,
+                vec![c(2), sym(1), c(5), c(5)],
+            )),
+            NodeIo::typed(TypeInfo::new(DataType::BFloat16, vec![sym(2), c(4)])),
+            NodeIo::typed(TypeInfo::new(index_type, vec![count])),
+        ]
+    };
+    let outs = run(&n, inputs(sym(2), DataType::Int64), 22);
+    assert_eq!(out_dtype(&outs), DataType::BFloat16);
+    assert_eq!(out_shape(&outs), vec![sym(2), sym(1), c(1), c(3)]);
+    let outs = run(&n, inputs(c(0), DataType::Int64), 22);
+    assert_eq!(out_shape(&outs), vec![c(0), sym(1), c(1), c(3)]);
+    for (opset, indices, message) in [
+        (16, DataType::Int64, "requires opset 22"),
+        (22, DataType::Int32, "must be Int64"),
+    ] {
+        let err = try_run(&n, inputs(sym(2), indices), opset).unwrap_err();
+        assert!(err.to_string().contains(message), "{err}");
+    }
+}
+
+#[test]
 fn opset26_bitcast_and_cumprod_validate_while_preserving_shape() {
     let mut cast = node("BitCast", 1, 1);
     cast.attributes.insert(

@@ -121,6 +121,7 @@ pub mod quantization;
 pub mod range;
 pub mod reduce;
 pub mod resize;
+mod roi_align;
 pub mod rotary_embedding;
 pub mod shape;
 pub mod size;
@@ -398,6 +399,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "ConvTranspose",
     "DeformConv",
     "GridSample",
+    "RoiAlign",
     "GatherBlockQuantized",
     "CausalConvWithState",
     "LinearAttention",
@@ -572,6 +574,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
         ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
+        ("RoiAlign", "") => onnx_runtime_ir::roi_align::DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
         ("DequantizePackedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => &[
             DataType::Uint8,
@@ -735,6 +738,8 @@ pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpD
     let registry = build_cuda_registry(runtime);
     let mut descriptors: Vec<CudaOpDescriptor> = registry
         .keys()
+        // RoiAlign is currently supported only in standalone nxrt.
+        .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
         .map(|key| CudaOpDescriptor {
             op_type: key.op_type.clone(),
             domain: key.domain.clone(),
@@ -1151,6 +1156,13 @@ pub fn build_cuda_registry_with_metrics(
                 runtime: runtime.clone(),
                 since_version,
             }),
+        );
+    }
+    for version in onnx_runtime_ir::roi_align::VERSIONS {
+        reg.register(
+            OpKey::new("RoiAlign", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(roi_align::Factory(runtime.clone(), version)),
         );
     }
     for version in [13, 22] {

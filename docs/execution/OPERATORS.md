@@ -113,7 +113,7 @@ rounding. The CUDA plugin declines runtime-valued shape reads for `Range`.
 | Scatter | 9 | |
 | Unique | 11 | |
 | NMS (NonMaxSuppression) | 10 | Detection models. |
-| RoiAlign | 10 | |
+| RoiAlign | 10, 16, 22 | Standalone CPU and CUDA. Opset 22 adds bfloat16; CUDA runs eagerly to report invalid device-side ROI indices. |
 
 ---
 
