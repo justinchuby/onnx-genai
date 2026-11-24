@@ -855,7 +855,7 @@ fn decode_i64(bytes: &[u8]) -> Vec<i64> {
 fn mod_matches_cpu() {
     let ep = require_cuda();
 
-    // Float Mod requires fmod=1 per ONNX.
+    // Legacy float Mod requires fmod=1.
     let fa: &[f32] = &[5.3, -5.3, 7.5, -7.5, 2.0, -2.0];
     let fb: &[f32] = &[2.0, 2.0, -2.5, -2.5, 3.0, 3.0];
     let inputs = [
@@ -910,6 +910,139 @@ fn mod_matches_cpu() {
         );
     }
     eprintln!("Mod: CUDA matches CPU EP (f32 fmod=1; i32/i64 truncated + floor)");
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn mod_28_matches_onnx_values() {
+    let ep = require_cuda();
+    let node = Node::new(
+        NodeId(0),
+        "Mod",
+        vec![
+            Some(onnx_runtime_ir::ValueId(0)),
+            Some(onnx_runtime_ir::ValueId(1)),
+        ],
+        vec![onnx_runtime_ir::ValueId(2)],
+    );
+    let shapes = [static_shape([1]), static_shape([1])];
+    let dtypes = [DataType::Float32; 2];
+    for provider in [&ep as &dyn ExecutionProvider, &CpuExecutionProvider::new()] {
+        let legacy = provider.supports_op(&node, 27, &shapes, &dtypes, &[]);
+        assert!(legacy.reason().unwrap().contains("fmod=0"));
+        assert!(
+            provider
+                .supports_op(&node, 28, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+    }
+
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        let inputs = [
+            Tensor {
+                dtype,
+                shape: vec![4, 1],
+                bytes: encode_floats(&[-5.5, 0.0, 6.0, f32::INFINITY], dtype),
+            },
+            Tensor {
+                dtype,
+                shape: vec![3],
+                bytes: encode_floats(&[3.0, -3.0, f32::INFINITY], dtype),
+            },
+        ];
+        let outputs = [(dtype, vec![4, 3])];
+        let nan = f32::NAN;
+        for (fmod, expected) in [
+            (
+                0,
+                [
+                    0.5,
+                    -2.5,
+                    f32::INFINITY,
+                    0.0,
+                    -0.0,
+                    0.0,
+                    0.0,
+                    -0.0,
+                    6.0,
+                    nan,
+                    nan,
+                    nan,
+                ],
+            ),
+            (
+                1,
+                [
+                    -2.5, -2.5, -5.5, 0.0, 0.0, 0.0, 0.0, 0.0, 6.0, nan, nan, nan,
+                ],
+            ),
+        ] {
+            let attrs = [("fmod", Attribute::Int(fmod))];
+            let cuda = run_cuda(&ep, "Mod", 28, &inputs, &outputs, &attrs);
+            let cpu = run_cpu("Mod", 28, &inputs, &outputs, &attrs);
+            for result in [cuda, cpu] {
+                let values = decode_floats(&result[0], dtype);
+                for (i, (got, want)) in values.into_iter().zip(expected).enumerate() {
+                    if want.is_nan() {
+                        assert!(got.is_nan(), "{dtype:?} fmod={fmod} lane {i}: {got}");
+                    } else {
+                        assert_eq!(
+                            got.to_bits(),
+                            want.to_bits(),
+                            "{dtype:?} fmod={fmod} lane {i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Pinned ONNX test_mod_int64_fmod, plus CPU/CUDA zero-divisor and MIN/-1.
+    let a = [-4, 7, 5, 4, -7, 8, i64::MIN, 9];
+    let b = [2_i64, -3, 8, -2, 3, 5, -1, 0];
+    let inputs = [
+        input(DataType::Int64, &[8], &a),
+        input(DataType::Int64, &[8], &b),
+    ];
+    let outputs = [(DataType::Int64, vec![8])];
+    for (fmod, expected) in [
+        (0, [0, -2, 5, 0, 2, 3, 0, 0]),
+        (1, [0, 1, 5, 0, -1, 3, 0, 0]),
+    ] {
+        let attrs = [("fmod", Attribute::Int(fmod))];
+        let cuda = run_cuda(&ep, "Mod", 28, &inputs, &outputs, &attrs);
+        let cpu = run_cpu("Mod", 28, &inputs, &outputs, &attrs);
+        assert_eq!(decode_i64(&cuda[0]), expected);
+        assert_eq!(decode_i64(&cpu[0]), expected);
+    }
+
+    let a = [u64::MAX, 7, 5];
+    let b = [1_u64 << 63, 3, 8];
+    let inputs = [
+        input(DataType::Uint64, &[3], &a),
+        input(DataType::Uint64, &[3], &b),
+    ];
+    let outputs = [(DataType::Uint64, vec![3])];
+    let cuda = run_cuda(&ep, "Mod", 28, &inputs, &outputs, &[]);
+    let cpu = run_cpu("Mod", 28, &inputs, &outputs, &[]);
+    let expected = raw(&[(1_u64 << 63) - 1, 1, 5]);
+    assert_eq!(cuda[0], expected);
+    assert_eq!(cpu[0], expected);
+
+    // This quotient overflows f64; fmod still returns the exact remainder.
+    let inputs = [
+        input(DataType::Float64, &[1], &[-f64::MAX]),
+        input(DataType::Float64, &[], &[f64::MIN_POSITIVE]),
+    ];
+    let outputs = [(DataType::Float64, vec![1])];
+    let cuda = run_cuda(&ep, "Mod", 28, &inputs, &outputs, &[]);
+    let cpu = run_cpu("Mod", 28, &inputs, &outputs, &[]);
+    let expected = raw(&[0.0_f64]);
+    assert_eq!(cuda[0], expected);
+    assert_eq!(cpu[0], expected);
 }
 
 // ────────────────────────────────────────────────────────────────────────────

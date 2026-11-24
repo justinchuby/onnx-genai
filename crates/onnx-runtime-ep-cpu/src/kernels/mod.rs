@@ -1604,11 +1604,15 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(elementwise::DivFactory),
     );
-    rec.register(
-        OpKey::new("Mod", "", 10),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(elementwise::ModFactory),
-    );
+    let mod_28 = onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE;
+    for (since_version, end_version) in [(10, mod_28 - 1), (mod_28, u64::MAX)] {
+        rec.register_through(
+            OpKey::new("Mod", "", since_version),
+            end_version,
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(elementwise::ModFactory { since_version }),
+        );
+    }
     rec.register(
         OpKey::new("Pow", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,

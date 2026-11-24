@@ -384,6 +384,7 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/neg.yaml"),
     include_str!("../../schemas/standard/abs.yaml"),
     include_str!("../../schemas/standard/mod.yaml"),
+    include_str!("../../schemas/standard/mod_v28.yaml"),
     include_str!("../../schemas/standard/log_softmax.yaml"),
     include_str!("../../schemas/standard/rms_normalization.yaml"),
     include_str!("../../schemas/standard/reduce_max.yaml"),
@@ -1653,6 +1654,21 @@ type_constraints:
     common_schema_test!(neg_schema_matches_opset_13, "Neg", 13, 1, 1);
     common_schema_test!(abs_schema_matches_opset_13, "Abs", 13, 1, 1);
     common_schema_test!(mod_schema_matches_opset_13, "Mod", 13, 2, 1);
+    common_schema_test!(mod_schema_matches_opset_28, "Mod", 28, 2, 1);
+
+    #[test]
+    fn mod_schema_preserves_numeric_types_and_default_across_opset_28() {
+        let registry = SchemaRegistry::builtins();
+        let old = registry.lookup("Mod", "", 27).unwrap();
+        let new = registry.lookup("Mod", "", 28).unwrap();
+        assert_eq!(old.since_version, 13);
+        assert_eq!(new.since_version, 28);
+        assert_eq!(
+            old.type_constraints[0].allowed,
+            new.type_constraints[0].allowed
+        );
+        assert_eq!(new.attributes[0].default, Some(AttributeDefault::Int(0)));
+    }
 
     #[test]
     fn added_schema_details_match_onnx_v1_20() {

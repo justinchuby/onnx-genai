@@ -159,7 +159,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-------|
 | `Add`, `Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16 with NumPy right-aligned broadcasting. Host-computed output shape plus zero-stride metadata drives one generic device index walk; half arithmetic computes in f32. |
 | `Sum`, `Mean` | `` | ✅ | **NVRTC-custom** | Variadic f32/f16/bf16 with NumPy right-aligned broadcasting (`nary.rs`); accumulates each input into an f32 scratch buffer, then `Mean` divides by the input count before narrowing once on store. |
-| `Mod` (v10) | `` | ✅ | **NVRTC-custom** | Broadcasting modulo (`mod_op.rs`); f32 requires `fmod=1` (`fmodf`), i32/i64 support both C-truncated (`fmod=1`) and Python floor (`fmod=0`) modes; a zero divisor yields `0`, matching the CPU EP. |
+| `Mod` | `` | ✅ | **NVRTC-custom** | Before opset 28: f32 truncating remainder, i32/i64 floor or truncating remainder. From opset 28: both modes for all schema numeric types, with f16/bf16 computed in f32. Integer zero divisors yield `0` (nxrt convention); floating zero divisors yield NaN. |
 
 ### Normalization & softmax
 
