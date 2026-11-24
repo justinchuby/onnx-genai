@@ -18,6 +18,8 @@ A reader that accepts a schema version must implement that version's typed SSA/d
 | `v1.7` | the workflow declares `commit_only` or `provisional_revisions`, and the runtime reconciles revisions transactionally with one typed `commit` or `abort_to_baseline` outcome |
 | `v1.8` | typed compressed-attention record/carry groups with explicit cadence, format, roles, batch geometry, and fail-closed validation |
 | `v1.9` | preferred `eot_token_id` is a member of the package EOS set, with explicit ending-role inheritance and authoritative request EOS overrides |
+| `v1.10` | Non-generative decision profiles: explicit prompting, tokenizer inputs, calibrated probability heads and answer policies; no architecture inference. |
+| `v1.11` | Decision request policies declare defaults, payloads, supported question kinds, option/score bounds, ordering and legend semantics explicitly. |
 
 ## Optional semantic extensions
 

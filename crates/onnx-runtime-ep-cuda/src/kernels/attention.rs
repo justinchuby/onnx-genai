@@ -1041,13 +1041,13 @@ mod tests {
     use super::*;
     use onnx_runtime_memory_api::MemoryRole;
 
-    fn rt() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn rt() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     #[test]
     fn new_rejects_indivisible_gqa_groups() {
-        let Some(runtime) = rt() else {
+        let Some((_provider, runtime)) = rt() else {
             eprintln!("skip: no CUDA GPU");
             return;
         };
@@ -1058,7 +1058,7 @@ mod tests {
 
     #[test]
     fn new_accepts_mha_and_gqa_and_mqa() {
-        let Some(runtime) = rt() else {
+        let Some((_provider, runtime)) = rt() else {
             eprintln!("skip: no CUDA GPU");
             return;
         };
@@ -1197,12 +1197,12 @@ mod tests {
     )]
     #[test]
     fn workspace_requirement_matches_layout_for_blas_softmax_and_is_none_for_fused() {
-        let Some(runtime) = rt() else {
+        let Some((_provider, runtime)) = rt() else {
             eprintln!("skip: no CUDA GPU");
             return;
         };
-        // A long shape forces the cuBLASLt/softmax (cuBLASLt) path: its governed
-        // requirement must equal the shared layout so the executor reserves
+        // The forced cuBLASLt/softmax path's governed requirement must equal
+        // the shared layout so the executor reserves
         // exactly what execution carves — no ungoverned raw allocation remains.
         let (batch, heads, sq, sk, d) = (1usize, 8usize, 512usize, 512usize, 64usize);
         let blas_softmax =

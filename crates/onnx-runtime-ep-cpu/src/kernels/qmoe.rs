@@ -803,7 +803,7 @@ enum ExpertGrantAdmission {
 
 fn owned_expert_grant(grant: DerivedWeightGrant) -> Option<Arc<DerivedWeightGrant>> {
     match grant {
-        DerivedWeightGrant::Local => None,
+        DerivedWeightGrant::Empty | DerivedWeightGrant::Local => None,
         grant => Some(Arc::new(grant)),
     }
 }
@@ -869,10 +869,7 @@ fn load_transient_expert(
                 fc2,
                 fc3,
                 track_residency,
-                match grant {
-                    DerivedWeightGrant::Local => None,
-                    grant => Some(Arc::new(grant)),
-                },
+                owned_expert_grant(grant),
             )?)))
         }
         WeightAdmission::Declined(reason) => Ok(ExpertExecution::RowStreamed(reason)),

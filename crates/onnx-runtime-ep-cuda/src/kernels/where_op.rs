@@ -21,7 +21,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DataType, Node};
 
 use super::elementwise::{broadcast_strides, require_matching_capture_signature, u64_bytes};
-use crate::device_metadata::DeviceMetadataCache;
+use crate::device_metadata::{DeviceMetadataCache, WarmMetadata, publish_metadata_candidate};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -59,8 +59,9 @@ impl KernelFactory for WhereFactory {
     fn create(&self, _: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(WhereKernel {
             runtime: self.runtime.clone(),
-            metadata: Mutex::new(DeviceMetadataCache::new(self.runtime.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            warm: Mutex::new(WarmMetadata::new(DeviceMetadataCache::new(
+                self.runtime.clone(),
+            ))),
         }))
     }
 }
@@ -85,16 +86,14 @@ struct WhereCaptureSignature {
 #[derive(Debug)]
 struct WhereKernel {
     runtime: Arc<CudaRuntime>,
-    metadata: Mutex<DeviceMetadataCache<WhereMetadataKey>>,
-    last_capture_safe_signature: Mutex<Option<WhereCaptureSignature>>,
+    warm: Mutex<WarmMetadata<DeviceMetadataCache<WhereMetadataKey>, WhereCaptureSignature>>,
 }
 
 impl Kernel for WhereKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep Where capture signature lock was poisoned".into())
-        })?;
-        let warmed_signature = last_signature.clone();
+        let mut candidate = self.warm.lock().map_err(|_| EpError::KernelFailed(
+            "cuda_ep Where metadata/signature state is poisoned; rebuild the provider before warming again".into(),
+        ))?.clone();
 
         if inputs.len() != 3 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -144,24 +143,20 @@ impl Kernel for WhereKernel {
         require_matching_capture_signature(
             &self.runtime,
             "Where",
-            warmed_signature.as_ref(),
+            candidate.signature.as_ref(),
             current_signature.as_ref(),
         )?;
 
         let elements = output.numel();
         if elements == 0 {
-            *last_signature = current_signature;
-            return Ok(());
+            candidate.signature = current_signature;
+            return publish_metadata_candidate(&self.warm, candidate, "Where");
         }
 
         let func = self
             .runtime
             .nvrtc_function("where_op", WHERE_SOURCE, "where_bytes")?;
-        let mut metadata = self.metadata.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep Where metadata lock was poisoned".into())
-        })?;
-        let mut metadata_candidate = metadata.clone();
-        let metadata_ptr = metadata_candidate.get_or_prepare(
+        let metadata_ptr = candidate.metadata.get_or_prepare(
             "Where broadcast metadata",
             |key| {
                 key.condition_shape == condition.shape
@@ -220,26 +215,25 @@ impl Kernel for WhereKernel {
             })
         }
         .map_err(|e| driver_err("launch where_bytes", e))?;
-        if !self.runtime.is_capturing()? {
-            *metadata = metadata_candidate;
-        }
-        *last_signature = current_signature;
-        Ok(())
+        candidate.signature = current_signature;
+        publish_metadata_candidate(&self.warm, candidate, "Where")
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.metadata
+        self.warm
             .lock()
             .ok()
-            .and_then(|metadata| metadata.device_graph_resource())
+            .and_then(|state| state.metadata.device_graph_resource())
             .into_iter()
             .collect()
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        match self.last_capture_safe_signature.lock() {
-            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+        match self.warm.lock() {
+            Ok(state) if state.signature.is_some() => {
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            }
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "Where must warm its exact broadcast shape/dtype signature before capture",
             ),

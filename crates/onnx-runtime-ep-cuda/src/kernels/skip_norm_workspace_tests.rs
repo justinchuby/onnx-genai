@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::runtime::GraphDeviceAllocation;
+use crate::runtime::NativeDeviceAllocation;
 use onnx_runtime_ep_api::{DeviceId, DevicePtrMut};
 
 fn inputs() -> [TensorMetadata<'static>; 4] {
@@ -281,7 +281,12 @@ fn skip_norm_workspace_bf16_broadcast_holes_capture_and_failure_revoke_warm_proo
                 .flat_map(|v| v.to_ne_bytes())
                 .collect::<Vec<_>>()
         };
-        let owner = GraphDeviceAllocation::allocate(runtime, bytes.len()).unwrap();
+        let owner = NativeDeviceAllocation::allocate_shared(
+            runtime,
+            bytes.len(),
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+        )
+        .unwrap();
         unsafe {
             runtime.htod(&bytes, owner.ptr()).unwrap();
         }
@@ -310,9 +315,24 @@ fn skip_norm_workspace_bf16_broadcast_holes_capture_and_failure_revoke_warm_proo
         )
     });
     let output_owners = [
-        GraphDeviceAllocation::allocate(runtime, 20).unwrap(),
-        GraphDeviceAllocation::allocate(runtime, 8).unwrap(),
-        GraphDeviceAllocation::allocate(runtime, 20).unwrap(),
+        NativeDeviceAllocation::allocate_shared(
+            runtime,
+            20,
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+        )
+        .unwrap(),
+        NativeDeviceAllocation::allocate_shared(
+            runtime,
+            8,
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+        )
+        .unwrap(),
+        NativeDeviceAllocation::allocate_shared(
+            runtime,
+            20,
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+        )
+        .unwrap(),
     ];
     let mut node = onnx_runtime_ir::Node::new_with_output_slots(
         onnx_runtime_ir::NodeId(0),

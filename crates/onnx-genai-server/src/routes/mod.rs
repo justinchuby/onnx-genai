@@ -49,13 +49,13 @@ use crate::{
 
 mod admin;
 mod completions;
+pub(crate) mod decision;
 mod images;
 pub(crate) mod llama;
 pub(crate) mod lora;
 mod multimodal;
 pub(crate) mod native;
 pub(crate) mod prompt;
-pub(crate) mod proxy;
 pub(crate) mod ranking;
 mod sessions;
 pub(crate) mod slots;
@@ -951,5 +951,3 @@ mod overload_tests {
         assert_eq!(error.kind, "unavailable_error");
     }
 }
-
-pub(crate) mod tools;

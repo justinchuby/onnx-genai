@@ -885,6 +885,7 @@ const KNOWN_PROFILE_KINDS: &[&str] = &[
     "generation",
     "embedding",
     "reranking",
+    "decision",
     "classification",
     "reward",
     "transcription",
@@ -893,6 +894,9 @@ const KNOWN_PROFILE_KINDS: &[&str] = &[
 /// A required profile must be executable by this reader; an ignorable profile
 /// may be skipped. Unknown core fields still fail through `deny_unknown_fields`.
 fn validate_profiles(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    if let Err(error) = crate::decision::decision_contract(metadata) {
+        errors.push(error.to_string());
+    }
     if let Err(error) = crate::task_profiles::embedding_contract(metadata) {
         errors.push(error.to_string());
     }

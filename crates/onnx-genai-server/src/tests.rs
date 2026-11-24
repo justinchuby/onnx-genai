@@ -7864,14 +7864,6 @@ mod llama_compat {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        for (path, kind) in [
-            ("/tools", "permission_error"),
-            ("/cors-proxy", "feature_disabled"),
-        ] {
-            let (status, error) = call(router.clone(), "GET", path, Value::Null).await;
-            assert_eq!(status, StatusCode::FORBIDDEN);
-            assert_eq!(error["error"]["type"], kind);
-        }
     }
 }
 
@@ -7880,14 +7872,48 @@ mod llama_router_compat {
     use tokio_stream::StreamExt;
 
     #[tokio::test]
+    async fn tools_are_owned_by_external_harnesses_not_server_routes() {
+        let state = lazy_state(ServerConfig::default());
+        let router = app(state.clone());
+        for path in ["/tools", "/cors-proxy"] {
+            for method in ["GET", "POST"] {
+                let response = router.clone().oneshot(Request::builder()
+                    .method(method).uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tool":"exec_shell_command","params":{"command":"echo should-not-run"}}"#))
+                    .unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+                assert!(
+                    response
+                        .headers()
+                        .get("access-control-allow-origin")
+                        .is_none()
+                );
+                assert_eq!(
+                    json_body(response).await["error"]["type"],
+                    "not_found_error"
+                );
+            }
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/props?autoload=false")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let props = json_body(response).await;
+        assert_eq!(props["nxrt_capabilities"]["server_tools"], false);
+        assert_eq!(props["cors_proxy_enabled"], false);
+    }
+
+    #[tokio::test]
     async fn props_acknowledgement_matches_upstream_without_loading_or_mutation() {
         for enabled in [false, true] {
             let state = lazy_state(ServerConfig {
                 endpoint_props: enabled,
-                tools: crate::ToolsConfig {
-                    enabled: vec![crate::BuiltinTool::GetInfo],
-                    ..Default::default()
-                },
                 ..Default::default()
             });
             let router = app(state.clone());
@@ -7903,7 +7929,7 @@ mod llama_router_compat {
                 .unwrap();
             let before = json_body(response).await;
             assert_eq!(before["endpoint_props"], enabled);
-            assert_eq!(before["nxrt_capabilities"]["server_tools"], true);
+            assert_eq!(before["nxrt_capabilities"]["server_tools"], false);
             for payload in ["", "not-json", r#"{"temperature":0.9,"n_predict":1}"#] {
                 let response = router
                     .clone()
@@ -7961,6 +7987,8 @@ mod llama_router_compat {
                 .unwrap();
             let before = json_body(response).await;
             assert_eq!(before["endpoint_props"], enabled);
+            assert_eq!(before["nxrt_capabilities"]["server_tools"], false);
+            assert_eq!(before["cors_proxy_enabled"], false);
             let response = router
                 .clone()
                 .oneshot(
@@ -10842,5 +10870,214 @@ mod lora_http {
                 .unwrap()
                 .contains("reload the model")
         );
+    }
+}
+
+mod systemone_decisions {
+    use super::*;
+    async fn call(
+        router: axum::Router,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        (response.status(), json_body(response).await)
+    }
+    fn fixture() -> AppState {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/decision");
+        AppState::load(&root, Some("decision-fixture".into())).unwrap()
+    }
+    fn policy_fixture() -> (tempfile::TempDir, AppState) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/decision");
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["tokenizer.json", "model.onnx.textproto"] {
+            std::fs::copy(root.join(file), dir.path().join(file)).unwrap();
+        }
+        let mut metadata: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("inference_metadata.yaml")).unwrap(),
+        )
+        .unwrap();
+        metadata["schema_version"] = serde_yaml::Value::String("v1.11".into());
+        metadata["profiles"]["decision_head"]["decision"]["input_policy"] = serde_yaml::to_value(json!({
+            "state":"payload",
+            "instructions":{"kind":"optional","default":"the","payload":"text"},
+            "default_type":"choice", "max_questions":1,
+            "choice":{"kind":"dynamic","minimum":2,"order":"request","descriptions":"payload","nonempty_keys":true},
+            "score":{"minimum":2,"maximum":2,"descriptions":"payload","legend":"canonical_json_text"},
+            "noul":{"order":"true_first","criteria":{"kind":"permissive","no_yes_aliases":true}}
+        })).unwrap();
+        std::fs::write(
+            dir.path().join("inference_metadata.yaml"),
+            serde_yaml::to_string(&metadata).unwrap(),
+        )
+        .unwrap();
+        let state = AppState::load(dir.path(), Some("policy-fixture".into())).unwrap();
+        (dir, state)
+    }
+    #[tokio::test]
+    async fn systemone_authored_policy_controls_defaults_order_and_boolean_mapping() {
+        let (_dir, state) = policy_fixture();
+        let router = app(state);
+        let (status, result) = call(
+            router.clone(),
+            "POST",
+            "/v1/systemone",
+            json!({
+                "state":"hello", "ignored":true,
+                "questions":{"x":{"criteria":{"z":"hello","a":"world"},"ignored":true}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["answers"]["x"]["choice"], "z");
+        assert_eq!(result["usage"], json!({"input_tokens":6,"output_tokens":0}));
+        let (status, result) = call(router.clone(), "POST", "/v1/systemone", json!({
+            "state":"hello", "questions":{"x":{"type":"noul","criteria":{"yes":"hello","no":"world"}}}
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert!(
+            result["answers"]["x"]["noul"].as_f64().unwrap() > 0.7,
+            "{result}"
+        );
+        for body in [
+            json!({"state":null,"questions":{"x":{"criteria":{"a":"hello","b":"world"}}}}),
+            json!({"state":"hello","questions":{"x":{"instructions":null,"criteria":{"a":"hello","b":"world"}}}}),
+            json!({"state":"hello","questions":{"x":{"type":"score","criteria":["a","b","c"]}}}),
+            json!({"state":"hello","questions":{"a":{"criteria":{"a":"hello","b":"world"}},"b":{"criteria":{"a":"hello","b":"world"}}}}),
+        ] {
+            let (status, error) = call(router.clone(), "POST", "/v1/systemone", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(error["error"]["message"].as_str().unwrap().len() > 20);
+        }
+        let (status, result) = call(router, "POST", "/v1/systemone", json!({
+            "state":"hello", "questions":{"x":{"type":"score","criteria":["hello",{"z":2,"a":1}]}}
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(
+            result["answers"]["x"]["legend"],
+            json!({"0":"hello","1":"{\"a\":1,\"z\":2}"})
+        );
+    }
+    fn request(state: &str) -> Value {
+        json!({"state":state,"questions":{
+            "select":{"type":"choice","instructions":"the","criteria":{"a":"hello","b":"world"}},
+            "level":{"type":"score","instructions":"the","criteria":["hello","world"]},
+            "yes":{"type":"noul","instructions":"the","criteria":{"false":"hello","true":"world"}}
+        }})
+    }
+    #[tokio::test]
+    async fn systemone_evaluates_choice_score_and_noul_without_generated_tokens() {
+        let router = app(fixture());
+        for (state, best) in [("hello", "a"), ("world", "b")] {
+            let (status, result) =
+                call(router.clone(), "POST", "/v1/systemone", request(state)).await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["model"], "decision-fixture");
+            assert_eq!(result["answers"]["select"]["choice"], best);
+            let p = result["answers"]["select"]["probabilities"]["b"]
+                .as_f64()
+                .unwrap();
+            assert!((result["answers"]["level"]["score"].as_f64().unwrap() - p).abs() < 1e-6);
+            assert!((result["answers"]["yes"]["noul"].as_f64().unwrap() - p).abs() < 1e-6);
+            assert_eq!(
+                result["answers"]["level"]["legend"],
+                json!({"0":"hello","1":"world"})
+            );
+            assert_eq!(
+                result["usage"],
+                json!({"input_tokens":18,"output_tokens":0})
+            );
+        }
+        let (_, props) = call(router, "GET", "/props", Value::Null).await;
+        assert_eq!(props["nxrt_capabilities"]["decision"], true);
+        assert_eq!(props["nxrt_capabilities"]["server_tools"], false);
+    }
+    #[tokio::test]
+    async fn systemone_refuses_unsupported_models_media_and_malformed_questions() {
+        let (status, result) =
+            call(app(tiny_state()), "POST", "/v1/systemone", request("hello")).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{result}");
+        assert_eq!(result["error"]["type"], "not_supported_error");
+        let router = app(fixture());
+        for value in [
+            json!({"state":"hello","questions":{}}),
+            json!({"questions":{"x":{"type":"noul","instructions":"the"}}}),
+            json!({"state":"hello","questions":{"x":{"type":"noul"}}}),
+            json!({"state":"hello","questions":{"x":{"type":"choice","instructions":"the","criteria":[]}}}),
+            json!({"state":"hello","questions":{"x":{"type":"score","instructions":"the","criteria":["one"]}}}),
+            json!({"state":"hello","questions":{"x":{"type":"noul","instructions":"the","criteria":{"unread":true}}}}),
+            json!({"state":"hello","questions":{"x":{"type":"noul","instructions":{"type":"input_audio","data":"abc"}}}}),
+            json!({"state":"hello","questions":{"x":{"type":"invalid","instructions":"the"}}}),
+            json!({"state":"hello","questions":{"x":{"type":"choice","instructions":"the","criteria":{"a":"hello"}}}}),
+            json!({"state":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}],"questions":{"x":{"type":"noul","instructions":"the"}}}),
+        ] {
+            let (status, result) = call(router.clone(), "POST", "/v1/systemone", value).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+            assert!(
+                result["error"]["message"].as_str().unwrap().len() > 30,
+                "{result}"
+            );
+        }
+        let mut media = request("hello");
+        media["images"] = json!(["data:image/png;base64,AA=="]);
+        let (status, result) = call(router, "POST", "/v1/systemone", media).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+    }
+    #[tokio::test]
+    async fn systemone_checks_all_preparation_and_capacity_before_execution() {
+        let mut state = fixture();
+        state.config.max_decision_questions = std::num::NonZeroUsize::new(1).unwrap();
+        let (status, _) = call(app(state), "POST", "/v1/systemone", request("hello")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let mut state = fixture();
+        state.config.max_decision_options = std::num::NonZeroUsize::new(1).unwrap();
+        let (status, _) = call(app(state), "POST", "/v1/systemone", request("hello")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let mut state = fixture();
+        state.config.max_decision_input_tokens = std::num::NonZeroUsize::new(2).unwrap();
+        let (status, result) = call(app(state), "POST", "/v1/systemone", request("hello")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("budget")
+        );
+        for (bytes, operations) in [(3, 1_000_000), (4 * 1024 * 1024, 1)] {
+            let mut state = fixture();
+            state.config.max_decision_prompt_bytes = std::num::NonZeroUsize::new(bytes).unwrap();
+            state.config.max_decision_template_operations =
+                std::num::NonZeroU64::new(operations).unwrap();
+            let (status, result) =
+                call(app(state), "POST", "/v1/systemone", request("hello")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+            assert!(
+                result["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("max_output_bytes"),
+                "{result}"
+            );
+        }
+        let router = app(fixture());
+        let mut invalid = request("hello");
+        invalid["questions"]["select"]["criteria"] = json!({"a":"hello"});
+        let (status, _) = call(router.clone(), "POST", "/v1/systemone", invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(router, "POST", "/v1/systemone", request("world")).await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

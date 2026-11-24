@@ -74,6 +74,22 @@ pub struct ServeArgs {
     #[arg(long, default_value = "128")]
     pub max_rerank_documents: std::num::NonZeroUsize,
 
+    /// Maximum tokens per non-generative decision prompt variant.
+    #[arg(long, default_value_t = onnx_genai_engine::decision::DecisionLimits::default().max_input_tokens)]
+    pub max_decision_input_tokens: std::num::NonZeroUsize,
+    /// Maximum rendered bytes per decision prompt variant, before tokenization.
+    #[arg(long, default_value_t = onnx_genai_engine::decision::DecisionLimits::default().template.max_output_bytes)]
+    pub max_decision_prompt_bytes: std::num::NonZeroUsize,
+    /// Maximum Jinja interpreter operations per decision prompt variant.
+    #[arg(long, default_value_t = onnx_genai_engine::decision::DecisionLimits::default().template.max_operations)]
+    pub max_decision_template_operations: std::num::NonZeroU64,
+    /// Maximum questions in one SystemOne decision request.
+    #[arg(long, default_value = "64")]
+    pub max_decision_questions: std::num::NonZeroUsize,
+    /// Maximum options per decision question (also bounded by model metadata).
+    #[arg(long, default_value = "128")]
+    pub max_decision_options: std::num::NonZeroUsize,
+
     /// Maximum active/retained resumable generations (X-Conversation-Id).
     #[arg(long, default_value_t = 16)]
     pub max_replay_streams: usize,
@@ -85,35 +101,6 @@ pub struct ServeArgs {
     /// Enable the upstream POST /props acknowledgement (no properties are changed).
     #[arg(long, env = "NXRT_PROPS")]
     pub props: bool,
-
-    /// Enable host filesystem/command tools for trusted clients: all or a comma-separated list.
-    #[arg(long, value_delimiter = ',', env = "NXRT_TOOLS")]
-    pub tools: Vec<crate::BuiltinTool>,
-    /// Maximum in-flight host-tool calls, including responses still being consumed.
-    #[arg(long, default_value = "8")]
-    pub tools_max_concurrent: std::num::NonZeroUsize,
-    /// Host memory budget for tool request/response and file I/O staging, in bytes.
-    #[arg(long, default_value = "268435456")]
-    pub tools_max_host_bytes: std::num::NonZeroU64,
-    /// Additional trusted browser origin permitted to invoke host tools.
-    #[arg(long)]
-    pub tools_allow_origin: Vec<String>,
-
-    /// Enable the official chat frontend's HTTP(S) MCP proxy (off by default).
-    #[arg(long)]
-    pub ui_mcp_proxy: bool,
-    /// Permit private/local targets through the explicitly enabled MCP proxy.
-    #[arg(long, requires = "ui_mcp_proxy")]
-    pub ui_mcp_proxy_allow_private_urls: bool,
-    /// Maximum bytes in one MCP proxy request or response.
-    #[arg(long, default_value = "67108864")]
-    pub ui_mcp_proxy_max_bytes: std::num::NonZeroUsize,
-    /// Maximum simultaneous outbound MCP proxy transfers.
-    #[arg(long, default_value = "16")]
-    pub ui_mcp_proxy_max_connections: std::num::NonZeroUsize,
-    /// Maximum wait without progress during an MCP proxy transfer, in seconds.
-    #[arg(long, default_value = "600")]
-    pub ui_mcp_proxy_timeout_secs: std::num::NonZeroU64,
 
     /// Reasoning effort applied when a request omits `reasoning_effort`.
     ///
@@ -225,27 +212,16 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
         endpoint_props: args.props,
-        tools: crate::ToolsConfig {
-            enabled: args.tools.clone(),
-            max_concurrent: args.tools_max_concurrent,
-            max_host_bytes: args.tools_max_host_bytes,
-            allow_origins: args.tools_allow_origin.clone(),
-        },
         max_completion_prompts: args.max_completion_prompts,
         max_rerank_input_tokens: args.max_rerank_input_tokens,
         max_rerank_documents: args.max_rerank_documents,
+        max_decision_input_tokens: args.max_decision_input_tokens,
+        max_decision_prompt_bytes: args.max_decision_prompt_bytes,
+        max_decision_template_operations: args.max_decision_template_operations,
+        max_decision_questions: args.max_decision_questions,
+        max_decision_options: args.max_decision_options,
         max_replay_streams: args.max_replay_streams,
         replay_buffer_bytes: args.replay_buffer_bytes,
-        mcp_proxy_policy: if !args.ui_mcp_proxy {
-            crate::McpProxyPolicy::Disabled
-        } else if args.ui_mcp_proxy_allow_private_urls {
-            crate::McpProxyPolicy::AllowPrivate
-        } else {
-            crate::McpProxyPolicy::Public
-        },
-        mcp_proxy_max_bytes: args.ui_mcp_proxy_max_bytes,
-        mcp_proxy_max_connections: args.ui_mcp_proxy_max_connections,
-        mcp_proxy_timeout_secs: args.ui_mcp_proxy_timeout_secs,
         default_reasoning_effort: args.default_reasoning_effort,
         max_sessions: args.max_sessions,
         max_queue_depth: args.max_queue_depth,
@@ -370,75 +346,28 @@ mod tests {
     }
 
     #[test]
-    fn builtin_tools_require_explicit_selection_and_bounded_resources() {
-        let disabled = TestCli::parse_from(["test", "model-dir"]);
-        assert!(
-            server_config_from_args(&disabled.serve)
-                .tools
-                .enabled
-                .is_empty()
-        );
-        let enabled = TestCli::parse_from([
-            "test",
-            "model-dir",
+    fn tool_execution_and_proxy_options_are_not_server_capabilities() {
+        for flag in [
             "--tools",
-            "read_file,exec_shell_command",
             "--tools-max-concurrent",
-            "2",
             "--tools-max-host-bytes",
-            "1048576",
             "--tools-allow-origin",
-            "https://trusted.invalid",
-        ]);
-        let config = server_config_from_args(&enabled.serve);
-        assert_eq!(
-            config.tools.enabled,
-            vec![
-                crate::BuiltinTool::ReadFile,
-                crate::BuiltinTool::ExecShellCommand
-            ]
-        );
-        assert_eq!(config.tools.max_concurrent.get(), 2);
-        assert_eq!(config.tools.max_host_bytes.get(), 1048576);
-        assert_eq!(config.tools.allow_origins, vec!["https://trusted.invalid"]);
-        assert!(TestCli::try_parse_from(["test", "model-dir", "--tools", "unknown"]).is_err());
-        for flag in ["--tools-max-concurrent", "--tools-max-host-bytes"] {
-            assert!(TestCli::try_parse_from(["test", "model-dir", flag, "0"]).is_err());
-        }
-    }
-
-    #[test]
-    fn mcp_proxy_flags_require_explicit_enable_and_positive_limits() {
-        let disabled = TestCli::parse_from(["test", "model-dir"]);
-        assert_eq!(
-            server_config_from_args(&disabled.serve).mcp_proxy_policy,
-            crate::McpProxyPolicy::Disabled
-        );
-        assert!(
-            TestCli::try_parse_from(["test", "model-dir", "--ui-mcp-proxy-allow-private-urls"])
-                .is_err()
-        );
-        let public = TestCli::parse_from(["test", "model-dir", "--ui-mcp-proxy"]);
-        assert_eq!(
-            server_config_from_args(&public.serve).mcp_proxy_policy,
-            crate::McpProxyPolicy::Public
-        );
-        let private = TestCli::parse_from([
-            "test",
-            "model-dir",
+            "--mcp-servers-config",
+            "--mcp-servers-json",
+            "--mcp-max-message-bytes",
+            "--tools-runtime",
             "--ui-mcp-proxy",
             "--ui-mcp-proxy-allow-private-urls",
-        ]);
-        assert_eq!(
-            server_config_from_args(&private.serve).mcp_proxy_policy,
-            crate::McpProxyPolicy::AllowPrivate
-        );
-        for flag in [
             "--ui-mcp-proxy-max-bytes",
             "--ui-mcp-proxy-max-connections",
             "--ui-mcp-proxy-timeout-secs",
         ] {
-            assert!(TestCli::try_parse_from(["test", "model-dir", flag, "0"]).is_err());
+            let error = TestCli::try_parse_from(["test", "model-dir", flag]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}: {error}"
+            );
         }
     }
 
@@ -589,6 +518,36 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("--max-completion-prompts"));
     }
+    #[test]
+    fn decision_resource_limits_are_positive_and_forwarded() {
+        let args = TestCli::parse_from([
+            "test",
+            "model-dir",
+            "--max-decision-input-tokens",
+            "256",
+            "--max-decision-questions",
+            "3",
+            "--max-decision-options",
+            "8",
+        ]);
+        let config = server_config_from_args(&args.serve);
+        assert_eq!(config.max_decision_input_tokens.get(), 256);
+        assert_eq!(config.max_decision_questions.get(), 3);
+        assert_eq!(config.max_decision_options.get(), 8);
+        for flag in [
+            "--max-decision-input-tokens",
+            "--max-decision-questions",
+            "--max-decision-prompt-bytes",
+            "--max-decision-template-operations",
+            "--max-decision-options",
+        ] {
+            assert!(
+                TestCli::try_parse_from(["test", "model-dir", flag, "0"]).is_err(),
+                "{flag}"
+            );
+        }
+    }
+
     #[test]
     fn reranking_resource_limits_are_positive_and_flow_to_server_config() {
         let cli = TestCli::parse_from([

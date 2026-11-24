@@ -172,7 +172,8 @@ pub use pinned_pool::{PinnedStagingPool, global_pinned_alloc_calls, global_pinne
 #[doc(hidden)]
 pub use provider::RoutePrepareCommitInterlock;
 pub use provider::{
-    CudaExecutionProvider, DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES, dynamic_kv_weight_lending_enabled,
+    CudaExecutionProvider, CudaProviderConfig, DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES,
+    dynamic_kv_weight_lending_enabled,
 };
 pub use weight_paging::{
     CudaResidencyStats, CudaWeightPage, CudaWeightPager, CudaWeightResidency, DeviceOffloadPolicy,

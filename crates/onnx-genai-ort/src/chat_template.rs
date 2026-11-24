@@ -22,6 +22,13 @@ pub struct ChatTemplate {
     eos_token: Option<String>,
 }
 
+/// Caller-owned bounds for model-authored template execution.
+#[derive(Debug, Clone, Copy)]
+pub struct TemplateLimits {
+    pub max_output_bytes: std::num::NonZeroUsize,
+    pub max_operations: std::num::NonZeroU64,
+}
+
 /// Chat roles understood by common Hugging Face chat templates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatRole {
@@ -377,6 +384,45 @@ impl ChatTemplate {
         reasoning_effort: Option<&str>,
         kwargs: &std::collections::BTreeMap<String, Value>,
     ) -> Result<String> {
+        self.render_controlled(
+            messages,
+            tools,
+            add_generation_prompt,
+            reasoning_effort,
+            kwargs,
+            None,
+        )
+    }
+
+    /// Render with explicit byte and interpreter-operation budgets.
+    pub fn render_with_limited_kwargs(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&str>,
+        add_generation_prompt: bool,
+        reasoning_effort: Option<&str>,
+        kwargs: &std::collections::BTreeMap<String, Value>,
+        limits: TemplateLimits,
+    ) -> Result<String> {
+        self.render_controlled(
+            messages,
+            tools,
+            add_generation_prompt,
+            reasoning_effort,
+            kwargs,
+            Some(limits),
+        )
+    }
+
+    fn render_controlled(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&str>,
+        add_generation_prompt: bool,
+        reasoning_effort: Option<&str>,
+        kwargs: &std::collections::BTreeMap<String, Value>,
+        limits: Option<TemplateLimits>,
+    ) -> Result<String> {
         Self::validate_kwargs(kwargs)?;
         let tools = match tools {
             Some(tools) => serde_json::from_str::<Value>(tools).map_err(|err| {
@@ -386,6 +432,9 @@ impl ChatTemplate {
         };
 
         let mut env = Environment::new();
+        if let Some(limits) = limits {
+            env.set_fuel(Some(limits.max_operations.get()));
+        }
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
         // Hugging Face chat templates are authored for Jinja2 on Python, so they
@@ -413,18 +462,111 @@ impl ChatTemplate {
         let template = env
             .get_template("chat")
             .map_err(|err| OrtError::InvalidArgument(format!("invalid chat template: {err}")))?;
-        template
-            .render(context! {
-                messages => messages,
-                tools => tools,
-                add_generation_prompt => add_generation_prompt,
-                reasoning_effort => reasoning_effort,
-                reasoning_strength => reasoning_effort,
-                bos_token => self.bos_token.as_deref().unwrap_or_default(),
-                eos_token => self.eos_token.as_deref().unwrap_or_default(),
-                ..minijinja::Value::from_serialize(kwargs),
+        let context = context! {
+            messages => messages,
+            tools => tools,
+            add_generation_prompt => add_generation_prompt,
+            reasoning_effort => reasoning_effort,
+            reasoning_strength => reasoning_effort,
+            bos_token => self.bos_token.as_deref().unwrap_or_default(),
+            eos_token => self.eos_token.as_deref().unwrap_or_default(),
+            ..minijinja::Value::from_serialize(kwargs),
+        };
+        if let Some(limits) = limits {
+            struct Output {
+                bytes: Vec<u8>,
+                limit: usize,
+            }
+            impl std::io::Write for Output {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+                        return Err(std::io::Error::other(format!(
+                            "template exceeds {} output bytes",
+                            self.limit
+                        )));
+                    }
+                    self.bytes
+                        .try_reserve(bytes.len())
+                        .map_err(std::io::Error::other)?;
+                    self.bytes.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut output = Output {
+                bytes: Vec::new(),
+                limit: limits.max_output_bytes.get(),
+            };
+            template.render_captured_to(context,&mut output).map_err(|error|OrtError::InvalidArgument(format!("chat template render exceeded limits or failed (max_output_bytes={}, max_operations={}): {error:#}",limits.max_output_bytes,limits.max_operations)))?;
+            String::from_utf8(output.bytes).map_err(|error| {
+                OrtError::InvalidArgument(format!(
+                    "chat template output is not UTF-8: {error}; repair the template"
+                ))
             })
-            .map_err(|err| OrtError::InvalidArgument(format!("chat template render failed: {err}")))
+        } else {
+            template.render(context).map_err(|err| {
+                OrtError::InvalidArgument(format!("chat template render failed: {err}"))
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod bounded_template_tests {
+    use super::*;
+    fn limits(bytes: usize, operations: u64) -> TemplateLimits {
+        TemplateLimits {
+            max_output_bytes: std::num::NonZeroUsize::new(bytes).unwrap(),
+            max_operations: std::num::NonZeroU64::new(operations).unwrap(),
+        }
+    }
+    #[test]
+    fn bounded_template_enforces_rendered_bytes_and_interpreter_fuel() {
+        let template = ChatTemplate::from_source("{% for i in range(1000) %}word{% endfor %}");
+        let error = template
+            .render_with_limited_kwargs(
+                &[],
+                None,
+                false,
+                None,
+                &Default::default(),
+                limits(32, 10000),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_output_bytes=32"), "{error}");
+        let template = ChatTemplate::from_source(
+            "{% for i in range(1000) %}{% set a = i + 1 %}{% endfor %}done",
+        );
+        let error = template
+            .render_with_limited_kwargs(
+                &[],
+                None,
+                false,
+                None,
+                &Default::default(),
+                limits(100, 10),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_operations=10"), "{error}");
+        assert!(error.to_lowercase().contains("fuel"), "{error}");
+        let template = ChatTemplate::from_source("{{ greeting }}");
+        let kwargs =
+            std::collections::BTreeMap::from([("greeting".into(), serde_json::json!("你好"))]);
+        assert_eq!(
+            template
+                .render_with_limited_kwargs(&[], None, false, None, &kwargs, limits(6, 100))
+                .unwrap(),
+            "你好"
+        );
+        assert!(
+            template
+                .render_with_limited_kwargs(&[], None, false, None, &kwargs, limits(5, 100))
+                .is_err()
+        );
     }
 }
 

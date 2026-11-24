@@ -1317,6 +1317,150 @@ fn scan_rejects_zero_element_nonleading_output_axis_stack_overflow() {
     );
 }
 
+#[test]
+fn packed_loop_stacks_logical_elements_without_slice_padding() {
+    for (dtype, slice_bytes, stacked_bytes) in [
+        (DataType::Int2, &[0xf9][..], &[0x79, 0x0e][..]),
+        (DataType::Uint2, &[0xf9][..], &[0x79, 0x0e][..]),
+        (DataType::Int4, &[0x21, 0xf3][..], &[0x21, 0x13, 0x32][..]),
+        (DataType::Uint4, &[0x21, 0xf3][..], &[0x21, 0x13, 0x32][..]),
+        (
+            DataType::Float4E2M1,
+            &[0x21, 0xf3][..],
+            &[0x21, 0x13, 0x32][..],
+        ),
+    ] {
+        let mut body = new_parent_at_opset(25);
+        input(&mut body, "i", DataType::Int64, &[]);
+        let cond = input(&mut body, "cond_in", DataType::Bool, &[]);
+        let cond_next = op(
+            &mut body,
+            "Identity",
+            &[cond],
+            Some("cond_out"),
+            DataType::Bool,
+            &[],
+            &[],
+        );
+        let captured = capture(&mut body, "X", dtype, &[3]);
+        let slice = op(
+            &mut body,
+            "Identity",
+            &[captured],
+            Some("slice"),
+            dtype,
+            &[3],
+            &[],
+        );
+        body.add_output(cond_next);
+        body.add_output(slice);
+
+        let mut g = new_parent_at_opset(25);
+        let trips = input(&mut g, "trips", DataType::Int64, &[]);
+        let cond = init(&mut g, "cond", DataType::Bool, &[], vec![1]);
+        input(&mut g, "X", dtype, &[3]);
+        let trips_out = g.intern_symbol("trips_out");
+        let y = g.create_named_value("Y", dtype, vec![Dim::Symbolic(trips_out), Dim::Static(3)]);
+        let node = control_flow_node(&mut g, "Loop", vec![Some(trips), Some(cond)], vec![y], &[]);
+        register(&mut g, node, "body", body);
+        g.add_output(y);
+        let mut session = InferenceSession::from_graph(g).expect("build packed Loop");
+        let x = Tensor::from_raw(dtype, vec![3], slice_bytes).unwrap();
+        for (n, expected) in [(2i64, stacked_bytes), (0, &[][..])] {
+            let trips = Tensor::from_raw(DataType::Int64, vec![], &n.to_le_bytes()).unwrap();
+            let y = session
+                .run(&[("trips", &trips), ("X", &x)])
+                .expect("run packed Loop");
+            assert_eq!(y[0].dtype, dtype);
+            assert_eq!(y[0].shape, [n as usize, 3]);
+            assert_eq!(y[0].as_bytes(), expected);
+        }
+    }
+}
+
+fn packed_scan_graph(steps: usize, width: usize) -> Graph {
+    let dtype = DataType::Uint4;
+    let mut body = new_parent_at_opset(25);
+    let x = input(&mut body, "slice", dtype, &[3, width]);
+    for name in ["leading_slice", "trailing_slice"] {
+        let y = op(
+            &mut body,
+            "Identity",
+            &[x],
+            Some(name),
+            dtype,
+            &[3, width],
+            &[],
+        );
+        body.add_output(y);
+    }
+
+    let mut g = new_parent_at_opset(25);
+    let x = input(&mut g, "X", dtype, &[3, steps, width]);
+    let leading = g.create_named_value("leading", dtype, static_shape([steps, 3, width]));
+    let trailing = g.create_named_value("trailing", dtype, static_shape([3, width, steps]));
+    let node = control_flow_node(
+        &mut g,
+        "Scan",
+        vec![Some(x)],
+        vec![leading, trailing],
+        &[
+            ("num_scan_inputs", Attribute::Int(1)),
+            ("scan_input_axes", Attribute::Ints(vec![-2])),
+            ("scan_input_directions", Attribute::Ints(vec![1])),
+            ("scan_output_axes", Attribute::Ints(vec![0, -1])),
+            ("scan_output_directions", Attribute::Ints(vec![0, 1])),
+        ],
+    );
+    register(&mut g, node, "body", body);
+    g.add_output(leading);
+    g.add_output(trailing);
+    g
+}
+
+#[test]
+fn packed_scan_slices_cross_byte_boundaries_and_stacks_both_directions() {
+    let mut session =
+        InferenceSession::from_graph(packed_scan_graph(2, 3)).expect("build packed Scan");
+    // Row-major lanes 0..15, 0, 1. Slicing axis 1 at index 1 yields
+    // [3,4,5, 9,10,11, 15,0,1] and is executed first.
+    let x = Tensor::from_raw(
+        DataType::Uint4,
+        vec![3, 2, 3],
+        &[0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x10],
+    )
+    .unwrap();
+    let y = session.run(&[("X", &x)]).expect("run packed Scan");
+    assert_eq!(y[0].dtype, DataType::Uint4);
+    assert_eq!(y[0].shape, [2, 3, 3]);
+    assert_eq!(
+        y[0].as_bytes(),
+        &[0x43, 0x95, 0xba, 0x0f, 0x01, 0x21, 0x76, 0xc8, 0xed]
+    );
+    assert_eq!(y[1].dtype, DataType::Uint4);
+    assert_eq!(y[1].shape, [3, 3, 2]);
+    assert_eq!(
+        y[1].as_bytes(),
+        &[0x30, 0x41, 0x52, 0x96, 0xa7, 0xb8, 0xfc, 0x0d, 0x1e]
+    );
+}
+
+#[test]
+fn packed_scan_preserves_empty_outputs() {
+    for (steps, width) in [(0, 3), (2, 0)] {
+        let mut session = InferenceSession::from_graph(packed_scan_graph(steps, width))
+            .expect("build empty packed Scan");
+        let x = Tensor::from_raw(DataType::Uint4, vec![3, steps, width], &[]).unwrap();
+        let y = session.run(&[("X", &x)]).expect("run empty packed Scan");
+        assert_eq!(y[0].shape, [steps, 3, width]);
+        assert_eq!(y[1].shape, [3, width, steps]);
+        for t in y {
+            assert_eq!(t.dtype, DataType::Uint4);
+            assert!(t.as_bytes().is_empty());
+        }
+    }
+}
+
 fn scan_shape_changing_body() -> Graph {
     let mut b = Graph::new();
     let state = capture(&mut b, "state", DataType::Float32, &[2]);
