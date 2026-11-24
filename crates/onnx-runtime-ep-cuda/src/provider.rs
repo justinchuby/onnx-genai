@@ -259,7 +259,7 @@ impl DeferredReleaseAction for RouteReservationRetirementAction {
         let mut action = *self;
         let health = action.health.upgrade();
         for source in action.armed_sources.drain(..) {
-            source.disarm_route_telemetry_after_stream_fences();
+            source.disarm_route_telemetry();
         }
         action.boundaries.clear();
         drop(
