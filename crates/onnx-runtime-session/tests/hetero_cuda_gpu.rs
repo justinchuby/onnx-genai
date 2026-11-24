@@ -26,19 +26,18 @@ fn packed_shape_only_cuda_no_fallback() {
         use std::path::Path;
 
         let ep = Arc::new(CudaExecutionProvider::initialized(0).expect("initialize physical CUDA"));
-        packed_shape_only_cases::assert_transport(
-            |graph| {
-                InferenceSession::from_graph_with_provider(
-                    graph,
-                    Arc::new(WeightStore::new()),
-                    Path::new("."),
-                    ep.clone(),
-                    None,
-                )
-                .expect("build native CUDA shape-only session")
-            },
-            DeviceId::cuda(0),
-        );
+        let build = |graph| {
+            InferenceSession::from_graph_with_provider(
+                graph,
+                Arc::new(WeightStore::new()),
+                Path::new("."),
+                ep.clone(),
+                None,
+            )
+            .expect("build native CUDA shape-only session")
+        };
+        packed_shape_only_cases::assert_transport(build, DeviceId::cuda(0));
+        packed_shape_only_cases::assert_ir9_fp8_reshape(build, DeviceId::cuda(0));
     }
     #[cfg(not(feature = "gpu-tests"))]
     panic!("requires CUDA; enable gpu-tests");

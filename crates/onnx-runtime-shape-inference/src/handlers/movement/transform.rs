@@ -9,13 +9,20 @@ use crate::shape_data::ShapeData;
 use super::concat_slice::vector_length;
 use super::{checked_extent, const_ints, validate_vector_input};
 
-/// Reshape, Flatten, Squeeze, and Unsqueeze use the same schema revisions for
-/// the low-bit types (ONNX 622adf94d4e720142950aa8178f7357d52e63db0).
-fn validate_shape_only_dtype(ctx: &InferenceContext) -> Result<(), ShapeInferError> {
+/// The IR10+ dtype boundaries are shared; Reshape adopted the four IR9 FP8
+/// types earlier than the other shape-only ops (ONNX 622adf94).
+fn validate_shape_only_dtype(
+    ctx: &InferenceContext,
+    ir9_since: u64,
+) -> Result<(), ShapeInferError> {
     let Some(dtype) = ctx.input_dtype(0) else {
         return Ok(());
     };
     let since = match dtype {
+        DataType::Float8E4M3FN
+        | DataType::Float8E4M3FNUZ
+        | DataType::Float8E5M2
+        | DataType::Float8E5M2FNUZ => ir9_since,
         DataType::Int4 | DataType::Uint4 => 21,
         DataType::Float4E2M1 => 23,
         DataType::Float8E8M0 => 24,
@@ -76,7 +83,7 @@ pub fn transpose(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// `Reshape`: output shape from the (shape-data) target vector, resolving `0`
 /// (copy) and `-1` (infer) dims symbolically.
 pub fn reshape(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    validate_shape_only_dtype(ctx)?;
+    validate_shape_only_dtype(ctx, 19)?;
     let Some(input) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
         return Ok(());
     };
@@ -179,7 +186,7 @@ pub fn reshape(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 
 /// `Flatten`: collapse to `[prod(dims[..axis]), prod(dims[axis..])]`.
 pub fn flatten(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    validate_shape_only_dtype(ctx)?;
+    validate_shape_only_dtype(ctx, 21)?;
     let Some(t) = ctx.input_type(0).cloned() else {
         return Ok(());
     };
@@ -202,7 +209,7 @@ pub fn flatten(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 
 /// `Squeeze` with axes taken from an attribute (opset < 13).
 pub fn squeeze_v1(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    validate_shape_only_dtype(ctx)?;
+    validate_shape_only_dtype(ctx, 21)?;
     let axes = ctx
         .node
         .attr("axes")
@@ -213,7 +220,7 @@ pub fn squeeze_v1(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 
 /// `Squeeze` with axes taken from input 1 (opset ≥ 13).
 pub fn squeeze_v13(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    validate_shape_only_dtype(ctx)?;
+    validate_shape_only_dtype(ctx, 21)?;
     // A runtime axes tensor can remove a variable number of dimensions, so its
     // output rank is not statically knowable.
     if ctx.has_input(1) && const_ints(ctx, 1).is_none() {
@@ -292,7 +299,7 @@ fn squeeze_common(
 
 /// `Unsqueeze` with axes from an attribute (opset < 13).
 pub fn unsqueeze_v1(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    validate_shape_only_dtype(ctx)?;
+    validate_shape_only_dtype(ctx, 21)?;
     let axes = ctx
         .node
         .attr("axes")
@@ -303,7 +310,7 @@ pub fn unsqueeze_v1(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 
 /// `Unsqueeze` with axes from input 1 (opset ≥ 13).
 pub fn unsqueeze_v13(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    validate_shape_only_dtype(ctx)?;
+    validate_shape_only_dtype(ctx, 21)?;
     validate_vector_input(ctx, 1, "Unsqueeze")?;
     let axes = const_ints(ctx, 1);
     if axes.is_none() {
