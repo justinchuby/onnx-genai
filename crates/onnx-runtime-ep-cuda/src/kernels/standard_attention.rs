@@ -1034,7 +1034,7 @@ pub struct StandardAttentionKernel {
 }
 
 /// Decode signature warmed as capture-safe. A subsequent capture pass reuses
-/// the workspace slots sized for this shape.
+/// the borrowed workspace layout prepared for this shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StdAttnCaptureSignature {
     dtype: DataType,
@@ -3738,8 +3738,8 @@ mod workspace_governance_tests {
 
     #[test]
     fn prefill_without_past_retains_the_composite() {
-        // Multi-token prefill (the 512-MiB-class worst case) is the per-call
-        // route: StepScoped, sized to `batch·heads·q_seq·key` fp32. With no past
+        // Multi-token prefill (the 512-MiB-class worst case) retains the lane
+        // peak, sized to `batch·heads·q_seq·key` fp32. With no past
         // cache there is no aliased growth to stage.
         let hidden = 32 * 128;
         let q = [1usize, 2048, hidden];
