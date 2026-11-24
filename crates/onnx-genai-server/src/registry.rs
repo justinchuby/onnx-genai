@@ -921,6 +921,7 @@ mod tests {
     fn stub_engine_driver() -> EngineDriver {
         let (tx, _rx) = mpsc::channel(1);
         EngineDriver {
+            adapters: None,
             native_slot: None,
             reranking: None,
             runtime_sampling: false,

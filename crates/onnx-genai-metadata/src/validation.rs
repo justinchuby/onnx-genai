@@ -1929,6 +1929,19 @@ fn validate_adapter_service(
         else {
             continue;
         };
+        for (role, ports) in [
+            ("input", &component.ports.inputs),
+            ("base", &component.ports.inputs),
+            ("output", &component.ports.outputs),
+        ] {
+            if !contract
+                .bindings
+                .get(role)
+                .is_some_and(|port| ports.contains_key(port))
+            {
+                errors.push(format!("workflow parameter overlay component '{name}' must bind '{role}' to a declared port; supply the source activation and actual base projection output separately"));
+            }
+        }
         let string_parameter = |key: &str| match contract.parameters.get(key) {
             Some(crate::schema::ScalarValue::String(value)) if !value.trim().is_empty() => {
                 Some(value.as_str())

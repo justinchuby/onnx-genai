@@ -98,9 +98,23 @@ pub(crate) async fn props(
         "nxrt_capabilities": {
             "resumable_streams": true, "reasoning_control": true,
             "tools": handle.tool_protocol.is_some(), "custom_sampler_order": handle.engine.runtime_sampling,
+            "lora": handle.engine.adapters.is_some(),
+            "lora_sessions": handle.engine.adapters.as_ref().is_some_and(|state|state.supports_sessions),
             "reranking": handle.engine.reranking.is_some()
         }
     });
+    let lora = match &handle.engine.adapters {
+        Some(state) => state.list().map_err(crate::lora::api_error)?,
+        None => Vec::new(),
+    };
+    properties["default_generation_settings"]["params"]["lora"] = json!(
+        lora.into_iter()
+            .map(|entry| crate::lora::Activation {
+                id: entry.id,
+                scale: entry.scale
+            })
+            .collect::<Vec<_>>()
+    );
     if let Some(source) = handle
         .chat_template
         .as_ref()
@@ -237,6 +251,7 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
                 .as_i64()
                 .is_some_and(|n| n == -1 || usize::try_from(n).is_ok()),
             "backend_sampling" => value == false,
+            "lora" => value.is_array(),
             "id_slot" => matches!(value.as_i64(), Some(-1 | 0)),
             "n" => value == 1,
             "user" => value.is_string(),

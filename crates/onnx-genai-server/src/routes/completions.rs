@@ -69,13 +69,19 @@ pub(crate) async fn completions(
         }
         Ok(prepared)
     };
-    let first_prepared = prepare(&first)?;
+    let mut first_prepared = prepare(&first)?;
+    let adapter_selection = first_prepared
+        .generation
+        .options_mut()
+        .adapter_selection
+        .clone();
     let mut rest = Vec::with_capacity(requests.len());
     for (index, request) in requests.into_iter().enumerate() {
-        let prepared = prepare(&request).map_err(|error| ApiError {
+        let mut prepared = prepare(&request).map_err(|error| ApiError {
             message: format!("prompt[{}]: {}", index + 1, error.message),
             ..error
         })?;
+        prepared.generation.options_mut().adapter_selection = adapter_selection.clone();
         rest.push((request, prepared));
     }
     if first.sampling.stream {
@@ -647,6 +653,7 @@ async fn prepare_chat_input(
     if !input_audio.is_empty() {
         prepared = prepare_audio_generate_request(request, &handle.tokenizer, output_budget)?;
     }
+    crate::lora::apply_request(request, handle, &mut prepared.request.options, has_session)?;
     prepared.request.options.max_constraint_bytes = config.replay_buffer_bytes;
     let pipeline_input = if !image_urls.is_empty() {
         Some(
@@ -1950,6 +1957,7 @@ pub(crate) fn prepare_completion(
     .map_err(|error| {
         ApiError::invalid_request(format!("invalid completion generation controls: {error:#}"))
     })?;
+    crate::lora::apply_request(&request.sampling, handle, &mut options, false)?;
     options.max_context = handle.model_max_context;
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.

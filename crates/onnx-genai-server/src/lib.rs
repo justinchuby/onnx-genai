@@ -31,6 +31,7 @@ mod driver;
 mod image_generation;
 mod image_input;
 mod lease;
+mod lora;
 mod metrics;
 mod models_config;
 pub mod multimodal;
@@ -144,6 +145,10 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/reranking", post(routes::ranking::rerank))
         .route("/embedding", post(routes::native::embeddings))
         .route("/embeddings", post(routes::native::embeddings))
+        .route(
+            "/lora-adapters",
+            get(routes::lora::list).post(routes::lora::set),
+        )
         .route("/slots", get(routes::slots::list))
         .route("/slots/{id_slot}", post(routes::slots::action))
         .route("/tokenize", post(routes::llama::tokenize))

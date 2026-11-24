@@ -10105,3 +10105,401 @@ mod native_slots_http {
         );
     }
 }
+
+#[cfg(feature = "native-backend")]
+mod lora_http {
+    use super::*;
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/build_lora_decoder.rs"
+        ));
+    }
+    fn state(root: &std::path::Path, disabled: bool) -> AppState {
+        fixture::build(
+            root,
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures"),
+        )
+        .unwrap();
+        AppState::load_with_config(
+            root,
+            Some("adapted".into()),
+            ServerConfig {
+                lora_init_without_apply: disabled,
+                engine_config: EngineConfig {
+                    decode_backend: EngineDecodeBackend::Native,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+    async fn call(
+        router: axum::Router,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    fn generation() -> Value {
+        json!({"prompt":[2,4],"n_predict":2,"temperature":0,"ignore_eos":true,"return_tokens":true})
+    }
+    #[tokio::test]
+    async fn global_defaults_and_request_override_execute_selected_adapters() {
+        let root = tempfile::tempdir().unwrap();
+        let router = app(state(root.path(), false));
+        let (status, catalog) = call(router.clone(), "GET", "/lora-adapters", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{catalog}");
+        assert_eq!(catalog[0]["id"], 0);
+        assert_eq!(catalog[1]["id"], 1);
+        assert_eq!(catalog[0]["scale"], 1.0);
+        assert_eq!(catalog[1]["scale"], 1.0);
+        assert_eq!(catalog[1]["path"], "adapters/red/adapter.json");
+        let (status, result) = call(
+            router.clone(),
+            "POST",
+            "/lora-adapters",
+            json!([{"id":1,"scale":1.0}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        let (status, red) = call(router.clone(), "POST", "/completion", generation()).await;
+        assert_eq!(status, StatusCode::OK, "{red}");
+        assert_eq!(red["tokens"], json!([4, 4]));
+        let mut blue = generation();
+        blue["lora"] = json!([{"id":0,"scale":1.0}]);
+        let (status, blue) = call(router.clone(), "POST", "/completion", blue).await;
+        assert_eq!(status, StatusCode::OK, "{blue}");
+        assert_eq!(blue["tokens"], json!([5, 5]));
+        let (_, catalog) = call(router.clone(), "GET", "/lora-adapters", Value::Null).await;
+        assert_eq!(catalog[0]["scale"], 0.0);
+        assert_eq!(catalog[1]["scale"], 1.0);
+        let (_, again) = call(router, "POST", "/completion", generation()).await;
+        assert_eq!(again["tokens"], json!([4, 4]));
+    }
+    #[tokio::test]
+    async fn empty_selection_disables_all_and_invalid_updates_are_atomic() {
+        let root = tempfile::tempdir().unwrap();
+        let router = app(state(root.path(), true));
+        let (_, baseline) = call(router.clone(), "POST", "/completion", generation()).await;
+        for request in [
+            json!([{"id":99,"scale":1}]),
+            json!([{"id":"0","scale":1}]),
+            json!([{"id":-1,"scale":1}]),
+            json!([{"id":0,"scale":1e99}]),
+        ] {
+            let (status, body) = call(router.clone(), "POST", "/lora-adapters", request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
+        let (_, catalog) = call(router.clone(), "GET", "/lora-adapters", Value::Null).await;
+        assert_eq!(catalog[0]["scale"], 0.0);
+        assert_eq!(catalog[1]["scale"], 0.0);
+        let (status, body) = call(
+            router.clone(),
+            "POST",
+            "/lora-adapters",
+            json!([{"id":1,"scale":1},{"id":1,"scale":0},{"id":0,"scale":null}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) =
+            call(router.clone(), "POST", "/lora-adapters", json!([{"id":1}])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(
+            router.clone(),
+            "POST",
+            "/lora-adapters",
+            json!([{"id":1,"scale":17.0,"path":"/not-opened/display-only.json"}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut request = generation();
+        request["lora"] = json!([]);
+        let (status, disabled) = call(router.clone(), "POST", "/completion", request).await;
+        assert_eq!(status, StatusCode::OK, "{disabled}");
+        assert_eq!(disabled["tokens"], baseline["tokens"]);
+        let (_, enabled) = call(router, "POST", "/completion", generation()).await;
+        assert_eq!(enabled["tokens"], json!([4, 4]));
+    }
+    #[tokio::test]
+    async fn chat_and_openai_completion_use_the_same_adapter_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let router = app(state(root.path(), true));
+        let (status, result) = call(
+            router.clone(),
+            "POST",
+            "/v1/completions",
+            json!({"prompt":"hello","max_tokens":2,"temperature":0,"lora":[{"id":0,"scale":1}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert!(
+            result["choices"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("world"),
+            "{result}"
+        );
+        let (status,result)=call(router.clone(),"POST","/v1/chat/completions",json!({"messages":[{"role":"user","content":"world"}],"max_tokens":2,"temperature":0,"lora":[{"id":1,"scale":1}]})).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert!(
+            result["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("hello"),
+            "{result}"
+        );
+        let (status,result)=call(router.clone(),"POST","/v1/responses",json!({"input":"world","max_output_tokens":2,"temperature":0,"lora":[{"id":1,"scale":1}]})).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert!(
+            result["output"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("hello"),
+            "{result}"
+        );
+        let (status,result)=call(router,"POST","/v1/messages",json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":2,"temperature":0,"lora":[{"id":0,"scale":1}]})).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("world"),
+            "{result}"
+        );
+    }
+    #[tokio::test]
+    async fn absent_adapter_service_is_an_empty_catalog_and_rejects_nonempty_requests() {
+        let router = app(tiny_state());
+        assert_eq!(
+            call(router.clone(), "GET", "/lora-adapters", Value::Null).await,
+            (StatusCode::OK, json!([]))
+        );
+        assert_eq!(
+            call(router.clone(), "POST", "/lora-adapters", json!([])).await,
+            (StatusCode::OK, json!({"success":true}))
+        );
+        for path in ["/lora-adapters", "/completion"] {
+            let body = if path == "/lora-adapters" {
+                json!([{"id":0,"scale":1}])
+            } else {
+                let mut value = generation();
+                value["lora"] = json!([{"id":0,"scale":1}]);
+                value
+            };
+            let (status, error) = call(router.clone(), "POST", path, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("adapter")
+            );
+        }
+    }
+    #[tokio::test]
+    async fn admitted_generation_keeps_its_defaults_when_global_scale_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path(), true);
+        let driver = state
+            .registry
+            .lookup_loaded("")
+            .unwrap()
+            .unwrap()
+            .engine
+            .clone();
+        let router = app(state);
+        call(
+            router.clone(),
+            "POST",
+            "/lora-adapters",
+            json!([{"id":1,"scale":1}]),
+        )
+        .await;
+        let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        driver
+            .workers
+            .primary_sender()
+            .unwrap()
+            .send(DriverCommand::Block {
+                entered,
+                release: release_rx,
+            })
+            .await
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let initial = driver.generation_capacity.available_permits();
+        let task = tokio::spawn(call(router.clone(), "POST", "/completion", generation()));
+        timeout(Duration::from_secs(5), async {
+            while driver.generation_capacity.available_permits() == initial {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (status, result) = call(
+            router.clone(),
+            "POST",
+            "/lora-adapters",
+            json!([{"id":0,"scale":1}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        release.send(()).unwrap();
+        let (status, result) = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["tokens"], json!([4, 4]));
+        let (status, result) = call(router, "POST", "/completion", generation()).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["tokens"], json!([5, 5]));
+    }
+    #[tokio::test]
+    async fn catalogs_and_defaults_are_bound_to_the_selected_model() {
+        let root = tempfile::tempdir().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        for name in ["a", "b"] {
+            fixture::build(&root.path().join(name), &fixtures).unwrap();
+        }
+        let state = AppState::load_from_specs(
+            ["a", "b"]
+                .into_iter()
+                .map(|name| ModelSpec {
+                    id: name.into(),
+                    path: root.path().join(name),
+                    eager: name == "a",
+                    warmup: false,
+                })
+                .collect(),
+            ServerConfig {
+                lora_init_without_apply: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let router = app(state);
+        let (status, _) = call(
+            router.clone(),
+            "GET",
+            "/lora-adapters?model=b&autoload=false",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, result) = call(
+            router.clone(),
+            "POST",
+            "/lora-adapters?model=a",
+            json!([{"id":1,"scale":1}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        let (status, catalog) =
+            call(router.clone(), "GET", "/lora-adapters?model=b", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{catalog}");
+        assert_eq!(catalog[0]["scale"], 0.0);
+        assert_eq!(catalog[1]["scale"], 0.0);
+        let (_, a) = call(
+            router,
+            "GET",
+            "/lora-adapters?model=a&autoload=false",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(a[1]["scale"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn replayed_chat_session_switches_composition_without_reusing_old_tensors() {
+        let root = tempfile::tempdir().unwrap();
+        let router = app(state(root.path(), true));
+        let (status, session) = call(router.clone(), "POST", "/v1/sessions", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        for (id, word) in [(1, "hello"), (0, "world")] {
+            let body = json!({"messages":[{"role":"user","content":"quick"}],"max_tokens":2,"temperature":0,"lora":[{"id":id,"scale":1}]});
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("X-Session-Id", session["id"].as_str().unwrap())
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(
+                body["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains(word),
+                "{body}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn failed_model_owner_cannot_accept_default_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path(), true);
+        let driver = state
+            .registry
+            .lookup_loaded("")
+            .unwrap()
+            .unwrap()
+            .engine
+            .clone();
+        driver
+            .workers
+            .primary_sender()
+            .unwrap()
+            .send(DriverCommand::Panic)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while driver.workers.primary_sender().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (status, error) = call(
+            app(state),
+            "POST",
+            "/lora-adapters",
+            json!([{"id":1,"scale":1}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reload the model")
+        );
+    }
+}

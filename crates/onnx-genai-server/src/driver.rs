@@ -38,6 +38,7 @@ pub(crate) struct EngineDriver {
     /// The worker threads that own the engine. Exactly one today; every command
     /// names the worker it must reach rather than assuming there is only one.
     pub(crate) workers: WorkerPool,
+    pub(crate) adapters: Option<Arc<crate::lora::LoraState>>,
     pub(crate) native_slot: Option<Arc<crate::slots::NativeSlot>>,
     /// Which model this engine was loaded as, bound once by
     /// [`ModelHandle::new`](crate::registry::ModelHandle::new).
@@ -431,6 +432,7 @@ struct EngineWorkerState<DropProbe> {
 }
 
 struct EngineWorkerReady {
+    adapters: Option<Arc<crate::lora::LoraState>>,
     native_slot: Option<Arc<crate::slots::NativeSlot>>,
     batching: Arc<BatchingReport>,
     kv_telemetry: Arc<KvTelemetry>,
@@ -451,6 +453,10 @@ fn prepare_engine_worker<DropProbe>(
     drop_probe: DropProbe,
     worker_count: usize,
 ) -> anyhow::Result<(EngineWorkerState<DropProbe>, EngineWorkerReady)> {
+    let adapters = engine
+        .adapter_service()
+        .map(|contract| crate::lora::LoraState::new(contract, engine.supports_adapter_sessions()))
+        .transpose()?;
     let reranking =
         onnx_genai_metadata::task_profiles::reranking_contract(engine.metadata())?.map(Arc::new);
     let batching = Arc::new(BatchingReport::from_capability(
@@ -481,6 +487,7 @@ fn prepare_engine_worker<DropProbe>(
     #[cfg(not(feature = "native-backend"))]
     let native_slot = None;
     let ready = EngineWorkerReady {
+        adapters,
         native_slot: native_slot.clone(),
         batching,
         kv_telemetry,
@@ -719,6 +726,7 @@ impl EngineDriver {
                 // knows the id this engine was loaded as.
                 model: ModelKey::new(""),
                 workers,
+                adapters: first_ready.adapters,
                 native_slot: first_ready.native_slot,
                 generation_capacity,
                 generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
@@ -1043,10 +1051,13 @@ impl EngineDriver {
     pub(crate) async fn generate(
         &self,
         session: Option<SessionLeaseGuard>,
-        request: GenerateRequest,
+        mut request: GenerateRequest,
         tool_call_policy: ToolCallPolicy,
         input: Option<MultimodalInput>,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
+        self.apply_adapter_defaults(&mut request).map_err(|error| {
+            GenerateSubmitError::Failed(DriverFailure::from_engine_error(&error))
+        })?;
         // A session-bound generation goes to the worker holding its KV state;
         // a stateless one goes to the worker that serves unbound work.
         debug_assert!(
@@ -1110,7 +1121,17 @@ impl EngineDriver {
 
     /// Run a small generation while blocking the calling thread. Used only by
     /// startup and the administrative warmup path, never request generation.
-    pub(crate) fn warmup(&self, request: GenerateRequest) -> anyhow::Result<()> {
+    fn apply_adapter_defaults(&self, request: &mut GenerateRequest) -> anyhow::Result<()> {
+        if request.options.adapter_selection.is_none()
+            && let Some(adapters) = &self.adapters
+        {
+            request.options.adapter_selection = Some(adapters.selection(None)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn warmup(&self, mut request: GenerateRequest) -> anyhow::Result<()> {
+        self.apply_adapter_defaults(&mut request)?;
         let (worker, turn) = self
             .workers
             .reserve_stateless_turn()
@@ -3275,6 +3296,7 @@ mod admission_tests {
             .try_send(DriverCommand::ResourceSnapshot(reply))
             .expect("fill command queue");
         let driver = EngineDriver {
+            adapters: None,
             native_slot: None,
             reranking: None,
             runtime_sampling: false,
@@ -3634,6 +3656,7 @@ mod admission_tests {
     async fn a_session_on_an_unknown_worker_is_refused() {
         let (commands, _rx) = mpsc::channel(1);
         let driver = EngineDriver {
+            adapters: None,
             native_slot: None,
             reranking: None,
             runtime_sampling: false,
@@ -3689,6 +3712,7 @@ mod admission_tests {
     async fn a_turn_that_never_reaches_a_worker_releases_its_lease() {
         let (commands, rx) = mpsc::channel(1);
         let driver = EngineDriver {
+            adapters: None,
             native_slot: None,
             reranking: None,
             runtime_sampling: false,

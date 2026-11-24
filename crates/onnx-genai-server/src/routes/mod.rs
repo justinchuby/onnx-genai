@@ -51,6 +51,7 @@ mod admin;
 mod completions;
 mod images;
 pub(crate) mod llama;
+pub(crate) mod lora;
 mod multimodal;
 pub(crate) mod native;
 pub(crate) mod prompt;

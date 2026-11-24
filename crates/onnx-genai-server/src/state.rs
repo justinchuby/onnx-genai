@@ -493,6 +493,8 @@ pub struct ServerConfig {
     /// These endpoints load and unload models at runtime and should only be exposed
     /// on loopback-bound instances or behind an authenticated reverse proxy.
     pub enable_admin_endpoints: bool,
+    /// Start declared adapters disabled instead of applying all at scale 1.
+    pub lora_init_without_apply: bool,
     /// Operator directory enabling llama.cpp slot state actions.
     pub slot_save_path: Option<std::path::PathBuf>,
     pub slot_save_max_file_bytes: std::num::NonZeroU64,
@@ -534,6 +536,7 @@ impl Default for ServerConfig {
             max_batch: None,
             enable_debug_endpoints: false,
             enable_admin_endpoints: false,
+            lora_init_without_apply: false,
             slot_save_path: None,
             slot_save_max_file_bytes: std::num::NonZeroU64::new(4 * 1024 * 1024 * 1024)
                 .expect("positive slot file bound"),
@@ -964,6 +967,9 @@ pub(crate) fn build_handle_with_authorities(
             config.max_queue_depth,
         )?
     };
+    if let Some(adapters) = &engine_driver.adapters {
+        adapters.initialize(config.lora_init_without_apply)?;
+    }
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
         engine: engine_driver,
@@ -1058,6 +1064,9 @@ fn build_pipeline_handle(
         requested_max_batch,
         config.max_queue_depth,
     )?;
+    if let Some(adapters) = &engine_driver.adapters {
+        adapters.initialize(config.lora_init_without_apply)?;
+    }
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
         engine: engine_driver,

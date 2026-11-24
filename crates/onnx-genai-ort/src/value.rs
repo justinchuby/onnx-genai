@@ -251,6 +251,8 @@ pub struct Value {
     shape: Vec<i64>,
     dtype: DataType,
     backing: TensorBacking,
+    // Released after the runtime view and backing allocation.
+    retained_owner: Option<Arc<dyn core::any::Any + Send + Sync>>,
 }
 
 struct OrtValueHandle {
@@ -276,6 +278,18 @@ impl Drop for OrtValueHandle {
 }
 
 impl Value {
+    /// Attach an allocation/resource owner to a tensor and every no-copy view.
+    /// The returned value shares its original backing; ordinary tensors pay no
+    /// allocation cost until an owner is attached. No runtime is initialized.
+    pub fn with_owner(mut self, owner: Arc<dyn core::any::Any + Send + Sync>) -> Result<Self> {
+        self.retained_owner = Some(match self.retained_owner.take() {
+            Some(previous) => Arc::new((previous, owner)),
+            None => owner,
+        });
+        let shape = self.shape.clone();
+        Self::into_alias_with_shape(self, &shape)
+    }
+
     /// Create a tensor value with given shape and type.
     ///
     /// Owns zero-initialized CPU storage without opening a runtime. Use
@@ -329,6 +343,7 @@ impl Value {
             )
         })?;
         Ok(Self {
+            retained_owner: None,
             ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype,
@@ -457,6 +472,7 @@ impl Value {
         let host_accessible = memory_info.is_host_accessible();
 
         Ok(Self {
+            retained_owner: None,
             ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype,
@@ -542,6 +558,7 @@ impl Value {
     pub fn from_vec_f32(data: Vec<f32>, shape: &[i64]) -> Result<Self> {
         validate_shape(shape, Some(data.len()))?;
         Ok(Self {
+            retained_owner: None,
             ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype: DataType::Float32,
@@ -553,6 +570,7 @@ impl Value {
     pub fn from_vec_f16_bits(data: Vec<u16>, shape: &[i64]) -> Result<Self> {
         validate_shape(shape, Some(data.len()))?;
         Ok(Self {
+            retained_owner: None,
             ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype: DataType::Float16,
@@ -564,6 +582,7 @@ impl Value {
     pub fn from_vec_bf16_bits(data: Vec<u16>, shape: &[i64]) -> Result<Self> {
         validate_shape(shape, Some(data.len()))?;
         Ok(Self {
+            retained_owner: None,
             ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype: DataType::BFloat16,
@@ -575,6 +594,7 @@ impl Value {
     pub fn from_vec_i64(data: Vec<i64>, shape: &[i64]) -> Result<Self> {
         validate_shape(shape, Some(data.len()))?;
         Ok(Self {
+            retained_owner: None,
             ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype: DataType::Int64,
@@ -607,6 +627,7 @@ impl Value {
         // tensor's data pointer is aligned for `dtype`.
         let data = ElementBytes::new(data);
         Ok(Self {
+            retained_owner: None,
             ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype,
@@ -1732,6 +1753,7 @@ impl Value {
             )));
         }
         Ok(Self {
+            retained_owner: None,
             ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype: owner.dtype,
@@ -1853,6 +1875,7 @@ impl Value {
             return Err(OrtError::InvalidArgument("external alias requires externally owned tensor storage; retain the original external owner".into()));
         };
         Ok(Self {
+            retained_owner: None,
             ort_view: Mutex::new(None),
             shape: self.shape.clone(),
             dtype: self.dtype,
@@ -1870,6 +1893,7 @@ impl Value {
         let (shape, dtype) = tensor_shape_and_type(handle.ptr.as_ptr())?;
         validate_shape(&shape, None)?;
         Ok(Self {
+            retained_owner: None,
             ort_view: Mutex::new(None),
             shape,
             dtype,
@@ -3254,6 +3278,32 @@ mod alias_offset_tests {
 #[cfg(test)]
 mod neutral_storage_tests {
     use super::*;
+    #[test]
+    fn resource_owners_follow_nested_views_without_copying_storage() -> Result<()> {
+        struct Owner(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let value = Value::from_vec_f32(vec![1.0, 2.0], &[2])?;
+        let pointer = value.data_ptr_addr()?;
+        let value = value
+            .with_owner(Arc::new(Owner(Arc::clone(&dropped))))?
+            .with_owner(Arc::new(Owner(Arc::clone(&dropped))))?;
+        let alias = value
+            .try_alias_clone()
+            .expect("resource-owned values are shared views")?;
+        drop(value);
+        assert_eq!(alias.data_ptr_addr()?, pointer);
+        assert_eq!(alias.to_vec_f32()?, vec![1.0, 2.0]);
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(alias);
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 2);
+        Ok(())
+    }
+
     #[test]
     // The production alias API shares allocation owners through Arc; these
     // handles stay on this process's test thread, including cached ORT views.

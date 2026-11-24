@@ -236,6 +236,13 @@ impl Engine {
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.require_workflow_execution_admitted()?;
+        self.validate_adapter_request(&request.request.options)?;
+        anyhow::ensure!(
+            request.session_id.is_none()
+                || self.adapter_service().is_none()
+                || self.workflow.supports_adapter_sessions(),
+            "adapter requests cannot reuse session-scoped tensors beyond replayed token history; send the full conversation as a stateless request"
+        );
         // Fail closed on the exact declared protocol before scheduler
         // admission, workflow session binding, or specialized driver state.
         let _ = self.tool_call_observer(&request.tool_call_policy, &request.request.options)?;

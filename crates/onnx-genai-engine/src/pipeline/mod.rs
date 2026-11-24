@@ -1109,6 +1109,11 @@ impl WorkflowRuntime {
             None
         };
         let ort_environment = models.environment_handle();
+        let worker = runtime_state::WorkerRuntimeState::default();
+        if directory.adapters.is_some() {
+            *worker.adapter_cache.borrow_mut() =
+                adapters::AdapterCache::new(std::rc::Rc::new(resource_governor.memory().clone()));
+        }
         Ok((
             Self {
                 plan: Arc::new(runtime_state::WorkflowPlan {
@@ -1125,7 +1130,7 @@ impl WorkflowRuntime {
                     preprocessing: directory.preprocessing,
                     speculative,
                 }),
-                worker: runtime_state::WorkerRuntimeState::default(),
+                worker,
                 backend: runtime_state::WorkerBackend::new(
                     models,
                     execution_islands,
@@ -1749,6 +1754,11 @@ impl WorkflowRuntime {
 
     pub fn adapter_lifecycle_diagnostic(&self) -> AdapterLifecycleDiagnostic {
         self.worker.adapter_cache.borrow().diagnostic()
+    }
+
+    /// Adapter contract admitted by this workflow's executor.
+    pub fn adapter_service(&self) -> Option<&onnx_genai_metadata::AdapterServiceContract> {
+        self.plan.adapter_service.as_ref()
     }
 
     pub fn run_pipeline(

@@ -2159,6 +2159,7 @@ impl Engine {
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.require_workflow_execution_admitted()?;
+        self.validate_adapter_request(&request.options)?;
         // Resolve the exact protocol and request policy before a cold path can
         // allocate its short-lived session or admit scheduler state.
         let _ = self.tool_call_observer(&tool_call_policy, &request.options)?;
@@ -2406,6 +2407,11 @@ impl Engine {
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.require_workflow_execution_admitted()?;
+        self.validate_adapter_request(&request.options)?;
+        anyhow::ensure!(
+            self.adapter_service().is_none() || self.workflow.supports_adapter_sessions(),
+            "adapter requests cannot reuse session-scoped tensors beyond replayed token history; send the full conversation as a stateless request"
+        );
         // A package with no decode core keeps its conversation in the
         // session-scoped cells its workflow declares. Routing here rather than
         // in one of the wrappers above is what makes every `generate_in_session`
@@ -3118,6 +3124,30 @@ impl Engine {
                     .collect::<anyhow::Result<Vec<_>>>()
             })
             .transpose()
+    }
+
+    /// Adapter service actually admitted by the workflow executor.
+    pub fn adapter_service(&self) -> Option<&onnx_genai_metadata::AdapterServiceContract> {
+        if self.holds_decode_core() {
+            None
+        } else {
+            self.workflow.adapter_service()
+        }
+    }
+
+    /// Whether named adapter requests can reconstruct every dependent tensor.
+    pub fn supports_adapter_sessions(&self) -> bool {
+        self.adapter_service().is_none() || self.workflow.supports_adapter_sessions()
+    }
+
+    pub(super) fn validate_adapter_request(&self, options: &GenerateOptions) -> anyhow::Result<()> {
+        if let Some(selection) = &options.adapter_selection {
+            anyhow::ensure!(
+                self.adapter_service().is_some() || selection.rows.iter().all(Vec::is_empty),
+                "this executor has no admitted adapter service; select a package with an adapter-aware workflow or omit adapter_selection"
+            );
+        }
+        Ok(())
     }
 
     /// Get the loaded metadata.
