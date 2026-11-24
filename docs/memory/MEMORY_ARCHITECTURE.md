@@ -1402,6 +1402,35 @@ existing replay/drop/host-allocation/preparation-counter assertions. The timing
 fixture now registers the same real caller workspace pin as other capture users.
 These fixtures are compiled; execution and performance require CUDA hardware.
 
+### Cold CUDA resource preparation rejects real stream capture
+
+A module-cache or raw-allocation-pool miss is a preparation boundary. The
+runtime enters the existing process-wide synchronizing section, then directly
+queries its compute stream's actual capture status before compiling/loading a regular
+or raw NVRTC module, or issuing a fresh `cuMemAlloc`. A live capture returns an
+actionable error before compilation, fallback selection, cache publication,
+pool draining or allocation accounting. Prepare the complete resource set
+before capture; rejection leaves the cold entry available for eager retry.
+
+The query does not take the graph lifecycle mutex: capture begin holds that
+mutex while waiting for synchronizers, so taking it inside the process gate
+would invert the lock order. The fixture checks that cold misses acquire no
+lifecycle lock and that the driver still reports ACTIVE (not INVALIDATED).
+
+The process gate excludes registered captures on other threads, but is
+reentrant on the capture thread and cannot discover an external raw capture.
+The driver query closes the same-compute-stream gap; it does not discover
+external capture on unrelated streams or contexts. Cache and pool hits return
+before this query and acquire no new gate, quota or per-region protocol.
+Existing ownership and lifetime requirements on reused addresses still apply.
+No free/retirement behavior changes here.
+
+A GPU-only unit fixture covers both registered and directly started captures,
+all three cold misses, unchanged module/fallback/allocation/transfer/sync state,
+warm module/pool reuse, intact capture and eager retry. It is compiled and
+listed on the Host, not executed without a CUDA device. Added cold query cost
+is unmeasured; warm-path source structure remains unchanged.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current

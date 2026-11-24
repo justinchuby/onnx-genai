@@ -2580,7 +2580,10 @@ impl CudaRuntime {
             if let Some(m) = cache.get(module_key) {
                 m.clone()
             } else {
-                let include_paths = nvrtc_include_paths();
+                // Cache hits above do not query capture status. A cold load must
+                // reject real capture before compilation or context mutation.
+                // The process gate protects other registered captures; it is
+                // not evidence that this stream is eager.
                 // Loading a module into the context synchronizes the device,
                 // invalidating a CUDA graph capture in progress on another
                 // thread. Held across the whole compile-and-load block: the
@@ -2588,6 +2591,10 @@ impl CudaRuntime {
                 // add a second gate acquisition for no benefit. See
                 // `alloc_raw`.
                 let _section = capture_gate::synchronizing_section();
+                self.require_eager_resource_preparation(format_args!(
+                    "NVRTC module '{module_key}'"
+                ))?;
+                let include_paths = nvrtc_include_paths();
                 let m = if self.nvrtc_cubin_fallback.load(Ordering::Relaxed) {
                     self.load_nvrtc_cubin(module_key, src, &include_paths)?
                 } else {
@@ -2639,8 +2646,11 @@ impl CudaRuntime {
             if let Some(module) = cache.get(module_key) {
                 module.clone()
             } else {
-                let include_paths = nvrtc_include_paths();
                 let _section = capture_gate::synchronizing_section();
+                self.require_eager_resource_preparation(format_args!(
+                    "raw NVRTC module '{module_key}'"
+                ))?;
+                let include_paths = nvrtc_include_paths();
                 let module = if self.nvrtc_cubin_fallback.load(Ordering::Relaxed) {
                     let image = self.nvrtc_cubin_image(module_key, src, &include_paths)?;
                     self.load_raw_module(module_key, image.as_ptr().cast())?
@@ -2976,6 +2986,28 @@ impl CudaRuntime {
             != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
     }
 
+    /// Cold resource misses must fail before any device mutation. The process
+    /// gate excludes other registered captures but is reentrant on their own
+    /// thread and cannot observe externally started capture on this stream.
+    /// Call only after a cache/pool miss so warm reuse adds no driver query.
+    fn require_eager_resource_preparation(&self, resource: impl std::fmt::Display) -> Result<()> {
+        // Never enter the graph lifecycle mutex while holding the process
+        // gate: begin() holds that mutex while waiting for the gate's readers.
+        let status = self.stream.capture_status().map_err(|error| {
+            driver_err(
+                &format!("query CUDA capture before preparing {resource}"),
+                error,
+            )
+        })?;
+        if status != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: cannot prepare {resource} during CUDA graph capture; \
+                 prepare and warm the complete resource set before beginning capture"
+            )));
+        }
+        Ok(())
+    }
+
     /// Require the real owner on a path already confirmed to be capturing.
     /// An external stream capture has no tracked flags, but still cannot embed
     /// private addresses without a registered ownership sink.
@@ -3111,6 +3143,9 @@ impl CudaRuntime {
         // running on another thread. Pool hits returned above take no lock, so
         // decode's steady state stays entirely off the gate.
         let _section = capture_gate::synchronizing_section();
+        self.require_eager_resource_preparation(format_args!(
+            "device allocation of {requested} bytes (pool class {class})"
+        ))?;
         // SAFETY: `malloc_sync` returns a fresh device allocation on the current
         // (bound) context; we own it and free it exactly once via `free_raw`.
         let mut allocated = unsafe { cudarc::driver::result::malloc_sync(class) };
@@ -4993,5 +5028,104 @@ mod validation_completion_tests {
             completed_validation_slot(&slot, DeviceValidationToken::new(owner, 2048)).unwrap(),
             Some(2048 ^ 0x1234)
         );
+    }
+}
+
+#[cfg(all(test, feature = "gpu-tests"))]
+mod cold_resource_capture_tests {
+    use super::*;
+
+    #[test]
+    fn cold_resource_misses_reject_real_capture_without_publishing_or_allocating() {
+        const SOURCE: &str = r#"extern "C" __global__ void no_op() {}"#;
+        for registered in [false, true] {
+            let runtime = CudaRuntime::new(0).expect("CUDA device required with gpu-tests");
+            runtime
+                .nvrtc_function("preflight_warm", SOURCE, "no_op")
+                .unwrap();
+            runtime
+                .nvrtc_raw_function("preflight_warm_raw", SOURCE, "no_op")
+                .unwrap();
+            // The warm pool route is deliberately retained: this check guards
+            // new driver allocation, not a new quota protocol around reuse.
+            let pooled = runtime.alloc_raw(256).unwrap();
+            unsafe { runtime.free_raw(pooled) }.unwrap();
+            assert!(
+                runtime.raw_pool_retained_bytes() > 0,
+                "fixture requires the default nonzero raw pool"
+            );
+            let allocations = runtime.allocation_counts();
+            let transfers = runtime.transfer_counts();
+            let syncs = runtime.forced_synchronization_count();
+            let modules = runtime.modules.lock().unwrap().len();
+            let raw_modules = runtime.raw_modules.lock().unwrap().len();
+            let fallback = runtime.nvrtc_cubin_fallback.load(Ordering::Relaxed);
+            if registered {
+                runtime.begin_graph_capture(&[]).unwrap();
+            } else {
+                runtime.stream.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).unwrap();
+            }
+            let lifecycle_locks = runtime.graph.lock_acquisition_count();
+            let regular = runtime
+                .nvrtc_function("preflight_cold", SOURCE, "no_op")
+                .expect_err("cold regular module must reject capture");
+            let raw = runtime
+                .nvrtc_raw_function("preflight_cold_raw", SOURCE, "no_op")
+                .err()
+                .expect("cold raw module must reject capture");
+            let allocation = runtime.alloc_raw(16 << 20).unwrap_err();
+            for (failure, resource) in [
+                (regular, "NVRTC module 'preflight_cold'"),
+                (raw, "raw NVRTC module 'preflight_cold_raw'"),
+                (allocation, "device allocation of 16777216 bytes"),
+            ] {
+                let message = failure.to_string();
+                assert!(
+                    message.contains(resource)
+                        && message.contains("during CUDA graph capture")
+                        && message.contains("before beginning capture"),
+                    "{message}"
+                );
+            }
+            assert_eq!(runtime.graph.lock_acquisition_count(), lifecycle_locks);
+            assert_eq!(runtime.modules.lock().unwrap().len(), modules);
+            assert_eq!(runtime.raw_modules.lock().unwrap().len(), raw_modules);
+            assert_eq!(
+                runtime.nvrtc_cubin_fallback.load(Ordering::Relaxed),
+                fallback
+            );
+            runtime
+                .nvrtc_function("preflight_warm", SOURCE, "no_op")
+                .unwrap();
+            runtime
+                .nvrtc_raw_function("preflight_warm_raw", SOURCE, "no_op")
+                .unwrap();
+            let reused = runtime.alloc_raw(256).unwrap();
+            assert_eq!(reused, pooled);
+            assert_eq!(
+                runtime.stream.capture_status().unwrap(),
+                cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE,
+                "rejection must not invalidate capture"
+            );
+            assert_eq!(runtime.allocation_counts(), allocations);
+            assert_eq!(runtime.transfer_counts(), transfers);
+            assert_eq!(runtime.forced_synchronization_count(), syncs);
+            if registered {
+                runtime.abort_graph_capture().unwrap();
+            } else {
+                runtime.test_end_unregistered_graph_capture().unwrap();
+            }
+            unsafe { runtime.free_raw(reused) }.unwrap();
+            // A rejected miss leaves no poisoned entry: eager re-preparation
+            // can publish both kinds of module and perform the allocation.
+            runtime
+                .nvrtc_function("preflight_cold", SOURCE, "no_op")
+                .unwrap();
+            runtime
+                .nvrtc_raw_function("preflight_cold_raw", SOURCE, "no_op")
+                .unwrap();
+            let fresh = runtime.alloc_raw(16 << 20).unwrap();
+            unsafe { runtime.free_raw(fresh) }.unwrap();
+        }
     }
 }
