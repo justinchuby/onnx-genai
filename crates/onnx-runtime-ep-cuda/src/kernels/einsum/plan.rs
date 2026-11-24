@@ -366,17 +366,29 @@ pub(super) struct CudaEinsumPlan {
     metadata_bytes: usize,
 }
 
-impl CudaEinsumPlan {
+pub(super) struct CudaEinsumRecipe {
+    semantic: Arc<EinsumShapePlan>,
+    signature: ArithmeticExecutionSignature,
+    requested: RequestedRoute,
+    memory_ceiling_bytes: u128,
+    dtype: DataType,
+    arithmetic: Arithmetic,
+    route: CudaEinsumRoute,
+    planner_quality: Option<EinsumPlannerQuality>,
+    workspace_layout: WorkspaceLayout,
+    step_specs: Vec<StepSpec>,
+}
+
+impl CudaEinsumRecipe {
     pub(super) fn build(
-        semantic: &EinsumShapePlan,
+        semantic_owner: Arc<EinsumShapePlan>,
         signature: ArithmeticExecutionSignature,
-        runtime: &Arc<CudaRuntime>,
         requested: RequestedRoute,
         memory_ceiling_bytes: u128,
     ) -> Result<Self> {
+        let semantic = semantic_owner.as_ref();
         let dtype = signature.inputs[0].dtype;
         let arithmetic = Arithmetic::for_dtype(dtype)?;
-        runtime.require_nvrtc_half_headers("Einsum")?;
         let precision =
             EinsumPrecisionPolicy::for_schema(semantic.schema(), dtype).ok_or_else(|| {
                 EpError::KernelFailed(format!(
@@ -447,6 +459,41 @@ impl CudaEinsumPlan {
                 )
             };
 
+        Ok(Self {
+            semantic: semantic_owner,
+            signature,
+            requested,
+            memory_ceiling_bytes,
+            dtype,
+            arithmetic,
+            route,
+            planner_quality,
+            workspace_layout,
+            step_specs,
+        })
+    }
+
+    /// Still uses existing private arithmetic/BLAS backing. A future canonical
+    /// bound-workspace refinement must supply real scratch addresses before
+    /// these ActualAddress algorithms and immutable metadata can be installed.
+    pub(super) fn bind_private_workspace(
+        self,
+        runtime: &Arc<CudaRuntime>,
+    ) -> Result<CudaEinsumPlan> {
+        let Self {
+            semantic: semantic_owner,
+            signature,
+            requested,
+            memory_ceiling_bytes,
+            dtype,
+            arithmetic,
+            route,
+            planner_quality,
+            workspace_layout,
+            step_specs,
+        } = self;
+        let semantic = semantic_owner.as_ref();
+        runtime.require_nvrtc_half_headers("Einsum")?;
         let workspace = if workspace_layout.bytes == 0 {
             None
         } else {
@@ -574,7 +621,7 @@ impl CudaEinsumPlan {
         };
         runtime.staged_warm_cache_mutation("Einsum algorithm/function selection")?;
 
-        Ok(Self {
+        Ok(CudaEinsumPlan {
             signature,
             requested,
             memory_ceiling_bytes,
@@ -597,7 +644,9 @@ impl CudaEinsumPlan {
             metadata_bytes,
         })
     }
+}
 
+impl CudaEinsumPlan {
     pub(super) fn matches(
         &self,
         requested: RequestedRoute,
@@ -1536,6 +1585,69 @@ fn encode_step(
 mod tests {
     use super::*;
     use onnx_runtime_ir::{EinsumInput, EinsumPlan};
+
+    fn recipe(requested: RequestedRoute, ceiling: u128) -> Result<CudaEinsumRecipe> {
+        // Pure address descriptions: building a recipe must not access a driver.
+        let shapes: &[&[usize]] = &[&[2, 3], &[3, 4], &[4, 5]];
+        let plan = EinsumShapePlan::build_for_schema(
+            "ab,bc,cd->ad",
+            shapes,
+            onnx_runtime_ir::EinsumSchema::resolve(12).unwrap(),
+        )
+        .unwrap();
+        let tensor = |shape: &[usize], pointer| ArithmeticTensorSignature {
+            device: DeviceId::cuda(0),
+            raw_base_pointer: pointer,
+            byte_offset: 0,
+            effective_pointer: pointer,
+            dtype: DataType::Float32,
+            shape: shape.to_vec(),
+            strides: compute_contiguous_strides(shape),
+        };
+        let signature = ArithmeticExecutionSignature {
+            inputs: shapes
+                .iter()
+                .enumerate()
+                .map(|(i, shape)| tensor(shape, (i as u64 + 1) * 0x1000))
+                .collect(),
+            output: tensor(&[2, 5], 0x4000),
+            alias_proof: super::super::ArithmeticAliasProof::OutputDisjointFromEveryInput,
+        };
+        CudaEinsumRecipe::build(Arc::new(plan), signature, requested, ceiling)
+    }
+
+    #[test]
+    fn host_recipe_selects_tree_and_aligned_live_slots_without_cuda() {
+        let recipe = recipe(RequestedRoute::Optimized, DEFAULT_MEMORY_CEILING_BYTES).unwrap();
+        assert_eq!(recipe.route, CudaEinsumRoute::OptimizedDp);
+        assert_eq!(recipe.step_specs.len(), 2);
+        assert!(!recipe.workspace_layout.values.is_empty());
+        assert!(recipe.workspace_layout.bytes > 0);
+        for offset in recipe.workspace_layout.values.values() {
+            assert_eq!(offset % WORKSPACE_ALIGNMENT, 0);
+            assert!(*offset < recipe.workspace_layout.bytes);
+        }
+    }
+
+    #[test]
+    fn host_recipe_ceiling_falls_back_only_for_auto() {
+        let generic = recipe(RequestedRoute::GenericNative, 0).unwrap();
+        assert_eq!(generic.route, CudaEinsumRoute::GenericNative);
+        assert_eq!(generic.workspace_layout.bytes, 0);
+        assert_eq!(generic.step_specs.len(), 1);
+        let auto = recipe(RequestedRoute::Auto, 0).unwrap();
+        assert_eq!(auto.route, CudaEinsumRoute::GenericNative);
+        assert_eq!(auto.workspace_layout.bytes, 0);
+        let error = recipe(RequestedRoute::Optimized, 0)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("0-byte workspace ceiling")
+                && error.contains("raise the explicit ceiling"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn generic_metadata_uses_the_canonical_physical_index_program() {

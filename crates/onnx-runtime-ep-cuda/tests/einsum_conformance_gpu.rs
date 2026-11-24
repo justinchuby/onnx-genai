@@ -14,7 +14,7 @@ use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut,
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
     CudaEinsumRoute, CudaExecutionProvider, EinsumRouteOverride, einsum_execution_stats,
-    execute_einsum_with_route, reset_einsum_execution_stats,
+    reset_einsum_execution_stats,
 };
 use onnx_runtime_ir::{Attribute, DataType, compute_contiguous_strides, static_shape};
 use onnx_runtime_loader::Model;
@@ -206,8 +206,9 @@ impl BackendAdapter for CudaAdapter<'_> {
                 ));
             }
         };
+        let caller = common::EinsumCallerLane::new(self.ep);
         let execute = |output: &mut onnx_runtime_ep_api::DeviceBuffer| {
-            execute_einsum_with_route(
+            caller.execute(
                 kernel.as_ref(),
                 &views,
                 &mut [TensorMut::new(
@@ -218,6 +219,7 @@ impl BackendAdapter for CudaAdapter<'_> {
                     self.ep.device_id(),
                 )],
                 override_route,
+                None,
             )
         };
 
@@ -237,7 +239,7 @@ impl BackendAdapter for CudaAdapter<'_> {
         let graph_before = self.ep.runtime().graph_execution_counts();
         self.ep
             .runtime()
-            .begin_graph_capture(&[kernel.as_ref()])
+            .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
             .map_err(adapter_error)?;
         execute(&mut output).map_err(adapter_error)?;
         self.ep

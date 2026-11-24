@@ -127,8 +127,8 @@ pub use kernels::csa_checkpoint::{
 pub use kernels::dsa_index_select::{DsaLaunchStats, dsa_launch_stats, reset_dsa_launch_stats};
 pub use kernels::einsum::{
     CudaEinsumRoute, EinsumExecutionStats, EinsumRouteOverride, einsum_execution_stats,
-    execute_einsum_with_route, execute_einsum_with_route_and_memory_ceiling,
-    reset_einsum_execution_stats,
+    einsum_workspace_requirement_for_route, execute_einsum_with_route,
+    execute_einsum_with_route_and_memory_ceiling, reset_einsum_execution_stats,
 };
 pub use kernels::gather::GATHER_CAPTURE_ERROR_INDEX;
 pub use kernels::gather_block_quantized::GATHER_BLOCK_QUANTIZED_CAPTURE_ERROR_INDEX;
