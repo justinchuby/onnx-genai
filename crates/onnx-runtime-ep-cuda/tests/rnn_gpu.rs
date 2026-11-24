@@ -65,6 +65,37 @@ fn rnn_bidirectional_lengths_and_clip() {
             } else {
                 float_input(dtype, shape, values)
             }
+
+            #[test]
+            #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+            fn rnn_zero_input_width_and_wide_hidden_state() {
+                let ep = require_cuda();
+                let dtype = DataType::Float32;
+                // Wider than one 128-thread block. The last row depends on column zero
+                // and the first row depends on the last column, across both timesteps.
+                let hidden = 129;
+                let mut r = vec![0.; hidden * hidden];
+                r[hidden - 1] = 1.;
+                r[(hidden - 1) * hidden] = 1.;
+                let mut bias = vec![0.; 2 * hidden];
+                bias[0] = 1.;
+                bias[2 * hidden - 1] = 2.;
+                let inputs = [
+                    float_input(dtype, &[2, 1, 0], &[]),
+                    float_input(dtype, &[1, hidden, 0], &[]),
+                    float_input(dtype, &[1, hidden, hidden], &r),
+                    float_input(dtype, &[1, 2 * hidden], &bias),
+                ];
+                let shapes = [(dtype, vec![2, 1, 1, hidden])];
+                let attrs = [("activations", Attribute::Strings(vec![b"Relu".to_vec()]))];
+                let mut expected = vec![0.; 2 * hidden];
+                expected[0] = 1.;
+                expected[hidden - 1] = 2.;
+                expected[hidden] = 3.;
+                expected[2 * hidden - 1] = 3.;
+                let output = run_cuda(&ep, "RNN", "", 29, &inputs, &shapes, &attrs);
+                assert_eq!(decode_floats(&output[0], dtype), expected);
+            }
         };
         let inputs = [
             float(&[2, 3, 1], &[1., 2., 100., 90., 91., 92.]),

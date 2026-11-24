@@ -2092,13 +2092,17 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sequence::CumSumFactory),
     );
-    for since in [14, 22] {
-        rec.register(
-            OpKey::new("RNN", "", since),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(rnn::Factory(since)),
-        );
-    }
+    rec.register_through(
+        OpKey::new("RNN", "", 14),
+        21,
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(rnn::Factory(14)),
+    );
+    rec.register(
+        OpKey::new("RNN", "", 22),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(rnn::Factory(22)),
+    );
     rec.register(
         OpKey::new("CumProd", "", 26),
         onnx_runtime_ep_api::WorkspacePlanning::None,
