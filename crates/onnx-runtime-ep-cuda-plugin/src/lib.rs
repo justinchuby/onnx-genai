@@ -264,6 +264,7 @@ mod cuda_impl {
                     - 1
             })
             .unwrap_or(i32::MAX)
+            .min(i32::try_from(descriptor.end_version).unwrap_or(i32::MAX))
     }
 
     /// Leak a string to get a `&'static str` (entries must live for the EP
@@ -276,6 +277,7 @@ mod cuda_impl {
         Box<dyn onnx_runtime_ep_api::provider::ExecutionProvider + Send>,
         *mut std::os::raw::c_void,
         Vec<KernelRegistryEntry>,
+        onnx_runtime_ep_plugin::factory::WorkspaceExecutionGuard,
     );
 
     /// Device support for the CUDA EP: GPU, stream-aware, device-only memory.
@@ -285,7 +287,7 @@ mod cuda_impl {
 
     /// Construct the CUDA EP and extract the native stream handle.
     ///
-    /// Returns `(ep, stream_handle, entries)` or an error if no GPU is
+    /// Returns `(ep, stream_handle, entries, preflight)` or an error if no GPU is
     /// available. The kernel-registry entries are derived from the constructed
     /// EP's real registry so the caller advertises each kernel under its true
     /// domain.
@@ -295,7 +297,16 @@ mod cuda_impl {
         })?;
         let stream_handle = ep.runtime().stream_ptr() as *mut std::os::raw::c_void;
         let entries = build_kernel_registry_entries(ep.runtime().clone());
-        Ok((Box::new(ep), stream_handle, entries))
+        let runtime = ep.runtime().clone();
+        let preflight: onnx_runtime_ep_plugin::factory::WorkspaceExecutionGuard =
+            std::sync::Arc::new(move || {
+                let capturing = runtime.is_capturing().map_err(|error| format!("cannot inspect the registered CUDA stream capture state: {error}; restore the CUDA context and recreate the session"))?;
+                if capturing {
+                    return Err("ORT external CUDA graph capture has no registered workspace ownership pins; end the capture and recreate the session in ordinary execution mode".into());
+                }
+                Ok(())
+            });
+        Ok((Box::new(ep), stream_handle, entries, preflight))
     }
 
     #[cfg(test)]
@@ -311,13 +322,14 @@ mod cuda_impl {
                 op_type: op_type.into(),
                 domain: domain.into(),
                 since_version,
+                end_version: u64::MAX,
                 supported_dtypes: &[],
             }
         }
 
         #[test]
         fn advertised_schema_ranges_end_before_the_next_registered_version() {
-            let descriptors = vec![
+            let mut descriptors = vec![
                 descriptor("DsaIndexSelect", "pkg.nxrt", 1),
                 descriptor("DsaIndexSelect", "pkg.nxrt", 3),
                 descriptor("Other", "pkg.nxrt", 1),
@@ -326,6 +338,8 @@ mod cuda_impl {
             assert_eq!(schema_end_version(&descriptors, 0), 2);
             assert_eq!(schema_end_version(&descriptors, 1), i32::MAX);
             assert_eq!(schema_end_version(&descriptors, 2), i32::MAX);
+            descriptors[1].end_version = 28;
+            assert_eq!(schema_end_version(&descriptors, 1), 28);
         }
     }
 }
@@ -389,19 +403,20 @@ pub unsafe extern "C" fn CreateEpFactories(
         {
             // Attempt to construct the CUDA EP. If no GPU is available, fail
             // closed with an actionable error.
-            let (ep, stream_handle, entries) = match cuda_impl::construct_ep_with_stream() {
-                Ok(tuple) => tuple,
-                Err(msg) => {
-                    unsafe {
-                        if !out_num_raw.is_null() {
-                            *out_num_raw = 0;
+            let (ep, stream_handle, entries, preflight) =
+                match cuda_impl::construct_ep_with_stream() {
+                    Ok(tuple) => tuple,
+                    Err(msg) => {
+                        unsafe {
+                            if !out_num_raw.is_null() {
+                                *out_num_raw = 0;
+                            }
                         }
+                        return onnx_runtime_ep_plugin::panic_to_fail_status(&format!(
+                            "onnx-runtime-ep-cuda-plugin: {msg}. Zero factories returned."
+                        ));
                     }
-                    return onnx_runtime_ep_plugin::panic_to_fail_status(&format!(
-                        "onnx-runtime-ep-cuda-plugin: {msg}. Zero factories returned."
-                    ));
-                }
-            };
+                };
 
             let ep_name = ep.name().to_string();
             let support = cuda_impl::device_support();
@@ -441,6 +456,19 @@ pub unsafe extern "C" fn CreateEpFactories(
                     }
                     return domain_status;
                 }
+                // SAFETY: kernels, NVRTC, cuBLAS and cuDNN use this provider's
+                // fixed runtime compute stream. Transfers using another stream
+                // establish dependencies before compute consumes their bytes.
+                // No host workspace writes outlive a call; replacement and
+                // release retain the provider's cross-stream settlement fences.
+                // Compute errors retire the lane. This does not grant external
+                // graph capture any workspace pin or bypass capture validation.
+                return unsafe {
+                    onnx_runtime_ep_plugin::factory::register_ordered_workspace_execution(
+                        factory,
+                        Some(preflight),
+                    )
+                };
             }
             status
         }

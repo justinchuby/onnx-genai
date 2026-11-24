@@ -89,7 +89,11 @@ impl Kernel for IfKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         let Some(captured) = inputs.get(1).filter(|input| {
             input.present && input.dtype == DataType::Float32 && input.shape.len() == 1
         }) else {

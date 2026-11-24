@@ -328,6 +328,29 @@ impl Executor {
         Ok(())
     }
 
+    /// Capture is cold: pin each actual owned lane once per segment. Inherited
+    /// raw views cannot manufacture an independent capture ownership capability.
+    pub(super) fn workspace_capture_resources(
+        &self,
+    ) -> Result<Vec<onnx_runtime_ep_api::DeviceGraphResource>> {
+        if self.inherited_workspace.has_any() {
+            return Err(EpError::KernelFailed(
+                "independent capture cannot pin inherited raw workspace views; capture through the parent executor that owns their backing".into()
+            ).into());
+        }
+        [&self.persistent_workspace, &self.step_workspace]
+            .into_iter()
+            .flatten()
+            .filter(|prepared| !prepared.buffer.is_empty())
+            .map(|prepared| {
+                prepared.buffer.device_graph_resource()?.ok_or_else(|| EpError::KernelFailed(
+                    "device graph capture requires binding-owned workspace; allocate the lane through a provider that supplies generation-checked ownership before capture".into()
+                ))
+            })
+            .collect::<onnx_runtime_ep_api::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Run the plan against a [`CaptureSchedule`], interleaving captured device
     /// graphs with eager seam nodes.
     ///
@@ -375,12 +398,14 @@ impl Executor {
                 match mode {
                     RunMode::Capture => {
                         let token = {
+                            let resources = self.workspace_capture_resources()?;
                             let kernels = self.collect_segment_kernels(seg, resolved)?;
                             ep.begin_owned_device_graph_capture(
                                 self.graph_owner,
                                 self.graph_slot,
                                 self.cap().device_graph_token,
                                 &kernels,
+                                resources,
                             )?
                         };
                         self.cap_mut().device_graph_token = Some(token);
@@ -764,8 +789,15 @@ impl Executor {
                     .unwrap_or(DataType::Undefined)
                 })
                 .collect::<Vec<_>>();
-            let (_, workspace) =
-                ctx.prepare_kernel_workspace(kernel, inputs, &views, node, workspace_planning)?;
+            let output_metadata = unresolved_output_metadata(node, ctx.graph);
+            let (_, workspace) = ctx.prepare_kernel_workspace(
+                kernel,
+                inputs,
+                &views,
+                &output_metadata,
+                node,
+                workspace_planning,
+            )?;
             let result = kernel.execute_kernel_sized(&views, &requested, workspace)?;
             validate_kernel_sized_outputs(
                 &result,
@@ -1118,30 +1150,12 @@ impl Executor {
                 // length lives on-device and context-overflow is caught earlier
                 // in the decoder (`total_len > max_len`). Otherwise keep the
                 // conservative `physical >= logical` guard.
-                let kv_capacity_bound = kernel_input_uses_physical_capacity(node, 4)
-                    && kernel_input_uses_physical_capacity(node, 5);
                 for (oi, &ovid) in outputs.iter().enumerate() {
-                    if oi == 0 {
-                        continue;
-                    }
-                    if let Some(value) = external.outputs.get(&ovid)
-                        && value.accepts_subshape
-                        && value.shape.len() == output_shapes[oi].len()
-                        && value
-                            .shape
-                            .iter()
-                            .zip(&output_shapes[oi])
-                            .enumerate()
-                            .all(|(axis, (&physical, &logical))| axis == 2 || physical == logical)
-                        && (kv_capacity_bound
-                            || value
-                                .shape
-                                .get(2)
-                                .zip(output_shapes[oi].get(2))
-                                .is_some_and(|(&physical, &logical)| physical >= logical))
+                    if let Some(physical) =
+                        bound_kernel_output_shape(node, oi, ovid, &output_shapes[oi], external)
                     {
                         output_shapes[oi].clear();
-                        output_shapes[oi].extend_from_slice(&value.shape);
+                        output_shapes[oi].extend_from_slice(physical);
                     }
                 }
             } else if is_kv_cache_growth_concat(&self.graph, node)
@@ -1976,6 +1990,7 @@ impl KernelDispatchContext<'_> {
         kernel: &dyn Kernel,
         inputs: &[Option<ValueId>],
         views: &[TensorView],
+        output_metadata: &[OutputMetadata<'_>],
         node: &Node,
         workspace_planning: onnx_runtime_ep_api::WorkspacePlanning,
     ) -> Result<(WorkspaceRequirement, Option<WorkspaceView>)> {
@@ -2002,7 +2017,8 @@ impl KernelDispatchContext<'_> {
                 TensorMetadata::new(view.dtype, view.shape, !view.is_absent())
             })
             .collect();
-        let requirement = kernel.workspace_requirement_for_execution(views, &metadata)?;
+        let requirement =
+            kernel.workspace_requirement_for_execution(views, &metadata, output_metadata)?;
         if requirement.bytes != 0
             && workspace_planning == onnx_runtime_ep_api::WorkspacePlanning::None
         {
@@ -2144,6 +2160,8 @@ impl KernelDispatchContext<'_> {
         outs: &mut [TensorMut],
         out_bufs: SmallVec<[OutBacking; 8]>,
     ) -> Result<()> {
+        let output_metadata: SmallVec<[OutputMetadata<'_>; 8]> =
+            outs.iter().map(OutputMetadata::from_view).collect();
         let kernel_inputs = has_lazy_inputs.then(|| {
             inputs
                 .iter()
@@ -2206,8 +2224,14 @@ impl KernelDispatchContext<'_> {
 
         let execution = {
             let _s = phase_span!("exec_kernel.compute");
-            let (_, workspace) =
-                self.prepare_kernel_workspace(kernel, inputs, views, node, workspace_planning)?;
+            let (_, workspace) = self.prepare_kernel_workspace(
+                kernel,
+                inputs,
+                views,
+                &output_metadata,
+                node,
+                workspace_planning,
+            )?;
             match &kernel_inputs {
                 Some(inputs) => kernel.execute_with_inputs(inputs, outs, workspace),
                 None => kernel.execute_with_workspace(views, outs, workspace),
@@ -2255,4 +2279,48 @@ impl KernelDispatchContext<'_> {
         }
         Ok(())
     }
+}
+
+pub(super) fn bound_kernel_output_shape<'a>(
+    node: &Node,
+    index: usize,
+    value: ValueId,
+    logical: &[usize],
+    external: &'a ExternalBindings,
+) -> Option<&'a [usize]> {
+    if !node.is_default_domain() || node.op_type != "Attention" || index == 0 {
+        return None;
+    }
+    let bound = external.outputs.get(&value)?;
+    let physical = &bound.shape;
+    let capacity_inputs = kernel_input_uses_physical_capacity(node, 4)
+        && kernel_input_uses_physical_capacity(node, 5);
+    (bound.accepts_subshape
+        && physical.len() == logical.len()
+        && physical
+            .iter()
+            .zip(logical)
+            .enumerate()
+            .all(|(axis, (physical, logical))| axis == 2 || physical == logical)
+        && (capacity_inputs
+            || physical
+                .get(2)
+                .zip(logical.get(2))
+                .is_some_and(|(physical, logical)| physical >= logical)))
+    .then_some(physical.as_slice())
+}
+
+pub(super) fn unresolved_output_metadata(
+    node: &Node,
+    graph: &Graph,
+) -> SmallVec<[OutputMetadata<'static>; 8]> {
+    node.outputs
+        .iter()
+        .map(|slot| match slot {
+            None => OutputMetadata::Absent,
+            Some(value) => OutputMetadata::Unresolved {
+                dtype: graph.value(*value).dtype,
+            },
+        })
+        .collect()
 }

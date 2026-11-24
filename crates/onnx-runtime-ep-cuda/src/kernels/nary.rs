@@ -12,10 +12,12 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceLayout, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
@@ -153,6 +155,71 @@ fn u64_bytes(values: &[u64]) -> Vec<u8> {
     out
 }
 
+/// One owner for the accumulator and every input's immutable broadcast words.
+/// All metadata must coexist while asynchronous accumulations read it.
+fn scratch_layout(op: &str, shape: &[usize], inputs: usize) -> Result<WorkspaceLayout<2>> {
+    let overflow = || {
+        EpError::KernelFailed(format!(
+            "cuda_ep {op}: accumulator and broadcast metadata exceed addressable workspace capacity; reduce the output shape, rank or input count"
+        ))
+    };
+    i32::try_from(shape.len()).map_err(|_| overflow())?;
+    let n = if shape.contains(&0) {
+        0
+    } else {
+        shape
+            .iter()
+            .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+            .ok_or_else(overflow)?
+    };
+    let words = if n == 0 {
+        0
+    } else {
+        shape
+            .len()
+            .checked_mul(2)
+            .and_then(|words| words.checked_mul(inputs))
+            .ok_or_else(overflow)?
+    };
+    WorkspaceLayout::new([
+        std::alloc::Layout::array::<f32>(n).map_err(|_| overflow())?,
+        std::alloc::Layout::array::<u64>(words).map_err(|_| overflow())?,
+    ])
+}
+
+fn workspace_requirement(op: &str, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    let Some(first) = inputs.first() else {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep {op}: expected at least one input to plan workspace; provide the variadic operands"
+        )));
+    };
+    FloatDtype::from_onnx(op, first.dtype)?;
+    let mut shape = first.shape.to_vec();
+    for (index, input) in inputs.iter().enumerate() {
+        if !input.present || input.dtype != first.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: input {index} must be present with dtype {:?} to plan workspace; provide matching variadic operands",
+                first.dtype
+            )));
+        }
+        shape = onnx_runtime_ir::broadcast_shapes(&shape, input.shape).map_err(EpError::Ir)?;
+    }
+    let layout = scratch_layout(op, &shape, inputs.len())?;
+    if layout.bytes() == 0 {
+        return Ok(WorkspaceRequirement::NONE);
+    }
+    Ok(WorkspaceRequirement {
+        bytes: u64::try_from(layout.bytes()).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep {op}: workspace size exceeds u64; reduce the output shape"
+            ))
+        })?,
+        alignment: layout.alignment(),
+        // Deferred device bindings must not retire/readmit fitting scratch every token.
+        lifetime: WorkspaceLifetime::SessionPersistent,
+    })
+}
+
 fn grid_for(n: usize) -> u32 {
     const MAX_BLOCKS: usize = 65_535;
     n.div_ceil(BLOCK as usize).clamp(1, MAX_BLOCKS) as u32
@@ -187,7 +254,12 @@ impl NaryKernel {
         if self.is_mean { "Mean" } else { "Sum" }
     }
 
-    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         let op = self.op_name();
         if inputs.is_empty() || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -203,7 +275,12 @@ impl NaryKernel {
         }
 
         let mut out_shape: Vec<usize> = inputs[0].shape.to_vec();
-        for input in inputs {
+        for (index, input) in inputs.iter().enumerate() {
+            if input.is_absent() {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: input {index} is absent; provide every variadic operand"
+                )));
+            }
             if input.dtype != inputs[0].dtype {
                 return Err(EpError::KernelFailed(format!(
                     "cuda_ep {op}: all inputs must share one dtype, got {:?} and {:?}",
@@ -236,7 +313,9 @@ impl NaryKernel {
             )));
         }
 
-        let n = outputs[0].numel();
+        let layout = scratch_layout(op, &out_shape, inputs.len())?;
+        let [accumulator, metadata_region] = layout.bind(workspace)?;
+        let n = accumulator.bytes() / std::mem::size_of::<f32>();
         if n == 0 {
             return Ok(());
         }
@@ -261,67 +340,71 @@ impl NaryKernel {
             shared_mem_bytes: 0,
         };
 
-        let scratch = self.runtime.alloc_raw(n * std::mem::size_of::<f32>())?;
-        let mut metadata_buffers: Vec<CUdeviceptr> = Vec::with_capacity(inputs.len());
-
-        let result = (|| {
-            for (index, input) in inputs.iter().enumerate() {
-                let metadata = broadcast_metadata(input.shape, &out_shape);
-                let metadata_bytes = u64_bytes(&metadata);
-                let metadata_ptr = self.runtime.alloc_raw(metadata_bytes.len().max(1))?;
-                metadata_buffers.push(metadata_ptr);
-                // SAFETY: the fresh allocation exactly covers the metadata slice.
-                unsafe { self.runtime.htod(&metadata_bytes, metadata_ptr) }?;
-
-                let a_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
-                let init: i32 = i32::from(index == 0);
-                let mut builder = self.runtime.stream().launch_builder(&accum);
-                builder
-                    .arg(&a_ptr)
-                    .arg(&scratch)
-                    .arg(&metadata_ptr)
-                    .arg(&rank)
-                    .arg(&n_u64)
-                    .arg(&init);
-                // SAFETY: `a_ptr` covers the input's contiguous elements; the
-                // scratch buffer holds `n` f32 accumulators; the metadata buffer
-                // holds `rank*2` u64 shape/stride words matching the kernel ABI.
-                unsafe { builder.launch(cfg) }
-                    .map_err(|error| driver_err("launch nary_accum", error))?;
-            }
-
-            let scale: f32 = if self.is_mean {
-                1.0 / inputs.len() as f32
-            } else {
-                1.0
-            };
-            let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-            let mut builder = self.runtime.stream().launch_builder(&store);
-            builder.arg(&scratch).arg(&y_ptr).arg(&scale).arg(&n_u64);
-            // SAFETY: `scratch` holds `n` accumulated f32 values and `y_ptr`
-            // covers `n` output elements of the validated dtype.
-            unsafe { builder.launch(cfg) }
-                .map_err(|error| driver_err("launch nary_store", error))?;
-            self.runtime.synchronize()
-        })();
-
-        // The synchronize above (or a failed launch) means no kernel is still
-        // reading the scratch or metadata buffers, so releasing them is safe.
-        // SAFETY: every pointer came from this runtime's `alloc_raw` and is
-        // freed exactly once here.
-        let mut cleanup = unsafe { self.runtime.free_raw(scratch) };
-        for metadata_ptr in metadata_buffers {
-            // SAFETY: as above; each metadata pointer is freed exactly once.
-            let free = unsafe { self.runtime.free_raw(metadata_ptr) };
-            cleanup = cleanup.and(free);
+        let scratch = cuptr(accumulator.ptr().0.cast_const());
+        let metadata_base = cuptr(metadata_region.ptr().0.cast_const());
+        let metadata_stride = metadata_region.bytes() / inputs.len();
+        let metadata = inputs
+            .iter()
+            .flat_map(|input| broadcast_metadata(input.shape, &out_shape))
+            .collect::<Vec<_>>();
+        let metadata_bytes = u64_bytes(&metadata);
+        if !metadata_bytes.is_empty() {
+            // SAFETY: checked composite backing covers all metadata. The
+            // synchronous upload completes before these host bytes are dropped.
+            unsafe { self.runtime.htod(&metadata_bytes, metadata_base) }?;
         }
-        result.and(cleanup)
+        for (index, input) in inputs.iter().enumerate() {
+            let metadata_ptr = metadata_base + (index * metadata_stride) as u64;
+            let a_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
+            let init: i32 = i32::from(index == 0);
+            let mut builder = self.runtime.stream().launch_builder(&accum);
+            builder
+                .arg(&a_ptr)
+                .arg(&scratch)
+                .arg(&metadata_ptr)
+                .arg(&rank)
+                .arg(&n_u64)
+                .arg(&init);
+            // SAFETY: disjoint metadata slices remain live in the caller's
+            // workspace; the stream orders successive accumulator updates.
+            unsafe { builder.launch(cfg) }
+                .map_err(|error| driver_err("launch nary_accum", error))?;
+        }
+        let scale: f32 = if self.is_mean {
+            1.0 / inputs.len() as f32
+        } else {
+            1.0
+        };
+        let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        let mut builder = self.runtime.stream().launch_builder(&store);
+        builder.arg(&scratch).arg(&y_ptr).arg(&scale).arg(&n_u64);
+        // SAFETY: accumulator and output extents were checked above. Backing
+        // retirement belongs to the executor, including launch-error paths.
+        unsafe { builder.launch(cfg) }.map_err(|error| driver_err("launch nary_store", error))?;
+        Ok(())
     }
 }
 
 impl Kernel for NaryKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs)
+        self.run(inputs, outputs, None)
+    }
+
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
+        workspace_requirement(self.op_name(), inputs)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 
     fn supports_strided_input(&self, _idx: usize) -> bool {
@@ -330,7 +413,7 @@ impl Kernel for NaryKernel {
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "Sum/Mean allocate and upload per-input broadcast metadata on every call",
+            "Sum/Mean upload host broadcast metadata during execution; prepare device metadata before enabling capture",
         )
     }
 }
@@ -359,5 +442,146 @@ mod tests {
         assert_eq!(broadcast_metadata(&[2, 3], &[2, 3]), vec![2, 3, 3, 1]);
         // Scalar output.
         assert_eq!(broadcast_metadata(&[], &[]), Vec::<u64>::new());
+    }
+    #[test]
+    fn workspace_plans_one_composite_for_all_broadcast_inputs() {
+        for op in ["Sum", "Mean"] {
+            for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+                let inputs = [
+                    TensorMetadata::new(dtype, &[2, 3], true),
+                    TensorMetadata::new(dtype, &[3], true),
+                    TensorMetadata::new(dtype, &[2, 1], true),
+                ];
+                let req = workspace_requirement(op, &inputs).unwrap();
+                assert_eq!(req.bytes, 24 + 3 * 2 * 2 * 8);
+                assert_eq!(req.alignment, 8);
+                assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
+            }
+        }
+        let scalar = workspace_requirement(
+            "Sum",
+            &[TensorMetadata::new(DataType::Float32, &[], true); 3],
+        )
+        .unwrap();
+        let layout = scratch_layout("Sum", &[], 3).unwrap();
+        let mut backing = [0u64; 1];
+        let [acc, metadata] = layout
+            .bind(Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+                scalar.bytes as usize,
+            )))
+            .unwrap();
+        assert_eq!(acc.bytes(), 4);
+        assert_eq!(metadata.bytes(), 0);
+        let empty = workspace_requirement(
+            "Mean",
+            &[TensorMetadata::new(DataType::Float16, &[2, 0, 3], true)],
+        )
+        .unwrap();
+        assert_eq!(empty, WorkspaceRequirement::NONE);
+        assert!(
+            scratch_layout("Mean", &[usize::MAX, 0], 3)
+                .unwrap()
+                .bind(None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn workspace_rejects_bad_geometry_and_incomplete_borrows() {
+        for (shape, count) in [
+            (&[usize::MAX, 2][..], 1),
+            (&[usize::MAX][..], 1),
+            (&[1][..], usize::MAX),
+        ] {
+            let error = scratch_layout("Sum", shape, count).unwrap_err().to_string();
+            assert!(error.contains("workspace capacity"), "{error}");
+            assert!(error.contains("reduce"), "{error}");
+        }
+        assert!(workspace_requirement("Mean", &[]).is_err());
+        assert!(
+            workspace_requirement(
+                "Sum",
+                &[TensorMetadata::new(DataType::Float32, &[2], false)]
+            )
+            .is_err()
+        );
+        assert!(
+            workspace_requirement(
+                "Sum",
+                &[
+                    TensorMetadata::new(DataType::Float32, &[2], true),
+                    TensorMetadata::new(DataType::Float16, &[2], true)
+                ]
+            )
+            .is_err()
+        );
+        assert!(
+            workspace_requirement(
+                "Mean",
+                &[
+                    TensorMetadata::new(DataType::Float32, &[2], true),
+                    TensorMetadata::new(DataType::Float32, &[3], true)
+                ]
+            )
+            .is_err()
+        );
+        let layout = scratch_layout("Sum", &[2, 3], 3).unwrap();
+        let mut backing = [0u64; 16];
+        for view in [
+            None,
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+                layout.bytes() - 1,
+            )),
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(
+                    backing.as_mut_ptr().cast::<u8>().wrapping_add(1).cast(),
+                ),
+                layout.bytes(),
+            )),
+        ] {
+            assert!(layout.bind(view).is_err());
+        }
+        let [acc, metadata] = layout
+            .bind(Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+                128,
+            )))
+            .unwrap();
+        assert_eq!(acc.bytes(), 24);
+        assert_eq!(metadata.ptr().0 as usize - acc.ptr().0 as usize, 24);
+        assert_eq!(metadata.bytes(), 96);
+    }
+
+    #[test]
+    fn execution_borrows_backing_without_private_allocation_or_final_sync() {
+        let source = include_str!("nary.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for forbidden in ["alloc_raw(", "free_raw(", "synchronize("] {
+            assert!(
+                !source.contains(forbidden),
+                "nary execution regained {forbidden}"
+            );
+        }
+    }
+    #[test]
+    fn registry_declares_metadata_workspace_for_variadic_kernels() {
+        let registry = include_str!("mod.rs");
+        for op in ["Sum", "Mean"] {
+            let key = format!("OpKey::new(\"{op}\", \"\", 1),");
+            let registration = registry
+                .split_once(&key)
+                .expect("variadic registration exists")
+                .1;
+            assert!(
+                registration
+                    .trim_start()
+                    .starts_with("onnx_runtime_ep_api::WorkspacePlanning::Metadata,"),
+                "{op} must opt into session workspace preparation"
+            );
+        }
     }
 }

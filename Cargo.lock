@@ -2286,6 +2286,7 @@ dependencies = [
  "onnx-runtime-memory-api",
  "onnx-runtime-memory-governor",
  "onnx-runtime-shape-inference",
+ "smallvec",
  "thiserror 2.0.19",
 ]
 
@@ -2446,6 +2447,7 @@ dependencies = [
  "onnx-runtime-memory-governor",
  "onnx-runtime-ort-testkit",
  "onnx-runtime-shape-inference",
+ "smallvec",
  "windows-sys 0.61.2",
 ]
 
@@ -2630,6 +2632,7 @@ dependencies = [
 name = "onnx-runtime-shape-inference"
 version = "0.1.0-dev.6"
 dependencies = [
+ "half",
  "onnx-runtime-einsum-conformance",
  "onnx-runtime-ir",
  "thiserror 2.0.19",

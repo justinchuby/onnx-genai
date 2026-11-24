@@ -481,6 +481,7 @@ impl Kernel for StftKernel {
     fn workspace_requirement(
         &self,
         _inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
         // frame_step is a required runtime scalar, so prepare-only metadata
         // cannot know the frame count. Execution computes the exact requirement.
@@ -491,6 +492,7 @@ impl Kernel for StftKernel {
         &self,
         inputs: &[TensorView],
         _metadata: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
         self.workspace_for(&self.resolve(inputs)?)
     }

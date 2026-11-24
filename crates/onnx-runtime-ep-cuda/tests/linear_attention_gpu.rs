@@ -167,14 +167,19 @@ fn check(cfg: &Config, dtype: DataType) {
 }
 
 fn run_check(ep: &CudaExecutionProvider, cfg: &Config, dtype: DataType, domain: &str) {
-    let inputs = build_inputs(cfg, dtype);
+    let inputs = if domain.is_empty() {
+        build_standard_inputs(cfg, dtype)
+    } else {
+        build_inputs(cfg, dtype)
+    };
     let outputs = vec![
         (dtype, vec![cfg.batch, cfg.seq, cfg.output_hidden()]),
         (dtype, vec![cfg.batch, cfg.kv_num_heads, cfg.d_k, cfg.d_v]),
     ];
     let a = attrs(cfg);
-    let cuda = run_cuda(ep, "LinearAttention", domain, OPSET, &inputs, &outputs, &a);
-    let cpu = run_cpu("LinearAttention", domain, OPSET, &inputs, &outputs, &a);
+    let opset = if domain.is_empty() { 27 } else { OPSET };
+    let cuda = run_cuda(ep, "LinearAttention", domain, opset, &inputs, &outputs, &a);
+    let cpu = run_cpu("LinearAttention", domain, opset, &inputs, &outputs, &a);
     assert_eq!(cuda.len(), 2, "{}: expected 2 outputs", cfg.label);
     assert_eq!(cpu.len(), 2, "{}: CPU expected 2 outputs", cfg.label);
     let tol = tolerance(dtype);
@@ -410,8 +415,296 @@ fn linear_attention_bf16_parity() {
 fn linear_attention_standard_domain_parity() {
     let ep = require_cuda();
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
-        for cfg in configs() {
+        for cfg in standard_configs() {
             run_check(&ep, &cfg, dtype, "");
+        }
+    }
+}
+
+fn standard_configs() -> impl Iterator<Item = Config> {
+    configs().into_iter().filter(|cfg| {
+        cfg.q_num_heads.is_multiple_of(cfg.kv_num_heads) && cfg.n_k_heads == cfg.kv_num_heads
+    })
+}
+
+fn build_standard_inputs(cfg: &Config, dtype: DataType) -> Vec<Tensor> {
+    let mut inputs = build_inputs(cfg, dtype);
+    if !matches!(cfg.update_rule, "gated" | "gated_delta") {
+        inputs[4] = common::absent_input(dtype);
+    }
+    if !matches!(cfg.update_rule, "delta" | "gated_delta") {
+        inputs[5] = common::absent_input(dtype);
+    }
+    inputs
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA")]
+#[test]
+fn opset27_linear_attention_optional_slots_and_mixed_state() {
+    let ep = require_cuda();
+    let dtype = DataType::Float16;
+    let qkv = || [1.0, 2.0, 3.0].map(|v| float_input(dtype, &[1, 1, 1], &[v]));
+    let heads = [
+        ("q_num_heads", Attribute::Int(1)),
+        ("kv_num_heads", Attribute::Int(1)),
+        ("update_rule", Attribute::String(b"delta".to_vec())),
+    ];
+    for (state, state_dtype, expected) in [(None, dtype, 3.0), (Some(0.5), DataType::Float32, 2.5)]
+    {
+        let mut inputs = qkv().to_vec();
+        inputs.push(state.map_or_else(
+            || common::absent_input(state_dtype),
+            |s| float_input(state_dtype, &[1, 1, 1, 1], &[s]),
+        ));
+        inputs.push(common::absent_input(dtype));
+        inputs.push(float_input(dtype, &[1, 1, 1], &[0.5]));
+        let outputs = [(dtype, vec![1, 1, 1]), (state_dtype, vec![1, 1, 1, 1])];
+        for result in [
+            run_cpu("LinearAttention", "", 27, &inputs, &outputs, &heads),
+            run_cuda(&ep, "LinearAttention", "", 27, &inputs, &outputs, &heads),
+        ] {
+            assert_eq!(decode_floats(&result[0], dtype), [expected]);
+            assert_eq!(decode_floats(&result[1], state_dtype), [expected]);
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA")]
+#[test]
+fn opset27_range_half_stash_matches_expected() {
+    let ep = require_cuda();
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        let inputs = [-2.0_f32.powi(-24), 16.0, 4.0].map(|v| float_input(dtype, &[], &[v]));
+        for (stash, len) in [(1, 4), (11, 5)] {
+            let got = run_cuda(
+                &ep,
+                "Range",
+                "",
+                27,
+                &inputs,
+                &[(dtype, vec![len])],
+                &[("stash_type", Attribute::Int(stash))],
+            );
+            assert_eq!(
+                decode_floats(&got[0], dtype),
+                [-2.0_f32.powi(-24), 4.0, 8.0, 12.0, 16.0][..len]
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "release microbenchmark; run on an idle GPU under the host benchmark lock"]
+fn opset27_recurrent_and_range_release_ab() {
+    assert!(!cfg!(debug_assertions), "run this probe with --release");
+    let cuda = require_cuda();
+    let cpu = onnx_runtime_ep_cpu::CpuExecutionProvider::new();
+    let dtype = DataType::Float32;
+    for (device, ep) in [
+        ("CPU", &cpu as &dyn ExecutionProvider),
+        ("CUDA", &cuda as &dyn ExecutionProvider),
+    ] {
+        let is_cuda = device == "CUDA";
+        let synchronize = || {
+            if is_cuda {
+                cuda.runtime().synchronize().unwrap();
+            }
+        };
+        let compare = |op: &str,
+                       label: &str,
+                       legacy: (&str, u64),
+                       inputs: &[Tensor],
+                       outputs: &[(DataType, Vec<usize>)],
+                       attributes: &[(&str, Attribute)],
+                       iterations: usize| {
+            let shapes: Vec<_> = inputs.iter().map(|t| t.shape.clone()).collect();
+            let make_kernel = |domain, opset| {
+                let (graph, id) = build_graph(op, domain, opset, inputs, outputs, attributes);
+                ep.get_kernel(graph.node(id), &shapes, opset).unwrap()
+            };
+            let kernels = [make_kernel(legacy.0, legacy.1), make_kernel("", 27)];
+            let input_buffers: Vec<_> = inputs
+                .iter()
+                .map(|t| {
+                    let mut buffer = ep.allocate(t.bytes.len().max(1), 256).unwrap();
+                    unsafe {
+                        if is_cuda {
+                            cuda.runtime()
+                                .htod(&t.bytes, cuptr(buffer.as_ptr()))
+                                .unwrap();
+                        } else {
+                            std::ptr::copy_nonoverlapping(
+                                t.bytes.as_ptr(),
+                                buffer.as_mut_ptr().cast(),
+                                t.bytes.len(),
+                            );
+                        }
+                    }
+                    buffer
+                })
+                .collect();
+            let mut output_buffers: Vec<_> = outputs
+                .iter()
+                .map(|(dtype, shape)| {
+                    ep.allocate(dtype.storage_bytes(shape.iter().product()).max(1), 256)
+                        .unwrap()
+                })
+                .collect();
+            let in_strides: Vec<_> = shapes
+                .iter()
+                .map(|s| compute_contiguous_strides(s))
+                .collect();
+            let out_strides: Vec<_> = outputs
+                .iter()
+                .map(|(_, s)| compute_contiguous_strides(s))
+                .collect();
+            let input_views: Vec<_> = inputs
+                .iter()
+                .zip(&input_buffers)
+                .zip(&in_strides)
+                .map(|((t, b), s)| {
+                    TensorView::new(DevicePtr(b.as_ptr()), t.dtype, &t.shape, s, ep.device_id())
+                })
+                .collect();
+            let mut output_views: Vec<_> = outputs
+                .iter()
+                .zip(&mut output_buffers)
+                .zip(&out_strides)
+                .map(|(((dtype, shape), b), s)| {
+                    TensorMut::new(
+                        DevicePtrMut(b.as_mut_ptr()),
+                        *dtype,
+                        shape,
+                        s,
+                        ep.device_id(),
+                    )
+                })
+                .collect();
+            for kernel in &kernels {
+                for _ in 0..15 {
+                    kernel.execute(&input_views, &mut output_views).unwrap();
+                }
+            }
+            let mut samples = [Vec::new(), Vec::new()];
+            for rep in 0..12 {
+                for arm in [rep % 2, (rep + 1) % 2] {
+                    synchronize();
+                    let start = std::time::Instant::now();
+                    for _ in 0..iterations {
+                        kernels[arm]
+                            .execute(&input_views, &mut output_views)
+                            .unwrap();
+                    }
+                    synchronize();
+                    samples[arm].push(start.elapsed().as_secs_f64() * 1e6 / iterations as f64);
+                }
+            }
+            for arm in 0..2 {
+                samples[arm].sort_by(f64::total_cmp);
+            }
+            println!(
+                "{device} {op} {label}: legacy {:?} us; v27 {:?} us (sorted; synchronized execute incl. host dispatch)",
+                samples[0], samples[1]
+            );
+            if is_cuda && op != "Range" {
+                use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+                use onnx_runtime_ep_api::DeviceGraphSlot;
+
+                const NODES: usize = 256;
+                const REPLAYS: usize = 4;
+                let runtime = cuda.runtime();
+                let slots = [DeviceGraphSlot::Primary, DeviceGraphSlot::Verify];
+                for (slot, kernel) in slots.into_iter().zip(&kernels) {
+                    runtime
+                        .begin_graph_capture_in(slot, &[kernel.as_ref()])
+                        .unwrap();
+                    for _ in 0..NODES {
+                        kernel.execute(&input_views, &mut output_views).unwrap();
+                    }
+                    runtime.end_graph_capture_in(slot).unwrap();
+                    runtime.replay_graph_in(slot).unwrap();
+                }
+                synchronize();
+                let stream = runtime.stream();
+                let start = stream.context().new_event(Some(CU_EVENT_DEFAULT)).unwrap();
+                let end = stream.context().new_event(Some(CU_EVENT_DEFAULT)).unwrap();
+                let time = |slot| {
+                    start.record(stream).unwrap();
+                    for _ in 0..REPLAYS {
+                        runtime.replay_graph_in(slot).unwrap();
+                    }
+                    end.record(stream).unwrap();
+                    f64::from(start.elapsed_ms(&end).unwrap()) * 1_000.0 / (NODES * REPLAYS) as f64
+                };
+                // Bracket each B sample by replays of the same A graph to expose drift.
+                for _ in 0..12 {
+                    let before = time(slots[0]);
+                    let current = time(slots[1]);
+                    let after = time(slots[0]);
+                    println!(
+                        "CUDA graph {op} {label}: legacy {before:.3} / {after:.3} us; v27 {current:.3} us"
+                    );
+                }
+                for slot in slots {
+                    assert!(runtime.reset_graph_in(slot).unwrap());
+                }
+            }
+        };
+        for (seq, label, iterations) in [(1, "decode", 1024), (64, "prefill", 128)] {
+            let cfg = Config {
+                label,
+                batch: 1,
+                seq,
+                d_k: 64,
+                d_v: 64,
+                q_num_heads: 8,
+                kv_num_heads: 8,
+                n_k_heads: 8,
+                update_rule: "gated_delta",
+                scale: 0.125,
+                decay_per_key_dim: false,
+                beta_shared: false,
+                with_past: true,
+            };
+            compare(
+                "LinearAttention",
+                label,
+                (DOMAIN, 1),
+                &build_inputs(&cfg, dtype),
+                &[(dtype, vec![1, seq, 512]), (dtype, vec![1, 8, 64, 64])],
+                &attrs(&cfg),
+                iterations,
+            );
+            let conv = [
+                float_input(dtype, &[1, 512, seq], &vec![0.4; 512 * seq]),
+                float_input(dtype, &[512, 1, 4], &vec![0.2; 512 * 4]),
+                float_input(dtype, &[512], &[0.1; 512]),
+                float_input(dtype, &[1, 512, 3], &[0.3; 512 * 3]),
+            ];
+            compare(
+                "CausalConvWithState",
+                label,
+                (DOMAIN, 1),
+                &conv,
+                &[(dtype, vec![1, 512, seq]), (dtype, vec![1, 512, 3])],
+                &[("activation", Attribute::String(b"silu".to_vec()))],
+                iterations,
+            );
+        }
+        for (length, iterations) in [(32, 1024), (65_536, 256)] {
+            compare(
+                "Range",
+                &format!("len={length}"),
+                ("", 11),
+                &[
+                    float_input(dtype, &[], &[0.0]),
+                    float_input(dtype, &[], &[length as f32]),
+                    float_input(dtype, &[], &[1.0]),
+                ],
+                &[(dtype, vec![length])],
+                &[],
+                iterations,
+            );
         }
     }
 }
@@ -427,8 +720,8 @@ fn linear_attention_standard_domain_parity() {
 fn linear_attention_both_domains_identical() {
     let ep = require_cuda();
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
-        for cfg in configs() {
-            let inputs = build_inputs(&cfg, dtype);
+        for cfg in standard_configs() {
+            let inputs = build_standard_inputs(&cfg, dtype);
             let outputs = vec![
                 (dtype, vec![cfg.batch, cfg.seq, cfg.output_hidden()]),
                 (dtype, vec![cfg.batch, cfg.kv_num_heads, cfg.d_k, cfg.d_v]),
@@ -443,7 +736,7 @@ fn linear_attention_both_domains_identical() {
                 &outputs,
                 &a,
             );
-            let std = run_cuda(&ep, "LinearAttention", "", OPSET, &inputs, &outputs, &a);
+            let std = run_cuda(&ep, "LinearAttention", "", 27, &inputs, &outputs, &a);
             assert_eq!(msft.len(), std.len(), "{}: output arity", cfg.label);
             for (idx, name) in ["output", "present_state"].iter().enumerate() {
                 assert_eq!(

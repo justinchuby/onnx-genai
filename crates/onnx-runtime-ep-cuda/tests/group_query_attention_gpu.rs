@@ -18,7 +18,7 @@ use common::reset_capture_error_for_isolated_test;
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, KernelMatch, TensorMut,
-    TensorView,
+    TensorView, WorkspaceAllocation,
 };
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
@@ -130,6 +130,24 @@ fn require_cuda() -> CudaExecutionProvider {
             "CUDA test requires CUDA runtime libraries; CPU-only runs must leave this test ignored"
         ),
     }
+}
+
+fn finish_workspace_dispatch(
+    ep: &CudaExecutionProvider,
+    workspace: Option<WorkspaceAllocation>,
+    execution: onnx_runtime_ep_api::Result<()>,
+) -> onnx_runtime_ep_api::Result<()> {
+    let release = workspace.map_or(Ok(()), |workspace| ep.deallocate_workspace(workspace));
+    match (execution, release) {
+        (Err(error), Err(release)) => {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                "GQA test dispatch failed: {error}; retiring prepared workspace also failed: {release}"
+            )));
+        }
+        (Err(error), _) | (_, Err(error)) => return Err(error),
+        (Ok(()), Ok(())) => {}
+    }
+    Ok(())
 }
 
 fn run(
@@ -310,16 +328,7 @@ fn run_with_backend(
     };
     // Retire scratch even when dispatch or the later readback fails. Provider
     // deferred release preserves queued device uses; output owners stay live.
-    let release = workspace.map_or(Ok(()), |workspace| ep.deallocate_workspace(workspace));
-    match (execution, release) {
-        (Err(error), Err(release)) => {
-            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
-                "GQA test dispatch failed: {error}; retiring prepared workspace also failed: {release}"
-            )));
-        }
-        (Err(error), _) | (_, Err(error)) => return Err(error),
-        (Ok(()), Ok(())) => {}
-    }
+    finish_workspace_dispatch(ep, workspace, execution)?;
 
     let mut results = Vec::with_capacity(output_buffers.len());
     for (buffer, shape) in output_buffers.iter().zip(output_shapes) {
@@ -381,9 +390,65 @@ fn read_bytes(
     Ok(host)
 }
 
+fn begin_workspace_capture(
+    ep: &CudaExecutionProvider,
+    kernels: &[&dyn Kernel],
+    workspace: &Option<WorkspaceAllocation>,
+) -> onnx_runtime_ep_api::Result<()> {
+    let resource = workspace
+        .as_ref()
+        .ok_or_else(|| {
+            onnx_runtime_ep_api::EpError::KernelFailed(
+                "prepare the manual capture workspace before capture".into(),
+            )
+        })?
+        .device_graph_resource()?
+        .ok_or_else(|| {
+            onnx_runtime_ep_api::EpError::KernelFailed(
+                "manual capture needs a binding-owned workspace pin".into(),
+            )
+        })?;
+    ep.runtime()
+        .begin_graph_capture_with_resources(kernels, vec![resource])
+}
+
+// This fixture exercises both one-token decode and a rejected two-token capture.
+// Admit the complete peak before either capture so failure tests reach the kernel.
+fn prepare_in_place_workspace(
+    ep: &CudaExecutionProvider,
+    kernel: &GroupQueryAttentionKernel,
+) -> Option<WorkspaceAllocation> {
+    use onnx_runtime_ep_api::{OutputMetadata, TensorMetadata};
+    let mut requirement = onnx_runtime_ep_api::WorkspaceRequirement::NONE;
+    for sequence in [1, 2] {
+        let q = [1, sequence, 16];
+        let y = [1, sequence, 8];
+        let cache = [1, 2, 5, 2];
+        let inputs = [
+            TensorMetadata::new(DataType::Float32, &q, true),
+            TensorMetadata::new(DataType::Float32, &[], false),
+            TensorMetadata::new(DataType::Float32, &[], false),
+            TensorMetadata::new(DataType::Float32, &cache, true),
+        ];
+        let outputs = [
+            OutputMetadata::tensor(DataType::Float32, &y),
+            OutputMetadata::tensor(DataType::Float32, &cache),
+            OutputMetadata::tensor(DataType::Float32, &cache),
+        ];
+        let candidate = kernel.workspace_requirement(&inputs, &outputs).unwrap();
+        if candidate.bytes > requirement.bytes {
+            requirement = candidate;
+        }
+    }
+    let mut workspace = None;
+    common::prepare_workspace(ep, requirement, &mut workspace).unwrap();
+    workspace
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_in_place_packed_f32_gqa(
     kernel: &GroupQueryAttentionKernel,
+    workspace: &mut Option<WorkspaceAllocation>,
     ep: &CudaExecutionProvider,
     packed_qkv: &DeviceBuffer,
     cache_k: &mut DeviceBuffer,
@@ -395,9 +460,10 @@ fn execute_in_place_packed_f32_gqa(
     positions: &DeviceBuffer,
     output: &mut DeviceBuffer,
     query_sequence_length: usize,
-) -> onnx_runtime_ep_api::Result<()> {
+) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
     execute_in_place_packed_f32_gqa_with_seqlens_shape(
         kernel,
+        workspace,
         ep,
         packed_qkv,
         cache_k,
@@ -416,6 +482,7 @@ fn execute_in_place_packed_f32_gqa(
 #[allow(clippy::too_many_arguments)]
 fn execute_in_place_packed_f32_gqa_with_seqlens_shape(
     kernel: &GroupQueryAttentionKernel,
+    workspace: &mut Option<WorkspaceAllocation>,
     ep: &CudaExecutionProvider,
     packed_qkv: &DeviceBuffer,
     cache_k: &mut DeviceBuffer,
@@ -428,7 +495,7 @@ fn execute_in_place_packed_f32_gqa_with_seqlens_shape(
     output: &mut DeviceBuffer,
     query_sequence_length: usize,
     seqlens_shape: &[usize],
-) -> onnx_runtime_ep_api::Result<()> {
+) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceRequirement> {
     let device = ep.device_id();
     let packed_shape = [1, query_sequence_length, 16];
     let output_shape = [1, query_sequence_length, 8];
@@ -530,7 +597,14 @@ fn execute_in_place_packed_f32_gqa_with_seqlens_shape(
             device,
         ),
     ];
-    kernel.execute(&inputs, &mut outputs)
+    let facts = outputs
+        .iter()
+        .map(onnx_runtime_ep_api::OutputMetadata::from_view)
+        .collect::<Vec<_>>();
+    let requirement = common::runtime_workspace_requirement(kernel, &inputs, &facts)?;
+    let view = common::prepare_workspace(ep, requirement, workspace)?;
+    kernel.execute_with_workspace(&inputs, &mut outputs, view)?;
+    Ok(requirement)
 }
 
 struct PackedStep {
@@ -730,7 +804,10 @@ fn run_packed_step(
     let output_shape = &output_shapes[0];
     let output_strides = compute_contiguous_strides(output_shape);
     let mut output = ep.allocate(output_shape.iter().product::<usize>() * 4, 256)?;
-    kernel.execute(
+    let mut workspace = None;
+    let execution = common::execute_kernel(
+        ep,
+        &*kernel,
         &inputs,
         &mut [
             TensorMut::new(
@@ -755,7 +832,9 @@ fn run_packed_step(
                 device,
             ),
         ],
-    )?;
+        &mut workspace,
+    );
+    finish_workspace_dispatch(ep, workspace, execution)?;
 
     let mut output_bytes = vec![0u8; output_shape.iter().product::<usize>() * 4];
     let mut key_bytes = vec![0u8; cache_shape.iter().product::<usize>() * 4];
@@ -1598,9 +1677,21 @@ fn benchmark_gqa_case(
     )
     .unwrap()
     .with_backend(backend);
+    let requirement = common::runtime_workspace_requirement(
+        &kernel,
+        &inputs,
+        &[
+            onnx_runtime_ep_api::OutputMetadata::tensor(dtype, &q_shape),
+            onnx_runtime_ep_api::OutputMetadata::tensor(dtype, &cache_shape),
+            onnx_runtime_ep_api::OutputMetadata::tensor(dtype, &cache_shape),
+        ],
+    )
+    .unwrap();
+    let mut workspace = None;
+    let workspace_view = common::prepare_workspace(ep, requirement, &mut workspace).unwrap();
     let mut run = || {
         kernel
-            .execute(
+            .execute_with_workspace(
                 &inputs,
                 &mut [
                     TensorMut::new(
@@ -1625,19 +1716,27 @@ fn benchmark_gqa_case(
                         device,
                     ),
                 ],
+                workspace_view,
             )
             .unwrap();
     };
     run();
+    ep.sync().unwrap();
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
+        // Measures dispatch through actual device completion. Preparation and
+        // cold allocations precede timing; deferred per-op sync is no proof.
         let start = Instant::now();
         run();
+        ep.sync().unwrap();
         samples.push(start.elapsed().as_secs_f64() * 1_000.0);
     }
     samples.sort_by(f64::total_cmp);
     let median = samples[samples.len() / 2];
     drop(run);
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
     drop(inputs);
     for buffer in [q, k, v, cache_k, cache_v, seqlens, total_length, output] {
         ep.deallocate(buffer).unwrap();
@@ -2057,8 +2156,10 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     let eager_positions = upload(&ep, &positions_host).unwrap();
     let mut eager_output = ep.allocate(output_bytes, 256).unwrap();
 
+    let mut workspace = prepare_in_place_workspace(&ep, &kernel);
     execute_in_place_packed_f32_gqa_with_seqlens_shape(
         &kernel,
+        &mut workspace,
         &ep,
         &packed,
         &mut cache_k,
@@ -2075,6 +2176,7 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     .unwrap();
     execute_in_place_packed_f32_gqa_with_seqlens_shape(
         &eager_kernel,
+        &mut workspace,
         &ep,
         &packed,
         &mut eager_cache_k,
@@ -2095,11 +2197,38 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     );
     assert!(kernel.cuda_graph_compatible());
 
-    let allocation_counts = runtime.allocation_counts();
+    assert!(kernel.device_graph_resources().is_empty());
     let kernels: [&dyn Kernel; 1] = [&kernel];
     runtime.begin_graph_capture(&kernels).unwrap();
+    let missing_pin = execute_in_place_packed_f32_gqa_with_seqlens_shape(
+        &kernel,
+        &mut workspace,
+        &ep,
+        &packed,
+        &mut cache_k,
+        &mut cache_v,
+        &seqlens,
+        &total,
+        &cos,
+        &sin,
+        &positions,
+        &mut output,
+        1,
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        missing_pin.to_string().contains("one real workspace owner"),
+        "{missing_pin}"
+    );
+    runtime.abort_graph_capture().unwrap();
+
+    let allocation_counts = runtime.allocation_counts();
+    let kernels: [&dyn Kernel; 1] = [&kernel];
+    begin_workspace_capture(&ep, &kernels, &workspace).unwrap();
     execute_in_place_packed_f32_gqa_with_seqlens_shape(
         &kernel,
+        &mut workspace,
         &ep,
         &packed,
         &mut cache_k,
@@ -2127,6 +2256,7 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
 
         execute_in_place_packed_f32_gqa_with_seqlens_shape(
             &eager_kernel,
+            &mut workspace,
             &ep,
             &packed,
             &mut eager_cache_k,
@@ -2178,9 +2308,10 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     overwrite(&ep, &positions, &prefill_positions_host).unwrap();
     let mut prefill_output = ep.allocate(2 * output_bytes, 256).unwrap();
     let kernels: [&dyn Kernel; 1] = [&kernel];
-    runtime.begin_graph_capture(&kernels).unwrap();
+    begin_workspace_capture(&ep, &kernels, &workspace).unwrap();
     let error = execute_in_place_packed_f32_gqa(
         &kernel,
+        &mut workspace,
         &ep,
         &prefill_packed,
         &mut cache_k,
@@ -2221,6 +2352,9 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     ] {
         ep.deallocate(buffer).unwrap();
     }
+    if let Some(owner) = workspace {
+        ep.deallocate_workspace(owner).unwrap();
+    }
 }
 
 #[cfg_attr(
@@ -2256,6 +2390,7 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
     let positions = upload(&ep, &valid_positions).unwrap();
     let mut output = ep.allocate(8 * std::mem::size_of::<f32>(), 256).unwrap();
 
+    let mut workspace = prepare_in_place_workspace(&ep, &kernel);
     let mut capture_invalid = |bad_seqlens: Option<i32>, bad_position: Option<i64>| -> u32 {
         // Explicit host reset returns the latch to a clean slate for each case.
         reset_capture_error_for_isolated_test(runtime).unwrap();
@@ -2263,6 +2398,7 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
         overwrite(&ep, &positions, &valid_positions).unwrap();
         execute_in_place_packed_f32_gqa(
             &kernel,
+            &mut workspace,
             &ep,
             &packed,
             &mut cache_k,
@@ -2277,9 +2413,10 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
         )
         .unwrap();
         let kernels: [&dyn Kernel; 1] = [&kernel];
-        runtime.begin_graph_capture(&kernels).unwrap();
+        begin_workspace_capture(&ep, &kernels, &workspace).unwrap();
         execute_in_place_packed_f32_gqa(
             &kernel,
+            &mut workspace,
             &ep,
             &packed,
             &mut cache_k,
@@ -2366,6 +2503,9 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
     ] {
         ep.deallocate(buffer).unwrap();
     }
+    if let Some(owner) = workspace {
+        ep.deallocate_workspace(owner).unwrap();
+    }
 }
 
 #[cfg_attr(
@@ -2428,8 +2568,10 @@ fn gqa_gpu_capture_error_latches_until_reset_without_resuming_over_hole() {
     reset_capture_error_for_isolated_test(runtime).unwrap();
 
     // Warm the fixed decode signature, then capture it.
+    let mut workspace = prepare_in_place_workspace(&ep, &kernel);
     execute_in_place_packed_f32_gqa(
         &kernel,
+        &mut workspace,
         &ep,
         &packed,
         &mut cache_k,
@@ -2445,6 +2587,7 @@ fn gqa_gpu_capture_error_latches_until_reset_without_resuming_over_hole() {
     .unwrap();
     execute_in_place_packed_f32_gqa(
         &eager_kernel,
+        &mut workspace,
         &ep,
         &packed,
         &mut eager_cache_k,
@@ -2461,9 +2604,10 @@ fn gqa_gpu_capture_error_latches_until_reset_without_resuming_over_hole() {
     assert!(kernel.cuda_graph_compatible());
 
     let kernels: [&dyn Kernel; 1] = [&kernel];
-    runtime.begin_graph_capture(&kernels).unwrap();
+    begin_workspace_capture(&ep, &kernels, &workspace).unwrap();
     execute_in_place_packed_f32_gqa(
         &kernel,
+        &mut workspace,
         &ep,
         &packed,
         &mut cache_k,
@@ -2490,6 +2634,7 @@ fn gqa_gpu_capture_error_latches_until_reset_without_resuming_over_hole() {
         overwrite(&ep, &eager_positions, &positions_step).unwrap();
         execute_in_place_packed_f32_gqa(
             &eager_kernel,
+            &mut workspace,
             &ep,
             &packed,
             &mut eager_cache_k,
@@ -2582,6 +2727,9 @@ fn gqa_gpu_capture_error_latches_until_reset_without_resuming_over_hole() {
         packed,
     ] {
         ep.deallocate(buffer).unwrap();
+    }
+    if let Some(owner) = workspace {
+        ep.deallocate_workspace(owner).unwrap();
     }
 }
 
@@ -3467,8 +3615,10 @@ fn gqa_gpu_fused_decode_prep_matches_unfused_bit_exactly() {
         let mut cache_k = upload(&ep, &cache_k_host).unwrap();
         let mut cache_v = upload(&ep, &cache_v_host).unwrap();
         let mut output = ep.allocate(output_bytes, 256).unwrap();
-        execute_in_place_packed_f32_gqa(
+        let mut workspace = prepare_in_place_workspace(&ep, kernel);
+        let requirement = execute_in_place_packed_f32_gqa(
             kernel,
+            &mut workspace,
             &ep,
             &packed,
             &mut cache_k,
@@ -3483,10 +3633,13 @@ fn gqa_gpu_fused_decode_prep_matches_unfused_bit_exactly() {
         )
         .unwrap();
         runtime.synchronize().unwrap();
-        let metadata = kernel.read_prepared_metadata_for_test(1).unwrap();
+        let metadata = kernel.read_prepared_metadata_for_test(
+            1, workspace.as_ref().unwrap(), requirement,
+        ).unwrap();
         let out = read_bytes(&ep, &output, output_bytes).unwrap();
         let ck = read_bytes(&ep, &cache_k, cache_bytes).unwrap();
         let cv = read_bytes(&ep, &cache_v, cache_bytes).unwrap();
+        if let Some(owner) = workspace { ep.deallocate_workspace(owner).unwrap(); }
         ep.deallocate(output).unwrap();
         ep.deallocate(cache_k).unwrap();
         ep.deallocate(cache_v).unwrap();
@@ -3638,6 +3791,109 @@ fn gqa_gpu_prepared_reference_scores_ignore_present_cache_padding() {
                     close(&outputs[2][offset..offset + 2], &value);
                 }
             }
+        }
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn gqa_gpu_prepared_general_half_uses_arbitrary_head_dim_and_padded_cache() {
+    let ep = require_cuda();
+    let (heads, kv_heads, dim, seq, capacity) = (4, 2, 7, 2, 8);
+    let q = vec![0.; seq * heads * dim];
+    let k = vec![0.; seq * kv_heads * dim];
+    let v: Vec<f32> = (0..seq)
+        .flat_map(|_| (0..kv_heads).flat_map(|head| vec![1. + 2. * head as f32; dim]))
+        .collect();
+    let expected: Vec<f32> = (0..seq)
+        .flat_map(|_| (0..heads).flat_map(|head| vec![1. + 2. * (head / 2) as f32; dim]))
+        .collect();
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        let inputs = base_inputs_dtype(
+            dtype,
+            &[1, seq, heads * dim],
+            &q,
+            &[1, seq, kv_heads * dim],
+            &k,
+            &v,
+            None,
+            None,
+            &[1],
+            2,
+        );
+        let outputs = run_with_backend(
+            &ep,
+            &attrs(&[]),
+            &inputs,
+            &[
+                vec![1, seq, heads * dim],
+                vec![1, kv_heads, capacity, dim],
+                vec![1, kv_heads, capacity, dim],
+            ],
+            Some(GroupQueryAttentionBackend::Phase2a),
+        )
+        .unwrap();
+        assert_close(&outputs[0], &expected, 0.002, 0.002);
+        for head in 0..kv_heads {
+            for position in 0..seq {
+                let offset = (head * capacity + position) * dim;
+                assert_close(
+                    &outputs[2][offset..offset + dim],
+                    &vec![1. + 2. * head as f32; dim],
+                    0.,
+                    0.,
+                );
+            }
+        }
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn gqa_gpu_hidden_present_scratch_matches_visible_padded_cache_outputs() {
+    let ep = require_cuda();
+    let inputs = base_inputs(
+        &[1, 2, 8],
+        &[
+            1., 0., 1., 0., 0., 1., 0., 1., 0.5, 1., 1., 0.5, 1., -1., -1., 1.,
+        ],
+        &[1, 2, 4],
+        &[1., 0., 0., 1., 0.5, 1., 1., 0.5],
+        &[1., 2., 10., 20., 3., 4., 30., 40.],
+        None,
+        None,
+        &[1],
+        11,
+    );
+    let output_shapes = [vec![1, 2, 8], vec![1, 2, 11, 2], vec![1, 2, 11, 2]];
+    let all = run_with_backend(
+        &ep,
+        &attrs(&[]),
+        &inputs,
+        &output_shapes,
+        Some(GroupQueryAttentionBackend::Phase2a),
+    )
+    .unwrap();
+    for outputs in [1, 2] {
+        let hidden = run_with_backend(
+            &ep,
+            &attrs(&[]),
+            &inputs,
+            &output_shapes[..outputs],
+            Some(GroupQueryAttentionBackend::Phase2a),
+        )
+        .unwrap();
+        close(&hidden[0], &all[0]);
+        if outputs == 2 {
+            // One visible output fixes the shared physical KV stride at 11;
+            // fully hidden caches instead use the input-derived bound of 2.
+            close(&hidden[1], &all[1]);
         }
     }
 }

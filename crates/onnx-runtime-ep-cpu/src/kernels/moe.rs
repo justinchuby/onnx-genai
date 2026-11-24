@@ -301,7 +301,11 @@ impl MoEKernel {
 }
 
 impl Kernel for MoEKernel {
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         let required = |index: usize, name: &str| {
             inputs
                 .get(index)
@@ -1939,7 +1943,7 @@ mod tests {
                     .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
                     .collect();
                 let req = one
-                    .install(|| kernel.workspace_requirement(&metadata))
+                    .install(|| kernel.workspace_requirement(&metadata, &[]))
                     .unwrap();
                 assert_eq!(req.bytes, bytes as u64);
                 let plan = RoutingPlan::build(&router_values, ROWS, E, K, true);
@@ -2026,13 +2030,16 @@ mod tests {
     fn execution_workspace_metadata_checks_empty_singleton_dtype_and_overflow() {
         let kernel = workspace_kernel(MOE_GROUPED_MIN_WORK);
         let requirement = |shape: &[usize], dtype, present| {
-            kernel.workspace_requirement(&[
-                TensorMetadata::new(dtype, shape, present),
-                TensorMetadata::new(dtype, &[], false),
-                TensorMetadata::new(dtype, &[], false),
-                TensorMetadata::new(dtype, &[], false),
-                TensorMetadata::new(dtype, &[4, 4, 4], true),
-            ])
+            kernel.workspace_requirement(
+                &[
+                    TensorMetadata::new(dtype, shape, present),
+                    TensorMetadata::new(dtype, &[], false),
+                    TensorMetadata::new(dtype, &[], false),
+                    TensorMetadata::new(dtype, &[], false),
+                    TensorMetadata::new(dtype, &[4, 4, 4], true),
+                ],
+                &[],
+            )
         };
         for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
             assert_eq!(requirement(&[0, 4], dtype, true).unwrap().bytes, 0);
@@ -2055,14 +2062,17 @@ mod tests {
         assert!(requirement(&[3, 4], DataType::Float32, false).is_err());
         assert!(
             kernel
-                .workspace_requirement(&[])
+                .workspace_requirement(&[], &[])
                 .unwrap_err()
                 .to_string()
                 .contains("input 0")
         );
         assert!(
             kernel
-                .workspace_requirement(&[TensorMetadata::new(DataType::Float32, &[3, 4], true)])
+                .workspace_requirement(
+                    &[TensorMetadata::new(DataType::Float32, &[3, 4], true)],
+                    &[]
+                )
                 .unwrap_err()
                 .to_string()
                 .contains("fc2_experts_weights")
@@ -2172,7 +2182,7 @@ mod tests {
                             .iter()
                             .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
                             .collect();
-                        let req = kernel.workspace_requirement(&metadata).unwrap();
+                        let req = kernel.workspace_requirement(&metadata, &[]).unwrap();
                         let bound = if hidden == 0 {
                             0
                         } else {

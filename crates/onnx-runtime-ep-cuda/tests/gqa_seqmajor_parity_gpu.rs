@@ -15,9 +15,11 @@
     clippy::uninlined_format_args,
     clippy::manual_is_multiple_of
 )]
+mod common;
+
 use half::f16;
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, TensorMut, TensorView,
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
 };
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
@@ -251,6 +253,7 @@ fn seq_major_decode_is_bit_identical_to_head_major() {
     // Runs one fused fp16 decode step (append + read) for the given layout,
     // returning the fp16 output bytes and the resulting cache bytes.
     let run_layout = |seq_major: bool, capture: bool| -> (Vec<u8>, Vec<u8>) {
+        let mut workspace = None;
         let kernel = GroupQueryAttentionKernel::new(
             runtime.clone(),
             QUERY_HEADS,
@@ -347,14 +350,25 @@ fn seq_major_decode_is_bit_identical_to_head_major() {
                     device,
                 ),
             ];
-            kernel.execute(&inputs, &mut outputs).unwrap();
+            common::execute_kernel(&ep, &kernel, &inputs, &mut outputs, &mut workspace).unwrap();
             if capture {
                 // Prove the fixed-stride seq-major decode records and replays
                 // inside a CUDA graph: warm up above, capture one step, replay.
                 runtime
-                    .begin_graph_capture(&[&kernel as &dyn onnx_runtime_ep_api::Kernel])
+                    .begin_graph_capture_with_resources(
+                        &[&kernel as &dyn onnx_runtime_ep_api::Kernel],
+                        vec![
+                            workspace
+                                .as_ref()
+                                .unwrap()
+                                .device_graph_resource()
+                                .unwrap()
+                                .unwrap(),
+                        ],
+                    )
                     .unwrap();
-                kernel.execute(&inputs, &mut outputs).unwrap();
+                common::execute_kernel(&ep, &kernel, &inputs, &mut outputs, &mut workspace)
+                    .unwrap();
                 runtime.end_graph_capture().unwrap();
                 runtime.replay_graph().unwrap();
                 runtime.replay_graph().unwrap();
@@ -372,6 +386,9 @@ fn seq_major_decode_is_bit_identical_to_head_major() {
         ep.deallocate(output_buffer).unwrap();
         ep.deallocate(value_buffer).unwrap();
         ep.deallocate(key_buffer).unwrap();
+        if let Some(owner) = workspace {
+            ep.deallocate_workspace(owner).unwrap();
+        }
         (out_bytes, cache_bytes)
     };
 
@@ -529,6 +546,7 @@ fn seq_major_full_generation_prefill_and_decode_is_bit_identical() {
     let capacity_buffer = upload(&ep, typed_bytes(&capacity)).unwrap();
 
     let run_layout = |seq_major: bool, capture: bool| -> (Vec<u8>, Vec<u8>) {
+        let mut workspace = None;
         let kernel = GroupQueryAttentionKernel::new(
             runtime.clone(),
             QUERY_HEADS,
@@ -627,9 +645,14 @@ fn seq_major_full_generation_prefill_and_decode_is_bit_identical() {
                     device,
                 ),
             ];
-            kernel
-                .execute(&prefill_inputs, &mut prefill_outputs)
-                .unwrap();
+            common::execute_kernel(
+                &ep,
+                &kernel,
+                &prefill_inputs,
+                &mut prefill_outputs,
+                &mut workspace,
+            )
+            .unwrap();
         }
 
         {
@@ -709,12 +732,36 @@ fn seq_major_full_generation_prefill_and_decode_is_bit_identical() {
                     device,
                 ),
             ];
-            kernel.execute(&decode_inputs, &mut decode_outputs).unwrap();
+            common::execute_kernel(
+                &ep,
+                &kernel,
+                &decode_inputs,
+                &mut decode_outputs,
+                &mut workspace,
+            )
+            .unwrap();
             if capture {
                 runtime
-                    .begin_graph_capture(&[&kernel as &dyn onnx_runtime_ep_api::Kernel])
+                    .begin_graph_capture_with_resources(
+                        &[&kernel as &dyn onnx_runtime_ep_api::Kernel],
+                        vec![
+                            workspace
+                                .as_ref()
+                                .unwrap()
+                                .device_graph_resource()
+                                .unwrap()
+                                .unwrap(),
+                        ],
+                    )
                     .unwrap();
-                kernel.execute(&decode_inputs, &mut decode_outputs).unwrap();
+                common::execute_kernel(
+                    &ep,
+                    &kernel,
+                    &decode_inputs,
+                    &mut decode_outputs,
+                    &mut workspace,
+                )
+                .unwrap();
                 runtime.end_graph_capture().unwrap();
                 assert_eq!(
                     runtime.graph_segment_count().unwrap(),
@@ -740,6 +787,9 @@ fn seq_major_full_generation_prefill_and_decode_is_bit_identical() {
         .unwrap();
         for buffer in [decode_output, prefill_output, cache_value, cache_key] {
             ep.deallocate(buffer).unwrap();
+        }
+        if let Some(owner) = workspace {
+            ep.deallocate_workspace(owner).unwrap();
         }
         (prefill_bytes, decode_bytes)
     };

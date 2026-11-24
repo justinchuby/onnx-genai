@@ -346,9 +346,7 @@ fn c(value: i64) -> DimExpr {
     DimExpr::constant(value)
 }
 
-/// `CausalConvWithState` (both the `com.microsoft` contrib spelling and the
-/// standard `ai.onnx` opset-27 one): output 0 preserves the `[B, C, L]` input
-/// activation; output 1 is the present conv state `[B, C, K-1]`.
+/// Contrib `CausalConvWithState` with its legacy inference behavior.
 pub fn causal_conv_with_state(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     if let Some(input) = ctx.input_type(0).cloned() {
         ctx.set_output_type(0, input);
@@ -369,6 +367,67 @@ pub fn causal_conv_with_state(ctx: &mut InferenceContext) -> Result<(), ShapeInf
             ctx.set_output_type(1, state);
         }
     }
+    Ok(())
+}
+
+fn causal_conv_with_state_v27(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    require_outputs(ctx, 2)?;
+    if let Some(activation) = ctx.node.attr("activation")
+        && !matches!(activation.as_str(), Some("none" | "silu" | "swish"))
+    {
+        return Err(ShapeInferError::Invalid {
+            op: ctx.op().into(),
+            detail: format!("activation must be none, silu, or swish, got {activation:?}"),
+        });
+    }
+    let input_shape = rank_shape(ctx, 0, 3)?;
+    let weight_shape = rank_shape(ctx, 1, 3)?;
+    let bias_shape = rank_shape(ctx, 2, 1)?;
+    let past_shape = rank_shape(ctx, 3, 3)?;
+    let invalid = |detail: String| ShapeInferError::Invalid {
+        op: "CausalConvWithState".into(),
+        detail,
+    };
+    if let Some(w) = &weight_shape
+        && (w[1].as_const().is_some_and(|d| d != 1) || w[2].as_const().is_some_and(|d| d < 1))
+    {
+        return Err(invalid(format!(
+            "weight must be [C, 1, K] with K >= 1, got {w:?}"
+        )));
+    }
+    let history = if let Some(w) = &weight_shape {
+        w[2].sub(&c(1))
+    } else if let Some(past) = &past_shape {
+        past[2].clone()
+    } else {
+        ctx.fresh_dim()
+    };
+    let matches = |expected: &DimExpr, actual: &DimExpr, name: &str| {
+        if let (Some(a), Some(b)) = (expected.as_const(), actual.as_const())
+            && a != b
+        {
+            return Err(invalid(format!("{name} must be {a}, got {b}")));
+        }
+        Ok(())
+    };
+    let Some(input) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    if let Some(x) = input_shape {
+        if let Some(w) = weight_shape {
+            matches(&x[1], &w[0], "weight channels")?;
+        }
+        if let Some(bias) = bias_shape {
+            matches(&x[1], &bias[0], "bias channels")?;
+        }
+        if let Some(past) = past_shape {
+            matches(&x[0], &past[0], "past_state batch")?;
+            matches(&x[1], &past[1], "past_state channels")?;
+            matches(&history, &past[2], "past_state history")?;
+        }
+        ctx.set_output(1, input.dtype, vec![x[0].clone(), x[1].clone(), history]);
+    }
+    ctx.set_output_type(0, input);
     Ok(())
 }
 
@@ -403,6 +462,56 @@ pub fn linear_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
         && let Some(state) = ctx.input_type(3).cloned()
     {
         ctx.set_output_type(1, state);
+    }
+    Ok(())
+}
+
+fn linear_attention_v27(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    require_outputs(ctx, 2)?;
+    let mode = ctx
+        .node
+        .attr("update_rule")
+        .and_then(Attribute::as_str)
+        .unwrap_or("gated_delta");
+    if let Some(detail) =
+        onnx_runtime_ir::linear_attention::gate_error(mode, ctx.has_input(4), ctx.has_input(5))
+    {
+        return Err(ShapeInferError::Invalid {
+            op: "LinearAttention".into(),
+            detail,
+        });
+    }
+    let q_heads = int_attr(ctx, "q_num_heads", 0)?;
+    let kv_heads = int_attr(ctx, "kv_num_heads", 0)?;
+    if q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0 {
+        return Err(ShapeInferError::Invalid {
+            op: "LinearAttention".into(),
+            detail: format!(
+                "q_num_heads={q_heads} must be a positive multiple of kv_num_heads={kv_heads}"
+            ),
+        });
+    }
+    let Some(dtype) = ctx.input_type(0).map(|t| t.dtype) else {
+        return Ok(());
+    };
+    let query = rank_shape(ctx, 0, 3)?;
+    let value = rank_shape(ctx, 2, 3)?;
+    if let (Some(q), Some(v)) = (query, value) {
+        let d_k = q[2]
+            .checked_div(&c(q_heads))
+            .unwrap_or_else(DimExpr::overflow);
+        let d_v = v[2]
+            .checked_div(&c(kv_heads))
+            .unwrap_or_else(DimExpr::overflow);
+        ctx.set_output(
+            0,
+            dtype,
+            vec![q[0].clone(), q[1].clone(), d_v.mul(&c(q_heads))],
+        );
+        if ctx.num_outputs() >= 2 {
+            let state_dtype = ctx.input_type(3).map_or(dtype, |state| state.dtype);
+            ctx.set_output(1, state_dtype, vec![q[0].clone(), c(kv_heads), d_k, d_v]);
+        }
     }
     Ok(())
 }
@@ -465,11 +574,14 @@ pub fn register(reg: &mut InferenceRegistry) {
         causal_conv_with_state,
     );
     reg.register("com.microsoft", "LinearAttention", 1, linear_attention);
-    // Standard ONNX-domain spelling (onnx/onnx#7689): same shape rule.
-    reg.register("", "LinearAttention", 1, linear_attention);
-    // Standard ONNX-domain spelling, opset 27: same shape rule as the contrib
-    // op, since the contract is identical.
-    reg.register("", "CausalConvWithState", 27, causal_conv_with_state);
+    reg.register_through("", "LinearAttention", 27, 28, linear_attention_v27);
+    reg.register_through(
+        "",
+        "CausalConvWithState",
+        27,
+        28,
+        causal_conv_with_state_v27,
+    );
     reg.register(
         "com.microsoft",
         "GatherBlockQuantized",

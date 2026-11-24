@@ -509,7 +509,11 @@ impl Kernel for NonMaxSuppressionKernel {
         self.materialize(inputs, outputs, workspace)
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         let boxes = inputs
             .first()
             .filter(|input| input.present)
