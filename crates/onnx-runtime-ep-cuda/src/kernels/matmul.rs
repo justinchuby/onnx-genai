@@ -18,14 +18,14 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
-    TensorView, WorkspaceRequirement, WorkspaceView,
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView, WorkspaceLayout,
+    WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::blas::{self, GemmDtype, GemmParams};
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, cuptr};
 
 /// NVRTC module/entry for the dense decode GEMVs.
 const GEMV_F16_MODULE: &str = "matmul_dense_gemv_f16";
@@ -34,9 +34,8 @@ const GEMV_F16_ENTRY: &str = "matmul_dense_gemv_f16";
 /// a single `MatMul` node keeps warm simultaneously. A node realistically sees a
 /// small, fixed set — decode `M==1`, a handful of prefill widths, and any
 /// speculative verify width — so 8 covers the hot working set while capping the
-/// per-node workspace footprint. Eviction is LRU and only runs off the
-/// (non-capturing) creation path, so the MRU decode plan baked into a live
-/// captured graph is never freed.
+/// per-node host-plan footprint. Eviction is LRU and follows successful eager
+/// creation; capture can only reuse already-warmed host plans.
 const DENSE_PLAN_CACHE_CAP: usize = 8;
 /// Threads per block for the dense fp16 GEMV. One thread owns one output
 /// column, so a warp reads 32 consecutive `B[k, col]` fp16 values — a fully
@@ -101,6 +100,7 @@ impl KernelFactory for MatMulFactory {
                 f32_gemv: None,
                 dense_plans: Vec::new(),
                 capture_ready: None,
+                prepared: None,
             }),
         }))
     }
@@ -114,20 +114,21 @@ pub struct MatMulKernel {
 }
 
 struct MatMulWarmState {
-    /// cuBLASLt objects and workspace preselected during the f32 M==1 warmup.
+    /// Pure host cuBLASLt plan preselected during the f32 M==1 warmup.
     /// Reusing the exact algorithm preserves bitwise parity with the old path
     /// while eliminating all capture-time setup and device allocation.
     f32_gemv: Option<CachedGemmPlan>,
-    /// cuBLASLt plans + persistent workspaces keyed by the 2-D (`batch == 1`)
+    /// Host cuBLASLt plans keyed by the 2-D (`batch == 1`)
     /// dense shape and the selected algorithm's pointer-alignment contract.
     /// Each compatible shape the node runs keeps its own preselected algorithm,
     /// so alternating prefill/decode/verify shapes replay without a per-call
     /// heuristic query while a weaker-aligned subview is replanned safely.
     /// MRU-ordered (front = most recent); bounded by [`DENSE_PLAN_CACHE_CAP`].
     dense_plans: Vec<CachedGemmPlan>,
-    /// Immutable signature and exact private workspace owner from the most
-    /// recent successful capture-safe call.
-    capture_ready: Option<Arc<MatMulCaptureReady>>,
+    /// Signature of the most recent successful capture-safe call.
+    capture_ready: Option<MatMulCaptureSignature>,
+    /// One exclusive refine/admit/launch transaction; candidates own only host state.
+    prepared: Option<PreparedDispatch>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,102 +150,99 @@ enum MatMulCaptureRoute {
     CublasLt,
 }
 
-#[derive(Clone)]
-struct MatMulCaptureReady {
-    signature: MatMulCaptureSignature,
-    resources: Vec<DeviceGraphResource>,
-}
-
-/// One cached cuBLASLt plan representation for both F32 single-row decode and
-/// other single-matrix GEMMs. Cache policy remains with MatMulWarmState: the
-/// decode slot and bounded dense MRU retain their existing independent lifetimes.
-///
-/// Scratch is still kernel-owned here. Moving it to the caller lane requires
-/// planning from the actual output layout before workspace admission; a
-/// TypedMinimum heuristic is not an upper bound for an ActualAddress plan.
+/// Cache entries contain algorithms and host descriptors, never device scratch.
 struct CachedGemmPlan {
-    runtime: Arc<CudaRuntime>,
     dtype: GemmDtype,
     m: usize,
     k: usize,
     n: usize,
-    plan: blas::CaptureGemmPlan,
-    workspace: Option<Arc<GraphDeviceAllocation>>,
+    algorithm: DenseAlgorithm,
+}
+
+enum DenseAlgorithm {
+    CublasLt(blas::CaptureGemmPlan),
+    F16HandGemv,
+}
+
+/// The selected plan is fixed before admission. A cold candidate enters the
+/// cache only after a successful launch; quota errors cannot select a fallback.
+enum PreparedPlan {
+    F32Slot,
+    Dense(usize),
+    Candidate(CachedGemmPlan),
+    F16HandGemv,
+}
+
+struct PreparedDispatch {
+    signature: MatMulCaptureSignature,
+    plan: PreparedPlan,
+    warmed: Option<MatMulCaptureSignature>,
+}
+
+impl PreparedPlan {
+    fn cached<'a>(&'a self, state: &'a MatMulWarmState) -> Result<Option<&'a CachedGemmPlan>> {
+        let entry = match self {
+            Self::F32Slot => state.f32_gemv.as_ref(),
+            Self::Dense(index) => state.dense_plans.get(*index),
+            Self::Candidate(plan) => Some(plan),
+            Self::F16HandGemv => return Ok(None),
+        };
+        entry.map(Some).ok_or_else(|| EpError::KernelFailed("cuda_ep MatMul: the admitted host-plan cache entry disappeared; retain exclusive kernel execution ownership from refinement through admission and launch".into()))
+    }
 }
 
 impl CachedGemmPlan {
-    #[allow(clippy::too_many_arguments)]
-    fn matches(
-        &self,
-        dtype: GemmDtype,
-        m: usize,
-        k: usize,
-        n: usize,
-        a: u64,
-        b: u64,
-        c: u64,
-    ) -> bool {
-        self.dtype == dtype
-            && self.m == m
-            && self.k == k
-            && self.n == n
-            && self
-                .plan
-                .supports(&dense_gemm_params(dtype, m, k, n, a, b, c))
+    fn matches(&self, p: &GemmParams) -> bool {
+        self.dtype == p.dtype
+            && (self.m, self.k, self.n) == (p.m, p.k, p.n)
+            && match &self.algorithm {
+                DenseAlgorithm::CublasLt(plan) => plan.supports(p),
+                DenseAlgorithm::F16HandGemv => true,
+            }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        runtime: Arc<CudaRuntime>,
-        dtype: GemmDtype,
-        m: usize,
-        k: usize,
-        n: usize,
-        a: u64,
-        b: u64,
-        c: u64,
-    ) -> Result<Self> {
-        let params = dense_gemm_params(dtype, m, k, n, a, b, c);
-        let plan = blas::plan_capture_gemm(runtime.blas(), &params)?;
-        let workspace_bytes = plan.workspace_bytes();
-        let workspace = if workspace_bytes > 0 {
-            Some(GraphDeviceAllocation::allocate(&runtime, workspace_bytes)?)
-        } else {
-            None
+    fn new(runtime: &CudaRuntime, params: &GemmParams) -> Result<Self> {
+        let algorithm = match blas::plan_capture_gemm(runtime.blas(), params) {
+            Ok(plan) => DenseAlgorithm::CublasLt(plan),
+            // Only planning can choose the zero-scratch fallback. Allocation or
+            // launch failures must propagate, never bypass governed admission.
+            Err(_) if params.dtype == GemmDtype::F16 && params.m == 1 => {
+                DenseAlgorithm::F16HandGemv
+            }
+            Err(error) => return Err(error),
         };
         Ok(Self {
-            runtime,
-            dtype,
-            m,
-            k,
-            n,
-            plan,
-            workspace,
+            dtype: params.dtype,
+            m: params.m,
+            k: params.k,
+            n: params.n,
+            algorithm,
         })
     }
 
-    fn launch(&self, a: u64, b: u64, c: u64) -> Result<()> {
-        let params = dense_gemm_params(self.dtype, self.m, self.k, self.n, a, b, c);
-        // SAFETY: `params` matches the shape the plan was selected for; a/b/c are
-        // live device buffers for this call; `workspace` covers the plan's
-        // requirement; the runtime stream is valid and current.
-        unsafe {
-            self.plan.launch(
-                self.runtime.blas(),
-                self.runtime.stream_ptr(),
-                &params,
-                self.workspace
-                    .as_ref()
-                    .map_or(0, |workspace| workspace.ptr()),
-            )
+    fn workspace_bytes(&self) -> usize {
+        match &self.algorithm {
+            DenseAlgorithm::CublasLt(plan) => plan.workspace_bytes(),
+            DenseAlgorithm::F16HandGemv => 0,
         }
     }
 
-    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
-        self.workspace
-            .as_ref()
-            .map(GraphDeviceAllocation::device_graph_resource)
+    fn route(&self) -> MatMulCaptureRoute {
+        match &self.algorithm {
+            DenseAlgorithm::F16HandGemv => MatMulCaptureRoute::F16HandGemv,
+            DenseAlgorithm::CublasLt(_) if self.dtype == GemmDtype::F32 && self.m == 1 => {
+                MatMulCaptureRoute::F32Gemv
+            }
+            DenseAlgorithm::CublasLt(_) => MatMulCaptureRoute::CublasLt,
+        }
     }
+}
+
+fn dense_workspace(bytes: usize, workspace: Option<WorkspaceView>) -> Result<WorkspaceView> {
+    let region = std::alloc::Layout::from_size_align(bytes, blas::WORKSPACE_ALIGNMENT)
+        .map_err(|_| EpError::KernelFailed(format!("cuda_ep MatMul: cuBLASLt scratch {bytes} bytes exceeds addressable capacity; reduce the GEMM shape")))?;
+    let [used] = WorkspaceLayout::new([region])?.bind(workspace)?;
+    Ok(used)
 }
 
 /// Build [`GemmParams`] for a plain 2-D (`batch == 1`) dense GEMM.
@@ -299,7 +297,7 @@ struct MatMulPlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MatMulExecutionRoute {
     DenseGemv,
-    DensePrivateGemm,
+    DenseCachedGemm,
     ExecutorWorkspaceGemm,
 }
 
@@ -373,7 +371,7 @@ impl MatMulPlan {
         {
             MatMulExecutionRoute::DenseGemv
         } else if single_matrix {
-            MatMulExecutionRoute::DensePrivateGemm
+            MatMulExecutionRoute::DenseCachedGemm
         } else {
             MatMulExecutionRoute::ExecutorWorkspaceGemm
         }
@@ -432,10 +430,25 @@ fn inner_mismatch(a: &[usize], b: &[usize]) -> EpError {
     ))
 }
 
+/// None denotes the existing batched metadata planner, never zero demand.
+fn dense_metadata_preparation(
+    plan: &MatMulPlan,
+    dtype: GemmDtype,
+    use_cublaslt: bool,
+) -> Option<onnx_runtime_ep_api::WorkspacePreparation> {
+    match plan.execution_route(dtype) {
+        MatMulExecutionRoute::ExecutorWorkspaceGemm => None,
+        MatMulExecutionRoute::DenseGemv if dtype == GemmDtype::F16 && !use_cublaslt => Some(
+            onnx_runtime_ep_api::WorkspacePreparation::Ready(WorkspaceRequirement::NONE),
+        ),
+        _ => Some(onnx_runtime_ep_api::WorkspacePreparation::Deferred),
+    }
+}
+
 /// Whether the M==1 fp16 `lm_head` decode MatMul takes the capturable cuBLASLt
 /// plan path (default) instead of the hand fp16 GEMV. Default-ON: cuBLASLt is
 /// ~1.5x faster on the dense logits projection and, with the shape-keyed plan
-/// cache ([`MatMulKernel::launch_dense_capturable`]), is CUDA-graph capturable
+/// cache (the cached host plan), is CUDA-graph capturable
 /// across prefill/decode/verify shapes. Set `ONNX_GENAI_LMHEAD_CUBLASLT` to
 /// `0`/`false`/`off` to fall back to the hand GEMV (the OFF escape hatch).
 fn lmhead_cublaslt_enabled() -> bool {
@@ -446,40 +459,136 @@ fn lmhead_cublaslt_enabled() -> bool {
 }
 
 impl MatMulKernel {
-    fn validate_capture_signature(
-        state: &MatMulWarmState,
-        signature: &MatMulCaptureSignature,
-    ) -> Result<()> {
-        let ready = state.capture_ready.as_ref().ok_or_else(|| {
-            EpError::KernelFailed(
-                "cuda_ep MatMul: capture began without a successful warmed signature. HOW: run \
-                 the exact dense MatMul signature eagerly before capture."
-                    .into(),
-            )
-        })?;
-        if ready.signature != *signature {
+    fn validate_operands(
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+    ) -> Result<(GemmDtype, MatMulPlan)> {
+        if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep MatMul: signature changed during CUDA graph capture: warmed={:?}, \
-                 current={signature:?}. HOW: abort capture and warm the exact replacement.",
-                ready.signature
+                "cuda_ep MatMul: expected 2 inputs and 1 output, got {} and {}; provide both operands and one destination",
+                inputs.len(),
+                outputs.len()
             )));
         }
-        Ok(())
+        let [a, b] = inputs else { unreachable!() };
+        let dtype = gemm_dtype(a.dtype)?;
+        if b.dtype != a.dtype || outputs[0].dtype != a.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep MatMul: mixed dtypes A={:?} B={:?} C={:?}; all must match",
+                a.dtype, b.dtype, outputs[0].dtype
+            )));
+        }
+        if !a.is_contiguous() || !b.is_contiguous() || !outputs[0].is_contiguous() {
+            return Err(not_implemented(
+                "MatMul with non-contiguous operands/output; materialize contiguous storage before execution",
+            ));
+        }
+        let plan = matmul_plan(a.shape, b.shape)?;
+        let expected = plan.output_shape();
+        if outputs[0].shape != expected {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep MatMul: output shape {:?}, expected {expected:?}; bind the inferred output shape",
+                outputs[0].shape
+            )));
+        }
+        Ok((dtype, plan))
     }
 
-    fn publish_capture_ready(
-        state: &mut MatMulWarmState,
-        signature: MatMulCaptureSignature,
-        resources: Vec<DeviceGraphResource>,
-    ) {
-        state.capture_ready = Some(Arc::new(MatMulCaptureReady {
-            signature,
-            resources,
-        }));
+    fn signature(
+        dtype: GemmDtype,
+        plan: &MatMulPlan,
+        route: MatMulCaptureRoute,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+    ) -> MatMulCaptureSignature {
+        MatMulCaptureSignature {
+            dtype,
+            route,
+            a_shape: inputs[0].shape.to_vec(),
+            b_shape: inputs[1].shape.to_vec(),
+            output_shape: outputs[0].shape.to_vec(),
+            m: plan.m,
+            k: plan.k,
+            n: plan.n,
+        }
     }
 
-    fn publish_capture_unsupported(state: &mut MatMulWarmState) {
-        state.capture_ready = None;
+    fn prepare_execution(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+    ) -> Result<WorkspaceRequirement> {
+        let mut state = self.warm_state.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep MatMul: warm-state lock poisoned; recreate the kernel".into(),
+            )
+        })?;
+        // A failed refiner or generic admission must revoke capture proof too:
+        // neither failure necessarily reaches execute.
+        let warmed = state.capture_ready.take();
+        state.prepared = None;
+        let (dtype, geometry) = Self::validate_operands(inputs, outputs)?;
+        if geometry.execution_route(dtype) == MatMulExecutionRoute::ExecutorWorkspaceGemm {
+            return match cached {
+                Some(preparation) => preparation.require_ready(),
+                None => self.workspace_requirement_for(metadata),
+            };
+        }
+        let params = dense_gemm_params(
+            dtype,
+            geometry.m,
+            geometry.k,
+            geometry.n,
+            cuptr(inputs[0].data_ptr::<u8>().cast()),
+            cuptr(inputs[1].data_ptr::<u8>().cast()),
+            // Inspect only the opaque element origin; output values are uninitialized.
+            cuptr(
+                outputs[0]
+                    .data
+                    .0
+                    .cast::<u8>()
+                    .wrapping_add(outputs[0].byte_offset)
+                    .cast(),
+            ),
+        );
+        let f32_decode = dtype == GemmDtype::F32 && geometry.m == 1;
+        let selected = if matches!(
+            dense_metadata_preparation(&geometry, dtype, lmhead_cublaslt_enabled()),
+            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(_))
+        ) {
+            PreparedPlan::F16HandGemv
+        } else if f32_decode && state.f32_gemv.as_ref().is_some_and(|p| p.matches(&params)) {
+            PreparedPlan::F32Slot
+        } else if !f32_decode
+            && let Some(index) = state.dense_plans.iter().position(|p| p.matches(&params))
+        {
+            PreparedPlan::Dense(index)
+        } else {
+            // Warm hits do not ask the driver whether capture is active.
+            if self.runtime.is_capturing()? {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep MatMul: dtype={dtype:?} M={} K={} N={} and its address alignment were not warmed before capture; abort capture and eagerly prepare/execute the exact bindings",
+                    geometry.m, geometry.k, geometry.n
+                )));
+            }
+            let candidate = CachedGemmPlan::new(&self.runtime, &params)?;
+            self.runtime
+                .staged_warm_cache_mutation("MatMul dense host-plan creation")?;
+            PreparedPlan::Candidate(candidate)
+        };
+        let (bytes, route) = selected
+            .cached(&state)?
+            .map_or((0, MatMulCaptureRoute::F16HandGemv), |p| {
+                (p.workspace_bytes(), p.route())
+            });
+        state.prepared = Some(PreparedDispatch {
+            signature: Self::signature(dtype, &geometry, route, inputs, outputs),
+            plan: selected,
+            warmed,
+        });
+        Ok(blas::governed_workspace_requirement(bytes))
     }
 
     fn run(
@@ -488,46 +597,16 @@ impl MatMulKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
-        if inputs.len() != 2 || outputs.len() != 1 {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep MatMul: expected 2 inputs and 1 output, got {} and {}",
-                inputs.len(),
-                outputs.len()
-            )));
-        }
+        let mut warm_state = self.warm_state.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep MatMul: warm-state lock poisoned; recreate the kernel".into(),
+            )
+        })?;
+        warm_state.capture_ready = None;
+        let prepared = warm_state.prepared.take();
+        let (dtype, plan) = Self::validate_operands(inputs, outputs)?;
         let a = &inputs[0];
         let b = &inputs[1];
-
-        // All operands must share one supported element type.
-        let dtype = gemm_dtype(a.dtype)?;
-        if b.dtype != a.dtype || outputs[0].dtype != a.dtype {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep MatMul: mixed dtypes A={:?} B={:?} C={:?} (all must match)",
-                a.dtype, b.dtype, outputs[0].dtype
-            )));
-        }
-
-        // Dense, row-major device buffers are required. Strided views (e.g. a
-        // transposed input) must be materialised by the graph.
-        if !a.is_contiguous() || !b.is_contiguous() {
-            return Err(not_implemented(
-                "MatMul with a non-contiguous (strided) input; \
-                 insert an explicit copy/transpose before the MatMul",
-            ));
-        }
-        if !outputs[0].is_contiguous() {
-            return Err(not_implemented("MatMul with a non-contiguous output"));
-        }
-
-        let plan = matmul_plan(a.shape, b.shape)?;
-
-        let expected_shape = plan.output_shape();
-        if outputs[0].shape != expected_shape {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep MatMul: output shape {:?}, expected {expected_shape:?}",
-                outputs[0].shape
-            )));
-        }
         let execution_route = plan.execution_route(dtype);
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             crate::trace::product(plan.batch_shape.iter().copied())
@@ -537,84 +616,85 @@ impl MatMulKernel {
                 .saturating_mul(2)
         });
         let capturing = self.runtime.is_capturing()?;
-        let a_shape = a.shape.to_vec();
-        let b_shape = b.shape.to_vec();
-        let output_shape = outputs[0].shape.to_vec();
-        let capture_signature = |route| MatMulCaptureSignature {
-            dtype,
-            route,
-            a_shape: a_shape.clone(),
-            b_shape: b_shape.clone(),
-            output_shape: output_shape.clone(),
-            m: plan.m,
-            k: plan.k,
-            n: plan.n,
-        };
-
-        // Device pointers (byte_offset applied). These are opaque CUDA
-        // addresses, never dereferenced on the host.
-        let a_ptr = cuptr(a.data_ptr::<u8>() as *const std::ffi::c_void);
-        let b_ptr = cuptr(b.data_ptr::<u8>() as *const std::ffi::c_void);
-        let c_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const std::ffi::c_void);
-        let mut warm_state = self.warm_state.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep MatMul: warm-state lock poisoned".into())
-        })?;
-
-        // Decode fast path: a single f32/fp16 `y[1, N] = a[1, K] * B[K, N]`.
-        // fp16 uses the dedicated GEMV; f32 reuses a cuBLASLt algorithm and
-        // workspace selected once at warmup. Neither path allocates, queries a
-        // heuristic, or synchronizes while capturing. The gate is purely
-        // structural, never tied to a model dimension.
-        if execution_route == MatMulExecutionRoute::DenseGemv {
-            let route = match dtype {
-                GemmDtype::F16 if lmhead_cublaslt_enabled() => MatMulCaptureRoute::CublasLt,
-                GemmDtype::F16 => MatMulCaptureRoute::F16HandGemv,
-                GemmDtype::F32 => MatMulCaptureRoute::F32Gemv,
-                GemmDtype::Bf16 => unreachable!("bf16 excluded by GEMV gate"),
-            };
-            let mut signature = capture_signature(route);
-            if capturing {
-                Self::validate_capture_signature(&warm_state, &signature)?;
+        let a_ptr = cuptr(a.data_ptr::<u8>().cast());
+        let b_ptr = cuptr(b.data_ptr::<u8>().cast());
+        let c_ptr = cuptr(outputs[0].data_ptr_mut::<u8>().cast());
+        if execution_route != MatMulExecutionRoute::ExecutorWorkspaceGemm {
+            let prepared = prepared.ok_or_else(|| EpError::KernelFailed("cuda_ep MatMul: no execution-time plan was prepared; refine workspace using the real input/output views, admit its exact requirement, then execute with the borrowed workspace".into()))?;
+            let signature = prepared.signature;
+            if signature.dtype != dtype
+                || (signature.m, signature.k, signature.n) != (plan.m, plan.k, plan.n)
+                || signature.a_shape != a.shape
+                || signature.b_shape != b.shape
+                || signature.output_shape != outputs[0].shape
+            {
+                return Err(EpError::KernelFailed("cuda_ep MatMul: bindings changed after workspace refinement; repeat refinement and admission for the actual launch bindings".into()));
             }
-            let resources = match dtype {
-                GemmDtype::F16 => {
-                    if lmhead_cublaslt_enabled() {
-                        match self.launch_dense_capturable(
-                            &mut warm_state,
-                            dtype,
-                            plan.m,
-                            plan.k,
-                            plan.n,
-                            a_ptr,
-                            b_ptr,
-                            c_ptr,
-                        ) {
-                            Ok(resources) => resources,
-                            Err(_err) if !self.runtime.is_capturing()? => {
-                                self.launch_dense_gemv_f16(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?;
-                                signature = capture_signature(MatMulCaptureRoute::F16HandGemv);
-                                Vec::new()
-                            }
-                            Err(err) => return Err(err),
-                        }
-                    } else {
-                        self.launch_dense_gemv_f16(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?;
-                        Vec::new()
+            if capturing && prepared.warmed.as_ref() != Some(&signature) {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep MatMul: signature changed or no successful warm preceded capture: current={signature:?}; abort capture and eagerly execute the exact signature"
+                )));
+            }
+            if capturing && matches!(prepared.plan, PreparedPlan::Candidate(_)) {
+                return Err(EpError::KernelFailed("cuda_ep MatMul: a cold host-plan candidate cannot be launched during capture; eagerly execute it first".into()));
+            }
+            let params = dense_gemm_params(dtype, plan.m, plan.k, plan.n, a_ptr, b_ptr, c_ptr);
+            if let Some(cached) = prepared.plan.cached(&warm_state)? {
+                if !cached.matches(&params) {
+                    return Err(EpError::KernelFailed("cuda_ep MatMul: launch addresses violate the admitted plan's alignment contract; refine again with the actual addresses".into()));
+                }
+                let used = dense_workspace(cached.workspace_bytes(), workspace)?;
+                if capturing && used.bytes() != 0 {
+                    self.runtime.require_registered_workspace_capture(
+                        used,
+                        "MatMul dense cuBLASLt workspace",
+                    )?;
+                }
+                let replacing = if dtype == GemmDtype::F32 && plan.m == 1 {
+                    warm_state.f32_gemv.is_some()
+                } else {
+                    warm_state.dense_plans.len() == DENSE_PLAN_CACHE_CAP
+                };
+                if matches!(prepared.plan, PreparedPlan::Candidate(_)) && replacing {
+                    // Retain the existing conservative retirement boundary for
+                    // host descriptors which could still have queued users.
+                    self.runtime.drain_for_unmap()?;
+                }
+                match &cached.algorithm {
+                    DenseAlgorithm::CublasLt(host_plan) => {
+                        // SAFETY: validated geometry and exact alignment contract;
+                        // `used` covers this very plan's admitted scratch.
+                        unsafe {
+                            host_plan.launch(
+                                self.runtime.blas(),
+                                self.runtime.stream_ptr(),
+                                &params,
+                                cuptr(used.ptr().0.cast_const()),
+                            )
+                        }?;
+                    }
+                    DenseAlgorithm::F16HandGemv => {
+                        self.launch_dense_gemv_f16(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?
                     }
                 }
-                GemmDtype::F32 => self.launch_dense_gemv_f32(
-                    &mut warm_state,
-                    a_ptr,
-                    b_ptr,
-                    c_ptr,
-                    plan.k,
-                    plan.n,
-                )?,
-                GemmDtype::Bf16 => unreachable!("bf16 excluded by GEMV gate"),
-            };
-            if !capturing {
-                Self::publish_capture_ready(&mut warm_state, signature, resources);
+            } else {
+                self.launch_dense_gemv_f16(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?;
             }
+            match prepared.plan {
+                PreparedPlan::Candidate(candidate) if dtype == GemmDtype::F32 && plan.m == 1 => {
+                    warm_state.f32_gemv = Some(candidate)
+                }
+                PreparedPlan::Candidate(candidate) => {
+                    warm_state.dense_plans.insert(0, candidate);
+                    warm_state.dense_plans.truncate(DENSE_PLAN_CACHE_CAP);
+                }
+                PreparedPlan::Dense(index) if !capturing && index != 0 => {
+                    let plan = warm_state.dense_plans.remove(index);
+                    warm_state.dense_plans.insert(0, plan);
+                }
+                _ => {}
+            }
+            warm_state.capture_ready = Some(signature);
             return Ok(());
         }
 
@@ -622,33 +702,6 @@ impl MatMulKernel {
         let a_matrix_bytes = plan.m * plan.k * elem_bytes;
         let b_matrix_bytes = plan.k * plan.n * elem_bytes;
         let c_matrix_bytes = plan.m * plan.n * elem_bytes;
-
-        // M>1 capture-safe fast path: a plain 2-D (`batch == 1`) dense GEMM
-        // reuses a cuBLASLt plan + persistent workspace selected once at warmup,
-        // so replays perform no heuristic query, allocation, or synchronization
-        // (its own workspace is never shared, so no post-GEMM sync is needed).
-        // This closes the last CUDA-graph capture seam at a speculative M=K
-        // verify width — the logits projection (`lm_head`).
-        if execution_route == MatMulExecutionRoute::DensePrivateGemm {
-            let signature = capture_signature(MatMulCaptureRoute::CublasLt);
-            if capturing {
-                Self::validate_capture_signature(&warm_state, &signature)?;
-            }
-            let resources = self.launch_dense_capturable(
-                &mut warm_state,
-                dtype,
-                plan.m,
-                plan.k,
-                plan.n,
-                a_ptr,
-                b_ptr,
-                c_ptr,
-            )?;
-            if !capturing {
-                Self::publish_capture_ready(&mut warm_state, signature, resources);
-            }
-            return Ok(());
-        }
 
         debug_assert_eq!(execution_route, MatMulExecutionRoute::ExecutorWorkspaceGemm);
         if capturing {
@@ -687,7 +740,6 @@ impl MatMulKernel {
                 }
             })
             .and_then(|()| self.runtime.synchronize())?;
-        Self::publish_capture_unsupported(&mut warm_state);
         Ok(())
     }
 
@@ -770,134 +822,6 @@ impl MatMulKernel {
         .map(|_| ())
         .map_err(|err| driver_err("launch MatMul fp16 GEMV", err))
     }
-
-    /// Launch the dense true-fp32 GEMV on the runtime stream.
-    ///
-    /// Warmup selects and retains the cuBLASLt algorithm and its required
-    /// workspace. Subsequent launches perform no allocation, host
-    /// synchronization, or heuristic query.
-    fn launch_dense_gemv_f32(
-        &self,
-        state: &mut MatMulWarmState,
-        a_ptr: u64,
-        b_ptr: u64,
-        c_ptr: u64,
-        k: usize,
-        n: usize,
-    ) -> Result<Vec<DeviceGraphResource>> {
-        let capturing = self.runtime.is_capturing()?;
-        if state.f32_gemv.as_ref().is_some_and(|candidate| {
-            candidate.matches(GemmDtype::F32, 1, k, n, a_ptr, b_ptr, c_ptr)
-        }) {
-            let cached = state.f32_gemv.as_ref().unwrap();
-            let resource = cached.device_graph_resource();
-            if capturing && let Some(resource) = &resource {
-                self.runtime.require_registered_address_capture(
-                    resource.identity(),
-                    "MatMul f32 GEMV workspace",
-                )?;
-            }
-            cached.launch(a_ptr, b_ptr, c_ptr)?;
-            return Ok(resource.into_iter().collect());
-        }
-        if capturing {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep MatMul: f32 GEMV K={k}, N={n} was not warmed before capture"
-            )));
-        }
-        let candidate = CachedGemmPlan::new(
-            self.runtime.clone(),
-            GemmDtype::F32,
-            1,
-            k,
-            n,
-            a_ptr,
-            b_ptr,
-            c_ptr,
-        )?;
-        self.runtime
-            .staged_warm_cache_mutation("MatMul f32 GEMV plan/workspace creation")?;
-        if state.f32_gemv.is_some() {
-            // Retire all users of the old plan without publishing or dropping
-            // it; replacement still depends on the candidate launch succeeding.
-            self.runtime.drain_for_unmap()?;
-        }
-        candidate.launch(a_ptr, b_ptr, c_ptr)?;
-        let resource = candidate.device_graph_resource();
-        state.f32_gemv = Some(candidate);
-        Ok(resource.into_iter().collect())
-    }
-
-    /// Launch a plain 2-D (`batch == 1`) dense M>1 GEMM through a cached
-    /// cuBLASLt plan (algorithm + persistent workspace) selected once at warmup.
-    ///
-    /// Reusing the heuristic-selected algorithm preserves the shared cuBLASLt
-    /// precision contract at a fixed shape and pointer-alignment class while
-    /// eliminating the capture-time heuristic query, allocation, and
-    /// synchronization. Mirrors [`Self::launch_dense_gemv_f32`]'s warm-once /
-    /// reject-cold-miss-during-capture contract.
-    #[allow(clippy::too_many_arguments)]
-    fn launch_dense_capturable(
-        &self,
-        state: &mut MatMulWarmState,
-        dtype: GemmDtype,
-        m: usize,
-        k: usize,
-        n: usize,
-        a_ptr: u64,
-        b_ptr: u64,
-        c_ptr: u64,
-    ) -> Result<Vec<DeviceGraphResource>> {
-        let capturing = self.runtime.is_capturing()?;
-        // Shape/alignment-contract lookup: a plan is reusable only when the
-        // current tensor origins prove the selected algorithm's requirements.
-        // A hit is promoted to MRU so the hot decode shape is not the LRU
-        // eviction victim.
-        if let Some(idx) = state
-            .dense_plans
-            .iter()
-            .position(|plan| plan.matches(dtype, m, k, n, a_ptr, b_ptr, c_ptr))
-        {
-            let resource = state.dense_plans[idx].device_graph_resource();
-            if capturing && let Some(resource) = &resource {
-                self.runtime.require_registered_address_capture(
-                    resource.identity(),
-                    "MatMul dense GEMM workspace",
-                )?;
-            }
-            state.dense_plans[idx].launch(a_ptr, b_ptr, c_ptr)?;
-            if !capturing && idx != 0 {
-                let plan = state.dense_plans.remove(idx);
-                state.dense_plans.insert(0, plan);
-            }
-            return Ok(resource.into_iter().collect());
-        }
-        // Cold miss. During capture we must not create a plan (the heuristic
-        // query, allocation, and the cache mutation are all illegal inside a
-        // captured region), so require the shape to have been warmed by a
-        // preceding non-capturing pass — the same contract the single-shape
-        // path enforced, now per shape.
-        if capturing {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep MatMul: dense GEMM dtype={dtype:?} M={m} K={k} N={n} \
-                 was not warmed before capture"
-            )));
-        }
-        let candidate =
-            CachedGemmPlan::new(self.runtime.clone(), dtype, m, k, n, a_ptr, b_ptr, c_ptr)?;
-        self.runtime
-            .staged_warm_cache_mutation("MatMul dense plan/workspace creation")?;
-        if state.dense_plans.len() == DENSE_PLAN_CACHE_CAP {
-            // Complete all users of the eventual LRU victim, but do not evict
-            // anything until the replacement launch has succeeded.
-            self.runtime.drain_for_unmap()?;
-        }
-        candidate.launch(a_ptr, b_ptr, c_ptr)?;
-        let resource = candidate.device_graph_resource();
-        state.dense_plans.insert(0, candidate);
-        state.dense_plans.truncate(DENSE_PLAN_CACHE_CAP);
-        Ok(resource.into_iter().collect())
-    }
 }
 
 impl Kernel for MatMulKernel {
@@ -910,8 +834,28 @@ impl Kernel for MatMulKernel {
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
+        if let [a, b] = inputs {
+            let dtype = gemm_dtype(a.dtype)?;
+            let plan = matmul_plan(a.shape, b.shape)?;
+            if let Some(preparation) =
+                dense_metadata_preparation(&plan, dtype, lmhead_cublaslt_enabled())
+            {
+                return Ok(preparation);
+            }
+        }
         self.workspace_requirement_for(inputs)
             .map(onnx_runtime_ep_api::WorkspacePreparation::Ready)
+    }
+
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        _output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+    ) -> Result<WorkspaceRequirement> {
+        self.prepare_execution(inputs, outputs, metadata, cached)
     }
 
     fn execute_with_workspace(
@@ -928,24 +872,11 @@ impl Kernel for MatMulKernel {
         false
     }
 
-    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.warm_state
-            .lock()
-            .ok()
-            .and_then(|state| {
-                state
-                    .capture_ready
-                    .as_ref()
-                    .map(|ready| ready.resources.clone())
-            })
-            .unwrap_or_default()
-    }
-
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // The dense f32/fp16 M==1 GEMV fast paths and the plain 2-D (`batch==1`)
         // M>1 cached-plan path perform no per-call allocation, D2H, heuristic
         // query, or synchronization. Advertise capture only after such a call
-        // has warmed the required persistent state (algorithm + workspace).
+        // has warmed the selected host algorithm and borrowed caller workspace.
         match self.warm_state.lock() {
             Ok(state) if state.capture_ready.is_some() => {
                 onnx_runtime_ep_api::CaptureSupport::Supported
@@ -968,6 +899,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dense_metadata_never_substitutes_zero_for_an_address_selected_plan() {
+        use onnx_runtime_ep_api::WorkspacePreparation::{Deferred, Ready};
+        for (a, b) in [([1, 17], [17, 23]), ([4, 17], [17, 23])] {
+            let plan = matmul_plan(&a, &b).unwrap();
+            for dtype in [GemmDtype::F32, GemmDtype::F16, GemmDtype::Bf16] {
+                assert_eq!(
+                    dense_metadata_preparation(&plan, dtype, true),
+                    Some(Deferred)
+                );
+                let off = dense_metadata_preparation(&plan, dtype, false).unwrap();
+                if dtype == GemmDtype::F16 && a[0] == 1 {
+                    assert_eq!(off, Ready(WorkspaceRequirement::NONE));
+                } else {
+                    assert_eq!(off, Deferred);
+                }
+            }
+        }
+        let batched = matmul_plan(&[2, 4, 17], &[2, 17, 23]).unwrap();
+        assert_eq!(
+            dense_metadata_preparation(&batched, GemmDtype::F32, true),
+            None
+        );
+    }
+
+    #[test]
+    fn dense_scratch_binds_only_the_exact_admitted_span() {
+        use onnx_runtime_ep_api::DevicePtrMut;
+        let view = WorkspaceView::new(DevicePtrMut(0x1000usize as *mut _), 8192);
+        let used = dense_workspace(1024, Some(view)).unwrap();
+        assert_eq!(used.ptr().0, view.ptr().0);
+        assert_eq!(
+            used.bytes(),
+            1024,
+            "capture needs the plan's used span, not an unrelated entire arena"
+        );
+        for offered in [
+            None,
+            Some(WorkspaceView::new(view.ptr(), 1023)),
+            Some(WorkspaceView::new(
+                DevicePtrMut(0x1001usize as *mut _),
+                8192,
+            )),
+        ] {
+            let error = dense_workspace(1024, offered).unwrap_err().to_string();
+            assert!(
+                error.contains("1024 bytes") && error.contains("prepare and pass"),
+                "{error}"
+            );
+        }
+        assert_eq!(dense_workspace(0, None).unwrap().bytes(), 0);
+    }
+
+    #[test]
     fn plan_2d_ok() {
         let p = matmul_plan(&[2, 3], &[3, 4]).unwrap();
         assert_eq!((p.m, p.k, p.n), (2, 3, 4));
@@ -975,7 +959,7 @@ mod tests {
         assert_eq!(p.batch_runs()[0].batch, 1);
         assert_eq!(
             p.execution_route(GemmDtype::F32),
-            MatMulExecutionRoute::DensePrivateGemm
+            MatMulExecutionRoute::DenseCachedGemm
         );
     }
 
@@ -1001,7 +985,7 @@ mod tests {
         let singleton_batch = matmul_plan(&[1, 4, 17], &[1, 17, 23]).unwrap();
         assert_eq!(
             singleton_batch.execution_route(GemmDtype::Bf16),
-            MatMulExecutionRoute::DensePrivateGemm
+            MatMulExecutionRoute::DenseCachedGemm
         );
 
         let batched = matmul_plan(&[2, 4, 17], &[2, 17, 23]).unwrap();

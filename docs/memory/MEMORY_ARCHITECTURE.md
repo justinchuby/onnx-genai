@@ -434,11 +434,30 @@ execution or asynchronous failure behavior on a device.
 
 ### CUDA dense MatMul cached-plan preparation boundary
 
-F32 single-row decode and the other single-matrix cuBLASLt paths now share one
-internal cached-plan representation. The single decode slot and bounded dense
-MRU retain their original policies, actual-pointer algorithm selection and
-capture resources; this consolidation does not yet govern their private device
-scratch. Plan reuse still checks the selected alignment contract before launch.
+F32 single-row decode and the other single-matrix cuBLASLt paths cache pure host
+plans. The F32 decode slot and bounded dense MRU retain their independent policies;
+no cache entry owns device scratch. Dense metadata demand is Deferred (the hand
+FP16 GEMV is genuinely zero). Execution refinement selects a plan from real A/B/C
+origins using ActualAddress alignment, reports its exact bytes to the caller lane,
+and fixes that same plan for launch. No TypedMinimum substitute or fixed 32-MiB
+reservation stands in for that demand. Batched/broadcast routes keep their existing
+metadata-bound planner and remain non-capturable.
+
+A cold candidate enters the host cache only after successful execution. Warm hits
+reuse the plan without a heuristic query or a second capture-state query in the
+refiner. The exclusive refine/admit/launch boundary carries the selected plan and
+the prior successful signature; failed refinement, admission or launch cannot
+publish capture readiness. Execute checks geometry/alignment and the precise
+borrowed span, and capture requires a real caller owner covering that span.
+The kernel publishes no private workspace graph resources. Existing conservative
+cache-eviction drains remain; this change makes no unsupported cuBLAS descriptor
+retirement assumption.
+
+FP16 single-row planning can select the hand GEMV when cuBLASLt planning fails.
+That zero-scratch route is fixed before admission and cached after success.
+Workspace refusal and cuBLAS launch errors propagate; they no longer trigger an
+implicit hand-kernel retry. Direct dense-kernel users must call execution-time
+refinement before launch, as native/eager/ORT already do.
 
 Metadata preparation now returns `WorkspacePreparation::Ready(requirement)` or
 `Deferred`. `Ready(NONE)` means an actual zero demand; `Deferred` requires live
@@ -458,14 +477,10 @@ metadata preparations, including `Deferred`, and refines on each Compute; exact
 address/value-dependent bytes never enter that geometry cache. Cached ready
 preparations avoid repeating the metadata query.
 
-This is the prerequisite for moving dense MatMul's remaining private scratch,
-not the migration itself. The metadata BLAS helper selects with TypedMinimum
-alignment, while capture plans select with ActualAddress alignment; workspace
-sizes need not order monotonically. The migration must retain the same selected
-host plan for exact admission and the borrowed-workspace launch. Unknown demand,
-a substitute algorithm, and a fixed 32-MiB reservation are not valid bounds.
-Exhaustively querying all pointer-alignment classes would add hundreds of cold
-heuristic calls and is not required by this contract.
+ActualAddress workspace sizes across alignment classes need not be monotonic.
+The selected host plan, rather than a second heuristic query, is the authority
+for both exact admission and borrowed-workspace execution. Exhaustively querying
+all pointer-alignment classes is unnecessary.
 
 Native eager dispatch already supports cold growth of its governed lane. A full
 static storage/alias epoch is therefore not a prerequisite for precise admission.
@@ -484,8 +499,7 @@ preparation report pending workspace nodes unless capability metadata proves
 there are none. Actual dispatch resolves remaining demand after view/in-place
 decisions. Recording a device graph cannot grow workspace even without a prior
 metadata preparation; eager warmup must establish fitting backing first. There
-is no duplicate preparation-required or eager-growth permission flag. Dense
-MatMul migration still needs matching host-plan selection and borrowed scratch.
+is no duplicate preparation-required or eager-growth permission flag.
 ActualAddress workspace sizes across shapes need not be monotonic, and neither
 physical-capacity symbols nor the observational activation plan establish a bound
 for all selected algorithms. Capture still requires a successful warm route and
@@ -504,8 +518,9 @@ at safe completion boundaries, not in per-token quota return/reclaim cycles.
 Zero demand and warm fitting capacity bypass allocation/quota callbacks; retained
 physical capacity remains charged until actual release. Pending work, capture
 pins and quarantine still govern retirement. Host and ORT regressions verify
-these callback properties; CUDA Pending StepScoped retirement and private MatMul
-scratch do not yet provide a universal warm-zero-callback guarantee. No CUDA
+these callback properties; CUDA Pending StepScoped retirement does not yet
+provide a universal warm-zero-callback guarantee. MatMul borrowed-scratch GPU
+regressions are compiled on this host, not executed. No CUDA
 numerical or performance claim follows from this API change.
 
 ### CUDA quantized MatMul prefill temporary storage
@@ -783,8 +798,8 @@ call; it owns the governed workspace preparation path
 | `kernels/index_share.rs:708` | `pkg.nxrt::IndexShare` selected-token attention workspace | aligned sum of reachable present staging, `B * q_heads * q_seq * selected_width * 4`, and optional `2 * B * sizeof(i64)` | prompt/cache dependent | session-persistent | **governed by #751** via `workspace_requirement` + prepared workspace |
 | `kernels/index_transform.rs:150` | index-transform metadata | `bytes.len()` | op/rank/config | step-scoped | raw bypass |
 | `kernels/indexing.rs:410` | indexing metadata | `bytes.len().max(1)` | op/rank/config | step-scoped | raw bypass |
-| `kernels/matmul.rs:222` | f32 `M=1` MatMul cached-plan workspace | selected heuristic `workspaceSize` | shape/algorithm dependent | session-persistent cached plan scratch | raw bypass; separate from #799's shared non-GEMV path |
-| `kernels/matmul.rs` | MatMul cuBLASLt workspace (non-GEMV routes only) | selected heuristic `workspaceSize` (ceiling `WORKSPACE_BYTES`) | shape/dtype/algorithm dependent | session-persistent shared peak | **governed by #799**; f32/fp16 `M=1` GEMV routes report `NONE` |
+| `kernels/matmul.rs` | dense MatMul cuBLASLt workspace, including F32/F16 single-row paths | exact cached ActualAddress plan `workspaceSize` | shape/dtype/alignment/algorithm dependent | session-persistent caller lane peak | metadata Deferred, execution refiner fixes the plan before admission; no private device scratch |
+| `kernels/matmul.rs` | batched/broadcast MatMul cuBLASLt workspace | metadata planner heuristic `workspaceSize` | shape/dtype/algorithm dependent | session-persistent shared peak | existing governed metadata bound; non-capturable |
 | `kernels/matmul_nbits.rs:3599` | `MatMulNBits` accuracy-4 decode activation quantization | `padded_k + (padded_k / block_size) * sizeof(f32)` | model config (`K`, `block_size`) | model-lifetime fixed scratch | raw bypass |
 | `kernels/matmul_nbits.rs:3980` | `MatMulNBits` f32 dequantized weight fallback | `K * N * 4` | model config (`K`, `N`) | step-scoped/prefill fallback | raw bypass |
 | `kernels/matmul_nbits.rs` | `MatMulNBits` f32 cuBLASLt workspace | selected heuristic `workspaceSize` (ceiling `WORKSPACE_BYTES`) | shape/dtype/algorithm dependent | session-persistent shared peak | **governed by #799**; direct GEMV/tiled routes report `NONE` |
