@@ -447,6 +447,8 @@ pub struct ServerConfig {
     pub max_rerank_input_tokens: std::num::NonZeroUsize,
     /// Maximum document count in one scoring request.
     pub max_rerank_documents: std::num::NonZeroUsize,
+    /// Unique encoded image bytes retained by one reranking request.
+    pub max_rerank_media_bytes: std::num::NonZeroUsize,
     /// Maximum tokens per decision prompt variant.
     pub max_decision_input_tokens: std::num::NonZeroUsize,
     /// Maximum rendered prompt bytes before decision tokenization.
@@ -524,6 +526,7 @@ impl Default for ServerConfig {
                 .expect("positive default reranking token budget"),
             max_rerank_documents: std::num::NonZeroUsize::new(128)
                 .expect("positive default reranking document budget"),
+            max_rerank_media_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
             max_decision_input_tokens: decision.max_input_tokens,
             max_decision_prompt_bytes: decision.template.max_output_bytes,
             max_decision_template_operations: decision.template.max_operations,

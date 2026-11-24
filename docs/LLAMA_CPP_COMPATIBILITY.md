@@ -49,7 +49,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/v1/embeddings` | Existing OpenAI embedding contract |
 | POST | `/completion`, `/completions`, `/infill` | Native buffered/streaming completion, bounded text/token/mixed batches, declared FIM metadata |
 | POST | `/embedding`, `/embeddings` | Native pooled embeddings with requested normalization |
-| POST | `/rerank`, `/reranking`, `/v1/rerank`, `/v1/reranking` | Declared token-pair scoring workflow with Jina/TEI response shapes |
+| POST | `/rerank`, `/reranking`, `/v1/rerank`, `/v1/reranking` | Declared text/image-pair scoring workflow with Jina/TEI response shapes |
 | POST | `/v1/responses`, `/responses` | Responses wire adapter over admitted chat generation |
 | POST | `/v1/messages` | Anthropic Messages wire adapter over admitted chat generation |
 | POST | `/v1/chat/completions/input_tokens`, `/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/responses/input_tokens`, `/v1/messages/count_tokens` | Input token counts from the shared inference preparation path |
@@ -425,12 +425,16 @@ Declared host LoRA serving supports global defaults, per-request overrides,
 model isolation and replayed conversation history. See [LoRA serving](LORA_SERVING.md)
 for package contracts, memory admission and remaining source/device limitations.
 
+Reranking accepts ordered query/document images through an explicit v2 profile,
+including actual native image preprocessing and model-owned token usage. See
+[reranking](RERANKING.md) for the package ABI, request shapes and resource bounds.
+
 ## Remaining differences
 
 This is a functional Llama Chat integration, not a claim of complete llama-server
 parity. These upstream protocols are still unimplemented:
 
-- Multimodal reranking, realtime audio/WebSocket inference, and multimodal/joint decision heads.
+- Realtime audio/WebSocket inference and multimodal/joint decision heads.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
 - GGUF package import, quantization selectors and selective sidecar management.
   Hugging Face nxrt-package download, resume and deletion are supported.

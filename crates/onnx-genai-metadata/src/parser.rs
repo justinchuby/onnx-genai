@@ -312,6 +312,17 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
         .and_then(serde_yaml::Value::as_mapping)
     {
         for (name, profile) in profiles {
+            if profile.get("reranking").is_some() {
+                crate::version::gate_feature_use(
+                    version,
+                    crate::version::SchemaFeature::MultimodalReranking,
+                    &format!(
+                        "profiles.{}.reranking",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                )
+                .map_err(crate::MetadataError::Parse)?;
+            }
             if profile.get("decision").is_some() {
                 crate::version::gate_feature_use(
                     version,

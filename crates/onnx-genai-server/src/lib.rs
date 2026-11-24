@@ -141,11 +141,23 @@ pub fn app(state: AppState) -> Router {
         .route("/completions", post(routes::native::completions))
         .route("/infill", post(routes::native::infill))
         .route("/tts", post(routes::native::tts))
-        .route("/reranking", post(routes::ranking::rerank))
-        .route("/rerank", post(routes::ranking::rerank))
+        .route(
+            "/reranking",
+            post(routes::ranking::rerank).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/rerank",
+            post(routes::ranking::rerank).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
         .route("/v1/systemone", post(routes::decision::decide))
-        .route("/v1/rerank", post(routes::ranking::rerank))
-        .route("/v1/reranking", post(routes::ranking::rerank))
+        .route(
+            "/v1/rerank",
+            post(routes::ranking::rerank).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/v1/reranking",
+            post(routes::ranking::rerank).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
         .route("/embedding", post(routes::native::embeddings))
         .route("/embeddings", post(routes::native::embeddings))
         .route(

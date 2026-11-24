@@ -151,7 +151,7 @@ pub enum SchemaVersionError {
 pub const INITIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
 
 /// The newest version this build can read.
-pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 11);
+pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 12);
 
 /// Every inference-metadata schema version this build reads.
 pub const SUPPORTED_SCHEMA_VERSIONS: SupportedSchemaVersions = SupportedSchemaVersions {
@@ -197,6 +197,9 @@ pub const DECISION_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 10);
 /// The version that introduced explicit decision request policies.
 pub const DECISION_INPUT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 11);
 
+/// The version that introduced ordered multimodal reranking input contracts.
+pub const MULTIMODAL_RERANKING_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 12);
+
 /// A serialized feature whose presence is bounded by one schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaFeature {
@@ -206,6 +209,7 @@ pub enum SchemaFeature {
     PreferredEnding,
     DecisionProfiles,
     DecisionInputPolicies,
+    MultimodalReranking,
 }
 
 impl SchemaFeature {
@@ -217,6 +221,7 @@ impl SchemaFeature {
             Self::PreferredEnding => PREFERRED_ENDING_SCHEMA_VERSION,
             Self::DecisionProfiles => DECISION_SCHEMA_VERSION,
             Self::DecisionInputPolicies => DECISION_INPUT_SCHEMA_VERSION,
+            Self::MultimodalReranking => MULTIMODAL_RERANKING_SCHEMA_VERSION,
         }
     }
 
@@ -229,6 +234,7 @@ impl SchemaFeature {
                 "workflow transaction publication mode and typed commit/abort reconciliation"
             }
             Self::DecisionInputPolicies => "explicit decision request policies",
+            Self::MultimodalReranking => "ordered multimodal reranking inputs",
             Self::DecisionProfiles => "model-authored non-generative decision profiles",
             Self::PreferredEnding => "preferred end-of-turn token role within the package EOS set",
             Self::CompressedStateGroups => {
@@ -249,6 +255,9 @@ impl SchemaFeature {
             }
             Self::DecisionProfiles => "Declare decision prompting and answer policies explicitly",
             Self::DecisionInputPolicies => "Declare decision.input_policy explicitly",
+            Self::MultimodalReranking => {
+                "Declare reranking query_images/document_images endpoints explicitly"
+            }
             Self::PreferredEnding => "Declare eot_token_id as a member of eos_token_id",
             Self::CompressedStateGroups => {
                 "Declare compressed records and fixed carries as complete paired \
@@ -285,6 +294,9 @@ pub fn gate_feature_use(
              {required}. Remove `pipeline.workflow.publication_mode` to keep a pre-{required} \
              document, or upgrade `schema_version` to \"{required}\" and author a valid mode \
              (`commit_only` or `provisional_revisions`)"
+        )),
+        SchemaFeature::MultimodalReranking => Err(format!(
+            "{path} requires minimum schema version {required}; declare reranking v2 with ordered image endpoints in schema_version '{required}', or use a text-only v1 profile"
         )),
         SchemaFeature::DecisionInputPolicies => Err(format!(
             "{path} requires minimum schema version {required}; author explicit decision.input_policy in schema_version '{required}', or omit it in older decision documents"
@@ -413,7 +425,7 @@ mod tests {
 
     #[test]
     fn a_canonical_version_prints_the_way_a_document_should_write_it() {
-        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.11");
+        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.12");
         assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
     }
 
@@ -452,10 +464,10 @@ mod tests {
 
     #[test]
     fn a_newer_minor_is_refused_by_number_rather_than_by_field_name() {
-        let error = gate(Some("1.12")).expect_err("1.12 is newer than this build");
+        let error = gate(Some("1.13")).expect_err("1.13 is newer than this build");
         let error = error.to_string();
         assert!(
-            error.contains("declares unsupported schema version v1.12"),
+            error.contains("declares unsupported schema version v1.13"),
             "{error}"
         );
         assert!(
@@ -510,7 +522,11 @@ mod tests {
             PREFERRED_ENDING_SCHEMA_VERSION
         );
         assert_eq!(gate(Some("1.10")).expect("1.10"), DECISION_SCHEMA_VERSION);
-        assert_eq!(gate(Some("1.11")).expect("1.11"), SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(
+            gate(Some("1.11")).expect("1.11"),
+            DECISION_INPUT_SCHEMA_VERSION
+        );
+        assert_eq!(gate(Some("1.12")).expect("1.12"), SUPPORTED_SCHEMA_VERSION);
     }
 
     #[test]
