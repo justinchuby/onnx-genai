@@ -1,15 +1,22 @@
 //! CUDA `QLinearMatMul` with integer accumulation and ONNX requantization.
 
 use std::ffi::c_void;
-use std::mem::size_of;
 use std::sync::Arc;
 
-use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node, broadcast_shapes, compute_contiguous_strides};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspacePreparation, WorkspaceView,
+};
+use onnx_runtime_ir::{DataType, Node, broadcast_shapes};
 
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
+
+use super::metadata_workspace::{
+    MetadataWorkspace, checked_metadata_strides, checked_tensor_bytes,
+};
+const OFFSET_WORDS: usize = 2;
 
 const BLOCK: u32 = 256;
 const SOURCE: &str = r#"
@@ -186,6 +193,7 @@ struct Geometry {
     k: usize,
     n: usize,
     batch_shape: Vec<usize>,
+    batches: usize,
     a_batch_shape: Vec<usize>,
     b_batch_shape: Vec<usize>,
     a_batch_strides: Vec<i64>,
@@ -235,12 +243,35 @@ impl Geometry {
         if !b_was_vector {
             output_shape.push(n);
         }
+        checked_tensor_bytes("QLinearMatMul", "A", DataType::Uint8, a)?;
+        checked_tensor_bytes("QLinearMatMul", "B", DataType::Uint8, b)?;
+        let output_elements =
+            checked_tensor_bytes("QLinearMatMul", "output", DataType::Uint8, &output_shape)?;
+        let batches = if output_elements == 0 {
+            0
+        } else {
+            checked_tensor_bytes(
+                "QLinearMatMul",
+                "broadcast batches",
+                DataType::Uint8,
+                &batch_shape,
+            )?
+        };
         Ok(Self {
             m,
             k,
             n,
-            a_batch_strides: compute_contiguous_strides(&a_batch_shape),
-            b_batch_strides: compute_contiguous_strides(&b_batch_shape),
+            batches,
+            a_batch_strides: checked_metadata_strides(
+                "QLinearMatMul",
+                "A batches",
+                &a_batch_shape,
+            )?,
+            b_batch_strides: checked_metadata_strides(
+                "QLinearMatMul",
+                "B batches",
+                &b_batch_shape,
+            )?,
             a_batch_shape,
             b_batch_shape,
             batch_shape,
@@ -248,9 +279,16 @@ impl Geometry {
         })
     }
 
-    fn batch_offsets(&self) -> Vec<u64> {
-        let count = self.batch_shape.iter().product::<usize>();
-        let mut offsets = Vec::with_capacity(count * 2);
+    fn workspace(&self, output: &OutputMetadata<'_>) -> Result<MetadataWorkspace> {
+        MetadataWorkspace::for_records("QLinearMatMul", self.batches, OFFSET_WORDS, output)
+    }
+    fn batch_offsets(&self) -> Result<Vec<u64>> {
+        let count = self.batches;
+        let words = count.checked_mul(OFFSET_WORDS).ok_or_else(|| EpError::KernelFailed(
+            "cuda_ep QLinearMatMul: batch offset count overflows; reduce the broadcast batch shape".into()))?;
+        let mut offsets = Vec::new();
+        offsets.try_reserve_exact(words).map_err(|cause| EpError::KernelFailed(format!(
+            "cuda_ep QLinearMatMul: cannot reserve {words} host offset words: {cause}; reduce the broadcast batch shape")))?;
         let mut index = vec![0; self.batch_shape.len()];
         for batch in 0..count {
             offsets
@@ -261,7 +299,7 @@ impl Geometry {
                 next_index(&self.batch_shape, &mut index);
             }
         }
-        offsets
+        Ok(offsets)
     }
 }
 
@@ -291,21 +329,9 @@ fn next_index(shape: &[usize], index: &mut [usize]) {
     }
 }
 
-fn upload_offsets(runtime: &CudaRuntime, values: &[u64]) -> Result<CUdeviceptr> {
-    let bytes = values
-        .iter()
-        .flat_map(|value| value.to_ne_bytes())
-        .collect::<Vec<_>>();
-    let pointer = runtime.alloc_raw(bytes.len())?;
-    if let Err(error) = unsafe { runtime.htod(&bytes, pointer) } {
-        let _ = unsafe { runtime.free_raw(pointer) };
-        return Err(error);
-    }
-    Ok(pointer)
-}
-
 fn validate_scale_values(runtime: &CudaRuntime, scale: &TensorView) -> Result<()> {
-    let mut bytes = vec![0_u8; scale.numel() * size_of::<f32>()];
+    let mut bytes =
+        vec![0_u8; checked_tensor_bytes("QLinearMatMul", "scale", DataType::Float32, scale.shape)?];
     if !bytes.is_empty() {
         // SAFETY: the validated scale tensor is contiguous Float32 storage and `bytes`
         // has exactly the corresponding allocation length.
@@ -323,8 +349,13 @@ fn validate_scale_values(runtime: &CudaRuntime, scale: &TensorView) -> Result<()
     Ok(())
 }
 
-impl Kernel for QLinearMatMulKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+impl QLinearMatMulKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if inputs.len() != 8 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(
                 "cuda_ep QLinearMatMul: expected 8 inputs and 1 output".into(),
@@ -378,6 +409,9 @@ impl Kernel for QLinearMatMulKernel {
                 "QLinearMatMul during CUDA graph capture because scale values require validation",
             ));
         }
+        let upload = geometry
+            .workspace(&OutputMetadata::from_view(&outputs[0]))?
+            .bind(workspace)?;
         for scale in [&inputs[1], &inputs[4], &inputs[6]] {
             validate_scale_values(&self.runtime, scale)?;
         }
@@ -385,8 +419,8 @@ impl Kernel for QLinearMatMulKernel {
         if elements == 0 {
             return Ok(());
         }
-        let offsets = geometry.batch_offsets();
-        let offsets_pointer = upload_offsets(&self.runtime, &offsets)?;
+        let offsets = geometry.batch_offsets()?;
+        let offsets_pointer = upload.upload(&self.runtime, &offsets)?;
         let function =
             self.runtime
                 .nvrtc_function("qlinear_matmul_v1", SOURCE, "qlinear_matmul")?;
@@ -437,8 +471,100 @@ impl Kernel for QLinearMatMulKernel {
             })
         }
         .map_err(|error| driver_err("launch QLinearMatMul", error));
-        let sync = launch.and_then(|_| self.runtime.synchronize());
-        let free = unsafe { self.runtime.free_raw(offsets_pointer) };
-        sync.and(free)
+        launch.and_then(|_| self.runtime.synchronize())
+    }
+}
+
+impl Kernel for QLinearMatMulKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        if inputs.len() != 8 || outputs.len() != 1 || inputs.iter().any(|input| !input.present) {
+            return Err(EpError::KernelFailed("cuda_ep QLinearMatMul: workspace planning requires eight present inputs and one output".into()));
+        }
+        Ok(WorkspacePreparation::Ready(
+            Geometry::new(inputs[0].shape, inputs[3].shape)?
+                .workspace(&outputs[0])?
+                .requirement(),
+        ))
+    }
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "QLinearMatMul validates device scale values and uploads borrowed batch offsets eagerly",
+        )
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+    use onnx_runtime_ep_api::WorkspaceRequirement;
+    #[test]
+    fn vector_dot_product_still_has_one_batch_offset_pair() {
+        let geometry = Geometry::new(&[3], &[3]).unwrap();
+        assert!(geometry.output_shape.is_empty());
+        assert_eq!(geometry.batches, 1);
+        assert_eq!(geometry.batch_offsets().unwrap(), vec![0, 0]);
+        assert_eq!(
+            geometry
+                .workspace(&OutputMetadata::Unresolved {
+                    dtype: DataType::Uint8
+                })
+                .unwrap()
+                .requirement()
+                .bytes,
+            16
+        );
+    }
+    #[test]
+    fn broadcast_offset_pairs_share_one_checked_requirement_and_empty_work_has_none() {
+        let geometry = Geometry::new(&[2, 1, 3, 4], &[1, 5, 4, 2]).unwrap();
+        assert_eq!(geometry.output_shape, vec![2, 5, 3, 2]);
+        assert_eq!(geometry.batches, 10);
+        assert_eq!(
+            geometry.batch_offsets().unwrap(),
+            vec![0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 1, 0, 1, 1, 1, 2, 1, 3, 1, 4]
+        );
+        assert_eq!(
+            geometry
+                .workspace(&OutputMetadata::Unresolved {
+                    dtype: DataType::Uint8
+                })
+                .unwrap()
+                .requirement()
+                .bytes,
+            160
+        );
+        let empty = Geometry::new(&[0, 3], &[3, 2]).unwrap();
+        assert!(empty.batch_offsets().unwrap().is_empty());
+        assert_eq!(
+            empty
+                .workspace(&OutputMetadata::Unresolved {
+                    dtype: DataType::Uint8
+                })
+                .unwrap()
+                .requirement(),
+            WorkspaceRequirement::NONE
+        );
+        assert!(
+            Geometry::new(&[usize::MAX, 2, 3], &[3, 2])
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("addressable storage")
+        );
     }
 }

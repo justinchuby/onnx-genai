@@ -681,13 +681,14 @@ impl LpPoolKernel {
             .chain(&pads[..rank])
             .copied()
             .collect::<Vec<_>>();
-        let metadata_pointer = MetadataWorkspace::for_rank(
+        let metadata_pointer = MetadataWorkspace::for_records(
             "LpPool",
             rank,
             METADATA_WORDS_PER_AXIS,
             &OutputMetadata::from_view(output),
         )?
-        .upload(&self.runtime, workspace, &metadata)?;
+        .bind(workspace)?
+        .upload(&self.runtime, &metadata)?;
         let function = self
             .runtime
             .nvrtc_function("lp_pool_v1", LP_SOURCE, "lp_pool")?;
@@ -752,7 +753,7 @@ impl Kernel for LpPoolKernel {
             return Err(EpError::KernelFailed("cuda_ep LpPool: workspace planning requires one present input of rank >= 3 and one output".into()));
         }
         Ok(WorkspacePreparation::Ready(
-            MetadataWorkspace::for_rank(
+            MetadataWorkspace::for_records(
                 "LpPool",
                 inputs[0].shape.len() - 2,
                 METADATA_WORDS_PER_AXIS,

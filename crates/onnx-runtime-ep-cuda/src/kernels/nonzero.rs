@@ -111,13 +111,14 @@ impl NonZeroKernel {
                 .checked_mul(input.shape[axis + 1] as u64)
                 .ok_or_else(|| EpError::KernelFailed("NonZero stride overflow".into()))?;
         }
-        let strides_ptr = MetadataWorkspace::for_rank(
+        let strides_ptr = MetadataWorkspace::for_records(
             "NonZero",
             rank,
             METADATA_WORDS_PER_AXIS,
             &OutputMetadata::from_view(output),
         )?
-        .upload(&self.runtime, workspace, &strides)?;
+        .bind(workspace)?
+        .upload(&self.runtime, &strides)?;
         let function = self.runtime.nvrtc_function(
             "nonzero_serial_v1",
             COORD_SOURCE,
@@ -177,7 +178,7 @@ impl Kernel for NonZeroKernel {
             inputs[0].shape.len()
         };
         Ok(WorkspacePreparation::Ready(
-            MetadataWorkspace::for_rank("NonZero", rank, METADATA_WORDS_PER_AXIS, &outputs[0])?
+            MetadataWorkspace::for_records("NonZero", rank, METADATA_WORDS_PER_AXIS, &outputs[0])?
                 .requirement(),
         ))
     }

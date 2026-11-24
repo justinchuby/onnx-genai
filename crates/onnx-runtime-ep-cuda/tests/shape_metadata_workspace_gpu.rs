@@ -1,4 +1,4 @@
-//! Real caller-lane reuse for eager rank-sized metadata, not a timing benchmark.
+//! Real caller-lane reuse for eager record-sized metadata, not a timing benchmark.
 mod common;
 
 use common::{Tensor, input};
@@ -62,6 +62,75 @@ fn eager_shape_metadata_reuses_one_owner_without_private_allocations() {
                 &[0f32, 2., 0., 3., 0., 4.],
             )],
             output: (DataType::Int64, vec![2, 3]),
+            attributes: vec![],
+            metadata_bytes: 16,
+        },
+        Case {
+            op: "CenterCropPad",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Int32, &[3, 2], &[1i32, 2, 3, 4, 5, 6]),
+                input(DataType::Int64, &[2], &[2i64, 5]),
+            ],
+            output: (DataType::Int32, vec![2, 5]),
+            attributes: vec![],
+            metadata_bytes: 64,
+        },
+        Case {
+            op: "Col2Im",
+            opset: 18,
+            inputs: vec![
+                input(
+                    DataType::Float32,
+                    &[1, 4, 4],
+                    &(1..=16).map(|n| n as f32).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int64, &[1, 2], &[3i64, 3]),
+                input(DataType::Int64, &[2, 1], &[2i64, 2]),
+            ],
+            output: (DataType::Float32, vec![1, 1, 3, 3]),
+            attributes: vec![],
+            metadata_bytes: 96,
+        },
+        Case {
+            op: "QLinearMatMul",
+            opset: 10,
+            inputs: vec![
+                input(
+                    DataType::Uint8,
+                    &[2, 2, 3],
+                    &[120u8, 125, 131, 118, 129, 140, 121, 126, 132, 119, 130, 141],
+                ),
+                input(DataType::Float32, &[], &[0.25f32]),
+                input(DataType::Uint8, &[], &[123u8]),
+                input(
+                    DataType::Uint8,
+                    &[1, 3, 2],
+                    &[126u8, 119, 130, 121, 124, 135],
+                ),
+                input(DataType::Float32, &[], &[0.5f32]),
+                input(DataType::Uint8, &[], &[127u8]),
+                input(DataType::Float32, &[], &[0.2f32]),
+                input(DataType::Uint8, &[], &[111u8]),
+            ],
+            output: (DataType::Uint8, vec![2, 2, 2]),
+            attributes: vec![],
+            metadata_bytes: 32,
+        },
+        Case {
+            op: "QLinearMatMul",
+            opset: 10,
+            inputs: vec![
+                input(DataType::Uint8, &[3], &[2u8, 3, 4]),
+                input(DataType::Float32, &[], &[1f32]),
+                input(DataType::Uint8, &[], &[0u8]),
+                input(DataType::Uint8, &[3], &[4u8, 3, 2]),
+                input(DataType::Float32, &[], &[1f32]),
+                input(DataType::Uint8, &[], &[0u8]),
+                input(DataType::Float32, &[], &[1f32]),
+                input(DataType::Uint8, &[], &[0u8]),
+            ],
+            output: (DataType::Uint8, vec![]),
             attributes: vec![],
             metadata_bytes: 16,
         },
@@ -201,6 +270,23 @@ fn eager_shape_metadata_reuses_one_owner_without_private_allocations() {
         kernel
             .execute_with_workspace(&views, &mut output, Some(view))
             .unwrap();
+        let after_first = runtime.transfer_counts();
+        assert_eq!(
+            after_first.host_to_device,
+            transfers.host_to_device + 1,
+            "exactly one metadata upload per nonempty call"
+        );
+        let expected_readbacks = match case.op {
+            "CenterCropPad" => 1,
+            "Col2Im" => 2,
+            "QLinearMatMul" => 3,
+            _ => 0,
+        };
+        assert_eq!(
+            after_first.device_to_host,
+            transfers.device_to_host + expected_readbacks,
+            "metadata planning must not add control/scale readbacks"
+        );
         let allocations = runtime.allocation_counts();
         for _ in 0..4 {
             let fitted = common::prepare_kernel_workspace(
@@ -228,6 +314,72 @@ fn eager_shape_metadata_reuses_one_owner_without_private_allocations() {
                 .unwrap();
         }
         assert_eq!(actual, expected[0], "{} dirty-lane parity", case.op);
+        // Same address and length, changed contents: preparation must never
+        // substitute a stale host value for this dispatch's control inputs.
+        if matches!(case.op, "CenterCropPad" | "Col2Im") {
+            let (slot, changed) = if case.op == "CenterCropPad" {
+                (1, common::raw(&[-1i64, 5]))
+            } else {
+                (2, common::raw(&[-2i64, 2]))
+            };
+            unsafe {
+                runtime
+                    .htod(&changed, cuptr(buffers[slot].as_ptr()))
+                    .unwrap();
+            }
+            let before = runtime.transfer_counts();
+            let error = kernel
+                .execute_with_workspace(&views, &mut output, Some(view))
+                .unwrap_err();
+            assert!(error.to_string().contains(case.op), "{error}");
+            assert_eq!(
+                runtime.transfer_counts().host_to_device,
+                before.host_to_device
+            );
+            unsafe {
+                runtime
+                    .htod(&case.inputs[slot].bytes, cuptr(buffers[slot].as_ptr()))
+                    .unwrap();
+            }
+            kernel
+                .execute_with_workspace(&views, &mut output, Some(view))
+                .unwrap();
+        } else if case.op == "QLinearMatMul" {
+            let mut updated = case.inputs.clone();
+            updated[1].bytes = common::raw(&[0.5f32]);
+            unsafe {
+                runtime
+                    .htod(&updated[1].bytes, cuptr(buffers[1].as_ptr()))
+                    .unwrap();
+            }
+            kernel
+                .execute_with_workspace(&views, &mut output, Some(view))
+                .unwrap();
+            let updated_expected = common::run_cpu(
+                case.op,
+                "",
+                case.opset,
+                &updated,
+                &outputs,
+                &case.attributes,
+            );
+            assert_ne!(
+                updated_expected, expected,
+                "the changed scale must affect the oracle"
+            );
+            let mut updated_output = vec![0; output_bytes];
+            unsafe {
+                runtime
+                    .dtoh(&mut updated_output, cuptr(output_buffer.as_ptr()))
+                    .unwrap();
+            }
+            assert_eq!(updated_output, updated_expected[0]);
+            unsafe {
+                runtime
+                    .htod(&case.inputs[1].bytes, cuptr(buffers[1].as_ptr()))
+                    .unwrap();
+            }
+        }
         // A raw recording cannot bypass the kernel's eager-upload restriction.
         runtime.begin_graph_capture(&[]).unwrap();
         let error = kernel
@@ -307,6 +459,46 @@ fn scalar_and_empty_shape_metadata_need_no_caller_capacity() {
             ],
             metadata_bytes: 0,
         },
+        Case {
+            op: "CenterCropPad",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Int32, &[3, 2], &[1i32, 2, 3, 4, 5, 6]),
+                input(DataType::Int64, &[2], &[0i64, 5]),
+            ],
+            output: (DataType::Int32, vec![0, 5]),
+            attributes: vec![],
+            metadata_bytes: 0,
+        },
+        Case {
+            op: "Col2Im",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Float32, &[0, 4, 4], &[] as &[f32]),
+                input(DataType::Int64, &[2], &[3i64, 3]),
+                input(DataType::Int64, &[2], &[2i64, 2]),
+            ],
+            output: (DataType::Float32, vec![0, 1, 3, 3]),
+            attributes: vec![],
+            metadata_bytes: 0,
+        },
+        Case {
+            op: "QLinearMatMul",
+            opset: 10,
+            inputs: vec![
+                input(DataType::Uint8, &[0, 3], &[] as &[u8]),
+                input(DataType::Float32, &[], &[1f32]),
+                input(DataType::Uint8, &[], &[0u8]),
+                input(DataType::Uint8, &[3, 2], &[1u8, 2, 3, 4, 5, 6]),
+                input(DataType::Float32, &[], &[1f32]),
+                input(DataType::Uint8, &[], &[0u8]),
+                input(DataType::Float32, &[], &[1f32]),
+                input(DataType::Uint8, &[], &[0u8]),
+            ],
+            output: (DataType::Uint8, vec![0, 2]),
+            attributes: vec![],
+            metadata_bytes: 0,
+        },
     ];
     for case in cases {
         let outputs = [case.output];
@@ -362,6 +554,27 @@ fn scalar_and_empty_shape_metadata_need_no_caller_capacity() {
             ),
             "{} zero-work parity",
             case.op
+        );
+        let mut invalid = case.inputs.clone();
+        match case.op {
+            "CenterCropPad" => invalid[1].bytes = common::raw(&[-1i64, 5]),
+            "Col2Im" => invalid[2].bytes = common::raw(&[-2i64, 2]),
+            "QLinearMatMul" => invalid[1].bytes = common::raw(&[f32::NAN]),
+            _ => continue,
+        }
+        let error = common::try_run_cuda(
+            &ep,
+            case.op,
+            "",
+            case.opset,
+            &invalid,
+            &outputs,
+            &case.attributes,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(case.op),
+            "empty output must still validate values: {error}"
         );
     }
 }

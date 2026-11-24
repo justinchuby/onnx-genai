@@ -1103,7 +1103,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("QLinearMatMul", "", 10),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(qlinear_matmul::QLinearMatMulFactory {
             runtime: runtime.clone(),
         }),
@@ -1497,14 +1497,14 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("CenterCropPad", "", 18),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(index_transform::CenterCropPadFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
         OpKey::new("Col2Im", "", 18),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(index_transform::Col2ImFactory {
             runtime: runtime.clone(),
         }),

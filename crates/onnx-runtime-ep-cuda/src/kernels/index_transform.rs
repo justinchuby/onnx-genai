@@ -4,11 +4,20 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspacePreparation, WorkspaceView,
+};
+use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
+
+use super::metadata_workspace::{
+    MetadataWorkspace, checked_metadata_strides, checked_tensor_bytes,
+};
+const CENTER_WORDS: usize = 4;
+const COL2IM_WORDS: usize = 6;
 
 const BLOCK: u32 = 256;
 const SOURCE: &str = r#"
@@ -129,7 +138,8 @@ fn device_i64(runtime: &CudaRuntime, input: &TensorView, op: &str, name: &str) -
             "cuda_ep {op}: {name} must be a contiguous Int64 tensor"
         )));
     }
-    let mut bytes = vec![0; input.numel() * 8];
+    let bytes = checked_tensor_bytes(op, name, DataType::Int64, input.shape)?;
+    let mut bytes = vec![0; bytes];
     if !bytes.is_empty() {
         unsafe { runtime.dtoh(&mut bytes, cuptr(input.data_ptr::<u8>() as *const c_void))? };
     }
@@ -139,20 +149,101 @@ fn device_i64(runtime: &CudaRuntime, input: &TensorView, op: &str, name: &str) -
         .collect())
 }
 
-fn upload_metadata(
-    runtime: &CudaRuntime,
-    metadata: &[u64],
-) -> Result<cudarc::driver::sys::CUdeviceptr> {
-    let bytes = metadata
-        .iter()
-        .flat_map(|value| value.to_ne_bytes())
-        .collect::<Vec<_>>();
-    let pointer = runtime.alloc_raw(bytes.len())?;
-    if let Err(error) = unsafe { runtime.htod(&bytes, pointer) } {
-        let _ = unsafe { runtime.free_raw(pointer) };
-        return Err(error);
+fn control_elements(input: TensorMetadata<'_>, op: &str, name: &str) -> Result<usize> {
+    if !input.present || input.dtype != DataType::Int64 {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep {op}: {name} must be present Int64 metadata"
+        )));
     }
-    Ok(pointer)
+    Ok(checked_tensor_bytes(op, name, DataType::Int64, input.shape)? / 8)
+}
+
+fn center_workspace(
+    inputs: &[TensorMetadata<'_>],
+    outputs: &[OutputMetadata<'_>],
+) -> Result<MetadataWorkspace> {
+    if inputs.len() != 2 || outputs.len() != 1 || !inputs[0].present {
+        return Err(EpError::KernelFailed(
+            "cuda_ep CenterCropPad: workspace planning requires two present inputs and one output"
+                .into(),
+        ));
+    }
+    control_elements(inputs[1], "CenterCropPad", "shape")?;
+    checked_tensor_bytes("CenterCropPad", "input", inputs[0].dtype, inputs[0].shape)?;
+    MetadataWorkspace::for_records(
+        "CenterCropPad",
+        inputs[0].shape.len(),
+        CENTER_WORDS,
+        &outputs[0],
+    )
+}
+
+fn col2im_workspace(
+    inputs: &[TensorMetadata<'_>],
+    outputs: &[OutputMetadata<'_>],
+) -> Result<MetadataWorkspace> {
+    if inputs.len() != 3 || outputs.len() != 1 || !inputs[0].present || inputs[0].shape.len() != 3 {
+        return Err(EpError::KernelFailed("cuda_ep Col2Im: workspace planning requires rank-3 data, image_shape, block_shape and one output".into()));
+    }
+    let rank = control_elements(inputs[1], "Col2Im", "image_shape")?;
+    if rank < 2 || control_elements(inputs[2], "Col2Im", "block_shape")? != rank {
+        return Err(EpError::KernelFailed("cuda_ep Col2Im: image_shape and block_shape must contain the same number of elements, at least two".into()));
+    }
+    checked_tensor_bytes("Col2Im", "input", inputs[0].dtype, inputs[0].shape)?;
+    MetadataWorkspace::for_records("Col2Im", rank, COL2IM_WORDS, &outputs[0])
+}
+
+fn checked_product(values: &[u64], name: &str) -> Result<u64> {
+    if values.contains(&0) {
+        return Ok(0);
+    }
+    values
+        .iter()
+        .try_fold(1u64, |product, value| product.checked_mul(*value))
+        .ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "cuda_ep Col2Im: {name} product overflows u64; reduce image/block dimensions"
+            ))
+        })
+}
+
+fn col2im_location_extent(
+    axis: usize,
+    image: u64,
+    block: u64,
+    dilation: u64,
+    stride: u64,
+    pads: [u64; 2],
+) -> Result<u64> {
+    if block == 0 || dilation == 0 || stride == 0 {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep Col2Im: block={block}, dilation={dilation}, stride={stride} at axis {axis} must be positive"
+        )));
+    }
+    let receptive = dilation.checked_mul(block-1).and_then(|n| n.checked_add(1))
+        .ok_or_else(|| EpError::KernelFailed(format!("cuda_ep Col2Im: receptive extent overflows at axis {axis}; reduce block_shape or dilation")))?;
+    let available = image.checked_add(pads[0]).and_then(|n| n.checked_add(pads[1]))
+        .ok_or_else(|| EpError::KernelFailed(format!("cuda_ep Col2Im: padded image extent overflows at axis {axis}; reduce image_shape or pads")))?;
+    // The device computes image_coordinate + pad_begin - kernel*dilation
+    // with signed long long. Bound both the positive intermediate and negative
+    // displacement, rather than assuming checked u64 extents prove that ABI.
+    let signed_max = i64::MAX as u64;
+    let largest_padded_coordinate = image.saturating_sub(1).checked_add(pads[0]);
+    if [image, block, dilation, stride, pads[0], pads[1]]
+        .iter()
+        .any(|&value| value > signed_max)
+        || receptive - 1 > signed_max
+        || largest_padded_coordinate.is_none_or(|coordinate| coordinate > signed_max)
+    {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep Col2Im: signed CUDA coordinate arithmetic exceeds i64 at axis {axis}; reduce image_shape, block_shape, dilation or pad_begin"
+        )));
+    }
+    Ok(if available < receptive {
+        0
+    } else {
+        (available - receptive) / stride + 1
+    })
 }
 
 fn launch_config(elements: u64) -> LaunchConfig {
@@ -188,8 +279,13 @@ struct CenterCropPadKernel {
     runtime: Arc<CudaRuntime>,
 }
 
-impl Kernel for CenterCropPadKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+impl CenterCropPadKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(
                 "cuda_ep CenterCropPad: expected 2 inputs and 1 output".into(),
@@ -200,6 +296,15 @@ impl Kernel for CenterCropPadKernel {
                 "CenterCropPad during CUDA graph capture because shape is a device input",
             ));
         }
+        let metadata: [_; 2] = std::array::from_fn(|index| {
+            TensorMetadata::new(
+                inputs[index].dtype,
+                inputs[index].shape,
+                !inputs[index].is_absent(),
+            )
+        });
+        let upload = center_workspace(&metadata, &[OutputMetadata::from_view(&outputs[0])])?
+            .bind(workspace)?;
         let input = &inputs[0];
         let shape = device_i64(&self.runtime, &inputs[1], "CenterCropPad", "shape")?;
         let output = &mut outputs[0];
@@ -249,11 +354,12 @@ impl Kernel for CenterCropPadKernel {
                 output.shape
             )));
         }
+        checked_tensor_bytes("index transform", "output", output.dtype, output.shape)?;
         if output.numel() == 0 {
             return Ok(());
         }
-        let input_strides = compute_contiguous_strides(input.shape);
-        let output_strides = compute_contiguous_strides(output.shape);
+        let input_strides = checked_metadata_strides("CenterCropPad", "input", input.shape)?;
+        let output_strides = checked_metadata_strides("CenterCropPad", "output", output.shape)?;
         let offsets = input.shape.iter().zip(output.shape).zip(selected).map(
             |((&source, &target), selected)| {
                 if selected {
@@ -272,7 +378,7 @@ impl Kernel for CenterCropPadKernel {
             .chain(output_strides.into_iter().map(|value| value as u64))
             .chain(offsets.map(|value| u64::from_ne_bytes(value.to_ne_bytes())))
             .collect::<Vec<_>>();
-        let metadata_pointer = upload_metadata(&self.runtime, &metadata)?;
+        let metadata_pointer = upload.upload(&self.runtime, &metadata)?;
         let function =
             self.runtime
                 .nvrtc_function("index_transform_v1", SOURCE, "center_crop_pad")?;
@@ -294,9 +400,35 @@ impl Kernel for CenterCropPadKernel {
             .arg(&elements);
         let launch = unsafe { builder.launch(launch_config(elements)) }
             .map_err(|error| driver_err("launch CenterCropPad", error));
-        let sync = launch.and_then(|_| self.runtime.synchronize());
-        let free = unsafe { self.runtime.free_raw(metadata_pointer) };
-        sync.and(free)
+        launch.and_then(|_| self.runtime.synchronize())
+    }
+}
+
+impl Kernel for CenterCropPadKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Ok(WorkspacePreparation::Ready(
+            center_workspace(inputs, outputs)?.requirement(),
+        ))
+    }
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "CenterCropPad reads device shape values and uploads borrowed metadata eagerly",
+        )
     }
 }
 
@@ -359,8 +491,13 @@ fn float_dtype(dtype: DataType, op: &str) -> Result<i32> {
     }
 }
 
-impl Kernel for Col2ImKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+impl Col2ImKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if inputs.len() != 3 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(
                 "cuda_ep Col2Im: expected 3 inputs and 1 output".into(),
@@ -371,6 +508,15 @@ impl Kernel for Col2ImKernel {
                 "Col2Im during CUDA graph capture because image/block shapes are device inputs",
             ));
         }
+        let metadata: [_; 3] = std::array::from_fn(|index| {
+            TensorMetadata::new(
+                inputs[index].dtype,
+                inputs[index].shape,
+                !inputs[index].is_absent(),
+            )
+        });
+        let upload = col2im_workspace(&metadata, &[OutputMetadata::from_view(&outputs[0])])?
+            .bind(workspace)?;
         let input = &inputs[0];
         let image = device_i64(&self.runtime, &inputs[1], "Col2Im", "image_shape")?;
         let block = device_i64(&self.runtime, &inputs[2], "Col2Im", "block_shape")?;
@@ -421,7 +567,7 @@ impl Kernel for Col2ImKernel {
                 rank * 2
             )));
         };
-        let block_elements = block.iter().product::<u64>();
+        let block_elements = checked_product(&block, "block_shape")?;
         if !(input.shape[1] as u64).is_multiple_of(block_elements) {
             return Err(EpError::KernelFailed(
                 "cuda_ep Col2Im: input channel-block dimension is not divisible by block_shape product"
@@ -431,35 +577,42 @@ impl Kernel for Col2ImKernel {
         let channels = input.shape[1] as u64 / block_elements;
         let mut location_shape = Vec::with_capacity(rank);
         for axis in 0..rank {
-            let receptive = dilations[axis] * (block[axis] - 1) + 1;
-            let available = image[axis] + pads[axis] + pads[axis + rank];
-            location_shape.push(if available < receptive {
-                0
-            } else {
-                (available - receptive) / strides[axis] + 1
-            });
+            location_shape.push(col2im_location_extent(
+                axis,
+                image[axis],
+                block[axis],
+                dilations[axis],
+                strides[axis],
+                [pads[axis], pads[axis + rank]],
+            )?);
         }
-        let locations = location_shape.iter().product::<u64>();
+        let locations = checked_product(&location_shape, "location shape")?;
         if input.shape[2] as u64 != locations {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Col2Im: input has {} columns, expected {locations}",
                 input.shape[2]
             )));
         }
-        let expected = [input.shape[0], channels as usize]
-            .into_iter()
-            .chain(image.iter().map(|&value| value as usize))
-            .collect::<Vec<_>>();
+        let mut expected = vec![input.shape[0], channels as usize];
+        for &dimension in &image {
+            expected.push(usize::try_from(dimension).map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep Col2Im: image_shape dimension exceeds usize; reduce image dimensions"
+                        .into(),
+                )
+            })?);
+        }
         if output.shape != expected {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Col2Im: output shape {:?}, expected {expected:?}",
                 output.shape
             )));
         }
+        checked_tensor_bytes("index transform", "output", output.dtype, output.shape)?;
         if output.numel() == 0 {
             return Ok(());
         }
-        let image_elements = image.iter().product::<u64>();
+        let image_elements = checked_product(&image, "image_shape")?;
         let metadata = image
             .iter()
             .chain(&block)
@@ -469,7 +622,7 @@ impl Kernel for Col2ImKernel {
             .chain(&location_shape)
             .copied()
             .collect::<Vec<_>>();
-        let metadata_pointer = upload_metadata(&self.runtime, &metadata)?;
+        let metadata_pointer = upload.upload(&self.runtime, &metadata)?;
         let function = self
             .runtime
             .nvrtc_function("index_transform_v1", SOURCE, "col2im")?;
@@ -492,8 +645,128 @@ impl Kernel for Col2ImKernel {
             .arg(&image_elements);
         let launch = unsafe { builder.launch(launch_config(output_elements)) }
             .map_err(|error| driver_err("launch Col2Im", error));
-        let sync = launch.and_then(|_| self.runtime.synchronize());
-        let free = unsafe { self.runtime.free_raw(metadata_pointer) };
-        sync.and(free)
+        launch.and_then(|_| self.runtime.synchronize())
+    }
+}
+
+impl Kernel for Col2ImKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Ok(WorkspacePreparation::Ready(
+            col2im_workspace(inputs, outputs)?.requirement(),
+        ))
+    }
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "Col2Im reads device image/block shapes and uploads borrowed metadata eagerly",
+        )
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+    use onnx_runtime_ep_api::WorkspaceRequirement;
+    #[test]
+    fn index_metadata_planning_uses_control_lengths_without_control_values() {
+        let center = [
+            TensorMetadata::new(DataType::Int32, &[3, 2], true),
+            TensorMetadata::new(DataType::Int64, &[2], true),
+        ];
+        let unresolved = [OutputMetadata::Unresolved {
+            dtype: DataType::Int32,
+        }];
+        assert_eq!(
+            center_workspace(&center, &unresolved)
+                .unwrap()
+                .requirement()
+                .bytes,
+            64
+        );
+        assert_eq!(
+            center_workspace(&center, &[OutputMetadata::tensor(DataType::Int32, &[0, 5])])
+                .unwrap()
+                .requirement(),
+            WorkspaceRequirement::NONE
+        );
+        let col = [
+            TensorMetadata::new(DataType::Float32, &[1, 4, 4], true),
+            TensorMetadata::new(DataType::Int64, &[1, 2], true),
+            TensorMetadata::new(DataType::Int64, &[2, 1], true),
+        ];
+        assert_eq!(
+            col2im_workspace(&col, &unresolved)
+                .unwrap()
+                .requirement()
+                .bytes,
+            96
+        );
+        let mut invalid = col;
+        invalid[2] = TensorMetadata::new(DataType::Int64, &[3], true);
+        assert!(
+            col2im_workspace(&invalid, &unresolved)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("same number of elements")
+        );
+        invalid[2] = TensorMetadata::new(DataType::Int64, &[usize::MAX], true);
+        assert!(col2im_workspace(&invalid, &unresolved).is_err());
+    }
+    #[test]
+    fn col2im_checked_extent_and_products_reject_overflow_before_launch() {
+        assert_eq!(col2im_location_extent(0, 3, 2, 1, 1, [0, 0]).unwrap(), 2);
+        assert_eq!(col2im_location_extent(1, 1, 3, 1, 2, [0, 0]).unwrap(), 0);
+        for (image, block, dilation, stride, pads) in [
+            (3, u64::MAX, 2, 1, [0, 0]),
+            (u64::MAX, 2, 1, 1, [1, 1]),
+            (3, 2, 1, 0, [0, 0]),
+        ] {
+            assert!(
+                col2im_location_extent(2, image, block, dilation, stride, pads)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("axis 2")
+            );
+        }
+        let max = i64::MAX as u64;
+        let error = col2im_location_extent(0, 2, 1, 1, max, [max, 0]).unwrap_err();
+        assert!(
+            error.to_string().contains("signed CUDA coordinate"),
+            "{error}"
+        );
+        // The neighboring representable boundary must still be accepted.
+        assert_eq!(
+            col2im_location_extent(0, 1, 1, 1, max, [max, 0]).unwrap(),
+            2
+        );
+        assert_eq!(
+            col2im_location_extent(0, 1, 2, max, max, [0, 0]).unwrap(),
+            0
+        );
+        assert!(
+            checked_product(&[u64::MAX, 2], "block_shape")
+                .unwrap_err()
+                .to_string()
+                .contains("block_shape")
+        );
+        assert_eq!(
+            checked_product(&[u64::MAX, 2, 0], "image_shape").unwrap(),
+            0
+        );
     }
 }

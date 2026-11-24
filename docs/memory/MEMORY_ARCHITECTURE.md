@@ -960,6 +960,41 @@ allocations, capture refusal and physical settlement. No CUDA hardware was
 available to execute those fixtures; upload latency and throughput remain
 unmeasured.
 
+### Control-driven descriptors bind before device readback
+
+`CenterCropPad`, `Col2Im` and `QLinearMatMul` now use the same caller descriptor
+path: `4 * input_rank`, `6 * image_shape_element_count` and
+`2 * broadcast_batch_count` u64 words, respectively. These counts need only
+shape/dtype facts; planning never reads control or scale values. Col2Im preserves
+the existing flattened contiguous Int64 control ABI, including non-vector
+control tensors. A vector dot product has one batch and still needs its two
+offset words even though its output is scalar.
+
+The private helper now describes records rather than only ranks. Binding yields
+a consumed `BoundMetadataUpload` proof containing an operator label and a
+borrowed view. It holds no owner, lease, pool, cache or grant. Each new kernel
+binds the whole descriptor before its original D2H validation and consumes the
+proof when uploading the exact payload. Missing, short or unaligned capacity
+therefore triggers neither D2H nor H2D. The previous Mod/LpPool/NonZero paths use
+this same interface; no compatibility entry point remains.
+
+Dynamic controls/scales are still read once per existing validation step, with
+no address-keyed value cache. Empty output requires no descriptor capacity but
+still validates the current device values. Recording remains explicitly
+unsupported, and synchronous H2D plus the eager-sync policy are unchanged.
+
+Dense byte spans, batch strides/offset counts and Col2Im receptive/padded/location
+products are checked before use. Col2Im also proves the signed-i64 range of its
+actual CUDA coordinate expression; a u64-safe extent alone is insufficient.
+Out-of-range coordinates fail with axis context and a corrective action.
+
+Host tests cover scalar dot products, broadcast offsets, flattened control
+lengths, empty geometry and overflow boundaries. Compiled device fixtures share
+one real owner across all six descriptor kernels, check exact existing readback
+counts, mutate controls/scales at the same address, and reject invalid values
+even for empty output. Device numerics, lifetime execution and performance still
+require CUDA hardware; the device algorithm sources are unchanged.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
@@ -1002,7 +1037,7 @@ call; it owns the governed workspace preparation path
 | `kernels/group_query_attention.rs` `gqa_transpose_scratch` + `gqa_workspace_layout` (`WS_Q_BNSH` / `WS_OUT_BNSH`) | `GroupQueryAttention` Q/output BNSH transpose scratch | Q: `align256(B·sq·num_heads·head_dim·elem)` when `sq>1`, packed input, or RoPE; output: the same aligned bytes only when `sq>1` | prompt/dtype/route dependent | session-persistent | **governed by #736** in the existing GQA composite; unpacked non-RoPE `sq==1` uses Q/output directly and charges `NONE` absent another region; packed `sq==1` overlays Q extraction with packed-Q staging |
 | `kernels/group_query_attention.rs` `GqaWorkspace::reserve` | `GroupQueryAttention` remaining pooled slots (present K/V / metadata) | slot-specific `bytes.max(1)` | cache/batch dependent, then reused | session-persistent growable state | raw bypass; scores, packed Q/K/V staging, and BNSH transpose slots are excluded — carved from the prepared composite on governed execution |
 | `kernels/index_share.rs:708` | `pkg.nxrt::IndexShare` selected-token attention workspace | aligned sum of reachable present staging, `B * q_heads * q_seq * selected_width * 4`, and optional `2 * B * sizeof(i64)` | prompt/cache dependent | session-persistent | **governed by #751** via `workspace_requirement` + prepared workspace |
-| `kernels/index_transform.rs:150` | index-transform metadata | `bytes.len()` | op/rank/config | step-scoped | raw bypass |
+| `kernels/index_transform.rs` | CenterCropPad/Col2Im descriptors | respectively `4 * rank * 8` and `6 * control_elements * 8` | input rank / checked image-shape control length | SessionPersistent caller peak | complete bind before existing D2H; exact borrowed upload |
 | `kernels/indexing.rs` | ScatterElements/ScatterND mean accumulator state | `data_numel * (16 or 24)` | output shape/dtype dependent | session-persistent shared caller peak | governed metadata requirement; real used-span capture pin; no private scratch owner |
 | `kernels/indexing.rs` metadata caches | shape/indexing descriptors | `bytes.len().max(1)` | op/rank/shape dependent | shape-keyed persistent metadata artifact | existing raw artifact owner and capture pin; separate from disposable mean state |
 | `kernels/matmul.rs` | dense MatMul cuBLASLt workspace, including F32/F16 single-row paths | exact cached ActualAddress plan `workspaceSize` | shape/dtype/alignment/algorithm dependent | session-persistent caller lane peak | metadata Deferred, execution refiner fixes the plan before admission; no private device scratch |
