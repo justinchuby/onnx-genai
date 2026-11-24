@@ -997,7 +997,7 @@ pub struct CudaRuntime {
     /// Latched after a legacy-default-stream upload fails without a completion
     /// proof. Future final releases also fence that stream; success cannot clear
     /// an earlier failure's pending use.
-    legacy_upload_unsettled: AtomicBool,
+    legacy_upload_unsettled: Arc<AtomicBool>,
     /// Capture-gate section covering this runtime's teardown, acquired in
     /// [`Drop::drop`] rather than at construction.
     ///
@@ -1271,7 +1271,7 @@ impl CudaRuntime {
             validation_reset_pause: AtomicBool::new(false),
             #[cfg(feature = "gpu-tests")]
             validation_reset_claimed: AtomicBool::new(false),
-            legacy_upload_unsettled: AtomicBool::new(false),
+            legacy_upload_unsettled: Arc::new(AtomicBool::new(false)),
             defer_eager_sync: AtomicBool::new(
                 // On by default; only an explicit falsey value restores the old
                 // always-sync eager path (escape hatch for debugging).
@@ -3413,8 +3413,8 @@ impl CudaRuntime {
     /// Release queues must fence the legacy default stream after a failed
     /// synchronous upload. This is not a completion witness and is never reset
     /// within the same runtime/context.
-    pub(crate) fn legacy_upload_needs_release_fence(&self) -> bool {
-        self.legacy_upload_unsettled.load(Ordering::Acquire)
+    pub(crate) fn legacy_upload_release_latch(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.legacy_upload_unsettled)
     }
 
     /// Enqueue an asynchronous host → device copy of `src` on the dedicated

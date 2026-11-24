@@ -7922,9 +7922,7 @@ mod tests {
         );
         let authority: Arc<dyn MemoryGovernor + Send + Sync> = governor.clone();
         let release_queue = CudaDeferredReleaseQueue::new(
-            Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
-                &runtime,
-            ))),
+            Box::new(crate::deferred_release::CudaStreamFences::new(&runtime)),
             crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
         );
         let residency = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
@@ -8105,9 +8103,7 @@ mod tests {
         );
         let authority: Arc<dyn MemoryGovernor + Send + Sync> = governor.clone();
         let release_queue = CudaDeferredReleaseQueue::new(
-            Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
-                &runtime,
-            ))),
+            Box::new(crate::deferred_release::CudaStreamFences::new(&runtime)),
             crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
         );
         let residency = CudaWeightResidency::new(Arc::clone(&runtime), (granule * 2) as u64)
@@ -8265,9 +8261,7 @@ mod tests {
         );
         let authority: Arc<dyn MemoryGovernor + Send + Sync> = governor.clone();
         let release_queue = CudaDeferredReleaseQueue::new(
-            Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
-                &runtime,
-            ))),
+            Box::new(crate::deferred_release::CudaStreamFences::new(&runtime)),
             crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
         );
         let residency = CudaWeightResidency::new(Arc::clone(&runtime), (granule * 2) as u64)
@@ -8715,9 +8709,7 @@ mod tests {
         // and passes it in -- so a residency built without one is a fixture
         // that does not model the production object.
         let release_queue = CudaDeferredReleaseQueue::new(
-            Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
-                &runtime,
-            ))),
+            Box::new(crate::deferred_release::CudaStreamFences::new(&runtime)),
             crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
         );
         let residency = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
@@ -8894,9 +8886,7 @@ mod tests {
         // which production always installs.
         let residency = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
             .with_deferred_release_queue(CudaDeferredReleaseQueue::new(
-                Box::new(crate::deferred_release::CudaStreamFences::new(Arc::clone(
-                    &runtime,
-                ))),
+                Box::new(crate::deferred_release::CudaStreamFences::new(&runtime)),
                 crate::deferred_release::DEFAULT_DEFERRED_RELEASE_CAPACITY,
             ))
             .with_vmm_admission(Arc::clone(&allocator), authority)

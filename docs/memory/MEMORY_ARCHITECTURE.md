@@ -1631,6 +1631,48 @@ unregistered caller capture refusal, numerical parity and replay after kernel
 drop. CUDA execution and throughput remain unmeasured. The new Host layout/bind
 and capture-owner checks are not claimed to have zero cost.
 
+### Physical release pins are independent of the runtime graph registry
+
+CUDA provider-context registrations now pin the release queue, whose fence
+source owns only the actual CUDA context, compute/copy streams and a shared
+legacy-upload failure latch. They do not permanently root the complete runtime.
+This removes the indirect `graph -> managed allocation -> context -> runtime`
+back-edge as well as the queue's former strong reference to the runtime.
+Ordinary releases still record two stream events; an unsettled legacy upload
+adds the default-stream tail even after the runtime itself has been destroyed.
+
+Execution handles have a different lifetime from these physical pins. The
+provider's once-only cleanup boundary hands one runtime Arc to a
+`StreamOrderedKeepAlive` action before retiring registration and closing the
+queue. Only completed stream fences permit that action to drop its Arc. This
+protects modules, BLAS/cuDNN handles and private allocations from early teardown
+without permanent allocation/context cycles or per-token ownership traffic.
+Existing provider graph reset and deferred cleanup ordering are preserved.
+
+Rejected retirement is recorded in the queue's retained diagnostics. An action
+that never executes deliberately retains its final Arc even if the queue later
+dies, including device loss, rather than issuing unordered CUDA destructors.
+That exceptional path leaks execution resources and does not claim successful
+retirement or quota refund. Physical fence-owner destruction holds the global
+capture exclusion through its CUDA stream/context field destructors, just as
+runtime destruction already does.
+
+Capture-sensitive terminal actions release the queue execution gate before
+entering process capture exclusion. Active capture defers them while their
+ownership stays pending; execution reacquires the queue gate and rechecks device
+loss. This establishes capture exclusion before the queue gate, including when
+a destructor enqueues child retirement. No finalizer thread or second pool is
+introduced.
+
+Host tests exercise two-stream completion, exactly-once handle retirement,
+refusal/loss retention, capture deferral with late child enqueue, device loss
+during that deferral and queue teardown. GPU fixtures compile physical fence
+use after runtime destruction, shared legacy-latch updates, and provider teardown
+without an extra runtime Arc in the test. No CUDA execution or teardown-latency
+measurement was available. Retained artifacts have not yet migrated to native
+allocation transactions; this separation establishes the lifetime boundary
+required for that migration without introducing a new EP protocol.
+
 ### Checkpoint snapshots have one dedicated native owner and an exclusive token
 
 `CsaCheckpointJournal` now borrows its provider and owns one native
