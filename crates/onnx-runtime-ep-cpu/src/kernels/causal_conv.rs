@@ -4,7 +4,7 @@
 //! Faithful CPU port of ONNX Runtime's contrib kernel
 //! (`contrib_ops/cpu/bert/causal_conv_with_state.cc`), verified to fp32 epsilon
 //! against ORT 1.26 (see `tests/qwen35_ort_parity.rs`). The op keeps the trailing
-//! `K-1` input frames from the previous step in `conv_state` so that decode
+//! `(K-1) * dilation` raw input frames from the previous step so that decode
 //! (`seq == 1`) stays causal across autoregressive steps.
 //!
 //! ## Contract (`ndim = 1`)
@@ -13,19 +13,18 @@
 //! * `weight` — `[C, 1, K]` depthwise filter (one filter per channel,
 //!   `group == C`).
 //! * `bias` — optional `[C]`.
-//! * `past_state` — optional `[B, C, K-1]`; treated as zeros when absent.
+//! * `past_state` — optional `[B, C, H]`; treated as zeros when absent.
 //!
 //! Outputs:
 //!
 //! * `y` — `[B, C, L]`.
-//! * `present_state` — `[B, C, K-1]`.
+//! * `present_state` — `[B, C, H]`.
 //!
-//! Per `(b, c)` let `seq = concat(past_state[b, c, :], x[b, c, :])` (length
-//! `(K-1) + L`). Then
+//! Let `H = (K-1) * dilation` and `seq = concat(past_state[b,c,:], x[b,c,:])`.
 //!
 //! ```text
-//! y[b, c, t] = activation( bias[c] + Σ_{j=0..K-1} weight[c, 0, j] · seq[t + j] )
-//! present_state[b, c, :] = seq[-(K-1):]
+//! y[b, c, t] = activation( bias[c] + Σ_{j=0..K-1} weight[c, 0, j] · seq[t + j*dilation] )
+//! present_state[b, c, :] = seq[L:L+H]
 //! ```
 //!
 //! `activation` is one of `none` (passthrough), `silu` or `swish` (both apply
@@ -38,6 +37,7 @@
 //! stays dtype-parameterized (RULES.md §2) without changing the arithmetic.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::causal_conv_with_state::Dilation;
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
@@ -57,9 +57,16 @@ enum ConvActivation {
 pub struct CausalConvWithStateKernel {
     activation: ConvActivation,
     standard: bool,
+    dilation: Dilation,
 }
 
 pub struct CausalConvWithStateFactory;
+
+pub(crate) fn unsupported_reason(node: &Node, opset: u64) -> Option<String> {
+    Dilation::parse(node, node.local_opset().unwrap_or(opset))
+        .err()
+        .map(|detail| format!("CausalConvWithState: {detail}"))
+}
 
 impl KernelFactory for CausalConvWithStateFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -82,7 +89,35 @@ impl KernelFactory for CausalConvWithStateFactory {
         Ok(Box::new(CausalConvWithStateKernel {
             activation,
             standard: node.is_default_domain(),
+            dilation: Dilation::parse(node, node.local_opset().unwrap_or(1)).map_err(|detail| {
+                EpError::KernelFailed(format!("CausalConvWithState: {detail}"))
+            })?,
         }))
+    }
+}
+
+#[inline]
+fn convolve_row<const DILATED: bool>(
+    out: &mut [f32],
+    x: &[f32],
+    weights: &[f32],
+    state: Option<&[f32]>,
+    bias: f32,
+    pad: usize,
+    dilation: usize,
+) {
+    for (t, out_t) in out.iter_mut().enumerate() {
+        let mut acc = bias;
+        for (k, &w) in weights.iter().enumerate() {
+            let pos = t + if DILATED { k * dilation } else { k };
+            let val = if pos < pad {
+                state.map_or(0.0, |s| s[pos])
+            } else {
+                x[pos - pad]
+            };
+            acc += w * val;
+        }
+        *out_t = acc;
     }
 }
 
@@ -107,12 +142,21 @@ impl Kernel for CausalConvWithStateKernel {
             )));
         }
         let kernel_size = w_shape[2];
-        if kernel_size == 0 {
-            return Err(EpError::KernelFailed(
-                "CausalConvWithState: kernel size K must be >= 1".into(),
-            ));
+        let pad = self
+            .dilation
+            .history_usize(kernel_size)
+            .map_err(|detail| EpError::KernelFailed(format!("CausalConvWithState: {detail}")))?;
+        if length.checked_add(pad).is_none() {
+            return Err(EpError::KernelFailed(format!(
+                "CausalConvWithState: input length {length} plus history {pad} exceeds host index size; reduce chunk length or dilation"
+            )));
         }
-        let pad = kernel_size - 1;
+        let dilation = if kernel_size == 1 {
+            1
+        } else {
+            // A nonzero history already fits usize and is >= dilation.
+            self.dilation.value() as usize
+        };
 
         // Optional inputs arrive positionally: an omitted one is a null-backed
         // placeholder in its own slot, not a shortened list. Testing arity
@@ -121,30 +165,39 @@ impl Kernel for CausalConvWithStateKernel {
         // opset-27 decode form `(input, weight, "", past_state)`.
         let has_bias = inputs.len() >= 3 && !inputs[2].is_absent();
         let has_state = inputs.len() >= 4 && !inputs[3].is_absent();
+        let present_shape = [batch, channels, pad];
+        for (name, output, shape) in [
+            ("output", outputs.first(), x_shape),
+            ("present_state", outputs.get(1), present_shape.as_slice()),
+        ] {
+            if let Some(output) = output
+                && (output.shape != shape || (self.standard && output.dtype != inputs[0].dtype))
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "CausalConvWithState: {name} must match shape {shape:?} and, for ai.onnx, input dtype {:?}; got shape {:?}, dtype {:?}",
+                    inputs[0].dtype, output.shape, output.dtype
+                )));
+            }
+        }
 
         let x = to_dense_f32_widen("CausalConvWithState", &inputs[0])?;
         let weight = to_dense_f32_widen("CausalConvWithState", &inputs[1])?;
         let bias = if has_bias {
-            let b = to_dense_f32_widen("CausalConvWithState", &inputs[2])?;
-            if b.len() != channels {
+            if inputs[2].shape != [channels] {
                 return Err(EpError::KernelFailed(format!(
-                    "CausalConvWithState: bias must be 1D with size C={channels}, got {} elements",
-                    b.len()
+                    "CausalConvWithState: bias must be [C={channels}], got {:?}",
+                    inputs[2].shape
                 )));
             }
-            Some(b)
+            Some(to_dense_f32_widen("CausalConvWithState", &inputs[2])?)
         } else {
             None
         };
         let state = if has_state {
             let s_shape = inputs[3].shape;
-            if s_shape.len() != 3
-                || s_shape[0] != batch
-                || s_shape[1] != channels
-                || s_shape[2] != pad
-            {
+            if s_shape != present_shape {
                 return Err(EpError::KernelFailed(format!(
-                    "CausalConvWithState: past_state must be [B={batch}, C={channels}, K-1={pad}], \
+                    "CausalConvWithState: past_state must be [B={batch}, C={channels}, history={pad}], \
                      got shape {s_shape:?}"
                 )));
             }
@@ -154,7 +207,7 @@ impl Kernel for CausalConvWithStateKernel {
         };
 
         let (primary_output, present_outputs) = outputs.split_at_mut(1);
-        let out_len = batch * channels * length;
+        let out_len = x.len();
 
         // In-place-aliasing guard: `y`/`present_state` are written directly into
         // their executor buffers, but a persistent DeviceIoBinding may bind an
@@ -171,8 +224,8 @@ impl Kernel for CausalConvWithStateKernel {
             .map(slice_byte_range)
             .collect();
 
-        let direct_out =
-            output_direct_write_eligible(&mut primary_output[0], out_len, &read_ranges);
+        let direct_out = out_len != 0
+            && output_direct_write_eligible(&mut primary_output[0], out_len, &read_ranges);
         let mut owned_out;
         let out: &mut [f32] = if direct_out {
             // SAFETY: `output_direct_write_eligible` proved the buffer is a
@@ -186,10 +239,20 @@ impl Kernel for CausalConvWithStateKernel {
             &mut owned_out
         };
 
-        let present_len = batch * channels * pad;
-        let direct_present = present_outputs.first_mut().is_some_and(|present| {
-            output_direct_write_eligible(present, present_len, &read_ranges)
-        });
+        let present_len = if !present_outputs.is_empty() && pad != 0 {
+            batch
+                .checked_mul(channels)
+                .and_then(|rows| rows.checked_mul(pad))
+                .ok_or_else(|| EpError::KernelFailed(format!(
+                    "CausalConvWithState: present_state size [B={batch}, C={channels}, history={pad}] exceeds host index size; reduce batch, channels, or dilation"
+                )))?
+        } else {
+            0
+        };
+        let direct_present = present_len != 0
+            && present_outputs.first_mut().is_some_and(|present| {
+                output_direct_write_eligible(present, present_len, &read_ranges)
+            });
         let mut owned_present;
         let mut present = if let Some(output) = present_outputs.first_mut() {
             if direct_present {
@@ -222,29 +285,17 @@ impl Kernel for CausalConvWithStateKernel {
 
                 let out_row =
                     &mut out[(b * channels + c) * length..(b * channels + c) * length + length];
-                if length == 1 {
+                if dilation == 1 && length == 1 {
                     let mut acc = bias_c;
                     for (k, &w) in w_row[..pad].iter().enumerate() {
                         acc += w * state_row.map_or(0.0, |s| s[k]);
                     }
                     acc += w_row[pad] * x_row[0];
                     out_row[0] = acc;
+                } else if dilation == 1 {
+                    convolve_row::<false>(out_row, x_row, w_row, state_row, bias_c, pad, dilation);
                 } else {
-                    for (t, out_t) in out_row.iter_mut().enumerate() {
-                        let mut acc = bias_c;
-                        for (k, &w) in w_row.iter().enumerate() {
-                            // Position `t + k` in the virtual `[state(pad) | x(L)]`
-                            // sequence: the first `pad` slots come from state.
-                            let pos = t + k;
-                            let val = if pos < pad {
-                                state_row.map_or(0.0, |s| s[pos])
-                            } else {
-                                x_row[pos - pad]
-                            };
-                            acc += w * val;
-                        }
-                        *out_t = acc;
-                    }
+                    convolve_row::<true>(out_row, x_row, w_row, state_row, bias_c, pad, dilation);
                 }
 
                 // present_state = last `pad` frames of `[state | x]`.
@@ -272,7 +323,7 @@ impl Kernel for CausalConvWithStateKernel {
             }
         }
 
-        if self.activation == ConvActivation::Silu {
+        if self.activation == ConvActivation::Silu && !out.is_empty() {
             if self.standard {
                 match inputs[0].dtype {
                     DataType::Float16 => out

@@ -1339,10 +1339,15 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
-    // Reuse the depthwise kernel; the standard schema changes at opset 29.
+    // The factory resolves the versioned dilation attribute for the standard op.
     rec.register_through(
         OpKey::new("CausalConvWithState", "", 27),
         28,
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(causal_conv::CausalConvWithStateFactory),
+    );
+    rec.register(
+        OpKey::new("CausalConvWithState", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
@@ -3520,7 +3525,7 @@ mod tests {
         // `mlas` and the optimized implementation with it.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
         // `TensorScatter` (opset-24 KV-cache update) adds one more, and the
-        // standard-domain `CausalConvWithState` (opset 27) adds one alongside
+        // standard-domain `CausalConvWithState` (opsets 27 and 29) adds two alongside
         // its `com.microsoft` spelling.
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
         // The EP-owned affine and GGUF Gather and grouped-projection fusions each add one.
@@ -3529,7 +3534,7 @@ mod tests {
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
         // Opset-28 Cast adds one registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 124 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 125 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")
@@ -3604,9 +3609,11 @@ mod tests {
         for op in ["LinearAttention", "CausalConvWithState"] {
             assert!(!reg.supports(op, "", 26));
             assert!(reg.supports(op, "ai.onnx", 28));
-            assert!(!reg.supports(op, "", 29));
-            assert!(reg.lookup(op, "", 29).is_none());
         }
+        assert!(!reg.supports("LinearAttention", "", 29));
+        assert!(reg.lookup("LinearAttention", "", 29).is_none());
+        assert!(reg.supports("CausalConvWithState", "", 29));
+        assert!(reg.lookup("CausalConvWithState", "", 29).is_some());
         assert!(
             reg.lookup("GatherBlockQuantized", "com.microsoft", 1)
                 .is_some()

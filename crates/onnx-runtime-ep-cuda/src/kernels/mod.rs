@@ -1350,10 +1350,17 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    // Reuse the depthwise kernel; the standard schema changes at opset 29.
+    // The factory resolves the versioned dilation attribute for the standard op.
     reg.register_through(
         OpKey::new("CausalConvWithState", "", 27),
         28,
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(causal_conv_with_state::CausalConvWithStateFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("CausalConvWithState", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv_with_state::CausalConvWithStateFactory {
             runtime: runtime.clone(),

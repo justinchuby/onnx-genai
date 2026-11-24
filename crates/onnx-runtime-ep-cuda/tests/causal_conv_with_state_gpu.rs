@@ -47,6 +47,136 @@ fn causal_conv_opset27_empty_chunk_preserves_or_zeros_state() {
     }
 }
 
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn causal_conv_opset29_matches_pinned_onnx_dilated_fixtures() {
+    let ep = require_cuda();
+    let dtype = DataType::Float32;
+    // test_causal_conv_with_state_dilated_d*_l*_k* at ONNX 622adf94d4e720142950aa8178f7357d52e63db0.
+    // Goldens computed by that revision's reference implementation, not nxrt CPU.
+    let fixtures: [(i64, usize, usize, bool, &str, &[f32], &[f32]); 4] = [
+        (
+            2,
+            7,
+            3,
+            false,
+            "none",
+            &[
+                0.25, 0.45, 0.65, 0.95, 1.25, 1.55, 1.85, 3.0, 3.5, 6.8, 7.7, 10.7, 11.9, 13.1,
+            ],
+            &[3.0, 4.0, 5.0, 6.0, 10.0, 11.0, 12.0, 13.0],
+        ),
+        (
+            3,
+            1,
+            4,
+            true,
+            "silu",
+            &[1.4909173, 18.8],
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 0.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+                16.0, 17.0, 1.0,
+            ],
+        ),
+        (
+            2,
+            0,
+            3,
+            true,
+            "none",
+            &[],
+            &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        ),
+        (
+            3,
+            2,
+            1,
+            false,
+            "swish",
+            &[0.14054413, 0.14054413, -0.12766725, -0.090033196],
+            &[],
+        ),
+    ];
+    let range = |n: usize| (0..n).map(|v| v as f32).collect::<Vec<_>>();
+    for (dilation, len, k, with_state, activation, y, present) in fixtures {
+        let history = (k - 1) * dilation as usize;
+        let mut inputs = vec![
+            float_input(dtype, &[1, 2, len], &range(2 * len)),
+            float_input(
+                dtype,
+                &[2, 1, k],
+                &range(2 * k)
+                    .into_iter()
+                    .map(|v| v / 10.0)
+                    .collect::<Vec<_>>(),
+            ),
+            float_input(dtype, &[2], &[0.25, -0.5]),
+        ];
+        if with_state {
+            inputs.push(float_input(dtype, &[1, 2, history], &range(2 * history)));
+        }
+        let outputs = [(dtype, vec![1, 2, len]), (dtype, vec![1, 2, history])];
+        let attrs = [
+            ("dilation", Attribute::Int(dilation)),
+            (
+                "activation",
+                Attribute::String(activation.as_bytes().to_vec()),
+            ),
+        ];
+        let actual = run_cuda(&ep, OP, "", 29, &inputs, &outputs, &attrs);
+        assert_close(
+            &format!("d{dilation}_l{len}_k{k}"),
+            dtype,
+            &decode_floats(&actual[0], dtype),
+            y,
+            2e-5,
+        );
+        assert_eq!(decode_floats(&actual[1], dtype), present);
+    }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn causal_conv_opset29_chains_dilated_chunks_with_omitted_bias() {
+    let ep = require_cuda();
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        let run = |x: &[f32], state: Option<&[f32]>| {
+            let mut inputs = vec![
+                float_input(dtype, &[1, 1, x.len()], x),
+                float_input(dtype, &[1, 1, 3], &[1.0, 2.0, 4.0]),
+            ];
+            if let Some(state) = state {
+                inputs.extend([
+                    common::absent_input(dtype),
+                    float_input(dtype, &[1, 1, 4], state),
+                ]);
+            }
+            let outputs = [(dtype, vec![1, 1, x.len()]), (dtype, vec![1, 1, 4])];
+            let raw = run_cuda(
+                &ep,
+                OP,
+                "",
+                29,
+                &inputs,
+                &outputs,
+                &[("dilation", Attribute::Int(2))],
+            );
+            (decode_floats(&raw[0], dtype), decode_floats(&raw[1], dtype))
+        };
+        assert_eq!(run(&[], None), (vec![], vec![0.0; 4]));
+        let (a, state) = run(&[1.0, 2.0], None);
+        assert_eq!(a, [4.0, 8.0]);
+        assert_eq!(state, [0.0, 0.0, 1.0, 2.0]);
+        let (b, state) = run(&[3.0, 4.0, 5.0], Some(&state));
+        assert_eq!(b, [14.0, 20.0, 27.0]);
+        assert_eq!(state, [2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(
+            run(&[1.0, 2.0, 3.0, 4.0, 5.0], None),
+            ([a, b].concat(), state)
+        );
+    }
+}
+
 fn tolerance(dtype: DataType, silu: bool) -> f32 {
     match (dtype, silu) {
         (DataType::Float32, false) => 2e-5,

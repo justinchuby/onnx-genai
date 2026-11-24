@@ -583,6 +583,9 @@ impl ExecutionProvider for CpuExecutionProvider {
         // These are *capability* declines, never performance ones: every entry
         // is a kernel we owe. See the benchmark doc's §23.6.
         let attribute_reason = match (op.op_type.as_str(), domain) {
+            ("CausalConvWithState", "ai.onnx" | "com.microsoft") => {
+                crate::kernels::causal_conv::unsupported_reason(op, opset)
+            }
             ("MoE", "com.microsoft") => crate::kernels::moe::unsupported_reason(op),
             ("QMoE", "com.microsoft") => crate::kernels::qmoe::unsupported_reason(op),
             ("GroupQueryAttention", "com.microsoft") => {

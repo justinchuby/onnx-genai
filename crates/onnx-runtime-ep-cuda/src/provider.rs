@@ -4305,7 +4305,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         if op.op_type == "CausalConvWithState"
             && (op.is_default_domain() || op.domain == "com.microsoft")
             && let Some(reason) =
-                crate::kernels::causal_conv_with_state::unsupported_reason(op, input_dtypes)
+                crate::kernels::causal_conv_with_state::unsupported_reason(op, opset, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
