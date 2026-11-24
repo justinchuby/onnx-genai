@@ -98,6 +98,21 @@ every call, including repeated growing shapes. Positive growth evidence alone
 therefore does not select mutable metadata storage. Such a policy needs device
 measurements of both changing and repeated shapes before changing the default.
 
+Broadcast arithmetic, comparison/logical, integer bitwise/shift and PRelu
+kernels publish immutable metadata and the successful launch signature together.
+Preparation and GPU submission use a private snapshot outside the shared state
+lock; only successful submission replaces the published pair. A failed candidate
+preserves the previous proof and owner. Replacement retirement happens after
+unlocking, while captured graphs retain their own pins. This publication rule
+does not provide concurrent execution lanes or change descriptor storage policy.
+
+Gemm's N-D bias epilogue likewise prepares a private immutable descriptor and
+publishes it only after successful submission, without holding its cache lock
+over preparation or GPU work. An inactive bias (absent C or beta=0) does not
+consult that cache, including on the K=0 empty-product path. Existing Gemm
+synchronization and eager-only capture policy remain in place; this transaction
+does not establish a cuBLASLt/bias capture contract.
+
 ### Resource allocation granularity
 
 Admission follows physical ownership and independent reclamation, not each

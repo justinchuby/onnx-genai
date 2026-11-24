@@ -314,6 +314,7 @@ struct BinaryCaptureSignature {
 pub struct BinaryIntKernel {
     kind: BinaryKind,
     runtime: Arc<CudaRuntime>,
+    /// Immutable metadata and the successful launch proof are one publication.
     warm: Mutex<WarmMetadata<BroadcastMetadataCache, BinaryCaptureSignature>>,
     /// Metadata-derived seq-independence: `true` iff all IR output dims are
     /// statically known (no growing seq axis), making the op capture-eligible
@@ -323,6 +324,9 @@ pub struct BinaryIntKernel {
 
 impl BinaryIntKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let mut candidate = self.warm.lock().map_err(|_| EpError::KernelFailed(
+            "cuda_ep bitwise metadata/signature state is poisoned; rebuild the provider before warming again".into(),
+        ))?.clone();
         let op = self.kind.op_name();
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -384,11 +388,6 @@ impl BinaryIntKernel {
                 out_shape: out_shape.clone(),
             },
         });
-        let mut candidate = self.warm.lock().map_err(|_| {
-            EpError::KernelFailed(format!(
-                "cuda_ep {op}: warm metadata state is poisoned; rebuild the provider before warming again"
-            ))
-        })?.clone();
         require_matching_capture_signature(
             &self.runtime,
             op,
@@ -423,7 +422,7 @@ impl BinaryIntKernel {
         // persistent cache buffer, valid across replays.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
         candidate.signature = current_signature;
-        publish_metadata_candidate(&self.warm, candidate, op)
+        publish_metadata_candidate(&self.warm, candidate, self.kind.op_name())
     }
 }
 
