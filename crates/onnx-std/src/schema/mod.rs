@@ -790,12 +790,24 @@ type_constraints:
         assert_eq!(bitshift28.since_version, 28);
         assert_eq!(
             bitshift11.type_constraints[0].allowed,
-            ["uint8", "uint16", "uint32", "uint64"]
+            [
+                DataType::Uint8,
+                DataType::Uint16,
+                DataType::Uint32,
+                DataType::Uint64
+            ]
         );
         assert_eq!(
             bitshift28.type_constraints[0].allowed,
             [
-                "uint8", "uint16", "uint32", "uint64", "int8", "int16", "int32", "int64"
+                DataType::Uint8,
+                DataType::Uint16,
+                DataType::Uint32,
+                DataType::Uint64,
+                DataType::Int8,
+                DataType::Int16,
+                DataType::Int32,
+                DataType::Int64,
             ]
         );
 
