@@ -1248,7 +1248,7 @@ all-target Clippy passed. These are functional checks without performance claims
 Live chat and legacy completions own bounded registrations until their consumer
 ends, with replay producers retaining control independently of reader reconnects.
 128-bit operating-system-random completion IDs prevent timestamp collisions.
-POST /control validates the action and signals the same resolved engine budget;
+POST /v1/chat/completions/control validates the action and signals the same resolved engine budget;
 unknown/finished and unarmed IDs return success:false. Native budget requests do
 not yet publish IDs for manual control. The final server suite passed 436 tests (2 inherited ignores), including HTTP
 control reaching real ONNX inference, capacity/completed-ID coverage and failure/
@@ -1770,3 +1770,27 @@ the two Native MTP tests and 71 CLI tests pass again, as do the real wheel check
 formatting and diff checks. Windows loader cases are mocked, and no CUDA
 execution or performance result is claimed. This closes the Python CPU startup
 isolation gap; the overall compatibility acceptance rows remain open.
+
+### Canonical live reasoning-control routing
+
+The pinned upstream README, server route and bundled frontend use
+`POST /v1/chat/completions/control`; the server now registers that exact path.
+The earlier local route is removed rather than retained as a pre-release alias.
+Control registrations carry the admitted model's identity instead of trusting a
+request-supplied model name. Router requests require a configured model and can
+signal only that model's live completion. Unknown models return actionable 404
+errors; idle or wrong-model lookups return `success:false` without loading a
+model. Single-model controls ignore the optional model name. Discovery and
+controls share one read-only catalogue-role predicate, preserving existing
+`/props` behavior without loading models or updating inference-use timestamps.
+
+Seventeen control-related tests and the full 452-server / two-inherited-ignore
+suite passed. A real Native sampler verifies that wrong-model controls leave
+its selected tokens unchanged and correct-model control emits the declared
+reasoning closer. The test also covers missing/blank models, unknown-model
+recovery hints, no idle-model autoload, old-route 404 and poisoned-registry
+operation/cause/recovery text. Existing chat/legacy buffered/SSE registrations,
+capacity and completion cleanup checks use the canonical path. All 38 HTTP
+integration tests, Native-CUDA-feature all-target strict Clippy, formatting and
+diff checks passed locally. CUDA execution remains unmeasured. This corrects a
+frontend-blocking endpoint gap; remaining acceptance rows stay open.

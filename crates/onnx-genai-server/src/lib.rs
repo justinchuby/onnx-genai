@@ -128,7 +128,10 @@ pub fn app(state: AppState) -> Router {
             "/chat/completions/input_tokens",
             post(routes::llama::input_tokens),
         )
-        .route("/control", post(completion_control::control))
+        .route(
+            "/v1/chat/completions/control",
+            post(completion_control::control),
+        )
         .route("/completion", post(routes::native::completions))
         .route("/completions", post(routes::native::completions))
         .route("/infill", post(routes::native::infill))

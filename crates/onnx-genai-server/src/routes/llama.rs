@@ -41,14 +41,7 @@ pub(crate) async fn props(
             "invalid /props query: {err}; use model=<model-id> and autoload=true or autoload=false"
         ))
     })?;
-    if query.model.is_empty()
-        && (state.registry.statuses().map_err(map_registry_error)?.len() > 1
-            || state
-                .registry
-                .lookup_loaded("")
-                .map_err(map_registry_error)?
-                .is_none())
-    {
+    if query.model.is_empty() && state.registry.is_router().map_err(map_registry_error)? {
         return Ok(Json(json!({
             "role": "router", "ui": true, "ui_settings": {},
             "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": true, "resumable_streams": true},

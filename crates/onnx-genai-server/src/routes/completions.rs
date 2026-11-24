@@ -301,6 +301,7 @@ async fn start_completion(
     )?;
     let registration = state.completion_controls.register_request(
         id,
+        handle,
         &request.sampling,
         prepared.generation.options_mut(),
     )?;
@@ -739,10 +740,12 @@ async fn run_chat_completion(
     projection.start().map_err(|error| {
         ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
     })?;
-    let registration =
-        state
-            .completion_controls
-            .register_request(&id, &request, &prepared.request.options)?;
+    let registration = state.completion_controls.register_request(
+        &id,
+        &handle,
+        &request,
+        &prepared.request.options,
+    )?;
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
@@ -892,10 +895,12 @@ async fn stream_chat_completion(
     let initial_gate = projection.start().map_err(|error| {
         ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
     })?;
-    let registration =
-        state
-            .completion_controls
-            .register_request(&id, &request, &prepared.request.options)?;
+    let registration = state.completion_controls.register_request(
+        &id,
+        &handle,
+        &request,
+        &prepared.request.options,
+    )?;
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
@@ -4019,7 +4024,12 @@ mod completion_delivery_tests {
                 &tx,
                 ("id", 1, "model", 3),
                 StartedCompletion {
-                    _registration: controls.register("id", None).unwrap(),
+                    _registration: controls
+                        .register(
+                            "id",
+                            crate::completion_control::ActiveCompletion::unarmed_for_test("model"),
+                        )
+                        .unwrap(),
                     events,
                     prompt_tokens: 3,
                 },
@@ -4030,7 +4040,12 @@ mod completion_delivery_tests {
             )
             .await
             .unwrap();
-            let released = controls.register("id", None).unwrap();
+            let released = controls
+                .register(
+                    "id",
+                    crate::completion_control::ActiveCompletion::unarmed_for_test("model"),
+                )
+                .unwrap();
             drop(released);
             let CompletionDelivery::Failed(error) = delivery else {
                 panic!("unfinished source must fail instead of claiming completed usage");
@@ -4057,7 +4072,12 @@ mod completion_delivery_tests {
             &tx,
             ("id", 1, "model", 0),
             StartedCompletion {
-                _registration: controls.register("id", None).unwrap(),
+                _registration: controls
+                    .register(
+                        "id",
+                        crate::completion_control::ActiveCompletion::unarmed_for_test("model"),
+                    )
+                    .unwrap(),
                 events,
                 prompt_tokens: 3,
             },
@@ -4069,7 +4089,12 @@ mod completion_delivery_tests {
         .await
         .unwrap();
         assert!(matches!(delivery, CompletionDelivery::Disconnected));
-        let released = controls.register("id", None).unwrap();
+        let released = controls
+            .register(
+                "id",
+                crate::completion_control::ActiveCompletion::unarmed_for_test("model"),
+            )
+            .unwrap();
         drop(released);
         assert!(source.is_closed());
     }

@@ -493,6 +493,18 @@ impl ModelRegistry {
         Ok(id.and_then(|id| inner.models.get(id)).cloned())
     }
 
+    /// Llama discovery and live controls select a model when the catalogue is
+    /// plural or its default has not loaded. Inspect under one read lock; never
+    /// load a model or update its inference-use timestamp for discovery/control.
+    pub(crate) fn is_router(&self) -> Result<bool, RegistryError> {
+        let inner = self.read()?;
+        Ok(inner.available.len() > 1
+            || inner
+                .default_id
+                .as_ref()
+                .is_none_or(|id| !inner.models.contains_key(id)))
+    }
+
     /// Returns `true` if `id` is a configured model (loaded or not).
     pub(crate) fn contains_available(&self, id: &str) -> Result<bool, RegistryError> {
         Ok(self.read()?.available.contains_key(id))
