@@ -1,5 +1,9 @@
 # llama.cpp protocol compatibility
 
+The [generated endpoint registration matrix](LLAMA_CPP_ENDPOINT_MATRIX.md) inventories
+all 55 static upstream method/path contracts, including aliases and conditional routes.
+Its route-presence results are separate from the behavioral evidence below.
+
 Native execution is enabled and selected by default in the engine, facade, CLI
 and server. ORT is an explicitly selected reference backend for tests and
 comparisons: use `--backend ort` or `EngineDecodeBackend::Ort`. Native failures
@@ -425,7 +429,12 @@ parity. These upstream protocols are still unimplemented:
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
 - GGUF/Hugging Face model downloads and deletion.
 
-Model download/delete and mutable `/props` remain disabled.
+Model download/delete remain disabled. `--props` enables `POST /props`, matching
+upstream's current acknowledgement-only contract: it returns `{"success":true}`
+and does not read or change generation settings. `GET /props` advertises the
+configured `endpoint_props` value in router and model modes. When disabled, POST
+returns upstream-compatible `501 not_supported_error`. This is not an API
+for changing generation defaults.
 `GET/POST /tools` now supports the seven explicitly enabled host built-ins,
 including command SSE, file selection and editing. See [host tools](SERVER_TOOLS.md)
 for limits, trusted-origin policy and remaining MCP/container/SSH integrations. The MCP
