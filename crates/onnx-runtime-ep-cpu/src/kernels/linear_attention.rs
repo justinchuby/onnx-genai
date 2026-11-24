@@ -56,7 +56,7 @@
 //! (RULES.md §2) without changing the arithmetic.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
 use crate::dtype::{
@@ -72,6 +72,15 @@ enum UpdateRule {
 }
 
 impl UpdateRule {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::Gated => "gated",
+            Self::Delta => "delta",
+            Self::GatedDelta => "gated_delta",
+        }
+    }
+
     fn needs_decay(self) -> bool {
         matches!(self, UpdateRule::Gated | UpdateRule::GatedDelta)
     }
@@ -81,6 +90,7 @@ impl UpdateRule {
 }
 
 pub struct LinearAttentionKernel {
+    standard: bool,
     q_num_heads: usize,
     kv_num_heads: usize,
     update_rule: UpdateRule,
@@ -105,6 +115,12 @@ impl KernelFactory for LinearAttentionFactory {
         };
         let q_num_heads = read_heads("q_num_heads")?;
         let kv_num_heads = read_heads("kv_num_heads")?;
+        let standard = node.is_default_domain() && node.local_opset().is_some_and(|v| v >= 27);
+        if standard && !q_num_heads.is_multiple_of(kv_num_heads) {
+            return Err(EpError::KernelFailed(format!(
+                "LinearAttention-27: q_num_heads={q_num_heads} must be a positive multiple of kv_num_heads={kv_num_heads}"
+            )));
+        }
 
         let update_rule = match node.attr("update_rule").and_then(|a| a.as_str()) {
             Some("linear") => UpdateRule::Linear,
@@ -126,6 +142,7 @@ impl KernelFactory for LinearAttentionFactory {
         };
 
         Ok(Box::new(LinearAttentionKernel {
+            standard,
             q_num_heads,
             kv_num_heads,
             update_rule,
@@ -138,6 +155,39 @@ impl Kernel for LinearAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         // query, key, value required; past_state, decay, beta optional.
         check_arity("LinearAttention", inputs, outputs, 3, 6, 1)?;
+        let optional = |index| inputs.get(index).filter(|v: &&TensorView| !v.is_absent());
+        let past_state = optional(3);
+        let decay = optional(4);
+        let beta = optional(5);
+        if self.standard {
+            let dtype = inputs[0].dtype;
+            let state_dtype = past_state.map_or(dtype, |state| state.dtype);
+            let supported = |d| {
+                matches!(
+                    d,
+                    DataType::Float32 | DataType::Float16 | DataType::BFloat16
+                )
+            };
+            if outputs.len() != 2 || outputs[1].is_absent() {
+                return Err(EpError::KernelFailed(
+                    "LinearAttention-27: both output and present_state are required".into(),
+                ));
+            }
+            if !supported(dtype)
+                || !supported(state_dtype)
+                || inputs[..3]
+                    .iter()
+                    .chain(decay)
+                    .chain(beta)
+                    .any(|v| v.dtype != dtype)
+                || outputs[0].dtype != dtype
+                || outputs[1].dtype != state_dtype
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "LinearAttention-27: activations must all use {dtype:?} and state {state_dtype:?}; supported types are Float32, Float16 and BFloat16"
+                )));
+            }
+        }
 
         let q_shape = inputs[0].shape;
         let k_shape = inputs[1].shape;
@@ -171,6 +221,16 @@ impl Kernel for LinearAttentionKernel {
             )));
         }
         let n_k_heads = k_shape[2] / d_k;
+        if n_k_heads == 0 || (self.standard && n_k_heads != kv_num_heads) {
+            return Err(EpError::KernelFailed(format!(
+                "LinearAttention: key has {n_k_heads} heads, expected {}",
+                if self.standard {
+                    kv_num_heads.to_string()
+                } else {
+                    "at least one".into()
+                }
+            )));
+        }
         if !v_shape[2].is_multiple_of(kv_num_heads) {
             return Err(EpError::KernelFailed(format!(
                 "LinearAttention: value hidden {} not divisible by kv_num_heads {kv_num_heads}",
@@ -211,18 +271,22 @@ impl Kernel for LinearAttentionKernel {
         let needs_decay = self.update_rule.needs_decay();
         let needs_delta = self.update_rule.needs_delta();
 
-        // Resolve optional inputs. ONNX omits trailing optionals by shortening
-        // the input list; the model always supplies all six.
-        let past_state = inputs.get(3);
-        let decay = inputs.get(4);
-        let beta = inputs.get(5);
-
-        if needs_decay && decay.is_none() {
+        if self.standard {
+            if let Some(detail) = onnx_runtime_ir::linear_attention::gate_error(
+                self.update_rule.name(),
+                decay.is_some(),
+                beta.is_some(),
+            ) {
+                return Err(EpError::KernelFailed(format!(
+                    "LinearAttention-27: {detail}"
+                )));
+            }
+        } else if needs_decay && decay.is_none() {
             return Err(EpError::KernelFailed(
                 "LinearAttention: decay input is required for update_rule=gated/gated_delta".into(),
             ));
         }
-        if needs_delta && beta.is_none() {
+        if !self.standard && needs_delta && beta.is_none() {
             return Err(EpError::KernelFailed(
                 "LinearAttention: beta input is required for update_rule=delta/gated_delta".into(),
             ));

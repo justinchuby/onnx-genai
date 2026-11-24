@@ -44,6 +44,7 @@ pub trait KernelFactory: Send + Sync {
 #[derive(Default)]
 pub struct OpRegistry {
     entries: HashMap<OpKey, (WorkspacePlanning, Box<dyn KernelFactory>)>,
+    end_versions: HashMap<OpKey, u64>,
     /// Normalized domain → op type → sorted registered `since_version`s.
     by_op: HashMap<String, HashMap<String, Vec<u64>>>,
 }
@@ -56,11 +57,27 @@ impl OpRegistry {
     /// Register a factory under `key`.
     pub fn register(
         &mut self,
+        key: OpKey,
+        planning: WorkspacePlanning,
+        factory: Box<dyn KernelFactory>,
+    ) {
+        self.register_through(key, u64::MAX, planning, factory);
+    }
+
+    /// Register a schema revision with an explicit inclusive upper opset bound.
+    pub fn register_through(
+        &mut self,
         mut key: OpKey,
+        end_version: u64,
         planning: WorkspacePlanning,
         factory: Box<dyn KernelFactory>,
     ) {
         key.domain = norm_domain(&key.domain).to_owned();
+        if end_version == u64::MAX {
+            self.end_versions.remove(&key);
+        } else {
+            self.end_versions.insert(key.clone(), end_version);
+        }
         let versions = self
             .by_op
             .entry(key.domain.clone())
@@ -101,19 +118,21 @@ impl OpRegistry {
         let versions = self.by_op.get(domain)?.get(op_type)?;
         let index = versions.partition_point(|&version| version <= opset);
         let since_version = *versions.get(index.checked_sub(1)?)?;
-        self.entries
-            .get(&OpKey::new(op_type, domain, since_version))
+        let key = OpKey::new(op_type, domain, since_version);
+        if opset > self.explicit_end_version(&key) {
+            return None;
+        }
+        self.entries.get(&key)
     }
 
-    /// Whether a factory is registered for `(op_type, domain)` at or before
-    /// `opset`.
+    /// Whether a factory covers this opset.
     pub fn supports(&self, op_type: &str, domain: &str, opset: u64) -> bool {
-        let domain = norm_domain(domain);
-        self.by_op
-            .get(domain)
-            .and_then(|ops| ops.get(op_type))
-            .and_then(|versions| versions.first())
-            .is_some_and(|&since_version| since_version <= opset)
+        self.lookup_entry(op_type, domain, opset).is_some()
+    }
+
+    /// Inclusive explicit upper bound for a normalized registration key.
+    pub fn explicit_end_version(&self, key: &OpKey) -> u64 {
+        self.end_versions.get(key).copied().unwrap_or(u64::MAX)
     }
 
     /// Earliest registered opset for `(op_type, domain)`, if the EP knows the

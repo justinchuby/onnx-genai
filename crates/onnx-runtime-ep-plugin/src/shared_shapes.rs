@@ -98,6 +98,13 @@ pub(crate) fn native_shape_operands(node: &Node) -> Option<&'static [usize]> {
         if opset >= 26 && matches!(op, "BitCast" | "CumProd") {
             return Some(&[]);
         }
+        if opset >= 27 {
+            match op {
+                "CausalConvWithState" | "LinearAttention" if opset <= 28 => return Some(&[]),
+                "Range" => return Some(&[0, 1, 2]),
+                _ => {}
+            }
+        }
         if onnx_runtime_ir::standard_math::OPS
             .iter()
             .any(|&(name, since)| name == op && opset >= since)

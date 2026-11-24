@@ -419,6 +419,7 @@ pub struct CudaOpDescriptor {
     pub op_type: String,
     pub domain: String,
     pub since_version: u64,
+    pub end_version: u64,
     /// Element types advertised for the op's type constraints. The plugin's
     /// claim filter checks *every* input and output dtype against this set, so
     /// it must be the union of all element types the kernel legitimately
@@ -659,8 +660,11 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("Cast", _)
         | ("CastLike", _)
         | ("TopK", _)
-        | ("Range", _)
         | ("EyeLike", _) => CUDA_ALL_DTYPES,
+        ("Range", "") => &[
+            DataType::Float32, DataType::Float64, DataType::Float16, DataType::BFloat16,
+            DataType::Int16, DataType::Int32, DataType::Int64,
+        ],
 
         // Logical ops: boolean.
         ("And", _) | ("Or", _) | ("Xor", _) | ("Not", _) => CUDA_BOOL_DTYPES,
@@ -727,6 +731,7 @@ pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpD
             op_type: key.op_type.clone(),
             domain: key.domain.clone(),
             since_version: key.since_version,
+            end_version: registry.explicit_end_version(key),
             supported_dtypes: cuda_supported_dtypes_for_op(&key.op_type, &key.domain),
         })
         .collect();
@@ -1030,11 +1035,21 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    reg.register(
+    reg.register_through(
         OpKey::new("Range", "", 11),
+        26,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(range::RangeFactory {
             runtime: runtime.clone(),
+            v27: false,
+        }),
+    );
+    reg.register(
+        OpKey::new("Range", "", 27),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(range::RangeFactory {
+            runtime: runtime.clone(),
+            v27: true,
         }),
     );
     for version in [10, 13, 19, 21, 23, 25] {
@@ -1314,14 +1329,10 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    // Standard ONNX-domain spelling, opset 27. Same contract as the contrib op
-    // (rank-3 `[B, C, L]`, depthwise `[C, 1, k]` weight, `k-1` carry state,
-    // `none`/`silu`/`swish` activation), so it reuses the same kernel rather
-    // than growing a second implementation to keep in step — matching what the
-    // CPU EP does for this op and what both EPs already do for
-    // `LinearAttention`.
-    reg.register(
+    // Reuse the depthwise kernel; the standard schema changes at opset 29.
+    reg.register_through(
         OpKey::new("CausalConvWithState", "", 27),
+        28,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv_with_state::CausalConvWithStateFactory {
             runtime: runtime.clone(),
@@ -1334,10 +1345,9 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    // Standard ONNX-domain spelling (onnx/onnx#7689), semantically identical to
-    // the com.microsoft op — served by the same fused kernel.
-    reg.register(
-        OpKey::new("LinearAttention", "", 1),
+    reg.register_through(
+        OpKey::new("LinearAttention", "", 27),
+        28,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(linear_attention::LinearAttentionFactory {
             runtime: runtime.clone(),

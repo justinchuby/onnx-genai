@@ -407,6 +407,9 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/size.yaml"),
     include_str!("../../schemas/standard/non_zero.yaml"),
     include_str!("../../schemas/standard/range.yaml"),
+    include_str!("../../schemas/standard/range_v27.yaml"),
+    include_str!("../../schemas/standard/causal_conv_with_state.yaml"),
+    include_str!("../../schemas/standard/linear_attention.yaml"),
     include_str!("../../schemas/standard/split.yaml"),
     include_str!("../../schemas/standard/tile.yaml"),
     include_str!("../../schemas/standard/pad.yaml"),
@@ -739,8 +742,15 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 113);
-        assert_eq!(registry.iter().count(), 126);
+        assert_eq!(registry.schemas.len(), 115);
+        assert_eq!(registry.iter().count(), 129);
+        for op in ["LinearAttention", "CausalConvWithState"] {
+            assert!(registry.lookup(op, "", 26).is_none());
+            assert_eq!(registry.lookup(op, "", 28).unwrap().since_version, 27);
+            assert!(registry.lookup(op, "", 29).is_none());
+        }
+        assert_eq!(registry.lookup("Range", "", 26).unwrap().since_version, 11);
+        assert_eq!(registry.lookup("Range", "", 27).unwrap().since_version, 27);
 
         for (name, since_version) in [
             ("DequantizePacked", 29),

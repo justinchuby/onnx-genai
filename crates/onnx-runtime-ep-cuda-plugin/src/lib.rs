@@ -264,6 +264,7 @@ mod cuda_impl {
                     - 1
             })
             .unwrap_or(i32::MAX)
+            .min(i32::try_from(descriptor.end_version).unwrap_or(i32::MAX))
     }
 
     /// Leak a string to get a `&'static str` (entries must live for the EP
@@ -311,13 +312,14 @@ mod cuda_impl {
                 op_type: op_type.into(),
                 domain: domain.into(),
                 since_version,
+                end_version: u64::MAX,
                 supported_dtypes: &[],
             }
         }
 
         #[test]
         fn advertised_schema_ranges_end_before_the_next_registered_version() {
-            let descriptors = vec![
+            let mut descriptors = vec![
                 descriptor("DsaIndexSelect", "pkg.nxrt", 1),
                 descriptor("DsaIndexSelect", "pkg.nxrt", 3),
                 descriptor("Other", "pkg.nxrt", 1),
@@ -326,6 +328,8 @@ mod cuda_impl {
             assert_eq!(schema_end_version(&descriptors, 0), 2);
             assert_eq!(schema_end_version(&descriptors, 1), i32::MAX);
             assert_eq!(schema_end_version(&descriptors, 2), i32::MAX);
+            descriptors[1].end_version = 28;
+            assert_eq!(schema_end_version(&descriptors, 1), 28);
         }
     }
 }

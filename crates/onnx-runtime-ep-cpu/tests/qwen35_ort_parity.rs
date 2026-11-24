@@ -63,7 +63,7 @@ fn run_f32(
         .collect();
 
     CpuExecutionProvider::new()
-        .get_kernel(node, input_shapes, 1)
+        .get_kernel(node, input_shapes, node.version.unwrap_or(1) as u64)
         .expect("Qwen3.5 kernel should be registered")
         .execute(&inputs, &mut outputs)
         .expect("Qwen3.5 kernel execution should succeed");
@@ -315,7 +315,7 @@ fn linear_attention_matches_onnxruntime_1_26() {
     }
 }
 
-/// The standard ONNX-domain spelling (`""`, onnx/onnx#7689) must dispatch to
+/// The standard ONNX-domain spelling (opset 27) must dispatch to
 /// the SAME fused CPU kernel as `com.microsoft` and produce byte-identical
 /// output — proving the dual-domain registration is wired through the CPU EP.
 #[test]
@@ -347,6 +347,7 @@ fn linear_attention_standard_domain_matches_com_microsoft() {
     let msft_node = linear_attention_node(heads, g::LAA_SCALE);
     let mut std_node = linear_attention_node(heads, g::LAA_SCALE);
     std_node.domain = String::new();
+    std_node.version = Some(27);
 
     let msft = run_f32(&msft_node, &input_shapes, &input_data, &output_shapes);
     let std = run_f32(&std_node, &input_shapes, &input_data, &output_shapes);
