@@ -171,7 +171,11 @@ before those references end; kernel resources drop before the final reference.
 Shared factory owners retain their existing teardown policy.
 
 One exclusive workspace lane belongs to each `ComputeState`. Sequential nodes
-borrow the same retained peak; concurrent states own independent backing. Fitting
+borrow the same retained peak; coexisting states own independent backing.
+Because `Kernel` requires `Send`, not `Sync`, a compiled-info execution lock also
+serializes host calls from different states sharing those kernels. The lock order
+is compiled info then state; kernel panic poisons the shared info for all states.
+These host locks do not establish device completion. Fitting
 requests make no provider or issuer calls. Growth preserves both capacity and
 alignment high-water marks using the existing consuming `replace_workspace`;
 teardown releases through the original provider. Failed replacement cannot

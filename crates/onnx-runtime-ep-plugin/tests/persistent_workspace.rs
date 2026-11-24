@@ -92,6 +92,8 @@ struct ScratchKernel {
     seen: Arc<Mutex<Vec<usize>>>,
     fail: Arc<AtomicBool>,
     calls: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+    panic_next: Arc<AtomicBool>,
 }
 impl Kernel for ScratchKernel {
     fn workspace_requirement(
@@ -121,11 +123,24 @@ impl Kernel for ScratchKernel {
         assert!(workspace.bytes() >= self.bytes);
         let scratch = unsafe { std::slice::from_raw_parts_mut(workspace.ptr().0.cast::<u64>(), 8) };
         let generation = self.calls.fetch_add(1, Ordering::SeqCst) as u64;
+        assert!(
+            !self.panic_next.swap(false, Ordering::SeqCst),
+            "planned shared kernel panic"
+        );
+        assert_eq!(
+            self.active.fetch_add(1, Ordering::SeqCst),
+            0,
+            "Send-only shared kernel must not execute concurrently"
+        );
+        for _ in 0..8 {
+            std::thread::yield_now();
+        }
         for (i, slot) in scratch.iter_mut().enumerate() {
             *slot = generation + i as u64;
         }
         assert_eq!(scratch.iter().sum::<u64>(), 8 * generation + 28);
         self.seen.lock().unwrap().push(workspace.ptr().0 as usize);
+        assert_eq!(self.active.fetch_sub(1, Ordering::SeqCst), 1);
         if self.fail.load(Ordering::SeqCst) {
             return Err(EpError::KernelFailed(
                 "planned post-submission failure".into(),
@@ -141,6 +156,8 @@ struct Fixture {
     seen: Arc<Mutex<Vec<usize>>>,
     fail: Arc<AtomicBool>,
     calls: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+    panic_next: Arc<AtomicBool>,
 }
 impl Fixture {
     fn new(
@@ -189,12 +206,16 @@ impl Fixture {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let fail = Arc::new(AtomicBool::new(false));
         let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let panic_next = Arc::new(AtomicBool::new(false));
         let entry = CompiledKernelEntry {
             kernel: Box::new(ScratchKernel {
                 bytes: 64,
                 seen: seen.clone(),
                 fail: fail.clone(),
                 calls: calls.clone(),
+                active: active.clone(),
+                panic_next: panic_next.clone(),
             }),
             num_inputs: 0,
             num_outputs: 0,
@@ -212,6 +233,8 @@ impl Fixture {
             seen,
             fail,
             calls,
+            active,
+            panic_next,
         }
     }
     fn state(&mut self) -> *mut std::ffi::c_void {
@@ -512,6 +535,8 @@ fn persistent_workspace_serial_nodes_share_peak_capacity_and_one_preflight_per_c
             seen: fixture.seen.clone(),
             fail: fixture.fail.clone(),
             calls: fixture.calls.clone(),
+            active: fixture.active.clone(),
+            panic_next: fixture.panic_next.clone(),
         }),
         num_inputs: 0,
         num_outputs: 0,
@@ -554,4 +579,73 @@ fn persistent_workspace_serial_nodes_share_peak_capacity_and_one_preflight_per_c
     drop(pool);
     assert_eq!(manager.process_used(Tier::Host), 0);
     assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn persistent_workspace_states_serialize_shared_send_only_kernel_and_keep_distinct_owners() {
+    let mut fixture = Fixture::new(CpuMemoryResources::default(), true, None);
+    let states = [fixture.state(), fixture.state()];
+    let info_address = std::ptr::from_mut(&mut fixture.info.vtable) as usize;
+    let compute = fixture.info.vtable.Compute.unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        for state in states {
+            let state_address = state as usize;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                for _ in 0..32 {
+                    let status = unsafe {
+                        compute(
+                            info_address as *mut ort::OrtNodeComputeInfo,
+                            state_address as *mut std::ffi::c_void,
+                            ptr::dangling_mut(),
+                        )
+                    };
+                    assert!(status.is_null(), "concurrent state execution failed");
+                }
+            });
+        }
+    });
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 64);
+    let seen = fixture.seen.lock().unwrap();
+    assert_eq!(
+        seen.iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        2,
+        "two live states need independent owners"
+    );
+    drop(seen);
+    for state in states {
+        fixture.release(state);
+    }
+}
+
+#[test]
+fn persistent_workspace_kernel_panic_rejects_other_states_of_same_compiled_info() {
+    let mut fixture = Fixture::new(CpuMemoryResources::default(), true, None);
+    let first = fixture.state();
+    let second = fixture.state();
+    fixture.panic_next.store(true, Ordering::SeqCst);
+    assert!(!fixture.compute(first).is_null());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert!(!fixture.compute(second).is_null());
+    LAST_ERROR.with(|error| {
+        assert!(
+            error
+                .borrow()
+                .contains("shared compiled kernels were poisoned"),
+            "{}",
+            error.borrow()
+        )
+    });
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        1,
+        "another state cannot reenter a panicked shared kernel"
+    );
+    fixture.release(first);
+    fixture.release(second);
 }

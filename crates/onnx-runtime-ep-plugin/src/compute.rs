@@ -1401,6 +1401,9 @@ pub struct ExportedComputeInfo {
     pub vtable: ort::OrtNodeComputeInfo,
     /// The compiled kernel entries for this subgraph (in topological order).
     pub entries: Vec<CompiledKernelEntry>,
+    /// Kernels are Send, not Sync. Independent states of the same compiled info
+    /// must serialize host execution as well as retaining disjoint workspaces.
+    execution: Mutex<()>,
     /// Optional routing table for multi-node fused subgraphs.
     pub routing: Option<SubgraphRouting>,
     /// One [`WorkspacePlanCache`] per entry in `entries`, same index. Built in
@@ -1511,6 +1514,7 @@ impl ExportedComputeInfo {
                 ReleaseState: Some(compute_release_state),
             },
             entries,
+            execution: Mutex::new(()),
             routing: None,
             workspace_plans,
             device_staging: None,
@@ -2565,6 +2569,16 @@ unsafe extern "C" fn compute_execute(
         }
 
         let exported = unsafe { &*(info.cast::<ExportedComputeInfo>()) };
+        // Lock order is compiled info, then state. A kernel panic retires the
+        // shared kernel instance for every state, including previously idle ones.
+        let _execution = match exported.execution.lock() {
+            Ok(execution) => execution,
+            Err(_) => {
+                return fail_status(
+                    "Compute: shared compiled kernels were poisoned by a prior panic; recreate the session before submitting work from any state",
+                );
+            }
+        };
         // Serialize host submission as well as borrowing. Registration proves
         // device ordering separately; this lock is not a completion fence.
         let state = unsafe { &*state.cast::<ComputeState>() };
