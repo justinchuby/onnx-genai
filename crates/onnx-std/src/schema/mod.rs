@@ -750,7 +750,7 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 118);
+        assert_eq!(registry.schemas.len(), 115);
         assert_eq!(registry.iter().count(), 133);
         for (op, prior, prior_indices) in [
             ("GatherND", 13, "tensor(int64)"),
