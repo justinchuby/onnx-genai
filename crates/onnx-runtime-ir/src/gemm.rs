@@ -83,8 +83,13 @@ impl GemmGeometry {
         let n = b[1 - axes.b_k];
         let prefix = &a[..a.len().saturating_sub(2)];
         let batch = checked_elements(prefix).ok_or_else(|| capacity(a, b))?;
-        let rows = batch.checked_mul(m).ok_or_else(|| capacity(a, b))?;
-        let elements = rows.checked_mul(n).ok_or_else(|| capacity(a, b))?;
+        let output_capacity = || {
+            format!(
+                "Gemm output for A {a:?} and B {b:?} exceeds addressable element capacity; reduce the output dimensions"
+            )
+        };
+        let rows = batch.checked_mul(m).ok_or_else(output_capacity)?;
+        let elements = rows.checked_mul(n).ok_or_else(output_capacity)?;
         rows.checked_mul(k)
             .and_then(|_| k.checked_mul(n))
             .ok_or_else(|| capacity(a, b))?;

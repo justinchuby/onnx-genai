@@ -93,7 +93,7 @@ static ARITH_DTYPES: &[DataType] = &[
 ];
 
 /// Dtypes supported by `dispatch_float!` (transcendental/accumulate ops).
-static FLOAT_DTYPES: &[DataType] = &[
+pub(crate) static FLOAT_DTYPES: &[DataType] = &[
     DataType::Float32,
     DataType::Float16,
     DataType::BFloat16,

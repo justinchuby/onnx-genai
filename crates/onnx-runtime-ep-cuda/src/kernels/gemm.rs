@@ -95,6 +95,7 @@ extern "C" __global__ void gemm_bias_nd_f32(
 const BIAS_MODULE: &str = "gemm_bias_f32";
 const BIAS_ENTRY: &str = "gemm_bias_f32";
 const BIAS_BLOCK: u32 = 256;
+pub(crate) const DTYPES: &[DataType] = &[DataType::Float32];
 
 /// Factory for [`GemmKernel`]; reads `alpha`/`beta` (default 1.0) and
 /// `transA`/`transB` (default 0) — all model-agnostic runtime attributes.
@@ -273,13 +274,13 @@ impl GemmKernel {
         let b = &inputs[1];
         let bias = inputs.get(2).filter(|c| !c.is_absent());
 
-        for (name, dt) in [("A", a.dtype), ("B", b.dtype), ("Y", outputs[0].dtype)] {
-            if dt != DataType::Float32 {
-                return Err(not_implemented(format!(
-                    "Gemm with {name} dtype {dt:?} (this slice is f32-only; f16/bf16 pending)"
-                )));
-            }
-        }
+        onnx_runtime_ep_api::gemm::validate_dtypes(
+            DTYPES,
+            [a.dtype, b.dtype, outputs[0].dtype]
+                .into_iter()
+                .chain(bias.map(|c| c.dtype)),
+        )
+        .map_err(EpError::KernelFailed)?;
         for (name, contiguous) in [
             ("A", a.is_contiguous()),
             ("B", b.is_contiguous()),
@@ -302,12 +303,6 @@ impl GemmKernel {
         let bias_plan = match bias {
             None => None,
             Some(c) => {
-                if c.dtype != DataType::Float32 {
-                    return Err(not_implemented(format!(
-                        "Gemm bias C dtype {:?} (this slice is f32-only)",
-                        c.dtype
-                    )));
-                }
                 if !c.is_contiguous() {
                     return Err(not_implemented(
                         "Gemm with a non-contiguous (strided) bias C; materialise it first",

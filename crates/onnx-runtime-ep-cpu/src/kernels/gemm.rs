@@ -336,6 +336,14 @@ impl GemmKernel {
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
         check_arity("Gemm", inputs, outputs, 2, 3, 1)?;
+        let bias = inputs.get(2).filter(|c| !c.is_absent());
+        onnx_runtime_ep_api::gemm::validate_dtypes(
+            super::FLOAT_DTYPES,
+            [inputs[0].dtype, inputs[1].dtype, outputs[0].dtype]
+                .into_iter()
+                .chain(bias.map(|c| c.dtype)),
+        )
+        .map_err(EpError::KernelFailed)?;
         let a_shape = inputs[0].shape;
         let b_shape = inputs[1].shape;
         let geometry = self.geometry(a_shape, b_shape)?;
@@ -352,7 +360,6 @@ impl GemmKernel {
             .validate_output(a_shape, b_shape, y_shape)
             .map_err(EpError::KernelFailed)?;
         Layout::array::<f32>(output_elements).map_err(|_| EpError::KernelFailed(format!("Gemm output {y_shape:?} exceeds addressable f32 storage; reduce the output dimensions")))?;
-        let bias = inputs.get(2).filter(|c| !c.is_absent());
         if let Some(c) = bias {
             validate_bias(c.shape, y_shape).map_err(EpError::KernelFailed)?;
         }
@@ -651,6 +658,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(y.to_f32(), [22., 28.]);
+        let mixed_b = Owned::f16(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
+        assert!(
+            kernel
+                .execute(&[a.view(), mixed_b.view()], &mut [y.view_mut()])
+                .unwrap_err()
+                .to_string()
+                .contains("share one dtype")
+        );
         node.version = Some(28);
         let old = GemmFactory::default().create(&node, &[]).unwrap();
         assert!(

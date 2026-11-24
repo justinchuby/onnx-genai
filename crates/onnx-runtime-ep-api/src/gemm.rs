@@ -1,13 +1,47 @@
 //! Native Gemm shape capability shared by CPU and CUDA.
 
 use onnx_runtime_ir::{
-    Node, Shape,
+    DataType, Node, Shape,
     gemm::{GemmAxes, ND_GEMM_OPSET, bias_broadcasts},
 };
 
-pub fn unsupported_reason(node: &Node, opset: u64, shapes: &[Shape]) -> Option<String> {
+pub fn validate_dtypes(
+    allowed: &[DataType],
+    mut dtypes: impl Iterator<Item = DataType>,
+) -> Result<(), String> {
+    if let Some(dtype) = dtypes.next() {
+        if !allowed.contains(&dtype) {
+            return Err(format!(
+                "Gemm dtype {dtype:?} is unsupported on this provider; use one of {allowed:?} or select a different provider"
+            ));
+        }
+        if let Some(other) = dtypes.find(|&other| other != dtype) {
+            return Err(format!(
+                "Gemm requires A, B, optional C, and Y to share one dtype, got {dtype:?} and {other:?}; cast all operands to the same supported dtype"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn unsupported_reason(
+    node: &Node,
+    opset: u64,
+    shapes: &[Shape],
+    dtypes: &[DataType],
+    allowed: &[DataType],
+) -> Option<String> {
     if !node.is_default_domain() || node.op_type != "Gemm" {
         return None;
+    }
+    if let Err(reason) = validate_dtypes(
+        allowed,
+        dtypes
+            .iter()
+            .copied()
+            .filter(|&dtype| dtype != DataType::Undefined),
+    ) {
+        return Some(reason);
     }
     let [a, b, ..] = shapes else { return None };
     let nd = opset >= ND_GEMM_OPSET;
@@ -38,4 +72,35 @@ pub fn unsupported_reason(node: &Node, opset: u64, shapes: &[Shape]) -> Option<S
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onnx_runtime_ir::{NodeId, static_shape};
+
+    #[test]
+    fn gemm_29_claim_requires_homogeneous_supported_dtypes() {
+        use DataType::{Float16, Float32, Int32, Undefined};
+        let node = Node::new(NodeId(0), "Gemm", vec![], vec![]);
+        let shapes = [static_shape([2, 3, 5]), static_shape([5, 7]), vec![]];
+        let cpu = &[Float16, Float32];
+        let cuda = &[Float32];
+        let claim = |dtypes: &[DataType], allowed: &[DataType]| {
+            unsupported_reason(&node, 29, &shapes, dtypes, allowed)
+        };
+        assert_eq!(claim(&[Float32, Float32, Undefined], cuda), None);
+        assert_eq!(claim(&[Float16, Float16, Float16], cpu), None);
+        assert!(
+            claim(&[Float16, Float16], cuda)
+                .unwrap()
+                .contains("unsupported")
+        );
+        assert!(claim(&[Int32, Int32], cpu).unwrap().contains("unsupported"));
+        assert!(
+            claim(&[Float32, Float32, Float16], cpu)
+                .unwrap()
+                .contains("share one dtype")
+        );
+    }
 }

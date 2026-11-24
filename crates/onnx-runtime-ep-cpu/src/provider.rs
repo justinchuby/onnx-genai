@@ -472,7 +472,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
-        if let Some(reason) = onnx_runtime_ep_api::gemm::unsupported_reason(op, opset, shapes) {
+        if let Some(reason) = onnx_runtime_ep_api::gemm::unsupported_reason(
+            op,
+            opset,
+            shapes,
+            input_dtypes,
+            crate::kernels::FLOAT_DTYPES,
+        ) {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "DequantizePacked"
