@@ -63,7 +63,7 @@ EXPECTED_STATUS = {
     **{op: "PASS" for op in CPU_OPS + ADDITIONAL_PASS_OPS},
     SYNTHETIC_UNSUPPORTED_OP: "UNSUPPORTED",
 }
-CUDA_DECLINE_CONTROL = "SigmoidFloat64"
+CUDA_DECLINE_CONTROL = "GemmFloat64"
 CUDA_SMOKE_STATUS = {"ReluFloat32": "PASS", CUDA_DECLINE_CONTROL: "UNSUPPORTED"}
 
 
@@ -370,20 +370,29 @@ def smoke_model(case: str) -> onnx.ModelProto:
     import numpy as np
     from onnx import helper, numpy_helper
 
-    op, dtype = {
-        "ReluFloat32": ("Relu", np.float32),
-        CUDA_DECLINE_CONTROL: ("Sigmoid", np.float64),
-    }[case]
-    x = numpy_helper.from_array(np.array([-2.0, 0.0, 3.0], dtype=dtype), "X")
-    declaration = helper.make_tensor_value_info("X", x.data_type, list(x.dims))
-    runtime_input = case == "ReluFloat32"
-    graph = helper.make_graph(
-        [helper.make_node(op, ["X"], ["Y"], name=case)],
-        case,
-        [declaration] if runtime_input else [],
-        [helper.make_tensor_value_info("Y", x.data_type, list(x.dims))],
-        [] if runtime_input else [x],
-    )
+    if case == "ReluFloat32":
+        from onnx import TensorProto
+
+        graph = helper.make_graph(
+            [helper.make_node("Relu", ["X"], ["Y"], name=case)],
+            case,
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [3])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [3])],
+        )
+    elif case == CUDA_DECLINE_CONTROL:
+        # CUDA's Gemm claim checks dtype before creating the kernel; f64 is
+        # supported on CPU and by the bridge but declined at CUDA placement.
+        a = numpy_helper.from_array(np.array([[1.0, 2.0]], np.float64), "A")
+        b = numpy_helper.from_array(np.array([[3.0], [4.0]], np.float64), "B")
+        graph = helper.make_graph(
+            [helper.make_node("Gemm", ["A", "B"], ["Y"], name=case)],
+            case,
+            [],
+            [helper.make_tensor_value_info("Y", a.data_type, [1, 1])],
+            [a, b],
+        )
+    else:
+        raise KeyError(case)
     return helper.make_model(
         graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=9
     )

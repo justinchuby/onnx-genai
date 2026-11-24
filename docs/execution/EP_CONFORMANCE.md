@@ -81,9 +81,9 @@ python3 conformance/run_onnx_tests.py --smoke
 python3 conformance/run_onnx_tests.py --cuda
 ```
 
-In the CPU smoke profile, both float32 `Relu` and float64 `Sigmoid` must pass.
+In the CPU smoke profile, both float32 `Relu` and float64 `Gemm` must pass.
 In the strict CUDA profile, float32 `Relu` must run on CUDA device 0 with matching
-outputs, while float64 `Sigmoid` must be declined. The double fixture is
+outputs, while float64 `Gemm` must be declined. The double fixture is
 transportable and runs on CPU, so it detects an accidental CPU fallback.
 The runner's direct invocation is `conformance_runner --cuda MODEL.onnx CASE_DIR`.
 The switch enforces `ONNX_GENAI_REQUIRE_CUDA=1` even if inherited as `0` and
