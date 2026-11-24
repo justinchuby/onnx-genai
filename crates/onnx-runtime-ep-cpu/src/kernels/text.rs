@@ -1,4 +1,4 @@
-//! Native host-string kernels for the ONNX opset-20 text operators.
+//! Native host-string kernels for ONNX operators.
 
 use std::ffi::{c_char, c_void};
 use std::ptr::NonNull;
@@ -100,6 +100,55 @@ fn broadcast_strides(input: &[usize], output: &[usize]) -> Vec<usize> {
 pub struct StringConcatKernel;
 pub struct StringConcatFactory;
 
+pub(super) fn broadcast_string_pairs<T>(
+    op: &str,
+    inputs: &[HostStringInput<'_>],
+    mut apply: impl FnMut(&str, &str) -> T,
+) -> Result<(Vec<usize>, Vec<T>)> {
+    require_inputs(op, inputs, 2)?;
+    let shape = broadcast_shape(op, inputs[0].shape, inputs[1].shape)?;
+    // No strides or input elements are needed for an empty broadcast.
+    if shape.contains(&0) {
+        return Ok((shape, Vec::new()));
+    }
+    let count = shape.iter().try_fold(1usize, |n, &dim| {
+        n.checked_mul(dim)
+            .ok_or_else(|| error(format!("{op}: broadcast output element count overflowed")))
+    })?;
+    let lhs_strides = broadcast_strides(inputs[0].shape, &shape);
+    let rhs_strides = broadcast_strides(inputs[1].shape, &shape);
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(|cause| {
+        error(format!(
+            "{op}: cannot allocate output of shape {shape:?}: {cause}"
+        ))
+    })?;
+    let mut index = vec![0usize; shape.len()];
+    let (mut lhs_offset, mut rhs_offset) = (0usize, 0usize);
+
+    for produced in 0..count {
+        values.push(apply(
+            &inputs[0].values[lhs_offset],
+            &inputs[1].values[rhs_offset],
+        ));
+        if produced + 1 == count {
+            break;
+        }
+        for axis in (0..shape.len()).rev() {
+            index[axis] += 1;
+            if index[axis] < shape[axis] {
+                lhs_offset += lhs_strides[axis];
+                rhs_offset += rhs_strides[axis];
+                break;
+            }
+            index[axis] = 0;
+            lhs_offset -= lhs_strides[axis] * (shape[axis] - 1);
+            rhs_offset -= rhs_strides[axis] * (shape[axis] - 1);
+        }
+    }
+    Ok((shape, values))
+}
+
 impl KernelFactory for StringConcatFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(StringConcatKernel))
@@ -111,41 +160,12 @@ impl Kernel for StringConcatKernel {
         &self,
         inputs: &[HostStringInput<'_>],
     ) -> Result<Vec<HostKernelOutput>> {
-        require_inputs("StringConcat", inputs, 2)?;
-        let shape = broadcast_shape("StringConcat", inputs[0].shape, inputs[1].shape)?;
-        let count = shape.iter().try_fold(1usize, |n, &dim| {
-            n.checked_mul(dim)
-                .ok_or_else(|| error("StringConcat: broadcast output element count overflowed"))
-        })?;
-        let lhs_strides = broadcast_strides(inputs[0].shape, &shape);
-        let rhs_strides = broadcast_strides(inputs[1].shape, &shape);
-        let mut values = Vec::with_capacity(count);
-        let mut index = vec![0usize; shape.len()];
-        let (mut lhs_offset, mut rhs_offset) = (0usize, 0usize);
-
-        for produced in 0..count {
-            let lhs = &inputs[0].values[lhs_offset];
-            let rhs = &inputs[1].values[rhs_offset];
+        let (shape, values) = broadcast_string_pairs("StringConcat", inputs, |lhs, rhs| {
             let mut value = String::with_capacity(lhs.len() + rhs.len());
             value.push_str(lhs);
             value.push_str(rhs);
-            values.push(value);
-
-            if produced + 1 == count {
-                break;
-            }
-            for axis in (0..shape.len()).rev() {
-                index[axis] += 1;
-                lhs_offset += lhs_strides[axis];
-                rhs_offset += rhs_strides[axis];
-                if index[axis] < shape[axis] {
-                    break;
-                }
-                index[axis] = 0;
-                lhs_offset -= lhs_strides[axis] * shape[axis];
-                rhs_offset -= rhs_strides[axis] * shape[axis];
-            }
-        }
+            value
+        })?;
         Ok(vec![HostKernelOutput {
             shape,
             data: HostKernelData::Strings(values),

@@ -4,7 +4,10 @@
 //! true). Logical kernels interpret that representation and always emit
 //! canonical `1`/`0` bytes.
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, HostKernelData, HostKernelOutput, HostStringInput, Kernel, KernelFactory, Result,
+    TensorMut, TensorView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use super::add::{broadcast_apply, require_same_dtype};
@@ -73,6 +76,8 @@ logical_factory!(XorFactory, Xor);
 
 /// Stateless elementwise equality comparison with NumPy broadcasting.
 pub struct EqualKernel;
+
+pub(crate) const EQUAL_STRING_SINCE: u64 = 19;
 
 /// Factory for [`EqualKernel`] (no attributes).
 pub struct EqualFactory;
@@ -175,6 +180,21 @@ impl Kernel for LogicalKernel {
 }
 
 impl Kernel for EqualKernel {
+    fn execute_host_strings(
+        &self,
+        inputs: &[HostStringInput<'_>],
+    ) -> Result<Vec<HostKernelOutput>> {
+        let (shape, bytes) =
+            super::text::broadcast_string_pairs("Equal", inputs, |lhs, rhs| u8::from(lhs == rhs))?;
+        Ok(vec![HostKernelOutput {
+            shape,
+            data: HostKernelData::Raw {
+                dtype: DataType::Bool,
+                bytes,
+            },
+        }])
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Equal", inputs, outputs, 2, 2, 1)?;
         if outputs[0].dtype != DataType::Bool {
