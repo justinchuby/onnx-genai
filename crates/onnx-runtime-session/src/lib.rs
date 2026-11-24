@@ -191,9 +191,7 @@ mod error {
         )]
         HeterogeneousPlacementRequired { unsupported_nodes: String },
 
-        #[error(
-            "strict CUDA kernel creation failed for {op_type} at {node}, opset {opset}: {source}"
-        )]
+        #[error("CUDA kernel creation failed for {op_type} at {node}, opset {opset}: {source}")]
         CudaKernelCreationFailed {
             node: String,
             op_type: String,

@@ -1148,6 +1148,16 @@ impl KernelCache {
             };
             let mut kernel = match compiled {
                 Ok(kernel) => kernel,
+                Err(source @ EpError::NoEpForOp { .. }) if ep.device_type() == DeviceType::Cuda => {
+                    // This is reached only after admission, so a missing CUDA
+                    // handler is a creation failure, not a capability decline.
+                    return Err(SessionError::CudaKernelCreationFailed {
+                        node: build::format_node_identity("graph", node_id, node),
+                        op_type: node.op_type.clone(),
+                        opset,
+                        source,
+                    });
+                }
                 Err(EpError::NoEpForOp {
                     domain,
                     op_type,
