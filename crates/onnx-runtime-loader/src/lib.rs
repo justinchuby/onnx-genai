@@ -317,6 +317,7 @@ fn build_from_bytes_with_weights(
     validate_loaded_model(&graph)?;
     prepare_graph_for_execution(&mut graph)?;
     infer_shapes(&mut graph)?;
+    validate_compress_dtypes(&graph)?;
 
     Ok((graph, Arc::new(store)))
 }
@@ -611,7 +612,8 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 ///
 /// 1. [`validate_opset_imports`] — every node's domain must declare an opset.
 /// 2. [`validate_einsum_nodes`] — resolve `Einsum-12`/`Einsum-28` from the
-///    imported opset and validate every statically known equation/type/shape.
+///    imported opset and validate every statically known equation/type/shape;
+///    also validate known Compress data dtypes against the imported schema.
 /// 3. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
 ///    (`If`/`Loop`/`Scan`) and reject any other op carrying a `GraphProto`
 ///    attribute the executor cannot run.
@@ -632,10 +634,75 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 pub fn validate_model(graph: &Graph) -> Result<(), LoaderError> {
     validate_opset_imports(graph)?;
     validate_einsum_nodes(graph)?;
+    validate_compress_dtypes(graph)?;
     validate_no_control_flow(graph)?;
     validate_no_dangling_refs(graph)?;
     validate_no_initializer_producer(graph)?;
     Ok(())
+}
+
+fn validate_compress_dtypes(graph: &Graph) -> Result<(), LoaderError> {
+    use onnx_runtime_ir::DataType;
+
+    fn check_graph(graph: &Graph, model_opset: Option<u64>) -> Result<(), LoaderError> {
+        for (_, node) in graph.nodes.iter() {
+            if !node.is_default_domain() || node.op_type != "Compress" {
+                continue;
+            }
+            let schema = match node.local_opset().or(model_opset) {
+                Some(opset @ 9..=10) => (9, opset),
+                Some(opset @ 11..=27) => (11, opset),
+                Some(opset @ 28..) => (28, opset),
+                // Missing imports and opsets predating the operator are handled
+                // by the import validator and kernel registry, respectively.
+                _ => continue,
+            };
+            let data = node.inputs.first().copied().flatten();
+            let output = node.outputs.first().copied().flatten();
+            for (port, id) in [("input", data), ("output", output)] {
+                let Some(id) = id.filter(|&id| graph.value_type_is_known(id)) else {
+                    continue;
+                };
+                let dtype = graph.value(id).dtype;
+                // Compress-9/11 use all_tensor_types(); Compress-28 uses
+                // all_tensor_types_ir4(), which adds only BF16.
+                let allowed = match dtype {
+                    DataType::Float16
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Uint8
+                    | DataType::Uint16
+                    | DataType::Uint32
+                    | DataType::Uint64
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Bool
+                    | DataType::String
+                    | DataType::Complex64
+                    | DataType::Complex128 => true,
+                    DataType::BFloat16 => schema.0 == 28,
+                    _ => false,
+                };
+                if !allowed {
+                    return Err(LoaderError::InvalidCompressDtype {
+                        node: node_label(node),
+                        port,
+                        dtype,
+                        schema: schema.0,
+                        opset: schema.1,
+                    });
+                }
+            }
+        }
+        for subgraph in graph.subgraphs.values() {
+            check_graph(subgraph, model_opset)?;
+        }
+        Ok(())
+    }
+
+    check_graph(graph, graph.opset_imports.get("").copied())
 }
 
 /// Resolve and validate every default-domain `Einsum` against the model's
