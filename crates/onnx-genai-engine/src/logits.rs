@@ -555,6 +555,7 @@ pub struct LlguidanceConstraint {
     kind: GrammarConstraintKind,
     completion_only_eos: Option<Vec<TokenId>>,
     sampled_vocab_size: usize,
+    activation_tokens: Option<Vec<TokenId>>,
     inner: Mutex<LlguidanceState>,
 }
 
@@ -570,6 +571,28 @@ impl LlguidanceConstraint {
     pub(crate) fn with_completion_only_eos(mut self, endings: Vec<TokenId>) -> Self {
         self.completion_only_eos = Some(endings);
         self
+    }
+
+    /// Leave generation unconstrained until a declared model token is accepted.
+    /// The triggering token belongs to the grammar, matching llama.cpp's raw
+    /// grammar contract. Activation is derived from the supplied history on
+    /// every call, so speculative rollback and replacement cannot leave a stale
+    /// activation latch behind. This entry point takes resolved token IDs;
+    /// transport word/pattern triggers require separate tokenizer resolution.
+    pub fn with_token_activation(mut self, tokens: Vec<TokenId>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !tokens.is_empty(),
+            "lazy grammar has no activation tokens; provide at least one resolved trigger token"
+        );
+        for &token in &tokens {
+            anyhow::ensure!(
+                (token as usize) < self.sampled_vocab_size,
+                "lazy grammar trigger token {token} is outside the sampled vocabulary of {} entries; choose a trigger from the model tokenizer",
+                self.sampled_vocab_size
+            );
+        }
+        self.activation_tokens = Some(tokens);
+        Ok(self)
     }
 
     pub fn from_hf_tokenizer(
@@ -732,6 +755,7 @@ impl LlguidanceConstraint {
             kind,
             completion_only_eos: None,
             sampled_vocab_size,
+            activation_tokens: None,
             inner: Mutex::new(LlguidanceState {
                 initial: constraint.deep_clone(),
                 constraint,
@@ -761,20 +785,39 @@ impl Constraint for LlguidanceConstraint {
         context: &ProcessorContext,
         candidates: &[TokenCandidate],
     ) -> anyhow::Result<Vec<bool>> {
+        let history = if let Some(triggers) = &self.activation_tokens {
+            for &token in &context.generated_tokens {
+                anyhow::ensure!(
+                    (token as usize) < self.sampled_vocab_size,
+                    "lazy grammar history token {token} is outside the sampled vocabulary of {} entries; repair generated history or its tokenizer",
+                    self.sampled_vocab_size
+                );
+            }
+            let Some(start) = context
+                .generated_tokens
+                .iter()
+                .position(|token| triggers.contains(token))
+            else {
+                return Ok(candidates
+                    .iter()
+                    .map(|candidate| (candidate.token_id as usize) < self.sampled_vocab_size)
+                    .collect());
+            };
+            &context.generated_tokens[start..]
+        } else {
+            context.generated_tokens.as_slice()
+        };
         let mut inner = self.inner.lock().map_err(|_| {
             anyhow::anyhow!(
                 "{} parser lock is poisoned; restart this generation with a fresh grammar state",
                 self.name()
             )
         })?;
-        if !context
-            .generated_tokens
-            .starts_with(&inner.committed_tokens)
-        {
+        if !history.starts_with(&inner.committed_tokens) {
             inner.reset();
         }
         let result = (|| -> anyhow::Result<Vec<bool>> {
-            for &token in &context.generated_tokens[inner.committed_tokens.len()..] {
+            for &token in &history[inner.committed_tokens.len()..] {
                 anyhow::ensure!(
                     (token as usize) < self.sampled_vocab_size,
                     "grammar history token {token} is outside the sampled vocabulary of {} entries; repair generated history or its tokenizer",
@@ -826,7 +869,7 @@ impl Constraint for LlguidanceConstraint {
                 format!(
                     "compute {} after {} generated tokens",
                     self.name(),
-                    context.generated_tokens.len()
+                    history.len()
                 )
             })?;
             if step.is_stop() {
@@ -5512,6 +5555,112 @@ payload: %json {"type":"object","properties":{"n":{"const":1}},"required":["n"],
             Some("1".to_string()),
             Some("2".to_string()),
         ]
+    }
+
+    fn lazy_token_test_grammar() -> LlguidanceConstraint {
+        LlguidanceConstraint::from_token_texts(
+            GrammarConstraintKind::Lark,
+            "start: <[1]> \"B\"",
+            &[
+                Some("free".into()),
+                Some("OPEN".into()),
+                Some("B".into()),
+                Some(String::new()),
+            ],
+            Some(3),
+        )
+        .unwrap()
+        .with_completion_only_eos(vec![3])
+        .with_token_activation(vec![1])
+        .unwrap()
+    }
+
+    fn lazy_token_test_mask(
+        grammar: &LlguidanceConstraint,
+        history: &[TokenId],
+    ) -> anyhow::Result<Vec<bool>> {
+        let candidates = ["free", "OPEN", "B", ""]
+            .iter()
+            .enumerate()
+            .map(|(id, text)| TokenCandidate {
+                token_id: id as TokenId,
+                text: (*text).into(),
+                is_eos: id == 3,
+            })
+            .collect::<Vec<_>>();
+        grammar.allowed_next_tokens(
+            &ProcessorContext {
+                generated_tokens: history.into(),
+                ..Default::default()
+            },
+            &candidates,
+        )
+    }
+
+    #[test]
+    fn lazy_token_grammar_consumes_trigger_identity_and_allows_unconstrained_prefix() {
+        let grammar = lazy_token_test_grammar();
+        assert_eq!(lazy_token_test_mask(&grammar, &[]).unwrap(), [true; 4]);
+        assert_eq!(lazy_token_test_mask(&grammar, &[0, 0]).unwrap(), [true; 4]);
+        assert_eq!(
+            lazy_token_test_mask(&grammar, &[0, 1]).unwrap(),
+            [false, false, true, false]
+        );
+        assert_eq!(
+            lazy_token_test_mask(&grammar, &[0, 1, 2]).unwrap(),
+            [false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn lazy_token_grammar_rederives_activation_after_rollback_and_replacement() {
+        let grammar = lazy_token_test_grammar();
+        assert_eq!(
+            lazy_token_test_mask(&grammar, &[0, 1, 2]).unwrap(),
+            [false, false, false, true]
+        );
+        assert_eq!(lazy_token_test_mask(&grammar, &[0]).unwrap(), [true; 4]);
+        assert_eq!(
+            lazy_token_test_mask(&grammar, &[0, 0, 1]).unwrap(),
+            [false, false, true, false]
+        );
+        assert_eq!(
+            lazy_token_test_mask(&grammar, &[1, 2]).unwrap(),
+            [false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn lazy_token_grammar_rejects_bad_history_then_recovers() {
+        let grammar = lazy_token_test_grammar();
+        assert!(lazy_token_test_mask(&grammar, &[0, 1, 0]).is_err());
+        assert_eq!(
+            lazy_token_test_mask(&grammar, &[0, 1]).unwrap(),
+            [false, false, true, false]
+        );
+        assert!(
+            format!("{:#}", lazy_token_test_mask(&grammar, &[99]).unwrap_err())
+                .contains("history token 99")
+        );
+    }
+
+    #[test]
+    fn lazy_token_grammar_validates_activation_vocabulary() {
+        assert!(
+            lazy_token_test_grammar()
+                .with_token_activation(vec![])
+                .is_err()
+        );
+        assert!(
+            lazy_token_test_grammar()
+                .with_token_activation(vec![99])
+                .is_err()
+        );
+        assert!(
+            lazy_token_test_grammar()
+                .with_token_activation(vec![1, 2])
+                .is_ok()
+        );
     }
 
     fn generate_scripted_grammar(

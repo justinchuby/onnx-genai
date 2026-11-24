@@ -1484,3 +1484,36 @@ restacked unchanged onto current main and the full functional graph passed
 again. A private versioned-inference-row name addresses an inherited strict
 lint without changing registration behavior. Per owner instruction this work
 does not wait for blocked remote CI.
+
+### Lazy grammar activation in progress
+
+The raw grammar engine now has an explicit resolved-token activation entry
+point. Before a trigger is accepted it leaves valid vocabulary candidates,
+including endings, unconstrained. The trigger itself starts the constrained
+history, retaining its model token identity rather than converting it to text.
+Activation is derived from each supplied history, so replacement and speculative
+rollback can return to an untriggered state. Invalid committed suffixes remain
+errors and the existing parser reset permits recovery with a valid history.
+
+This is an engine prerequisite, not completed server support. Server admission
+still rejects active lazy requests until all trigger modes and their tokenizer
+resolution are integrated. The pinned upstream
+[`common/sampling.cpp`](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/sampling.cpp)
+resolves a single-token word into a preserved-token trigger; multi-token words
+remain literal patterns. Token triggers take precedence over patterns in each
+accepted token. Pattern order is configuration order, and replay starts at the
+first nonempty capture, or the full match when none is nonempty. As shown in
+[`src/llama-grammar.cpp`](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-grammar.cpp),
+a replay start can fall inside a token: the first piece is truncated while its
+original token identity survives. A synthetic text prefix alone cannot establish
+that contract for model-token references. Pattern matching also uses byte-based
+ECMAScript regex semantics, which must not silently become Unicode Rust regex
+semantics. The upstream raw `%llguidance` branch constructs its sampler before
+the GBNF lazy branch; its behavior needs separate conformance coverage.
+
+Four selected activation tests passed, including model-token references, root
+completion, rollback/replacement, invalid-history recovery and trigger vocabulary
+validation. The full engine library regression passed: 956 tests and one
+inherited ignore. Strict engine all-target Clippy and formatting passed.
+Word/pattern activation, partial-token replay, reasoning
+suppression, server mapping and real HTTP conformance remain required.
