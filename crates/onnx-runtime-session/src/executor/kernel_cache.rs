@@ -65,15 +65,14 @@ pub(super) fn resolve_kernel_constant_inputs<'a>(
 }
 
 /// Cache key for a compiled kernel (§11.1). Keyed by the concrete node and its
-/// **resolved** (concrete) input shapes: attributes are fixed per node, so this
-/// is correct, and the shape component makes it *shape-keyed* — a re-run with
-/// the same resolved shapes hits, a different shape (e.g. a new batch/seq)
-/// misses and re-compiles. This preserves Chew's guarantee: a kernel is never
-/// reused for a shape it was not compiled for.
+/// **resolved** (concrete) input shapes and cold shape facts. Attributes are
+/// fixed per node; changed shapes or binding-derived facts compile a distinct
+/// kernel, including capacity pinning that leaves concrete shapes unchanged.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(super) struct KernelKey {
     pub(super) node: u32,
     pub(super) shapes: Vec<Vec<usize>>,
+    pub(super) shape_facts: KernelShapeFacts,
 }
 
 impl KernelKey {
@@ -759,6 +758,67 @@ pub(super) fn node_capture_seq_independent(
             .all(|input| input.is_none_or(edge_free_of_growing))
 }
 
+/// Positive evolution evidence is deliberately separate from the capture
+/// denylist, which also contains opaque/untraceable (merely unknown) symbols.
+#[derive(Debug)]
+pub(super) struct ShapeEvolutionClassifier {
+    growing: HashSet<SymbolId>,
+    unproven: HashSet<SymbolId>,
+}
+
+impl ShapeEvolutionClassifier {
+    pub(super) fn new(graph: &Graph, pinned: &HashSet<SymbolId>) -> Self {
+        let mut growing = collect_structural_growing_symbols_excluding(graph, pinned);
+        close_disqualifying_set(graph, &mut growing);
+        growing.retain(|symbol| !pinned.contains(symbol));
+        let mut unproven = compute_not_pinned_symbols_excluding(graph, pinned);
+        // Capture's legacy no-floor fallback remains unchanged, but absence of
+        // provenance cannot establish positive shape stability for resource policy.
+        if graph.inference_symbol_floor.is_none() {
+            unproven.extend(
+                graph
+                    .symbol_constraints
+                    .keys()
+                    .filter(|symbol| !pinned.contains(symbol))
+                    .copied(),
+            );
+        }
+        Self { growing, unproven }
+    }
+
+    pub(super) fn facts(
+        &self,
+        graph: &Graph,
+        node: &Node,
+        capture_disqualifying: &HashSet<SymbolId>,
+    ) -> KernelShapeFacts {
+        let mut unknown = node.outputs.iter().all(Option::is_none);
+        let mut growing = false;
+        for value in node.inputs.iter().chain(&node.outputs).flatten() {
+            match graph
+                .try_value(*value)
+                .and_then(|value| value.tensor_shape())
+            {
+                Some(shape) => {
+                    growing |= shape_references_any(shape, &self.growing);
+                    unknown |= shape_references_any(shape, &self.unproven);
+                }
+                None => unknown = true,
+            }
+        }
+        KernelShapeFacts {
+            evolution: if growing {
+                ShapeEvolution::Growing
+            } else if unknown {
+                ShapeEvolution::Unknown
+            } else {
+                ShapeEvolution::Stable
+            },
+            capture_eligible: node_capture_seq_independent(graph, node, capture_disqualifying),
+        }
+    }
+}
+
 /// Observable kernel-cache statistics (§11.1) — enough to prove reuse in tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -1044,7 +1104,7 @@ impl KernelCache {
 
     /// Zero-allocation kernel lookup via a pre-stored binding key.
     ///
-    /// Returns `Some` when `binding` shapes match the current `input_shapes`
+    /// Returns `Some` when `binding` shapes and facts match the current inputs
     /// and the compiled kernel is present in the cache. Returns `None` on any
     /// mismatch — caller falls through to `get_or_create`. This is the
     /// **pre-bound fast path**: during steady-state decode (fixed shapes), it
@@ -1055,8 +1115,9 @@ impl KernelCache {
         &'a self,
         binding: &KernelKey,
         input_shapes: &[Vec<usize>],
+        shape_facts: KernelShapeFacts,
     ) -> Option<&'a dyn onnx_runtime_ep_api::Kernel> {
-        if !binding.matches_shapes(input_shapes) {
+        if binding.shape_facts != shape_facts || !binding.matches_shapes(input_shapes) {
             return None;
         }
         let kernel = self.entries.get(binding)?.as_ref();
@@ -1068,11 +1129,18 @@ impl KernelCache {
     }
 
     #[inline]
-    pub(super) fn has_prebound(&self, binding: &KernelKey, input_shapes: &[Vec<usize>]) -> bool {
-        binding.matches_shapes(input_shapes) && self.entries.contains_key(binding)
+    pub(super) fn has_prebound(
+        &self,
+        binding: &KernelKey,
+        input_shapes: &[Vec<usize>],
+        shape_facts: KernelShapeFacts,
+    ) -> bool {
+        binding.shape_facts == shape_facts
+            && binding.matches_shapes(input_shapes)
+            && self.entries.contains_key(binding)
     }
 
-    /// Return the cached kernel for `(node, resolved_input_shapes)`, verifying
+    /// Return the cached kernel for `(node, resolved_input_shapes, shape_facts)`, verifying
     /// EP support and compiling+inserting it on a miss. Also returns the
     /// [`KernelKey`] so the caller can store it as a pre-binding for future
     /// zero-alloc lookups.
@@ -1089,7 +1157,7 @@ impl KernelCache {
         constant_inputs: &[bool],
         constant_values: &[Option<KernelConstantInput<'_>>],
         opset: u64,
-        capture_seq_independent: bool,
+        shape_facts: KernelShapeFacts,
         artifact_config: ExecutorArtifactConfig,
         artifact_readiness: &mut ProviderArtifactReadiness,
         ep: &dyn ExecutionProvider,
@@ -1099,6 +1167,7 @@ impl KernelCache {
         let key = KernelKey {
             node: node_id.0,
             shapes: input_shapes.to_vec(),
+            shape_facts,
         };
         if self.entries.contains_key(&key) {
             self.hits += 1;
@@ -1177,6 +1246,7 @@ impl KernelCache {
                 }
                 Err(error) => return Err(error.into()),
             };
+            kernel.configure_shape_facts(shape_facts);
             kernel.set_constant_inputs(constant_inputs);
             let mut adopted = if let Some(state) = shared_constant_state {
                 kernel.adopt_shareable_constant_state(state)?
@@ -1195,7 +1265,6 @@ impl KernelCache {
             if !adopted && let Some(request_id) = self.block_quantized_moe_traffic_request {
                 kernel.arm_block_quantized_moe_traffic(request_id)?;
             }
-            kernel.set_capture_seq_independent(capture_seq_independent);
             self.entries.insert(key.clone(), kernel);
             self.last_used
                 .insert(key.clone(), AtomicU64::new(self.tick()));

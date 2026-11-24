@@ -79,6 +79,25 @@ and host tests do not validate CUDA mapping, stream ordering, capture/replay or
 throughput. Adoption, pooling, lending and release behavior remain unchanged in
 this cleanup.
 
+### Shape evidence and metadata ownership
+
+`KernelShapeFacts` separates positive graph evidence (`Stable`, `Growing`,
+`Unknown`) from capture eligibility. A capture denylist can permit an unproven
+symbol; that permission does not prove stability. Conversely, `Growing` means
+an input or output depends on a growing symbol, not that every call changes its
+concrete shape. Session computes these facts during construction and capacity
+pinning, and includes them in kernel specialization and prebinding identity.
+Changing facts cannot reuse a kernel prepared under the old configuration even
+when concrete input shapes match.
+
+Binary broadcast descriptors keep immutable native ownership. Repeated shapes
+reuse the published descriptor without a new upload or quota admission; captured
+graphs pin the actual owner. A shared workspace lane has unspecified contents
+between dispatches, so using it for these descriptors would require uploading on
+every call, including repeated growing shapes. Positive growth evidence alone
+therefore does not select mutable metadata storage. Such a policy needs device
+measurements of both changing and repeated shapes before changing the default.
+
 ### Resource allocation granularity
 
 Admission follows physical ownership and independent reclamation, not each
@@ -1323,6 +1342,36 @@ cover lazy hits, no explicit drain on replacement under eager deferral, staged
 failure retention, capture miss rejection and replay after owner replacement
 and kernel drop. Host/type checks and GPU-feature compilation can verify the
 interfaces here; device execution and performance need CUDA hardware.
+
+Binary elementwise and `Where` now keep metadata and their most recent
+successful dtype/shape signature in one `WarmMetadata` record under one mutex.
+Execution briefly clones the complete record, releases the lock, and performs
+validation, lazy preparation, NVRTC resolution and device launches against that
+local candidate. A successful call publishes the metadata/signature pair through
+one short replace; old owners retire after unlocking. Poisoned publication
+refuses the candidate without changing the published pair. Failed execution
+preserves the previous successful A signature and owner, matching the existing
+broadcast capture contract rather than SkipNorm's last-call readiness policy.
+
+Capture validates the signature from that same snapshot and the real native
+owner consumed by the candidate. It does not combine independently re-read
+metadata/signature states or perform a separate post-launch capture query just
+to publish. Empty `Where` keeps its no-allocation path, updates the empty
+signature and may retain one previously prepared owner without consuming it;
+a later nonempty capture still must match the new exact signature. Resource
+collection and capture eligibility inspect the same published record. This does
+not authorize concurrent warm/configuration/capture on one kernel: existing
+exclusive execution contracts remain required.
+
+The one-record clone retains the existing Host signature-vector work. No new
+physical allocation, per-region ticket, grant or refund is added on warm reuse.
+Host publication tests exercise metadata/proof pairing and reentrant retirement
+after unlocking, including poison refusal. Device fixtures cover A success,
+B post-upload failure preserving A, successful B publication, independent A/B
+graph replay after kernel destruction, and empty/nonempty signature transitions.
+They are compiled/listed on this CPU-only host; device lifetime and performance
+are unmeasured. SiluMul and other paths without broadcast metadata retain their
+existing state handling.
 
 The same cache now backs `ScatterElements`, `GatherElements` and the shared
 `PersistentMetadata` adapter used by movement, Einsum views, ScatterND,

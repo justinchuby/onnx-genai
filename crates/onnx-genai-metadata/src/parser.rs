@@ -307,6 +307,24 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
         )
         .map_err(crate::MetadataError::Parse)?;
     }
+    if let Some(profiles) = document
+        .get("profiles")
+        .and_then(serde_yaml::Value::as_mapping)
+    {
+        for (name, profile) in profiles {
+            if profile.get("decision").is_some() {
+                crate::version::gate_feature_use(
+                    version,
+                    crate::version::SchemaFeature::DecisionProfiles,
+                    &format!(
+                        "profiles.{}.decision",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                )
+                .map_err(crate::MetadataError::Parse)?;
+            }
+        }
+    }
     gate_output_protocol_features(document, version)?;
     gate_compressed_state_features(document, version)?;
     reject_retired_streaming_emit(document)?;

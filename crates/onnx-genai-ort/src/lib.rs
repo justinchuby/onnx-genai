@@ -61,7 +61,7 @@ pub mod value;
 
 pub use allocator::{Allocator, AllocatorType, MemoryInfo, MemoryType};
 pub use binding::IoBinding;
-pub use chat_template::{ChatMessage, ChatRole, ChatTemplate};
+pub use chat_template::{ChatMessage, ChatRole, ChatTemplate, TemplateLimits};
 pub use decode::{
     BatchStepLogits, BatchedDecodeSession, BatchedSharedBufferDecodeSession,
     BatchedStaticCacheDecodeSession, DecodeKvMode, DecodeSession, DecodeSessionOptions,

@@ -123,6 +123,24 @@ impl<K> DeviceMetadataCache<K> {
     }
 }
 
+/// Metadata and its most recent successful launch proof are one publication.
+/// Cloning stages a private candidate; failed preparation/consumption does not
+/// change the published pair. This is not an execution-concurrency authority.
+#[derive(Clone, Debug)]
+pub(crate) struct WarmMetadata<M, S> {
+    pub(crate) metadata: M,
+    pub(crate) signature: Option<S>,
+}
+
+impl<M, S> WarmMetadata<M, S> {
+    pub(crate) fn new(metadata: M) -> Self {
+        Self {
+            metadata,
+            signature: None,
+        }
+    }
+}
+
 /// Commit only a successfully consumed candidate. Return/drop the old state
 /// after unlocking: native retirement may wait for capture or run queue actions.
 pub(crate) fn publish_metadata_candidate<T>(
@@ -148,8 +166,9 @@ mod tests {
     fn metadata_publication_retires_previous_and_refused_owners_after_unlocking() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Owner {
-            state: std::sync::Weak<Mutex<Option<Owner>>>,
+            state: std::sync::Weak<Mutex<WarmMetadata<Option<Owner>, u64>>>,
             drops: Arc<AtomicUsize>,
+            generation: u64,
         }
         impl Drop for Owner {
             fn drop(&mut self) {
@@ -162,22 +181,29 @@ mod tests {
                 self.drops.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let state = Arc::new(Mutex::new(None));
+        let state = Arc::new(Mutex::new(WarmMetadata::new(None)));
         let drops = Arc::new(AtomicUsize::new(0));
-        let owner = || {
-            Some(Owner {
+        let owner = |generation| WarmMetadata {
+            metadata: Some(Owner {
                 state: Arc::downgrade(&state),
                 drops: Arc::clone(&drops),
-            })
+                generation,
+            }),
+            signature: Some(generation),
         };
-        publish_metadata_candidate(&state, owner(), "test broadcast metadata").unwrap();
-        publish_metadata_candidate(&state, owner(), "test broadcast metadata").unwrap();
+        publish_metadata_candidate(&state, owner(1), "test broadcast metadata").unwrap();
+        publish_metadata_candidate(&state, owner(2), "test broadcast metadata").unwrap();
         assert_eq!(drops.load(Ordering::Relaxed), 1);
+        {
+            let published = state.lock().unwrap();
+            assert_eq!(published.signature, Some(2));
+            assert_eq!(published.metadata.as_ref().unwrap().generation, 2);
+        }
         let _ = std::panic::catch_unwind(|| {
             let _guard = state.lock().unwrap();
             panic!("injected metadata publication panic");
         });
-        let failure = publish_metadata_candidate(&state, owner(), "test broadcast metadata")
+        let failure = publish_metadata_candidate(&state, owner(3), "test broadcast metadata")
             .unwrap_err()
             .to_string();
         assert!(
@@ -189,13 +215,21 @@ mod tests {
             2,
             "refused candidate must retire after the poisoned lock is released"
         );
-        assert!(
-            state
+        {
+            let published = state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_some(),
-            "refusal preserves published state"
-        );
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(
+                published.signature,
+                Some(2),
+                "refusal must preserve the old success proof"
+            );
+            assert_eq!(
+                published.metadata.as_ref().unwrap().generation,
+                2,
+                "refusal must preserve the same metadata/proof pair"
+            );
+        }
         drop(state);
         assert_eq!(drops.load(Ordering::Relaxed), 3);
     }
