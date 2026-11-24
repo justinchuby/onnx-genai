@@ -172,6 +172,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `SimplifiedLayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Contrib-domain registration of the same fused RMS-normalization implementation. |
 | `BatchNormalization` | `` | ✅ | **NVRTC-custom** | Inference-mode channel-wise normalization for contiguous f32/f16/bf16 NCHW-style tensors; custom epsilon and per-channel scale/bias/mean/variance (`batch_normalization.rs`). |
 | `InstanceNormalization`, `GroupNormalization` | `` | ✅ | **NVRTC block reduction** | Arbitrary-rank contiguous NCHW-style f32/f16/bf16 normalization. Instance normalization reduces per `(N,C)` slice; group normalization supports opset-18 per-group and opset-21 per-channel affine parameters with float stash semantics (`group_normalization.rs`). |
+| `MeanVarianceNormalization` | `` | ✅ | **NVRTC block reduction** | Opset 29 and later; arbitrary reduction axes on contiguous f16/bf16/f32/f64 tensors. Computes centered variance without device intermediates, adds epsilon after the square root, and widens f16/bf16 to f32 for the calculation. |
 | `LpNormalization` | `` | ✅ | **NVRTC block reduction** | Axis-wise p=1/p=2 normalization for f32/f16/bf16, including negative and interior axes with CPU-matched tiny-norm clamping (`global_reduction.rs`). |
 | `ReduceMean` | `` | ✅ | **cuDNN** `cudnnReduceTensor` | See reductions below. |
 

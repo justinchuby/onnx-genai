@@ -5476,6 +5476,15 @@ fn lrn_mvn_reverse_sequence_are_shape_preserving() {
 }
 
 #[test]
+fn mean_variance_normalization_29_preserves_symbolic_shape_and_bfloat16() {
+    let n = with_attr(node("MeanVarianceNormalization", 1, 1), "axes", ints(&[-1]));
+    let shape = vec![sym(7), c(5)];
+    let out = run(&n, vec![tin(DataType::BFloat16, shape.clone())], 29);
+    assert_eq!(out_shape(&out), shape);
+    assert_eq!(out_dtype(&out), DataType::BFloat16);
+}
+
+#[test]
 fn random_generators_shape_and_dtype() {
     // RandomNormal/RandomUniform: shape from attr, dtype override.
     let n = with_attr(
