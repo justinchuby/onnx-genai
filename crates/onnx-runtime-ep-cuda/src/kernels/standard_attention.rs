@@ -2675,7 +2675,7 @@ fn execute_prepared(
     let requirement = kernel
         .workspace_requirement(&metadata, &out)
         .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)?;
-    let owner = crate::runtime::GraphDeviceAllocation::allocate(
+    let owner = crate::runtime::NativeDeviceAllocation::allocate_shared(
         &kernel.runtime,
         requirement.bytes as usize,
         onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
