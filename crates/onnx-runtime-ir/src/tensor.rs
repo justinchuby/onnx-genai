@@ -153,17 +153,7 @@ pub fn checked_numel(dims: &[usize]) -> Option<usize> {
 
 /// Dense storage size for `dtype` and `dims`, or `None` on geometry overflow.
 pub fn checked_expected_bytes(dtype: DataType, dims: &[usize]) -> Option<usize> {
-    let element_count = checked_numel(dims)?;
-    if dtype == DataType::Undefined {
-        return None;
-    }
-    if dtype.is_sub_byte() {
-        let elements_per_byte = 8 / dtype.bit_size();
-        return (element_count / elements_per_byte).checked_add(usize::from(
-            !element_count.is_multiple_of(elements_per_byte),
-        ));
-    }
-    element_count.checked_mul(dtype.byte_size())
+    dtype.checked_storage_bytes(checked_numel(dims)?)
 }
 
 /// A sparse constant tensor in COO form.

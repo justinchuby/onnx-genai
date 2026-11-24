@@ -76,12 +76,10 @@ pub(super) fn parse(data: &[u8]) -> Result<Entries, String> {
         let dtype = match tensor.dtype.as_str() {
             "BOOL" => DataType::Bool,
             "F4" => DataType::Float4E2M1,
-            "F6_E2M3" | "F6_E3M2" => {
-                return Err(format!(
-                    "SafeTensors key {key:?} uses {}, but nxrt cannot represent the corresponding ONNX FLOAT6 dtype yet; re-export both the model and the weights with a supported dtype",
-                    tensor.dtype
-                ));
-            }
+            // Keyed bindings use the ONNX bit order. SafeTensors transports
+            // opaque producer bytes and does not describe tiled layouts.
+            "F6_E2M3" => DataType::Float6E2M3,
+            "F6_E3M2" => DataType::Float6E3M2,
             "I8" => DataType::Int8,
             "U8" => DataType::Uint8,
             "I16" => DataType::Int16,
@@ -106,12 +104,18 @@ pub(super) fn parse(data: &[u8]) -> Result<Entries, String> {
                 ));
             }
         };
-        // The format requires whole-byte tensors, unlike ONNX, which pads an
-        // odd FLOAT4 element count. A nonempty F4 shape needs an even dimension.
-        if dtype == DataType::Float4E2M1 && tensor.shape.iter().all(|dim| dim % 2 != 0) {
+        // SafeTensors requires whole bytes in each tensor, not in each row.
+        // Check the product modulo eight without overflowing on large shapes.
+        let bits_mod_byte = tensor
+            .shape
+            .iter()
+            .fold(dtype.bit_size() % 8, |bits, dim| bits * (dim % 8) % 8);
+        if bits_mod_byte != 0 {
             return Err(format!(
-                "SafeTensors key {key:?}: F4 shape {:?} does not fill whole bytes; export an even number of logical elements",
-                tensor.shape
+                "SafeTensors key {key:?}: {} shape {:?} does not fill whole bytes; export a logical element count divisible by {}",
+                tensor.dtype,
+                tensor.shape,
+                if dtype.is_float6() { 4 } else { 2 }
             ));
         }
         let size =

@@ -788,6 +788,8 @@ fn parse_dtype(text: &str, line: usize) -> Result<DataType> {
         "uint4" => DataType::Uint4,
         "int4" => DataType::Int4,
         "float4e2m1" => DataType::Float4E2M1,
+        "float6e2m3" => DataType::Float6E2M3,
+        "float6e3m2" => DataType::Float6E3M2,
         "float8e8m0" => DataType::Float8E8M0,
         "uint2" => DataType::Uint2,
         "int2" => DataType::Int2,

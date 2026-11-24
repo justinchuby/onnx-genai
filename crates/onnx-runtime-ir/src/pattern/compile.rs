@@ -1140,6 +1140,8 @@ fn element_type(name: &str) -> Option<DataType> {
         "int4" => DataType::Int4,
         "uint4" => DataType::Uint4,
         "float4e2m1" => DataType::Float4E2M1,
+        "float6e2m3" => DataType::Float6E2M3,
+        "float6e3m2" => DataType::Float6E3M2,
         "int2" => DataType::Int2,
         "uint2" => DataType::Uint2,
         _ => return None,

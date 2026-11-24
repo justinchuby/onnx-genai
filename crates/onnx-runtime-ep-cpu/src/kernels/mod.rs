@@ -1548,7 +1548,12 @@ pub(crate) fn build_cpu_registry_with_resources(
     rec.register(
         OpKey::new("Cast", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastFactory),
+        Box::new(cast::CastFactory { float6: false }),
+    );
+    rec.register(
+        OpKey::new("Cast", "", 28),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(cast::CastFactory { float6: true }),
     );
     rec.register(
         OpKey::new("CastLike", "", 15),
@@ -3506,7 +3511,8 @@ mod tests {
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 121 + mlas_registrations);
+        // Opset-28 Cast adds one registration.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 122 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")
