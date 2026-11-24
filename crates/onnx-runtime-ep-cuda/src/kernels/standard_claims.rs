@@ -16,6 +16,13 @@ pub(crate) fn unsupported_reason_at_opset(
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
+        "QuantizeLinear" | "DequantizeLinear" => {
+            if let Some(result) = super::quantization::claim_int16(node, opset, input_dtypes) {
+                result
+            } else {
+                return unsupported_reason(node, input_shapes, input_dtypes);
+            }
+        }
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result
@@ -49,8 +56,10 @@ pub(crate) fn unsupported_reason(
         "Swish" | "ThresholdedRelu" => float_activation(node, input_dtypes),
         "Sum" | "Mean" => variadic_float(node, input_dtypes),
         "Mod" => mod_op(node, input_dtypes),
-        "QuantizeLinear" => quantize_linear(node, input_dtypes),
-        "DequantizeLinear" => dequantize_linear(node, input_dtypes),
+        "QuantizeLinear" => quantize_linear(node, input_dtypes)
+            .and_then(|()| super::quantization::legacy_geometry(node, input_shapes, input_dtypes)),
+        "DequantizeLinear" => dequantize_linear(node, input_dtypes)
+            .and_then(|()| super::quantization::legacy_geometry(node, input_shapes, input_dtypes)),
         "DequantizePacked" => {
             onnx_runtime_ir::dequantize_packed::validate_claim(node, input_shapes, input_dtypes)
         }

@@ -604,10 +604,14 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("BlockQuantizedMatMul", _)
         | ("BlockQuantizedMoE", _)
         | ("QLinearMatMul", _)
-        | ("QuantizeLinear", _)
         | ("DynamicQuantizeLinear", _) => CUDA_QUANT_MATMUL_DTYPES,
+        ("QuantizeLinear", _) => &[
+            DataType::Float32, DataType::Float16, DataType::BFloat16, DataType::Int32,
+            DataType::Int8, DataType::Uint8, DataType::Int16, DataType::Uint16,
+        ],
         ("DequantizeLinear", _) => &[
-            DataType::Float32, DataType::Int8, DataType::Uint8, DataType::Int4, DataType::Uint4,
+            DataType::Float32, DataType::Float16, DataType::BFloat16, DataType::Int8,
+            DataType::Uint8, DataType::Int4, DataType::Uint4, DataType::Int16, DataType::Uint16,
         ],
 
         // Quantized gather: Uint8 data + Int64/Int32 indices + f16 scales.

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::int16_quantization as q16;
 use onnx_runtime_ir::{DataType, Node, Shape};
 
 use crate::error::{driver_err, not_implemented};
@@ -114,12 +115,16 @@ extern "C" __global__ void dynamic_quantize_u8(
 }
 "#;
 
-pub fn unsupported_reason(op: &Node, shapes: &[Shape], dtypes: &[DataType]) -> Option<String> {
+pub(super) fn legacy_geometry(
+    op: &Node,
+    shapes: &[Shape],
+    dtypes: &[DataType],
+) -> std::result::Result<(), String> {
     let compact_optional_zp = op.inputs.get(2) == Some(&None) && shapes.len() == 2;
     if !(2..=3).contains(&op.inputs.len())
         || (shapes.len() != op.inputs.len() && !compact_optional_zp)
     {
-        return Some(format!(
+        return Err(format!(
             "{} requires 2 or 3 present inputs with shape metadata",
             op.op_type
         ));
@@ -131,7 +136,7 @@ pub fn unsupported_reason(op: &Node, shapes: &[Shape], dtypes: &[DataType]) -> O
                 None | Some(onnx_runtime_ir::Attribute::Int(0 | 1))
             )
         {
-            return Some("DequantizeLinear CUDA supports Float32 scale and output".into());
+            return Err("DequantizeLinear CUDA supports Float32 scale and output".into());
         }
         let block = op.attr("block_size").and_then(|a| a.as_int()).unwrap_or(0);
         if block > 0
@@ -140,22 +145,80 @@ pub fn unsupported_reason(op: &Node, shapes: &[Shape], dtypes: &[DataType]) -> O
                 .get(2)
                 .is_none_or(|shape| op.inputs[2].is_none() || shape == &shapes[1])
         {
-            return None;
+            return Ok(());
         }
     }
     if !shapes[1].is_empty() {
-        return Some(format!(
+        return Err(format!(
             "{} CUDA coverage requires a scalar scale",
             op.op_type
         ));
     }
     if shapes.get(2).is_some_and(|shape| !shape.is_empty()) {
-        return Some(format!(
+        return Err(format!(
             "{} CUDA coverage requires a scalar zero_point",
             op.op_type
         ));
     }
-    None
+    Ok(())
+}
+
+pub(super) fn claim_int16(
+    node: &Node,
+    opset: u64,
+    dtypes: &[DataType],
+) -> Option<std::result::Result<(), String>> {
+    let quantize = node.op_type == "QuantizeLinear";
+    let attr = q16::attribute_dtype(node, "output_dtype");
+    let zp = dtypes
+        .get(2)
+        .copied()
+        .filter(|_| node.inputs.get(2).is_some_and(Option::is_some));
+    let code = if quantize {
+        let attr = attr.ok().flatten();
+        if !zp.is_some_and(q16::is_code) && !attr.is_some_and(q16::is_code) {
+            return None;
+        }
+        zp.or(attr)?
+    } else {
+        dtypes
+            .first()
+            .copied()
+            .filter(|&dtype| q16::is_code(dtype))?
+    };
+    Some((|| {
+        q16::validate_opset(node, opset)?;
+        if !(2..=3).contains(&node.inputs.len())
+            || node.inputs[..2].iter().any(Option::is_none)
+            || !matches!(node.outputs.as_slice(), [Some(_)])
+        {
+            return Err("requires x, scale, optional zero_point and one output".into());
+        }
+        let [x, scale, ..] = dtypes else {
+            return Err("requires x and scale dtype metadata".into());
+        };
+        if node.inputs.get(2).is_some_and(Option::is_some) && zp != Some(code) {
+            return Err(format!(
+                "zero_point must match the quantized dtype {code:?}"
+            ));
+        }
+        if quantize {
+            if !q16::is_code(code)
+                || q16::attribute_dtype(node, "output_dtype")?.is_some_and(|dtype| dtype != code)
+            {
+                return Err("output_dtype must match the INT16/UINT16 zero_point dtype".into());
+            }
+            if opset < 23 && x != scale {
+                return Err(format!(
+                    "opset {opset} requires x and scale to share a dtype; got {x:?} and {scale:?}"
+                ));
+            }
+            q16::quantize_precision(q16::attribute_dtype(node, "precision")?, *x, *scale)?;
+        } else {
+            q16::dequantize_output(node, *scale)?;
+        }
+        Ok(())
+    })())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -174,6 +237,7 @@ impl KernelFactory for LinearQuantFactory {
         Ok(Box::new(LinearQuantKernel {
             op: self.op,
             runtime: self.runtime.clone(),
+            node: node.clone(),
             axis: node.attr("axis").and_then(|a| a.as_int()).unwrap_or(1),
             block: node
                 .attr("block_size")
@@ -186,6 +250,7 @@ impl KernelFactory for LinearQuantFactory {
 struct LinearQuantKernel {
     op: LinearQuantOp,
     runtime: Arc<CudaRuntime>,
+    node: Node,
     axis: i64,
     block: i64,
 }
@@ -211,6 +276,20 @@ impl Kernel for LinearQuantKernel {
         }
         let x = &inputs[0];
         let scale = &inputs[1];
+        let quant_dtype = match self.op {
+            LinearQuantOp::Quantize => outputs[0].dtype,
+            LinearQuantOp::Dequantize => x.dtype,
+        };
+        if q16::is_code(quant_dtype) {
+            return self.execute_int16(
+                name,
+                quant_dtype,
+                x,
+                scale,
+                inputs.get(2).filter(|v| !v.is_absent()),
+                &mut outputs[0],
+            );
+        }
         if matches!(self.op, LinearQuantOp::Dequantize)
             && (self.block != 0 || matches!(x.dtype, DataType::Int4 | DataType::Uint4))
         {
@@ -226,10 +305,6 @@ impl Kernel for LinearQuantKernel {
                 "{name} requires a scalar Float32 scale"
             )));
         }
-        let quant_dtype = match self.op {
-            LinearQuantOp::Quantize => outputs[0].dtype,
-            LinearQuantOp::Dequantize => x.dtype,
-        };
         if !matches!(quant_dtype, DataType::Int8 | DataType::Uint8) {
             return Err(not_implemented(format!(
                 "{name} quantized dtype {quant_dtype:?} (supported: Int8, Uint8)"
@@ -300,6 +375,129 @@ impl Kernel for LinearQuantKernel {
 }
 
 impl LinearQuantKernel {
+    #[allow(clippy::too_many_arguments)]
+    fn execute_int16(
+        &self,
+        name: &str,
+        code: DataType,
+        x: &TensorView,
+        scale: &TensorView,
+        zp: Option<&TensorView>,
+        y: &mut TensorMut,
+    ) -> Result<()> {
+        let invalid = |detail| EpError::KernelFailed(format!("cuda_ep {name}: {detail}"));
+        if y.shape != x.shape || zp.is_some_and(|z| z.dtype != code || z.shape != scale.shape) {
+            return Err(invalid(format!(
+                "output shape {:?} must match x {:?}; zero_point must be {code:?} of scale shape {:?}",
+                y.shape, x.shape, scale.shape
+            )));
+        }
+        let (stem, precision) = match self.op {
+            LinearQuantOp::Quantize => {
+                let expected = q16::attribute_dtype(&self.node, "output_dtype").map_err(invalid)?;
+                if expected.is_some_and(|dtype| dtype != code) || expected.is_none() && zp.is_none()
+                {
+                    return Err(invalid(format!(
+                        "output_dtype or zero_point must select {code:?}"
+                    )));
+                }
+                let precision = q16::attribute_dtype(&self.node, "precision").map_err(invalid)?;
+                let precision =
+                    q16::quantize_precision(precision, x.dtype, scale.dtype).map_err(invalid)?;
+                ("quantize16", precision)
+            }
+            LinearQuantOp::Dequantize => {
+                let expected = q16::dequantize_output(&self.node, scale.dtype).map_err(invalid)?;
+                if y.dtype != expected {
+                    return Err(invalid(format!(
+                        "output dtype {:?} must be {expected:?}",
+                        y.dtype
+                    )));
+                }
+                ("dequantize16", DataType::Undefined)
+            }
+        };
+        let block = u64::try_from(self.block)
+            .map_err(|_| invalid(format!("block_size={} must be nonnegative", self.block)))?;
+        // A nonzero inner identifies per-axis or blocked indexing. Empty data
+        // never launches a kernel, even when its inner product is zero.
+        let (axis, inner) = if block == 0 && scale.shape.is_empty() {
+            (0, 0)
+        } else {
+            let rank = x.shape.len() as i64;
+            if !(-rank..rank).contains(&self.axis) {
+                return Err(invalid(format!(
+                    "axis {} is out of range for rank {rank}",
+                    self.axis
+                )));
+            }
+            let index = self.axis.rem_euclid(rank) as usize;
+            let extent = x.shape[index] as u64;
+            let expected = if block == 0 {
+                vec![x.shape[index]]
+            } else {
+                let mut shape = x.shape.to_vec();
+                shape[index] = extent.div_ceil(block) as usize;
+                shape
+            };
+            if scale.shape != expected {
+                return Err(invalid(format!(
+                    "scale shape {:?} must be {expected:?} for axis {} and block_size {block}",
+                    scale.shape, self.axis
+                )));
+            }
+            (
+                extent,
+                x.shape[index + 1..].iter().product::<usize>() as u64,
+            )
+        };
+        let n = x.numel() as u64;
+        if n == 0 {
+            return Ok(());
+        }
+        let function = self.runtime.nvrtc_function(
+            "linear_quant_int16_v1",
+            include_str!("quantization_int16.cu"),
+            stem,
+        )?;
+        let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
+        let scale_ptr = cuptr(scale.data_ptr::<u8>() as *const c_void);
+        let zp_ptr = zp.map_or(0, |v| cuptr(v.data_ptr::<u8>() as *const c_void));
+        let y_ptr = cuptr(y.data_ptr_mut::<u8>() as *const c_void);
+        let data_type = if matches!(self.op, LinearQuantOp::Quantize) {
+            x.dtype
+        } else {
+            y.dtype
+        } as i32;
+        let scale_type = scale.dtype as i32;
+        let precision = precision as i32;
+        let signed = i32::from(code == DataType::Int16);
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&x_ptr)
+            .arg(&scale_ptr)
+            .arg(&zp_ptr)
+            .arg(&y_ptr)
+            .arg(&n)
+            .arg(&inner)
+            .arg(&axis)
+            .arg(&block)
+            .arg(&data_type)
+            .arg(&scale_type)
+            .arg(&precision)
+            .arg(&signed);
+        // SAFETY: checked dtype/shape/contiguity bounds all kernel accesses.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (n.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|error| driver_err(&format!("launch {name} INT16/UINT16"), error))
+    }
+
     fn dequantize_affine(
         &self,
         x: &TensorView,

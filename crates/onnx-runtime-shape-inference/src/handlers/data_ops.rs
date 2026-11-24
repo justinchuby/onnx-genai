@@ -473,19 +473,50 @@ fn quantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     } else {
         Some(attribute_dtype.unwrap_or(DataType::Uint8))
     };
+    if dtype.is_some_and(onnx_runtime_ir::int16_quantization::is_code) {
+        use onnx_runtime_ir::int16_quantization as q;
+        let invalid = |detail| ShapeInferError::Invalid {
+            op: ctx.op().into(),
+            detail,
+        };
+        let opset = ctx.opset("");
+        q::validate_opset(ctx.node, opset).map_err(invalid)?;
+        if let (Some(x), Some(scale)) = (ctx.input_dtype(0), ctx.input_dtype(1)) {
+            if opset < 23 && x != scale {
+                return Err(invalid(format!(
+                    "opset {opset} requires x and scale to share a dtype; got {x:?} and {scale:?}"
+                )));
+            }
+            let precision = q::attribute_dtype(ctx.node, "precision").map_err(invalid)?;
+            q::quantize_precision(precision, x, scale).map_err(invalid)?;
+        }
+    }
     if let (Some(shape), Some(dtype)) = (ctx.input_shape(0).map(<[DimExpr]>::to_vec), dtype) {
         ctx.set_output(0, dtype, shape);
     }
     Ok(())
 }
 
-/// `DequantizeLinear`: output shape follows x and dtype follows scale.
+/// `DequantizeLinear`: output shape follows x; 16-bit integer inputs can
+/// override the scale's output dtype starting at opset 23.
 fn dequantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     validate_quantization_granularity(ctx, 0, 1, 2)?;
-    if let (Some(shape), Some(dtype)) = (
+    if let (Some(shape), Some(mut dtype)) = (
         ctx.input_shape(0).map(<[DimExpr]>::to_vec),
         ctx.input_dtype(1),
     ) {
+        if ctx
+            .input_dtype(0)
+            .is_some_and(onnx_runtime_ir::int16_quantization::is_code)
+        {
+            use onnx_runtime_ir::int16_quantization as q;
+            let invalid = |detail| ShapeInferError::Invalid {
+                op: ctx.op().into(),
+                detail,
+            };
+            q::validate_opset(ctx.node, ctx.opset("")).map_err(invalid)?;
+            dtype = q::dequantize_output(ctx.node, dtype).map_err(invalid)?;
+        }
         ctx.set_output(0, dtype, shape);
     }
     Ok(())

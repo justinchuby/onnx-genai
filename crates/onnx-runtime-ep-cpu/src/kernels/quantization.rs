@@ -1,6 +1,7 @@
 //! Standard ONNX linear quantization kernels.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::int16_quantization as q16;
 use onnx_runtime_ir::{DataType, Node};
 
 use super::{check_arity, to_dense_bytes, write_dense_bytes};
@@ -8,6 +9,8 @@ use super::{check_arity, to_dense_bytes, write_dense_bytes};
 pub struct QuantizeLinearKernel {
     axis: i64,
     block_size: Option<usize>,
+    output_dtype: Option<DataType>,
+    precision: std::result::Result<Option<DataType>, String>,
 }
 
 pub struct QuantizeLinearFactory;
@@ -15,6 +18,11 @@ pub struct QuantizeLinearFactory;
 impl KernelFactory for QuantizeLinearFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(QuantizeLinearKernel {
+            output_dtype: q16::attribute_dtype(node, "output_dtype")
+                .ok()
+                .flatten()
+                .filter(|&dtype| q16::is_code(dtype)),
+            precision: q16::attribute_dtype(node, "precision"),
             axis: node.attr("axis").and_then(|a| a.as_int()).unwrap_or(1),
             block_size: node
                 .attr("block_size")
@@ -73,6 +81,9 @@ impl KernelFactory for DynamicQuantizeLinearFactory {
 impl Kernel for QuantizeLinearKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("QuantizeLinear", inputs, outputs, 2, 3, 1)?;
+        if q16::is_code(outputs[0].dtype) {
+            return self.quantize_int16(inputs, &mut outputs[0]);
+        }
         let x = read_floats("QuantizeLinear", &inputs[0])?;
         let scale = read_floats("QuantizeLinear", &inputs[1])?;
         let zp_dtype = if inputs.len() == 3 && !inputs[2].is_absent() {
@@ -113,6 +124,76 @@ impl Kernel for QuantizeLinearKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+}
+
+impl QuantizeLinearKernel {
+    fn quantize_int16(&self, inputs: &[TensorView], out: &mut TensorMut) -> Result<()> {
+        let op = "QuantizeLinear";
+        let invalid = |detail| EpError::KernelFailed(format!("{op}: {detail}"));
+        let zp = inputs.get(2).filter(|v| !v.is_absent());
+        let expected = zp
+            .map(|z| z.dtype)
+            .or(self.output_dtype)
+            .unwrap_or(DataType::Uint8);
+        if out.dtype != expected || self.output_dtype.is_some_and(|dtype| dtype != expected) {
+            return Err(invalid(format!(
+                "output dtype {:?}, zero_point dtype {:?} and output_dtype {:?} must agree",
+                out.dtype,
+                zp.map(|z| z.dtype),
+                self.output_dtype
+            )));
+        }
+        let precision = q16::quantize_precision(
+            *self
+                .precision
+                .as_ref()
+                .map_err(|detail| invalid(detail.clone()))?,
+            inputs[0].dtype,
+            inputs[1].dtype,
+        )
+        .map_err(invalid)?;
+        let read = |view: &TensorView| -> Result<Vec<f64>> {
+            if view.dtype == DataType::Int32 {
+                Ok(read_integers(op, view)?
+                    .into_iter()
+                    .map(|value| value as f64)
+                    .collect())
+            } else {
+                Ok(read_floats(op, view)?.into_iter().map(f64::from).collect())
+            }
+        };
+        let x = read(&inputs[0])?;
+        let scale = read(&inputs[1])?;
+        let zeros = zp.map_or_else(|| Ok(vec![0]), |view| read_integers(op, view))?;
+        let params = Params::new(
+            op,
+            inputs[0].shape,
+            inputs[1].shape,
+            &scale,
+            zp.map(|v| v.shape),
+            &zeros,
+            self.axis,
+            self.block_size,
+        )?;
+        let narrow = |value: f64| match precision {
+            DataType::Float16 => half::f16::from_f64(value).to_f64(),
+            DataType::BFloat16 => half::bf16::from_f64(value).to_f64(),
+            _ => value,
+        };
+        let mut bytes = Vec::with_capacity(x.len() * out.dtype.byte_size());
+        for (i, value) in x.into_iter().enumerate() {
+            let p = params.at(i);
+            let quotient = if precision == DataType::Float32 {
+                f64::from(value as f32 / scale[p] as f32)
+            } else {
+                narrow(narrow(value) / narrow(scale[p]))
+            };
+            let code = (quotient.round_ties_even() as i64)
+                .saturating_add(zeros[if zp.is_some() { p } else { 0 }]);
+            write_integer(&mut bytes, out.dtype, code)?;
+        }
+        write_dense_bytes(out, &bytes)
     }
 }
 
@@ -216,17 +297,20 @@ struct Params {
 
 impl Params {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    fn new<T: Into<f64> + Copy>(
         op: &str,
         x_shape: &[usize],
         scale_shape: &[usize],
-        scale: &[f32],
+        scale: &[T],
         zp_shape: Option<&[usize]>,
         zp: &[i64],
         axis: i64,
         block_size: Option<usize>,
     ) -> Result<Self> {
-        if scale.iter().any(|&s| s <= 0.0 || !s.is_finite()) {
+        if scale.iter().any(|&s| {
+            let s = s.into();
+            s <= 0.0 || !s.is_finite()
+        }) {
             return Err(EpError::KernelFailed(format!(
                 "{op}: scale values must be finite and positive"
             )));
@@ -354,6 +438,18 @@ fn read_integers(op: &str, view: &TensorView) -> Result<Vec<i64>> {
     Ok(match view.dtype {
         DataType::Int8 => bytes.iter().map(|&b| b as i8 as i64).collect(),
         DataType::Uint8 => bytes.into_iter().map(i64::from).collect(),
+        DataType::Int16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i64::from(i16::from_le_bytes(*b)))
+            .collect(),
+        DataType::Uint16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i64::from(u16::from_le_bytes(*b)))
+            .collect(),
         DataType::Int32 => bytes
             .as_chunks::<4>()
             .0
@@ -362,7 +458,7 @@ fn read_integers(op: &str, view: &TensorView) -> Result<Vec<i64>> {
             .collect(),
         other => {
             return Err(EpError::KernelFailed(format!(
-                "{op}: expected Int4, Uint4, Int8, Uint8, or Int32 quantized tensors, got {other:?}"
+                "{op}: expected Int4, Uint4, Int8, Uint8, Int16, Uint16, or Int32 quantized tensors, got {other:?}"
             )));
         }
     })
@@ -399,6 +495,12 @@ fn write_integer(bytes: &mut Vec<u8>, dtype: DataType, value: i64) -> Result<()>
     match dtype {
         DataType::Int8 => bytes.push(value.clamp(i8::MIN as i64, i8::MAX as i64) as i8 as u8),
         DataType::Uint8 => bytes.push(value.clamp(0, u8::MAX as i64) as u8),
+        DataType::Int16 => bytes.extend_from_slice(
+            &(value.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16).to_le_bytes(),
+        ),
+        DataType::Uint16 => {
+            bytes.extend_from_slice(&(value.clamp(0, i64::from(u16::MAX)) as u16).to_le_bytes())
+        }
         DataType::Int32 => bytes.extend_from_slice(
             &(value.clamp(i32::MIN as i64, i32::MAX as i64) as i32).to_le_bytes(),
         ),
@@ -462,6 +564,8 @@ mod tests {
         let scale = Owned::f32(&[], &[1.0]);
         let mut out = Owned::zeros(DataType::Uint8, &[6]);
         QuantizeLinearKernel {
+            output_dtype: None,
+            precision: Ok(None),
             axis: 1,
             block_size: None,
         }
@@ -477,6 +581,8 @@ mod tests {
         let zp = Owned::u8(&[2], &[2, 4]);
         let mut q = Owned::zeros(DataType::Uint8, &[2, 2]);
         QuantizeLinearKernel {
+            output_dtype: None,
+            precision: Ok(None),
             axis: 1,
             block_size: None,
         }
@@ -524,6 +630,8 @@ mod tests {
             let zero_point = Owned::u8(&[], &[113]);
             let mut output = Owned::zeros(DataType::Uint8, &[rows, 8]);
             QuantizeLinearKernel {
+                output_dtype: None,
+                precision: Ok(None),
                 axis: 1,
                 block_size: None,
             }

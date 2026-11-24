@@ -515,6 +515,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
             DataType::Int8,
             DataType::Uint8,
             DataType::Int32,
+            DataType::Int16,
+            DataType::Uint16,
         ],
         ("QuantizeLinear", "") | ("DynamicQuantizeLinear", "") | ("QLinearMatMul", "") => {
             ARITH_DTYPES

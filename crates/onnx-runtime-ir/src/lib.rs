@@ -59,6 +59,7 @@ mod error;
 pub mod gemm;
 mod graph;
 mod graph_view;
+pub mod int16_quantization;
 mod layout;
 pub mod linear_attention;
 mod node;
