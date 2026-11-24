@@ -1240,9 +1240,38 @@ in their callers. The artifact labels passed to staging are borrowed, avoiding
 new warm formatting. Host regressions pin table ABI and sentinel/signed-bit
 encoding; the Transpose device fixture additionally checks warm allocation/
 transfer/drain stability and mandatory drains for failed and successful rewarm,
-while retaining its old-graph replay after rewarm and kernel drop. Slice still
-has two independently prepared tables at this stage; unifying their common
-physical lifetime is a separate change.
+while retaining its old-graph replay after rewarm and kernel drop.
+
+### Slice metadata shares one physical lifetime
+
+Slice's dimensions and signed strides now occupy one immutable metadata
+artifact. A checked `WorkspaceLayout<2>` verifies equal table rank and individual
+and aggregate addressable capacity before Host payload allocation. Each empty
+table has an initialized u64 sentinel. One candidate, one metadata mutex, one
+upload and one graph pin replace the previous pair. The invocation-local layout
+binds both ABI pointers from the candidate's real address and logical capacity;
+there is no separately cached layout or pointer state. The CUDA source and
+separate dimensions/strides launch parameters are unchanged, including negative
+stride bits. One successful launch publishes the complete replacement.
+
+The combined contents form the full metadata key. Base offset remains an
+independent launch argument, governed by the existing Slice plan/signature.
+Eager calls still read dynamic starts/ends/axes/steps; capture reuses the warmed
+fixed plan. Empty-output and scalar-copy paths remain unchanged. Warm eager
+calls therefore still incur control D2H and Host shape/plan construction; the
+metadata hit introduces no additional upload or retirement drain. A content
+miss uses one mandatory retirement drain rather than independently replacing
+two tables. This adds no quota protocol or new allocator.
+
+Host regressions cover table order, signed encoding, aligned origins,
+initialized sentinels, complete-span refusal, rank mismatch and layout overflow.
+The device lifecycle fixture checks one cold allocation/upload, unchanged warm
+metadata counters while accounting for four existing control D2H barriers,
+one post-upload failure checkpoint, complete replacement, and old-graph replay
+after rewarm/kernel drop. Its graph retirement assertion accounts for exactly
+one 512-byte artifact class through driver release or the existing pool for
+the rank-two fixture. These are compiled device assertions; CUDA execution,
+actual driver memory use and latency/throughput remain unmeasured here.
 
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
