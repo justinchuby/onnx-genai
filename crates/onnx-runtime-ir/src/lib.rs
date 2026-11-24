@@ -61,6 +61,7 @@ mod graph_view;
 mod layout;
 mod node;
 pub mod onnx;
+pub mod opset26;
 pub mod packed_matmul;
 pub mod packed_routed;
 pub mod pattern;

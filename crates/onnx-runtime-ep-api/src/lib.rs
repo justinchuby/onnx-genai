@@ -36,6 +36,7 @@
 pub mod abi;
 pub mod affine_gather;
 pub mod attention_window;
+pub mod bit_cast;
 pub mod epcontext;
 pub mod float6_projection;
 pub mod host_parallel;
