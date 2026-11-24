@@ -17563,6 +17563,29 @@ impl ExecutionProvider for OutputWorkspaceProbeEp {
     ) -> onnx_runtime_ep_api::Result<Fence> {
         self.cpu.copy_async(src, dst, bytes)
     }
+    fn copy_from_host(
+        &self,
+        src: &[u8],
+        dst: &mut DeviceBuffer,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        if self
+            .failure
+            .compare_exchange(5, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Err(EpError::KernelFailed(
+                "forced input upload failure; retry the request".into(),
+            ));
+        }
+        if self
+            .failure
+            .compare_exchange(6, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            panic!("forced input upload panic");
+        }
+        self.cpu.copy_from_host(src, dst)
+    }
     fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
         self.cpu.sync()
     }
@@ -17984,4 +18007,144 @@ fn output_backings_survive_workspace_planning_admission_execution_errors_and_unw
             "stage {stage} leaked allocation ownership"
         );
     }
+}
+
+fn run_storage_fixture(stage: u8) -> (Executor, Arc<OutputWorkspaceProbeEp>, ValueId, ValueId) {
+    let ep = Arc::new(OutputWorkspaceProbeEp {
+        deferred: false,
+        failure: Arc::new(AtomicU8::new(stage)),
+        cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
+        plans: Default::default(),
+    });
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let first = graph.create_named_value("first", DataType::Float32, static_shape([64]));
+    let second = graph.create_named_value("second", DataType::Float32, static_shape([64]));
+    graph.add_input(first);
+    graph.add_input(second);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([3]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "OutputWorkspaceProbe",
+        vec![Some(first)],
+        vec![output],
+    ));
+    graph.add_output(output);
+    // Graph outputs cannot borrow read-only caller storage, so this input must
+    // take the upload path after `first` qualified for zero-copy borrowing.
+    graph.add_output(second);
+    let executor = Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    (executor, ep, first, second)
+}
+
+#[test]
+fn input_upload_failure_or_panic_never_publishes_partial_borrowed_handles() {
+    for stage in [5, 6] {
+        let (mut executor, _, first, second) = run_storage_fixture(stage);
+        let a = Tensor::from_f32(&[64], &[1.; 64]).unwrap();
+        let b = Tensor::from_f32(&[64], &[2.; 64]).unwrap();
+        assert!(
+            (a.as_bytes().as_ptr() as usize).is_multiple_of(TensorLayout::contiguous().alignment),
+            "the positive control must qualify for zero-copy borrowing"
+        );
+        let inputs = [("first", &a), ("second", &b)];
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.run(&inputs)));
+        if stage == 5 {
+            assert!(
+                result
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("forced input upload failure")
+            );
+        } else {
+            assert!(result.is_err(), "the unwind positive control must panic");
+        }
+        assert!(
+            executor.parked_input_buffers.is_empty(),
+            "a later upload failure left an earlier input loan installed"
+        );
+        for value in [first, second] {
+            assert!(!executor.buffers[&value].is_borrowed());
+        }
+        assert_ne!(
+            executor.buffers[&first].as_ptr().cast::<u8>(),
+            a.as_bytes().as_ptr()
+        );
+        if stage == 5 {
+            let recovered = executor.run(&inputs).unwrap();
+            assert_eq!(recovered[0].as_bytes(), &[0x5a; 12]);
+            assert_eq!(recovered[1].as_bytes(), b.as_bytes());
+            assert!(executor.parked_input_buffers.is_empty());
+        }
+    }
+}
+
+#[test]
+fn run_storage_preparation_preserves_backing_without_uploading_inputs_or_running_kernels() {
+    let (mut executor, ep, first, second) = run_storage_fixture(5);
+    let resolved = executor.resolve_all(&HashMap::new()).unwrap();
+    executor.size_buffers(&resolved).unwrap();
+    ep.cpu
+        .copy_from_host(&[0xa5; 256], executor.buffers.get_mut(&first).unwrap())
+        .unwrap();
+    let origins = [first, second].map(|value| executor.buffers[&value].as_ptr() as usize);
+    for _ in 0..3 {
+        executor
+            .prepare_run_storage(&ExternalBindings::default(), &resolved, None)
+            .unwrap();
+        assert_eq!(
+            [first, second].map(|value| executor.buffers[&value].as_ptr() as usize),
+            origins
+        );
+        assert!(executor.parked_input_buffers.is_empty());
+        assert_eq!(
+            ep.failure.load(Ordering::SeqCst),
+            5,
+            "storage-only prep unexpectedly attempted upload"
+        );
+        assert!(ep.plans.lock().unwrap().is_empty());
+    }
+    let mut bytes = [0u8; 256];
+    ep.cpu
+        .copy_to_host(&executor.buffers[&first], &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, [0xa5; 256]);
+}
+
+#[test]
+fn run_storage_preparation_excludes_real_external_input_backing() {
+    let (mut executor, ep, first, second) = run_storage_fixture(5);
+    let resolved = executor.resolve_all(&HashMap::new()).unwrap();
+    executor.size_buffers(&resolved).unwrap();
+    let second_origin = executor.buffers[&second].as_ptr() as usize;
+    let mut backing = [9f32; 64];
+    let mut external = ExternalBindings::default();
+    external.inputs.insert(
+        first,
+        ExternalValue {
+            dtype: DataType::Float32,
+            shape: vec![64],
+            accepts_subshape: false,
+            strides: None,
+            fixed_stride_shape: None,
+            ptr: backing.as_mut_ptr() as usize,
+            len: size_of_val(&backing),
+            alignment: align_of::<f32>(),
+            device: onnx_runtime_ir::DeviceId::cpu(),
+        },
+    );
+    executor
+        .prepare_run_storage(&external, &resolved, None)
+        .unwrap();
+    assert!(
+        !executor.buffers.contains_key(&first),
+        "an externally bound input must not acquire a shadow allocation"
+    );
+    assert_eq!(executor.buffers[&second].as_ptr() as usize, second_origin);
+    assert_eq!(external.inputs[&first].ptr, backing.as_mut_ptr() as usize);
+    assert_eq!(backing, [9.; 64]);
+    assert_eq!(ep.failure.load(Ordering::SeqCst), 5);
+    assert!(executor.parked_input_buffers.is_empty());
 }

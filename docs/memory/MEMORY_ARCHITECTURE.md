@@ -353,6 +353,32 @@ counts do not change during execution.
 Compiling that regression does not establish CUDA numerical or performance
 correctness; a device is still required to run it.
 
+### Separate backing preparation from input payload binding
+
+Native setup first calls `prepare_run_storage`: it excludes external values and
+reuses/sizes the existing per-value backing allocations. This phase takes only
+resolved shapes, external bindings and the existing Stage2 exclusion set; it
+uploads no input payload, reads no activation values and executes no kernel.
+External inputs have no shadow allocation. Producer-less output seeding retains
+its existing resident source backing. This is a reusable backing-preparation
+boundary, not yet a complete proof of final origins after views and in-place
+alias decisions.
+
+`bind_run_inputs` then completes every fallible upload or string clone before
+installing any read-only input loan. Borrow candidates are local references into
+the caller's tensors; the inline list holds eight candidates and may spill for
+larger arities. Upload error or unwinding cannot leave an earlier caller alias
+installed in the executor. Successful execution uses the existing parked owners
+and cleanup; Stage2 retains its original fixed-pointer copy policy. Upload errors
+identify the input name, type, shape, byte count and provider device.
+
+No quota protocol, pool or persistent cache is introduced. Host regressions
+reproduce the original partial-binding error and verify failure/panic behavior,
+recovery, storage-only preparation, stable fitting backings and external-input
+exclusion. The exact shape/storage epoch and view/in-place facts required for
+MatMul admission remain subsequent work; allocating a value buffer alone does
+not prove that execution will use it as the final tensor origin.
+
 ### Output storage ownership during workspace planning
 
 Native dispatch keeps internal output allocation owners in the executor's buffer
