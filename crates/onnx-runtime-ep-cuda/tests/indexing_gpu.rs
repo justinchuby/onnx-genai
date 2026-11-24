@@ -14,6 +14,8 @@
 )]
 //! CUDA conformance tests for router/mask indexing and scan operators.
 
+mod common;
+
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DeviceBuffer, DeviceId, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut,
@@ -171,7 +173,15 @@ fn run(
             )
         })
         .collect::<Vec<_>>();
-    kernel.execute(&input_views, &mut output_views).unwrap();
+    let mut workspace = None;
+    common::execute_kernel(
+        &ep,
+        kernel.as_ref(),
+        &input_views,
+        &mut output_views,
+        &mut workspace,
+    )
+    .unwrap();
 
     let result = outputs
         .iter()
@@ -188,6 +198,9 @@ fn run(
             bytes
         })
         .collect();
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
     for buffer in input_buffers {
         ep.deallocate(buffer).unwrap();
     }
@@ -269,23 +282,35 @@ fn with_warmed_capture(
         .iter()
         .map(|(_, shape)| compute_contiguous_strides(shape))
         .collect::<Vec<_>>();
-    let execute = |buffers: &mut [DeviceBuffer]| {
-        let mut output_views = outputs
-            .iter()
-            .zip(buffers.iter_mut())
-            .zip(&output_strides)
-            .map(|(((dtype, shape), buffer), strides)| {
-                TensorMut::new(
-                    DevicePtrMut(buffer.as_mut_ptr()),
-                    *dtype,
-                    shape,
-                    strides,
-                    ep.device_id(),
-                )
-            })
-            .collect::<Vec<_>>();
-        kernel.execute(&input_views, &mut output_views).unwrap();
-    };
+    let workspace = std::cell::RefCell::new(None);
+    let execute =
+        |buffers: &mut [DeviceBuffer],
+         override_view: Option<Option<onnx_runtime_ep_api::WorkspaceView>>| {
+            let mut output_views = outputs
+                .iter()
+                .zip(buffers.iter_mut())
+                .zip(&output_strides)
+                .map(|(((dtype, shape), buffer), strides)| {
+                    TensorMut::new(
+                        DevicePtrMut(buffer.as_mut_ptr()),
+                        *dtype,
+                        shape,
+                        strides,
+                        ep.device_id(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            match override_view {
+                Some(view) => kernel.execute_with_workspace(&input_views, &mut output_views, view),
+                None => common::execute_kernel(
+                    &ep,
+                    kernel.as_ref(),
+                    &input_views,
+                    &mut output_views,
+                    &mut workspace.borrow_mut(),
+                ),
+            }
+        };
     let download = |buffers: &[DeviceBuffer]| {
         outputs
             .iter()
@@ -304,26 +329,105 @@ fn with_warmed_capture(
             .collect::<Vec<_>>()
     };
 
-    execute(&mut output_buffers);
+    execute(&mut output_buffers, None).unwrap();
     let eager = download(&output_buffers);
     assert!(
         kernel.cuda_graph_compatible(),
         "{op} must advertise capture support after warmup"
     );
+    if let Some(view) = workspace.borrow_mut().as_mut().map(
+        |owner: &mut onnx_runtime_ep_api::WorkspaceAllocation| {
+            onnx_runtime_ep_api::WorkspaceView::new(DevicePtrMut(owner.as_mut_ptr()), owner.len())
+        },
+    ) {
+        let metadata = input_views
+            .iter()
+            .map(|v| onnx_runtime_ep_api::TensorMetadata::new(v.dtype, v.shape, true))
+            .collect::<Vec<_>>();
+        let out_metadata = outputs
+            .iter()
+            .map(|(dtype, shape)| onnx_runtime_ep_api::OutputMetadata::tensor(*dtype, shape))
+            .collect::<Vec<_>>();
+        let requirement = kernel
+            .workspace_requirement(&metadata, &out_metadata)
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        let missing = execute(&mut output_buffers, Some(None))
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("workspace needs"), "{missing}");
+        assert!(!kernel.cuda_graph_compatible());
+        // Overrides never borrow the cell; rewarm after releasing this borrow.
+        let short =
+            onnx_runtime_ep_api::WorkspaceView::new(view.ptr(), requirement.bytes as usize - 1);
+        assert!(
+            execute(&mut output_buffers, Some(Some(short)))
+                .unwrap_err()
+                .to_string()
+                .contains("workspace needs")
+        );
+    }
+    execute(&mut output_buffers, None).unwrap();
+    if workspace.borrow().is_some() {
+        ep.runtime()
+            .begin_graph_capture(&[kernel.as_ref()])
+            .unwrap();
+        let missing_pin = execute(&mut output_buffers, None).unwrap_err().to_string();
+        ep.runtime().abort_graph_capture().unwrap();
+        assert!(
+            missing_pin.contains("real workspace owner"),
+            "{missing_pin}"
+        );
+        assert!(!kernel.cuda_graph_compatible());
+        execute(&mut output_buffers, None).unwrap();
+    }
     let allocation_counts = ep.runtime().allocation_counts();
+    let pins = workspace
+        .borrow()
+        .as_ref()
+        .map(|owner| {
+            owner
+                .device_graph_resource()
+                .unwrap()
+                .expect("caller workspace must carry its real owner")
+        })
+        .into_iter()
+        .collect();
     ep.runtime()
-        .begin_graph_capture(&[kernel.as_ref()])
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], pins)
         .unwrap();
     for _ in 0..nodes_per_graph {
-        execute(&mut output_buffers);
+        execute(&mut output_buffers, None).unwrap();
     }
     ep.runtime().end_graph_capture().unwrap();
     assert_eq!(ep.runtime().allocation_counts(), allocation_counts);
-    ep.runtime().replay_graph().unwrap();
-    let replay = download(&output_buffers);
+    let mut replay = Vec::new();
+    for _ in 0..3 {
+        if let Some(owner) = workspace.borrow_mut().as_mut() {
+            unsafe {
+                ep.runtime()
+                    .htod(
+                        &vec![0xff; owner.len()],
+                        cuptr(owner.as_mut_ptr().cast_const()),
+                    )
+                    .unwrap();
+            }
+        }
+        ep.runtime().replay_graph().unwrap();
+        replay = download(&output_buffers);
+        assert_eq!(
+            replay, eager,
+            "{op} must initialize shared scratch before each replay"
+        );
+    }
+    assert_eq!(ep.runtime().allocation_counts(), allocation_counts);
     inspect(&ep);
     assert!(ep.runtime().reset_graph().unwrap());
 
+    if let Some(workspace) = workspace.into_inner() {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
     drop(input_views);
     drop(kernel);
     for buffer in input_buffers.drain(..) {
@@ -1028,6 +1132,9 @@ fn scatter_opset29_int32_nd_add_and_empty_tuple_mean() {
     let expected = vec![raw(&[3_f32, 4., 5., 6.])];
     assert_eq!(run("ScatterND", 29, &inputs, &outputs, &mean), expected);
     assert_eq!(run_cpu("ScatterND", 29, &inputs, &outputs, &mean), expected);
+    let (eager, replay) = run_warmed_capture("ScatterND", 29, &inputs, &outputs, &mean);
+    assert_eq!(eager, expected);
+    assert_eq!(replay, expected);
 
     let empty_slice = [
         tensor::<f32>(DataType::Float32, &[2, 0], &[]),
@@ -1043,6 +1150,49 @@ fn scatter_opset29_int32_nd_add_and_empty_tuple_mean() {
     );
     assert_eq!(eager, vec![Vec::<u8>::new()]);
     assert_eq!(replay, eager);
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+#[test]
+fn scatter_mean_zero_workspace_preserves_copy_and_invalid_empty_slice_checks() {
+    let attrs = [("reduction", Attribute::String(b"mean".to_vec()))];
+    let original = [0x7fc01234_u32, 0x80000000, 0x3f800000];
+    let inputs = [
+        tensor(DataType::Float32, &[3], &original),
+        tensor::<i32>(DataType::Int32, &[0], &[]),
+        tensor::<f32>(DataType::Float32, &[0], &[]),
+    ];
+    let (eager, replay) = run_warmed_capture(
+        "ScatterElements",
+        29,
+        &inputs,
+        &[(DataType::Float32, vec![3])],
+        &attrs,
+    );
+    assert_eq!(
+        eager,
+        vec![raw(&original)],
+        "empty updates must preserve original bits, including NaN and signed zero"
+    );
+    assert_eq!(replay, eager);
+    let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
+    let invalid_empty_slice = [
+        common::input::<f32>(DataType::Float32, &[2, 0], &[]),
+        common::input(DataType::Int32, &[1, 1], &[-3_i32]),
+        common::input::<f32>(DataType::Float32, &[1, 0], &[]),
+    ];
+    let error = common::try_run_cuda(
+        &ep,
+        "ScatterND",
+        "",
+        29,
+        &invalid_empty_slice,
+        &[(DataType::Float32, vec![2, 0])],
+        &attrs,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("index -3 out of range"), "{error}");
 }
 
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]

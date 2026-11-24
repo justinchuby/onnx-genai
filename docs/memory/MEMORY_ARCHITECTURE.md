@@ -432,6 +432,33 @@ verify error recovery and final allocator balance, and check partial binding and
 external offset/stride behavior. These ownership results do not establish CUDA
 execution or asynchronous failure behavior on a device.
 
+### Scatter mean shares the caller lane
+
+CUDA ScatterElements/ScatterND mean accumulators borrow the session-persistent
+caller lane instead of retaining one allocation/Mutex per kernel. The metadata
+hook reports a checked shape-only bound: 16 bytes per floating output element,
+24 for Int64's exact sum limbs/count, aligned for u64/double. Non-mean reductions,
+empty updates and empty data have zero demand. Zero demand does not skip index
+validation or original-data copying. In particular ND index depth zero can have
+empty indices storage and nonempty updates, so indices.numel is not a zero-demand
+predicate.
+
+Execution binds the exact used span, verifies its real caller owner during
+capture, and preserves stream-ordered memset/scatter/finish without new
+synchronization. Every invocation initializes disposable state before use.
+Only successful execution republishes the warm signature; missing/short backing,
+unregistered capture spans, invalid indices and launch/metadata failures revoke
+it. Persistent metadata owners and graph resources remain independently retained;
+only the mean scratch owner/resource is removed. Both op registrations advertise
+metadata workspace planning; no new allocator, quota or per-region protocol is
+required of the EP.
+
+Host tests cover dtype layouts, empty/depth-zero demands, checked overflow and
+invalid backing. GPU fixtures exercise missing/short workspace, missing caller
+pin, dirty-scratch replay, empty-update bit preservation and invalid empty-slice
+indices. They are compile-checked here; CUDA numerics, NVRTC, replay and throughput
+have not been executed on this host.
+
 ### CUDA dense MatMul cached-plan preparation boundary
 
 F32 single-row decode and the other single-matrix cuBLASLt paths cache pure host
@@ -797,7 +824,8 @@ call; it owns the governed workspace preparation path
 | `kernels/group_query_attention.rs` `GqaWorkspace::reserve` | `GroupQueryAttention` remaining pooled slots (present K/V / metadata) | slot-specific `bytes.max(1)` | cache/batch dependent, then reused | session-persistent growable state | raw bypass; scores, packed Q/K/V staging, and BNSH transpose slots are excluded — carved from the prepared composite on governed execution |
 | `kernels/index_share.rs:708` | `pkg.nxrt::IndexShare` selected-token attention workspace | aligned sum of reachable present staging, `B * q_heads * q_seq * selected_width * 4`, and optional `2 * B * sizeof(i64)` | prompt/cache dependent | session-persistent | **governed by #751** via `workspace_requirement` + prepared workspace |
 | `kernels/index_transform.rs:150` | index-transform metadata | `bytes.len()` | op/rank/config | step-scoped | raw bypass |
-| `kernels/indexing.rs:410` | indexing metadata | `bytes.len().max(1)` | op/rank/config | step-scoped | raw bypass |
+| `kernels/indexing.rs` | ScatterElements/ScatterND mean accumulator state | `data_numel * (16 or 24)` | output shape/dtype dependent | session-persistent shared caller peak | governed metadata requirement; real used-span capture pin; no private scratch owner |
+| `kernels/indexing.rs` metadata caches | shape/indexing descriptors | `bytes.len().max(1)` | op/rank/shape dependent | shape-keyed persistent metadata artifact | existing raw artifact owner and capture pin; separate from disposable mean state |
 | `kernels/matmul.rs` | dense MatMul cuBLASLt workspace, including F32/F16 single-row paths | exact cached ActualAddress plan `workspaceSize` | shape/dtype/alignment/algorithm dependent | session-persistent caller lane peak | metadata Deferred, execution refiner fixes the plan before admission; no private device scratch |
 | `kernels/matmul.rs` | batched/broadcast MatMul cuBLASLt workspace | metadata planner heuristic `workspaceSize` | shape/dtype/algorithm dependent | session-persistent shared peak | existing governed metadata bound; non-capturable |
 | `kernels/matmul_nbits.rs:3599` | `MatMulNBits` accuracy-4 decode activation quantization | `padded_k + (padded_k / block_size) * sizeof(f32)` | model config (`K`, `block_size`) | model-lifetime fixed scratch | raw bypass |
