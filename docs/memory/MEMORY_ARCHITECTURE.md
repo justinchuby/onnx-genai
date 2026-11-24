@@ -995,6 +995,42 @@ counts, mutate controls/scales at the same address, and reject invalid values
 even for empty output. Device numerics, lifetime execution and performance still
 require CUDA hardware; the device algorithm sources are unchanged.
 
+### Pad and Resize mixed descriptors share one byte span
+
+Pad and Resize now declare Metadata-planned SessionPersistent caller capacity.
+The descriptor helper accepts exact byte payloads as well as u64 records; both
+paths use the same complete bind and consumed borrowed upload proof, without
+another owner, pool, ledger or region-level grant.
+
+Pad needs `32 * rank + element_bytes`: four 8-byte arrays followed by the fill
+value. A single-byte tail is valid, and even scalar Pad keeps its fill byte(s).
+Known empty output needs no capacity. Complete binding precedes the existing
+pads/axes/value readback; the original early-empty validation order is retained.
+Extent calculation uses i128 and checks the actual signed CUDA source-coordinate
+endpoints and reflection period before launch.
+
+Resize combines its four integer arrays and doubles into one descriptor. Normal
+or sizes-based execution needs `40 * rank` bytes; HalfPixelSymmetric with selected
+scales needs `48 * rank`, including its per-axis offsets. The scales pointer is
+`base + 32 * rank`, naturally double-aligned. One payload and one synchronous H2D
+replace the two former uploads, preserving launch ABI and completion policy.
+
+A shared pure classifier preserves Resize-10 slot 1 and later versions' exactly
+one present, nonempty scales/sizes rule. Only a selected scales source activates
+the symmetric-offset region. Existing rank limits, positive finite scales,
+control lengths and shape validation remain; float-derived extents are checked
+before integer conversion. Resize-10 scalar descriptors can be empty under its
+existing control rules. Both operators still reject recording before readback.
+
+Host tests cover exact mixed sizes, scalar/empty cases, versioned control
+selection, negative pads, signed reflection/source bounds and nonfinite or
+unaddressable extents. Compiled device fixtures extend the same real root-owner
+reuse to all eight descriptor operators, including odd-byte Pad, same-address
+fill/control changes, both Resize symmetric routes and exact H2D/readback counts.
+CUDA source strings remain unchanged. No device numerical/lifetime/performance
+validation was possible locally, and fewer upload calls alone is not a measured
+throughput result.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
@@ -1055,14 +1091,14 @@ call; it owns the governed workspace preparation path
 | `kernels/nonzero.rs` | NonZero coordinate strides | `input_rank * 8`, zero for scalar/empty | input rank/output emptiness | SessionPersistent caller peak | checked borrowed upload; no private allocation |
 | `kernels/normalization.rs:1563` | normalization metadata | `metadata_bytes.len()` | op/rank/config | step-scoped | raw bypass |
 | `kernels/packed_varlen_attention.rs:581` | packed-varlen metadata | `bytes.max(1)` | batch/sequence metadata | step-scoped | raw bypass |
-| `kernels/pad.rs:292` | Pad metadata | `metadata.len()` | rank/pads config | step-scoped | raw bypass |
+| `kernels/pad.rs` | Pad integer arrays plus fill bytes | `32 * rank + element_bytes`, zero for empty output | rank/dtype | SessionPersistent caller peak | complete byte-span borrow before controls; no private allocation |
 | `kernels/pooling.rs:538` | pooling metadata | `bytes.len()` | rank/kernel config | step-scoped | raw bypass |
 | `kernels/qlinear_matmul.rs:299` | QLinearMatMul metadata | `bytes.len()` | rank/quantization params | step-scoped | raw bypass |
 | `kernels/qmoe.rs`, `qmoe/workspace.rs` | integer-affine QMoE routing, expert intermediates, grouping and float widening | one checked composite of the 19 reachable regions | rows/experts/hidden/intermediate, activation/gate route and each operand dtype | shared SessionPersistent caller peak | metadata planning and actual used-span capture pin; no private pool or slot owner |
 | `kernels/reduce.rs:711` | reduce base shape metadata | `base_bytes.len().max(1)` | rank/config | step-scoped | raw bypass |
 | `kernels/reduce.rs:712` | reduce delta shape metadata | `delta_bytes.len().max(1)` | rank/config | step-scoped | raw bypass |
 | `kernels/reduce.rs:720` | reduce axes metadata | `axes_bytes.len().max(1)` | rank/axes config | step-scoped | raw bypass |
-| `kernels/resize.rs:259` | Resize metadata | `bytes.len()` | rank/scales/sizes config | step-scoped | raw bypass |
+| `kernels/resize.rs` | Resize integer arrays, scales and optional symmetric offsets | `40 * rank` or `48 * rank`, zero for empty output | rank/selected source/coordinate mode | SessionPersistent caller peak | one combined borrowed upload; no private allocation |
 | `kernels/standard_attention.rs:633,777` (`std_attention_workspace_layout` / `workspace_requirement`), selected at `:1690-1766` | default-domain `Attention` f32 scores + staged dense K/V composite | scores `batch * q_heads * q_seq * total_seq * sizeof(f32)` on every route; staged key/value, when reachable, each `batch * kv_heads * present_seq * head_dim * element_bytes`, with 256-byte region alignment | prompt/cache/route dependent | step-scoped on per-call prefill/batched dense growth; session-persistent on capture-eligible single-token dense growth | **governed by #736** through one shared plan/execute layout; fixed-capacity append, no-past, and missing present-output routes add **zero** staged-K/V bytes (the always-live scores remain); direct-`execute` compatibility keeps self-owned scratch |
 | `kernels/standard_attention.rs:1780,1799-1803` | default-domain `Attention` capture/eager control metadata | device valid length `sizeof(i32)`; offsets + pad limits `2 * batch.max(1) * sizeof(i64)` | batch dependent, negligible | step-scoped on eager calls; retained for capture-eligible decode | raw bypass; staged K/V and scores are excluded and governed by #736 |
 | `kernels/varlen_attention.rs:531` | varlen attention metadata buffer | `bytes.max(1)` | batch/sequence metadata | step-scoped | raw bypass |

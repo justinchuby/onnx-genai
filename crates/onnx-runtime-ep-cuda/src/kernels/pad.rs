@@ -4,11 +4,18 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspacePreparation, WorkspaceView,
+};
+use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
+
+use super::metadata_workspace::{
+    MetadataWorkspace, checked_metadata_strides, checked_tensor_bytes,
+};
 
 const BLOCK: u32 = 256;
 const SOURCE: &str = r#"
@@ -125,7 +132,8 @@ fn device_bytes(runtime: &CudaRuntime, input: &TensorView) -> Result<Vec<u8>> {
     if !input.is_contiguous() {
         return Err(not_implemented("Pad with strided metadata input"));
     }
-    let mut bytes = vec![0; input.dtype.storage_bytes(input.numel())];
+    let mut bytes =
+        vec![0; checked_tensor_bytes("Pad", "control input", input.dtype, input.shape)?];
     if !bytes.is_empty() {
         unsafe { runtime.dtoh(&mut bytes, cuptr(input.data_ptr::<u8>() as *const c_void))? };
     }
@@ -163,8 +171,85 @@ fn legacy_fill(dtype: DataType, value: f32) -> Vec<u8> {
     }
 }
 
-impl Kernel for PadKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+fn pad_descriptor_bytes(rank: usize, element_bytes: usize) -> Result<usize> {
+    rank.checked_mul(32)
+        .and_then(|bytes| bytes.checked_add(element_bytes))
+        .ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep Pad: descriptor size overflows; reduce rank or element width".into(),
+            )
+        })
+}
+
+fn pad_workspace(
+    inputs: &[TensorMetadata<'_>],
+    outputs: &[OutputMetadata<'_>],
+) -> Result<MetadataWorkspace> {
+    if inputs.is_empty() || inputs.len() > 4 || outputs.len() != 1 || !inputs[0].present {
+        return Err(EpError::KernelFailed(
+            "cuda_ep Pad: workspace planning requires 1..=4 inputs, present data and one output"
+                .into(),
+        ));
+    }
+    let input = inputs[0];
+    let width = input.dtype.byte_size();
+    if width == 0 {
+        return Err(not_implemented("Pad for packed or variable-width dtype"));
+    }
+    i32::try_from(input.shape.len())
+        .map_err(|_| EpError::KernelFailed("cuda_ep Pad: rank exceeds i32".into()))?;
+    checked_tensor_bytes("Pad", "input", input.dtype, input.shape)?;
+    MetadataWorkspace::for_bytes(
+        "Pad",
+        pad_descriptor_bytes(input.shape.len(), width)?,
+        &outputs[0],
+    )
+}
+
+fn checked_pad_extent(
+    mode: PadMode,
+    axis: usize,
+    dimension: usize,
+    begin: i64,
+    end: i64,
+) -> Result<usize> {
+    let dimension = i64::try_from(dimension).map_err(|_| EpError::KernelFailed(format!(
+        "cuda_ep Pad: input dimension at axis {axis} exceeds signed CUDA coordinate range; reduce the shape")))?;
+    let padded = i128::from(dimension) + i128::from(begin) + i128::from(end);
+    let padded = i64::try_from(padded).ok().filter(|&value| value >= 0).ok_or_else(|| EpError::KernelFailed(format!(
+        "cuda_ep Pad: pads ({begin}, {end}) at axis {axis} crop past zero or exceed signed CUDA extent; reduce the crop/padding")))?;
+    if padded > 0 {
+        if mode != PadMode::Constant && dimension == 0 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Pad: non-constant mode cannot sample empty axis {axis}"
+            )));
+        }
+        let first = -i128::from(begin);
+        let last = i128::from(padded - 1) - i128::from(begin);
+        if i64::try_from(first).is_err() || i64::try_from(last).is_err() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Pad: coordinate minus pad_begin overflows signed CUDA arithmetic at axis {axis}; reduce padding/cropping"
+            )));
+        }
+        if mode == PadMode::Reflect
+            && dimension > 1
+            && 2 * i128::from(dimension - 1) > i128::from(i64::MAX)
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Pad: reflection period overflows signed CUDA arithmetic at axis {axis}; reduce the input dimension"
+            )));
+        }
+    }
+    Ok(padded as usize)
+}
+
+impl PadKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if inputs.is_empty() || inputs.len() > 4 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Pad: expected 1..=4 inputs and 1 output, got {} and {}",
@@ -177,6 +262,17 @@ impl Kernel for PadKernel {
                 "Pad during CUDA graph capture because pads and axes are device inputs",
             ));
         }
+        let metadata: [_; 4] = std::array::from_fn(|index| {
+            inputs.get(index).map_or(
+                TensorMetadata::new(DataType::Undefined, &[], false),
+                |input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()),
+            )
+        });
+        let upload = pad_workspace(
+            &metadata[..inputs.len()],
+            &[OutputMetadata::from_view(&outputs[0])],
+        )?
+        .bind(workspace)?;
         let data = &inputs[0];
         let output = &mut outputs[0];
         if !data.is_contiguous() || !output.is_contiguous() {
@@ -230,18 +326,7 @@ impl Kernel for PadKernel {
             .iter()
             .enumerate()
             .map(|(axis, &dimension)| {
-                let padded = dimension as i64 + begin[axis] + end[axis];
-                if padded < 0 {
-                    Err(EpError::KernelFailed(format!(
-                        "cuda_ep Pad: pads crop axis {axis} past its extent"
-                    )))
-                } else if self.mode != PadMode::Constant && padded > 0 && dimension == 0 {
-                    Err(EpError::KernelFailed(format!(
-                        "cuda_ep Pad: non-constant mode cannot sample empty axis {axis}"
-                    )))
-                } else {
-                    Ok(padded as usize)
-                }
+                checked_pad_extent(self.mode, axis, dimension, begin[axis], end[axis])
             })
             .collect::<Result<Vec<_>>>()?;
         if output.shape != expected_shape {
@@ -250,6 +335,7 @@ impl Kernel for PadKernel {
                 output.shape
             )));
         }
+        checked_tensor_bytes("Pad", "output", output.dtype, output.shape)?;
         if output.numel() == 0 {
             return Ok(());
         }
@@ -267,9 +353,9 @@ impl Kernel for PadKernel {
             vec![0; element_bytes]
         };
 
-        let input_strides = compute_contiguous_strides(data.shape);
-        let output_strides = compute_contiguous_strides(output.shape);
-        let mut metadata = Vec::with_capacity(rank * 32 + element_bytes);
+        let input_strides = checked_metadata_strides("Pad", "input", data.shape)?;
+        let output_strides = checked_metadata_strides("Pad", "output", output.shape)?;
+        let mut metadata = Vec::with_capacity(pad_descriptor_bytes(rank, element_bytes)?);
         for value in &begin {
             metadata.extend_from_slice(&value.to_ne_bytes());
         }
@@ -289,11 +375,7 @@ impl Kernel for PadKernel {
             .map_err(|_| EpError::KernelFailed("cuda_ep Pad: rank exceeds i32".into()))?;
         let element_bytes = i32::try_from(element_bytes)
             .map_err(|_| EpError::KernelFailed("cuda_ep Pad: element width exceeds i32".into()))?;
-        let metadata_ptr = self.runtime.alloc_raw(metadata.len())?;
-        if let Err(error) = unsafe { self.runtime.htod(&metadata, metadata_ptr) } {
-            let _ = unsafe { self.runtime.free_raw(metadata_ptr) };
-            return Err(error);
-        }
+        let metadata_ptr = upload.upload_bytes(&self.runtime, &metadata)?;
         let input_ptr = cuptr(data.data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
         let mode = self.mode.code();
@@ -319,8 +401,94 @@ impl Kernel for PadKernel {
             })
         }
         .map_err(|error| driver_err("launch Pad", error));
-        let sync = launch.and_then(|_| self.runtime.synchronize());
-        let free = unsafe { self.runtime.free_raw(metadata_ptr) };
-        sync.and(free)
+        launch.and_then(|_| self.runtime.synchronize())
+    }
+}
+
+impl Kernel for PadKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Ok(WorkspacePreparation::Ready(
+            pad_workspace(inputs, outputs)?.requirement(),
+        ))
+    }
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "Pad reads device pads/axes and uploads borrowed metadata eagerly",
+        )
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+    use onnx_runtime_ep_api::WorkspaceRequirement;
+    #[test]
+    fn pad_byte_plan_includes_fill_even_for_scalar_and_does_not_round_tail() {
+        for (dtype, shape, expected) in [
+            (DataType::Uint8, &[][..], 1),
+            (DataType::Uint8, &[2, 2][..], 65),
+            (DataType::Float32, &[2][..], 36),
+        ] {
+            let inputs = [TensorMetadata::new(dtype, shape, true)];
+            let plan = pad_workspace(&inputs, &[OutputMetadata::Unresolved { dtype }]).unwrap();
+            assert_eq!(plan.requirement().bytes, expected);
+            assert_eq!(
+                pad_workspace(&inputs, &[OutputMetadata::tensor(dtype, &[0])])
+                    .unwrap()
+                    .requirement(),
+                WorkspaceRequirement::NONE
+            );
+        }
+        assert!(pad_descriptor_bytes(usize::MAX, 1).is_err());
+    }
+    #[test]
+    fn pad_extent_proves_signed_source_and_reflection_boundaries() {
+        assert_eq!(
+            checked_pad_extent(PadMode::Constant, 0, 2, 1, 0).unwrap(),
+            3
+        );
+        assert_eq!(
+            checked_pad_extent(PadMode::Constant, 0, 2, -1, -1).unwrap(),
+            0
+        );
+        assert!(
+            checked_pad_extent(PadMode::Constant, 1, 2, i64::MIN, i64::MAX)
+                .unwrap_err()
+                .to_string()
+                .contains("coordinate minus pad_begin")
+        );
+        assert_eq!(
+            checked_pad_extent(PadMode::Constant, 1, 1, -i64::MAX, i64::MAX).unwrap(),
+            1
+        );
+        assert!(checked_pad_extent(PadMode::Constant, 0, 3, -4, 0).is_err());
+        assert!(
+            checked_pad_extent(PadMode::Wrap, 0, 0, 1, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("empty axis")
+        );
+        let wide = i64::MAX as usize / 2 + 2;
+        assert!(
+            checked_pad_extent(PadMode::Reflect, 2, wide, 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("reflection period")
+        );
     }
 }

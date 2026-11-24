@@ -134,6 +134,61 @@ fn eager_shape_metadata_reuses_one_owner_without_private_allocations() {
             attributes: vec![],
             metadata_bytes: 16,
         },
+        Case {
+            op: "Pad",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Uint8, &[2, 2], &[1u8, 2, 3, 4]),
+                input(DataType::Int64, &[4], &[1i64, 0, 0, 1]),
+                input(DataType::Uint8, &[], &[9u8]),
+            ],
+            output: (DataType::Uint8, vec![3, 3]),
+            attributes: vec![],
+            metadata_bytes: 65,
+        },
+        Case {
+            op: "Pad",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Uint8, &[], &[2u8]),
+                input(DataType::Int64, &[0], &[] as &[i64]),
+                input(DataType::Uint8, &[], &[9u8]),
+            ],
+            output: (DataType::Uint8, vec![]),
+            attributes: vec![],
+            metadata_bytes: 1,
+        },
+        Case {
+            op: "Resize",
+            opset: 19,
+            inputs: vec![
+                input(DataType::Float32, &[2, 2], &[1f32, 2., 3., 4.]),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+                input(DataType::Float32, &[2], &[1.6f32, 1.6]),
+            ],
+            output: (DataType::Float32, vec![3, 3]),
+            attributes: vec![(
+                "coordinate_transformation_mode",
+                Attribute::String("half_pixel_symmetric".into()),
+            )],
+            metadata_bytes: 96,
+        },
+        Case {
+            op: "Resize",
+            opset: 19,
+            inputs: vec![
+                input(DataType::Float32, &[2, 2], &[1f32, 2., 3., 4.]),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+                input(DataType::Int64, &[2], &[3i64, 3]),
+            ],
+            output: (DataType::Float32, vec![3, 3]),
+            attributes: vec![(
+                "coordinate_transformation_mode",
+                Attribute::String("half_pixel_symmetric".into()),
+            )],
+            metadata_bytes: 80,
+        },
     ];
     let mut workspace = None;
     let mut original_identity = None;
@@ -280,6 +335,8 @@ fn eager_shape_metadata_reuses_one_owner_without_private_allocations() {
             "CenterCropPad" => 1,
             "Col2Im" => 2,
             "QLinearMatMul" => 3,
+            "Pad" => u64::from(!case.inputs[1].bytes.is_empty()) + 1,
+            "Resize" => 1,
             _ => 0,
         };
         assert_eq!(
@@ -377,6 +434,62 @@ fn eager_shape_metadata_reuses_one_owner_without_private_allocations() {
             unsafe {
                 runtime
                     .htod(&case.inputs[1].bytes, cuptr(buffers[1].as_ptr()))
+                    .unwrap();
+            }
+        }
+        if case.op == "Pad" && !outputs[0].1.is_empty() {
+            let mut updated = case.inputs.clone();
+            updated[2].bytes = vec![7u8];
+            unsafe {
+                runtime
+                    .htod(&updated[2].bytes, cuptr(buffers[2].as_ptr()))
+                    .unwrap();
+            }
+            kernel
+                .execute_with_workspace(&views, &mut output, Some(view))
+                .unwrap();
+            let wanted = common::run_cpu(
+                case.op,
+                "",
+                case.opset,
+                &updated,
+                &outputs,
+                &case.attributes,
+            );
+            let mut actual = vec![0; output_bytes];
+            unsafe {
+                runtime
+                    .dtoh(&mut actual, cuptr(output_buffer.as_ptr()))
+                    .unwrap();
+            }
+            assert_eq!(actual, wanted[0]);
+            assert_ne!(wanted, expected);
+            unsafe {
+                runtime
+                    .htod(&case.inputs[2].bytes, cuptr(buffers[2].as_ptr()))
+                    .unwrap();
+            }
+        } else if case.op == "Resize" {
+            let (slot, bad) = if case.inputs.len() == 3 {
+                (2, common::raw(&[f32::NAN, 1.6]))
+            } else {
+                (3, common::raw(&[-1i64, 3]))
+            };
+            unsafe {
+                runtime.htod(&bad, cuptr(buffers[slot].as_ptr())).unwrap();
+            }
+            let before = runtime.transfer_counts();
+            let error = kernel
+                .execute_with_workspace(&views, &mut output, Some(view))
+                .unwrap_err();
+            assert!(error.to_string().contains("Resize"), "{error}");
+            assert_eq!(
+                runtime.transfer_counts().host_to_device,
+                before.host_to_device
+            );
+            unsafe {
+                runtime
+                    .htod(&case.inputs[slot].bytes, cuptr(buffers[slot].as_ptr()))
                     .unwrap();
             }
         }
@@ -499,6 +612,40 @@ fn scalar_and_empty_shape_metadata_need_no_caller_capacity() {
             attributes: vec![],
             metadata_bytes: 0,
         },
+        Case {
+            op: "Pad",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Uint8, &[2], &[1u8, 2]),
+                input(DataType::Int64, &[2], &[-1i64, -1]),
+            ],
+            output: (DataType::Uint8, vec![0]),
+            attributes: vec![],
+            metadata_bytes: 0,
+        },
+        Case {
+            op: "Resize",
+            opset: 19,
+            inputs: vec![
+                input(DataType::Float32, &[2, 2], &[1f32, 2., 3., 4.]),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+                input(DataType::Float32, &[2], &[0.1f32, 0.1]),
+            ],
+            output: (DataType::Float32, vec![0, 0]),
+            attributes: vec![],
+            metadata_bytes: 0,
+        },
+        Case {
+            op: "Resize",
+            opset: 10,
+            inputs: vec![
+                input(DataType::Float32, &[], &[2f32]),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+            ],
+            output: (DataType::Float32, vec![]),
+            attributes: vec![],
+            metadata_bytes: 0,
+        },
     ];
     for case in cases {
         let outputs = [case.output];
@@ -560,6 +707,8 @@ fn scalar_and_empty_shape_metadata_need_no_caller_capacity() {
             "CenterCropPad" => invalid[1].bytes = common::raw(&[-1i64, 5]),
             "Col2Im" => invalid[2].bytes = common::raw(&[-2i64, 2]),
             "QLinearMatMul" => invalid[1].bytes = common::raw(&[f32::NAN]),
+            "Pad" => invalid[1].bytes = common::raw(&[-3i64, 0]),
+            "Resize" if case.opset >= 11 => invalid[2].bytes = common::raw(&[f32::NAN, 0.1]),
             _ => continue,
         }
         let error = common::try_run_cuda(

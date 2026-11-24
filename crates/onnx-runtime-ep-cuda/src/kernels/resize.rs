@@ -3,12 +3,19 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspacePreparation, WorkspaceView,
+};
+use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
+
+use super::metadata_workspace::{
+    MetadataWorkspace, checked_metadata_strides, checked_tensor_bytes,
+};
 
 const BLOCK: u32 = 256;
 const SOURCE: &str = r#"
@@ -254,7 +261,8 @@ fn device_bytes(runtime: &CudaRuntime, input: &TensorView) -> Result<Vec<u8>> {
     if !input.is_contiguous() {
         return Err(not_implemented("Resize with strided control input"));
     }
-    let mut bytes = vec![0; input.dtype.storage_bytes(input.numel())];
+    let mut bytes =
+        vec![0; checked_tensor_bytes("Resize", "control input", input.dtype, input.shape)?];
     if !bytes.is_empty() {
         unsafe { runtime.dtoh(&mut bytes, cuptr(input.data_ptr::<u8>() as *const c_void))? };
     }
@@ -285,15 +293,6 @@ fn device_i64(runtime: &CudaRuntime, input: &TensorView, name: &str) -> Result<V
         .collect())
 }
 
-fn upload_bytes(runtime: &CudaRuntime, bytes: &[u8]) -> Result<CUdeviceptr> {
-    let pointer = runtime.alloc_raw(bytes.len())?;
-    if let Err(error) = unsafe { runtime.htod(bytes, pointer) } {
-        let _ = unsafe { runtime.free_raw(pointer) };
-        return Err(error);
-    }
-    Ok(pointer)
-}
-
 fn dtype_code(dtype: DataType) -> Result<i32> {
     match dtype {
         DataType::Float32 => Ok(0),
@@ -305,8 +304,113 @@ fn dtype_code(dtype: DataType) -> Result<i32> {
     }
 }
 
-impl Kernel for ResizeKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResizeControl {
+    Scales(usize),
+    Sizes(usize),
+}
+
+fn select_control(since_version: u32, inputs: &[TensorMetadata<'_>]) -> Result<ResizeControl> {
+    if since_version == 10 {
+        return inputs
+            .get(1)
+            .filter(|input| input.present)
+            .map(|_| ResizeControl::Scales(1))
+            .ok_or_else(|| {
+                EpError::KernelFailed("cuda_ep Resize-10: scales input 1 must be present".into())
+            });
+    }
+    let nonempty = |slot: usize| -> Result<bool> {
+        let Some(input) = inputs.get(slot).filter(|input| input.present) else {
+            return Ok(false);
+        };
+        let elements = if input.shape.contains(&0) {
+            Some(0)
+        } else {
+            onnx_runtime_ir::checked_numel(input.shape)
+        };
+        elements.map(|elements| elements != 0).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "cuda_ep Resize: control input {slot} element count overflows; reduce its shape"
+            ))
+        })
+    };
+    match (nonempty(2)?, nonempty(3)?) {
+        (true, false) => Ok(ResizeControl::Scales(2)),
+        (false, true) => Ok(ResizeControl::Sizes(3)),
+        _ => Err(EpError::KernelFailed(
+            "cuda_ep Resize: exactly one non-empty scales or sizes input is required".into(),
+        )),
+    }
+}
+
+struct ResizeMetadata {
+    workspace: MetadataWorkspace,
+    control: ResizeControl,
+    symmetric: bool,
+    integer_bytes: usize,
+}
+
+fn resize_metadata(
+    since_version: u32,
+    coordinate_mode: CoordinateMode,
+    inputs: &[TensorMetadata<'_>],
+    outputs: &[OutputMetadata<'_>],
+) -> Result<ResizeMetadata> {
+    if inputs.is_empty()
+        || !inputs[0].present
+        || outputs.len() != 1
+        || (since_version == 10 && inputs.len() != 2)
+        || (since_version >= 11 && !(1..=4).contains(&inputs.len()))
+    {
+        return Err(EpError::KernelFailed(
+            "cuda_ep Resize: invalid input/output metadata arity".into(),
+        ));
+    }
+    let rank = inputs[0].shape.len();
+    if rank > 16 {
+        return Err(not_implemented("Resize rank greater than 16"));
+    }
+    if inputs[0].shape.contains(&0) {
+        return Err(not_implemented("Resize with an empty input dimension"));
+    }
+    dtype_code(inputs[0].dtype)?;
+    checked_tensor_bytes("Resize", "input", inputs[0].dtype, inputs[0].shape)?;
+    let control = select_control(since_version, inputs)?;
+    let symmetric = matches!(coordinate_mode, CoordinateMode::HalfPixelSymmetric)
+        && matches!(control, ResizeControl::Scales(_));
+    let integer_bytes = rank * 32; // rank <= 16; four u64 arrays.
+    let bytes = integer_bytes + rank * 8 * if symmetric { 2 } else { 1 };
+    Ok(ResizeMetadata {
+        workspace: MetadataWorkspace::for_bytes("Resize", bytes, &outputs[0])?,
+        control,
+        symmetric,
+        integer_bytes,
+    })
+}
+
+fn scaled_extent(axis: usize, input: usize, scale: f64) -> Result<usize> {
+    let extent = (input as f64 * scale).floor();
+    if !scale.is_finite()
+        || scale <= 0.0
+        || !extent.is_finite()
+        || extent < 0.0
+        || extent >= isize::MAX as f64
+    {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep Resize: scale {scale} produces an unaddressable extent at axis {axis}; use a positive finite scale and reduce the resized shape"
+        )));
+    }
+    Ok(extent as usize)
+}
+
+impl ResizeKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if outputs.len() != 1
             || (self.since_version == 10 && inputs.len() != 2)
             || (self.since_version >= 11 && !(1..=4).contains(&inputs.len()))
@@ -320,6 +424,19 @@ impl Kernel for ResizeKernel {
                 "Resize during CUDA graph capture because scales/sizes are device inputs",
             ));
         }
+        let metadata: [_; 4] = std::array::from_fn(|index| {
+            inputs.get(index).map_or(
+                TensorMetadata::new(DataType::Undefined, &[], false),
+                |input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()),
+            )
+        });
+        let plan = resize_metadata(
+            self.since_version,
+            self.coordinate_mode,
+            &metadata[..inputs.len()],
+            &[OutputMetadata::from_view(&outputs[0])],
+        )?;
+        let upload = plan.workspace.bind(workspace)?;
         let input = &inputs[0];
         let output = &mut outputs[0];
         if input.dtype != output.dtype || !input.is_contiguous() || !output.is_contiguous() {
@@ -339,23 +456,10 @@ impl Kernel for ResizeKernel {
             return Err(not_implemented("Resize rank greater than 16"));
         }
         let axes = normalize_axes(self.axes.as_deref(), rank)?;
-        let (scales_input, sizes_input) = if self.since_version == 10 {
-            (Some(&inputs[1]), None)
-        } else {
-            (
-                inputs
-                    .get(2)
-                    .filter(|value| !value.is_absent() && value.numel() != 0),
-                inputs
-                    .get(3)
-                    .filter(|value| !value.is_absent() && value.numel() != 0),
-            )
+        let (scales_input, sizes_input) = match plan.control {
+            ResizeControl::Scales(slot) => (Some(&inputs[slot]), None),
+            ResizeControl::Sizes(slot) => (None, Some(&inputs[slot])),
         };
-        if scales_input.is_some() == sizes_input.is_some() {
-            return Err(EpError::KernelFailed(
-                "cuda_ep Resize: exactly one non-empty scales or sizes input is required".into(),
-            ));
-        }
         let mut scales = vec![1.0_f64; rank];
         let mut expected = input.shape.to_vec();
         if let Some(scales_input) = scales_input {
@@ -372,7 +476,7 @@ impl Kernel for ResizeKernel {
                     ));
                 }
                 scales[axis] = f64::from(scale);
-                expected[axis] = (input.shape[axis] as f64 * scales[axis]).floor() as usize;
+                expected[axis] = scaled_extent(axis, input.shape[axis], scales[axis])?;
             }
         } else if let Some(sizes_input) = sizes_input {
             let values = device_i64(&self.runtime, sizes_input, "sizes")?;
@@ -400,14 +504,14 @@ impl Kernel for ResizeKernel {
                 output.shape
             )));
         }
+        checked_tensor_bytes("Resize", "output", output.dtype, output.shape)?;
         if output.numel() == 0 {
             return Ok(());
         }
-        let symmetric = matches!(self.coordinate_mode, CoordinateMode::HalfPixelSymmetric)
-            && scales_input.is_some();
+        let symmetric = plan.symmetric;
         if symmetric {
             // Sizes specify the exact extent, so only scales can truncate it.
-            // Append one offset per axis to the existing scale upload.
+            // Append one offset per axis to the combined descriptor payload.
             scales.reserve(rank);
             for axis in 0..rank {
                 let input_width = input.shape[axis] as f64;
@@ -415,8 +519,8 @@ impl Kernel for ResizeKernel {
                 scales.push(input_width * 0.5 * (1.0 - adjustment));
             }
         }
-        let input_strides = compute_contiguous_strides(input.shape);
-        let output_strides = compute_contiguous_strides(output.shape);
+        let input_strides = checked_metadata_strides("Resize", "input", input.shape)?;
+        let output_strides = checked_metadata_strides("Resize", "output", output.shape)?;
         let integer_metadata = input
             .shape
             .iter()
@@ -425,14 +529,13 @@ impl Kernel for ResizeKernel {
             .chain(input_strides.into_iter().map(|value| value as u64))
             .chain(output_strides.into_iter().map(|value| value as u64))
             .collect::<Vec<_>>();
-        let integer_bytes = integer_metadata
-            .iter()
-            .flat_map(|value| value.to_ne_bytes())
-            .collect::<Vec<_>>();
-        let scale_bytes = scales
-            .iter()
-            .flat_map(|value| value.to_ne_bytes())
-            .collect::<Vec<_>>();
+        let mut payload = Vec::with_capacity(plan.integer_bytes + scales.len() * 8);
+        for value in integer_metadata {
+            payload.extend_from_slice(&value.to_ne_bytes());
+        }
+        for value in scales {
+            payload.extend_from_slice(&value.to_ne_bytes());
+        }
         let entry = if symmetric {
             "resize_nd_symmetric"
         } else {
@@ -441,14 +544,8 @@ impl Kernel for ResizeKernel {
         let function = self
             .runtime
             .nvrtc_function("resize_common_v2", SOURCE, entry)?;
-        let integer_pointer = upload_bytes(&self.runtime, &integer_bytes)?;
-        let scale_pointer = match upload_bytes(&self.runtime, &scale_bytes) {
-            Ok(pointer) => pointer,
-            Err(error) => {
-                let _ = unsafe { self.runtime.free_raw(integer_pointer) };
-                return Err(error);
-            }
-        };
+        let integer_pointer = upload.upload_bytes(&self.runtime, &payload)?;
+        let scale_pointer = integer_pointer + plan.integer_bytes as u64;
         let input_pointer = cuptr(input.data_ptr::<u8>() as *const c_void);
         let output_pointer = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
         let output_elements = output.numel() as u64;
@@ -492,10 +589,7 @@ impl Kernel for ResizeKernel {
             })
         }
         .map_err(|error| driver_err("launch Resize", error));
-        let sync = launch.and_then(|_| self.runtime.synchronize());
-        let free_scales = unsafe { self.runtime.free_raw(scale_pointer) };
-        let free_integer = unsafe { self.runtime.free_raw(integer_pointer) };
-        sync.and(free_scales).and(free_integer)
+        launch.and_then(|_| self.runtime.synchronize())
     }
 }
 
@@ -520,10 +614,133 @@ fn normalize_axes(raw: Option<&[i64]>, rank: usize) -> Result<Vec<usize>> {
     Ok(axes)
 }
 
+impl Kernel for ResizeKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Ok(WorkspacePreparation::Ready(
+            resize_metadata(self.since_version, self.coordinate_mode, inputs, outputs)?
+                .workspace
+                .requirement(),
+        ))
+    }
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "Resize reads device scales/sizes and uploads borrowed metadata eagerly",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use onnx_runtime_ir::{NodeId, ValueId};
+
+    #[test]
+    fn selected_control_source_drives_one_exact_integer_double_composite() {
+        let mut inputs = [
+            TensorMetadata::new(DataType::Float32, &[2, 2], true),
+            TensorMetadata::new(DataType::Float32, &[0], true),
+            TensorMetadata::new(DataType::Float32, &[2], true),
+            TensorMetadata::new(DataType::Int64, &[0], true),
+        ];
+        let outputs = [OutputMetadata::Unresolved {
+            dtype: DataType::Float32,
+        }];
+        let scales =
+            resize_metadata(11, CoordinateMode::HalfPixelSymmetric, &inputs, &outputs).unwrap();
+        assert_eq!(scales.control, ResizeControl::Scales(2));
+        assert!(scales.symmetric);
+        assert_eq!(scales.integer_bytes, 64);
+        assert_eq!(scales.workspace.requirement().bytes, 96);
+        inputs[2].shape = &[0];
+        inputs[3].shape = &[2];
+        let sizes =
+            resize_metadata(11, CoordinateMode::HalfPixelSymmetric, &inputs, &outputs).unwrap();
+        assert_eq!(sizes.control, ResizeControl::Sizes(3));
+        assert!(!sizes.symmetric);
+        assert_eq!(sizes.workspace.requirement().bytes, 80);
+        inputs[2].shape = &[2];
+        assert!(select_control(11, &inputs).is_err());
+    }
+    #[test]
+    fn resize_zero_rank_preserves_versioned_control_rules_and_known_empty_output() {
+        let scalar = [
+            TensorMetadata::new(DataType::Float32, &[], true),
+            TensorMetadata::new(DataType::Float32, &[0], true),
+        ];
+        let plan = resize_metadata(
+            10,
+            CoordinateMode::Asymmetric,
+            &scalar,
+            &[OutputMetadata::tensor(DataType::Float32, &[])],
+        )
+        .unwrap();
+        assert_eq!(
+            plan.workspace.requirement(),
+            onnx_runtime_ep_api::WorkspaceRequirement::NONE
+        );
+        assert!(select_control(11, &scalar).is_err());
+        let rank17 = [1; 17];
+        let invalid = [
+            TensorMetadata::new(DataType::Float32, &rank17, true),
+            scalar[1],
+        ];
+        assert!(
+            resize_metadata(
+                10,
+                CoordinateMode::Asymmetric,
+                &invalid,
+                &[OutputMetadata::Unresolved {
+                    dtype: DataType::Float32
+                }]
+            )
+            .is_err()
+        );
+        let data = [
+            TensorMetadata::new(DataType::Float32, &[2, 2], true),
+            TensorMetadata::new(DataType::Float32, &[2], true),
+        ];
+        assert_eq!(
+            resize_metadata(
+                10,
+                CoordinateMode::Asymmetric,
+                &data,
+                &[OutputMetadata::tensor(DataType::Float32, &[0, 0])]
+            )
+            .unwrap()
+            .workspace
+            .requirement(),
+            onnx_runtime_ep_api::WorkspaceRequirement::NONE
+        );
+    }
+    #[test]
+    fn scaled_extents_reject_nonfinite_or_unaddressable_values_before_casting() {
+        assert_eq!(scaled_extent(0, 2, 1.6).unwrap(), 3);
+        assert_eq!(scaled_extent(0, 2, 0.1).unwrap(), 0);
+        for scale in [f64::NAN, f64::INFINITY, 0.0, -1.0, 1e300] {
+            assert!(
+                scaled_extent(3, 2, scale)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("axis 3")
+            );
+        }
+        assert!(scaled_extent(0, isize::MAX as usize, 2.0).is_err());
+    }
 
     fn resize_node(name: &str, attribute: Attribute) -> Node {
         let mut node = Node::new(
