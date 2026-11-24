@@ -1,14 +1,18 @@
-#![cfg(feature = "gpu-tests")]
 //! Real registry + exact caller admission + one-use control snapshots.
+#[cfg(feature = "gpu-tests")]
 mod common;
+#[cfg(feature = "gpu-tests")]
 use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, KernelMatch, OutputMetadata,
     TensorMetadata, TensorMut, TensorView, WorkspaceAllocation, WorkspacePlanning,
     WorkspaceRequirement, WorkspaceView,
 };
+#[cfg(feature = "gpu-tests")]
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
+#[cfg(feature = "gpu-tests")]
 use onnx_runtime_ir::{Attribute, DataType, compute_contiguous_strides, static_shape};
 
+#[cfg(feature = "gpu-tests")]
 fn prepare(
     ep: &CudaExecutionProvider,
     kernel: &dyn Kernel,
@@ -33,6 +37,8 @@ fn prepare(
     (request, view)
 }
 
+// The capture regression uses the gpu-tests-only raw capture teardown API.
+#[cfg(feature = "gpu-tests")]
 fn exercise(packed: bool) {
     let ep = common::require_cuda();
     let runtime = ep.runtime();
@@ -368,11 +374,18 @@ fn exercise(packed: bool) {
         ep.deallocate(buffer).unwrap();
     }
 }
+#[cfg(not(feature = "gpu-tests"))]
+fn exercise(_: bool) {
+    panic!("enable gpu-tests on a CUDA runner to exercise varlen caller workspace");
+}
+
 #[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA; enable gpu-tests")]
 fn padded_exact_workspace_snapshot_and_failure_recovery() {
     exercise(false);
 }
 #[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA; enable gpu-tests")]
 fn packed_exact_workspace_snapshot_and_failure_recovery() {
     exercise(true);
 }
