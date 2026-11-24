@@ -1380,7 +1380,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("LinearAttention", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(linear_attention::LinearAttentionFactory {
             runtime: runtime.clone(),
         }),
@@ -1388,7 +1388,7 @@ pub fn build_cuda_registry_with_metrics(
     reg.register_through(
         OpKey::new("LinearAttention", "", 27),
         28,
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(linear_attention::LinearAttentionFactory {
             runtime: runtime.clone(),
         }),

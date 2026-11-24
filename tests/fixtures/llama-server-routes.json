@@ -1,0 +1,301 @@
+{
+  "commit": "8d60873dfb8619f2b5ed31adfbab07cccb40db5c",
+  "source": "tools/server/server.cpp",
+  "registrations": [
+    {
+      "method": "GET",
+      "path": "/health",
+      "source_line": 174
+    },
+    {
+      "method": "GET",
+      "path": "/v1/health",
+      "source_line": 175
+    },
+    {
+      "method": "GET",
+      "path": "/metrics",
+      "source_line": 176
+    },
+    {
+      "method": "GET",
+      "path": "/props",
+      "source_line": 177
+    },
+    {
+      "method": "POST",
+      "path": "/props",
+      "source_line": 178
+    },
+    {
+      "method": "GET",
+      "path": "/models",
+      "source_line": 179
+    },
+    {
+      "method": "GET",
+      "path": "/v1/models",
+      "source_line": 180
+    },
+    {
+      "method": "POST",
+      "path": "/completion",
+      "source_line": 181
+    },
+    {
+      "method": "POST",
+      "path": "/completions",
+      "source_line": 182
+    },
+    {
+      "method": "POST",
+      "path": "/v1/completions",
+      "source_line": 183
+    },
+    {
+      "method": "POST",
+      "path": "/chat/completions",
+      "source_line": 184
+    },
+    {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "source_line": 185
+    },
+    {
+      "method": "POST",
+      "path": "/v1/chat/completions/control",
+      "source_line": 186
+    },
+    {
+      "method": "POST",
+      "path": "/v1/responses",
+      "source_line": 187
+    },
+    {
+      "method": "POST",
+      "path": "/responses",
+      "source_line": 188
+    },
+    {
+      "method": "POST",
+      "path": "/v1/audio/transcriptions",
+      "source_line": 189
+    },
+    {
+      "method": "POST",
+      "path": "/audio/transcriptions",
+      "source_line": 190
+    },
+    {
+      "method": "POST",
+      "path": "/tts",
+      "source_line": 191
+    },
+    {
+      "method": "POST",
+      "path": "/v1/audio/speech",
+      "source_line": 192
+    },
+    {
+      "method": "POST",
+      "path": "/audio/speech",
+      "source_line": 193
+    },
+    {
+      "method": "WS",
+      "path": "/v1/realtime",
+      "source_line": 194
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages",
+      "source_line": 195
+    },
+    {
+      "method": "POST",
+      "path": "/infill",
+      "source_line": 196
+    },
+    {
+      "method": "POST",
+      "path": "/embedding",
+      "source_line": 197
+    },
+    {
+      "method": "POST",
+      "path": "/embeddings",
+      "source_line": 198
+    },
+    {
+      "method": "POST",
+      "path": "/v1/embeddings",
+      "source_line": 199
+    },
+    {
+      "method": "POST",
+      "path": "/rerank",
+      "source_line": 200
+    },
+    {
+      "method": "POST",
+      "path": "/reranking",
+      "source_line": 201
+    },
+    {
+      "method": "POST",
+      "path": "/v1/rerank",
+      "source_line": 202
+    },
+    {
+      "method": "POST",
+      "path": "/v1/reranking",
+      "source_line": 203
+    },
+    {
+      "method": "POST",
+      "path": "/v1/systemone",
+      "source_line": 204
+    },
+    {
+      "method": "POST",
+      "path": "/tokenize",
+      "source_line": 205
+    },
+    {
+      "method": "POST",
+      "path": "/detokenize",
+      "source_line": 206
+    },
+    {
+      "method": "POST",
+      "path": "/apply-template",
+      "source_line": 207
+    },
+    {
+      "method": "POST",
+      "path": "/chat/completions/input_tokens",
+      "source_line": 209
+    },
+    {
+      "method": "POST",
+      "path": "/v1/chat/completions/input_tokens",
+      "source_line": 210
+    },
+    {
+      "method": "POST",
+      "path": "/responses/input_tokens",
+      "source_line": 211
+    },
+    {
+      "method": "POST",
+      "path": "/v1/responses/input_tokens",
+      "source_line": 212
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages/count_tokens",
+      "source_line": 213
+    },
+    {
+      "method": "GET",
+      "path": "/lora-adapters",
+      "source_line": 215
+    },
+    {
+      "method": "POST",
+      "path": "/lora-adapters",
+      "source_line": 216
+    },
+    {
+      "method": "GET",
+      "path": "/slots",
+      "source_line": 218
+    },
+    {
+      "method": "POST",
+      "path": "/slots/:id_slot",
+      "source_line": 219
+    },
+    {
+      "method": "GET",
+      "path": "/v1/stream",
+      "source_line": 232
+    },
+    {
+      "method": "POST",
+      "path": "/v1/streams/lookup",
+      "source_line": 233
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/stream",
+      "source_line": 234
+    },
+    {
+      "method": "GET",
+      "path": "/cors-proxy",
+      "source_line": 284
+    },
+    {
+      "method": "POST",
+      "path": "/cors-proxy",
+      "source_line": 285
+    },
+    {
+      "method": "GET",
+      "path": "/cors-proxy",
+      "source_line": 290
+    },
+    {
+      "method": "POST",
+      "path": "/cors-proxy",
+      "source_line": 291
+    },
+    {
+      "method": "GET",
+      "path": "/tools",
+      "source_line": 308
+    },
+    {
+      "method": "POST",
+      "path": "/tools",
+      "source_line": 309
+    },
+    {
+      "method": "GET",
+      "path": "/tools",
+      "source_line": 320
+    },
+    {
+      "method": "POST",
+      "path": "/tools",
+      "source_line": 321
+    },
+    {
+      "method": "POST",
+      "path": "/models",
+      "source_line": 557
+    },
+    {
+      "method": "POST",
+      "path": "/models/load",
+      "source_line": 558
+    },
+    {
+      "method": "POST",
+      "path": "/models/unload",
+      "source_line": 559
+    },
+    {
+      "method": "GET",
+      "path": "/models/sse",
+      "source_line": 560
+    },
+    {
+      "method": "DELETE",
+      "path": "/models",
+      "source_line": 561
+    }
+  ]
+}

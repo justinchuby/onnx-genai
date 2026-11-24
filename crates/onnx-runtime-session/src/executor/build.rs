@@ -326,6 +326,17 @@ pub(super) fn hetero_placement_env_enabled() -> bool {
     }
 }
 
+fn needs_cuda_host_strings(graph: &Graph, ep: &dyn ExecutionProvider) -> bool {
+    ep.device_type() == DeviceType::Cuda
+        && (graph
+            .nodes
+            .iter()
+            .any(|(_, node)| super::host_strings::uses_managed_strings(graph, node))
+            || super::host_strings::producerless_string_outputs(graph)
+                .next()
+                .is_some())
+}
+
 /// Reject operators no execution provider can run, before EP optimizer passes
 /// run. An optimizer pass's postcondition validation walks the whole graph and
 /// would otherwise surface a less actionable structural error (e.g. an
@@ -338,16 +349,41 @@ pub(super) fn hetero_placement_env_enabled() -> bool {
 /// declared input shapes are pre-validated: a symbolic/data-dependent shape is
 /// resolved and validated at run time, so pre-checking a contrib op whose
 /// support is shape-conditional would change behavior for valid graphs.
-pub(super) fn reject_unsupported_operators(
+/// An explicit ordered probe also checks symbolic shapes and unclaimed
+/// control-flow bodies, since declining after execution starts is too late.
+fn reject_unsupported_operators(
     graph: &Graph,
     ep: &dyn ExecutionProvider,
-    probe_symbolic: bool,
+    ordered_probe: bool,
 ) -> Result<()> {
     if ep.device_type() == DeviceType::Cuda {
         return Ok(());
     }
+    check_operator_coverage(graph, graph, ep, ordered_probe, "graph")
+}
+
+fn check_operator_coverage(
+    graph: &Graph,
+    opset_graph: &Graph,
+    ep: &dyn ExecutionProvider,
+    ordered_probe: bool,
+    scope: &str,
+) -> Result<()> {
     let graph_claims = onnx_runtime_ep_api::GraphKernelClaims::query(ep, graph)?;
     for (node_id, node) in graph.nodes.iter() {
+        if ordered_probe
+            && !ep.device_id().is_host_accessible()
+            && super::host_strings::uses_managed_strings(graph, node)
+        {
+            return Err(SessionError::OrderedProviderDeclined {
+                reason: format!(
+                    "provider '{}' declined {}: {}",
+                    ep.name(),
+                    format_node_identity(scope, node_id, node),
+                    super::host_strings::MANAGED_STRING_DEVICE_DECLINE
+                ),
+            });
+        }
         if graph_claims.contains(node_id)
             || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
@@ -367,7 +403,7 @@ pub(super) fn reject_unsupported_operators(
             .collect::<Vec<_>>();
         // Defer nodes with any non-static declared input shape to the run-time
         // kernel gate, which sees concrete shapes.
-        if !probe_symbolic && !shapes.iter().all(|shape| as_static_shape(shape).is_some()) {
+        if !ordered_probe && !shapes.iter().all(|shape| as_static_shape(shape).is_some()) {
             continue;
         }
         let input_dtypes = node
@@ -380,17 +416,46 @@ pub(super) fn reject_unsupported_operators(
             })
             .collect::<Vec<_>>();
         let layouts = vec![TensorLayout::contiguous(); shapes.len()];
-        let opset = effective_opset(graph, node);
+        let opset = effective_opset(opset_graph, node);
         if let KernelMatch::Unsupported { reason } =
             ep.supports_op(node, opset, &shapes, &input_dtypes, &layouts)
         {
-            return Err(SessionError::unsupported_op(
-                node,
-                node_id,
-                opset,
-                ep.name(),
-                reason,
-            ));
+            let error = SessionError::unsupported_op(node, node_id, opset, ep.name(), reason);
+            return Err(if ordered_probe {
+                SessionError::OrderedProviderDeclined {
+                    reason: format!("{scope}: {error}"),
+                }
+            } else {
+                error
+            });
+        }
+    }
+    if ordered_probe {
+        if !ep.device_id().is_host_accessible()
+            && let Some(id) = super::host_strings::producerless_string_outputs(graph).next()
+        {
+            return Err(SessionError::OrderedProviderDeclined {
+                reason: format!(
+                    "provider '{}' declined {scope} output '{}' (value#{}): {}",
+                    ep.name(),
+                    graph.value(id).name.as_deref().unwrap_or("<unnamed>"),
+                    id.0,
+                    super::host_strings::MANAGED_STRING_DEVICE_DECLINE
+                ),
+            });
+        }
+        // A graph-backed claim owns its entire region; its child graphs do
+        // not dispatch through this provider's per-op kernels.
+        for ((node_id, attribute), subgraph) in &graph.subgraphs {
+            if !graph_claims.contains(*node_id) {
+                check_operator_coverage(
+                    subgraph,
+                    opset_graph,
+                    ep,
+                    true,
+                    &format!("{scope}/node#{}/{attribute}", node_id.0),
+                )?;
+            }
         }
     }
     Ok(())
@@ -416,19 +481,6 @@ pub(super) fn cuda_fallback_report(
         &mut issues,
         ordered_probe,
     )?;
-    for value_id in super::host_strings::producerless_string_outputs(graph) {
-        let value = graph.value(value_id);
-        issues.push(ExecutionProviderDecline {
-            node: format!(
-                "graph output '{}' (value#{})",
-                value.name.as_deref().unwrap_or("<unnamed>"),
-                value_id.0
-            ),
-            domain: "ai.onnx".into(),
-            op_type: "<graph output>".into(),
-            reason: super::host_strings::MANAGED_STRING_DEVICE_DECLINE.into(),
-        });
-    }
     if issues.is_empty() {
         return Ok(None);
     }
@@ -604,6 +656,19 @@ pub(super) fn collect_cuda_coverage_issues(
             issues,
             ordered_probe,
         )?;
+    }
+    for value_id in super::host_strings::producerless_string_outputs(graph) {
+        let value = graph.value(value_id);
+        issues.push(ExecutionProviderDecline {
+            node: format!(
+                "{scope} output '{}' (value#{})",
+                value.name.as_deref().unwrap_or("<unnamed>"),
+                value_id.0
+            ),
+            domain: "ai.onnx".into(),
+            op_type: "<graph output>".into(),
+            reason: super::host_strings::MANAGED_STRING_DEVICE_DECLINE.into(),
+        });
     }
     Ok(())
 }
@@ -976,7 +1041,7 @@ impl Executor {
     }
 
     pub(crate) fn build_ordered_with_mode(
-        graph: Graph,
+        mut graph: Graph,
         weights: Arc<WeightStore>,
         providers: crate::ExecutionProviderOrder,
         require_cuda: bool,
@@ -1007,32 +1072,18 @@ impl Executor {
                 fallback_ep,
             );
         }
+        // Compiled EPContext artifacts are restored specifically on the primary
+        // and cannot enter the ordered or heterogeneous placement paths.
+        if onnx_runtime_loader::ep_context_nodes(&graph)
+            .next()
+            .is_some()
+        {
+            return Self::build_with_mode(graph, weights, primary, false, false, fallback_ep);
+        }
         if let Some(fallback) = &fallback_ep {
             validate_cpu_fallback(fallback.as_ref())?;
         }
-        // Keep the existing managed-string path (including producerless outputs).
-        if graph
-            .values
-            .iter()
-            .any(|(_, v)| v.tensor_dtype() == Some(DataType::String))
-        {
-            return Self::build_with_mode(
-                graph,
-                weights,
-                primary,
-                false,
-                hetero_enabled,
-                fallback_ep,
-            );
-        }
-        match crate::hetero::validate_top_level_tensor_graph(&graph) {
-            Ok(()) => {}
-            Err(SessionError::HeterogeneousExecutionUnsupported { .. }) => {
-                return Self::build_with_mode(graph, weights, primary, false, false, fallback_ep);
-            }
-            Err(error) => return Err(error),
-        }
-        graph.topological_order()?;
+        prepare_execution(&mut graph)?;
         let mut primary_decline = None;
         for (index, ep) in std::iter::once(&primary).chain(&additional).enumerate() {
             match Self::build_single(
@@ -1056,7 +1107,24 @@ impl Executor {
             }
         }
 
-        if hetero_enabled {
+        // Whole-graph coverage and partition eligibility are independent.
+        // Keep managed strings on the existing primary/host placement path.
+        let split_eligible = match crate::hetero::validate_top_level_tensor_graph(&graph) {
+            Ok(()) => true,
+            Err(SessionError::HeterogeneousExecutionUnsupported { .. }) => false,
+            Err(error) => return Err(error),
+        };
+        if split_eligible && needs_cuda_host_strings(&graph, primary.as_ref()) {
+            return Self::build_with_mode(
+                graph,
+                weights,
+                primary,
+                false,
+                hetero_enabled,
+                fallback_ep,
+            );
+        }
+        if split_eligible && hetero_enabled {
             let cpu = resolve_cpu_fallback(fallback_ep.as_ref())?;
             let slots = std::iter::once(Arc::clone(&primary))
                 .chain(additional)
@@ -1089,7 +1157,19 @@ impl Executor {
 
         if primary.device_type() == DeviceType::Cuda {
             // Preserve the legacy CUDA placement report on whole-session fallback.
-            Self::build_with_mode(graph, weights, primary, false, false, fallback_ep)
+            // Going directly to the single executor also avoids the automatic
+            // host-string split for graphs known to be outside the split subset.
+            Self::build_single(
+                graph,
+                weights,
+                primary,
+                BuildPlacement {
+                    require_cuda: false,
+                    hetero_enabled: false,
+                    ordered_probe: false,
+                },
+                fallback_ep,
+            )
         } else if let Some(cpu) = fallback_ep {
             Self::build_with_mode(graph, weights, cpu, false, false, None)
         } else {
@@ -1139,14 +1219,7 @@ impl Executor {
             validate_cpu_fallback(fallback.as_ref())?;
         }
         prepare_execution(&mut graph)?;
-        let needs_host_strings = ep.device_type() == DeviceType::Cuda
-            && (graph
-                .nodes
-                .iter()
-                .any(|(_, node)| super::host_strings::uses_managed_strings(&graph, node))
-                || super::host_strings::producerless_string_outputs(&graph)
-                    .next()
-                    .is_some());
+        let needs_host_strings = needs_cuda_host_strings(&graph, ep.as_ref());
         if (hetero_enabled || needs_host_strings)
             && !require_cuda
             && ep.device_type() != DeviceType::Cpu
@@ -1659,17 +1732,7 @@ impl Executor {
         // unsupported-operator error) with a structural error. Mirrors the
         // control-flow signature check above.
         graph.topological_order()?;
-        if let Err(error) = reject_unsupported_operators(graph, ep.as_ref(), ordered_probe) {
-            return Err(
-                if ordered_probe && matches!(error, SessionError::UnsupportedOp { .. }) {
-                    SessionError::OrderedProviderDeclined {
-                        reason: error.to_string(),
-                    }
-                } else {
-                    error
-                },
-            );
-        }
+        reject_unsupported_operators(graph, ep.as_ref(), ordered_probe)?;
         let graph_before_ep_passes = graph.clone();
         let ep_pass_nodes_before = graph.num_nodes();
         run_ep_scoped_passes(graph, weights, ep.as_ref())?;

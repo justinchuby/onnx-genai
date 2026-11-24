@@ -47,9 +47,9 @@ pub(crate) async fn props(
     if query.model.is_empty() && state.registry.is_router().map_err(map_registry_error)? {
         return Ok(Json(json!({
             "role": "router", "ui": true, "ui_settings": {},
-            "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": true, "resumable_streams": true},
+            "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": true, "resumable_streams": true, "server_tools": state.tools.is_some()},
             "cors_proxy_enabled": state.config.mcp_proxy_policy.is_enabled(), "endpoint_slots": true,
-            "endpoint_props": false, "endpoint_metrics": cfg!(feature = "metrics"),
+            "endpoint_props": state.config.endpoint_props, "endpoint_metrics": cfg!(feature = "metrics"),
             "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION"))
         })));
     }
@@ -90,7 +90,7 @@ pub(crate) async fn props(
         },
         "chat_template": handle.chat_template.as_ref().map_or("", |t| t.source()),
         "chat_template_caps": {},
-        "endpoint_slots": handle.engine.native_slot.is_some(), "endpoint_props": false,
+        "endpoint_slots": handle.engine.native_slot.is_some(), "endpoint_props": state.config.endpoint_props,
         "endpoint_metrics": cfg!(feature = "metrics"),
         "ui": true, "ui_settings": {}, "is_sleeping": false,
         "cors_proxy_enabled": state.config.mcp_proxy_policy.is_enabled(),
@@ -269,6 +269,20 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
         .validate_continuation()
         .map_err(|error| ApiError::invalid_request(format!("{error:#}")))?;
     Ok(())
+}
+
+/// Upstream currently acknowledges this request without reading a mutation schema.
+/// Keep it independent of model resolution and do not pretend to change defaults.
+pub(crate) async fn post_props(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    if !state.config.endpoint_props {
+        return Err(ApiError {
+            status: StatusCode::NOT_IMPLEMENTED,
+            kind: "not_supported_error",
+            message: "POST /props is disabled; start nxrt serve with --props to enable the upstream acknowledgement (no properties are changed)".into(),
+            retry_after_secs: None,
+        });
+    }
+    Ok(Json(json!({"success": true})))
 }
 
 pub(crate) async fn disabled_feature() -> Response {

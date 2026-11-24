@@ -320,21 +320,19 @@ impl Kernel for RangeKernel {
 #[cfg(test)]
 mod claim_probes {
     use std::ffi::c_void;
-    use std::sync::Arc;
 
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, Kernel, TensorMut, TensorView};
     use onnx_runtime_ir::{DataType, DeviceId};
 
     use super::RangeKernel;
-    use crate::runtime::CudaRuntime;
 
-    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn maybe_runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     #[test]
     fn i32_range_matches_reference_on_gpu() {
-        let Some(runtime) = maybe_runtime() else {
+        let Some((_provider, runtime)) = maybe_runtime() else {
             eprintln!("skipping i32 Range GPU probe: CUDA runtime unavailable");
             return;
         };

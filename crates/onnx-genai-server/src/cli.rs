@@ -82,6 +82,10 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     pub replay_buffer_bytes: usize,
 
+    /// Enable the upstream POST /props acknowledgement (no properties are changed).
+    #[arg(long, env = "NXRT_PROPS")]
+    pub props: bool,
+
     /// Enable host filesystem/command tools for trusted clients: all or a comma-separated list.
     #[arg(long, value_delimiter = ',', env = "NXRT_TOOLS")]
     pub tools: Vec<crate::BuiltinTool>,
@@ -220,6 +224,7 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
     ServerConfig {
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
+        endpoint_props: args.props,
         tools: crate::ToolsConfig {
             enabled: args.tools.clone(),
             max_concurrent: args.tools_max_concurrent,
@@ -354,6 +359,14 @@ mod tests {
         ] {
             assert!(TestCli::try_parse_from(["test", "model-dir", flag, "0"]).is_err());
         }
+    }
+
+    #[test]
+    fn props_acknowledgement_requires_explicit_enable() {
+        let disabled = TestCli::parse_from(["test", "model-dir"]);
+        assert!(!server_config_from_args(&disabled.serve).endpoint_props);
+        let enabled = TestCli::parse_from(["test", "model-dir", "--props"]);
+        assert!(server_config_from_args(&enabled.serve).endpoint_props);
     }
 
     #[test]

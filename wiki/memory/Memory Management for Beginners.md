@@ -312,19 +312,18 @@ device 内存机制只有 VMM arena**。原先那个 eager 的 `cuMemAlloc` allo
 自己实现一个再注入：
 
 ```rust
-let provider = CudaExecutionProvider::new(0)?
-    .with_memory(Arc::new(MyEagerAllocator::new(context)));
+let provider = CudaExecutionProvider::from_config(
+    0,
+    CudaProviderConfig {
+        memory: Some(Arc::new(MyEagerAllocator::new(context))),
+        ..Default::default()
+    },
+)?;
 ```
 
-注入是**权威的**：成功之后内建 arena 会被退役，之后所有 device 内存都来自注入的
-allocator。这里有两条规则：
-
-1. allocator 必须服务同一个 device，否则调用直接被拒绝 —— 一个 host 指针在
-   kernel 里解引用之前不会有任何征兆。
-2. 如果当前机制已经发出过内存，注入会被拒绝。已经发出的指针必须由发出它的机制
-   回收，中途换掉会让它变成孤儿。
-
-被拒绝时会返回 `Err`，不会出现“调用成功但被忽略”的情况。
+注入是**权威的**：构造只注册选中的 allocator，不会先创建再退役一个内建 arena。
+allocator 必须服务同一个 device；不匹配会在加载 CUDA 之前返回包含设备信息的
+`Err`。构造成功后不能再更换 allocator，已发出的指针始终由原机制回收。
 
 ## 内建 VMM arena 的既定约束
 
@@ -345,12 +344,12 @@ allocator。这里有两条规则：
 例如 device、pinned host、unified memory、workspace arena、weight backing
 和 KV backing。单数 getter 无法说明调用方拿到的是哪一种。
 
-### 有效 allocator 可能切换
+### allocator 身份必须与 allocation 一致
 
-CUDA EP 默认使用内建的 VMM arena，但调用方可以通过
-`CudaExecutionProvider::with_memory` 注入自己的 allocator，此时内建 arena 会被
-**替换**（见下一节）。外部缓存旧 allocator，再用它释放新 allocator 创建的
-pointer，会造成 cross-allocator free。
+CUDA EP 默认使用内建的 VMM arena，调用方也可以在构造时通过
+`CudaProviderConfig::memory` 选定自己的 allocator。构造成功后机制身份不再变化。
+即便多个 provider 使用同一个 device，也不能缓存其中一个 allocator 再用它释放
+另一个 provider 创建的 pointer；每次释放必须保留原 allocation 的绑定身份。
 
 ### 裸 allocator 容易绕过 Governor
 
@@ -490,7 +489,7 @@ onnx-runtime-memory-api
 每个阶段应是可独立验证、可独立回滚的 PR。不要把整套迁移压进
 [issue #513](https://github.com/justinchuby/onnx-genai/issues/513)；该 issue
 的核心目标——无需重写整个 EP 即可注入 allocator——已经通过
-`with_memory(...)` 实现。
+构造输入 `CudaProviderConfig::memory` 实现。
 
 ## 设计不变量
 

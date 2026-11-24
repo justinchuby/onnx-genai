@@ -368,6 +368,51 @@ fn configs() -> Vec<Config> {
             beta_shared: false,
             with_past: true,
         },
+        Config {
+            label: "gated_delta/caller-state-dk257",
+            batch: 1,
+            seq: 2,
+            d_k: 257,
+            d_v: 7,
+            q_num_heads: 2,
+            kv_num_heads: 2,
+            n_k_heads: 2,
+            update_rule: "gated_delta",
+            scale: 0.1,
+            decay_per_key_dim: false,
+            beta_shared: false,
+            with_past: true,
+        },
+        Config {
+            label: "linear/caller-state-no-past-dk321",
+            batch: 1,
+            seq: 1,
+            d_k: 321,
+            d_v: 5,
+            q_num_heads: 2,
+            kv_num_heads: 2,
+            n_k_heads: 2,
+            update_rule: "linear",
+            scale: 0.1,
+            decay_per_key_dim: false,
+            beta_shared: false,
+            with_past: false,
+        },
+        Config {
+            label: "linear/zero-sequence-caller-state",
+            batch: 1,
+            seq: 0,
+            d_k: 257,
+            d_v: 3,
+            q_num_heads: 2,
+            kv_num_heads: 2,
+            n_k_heads: 2,
+            update_rule: "linear",
+            scale: 0.1,
+            decay_per_key_dim: false,
+            beta_shared: false,
+            with_past: true,
+        },
     ]
 }
 
@@ -896,13 +941,19 @@ fn linear_attention_state_carry_matches_chained() {
 )]
 #[test]
 fn linear_attention_capture_replay_preserves_in_place_recurrent_state() {
+    for d_k in [5, 257] {
+        capture_recurrent_state_with_workspace(d_k);
+    }
+}
+
+fn capture_recurrent_state_with_workspace(d_k: usize) {
     let ep = require_cuda();
     let runtime = ep.runtime();
     let cfg = Config {
         label: "capture-in-place-state",
         batch: 1,
         seq: 1,
-        d_k: 5,
+        d_k,
         d_v: 4,
         q_num_heads: 2,
         kv_num_heads: 2,
@@ -1032,12 +1083,24 @@ fn linear_attention_capture_replay_preserves_in_place_recurrent_state() {
         runtime.htod(bytes, cuptr(buffer.as_ptr())).unwrap();
     };
 
-    kernel
-        .execute(&captured_views, &mut captured_outputs)
-        .unwrap();
-    eager_kernel
-        .execute(&eager_views, &mut eager_outputs)
-        .unwrap();
+    let mut captured_workspace = None;
+    let mut eager_workspace = None;
+    common::execute_kernel(
+        &ep,
+        kernel.as_ref(),
+        &captured_views,
+        &mut captured_outputs,
+        &mut captured_workspace,
+    )
+    .unwrap();
+    common::execute_kernel(
+        &ep,
+        eager_kernel.as_ref(),
+        &eager_views,
+        &mut eager_outputs,
+        &mut eager_workspace,
+    )
+    .unwrap();
     assert_eq!(
         read(&captured_inputs[3], state_bytes),
         read(&eager_inputs[3], state_bytes),
@@ -1046,9 +1109,24 @@ fn linear_attention_capture_replay_preserves_in_place_recurrent_state() {
 
     let allocation_counts = runtime.allocation_counts();
     let kernels = [kernel.as_ref()];
-    runtime.begin_graph_capture(&kernels).unwrap();
+    let resources = captured_workspace
+        .as_ref()
+        .map(|owner| {
+            owner
+                .device_graph_resource()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let workspace = captured_workspace.as_mut().map(|owner| {
+        onnx_runtime_ep_api::WorkspaceView::new(DevicePtrMut(owner.as_mut_ptr()), owner.len())
+    });
+    runtime
+        .begin_graph_capture_with_resources(&kernels, resources)
+        .unwrap();
     kernel
-        .execute(&captured_views, &mut captured_outputs)
+        .execute_with_workspace(&captured_views, &mut captured_outputs, workspace)
         .unwrap();
     runtime.end_graph_capture().unwrap();
 
@@ -1063,9 +1141,14 @@ fn linear_attention_capture_replay_preserves_in_place_recurrent_state() {
             overwrite(&captured_inputs[index], &replacement.bytes);
             overwrite(&eager_inputs[index], &replacement.bytes);
         }
-        eager_kernel
-            .execute(&eager_views, &mut eager_outputs)
-            .unwrap();
+        common::execute_kernel(
+            &ep,
+            eager_kernel.as_ref(),
+            &eager_views,
+            &mut eager_outputs,
+            &mut eager_workspace,
+        )
+        .unwrap();
         runtime.replay_graph().unwrap();
         assert_eq!(
             read(&captured_output, output_bytes),
@@ -1083,6 +1166,9 @@ fn linear_attention_capture_replay_preserves_in_place_recurrent_state() {
     assert!(runtime.reset_graph().unwrap());
     drop(captured_outputs);
     drop(eager_outputs);
+    for workspace in [captured_workspace, eager_workspace].into_iter().flatten() {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
     for buffer in captured_inputs {
         ep.deallocate(buffer).unwrap();
     }
