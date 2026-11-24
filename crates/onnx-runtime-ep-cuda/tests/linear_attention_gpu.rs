@@ -606,6 +606,49 @@ fn opset27_recurrent_and_range_release_ab() {
                 "{device} {op} {label}: legacy {:?} us; v27 {:?} us (sorted; synchronized execute incl. host dispatch)",
                 samples[0], samples[1]
             );
+            if is_cuda && op != "Range" {
+                use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+                use onnx_runtime_ep_api::DeviceGraphSlot;
+
+                const NODES: usize = 256;
+                const REPLAYS: usize = 4;
+                let runtime = cuda.runtime();
+                let slots = [DeviceGraphSlot::Primary, DeviceGraphSlot::Verify];
+                for (slot, kernel) in slots.into_iter().zip(&kernels) {
+                    runtime
+                        .begin_graph_capture_in(slot, &[kernel.as_ref()])
+                        .unwrap();
+                    for _ in 0..NODES {
+                        kernel.execute(&input_views, &mut output_views).unwrap();
+                    }
+                    runtime.end_graph_capture_in(slot).unwrap();
+                    runtime.replay_graph_in(slot).unwrap();
+                }
+                synchronize();
+                let stream = runtime.stream();
+                let start = stream.context().new_event(Some(CU_EVENT_DEFAULT)).unwrap();
+                let end = stream.context().new_event(Some(CU_EVENT_DEFAULT)).unwrap();
+                let time = |slot| {
+                    start.record(stream).unwrap();
+                    for _ in 0..REPLAYS {
+                        runtime.replay_graph_in(slot).unwrap();
+                    }
+                    end.record(stream).unwrap();
+                    f64::from(start.elapsed_ms(&end).unwrap()) * 1_000.0 / (NODES * REPLAYS) as f64
+                };
+                // Bracket each B sample by replays of the same A graph to expose drift.
+                for _ in 0..12 {
+                    let before = time(slots[0]);
+                    let current = time(slots[1]);
+                    let after = time(slots[0]);
+                    println!(
+                        "CUDA graph {op} {label}: legacy {before:.3} / {after:.3} us; v27 {current:.3} us"
+                    );
+                }
+                for slot in slots {
+                    assert!(runtime.reset_graph_in(slot).unwrap());
+                }
+            }
         };
         for (seq, label, iterations) in [(1, "decode", 1024), (64, "prefill", 128)] {
             let cfg = Config {
