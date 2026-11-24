@@ -887,7 +887,6 @@ pub struct CudaRuntime {
     owned_graphs: ArcSwap<HashMap<(DeviceGraphOwner, DeviceGraphSlot), Arc<CudaGraphLifecycle>>>,
     owned_graphs_write: Mutex<()>,
     registered_capture_active: AtomicBool,
-    unregistered_capture_active: AtomicBool,
     active_capture_resources: ArcSwapOption<Vec<DeviceGraphResource>>,
     blas: CublasLt,
     cudnn: CudnnBackend,
@@ -1226,7 +1225,6 @@ impl CudaRuntime {
             owned_graphs: ArcSwap::from_pointee(HashMap::new()),
             owned_graphs_write: Mutex::new(()),
             registered_capture_active: AtomicBool::new(false),
-            unregistered_capture_active: AtomicBool::new(false),
             active_capture_resources: ArcSwapOption::empty(),
             blas,
             cudnn,
@@ -2360,10 +2358,7 @@ impl CudaRuntime {
             .begin_capture(
                 cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
             )
-            .map_err(|error| driver_err("begin unregistered CUDA graph capture", error))?;
-        self.unregistered_capture_active
-            .store(true, Ordering::Release);
-        Ok(())
+            .map_err(|error| driver_err("begin unregistered CUDA graph capture", error))
     }
 
     /// End and destroy the raw test capture started above.
@@ -2377,17 +2372,14 @@ impl CudaRuntime {
             cudarc::driver::result::stream::end_capture(self.stream.cu_stream())
                 .map_err(|error| driver_err("end unregistered CUDA graph capture", error))?
         };
-        let result = if !graph.is_null() {
+        if !graph.is_null() {
             // SAFETY: no executable was instantiated; this helper exclusively
             // owns the fresh raw graph handle.
             unsafe { cudarc::driver::result::graph::destroy(graph) }
                 .map_err(|error| driver_err("destroy unregistered CUDA graph", error))
         } else {
             Ok(())
-        };
-        self.unregistered_capture_active
-            .store(false, Ordering::Release);
-        result
+        }
     }
 
     /// Snapshot explicit device allocation/free calls made through this runtime.
@@ -2982,25 +2974,6 @@ impl CudaRuntime {
     pub fn is_capturing(&self) -> Result<bool> {
         Ok(self.graph_capture_status()?
             != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
-    }
-
-    pub(crate) fn capture_active(&self) -> bool {
-        self.registered_capture_active.load(Ordering::Acquire)
-            || self.unregistered_capture_active.load(Ordering::Acquire)
-    }
-
-    /// Fast check for launch paths using the runtime's tracked capture modes.
-    /// A caller that already confirmed capture with the driver must use
-    /// `require_captured_address_owner`, including captures started externally.
-    pub(crate) fn require_registered_address_capture(
-        &self,
-        identity: usize,
-        label: &str,
-    ) -> Result<()> {
-        if self.capture_active() {
-            self.require_captured_address_owner(identity, label)?;
-        }
-        Ok(())
     }
 
     /// Require the real owner on a path already confirmed to be capturing.

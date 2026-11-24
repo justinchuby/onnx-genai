@@ -1766,7 +1766,7 @@ impl QMoERouteTelemetry {
             Some(armed) if armed.matches_experts(experts) => {
                 if self.runtime.is_capturing()? {
                     for resource in armed.device_graph_resources() {
-                        self.runtime.require_registered_address_capture(
+                        self.runtime.require_captured_address_owner(
                             resource.identity(),
                             "QMoE route telemetry allocation",
                         )?;

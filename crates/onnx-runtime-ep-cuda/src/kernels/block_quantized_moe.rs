@@ -38,7 +38,7 @@ use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
     DeviceGraphResource, EpError, ExecutionProvider, Kernel, KernelConstantInput, KernelFactory,
     Result, SealedDeviceAllocation, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    WorkspaceLayout, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::kernels::moe::{
     Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
@@ -1039,7 +1039,7 @@ struct PreparedMoeGeometry {
     fc1_out: usize,
     routes: usize,
     has_fc3: bool,
-    layout: QmoeWorkspaceLayout,
+    layout: WorkspaceLayout<6>,
 }
 
 impl PreparedMoeGeometry {
@@ -1921,20 +1921,6 @@ impl BlockQuantizedMoEKernel {
 
 const WORKSPACE_ALIGNMENT: usize = 256;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct QmoeWorkspaceLayout {
-    offsets: [usize; 6],
-    bytes: usize,
-}
-
-fn align_up(value: usize, alignment: usize) -> Result<usize> {
-    let mask = alignment - 1;
-    value
-        .checked_add(mask)
-        .map(|value| value & !mask)
-        .ok_or_else(|| error("BlockQuantizedMoE workspace alignment overflow"))
-}
-
 fn qmoe_workspace_layout(
     input_shape: &[usize],
     router_shape: &[usize],
@@ -1942,7 +1928,7 @@ fn qmoe_workspace_layout(
     top_k: usize,
     swiglu_fusion: usize,
     has_fc3: bool,
-) -> Result<QmoeWorkspaceLayout> {
+) -> Result<WorkspaceLayout<6>> {
     record_workspace_layout_build();
     if !matches!(input_shape.len(), 2 | 3) {
         return Err(error(format!(
@@ -1979,10 +1965,7 @@ fn qmoe_workspace_layout(
         )));
     }
     if rows == 0 || hidden == 0 {
-        return Ok(QmoeWorkspaceLayout {
-            offsets: [0; 6],
-            bytes: 0,
-        });
+        return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 6]);
     }
     let fc1_out = fc1_shape[1];
     let inter = if swiglu_fusion == 0 {
@@ -2027,22 +2010,16 @@ fn qmoe_workspace_layout(
             "route output scratch",
         )?,
     ];
-    let mut offsets = [0; 6];
-    let mut cursor = 0usize;
+    let mut regions = [std::alloc::Layout::new::<()>(); 6];
     for (index, size) in sizes.into_iter().enumerate() {
-        if size == 0 {
-            offsets[index] = 0;
-            continue;
+        if size != 0 {
+            regions[index] = std::alloc::Layout::from_size_align(size, WORKSPACE_ALIGNMENT)
+                .map_err(|_| error(format!("BlockQuantizedMoE workspace region {index} needs {size} bytes aligned to {WORKSPACE_ALIGNMENT}, exceeding addressable capacity; reduce rows, top_k or projection dimensions")))?;
         }
-        cursor = align_up(cursor, WORKSPACE_ALIGNMENT)?;
-        offsets[index] = cursor;
-        cursor = cursor
-            .checked_add(size)
-            .ok_or_else(|| error("BlockQuantizedMoE workspace byte count overflow"))?;
     }
-    Ok(QmoeWorkspaceLayout {
-        offsets,
-        bytes: cursor,
+    WorkspaceLayout::new(regions).map_err(|source| EpError::Backend {
+        operation: "plan BlockQuantizedMoE composite workspace",
+        source: Box::new(source),
     })
 }
 
@@ -2299,7 +2276,7 @@ impl Kernel for BlockQuantizedMoEKernel {
         }
         Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
             WorkspaceRequirement {
-                bytes: u64::try_from(self.geometry.layout.bytes)
+                bytes: u64::try_from(self.geometry.layout.bytes())
                     .map_err(|_| error("BlockQuantizedMoE workspace does not fit u64"))?,
                 alignment: WORKSPACE_ALIGNMENT,
                 lifetime: WorkspaceLifetime::SessionPersistent,
@@ -2403,45 +2380,52 @@ impl Kernel for BlockQuantizedMoEKernel {
             return Ok(());
         }
 
-        let workspace = workspace.ok_or_else(|| {
-            error("BlockQuantizedMoE execute reached compute without prepared workspace")
-        })?;
-        if workspace.bytes() < self.geometry.layout.bytes {
-            return Err(error(format!(
-                "BlockQuantizedMoE prepared-workspace invariant violated: execution requires {} bytes but only {} were prepared",
-                self.geometry.layout.bytes,
-                workspace.bytes()
-            )));
-        }
-        let base = cuptr(workspace.ptr().0.cast_const());
-        let ptr = |index: usize| base + self.geometry.layout.offsets[index] as u64;
+        let regions = self
+            .geometry
+            .layout
+            .bind(workspace)
+            .map_err(|source| EpError::Backend {
+                operation: "bind BlockQuantizedMoE complete caller workspace",
+                source: Box::new(source),
+            })?;
+        let used = WorkspaceView::new(
+            workspace
+                .expect("nonempty layout binding required backing")
+                .ptr(),
+            self.geometry.layout.bytes(),
+        );
+        let ptr = |index: usize| cuptr(regions[index].ptr().0.cast_const());
         let route_indices = ptr(0);
         let route_weights_ptr = ptr(1);
         let fc1_output = ptr(2);
         let fc3_output = fc3.map(|_| ptr(3));
         let activated = ptr(4);
         let route_output = ptr(5);
+        let capturing = self.runtime.is_capturing()?;
 
         let telemetry = shared.telemetry.load();
-        let (telemetry_bitmap, telemetry_header) = if telemetry
+        let active_telemetry = telemetry
             .as_ref()
-            .is_some_and(|owner| owner.record.matches_experts(self.geometry.experts))
-        {
-            let owner = telemetry.as_ref().expect("checked above");
+            .filter(|owner| owner.record.matches_experts(self.geometry.experts));
+        let (telemetry_bitmap, telemetry_header) = active_telemetry.map_or((0, 0), |owner| {
             (owner.record.bitmap_ptr(), owner.record.header_ptr())
-        } else {
-            (0, 0)
-        };
+        });
 
-        self.runtime.require_registered_address_capture(
-            Arc::as_ptr(&shared.banks) as usize,
-            "BlockQuantizedMoE projection banks",
-        )?;
-        if let Some(owner) = telemetry.as_ref() {
-            self.runtime.require_registered_address_capture(
-                Arc::as_ptr(owner) as usize,
-                "BlockQuantizedMoE traffic record",
+        if capturing {
+            self.runtime.require_registered_workspace_capture(
+                used,
+                "BlockQuantizedMoE composite caller workspace",
             )?;
+            self.runtime.require_captured_address_owner(
+                Arc::as_ptr(&shared.banks) as usize,
+                "BlockQuantizedMoE projection banks",
+            )?;
+            if let Some(owner) = active_telemetry {
+                self.runtime.require_captured_address_owner(
+                    Arc::as_ptr(owner) as usize,
+                    "BlockQuantizedMoE traffic record",
+                )?;
+            }
         }
         self.launch_route(
             &inputs[1],
@@ -2750,13 +2734,19 @@ mod workspace_tests {
                 false,
             )
             .unwrap();
-            assert!(layout.bytes > 0);
+            assert!(layout.bytes() > 0);
+            // Address arithmetic only: no host/device references are formed.
+            let regions = layout
+                .bind(Some(WorkspaceView::new(
+                    onnx_runtime_ep_api::DevicePtrMut(0x1000usize as *mut c_void),
+                    layout.bytes(),
+                )))
+                .unwrap();
             assert!(
-                layout
-                    .offsets
+                regions
                     .iter()
-                    .filter(|&&offset| offset != 0)
-                    .all(|offset| offset % WORKSPACE_ALIGNMENT == 0)
+                    .filter(|region| region.bytes() != 0)
+                    .all(|region| (region.ptr().0 as usize).is_multiple_of(WORKSPACE_ALIGNMENT))
             );
         }
     }
@@ -2765,8 +2755,67 @@ mod workspace_tests {
     fn workspace_layout_zero_rows_requires_no_bytes() {
         let layout =
             qmoe_workspace_layout(&[1, 0, 128], &[0, 8], &[8, 256, 1, 1], 2, 1, false).unwrap();
-        assert_eq!(layout.bytes, 0);
-        assert_eq!(layout.offsets, [0; 6]);
+        assert_eq!(layout.bytes(), 0);
+        let regions = layout.bind(None).unwrap();
+        assert!(
+            regions
+                .iter()
+                .all(|region| region.bytes() == 0 && region.ptr().0.is_null())
+        );
+        let hidden_zero =
+            qmoe_workspace_layout(&[1, 3, 0], &[3, 8], &[8, 256, 1, 1], 2, 1, false).unwrap();
+        assert_eq!(hidden_zero.bytes(), 0);
+    }
+
+    #[test]
+    fn workspace_regions_preserve_the_original_abi_and_validate_the_complete_span() {
+        use onnx_runtime_ep_api::DevicePtrMut;
+        #[repr(align(256))]
+        struct Aligned([u8; 2048]);
+        let mut backing = Aligned([0; 2048]);
+        let ptr = DevicePtrMut(backing.0.as_mut_ptr().cast());
+        for (has_fc3, bytes, offsets) in [
+            (false, 1192, [0usize, 256, 512, 0, 768, 1024]),
+            (true, 1448, [0usize, 256, 512, 768, 1024, 1280]),
+        ] {
+            let layout =
+                qmoe_workspace_layout(&[1, 3, 7], &[3, 8], &[8, 10, 1, 1], 2, 1, has_fc3).unwrap();
+            assert_eq!(
+                layout.bytes(),
+                bytes,
+                "no trailing padding or absent-FC3 padding may be charged"
+            );
+            let regions = layout.bind(Some(WorkspaceView::new(ptr, 2048))).unwrap();
+            for (index, region) in regions
+                .iter()
+                .enumerate()
+                .filter(|(_, region)| region.bytes() != 0)
+            {
+                assert_eq!(region.ptr().0 as usize - ptr.0 as usize, offsets[index]);
+            }
+            for offered in [
+                None,
+                Some(WorkspaceView::new(ptr, bytes - 1)),
+                Some(WorkspaceView::new(
+                    DevicePtrMut(std::ptr::null_mut()),
+                    bytes,
+                )),
+                Some(WorkspaceView::new(
+                    DevicePtrMut(ptr.0.cast::<u8>().wrapping_add(1).cast()),
+                    bytes,
+                )),
+                Some(WorkspaceView::new(
+                    DevicePtrMut((usize::MAX & !(WORKSPACE_ALIGNMENT - 1)) as *mut c_void),
+                    bytes,
+                )),
+            ] {
+                let message = layout.bind(offered).unwrap_err().to_string();
+                assert!(
+                    message.contains("workspace needs") && message.contains("prepare and pass"),
+                    "{message}"
+                );
+            }
+        }
     }
 
     #[test]

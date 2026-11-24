@@ -645,10 +645,12 @@ pub fn launch_planar_linear(
         }
     }
     let runtime = admission.provider.runtime();
-    runtime.require_registered_address_capture(
-        Arc::as_ptr(&admission.banks) as usize,
-        "planar linear bank",
-    )?;
+    if runtime.is_capturing()? {
+        runtime.require_captured_address_owner(
+            Arc::as_ptr(&admission.banks) as usize,
+            "planar linear bank",
+        )?;
+    }
     let access = super::SealedLaunchAccess::new();
     let ptrs = PlanarLinearRawPtrs {
         activation: cuptr(activation.as_ptr()),
