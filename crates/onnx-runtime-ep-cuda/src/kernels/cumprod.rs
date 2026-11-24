@@ -230,6 +230,7 @@ mod tests {
                         run(arm);
                     }
                     rt.end_graph_capture().unwrap();
+                    assert_eq!(rt.graph_segment_count().unwrap(), 1);
                     rt.replay_graph().unwrap();
                     rt.synchronize().unwrap();
                     if case == 0 && rep == 0 && arm == 0 {
@@ -239,6 +240,8 @@ mod tests {
                                 rt.replay_graph().unwrap();
                             }
                             rt.synchronize().unwrap();
+                            // The runtime otherwise appends the next arm to this capture.
+                            assert!(rt.reset_graph().unwrap());
                         }
                     }
                     let start = context
