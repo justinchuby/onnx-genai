@@ -642,6 +642,34 @@ now joins this same composite as described below. Portable prefill capture
 eligibility remains conservative. Host layout checks and GPU-target compilation
 do not validate device arithmetic, asynchronous failure ordering or throughput.
 
+### BF16 converted constants are immutable per signature
+
+MatMulNBits keeps one prepared record containing the source signature, checked
+composite layout and actual optional `GraphDeviceAllocation` owner. Capacity is
+derived from that owner. Warm hits perform signature comparison, layout binding
+and capture ownership validation; they do not allocate, convert or synchronize.
+Zero-element constants require no device backing.
+
+A changed signature validates every source extent and cast limit, refuses real
+stream capture, and prepares a new complete composite. It never overwrites the
+previous allocation merely because its capacity fits. Prior compute readers are
+drained at this cold boundary even with eager synchronization deferred. Only
+successful conversion submissions and the preparation checkpoint publish the
+replacement. Errors leave the previous record intact; outer execution still
+clears capture readiness on failure. An already captured graph retains its old
+owner and converted contents until graph retirement. This is resource reuse by
+signature and lifetime, without per-operand quota tickets or a new EP protocol.
+
+Registered capture hits must pin the real artifact owner. Raw/unregistered
+capture cannot embed a warm private pointer, and a capture miss rejects before
+allocation or conversion. Host tests exercise operand count, empty layouts,
+regions, source address overflow and int32 conversion limits. A GPU fixture
+covers warm no-work counters, failed replacement, same-size replacement after
+capture, old graph replay and raw-capture refusal. It is compiled/listed on this
+Host, not executed; device arithmetic, lifetime behavior and performance remain
+unmeasured. The underlying retained-artifact owner still uses the runtime raw
+allocation path; this change does not claim native quota coverage for artifacts.
+
 ### CUDA quantized MatMul accuracy-4 decode activation scratch
 
 The F32 single-row int4 accuracy-4 block-32 route borrows padded int8 activation
