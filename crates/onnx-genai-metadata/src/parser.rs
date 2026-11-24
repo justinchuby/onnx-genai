@@ -201,7 +201,7 @@ pub fn load_metadata_from_dir(
 }
 
 /// Recognized inference-metadata filenames, in the order they are preferred.
-const METADATA_FILE_NAMES: [&str; 3] = [
+pub const METADATA_FILE_NAMES: [&str; 3] = [
     "inference_metadata.yaml",
     "inference_metadata.yml",
     "inference_metadata.json",

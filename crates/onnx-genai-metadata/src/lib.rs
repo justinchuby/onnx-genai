@@ -40,10 +40,11 @@ pub use graph_cardinality::{
 pub use identity::{IDENTITY_SCHEME, semantic_identity, semantic_identity_of_str};
 pub use lowering::{CompiledWorkflow, compile_workflow};
 pub use parser::{
-    MtpProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor, SpeculatorProposerKind,
-    SpeculatorProposerStatus, find_metadata_path, inspect_legacy_speculator_for_migration,
-    load_metadata, load_metadata_from_dir, load_metadata_package, load_metadata_with_identity,
-    load_pipeline_spec, parse_metadata, parse_metadata_json, resolve_package_artifact,
+    METADATA_FILE_NAMES, MtpProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor,
+    SpeculatorProposerKind, SpeculatorProposerStatus, find_metadata_path,
+    inspect_legacy_speculator_for_migration, load_metadata, load_metadata_from_dir,
+    load_metadata_package, load_metadata_with_identity, load_pipeline_spec, parse_metadata,
+    parse_metadata_json, resolve_package_artifact,
 };
 pub use schema::*;
 pub use session_state::{

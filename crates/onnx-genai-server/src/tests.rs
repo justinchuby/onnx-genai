@@ -8076,7 +8076,7 @@ mod llama_router_compat {
         assert!(
             std::str::from_utf8(&first)
                 .unwrap()
-                .contains("status_update")
+                .contains("model_status")
         );
         drop(stream);
         for (path, loaded) in [("/models/load", true), ("/models/unload", false)] {
