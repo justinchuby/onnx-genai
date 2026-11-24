@@ -1708,3 +1708,16 @@ after an explicit reference-view failure are covered. Real CLI subprocesses
 passed both default Native generation with an unavailable ORT path and explicit
 ORT reference generation. The broader engine/server/HTTP regression and strict
 CUDA-feature checks are being completed before landing.
+
+Neutral storage validation completed: the full storage-change graph passed
+191 ORT/value, 979 engine / one inherited ignore, 451 server / two inherited
+ignores and 71 CLI tests. The subsequent capacity/portable-shape checks passed
+the 191-value suite again, including the isolated missing-library capacity
+regression. Both CLI profile subprocesses and all 38 HTTP tests then passed,
+including the independent missing-ORT buffered completion and successful SSE
+finish/error assertions. Strict ORT/engine/server/CLI all-target Clippy with the
+ORT CUDA feature, formatting and diff checks passed. The two implementation
+commits restacked unchanged onto current main; both CLI subprocesses, HTTP 38
+and strict checks passed again on that restack. PR #2529 proceeds after local
+self-review without waiting for blocked CI, as explicitly requested. GPU
+execution/performance and the Python/MTP isolation work remain unproven here.
