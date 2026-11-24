@@ -1192,6 +1192,440 @@ fn assert_commit_buffer_devices(expected: DeviceId, ranges: &[(&DeviceBuffer, us
     }
 }
 
+/// One selected native allocation domain, independent of graph/execution state.
+/// This is owned inline by the provider for now; artifact installation is a later
+/// step. Runtime is borrowed only during admission, not retained in this state.
+struct CudaAllocationDomain {
+    // Release selected allocator references before registration and its pins.
+    memory: CudaMemory,
+    memory_binding: CudaMemoryBinding,
+    governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
+    attribution: Arc<CudaMappedAttribution>,
+    ep_allocations: Arc<AtomicU64>,
+    ep_frees: Arc<AtomicU64>,
+    closed: AtomicBool,
+    device: DeviceId,
+    #[cfg(any(test, feature = "gpu-tests"))]
+    fail_next_allocation: AtomicBool,
+    // Last: allocator/registration teardown can still enqueue physical work.
+    release_queue: Arc<CudaDeferredReleaseQueue>,
+}
+
+impl CudaAllocationDomain {
+    fn new(
+        device: DeviceId,
+        memory: CudaMemory,
+        memory_binding: CudaMemoryBinding,
+        governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
+        attribution: Arc<CudaMappedAttribution>,
+        release_queue: Arc<CudaDeferredReleaseQueue>,
+    ) -> Self {
+        Self {
+            device,
+            memory,
+            memory_binding,
+            governor,
+            attribution,
+            release_queue,
+            ep_allocations: Arc::new(AtomicU64::new(0)),
+            ep_frees: Arc::new(AtomicU64::new(0)),
+            closed: AtomicBool::new(false),
+            #[cfg(any(test, feature = "gpu-tests"))]
+            fail_next_allocation: AtomicBool::new(false),
+        }
+    }
+
+    /// The single allocator selected for this provider.
+    fn memory(&self) -> &dyn onnx_runtime_memory_api::DeviceAllocator {
+        self.memory.allocator()
+    }
+
+    /// The provider-managed mapped-growth path is intentionally narrower than
+    /// generic `VirtualBacking`: it consumes governor capacity through inherent
+    /// `CudaVmmAllocator` methods, so only the construction-selected in-tree VMM
+    /// is eligible. Capability discovery and the explicit accounting promise
+    /// are both checked from that selected allocator reference.
+    fn managed_vmm(&self) -> Option<&Arc<crate::vmm_allocator::CudaVmmAllocator>> {
+        let arena = self.memory.vmm()?;
+        let selected: &dyn onnx_runtime_memory_api::DeviceAllocator = arena.as_ref();
+        (selected.commits_on_demand() && selected.as_virtual_backing().is_some()).then_some(arena)
+    }
+
+    /// This binding's virtual-backing capability, or an actionable error.
+    fn bound_virtual_backing(&self, operation: &str) -> Result<Option<ScopedVirtualBacking>> {
+        self.memory_binding
+            .binding
+            .virtual_backing()
+            .map_err(|error| manager_failure(&format!("{operation}: capability lookup"), error))
+    }
+
+    fn require_allocation_outside_capture(
+        &self,
+        runtime: &CudaRuntime,
+        operation: &str,
+        size: usize,
+        alignment: usize,
+    ) -> Result<()> {
+        if runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: cannot {operation} ({size} bytes aligned to {alignment}) during CUDA graph capture; abort recording and eagerly prepare retained backing before capture"
+            )));
+        }
+        Ok(())
+    }
+
+    fn reject_injected_allocation_failure(&self, _size: usize) -> Result<()> {
+        #[cfg(any(test, feature = "gpu-tests"))]
+        if self.fail_next_allocation.swap(false, Ordering::AcqRel) {
+            return Err(EpError::OutOfMemory {
+                requested: _size,
+                available: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Shared cold admission for independently owned native storage. Workspace
+    /// release-barrier waiting stays with the workspace caller; immutable weights
+    /// do not wait for an unrelated lane. No second allocator or quota ledger.
+    fn allocate_governed(
+        &self,
+        runtime: &CudaRuntime,
+        size: usize,
+        alignment: usize,
+        role: MemoryRole,
+    ) -> Result<DeviceBuffer> {
+        self.ensure_accepting_work("native owned allocations")?;
+        self.require_allocation_outside_capture(
+            runtime,
+            &format!("allocate {role:?}"),
+            size,
+            alignment,
+        )?;
+        self.reject_injected_allocation_failure(size)?;
+        let target_mapped = self.mapped_bytes_for_allocation(size, alignment)?;
+        if let Some(grant) = self.prepare_mapped_growth(target_mapped, role)? {
+            return self.allocate_with_mapped_growth_for_role(size, alignment, grant, role);
+        }
+        let full = 0..size;
+        self.allocate_transaction(size, alignment, std::slice::from_ref(&full), role, true)
+    }
+
+    /// Allocate through the process manager while leaving stream/capability
+    /// execution in this provider.
+    ///
+    /// `manage_eager_charge` is true for the migrated session workspace path.
+    /// Remaining generic callers keep compatibility accounting until they move
+    /// to a role/holder-aware transaction; their bytes are reported as
+    /// unattributed rather than silently appearing governed.
+    fn allocate_transaction(
+        &self,
+        size: usize,
+        alignment: usize,
+        committed_ranges: &[std::ops::Range<usize>],
+        role: MemoryRole,
+        manage_eager_charge: bool,
+    ) -> Result<DeviceBuffer> {
+        self.ensure_accepting_work("device allocations")?;
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(EpError::AlignmentError);
+        }
+        let virtual_backing = self.bound_virtual_backing("allocating device memory")?;
+        let reserve_bytes = match virtual_backing.as_ref() {
+            Some(capability) => capability
+                .mapped_bytes_for_allocation(size, alignment)
+                .map_err(|error| manager_failure("cannot size mapped allocation", error))?,
+            None => size as u64,
+        };
+        let charge_mode = if self.memory().commits_on_demand() && self.governor.is_some() {
+            AllocationChargeMode::AuthorityManaged
+        } else if manage_eager_charge && self.governor.is_some() {
+            AllocationChargeMode::Managed
+        } else {
+            AllocationChargeMode::Compatibility
+        };
+        let delegated = self
+            .memory_binding
+            .authority
+            .has_process_delegation(onnx_runtime_memory_api::Tier::Device);
+        let request = AllocationRequest {
+            allocation_bytes: size,
+            alignment,
+            tier: onnx_runtime_memory_api::Tier::Device,
+            role,
+            holder: self.memory_binding.holder.clone(),
+            charge_mode,
+            authority_reserve_bytes: if charge_mode == AllocationChargeMode::Compatibility {
+                0
+            } else {
+                reserve_bytes
+            },
+            process_reserve_bytes: if charge_mode == AllocationChargeMode::Managed && !delegated {
+                reserve_bytes
+            } else {
+                0
+            },
+        };
+        let managed = self
+            .memory_binding
+            .binding
+            .allocate_with(
+                request,
+                |context| match virtual_backing.as_ref() {
+                    Some(_) => context.allocate_committed(committed_ranges),
+                    None => context.allocate_owning(),
+                },
+                |owner| {
+                    let physical = match virtual_backing.as_ref() {
+                        Some(capability) => capability
+                            .allocation_committed_bytes(owner)
+                            .map_err(|error| AllocationStepError::new(error.to_string()))?
+                            as u64,
+                        None => size as u64,
+                    };
+                    Ok(match charge_mode {
+                        AllocationChargeMode::Managed => AllocationPublication {
+                            charged_bytes: physical,
+                            process_reserved_bytes: if delegated { 0 } else { physical },
+                            physical_bytes: Some(physical),
+                            mapped_bytes: Some(physical),
+                            unattributed_bytes: 0,
+                            shared_physical: None,
+                        },
+                        AllocationChargeMode::AuthorityManaged => AllocationPublication {
+                            // Generic virtual backing cannot expose how much of
+                            // this mapping reused an authority-owned pool.
+                            // Authority snapshots remain the charge source.
+                            charged_bytes: 0,
+                            process_reserved_bytes: 0,
+                            physical_bytes: None,
+                            mapped_bytes: Some(physical),
+                            unattributed_bytes: 0,
+                            shared_physical: None,
+                        },
+                        AllocationChargeMode::Compatibility => {
+                            AllocationPublication::compatibility(physical, physical)
+                        }
+                    })
+                },
+            )
+            .map_err(|error| manager_failure("allocation transaction failed", error))?;
+        self.ep_allocations.fetch_add(1, Ordering::Relaxed);
+        Ok(DeviceBuffer::from_managed_allocation(
+            Box::new(managed),
+            self.device,
+        ))
+    }
+
+    fn allocate_with_mapped_growth_for_role(
+        &self,
+        size: usize,
+        alignment: usize,
+        grant: onnx_runtime_memory_governor::MappedGrowthGrant,
+        role: MemoryRole,
+    ) -> Result<DeviceBuffer> {
+        self.ensure_accepting_work("device allocations")?;
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(EpError::AlignmentError);
+        }
+        let full = 0..size;
+        let Some(arena) = self.managed_vmm() else {
+            return Err(EpError::KernelFailed(
+                "cuda_ep: mapped growth requires the construction-selected CUDA VMM allocator; \
+                 no second allocator handle or capability downcast is used"
+                    .into(),
+            ));
+        };
+        let requested = grant.requested_bytes();
+        let grant = std::cell::RefCell::new(Some(grant));
+        let additional_owned = std::cell::Cell::new(0_u64);
+        let newly_mapped = std::cell::Cell::new(0_u64);
+        let managed = self
+            .memory_binding
+            .binding
+            .allocate_with(
+                AllocationRequest::authority_managed(
+                    size,
+                    alignment,
+                    onnx_runtime_memory_api::Tier::Device,
+                    role,
+                    self.memory_binding.holder.clone(),
+                    requested,
+                ),
+                |context| {
+                    let allocation = {
+                        let mut grant = grant.borrow_mut();
+                        let grant = grant.as_mut().expect("growth grant is live until commit");
+                        arena
+                            .allocate_committed_with_capacity(
+                                size,
+                                alignment,
+                                std::slice::from_ref(&full),
+                                grant.physical_capacity(),
+                            )
+                            .map_err(AllocationStepError::from)?
+                    };
+                    additional_owned.set(allocation.additional_owned_bytes);
+                    newly_mapped.set(allocation.newly_mapped_bytes);
+                    // SAFETY: the arena registered in this binding just returned
+                    // this unique live allocation and no other owner exists.
+                    match unsafe { context.adopt_allocation(allocation.allocation) } {
+                        Ok(owner) => Ok(owner),
+                        Err(error) => {
+                            // No identity escaped. Try the Phase-4 structured
+                            // release immediately; a partial failure must retain
+                            // the residual mapped attribution while always
+                            // releasing the growth-operation guard.
+                            // SAFETY: this is the exact unique allocation just
+                            // returned by `arena`.
+                            let outcome =
+                                unsafe { arena.release(allocation.allocation, size, alignment) };
+                            if outcome.is_complete() {
+                                Err(error)
+                            } else {
+                                let grant = grant
+                                    .borrow_mut()
+                                    .take()
+                                    .expect("growth grant remains provisional");
+                                let retained_mapped = allocation
+                                    .newly_mapped_bytes
+                                    .saturating_sub(outcome.unmapped_bytes());
+                                let settlement = grant.settle_retained_bytes(retained_mapped);
+                                Err(AllocationStepError::retained(format!(
+                                    "could not publish mapped-capacity ownership ({error}); \
+                                     structured rollback left {} byte(s) retained and {} byte(s) \
+                                     mapped{}",
+                                    outcome
+                                        .residual()
+                                        .map_or(size as u64, |residual| residual.retained_bytes),
+                                    retained_mapped,
+                                    settlement.err().map_or(String::new(), |error| format!(
+                                        "; conservative attribution settlement reported: \
+                                             {error}"
+                                    ))
+                                )))
+                            }
+                        }
+                    }
+                },
+                |_| {
+                    let actual = newly_mapped.get();
+                    grant
+                        .borrow_mut()
+                        .take()
+                        .expect("growth grant commits once")
+                        .commit_bytes(actual)
+                        .map_err(AllocationStepError::from)?;
+                    Ok(AllocationPublication {
+                        charged_bytes: additional_owned.get(),
+                        process_reserved_bytes: 0,
+                        // Physical handles belong to the authority pool and may
+                        // outlive this allocation. Per-allocation residency is
+                        // therefore unknown rather than equated to mapping.
+                        physical_bytes: None,
+                        mapped_bytes: Some(actual),
+                        unattributed_bytes: 0,
+                        shared_physical: None,
+                    })
+                },
+            )
+            .map_err(|error| {
+                manager_failure("mapped-growth allocation transaction failed", error)
+            })?;
+        self.ep_allocations.fetch_add(1, Ordering::Relaxed);
+        Ok(DeviceBuffer::from_managed_allocation(
+            Box::new(managed),
+            self.device,
+        ))
+    }
+
+    /// Refuse new provider-owned work after shutdown or teardown.
+    ///
+    /// Releases of memory this provider already issued keep working: they are
+    /// ownership this provider is *obliged* to settle, not new work.
+    fn ensure_accepting_work(&self, operation: &str) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: the execution provider for CUDA device {} has been shut down and no \
+                 longer accepts {operation}; already-issued allocations can still be released",
+                self.device.index
+            )));
+        }
+        Ok(())
+    }
+
+    /// The accounting observer a deferred release reports its outcome to.
+    fn release_accounting(&self) -> Arc<dyn ReleaseObserver> {
+        Arc::new(CudaReleaseAccounting {
+            attribution: Arc::clone(&self.attribution),
+            frees: Arc::clone(&self.ep_frees),
+        })
+    }
+
+    fn refund_canonical_mapped_zone(&self, unmapped: u64) {
+        self.attribution.refund(unmapped);
+    }
+
+    fn mapped_bytes_for_allocation(&self, bytes: usize, alignment: usize) -> Result<u64> {
+        match self.memory().as_virtual_backing() {
+            Some(virtual_backing) => virtual_backing
+                .mapped_bytes_for_allocation(bytes, alignment)
+                .map_err(EpError::Memory),
+            None => Ok(bytes as u64),
+        }
+    }
+
+    fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_api::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        if bytes == 0 || !dynamic_lending_enabled() || self.managed_vmm().is_none() {
+            return Ok(None);
+        }
+        let Some(governor) = self.governor.as_deref() else {
+            eprintln!(
+                "cuda_ep: WARNING: dynamic mapped growth requested without an authority \
+                 participant; continuing with ordinary allocator admission"
+            );
+            return Ok(None);
+        };
+        let mut requesters = self
+            .attribution
+            .requesters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Content roles remain distinct in their leases and metrics, but every
+        // allocation in this suballocating arena shares one mapped allowance.
+        let role = mapped_attribution_role(role);
+        let requester = match requesters.entry(role) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let holder = match role {
+                    onnx_runtime_memory_api::MemoryRole::KvCache => {
+                        onnx_runtime_memory_governor::HolderId::new(65)
+                    }
+                    _ => onnx_runtime_memory_governor::HolderId::new(66),
+                };
+                entry.insert(
+                    governor
+                        .reserve_mapped_allowance(
+                            onnx_runtime_memory_api::Tier::Device,
+                            0,
+                            role,
+                            holder,
+                        )
+                        .map_err(EpError::Memory)?,
+                )
+            }
+        };
+        governor
+            .prepare_mapped_growth(requester, bytes)
+            .map(Some)
+            .map_err(EpError::Memory)
+    }
+}
+
 /// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
 ///
 /// Unlike the always-available CPU EP, this provider needs a real device, so
@@ -1201,33 +1635,7 @@ fn assert_commit_buffer_devices(expected: DeviceId, ranges: &[(&DeviceBuffer, us
 pub struct CudaExecutionProvider {
     device: DeviceId,
     runtime: Arc<CudaRuntime>,
-    /// Where this EP's device buffers come from.
-    ///
-    /// The same DeviceAllocator contract the CPU EP and the ONNX Runtime
-    /// allocator use, so an allocator a caller writes serves every backend.
-    /// The built-in mechanism is the VMM arena and nothing else; a caller who
-    /// wants something different installs it with
-    /// [`with_memory`](Self::with_memory), which replaces the arena outright
-    /// rather than sitting beside it.
-    memory: CudaMemory,
-    governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
-    /// Allocations and frees this EP made through `memory`.
-    ///
-    /// Kept here rather than asked of the allocator, because the allocator is
-    /// the part a caller replaces and counting is not something the shared
-    /// contract should require of them. The EP knows every call it makes.
-    ///
-    /// These exist because roughly twenty-five tests assert that a warmed,
-    /// capture-safe path performs no further allocations, and they assert it by
-    /// reading a counter. Before the allocator seam those went through
-    /// `CudaRuntime::alloc_raw`, which counted them; afterwards they did not,
-    /// and every one of those assertions silently became "0 == 0".
-    ep_allocations: Arc<AtomicU64>,
-    ep_frees: Arc<AtomicU64>,
     initialized: bool,
-    /// Set by `shutdown`/`Drop`: no new provider-owned work is accepted, but
-    /// already-accepted releases keep running on the queue.
-    closed: AtomicBool,
     memory_cleanup_armed: AtomicBool,
     workspace_release_barrier: WorkspaceReleaseBarrier,
     registry: OpRegistry,
@@ -1240,19 +1648,14 @@ pub struct CudaExecutionProvider {
     residency: Option<Arc<CudaWeightResidency>>,
     mapped_reclaim_registration:
         std::sync::OnceLock<onnx_runtime_memory_governor::MappedHolderRegistration>,
-    /// The mapped-attribution zone every arena allocation is charged against.
-    attribution: Arc<CudaMappedAttribution>,
-    /// Registry-issued identity for the selected allocator: this is what makes a
-    /// release generation-checked instead of pointer-keyed.
-    memory_binding: CudaMemoryBinding,
+    /// Selected allocator and native accounting. Declared after mapped reclaim
+    /// registration so its teardown still observes the complete memory domain.
+    allocation_domain: CudaAllocationDomain,
     /// Retired allocator registrations that still have old binding-issued
     /// allocations or queued releases. They share the current context/authority
     /// and are removed by the same drain callback.
     retired_memory_mechanisms: Vec<RegisteredMemoryMechanism>,
     retired_allocator_teardown: Vec<Arc<AtomicBool>>,
-    /// The context-owned queue that performs every final device release after
-    /// both stream tails.
-    release_queue: Arc<CudaDeferredReleaseQueue>,
     /// Executor-scoped route-residency lifecycle state. Sibling/base/MTP
     /// executors may share this EP, but each owns an independent finalization
     /// outcome, boundary, and retained bank artifacts.
@@ -1271,8 +1674,6 @@ pub struct CudaExecutionProvider {
     route_request_boundary_calls: AtomicU64,
     #[cfg(any(test, feature = "gpu-tests"))]
     fail_allocation_after_required_report: AtomicBool,
-    #[cfg(any(test, feature = "gpu-tests"))]
-    fail_next_allocation: AtomicBool,
     #[cfg(feature = "gpu-tests")]
     route_prepare_commit_interlock: Mutex<Option<Arc<RoutePrepareCommitInterlock>>>,
     route_diag: Arc<RouteResidencyDiagnostics>,
@@ -1312,20 +1713,6 @@ impl std::fmt::Debug for CudaExecutionProvider {
 }
 
 impl CudaExecutionProvider {
-    fn require_allocation_outside_capture(
-        &self,
-        operation: &str,
-        size: usize,
-        alignment: usize,
-    ) -> Result<()> {
-        if self.runtime.is_capturing()? {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: cannot {operation} ({size} bytes aligned to {alignment}) during CUDA graph capture; abort recording and eagerly prepare retained backing before capture"
-            )));
-        }
-        Ok(())
-    }
-
     fn artifact_policy(&self) -> ExecutorArtifactPolicy {
         ExecutorArtifactPolicy::new(
             self.artifact_provider_id,
@@ -1699,13 +2086,8 @@ impl CudaExecutionProvider {
         )?;
         let provider = Self {
             device: DeviceId::cuda(ordinal),
-            governor: governor.clone(),
-            memory,
-            ep_allocations: Arc::new(AtomicU64::new(0)),
-            ep_frees: Arc::new(AtomicU64::new(0)),
             runtime,
             initialized: false,
-            closed: AtomicBool::new(false),
             memory_cleanup_armed: AtomicBool::new(false),
             workspace_release_barrier: WorkspaceReleaseBarrier::default(),
             registry,
@@ -1713,11 +2095,16 @@ impl CudaExecutionProvider {
             offload_policy,
             residency,
             mapped_reclaim_registration: std::sync::OnceLock::new(),
-            attribution,
-            memory_binding,
+            allocation_domain: CudaAllocationDomain::new(
+                DeviceId::cuda(ordinal),
+                memory,
+                memory_binding,
+                governor.clone(),
+                attribution,
+                release_queue,
+            ),
             retired_memory_mechanisms: Vec::new(),
             retired_allocator_teardown: Vec::new(),
-            release_queue,
             route_residency_config,
             artifact_provider_id,
             route_executors: Mutex::new(HashMap::new()),
@@ -1730,8 +2117,6 @@ impl CudaExecutionProvider {
             route_request_boundary_calls: AtomicU64::new(0),
             #[cfg(any(test, feature = "gpu-tests"))]
             fail_allocation_after_required_report: AtomicBool::new(false),
-            #[cfg(any(test, feature = "gpu-tests"))]
-            fail_next_allocation: AtomicBool::new(false),
             #[cfg(feature = "gpu-tests")]
             route_prepare_commit_interlock: Mutex::new(None),
             route_diag: Arc::new(RouteResidencyDiagnostics::default()),
@@ -1739,16 +2124,24 @@ impl CudaExecutionProvider {
         };
         if let Some(residency) = provider.residency.as_ref() {
             residency
-                .install_context_scope(provider.memory_binding.binding.context_scope())
+                .install_context_scope(
+                    provider
+                        .allocation_domain
+                        .memory_binding
+                        .binding
+                        .context_scope(),
+                )
                 .map_err(|error| {
                     EpError::KernelFailed(format!(
                         "cuda_ep: cannot install weight-residency context gate: {error}"
                     ))
                 })?;
         }
-        if let (Some(residency), Some(arena), Some(governor)) =
-            (provider.residency.as_ref(), provider.memory.vmm(), governor)
-        {
+        if let (Some(residency), Some(arena), Some(governor)) = (
+            provider.residency.as_ref(),
+            provider.allocation_domain.memory.vmm(),
+            governor,
+        ) {
             residency
                 .install_vmm_admission(Arc::clone(arena), governor)
                 .map_err(|error| {
@@ -1949,22 +2342,6 @@ impl CudaExecutionProvider {
         })
     }
 
-    /// The single allocator selected for this provider.
-    fn memory(&self) -> &dyn onnx_runtime_memory_api::DeviceAllocator {
-        self.memory.allocator()
-    }
-
-    /// The provider-managed mapped-growth path is intentionally narrower than
-    /// generic `VirtualBacking`: it consumes governor capacity through inherent
-    /// `CudaVmmAllocator` methods, so only the construction-selected in-tree VMM
-    /// is eligible. Capability discovery and the explicit accounting promise
-    /// are both checked from that selected allocator reference.
-    fn managed_vmm(&self) -> Option<&Arc<crate::vmm_allocator::CudaVmmAllocator>> {
-        let arena = self.memory.vmm()?;
-        let selected: &dyn onnx_runtime_memory_api::DeviceAllocator = arena.as_ref();
-        (selected.commits_on_demand() && selected.as_virtual_backing().is_some()).then_some(arena)
-    }
-
     /// Wait only for the work that could still be reading device memory *now*.
     ///
     /// A fresh completion event is recorded at the tail of the compute stream
@@ -2013,13 +2390,13 @@ impl CudaExecutionProvider {
     /// Exposed so tests and diagnostics can observe pending/completed/retained
     /// release state rather than inferring it from a byte count.
     pub fn release_queue(&self) -> &Arc<CudaDeferredReleaseQueue> {
-        &self.release_queue
+        &self.allocation_domain.release_queue
     }
 
     /// Process manager coordinating this provider's memory registrations and
     /// allocation transactions.
     pub fn process_memory_manager(&self) -> ProcessMemoryManager {
-        self.memory_binding.manager.clone()
+        self.allocation_domain.memory_binding.manager.clone()
     }
 
     /// Confirm externally observed CUDA context termination after device loss.
@@ -2027,53 +2404,62 @@ impl CudaExecutionProvider {
     /// This is the only device-loss boundary that discharges retained manager
     /// charges. [`mark_device_lost`](Self::mark_device_lost) alone never refunds.
     pub fn confirm_memory_context_terminated(&self) -> Result<()> {
-        self.memory_binding
+        self.allocation_domain
+            .memory_binding
             .manager
-            .confirm_context_terminated(&self.memory_binding.context)
+            .confirm_context_terminated(&self.allocation_domain.memory_binding.context)
             .map_err(|error| manager_failure("cannot confirm CUDA context termination", error))?;
         if let Some(residency) = self.residency.as_ref() {
             residency.confirm_context_terminated();
         }
-        if let Some(authority) = self.memory_binding.authority.memory_authority_id() {
+        if let Some(authority) = self
+            .allocation_domain
+            .memory_binding
+            .authority
+            .memory_authority_id()
+        {
             crate::virtual_memory::confirm_physical_handle_pool_context_terminated(
-                self.memory_binding.cuda_context_identity,
+                self.allocation_domain.memory_binding.cuda_context_identity,
                 authority,
             );
         }
-        self.attribution
+        self.allocation_domain
+            .attribution
             .requesters
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         self.memory_cleanup_armed.store(true, Ordering::Release);
-        for mechanism in self
-            .retired_memory_mechanisms
-            .iter()
-            .chain(std::iter::once(&self.memory_binding.mechanism))
-        {
-            self.memory_binding
+        for mechanism in self.retired_memory_mechanisms.iter().chain(std::iter::once(
+            &self.allocation_domain.memory_binding.mechanism,
+        )) {
+            self.allocation_domain
+                .memory_binding
                 .manager
                 .remove_mechanism(mechanism)
                 .map_err(|error| {
                     manager_failure("cannot remove a terminated CUDA memory mechanism", error)
                 })?;
         }
-        self.memory_binding
+        self.allocation_domain
+            .memory_binding
             .manager
-            .unregister_holder(&self.memory_binding.holder)
+            .unregister_holder(&self.allocation_domain.memory_binding.holder)
             .map_err(|error| {
                 manager_failure("cannot unregister a terminated CUDA memory holder", error)
             })?;
-        self.memory_binding
+        self.allocation_domain
+            .memory_binding
             .manager
-            .remove_provider_context(&self.memory_binding.context)
+            .remove_provider_context(&self.allocation_domain.memory_binding.context)
             .map_err(|error| {
                 manager_failure("cannot remove a terminated CUDA provider context", error)
             })?;
         if let Err(error) = self
+            .allocation_domain
             .memory_binding
             .manager
-            .remove_authority(&self.memory_binding.authority)
+            .remove_authority(&self.allocation_domain.memory_binding.authority)
             && !matches!(
                 error,
                 AllocationTransactionError::Binding(BindingError::AuthorityInUse(_))
@@ -2089,7 +2475,7 @@ impl CudaExecutionProvider {
 
     /// Structured deferred-release observability for this provider.
     pub fn deferred_release_stats(&self) -> crate::deferred_release::DeferredReleaseStats {
-        self.release_queue.stats()
+        self.allocation_domain.release_queue.stats()
     }
 
     /// Mark this provider's device lost.
@@ -2102,9 +2488,13 @@ impl CudaExecutionProvider {
         // invalidating any mechanism, so no same-device context is left calling
         // CUDA through a queue that missed the loss.
         let _ = self
+            .allocation_domain
             .memory_binding
             .manager
-            .invalidate_device(self.memory_binding.mechanism.device(), reason);
+            .invalidate_device(
+                self.allocation_domain.memory_binding.mechanism.device(),
+                reason,
+            );
     }
 
     /// The binding-issued owner behind a buffer this provider allocated.
@@ -2126,23 +2516,15 @@ impl CudaExecutionProvider {
                 self.device.index
             ))
         })?;
-        if owner.identity().binding() != self.memory_binding.binding.identity() {
+        if owner.identity().binding() != self.allocation_domain.memory_binding.binding.identity() {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep: {operation} refused a buffer issued by a different memory binding \
                  ({:?}) than this provider's ({:?})",
                 owner.identity().binding(),
-                self.memory_binding.binding.identity()
+                self.allocation_domain.memory_binding.binding.identity()
             )));
         }
         Ok(owner)
-    }
-
-    /// This binding's virtual-backing capability, or an actionable error.
-    fn bound_virtual_backing(&self, operation: &str) -> Result<Option<ScopedVirtualBacking>> {
-        self.memory_binding
-            .binding
-            .virtual_backing()
-            .map_err(|error| manager_failure(&format!("{operation}: capability lookup"), error))
     }
 
     /// Take device buffers from `memory` instead of from the built-in VMM
@@ -2185,8 +2567,12 @@ impl CudaExecutionProvider {
         if let Some(error) = reject_foreign_device(expected.index, key) {
             return Err(error);
         }
-        let served = self.ep_allocations.load(Ordering::Relaxed);
+        let served = self
+            .allocation_domain
+            .ep_allocations
+            .load(Ordering::Relaxed);
         let committed = self
+            .allocation_domain
             .memory
             .vmm()
             .map(|arena| arena.committed_and_reserved().0)
@@ -2201,14 +2587,14 @@ impl CudaExecutionProvider {
         // through it yet on this path, and retiring keeps any pins it holds
         // intact instead of asserting that it is quiescent.
         let rebound = Self::bind_allocator(
-            self.memory_binding.manager.clone(),
-            self.memory_binding.context.clone(),
-            self.memory_binding.authority.clone(),
-            Some(self.memory_binding.holder.clone()),
-            self.memory_binding.cuda_context_identity,
+            self.allocation_domain.memory_binding.manager.clone(),
+            self.allocation_domain.memory_binding.context.clone(),
+            self.allocation_domain.memory_binding.authority.clone(),
+            Some(self.allocation_domain.memory_binding.holder.clone()),
+            self.allocation_domain.memory_binding.cuda_context_identity,
             Arc::clone(&memory),
         )?;
-        let previous = std::mem::replace(&mut self.memory_binding, rebound);
+        let previous = std::mem::replace(&mut self.allocation_domain.memory_binding, rebound);
         let previous_mechanism = previous.mechanism.clone();
         let mut removed = false;
         if let Err(error) = previous.manager.retire(&previous.mechanism) {
@@ -2229,7 +2615,7 @@ impl CudaExecutionProvider {
             self.retired_allocator_teardown
                 .push(Arc::clone(&previous.allocator_teardown_complete));
         }
-        self.memory = CudaMemory::Injected(memory);
+        self.allocation_domain.memory = CudaMemory::Injected(memory);
         Ok(self)
     }
 
@@ -3108,7 +3494,7 @@ impl CudaExecutionProvider {
             );
         }
         let cleanup = RouteReservationRetirementSubmission {
-            queue: Arc::clone(&self.release_queue),
+            queue: Arc::clone(&self.allocation_domain.release_queue),
             action: RouteReservationRetirementAction {
                 executor,
                 generation: health.generation(),
@@ -3291,8 +3677,13 @@ impl CudaExecutionProvider {
         // without passing through `deallocate`. See [`crate::interleave_cache`].
         self.runtime.set_weights_may_be_paged();
         crate::weight_paging::CudaWeightPager::new(Arc::clone(&self.runtime), source)
-            .with_deferred_release_queue(Arc::clone(&self.release_queue))
-            .with_context_scope(self.memory_binding.binding.context_scope())
+            .with_deferred_release_queue(Arc::clone(&self.allocation_domain.release_queue))
+            .with_context_scope(
+                self.allocation_domain
+                    .memory_binding
+                    .binding
+                    .context_scope(),
+            )
     }
 
     /// Build a bounded-VRAM [`CudaWeightResidency`] (WEIGHT_OFFLOAD Phase 3b
@@ -3303,9 +3694,14 @@ impl CudaExecutionProvider {
         self.runtime.set_weights_may_be_paged();
         let residency =
             crate::weight_paging::CudaWeightResidency::new(Arc::clone(&self.runtime), budget_bytes)
-                .with_deferred_release_queue(Arc::clone(&self.release_queue));
+                .with_deferred_release_queue(Arc::clone(&self.allocation_domain.release_queue));
         residency
-            .install_context_scope(self.memory_binding.binding.context_scope())
+            .install_context_scope(
+                self.allocation_domain
+                    .memory_binding
+                    .binding
+                    .context_scope(),
+            )
             .expect("a new CUDA weight residency has no context scope");
         residency
     }
@@ -3333,24 +3729,12 @@ impl CudaExecutionProvider {
         &self.offload_policy
     }
 
-    fn refund_canonical_mapped_zone(&self, unmapped: u64) {
-        self.attribution.refund(unmapped);
-    }
-
-    /// The accounting observer a deferred release reports its outcome to.
-    fn release_accounting(&self) -> Arc<dyn ReleaseObserver> {
-        Arc::new(CudaReleaseAccounting {
-            attribution: Arc::clone(&self.attribution),
-            frees: Arc::clone(&self.ep_frees),
-        })
-    }
-
     pub(crate) fn provider_context_identity(&self) -> ProviderContextIdentity {
-        self.memory_binding.context.identity()
+        self.allocation_domain.memory_binding.context.identity()
     }
 
     pub(crate) fn upload_sealed(&self, bytes: &[u8], align: usize) -> Result<CudaSealedAllocation> {
-        if matches!(self.memory, CudaMemory::Injected(_)) {
+        if matches!(self.allocation_domain.memory, CudaMemory::Injected(_)) {
             return Err(EpError::KernelFailed(
                 "cuda_ep: sealed planar admission requires the provider-owned CUDA allocator; \
                  an injected allocator remains externally controlled and cannot prove that \
@@ -3358,7 +3742,12 @@ impl CudaExecutionProvider {
                     .into(),
             ));
         }
-        let mut buffer = self.allocate_governed(bytes.len(), align, MemoryRole::Weights)?;
+        let mut buffer = self.allocation_domain.allocate_governed(
+            &self.runtime,
+            bytes.len(),
+            align,
+            MemoryRole::Weights,
+        )?;
         let identity = buffer
             .bound_owner()
             .ok_or_else(|| {
@@ -3379,287 +3768,13 @@ impl CudaExecutionProvider {
         Ok(CudaSealedAllocation {
             buffer: Some(buffer),
             runtime: Arc::downgrade(&self.runtime),
-            release_queue: Arc::downgrade(&self.release_queue),
+            release_queue: Arc::downgrade(&self.allocation_domain.release_queue),
             identity,
             device: self.device,
             provider_context: self.provider_context_identity(),
             runtime_identity: Arc::as_ptr(&self.runtime) as usize,
-            observer: self.release_accounting(),
+            observer: self.allocation_domain.release_accounting(),
         })
-    }
-
-    fn reject_injected_allocation_failure(&self, _size: usize) -> Result<()> {
-        #[cfg(any(test, feature = "gpu-tests"))]
-        if self.fail_next_allocation.swap(false, Ordering::AcqRel) {
-            return Err(EpError::OutOfMemory {
-                requested: _size,
-                available: 0,
-            });
-        }
-        Ok(())
-    }
-
-    /// Shared cold admission for independently owned native storage. Workspace
-    /// release-barrier waiting stays with the workspace caller; immutable weights
-    /// do not wait for an unrelated lane. No second allocator or quota ledger.
-    fn allocate_governed(
-        &self,
-        size: usize,
-        alignment: usize,
-        role: MemoryRole,
-    ) -> Result<DeviceBuffer> {
-        self.ensure_accepting_work("native owned allocations")?;
-        self.require_allocation_outside_capture(&format!("allocate {role:?}"), size, alignment)?;
-        self.reject_injected_allocation_failure(size)?;
-        let target_mapped = self.mapped_bytes_for_allocation(size, alignment)?;
-        if let Some(grant) = self.prepare_mapped_growth(target_mapped, role)? {
-            return self.allocate_with_mapped_growth_for_role(size, alignment, grant, role);
-        }
-        let full = 0..size;
-        self.allocate_transaction(size, alignment, std::slice::from_ref(&full), role, true)
-    }
-
-    /// Allocate through the process manager while leaving stream/capability
-    /// execution in this provider.
-    ///
-    /// `manage_eager_charge` is true for the migrated session workspace path.
-    /// Remaining generic callers keep compatibility accounting until they move
-    /// to a role/holder-aware transaction; their bytes are reported as
-    /// unattributed rather than silently appearing governed.
-    fn allocate_transaction(
-        &self,
-        size: usize,
-        alignment: usize,
-        committed_ranges: &[std::ops::Range<usize>],
-        role: MemoryRole,
-        manage_eager_charge: bool,
-    ) -> Result<DeviceBuffer> {
-        self.ensure_accepting_work("device allocations")?;
-        if alignment == 0 || !alignment.is_power_of_two() {
-            return Err(EpError::AlignmentError);
-        }
-        let virtual_backing = self.bound_virtual_backing("allocating device memory")?;
-        let reserve_bytes = match virtual_backing.as_ref() {
-            Some(capability) => capability
-                .mapped_bytes_for_allocation(size, alignment)
-                .map_err(|error| manager_failure("cannot size mapped allocation", error))?,
-            None => size as u64,
-        };
-        let charge_mode = if self.memory().commits_on_demand() && self.governor.is_some() {
-            AllocationChargeMode::AuthorityManaged
-        } else if manage_eager_charge && self.governor.is_some() {
-            AllocationChargeMode::Managed
-        } else {
-            AllocationChargeMode::Compatibility
-        };
-        let delegated = self
-            .memory_binding
-            .authority
-            .has_process_delegation(onnx_runtime_memory_api::Tier::Device);
-        let request = AllocationRequest {
-            allocation_bytes: size,
-            alignment,
-            tier: onnx_runtime_memory_api::Tier::Device,
-            role,
-            holder: self.memory_binding.holder.clone(),
-            charge_mode,
-            authority_reserve_bytes: if charge_mode == AllocationChargeMode::Compatibility {
-                0
-            } else {
-                reserve_bytes
-            },
-            process_reserve_bytes: if charge_mode == AllocationChargeMode::Managed && !delegated {
-                reserve_bytes
-            } else {
-                0
-            },
-        };
-        let managed = self
-            .memory_binding
-            .binding
-            .allocate_with(
-                request,
-                |context| match virtual_backing.as_ref() {
-                    Some(_) => context.allocate_committed(committed_ranges),
-                    None => context.allocate_owning(),
-                },
-                |owner| {
-                    let physical = match virtual_backing.as_ref() {
-                        Some(capability) => capability
-                            .allocation_committed_bytes(owner)
-                            .map_err(|error| AllocationStepError::new(error.to_string()))?
-                            as u64,
-                        None => size as u64,
-                    };
-                    Ok(match charge_mode {
-                        AllocationChargeMode::Managed => AllocationPublication {
-                            charged_bytes: physical,
-                            process_reserved_bytes: if delegated { 0 } else { physical },
-                            physical_bytes: Some(physical),
-                            mapped_bytes: Some(physical),
-                            unattributed_bytes: 0,
-                            shared_physical: None,
-                        },
-                        AllocationChargeMode::AuthorityManaged => AllocationPublication {
-                            // Generic virtual backing cannot expose how much of
-                            // this mapping reused an authority-owned pool.
-                            // Authority snapshots remain the charge source.
-                            charged_bytes: 0,
-                            process_reserved_bytes: 0,
-                            physical_bytes: None,
-                            mapped_bytes: Some(physical),
-                            unattributed_bytes: 0,
-                            shared_physical: None,
-                        },
-                        AllocationChargeMode::Compatibility => {
-                            AllocationPublication::compatibility(physical, physical)
-                        }
-                    })
-                },
-            )
-            .map_err(|error| manager_failure("allocation transaction failed", error))?;
-        self.ep_allocations.fetch_add(1, Ordering::Relaxed);
-        Ok(DeviceBuffer::from_managed_allocation(
-            Box::new(managed),
-            self.device,
-        ))
-    }
-
-    fn allocate_with_mapped_growth_for_role(
-        &self,
-        size: usize,
-        alignment: usize,
-        grant: onnx_runtime_memory_governor::MappedGrowthGrant,
-        role: MemoryRole,
-    ) -> Result<DeviceBuffer> {
-        self.ensure_accepting_work("device allocations")?;
-        if alignment == 0 || !alignment.is_power_of_two() {
-            return Err(EpError::AlignmentError);
-        }
-        let full = 0..size;
-        let Some(arena) = self.managed_vmm() else {
-            return Err(EpError::KernelFailed(
-                "cuda_ep: mapped growth requires the construction-selected CUDA VMM allocator; \
-                 no second allocator handle or capability downcast is used"
-                    .into(),
-            ));
-        };
-        let requested = grant.requested_bytes();
-        let grant = std::cell::RefCell::new(Some(grant));
-        let additional_owned = std::cell::Cell::new(0_u64);
-        let newly_mapped = std::cell::Cell::new(0_u64);
-        let managed = self
-            .memory_binding
-            .binding
-            .allocate_with(
-                AllocationRequest::authority_managed(
-                    size,
-                    alignment,
-                    onnx_runtime_memory_api::Tier::Device,
-                    role,
-                    self.memory_binding.holder.clone(),
-                    requested,
-                ),
-                |context| {
-                    let allocation = {
-                        let mut grant = grant.borrow_mut();
-                        let grant = grant.as_mut().expect("growth grant is live until commit");
-                        arena
-                            .allocate_committed_with_capacity(
-                                size,
-                                alignment,
-                                std::slice::from_ref(&full),
-                                grant.physical_capacity(),
-                            )
-                            .map_err(AllocationStepError::from)?
-                    };
-                    additional_owned.set(allocation.additional_owned_bytes);
-                    newly_mapped.set(allocation.newly_mapped_bytes);
-                    // SAFETY: the arena registered in this binding just returned
-                    // this unique live allocation and no other owner exists.
-                    match unsafe { context.adopt_allocation(allocation.allocation) } {
-                        Ok(owner) => Ok(owner),
-                        Err(error) => {
-                            // No identity escaped. Try the Phase-4 structured
-                            // release immediately; a partial failure must retain
-                            // the residual mapped attribution while always
-                            // releasing the growth-operation guard.
-                            // SAFETY: this is the exact unique allocation just
-                            // returned by `arena`.
-                            let outcome =
-                                unsafe { arena.release(allocation.allocation, size, alignment) };
-                            if outcome.is_complete() {
-                                Err(error)
-                            } else {
-                                let grant = grant
-                                    .borrow_mut()
-                                    .take()
-                                    .expect("growth grant remains provisional");
-                                let retained_mapped = allocation
-                                    .newly_mapped_bytes
-                                    .saturating_sub(outcome.unmapped_bytes());
-                                let settlement = grant.settle_retained_bytes(retained_mapped);
-                                Err(AllocationStepError::retained(format!(
-                                    "could not publish mapped-capacity ownership ({error}); \
-                                     structured rollback left {} byte(s) retained and {} byte(s) \
-                                     mapped{}",
-                                    outcome
-                                        .residual()
-                                        .map_or(size as u64, |residual| residual.retained_bytes),
-                                    retained_mapped,
-                                    settlement.err().map_or(String::new(), |error| format!(
-                                        "; conservative attribution settlement reported: \
-                                             {error}"
-                                    ))
-                                )))
-                            }
-                        }
-                    }
-                },
-                |_| {
-                    let actual = newly_mapped.get();
-                    grant
-                        .borrow_mut()
-                        .take()
-                        .expect("growth grant commits once")
-                        .commit_bytes(actual)
-                        .map_err(AllocationStepError::from)?;
-                    Ok(AllocationPublication {
-                        charged_bytes: additional_owned.get(),
-                        process_reserved_bytes: 0,
-                        // Physical handles belong to the authority pool and may
-                        // outlive this allocation. Per-allocation residency is
-                        // therefore unknown rather than equated to mapping.
-                        physical_bytes: None,
-                        mapped_bytes: Some(actual),
-                        unattributed_bytes: 0,
-                        shared_physical: None,
-                    })
-                },
-            )
-            .map_err(|error| {
-                manager_failure("mapped-growth allocation transaction failed", error)
-            })?;
-        self.ep_allocations.fetch_add(1, Ordering::Relaxed);
-        Ok(DeviceBuffer::from_managed_allocation(
-            Box::new(managed),
-            self.device,
-        ))
-    }
-
-    /// Refuse new provider-owned work after shutdown or teardown.
-    ///
-    /// Releases of memory this provider already issued keep working: they are
-    /// ownership this provider is *obliged* to settle, not new work.
-    fn ensure_accepting_work(&self, operation: &str) -> Result<()> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: the execution provider for CUDA device {} has been shut down and no \
-                 longer accepts {operation}; already-issued allocations can still be released",
-                self.device.index
-            )));
-        }
-        Ok(())
     }
 
     fn wait_for_workspace_release_barrier(
@@ -3709,17 +3824,20 @@ impl CudaExecutionProvider {
         // the final stream tails without permanently rooting its graph state.
         // Refusal must never fall back to an unordered destructor on this thread.
         let action = StreamOrderedKeepAlive::new(Arc::clone(&self.runtime), "CUDA runtime handles");
-        if let Err(refused) = self.release_queue.enqueue(action) {
+        if let Err(refused) = self.allocation_domain.release_queue.enqueue(action) {
             let detail = format!(
                 "runtime handle retirement refused as {}; retaining execution handles without synchronization or quota refund",
                 refused.rejection.name()
             );
-            self.release_queue.retain_refused(refused, detail);
+            self.allocation_domain
+                .release_queue
+                .retain_refused(refused, detail);
         }
         if let Err(error) = self
+            .allocation_domain
             .memory_binding
             .manager
-            .retire_context(&self.memory_binding.context)
+            .retire_context(&self.allocation_domain.memory_binding.context)
         {
             eprintln!(
                 "cuda_ep: WARNING: could not retire the CUDA memory context during teardown: \
@@ -3727,24 +3845,30 @@ impl CudaExecutionProvider {
             );
         }
         if let Err(error) = self
+            .allocation_domain
             .memory_binding
             .manager
-            .retire(&self.memory_binding.mechanism)
+            .retire(&self.allocation_domain.memory_binding.mechanism)
         {
             eprintln!(
                 "cuda_ep: WARNING: could not retire the CUDA memory mechanism during teardown: \
                  {error}"
             );
         }
-        let manager = self.memory_binding.manager.downgrade();
+        let manager = self.allocation_domain.memory_binding.manager.downgrade();
         let mut mechanisms = self.retired_memory_mechanisms.clone();
-        mechanisms.push(self.memory_binding.mechanism.clone());
+        mechanisms.push(self.allocation_domain.memory_binding.mechanism.clone());
         let mut allocator_teardown = self.retired_allocator_teardown.clone();
-        allocator_teardown.push(Arc::clone(&self.memory_binding.allocator_teardown_complete));
-        let holder = self.memory_binding.holder.clone();
-        let context = self.memory_binding.context.clone();
-        let authority = self.memory_binding.authority.clone();
-        self.release_queue.set_drain_callback(move || {
+        allocator_teardown.push(Arc::clone(
+            &self
+                .allocation_domain
+                .memory_binding
+                .allocator_teardown_complete,
+        ));
+        let holder = self.allocation_domain.memory_binding.holder.clone();
+        let context = self.allocation_domain.memory_binding.context.clone();
+        let authority = self.allocation_domain.memory_binding.authority.clone();
+        self.allocation_domain.release_queue.set_drain_callback(move || {
             let Some(manager) = manager.upgrade() else {
                 return true;
             };
@@ -3829,8 +3953,8 @@ impl CudaExecutionProvider {
 
     /// Report deferred-release state that a caller should know about.
     fn report_release_state(&self, phase: &str) {
-        let stats = self.release_queue.stats();
-        for retained in self.release_queue.retained() {
+        let stats = self.allocation_domain.release_queue.stats();
+        for retained in self.allocation_domain.release_queue.retained() {
             eprintln!(
                 "cuda_ep: WARNING: at {phase}, {} byte(s) of {} ownership remain retained ({}): \
                  {}",
@@ -4105,7 +4229,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     /// device memory should see it.
     fn shutdown(&mut self) -> Result<()> {
         self.initialized = false;
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if self.allocation_domain.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         // Drain any installed route-residency binding first, so the boundary
@@ -4124,10 +4248,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         // and settling them is what tears down the allocator and its
         // reservations — which produces the last piece of work the queue must
         // accept.
-        self.release_queue.close_after_drain();
+        self.allocation_domain.release_queue.close_after_drain();
         // One non-blocking sweep, so a release whose fences are already complete
         // is reflected in the report below instead of looking pending.
-        self.release_queue.poll();
+        self.allocation_domain.release_queue.poll();
         self.report_release_state("shutdown");
         Ok(())
     }
@@ -4495,14 +4619,31 @@ impl ExecutionProvider for CudaExecutionProvider {
         cuda_optimization_passes(Some(self.runtime.capabilities()))
     }
 
+    fn mapped_bytes_for_allocation(&self, bytes: usize, alignment: usize) -> Result<u64> {
+        self.allocation_domain
+            .mapped_bytes_for_allocation(bytes, alignment)
+    }
+
+    fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        self.allocation_domain.prepare_mapped_growth(bytes, role)
+    }
+
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
-        self.reject_injected_allocation_failure(size)?;
+        self.allocation_domain
+            .reject_injected_allocation_failure(size)?;
         if dynamic_lending_enabled()
-            && let Some(arena) = self.managed_vmm()
-            && let Some(governor) = self.governor.as_deref()
-            && let Some(requester) = self.attribution.allowance(mapped_attribution_role(
-                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
-            ))
+            && let Some(arena) = self.allocation_domain.managed_vmm()
+            && let Some(governor) = self.allocation_domain.governor.as_deref()
+            && let Some(requester) =
+                self.allocation_domain
+                    .attribution
+                    .allowance(mapped_attribution_role(
+                        onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+                    ))
         {
             let virtual_backing =
                 onnx_runtime_memory_api::DeviceAllocator::as_virtual_backing(arena.as_ref())
@@ -4525,7 +4666,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         alignment: usize,
         grant: onnx_runtime_memory_governor::MappedGrowthGrant,
     ) -> Result<DeviceBuffer> {
-        self.allocate_with_mapped_growth_for_role(
+        self.allocation_domain.allocate_with_mapped_growth_for_role(
             size,
             alignment,
             grant,
@@ -4536,7 +4677,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     fn workspace_pressure_registry(
         &self,
     ) -> Result<Option<onnx_runtime_memory_governor::PressureRegistry>> {
-        self.memory_binding.authority.pressure_registry().map_err(|error| {
+        self.allocation_domain.memory_binding.authority.pressure_registry().map_err(|error| {
             EpError::KernelFailed(format!(
                 "cuda_ep: workspace authority pressure registry is invalid: {error}; bind workspace backing and its pressure registry to the same physical authority"
             ))
@@ -4549,14 +4690,20 @@ impl ExecutionProvider for CudaExecutionProvider {
         alignment: usize,
         role: MemoryRole,
     ) -> Result<WorkspaceAllocation> {
-        self.require_allocation_outside_capture("allocate workspace", size, alignment)?;
+        self.allocation_domain.require_allocation_outside_capture(
+            &self.runtime,
+            "allocate workspace",
+            size,
+            alignment,
+        )?;
         Self::wait_for_workspace_release_barrier(
             &self.workspace_release_barrier,
             std::time::Duration::from_secs(30),
         )?;
         // Waiting may span a capture-state transition, so the common admission
         // rechecks the real stream before grants or allocation mutation.
-        self.allocate_governed(size, alignment, role)
+        self.allocation_domain
+            .allocate_governed(&self.runtime, size, alignment, role)
             .map(WorkspaceAllocation::new)
     }
 
@@ -4567,7 +4714,12 @@ impl ExecutionProvider for CudaExecutionProvider {
         alignment: usize,
         role: MemoryRole,
     ) -> Result<WorkspaceAllocation> {
-        self.require_allocation_outside_capture("replace workspace", size, alignment)?;
+        self.allocation_domain.require_allocation_outside_capture(
+            &self.runtime,
+            "replace workspace",
+            size,
+            alignment,
+        )?;
         if old.is_some() {
             self.sync()?;
         }
@@ -4597,7 +4749,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         alignment: usize,
         committed_ranges: &[std::ops::Range<usize>],
     ) -> Result<DeviceBuffer> {
-        self.allocate_transaction(
+        self.allocation_domain.allocate_transaction(
             size,
             alignment,
             committed_ranges,
@@ -4618,7 +4770,9 @@ impl ExecutionProvider for CudaExecutionProvider {
             "cuda_ep: refusing to commit a buffer from device {:?}",
             buffer.device()
         );
-        let Some(virtual_backing) = self.bound_virtual_backing("committing an allocation range")?
+        let Some(virtual_backing) = self
+            .allocation_domain
+            .bound_virtual_backing("committing an allocation range")?
         else {
             // Eager fallback: the whole allocation was already physically
             // backed, so there is no accounting-changing operation to perform.
@@ -4643,7 +4797,9 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn commit_allocation_ranges(&self, ranges: &[(&DeviceBuffer, usize, usize)]) -> Result<()> {
         assert_commit_buffer_devices(self.device, ranges);
-        let Some(virtual_backing) = self.bound_virtual_backing("committing allocation ranges")?
+        let Some(virtual_backing) = self
+            .allocation_domain
+            .bound_virtual_backing("committing allocation ranges")?
         else {
             // Same explicit eager fallback as the single-range operation.
             return Ok(());
@@ -4674,7 +4830,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         ranges: &[(&DeviceBuffer, usize, usize)],
         grant: &mut onnx_runtime_memory_governor::MappedGrowthGrant,
     ) -> Result<u64> {
-        let Some(arena) = self.managed_vmm() else {
+        let Some(arena) = self.allocation_domain.managed_vmm() else {
             return Err(EpError::KernelFailed(
                 "cuda_ep: mapped growth requires the construction-selected CUDA VMM allocator; \
                  injected allocators use their ordinary capability path"
@@ -4684,8 +4840,9 @@ impl ExecutionProvider for CudaExecutionProvider {
         // The capacity-token commit is a specialized arena call, so the bound
         // owner is validated explicitly first: identity, generation, and live
         // record are all checked before any concrete VMM range is built.
-        let virtual_backing =
-            self.bound_virtual_backing("committing allocation ranges with mapped growth")?;
+        let virtual_backing = self
+            .allocation_domain
+            .bound_virtual_backing("committing allocation ranges with mapped growth")?;
         let raw = ranges
             .iter()
             .map(|&(buffer, offset, bytes)| {
@@ -4722,7 +4879,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         &self,
         ranges: &[(&DeviceBuffer, usize, usize)],
     ) -> Result<u64> {
-        let Some(virtual_backing) = self.memory().as_virtual_backing() else {
+        let Some(virtual_backing) = self.allocation_domain.memory().as_virtual_backing() else {
             return Ok(ranges.iter().fold(0_u64, |total, &(_, _, bytes)| {
                 total.saturating_add(bytes as u64)
             }));
@@ -4743,15 +4900,6 @@ impl ExecutionProvider for CudaExecutionProvider {
         virtual_backing
             .mapped_bytes_for_allocation_ranges(&raw)
             .map_err(EpError::Memory)
-    }
-
-    fn mapped_bytes_for_allocation(&self, bytes: usize, alignment: usize) -> Result<u64> {
-        match self.memory().as_virtual_backing() {
-            Some(virtual_backing) => virtual_backing
-                .mapped_bytes_for_allocation(bytes, alignment)
-                .map_err(EpError::Memory),
-            None => Ok(bytes as u64),
-        }
     }
 
     /// Explicitly unmap part of a live allocation, before the caller proceeds.
@@ -4782,7 +4930,10 @@ impl ExecutionProvider for CudaExecutionProvider {
             "cuda_ep: refusing to decommit a buffer from device {:?}",
             buffer.device()
         );
-        let Some(virtual_backing) = self.bound_virtual_backing("decommitting a range")? else {
+        let Some(virtual_backing) = self
+            .allocation_domain
+            .bound_virtual_backing("decommitting a range")?
+        else {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep: allocator for CUDA device {} has no VirtualBacking capability; \
                  partial decommit is unsupported for eager allocations",
@@ -4791,7 +4942,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         };
         let owner = self.bound_owner(buffer, "decommitting a range")?;
         self.wait_for_recorded_stream_tails("an explicit partial decommit")?;
-        let Some(arena) = self.managed_vmm() else {
+        let Some(arena) = self.allocation_domain.managed_vmm() else {
             // An injected VirtualBacking has no structured decommit outcome;
             // its adapter already refuses on anything but a complete unmap.
             let unmapped = virtual_backing
@@ -4804,7 +4955,8 @@ impl ExecutionProvider for CudaExecutionProvider {
                         self.device.index
                     ))
                 })?;
-            self.refund_canonical_mapped_zone(unmapped);
+            self.allocation_domain
+                .refund_canonical_mapped_zone(unmapped);
             return Ok(unmapped);
         };
         // Validate the generation through the bound capability before the
@@ -4825,7 +4977,8 @@ impl ExecutionProvider for CudaExecutionProvider {
             })?;
         match outcome {
             crate::vmm_allocator::DecommitOutcome::Complete { accounting } => {
-                self.refund_canonical_mapped_zone(accounting.unmapped_bytes);
+                self.allocation_domain
+                    .refund_canonical_mapped_zone(accounting.unmapped_bytes);
                 Ok(accounting.unmapped_bytes)
             }
             crate::vmm_allocator::DecommitOutcome::RolledBack { reason } => {
@@ -4844,7 +4997,8 @@ impl ExecutionProvider for CudaExecutionProvider {
             } => {
                 // Refund only what the outcome reports as actually unmapped;
                 // the residual stays charged because it is still owned.
-                self.refund_canonical_mapped_zone(accounting.unmapped_bytes);
+                self.allocation_domain
+                    .refund_canonical_mapped_zone(accounting.unmapped_bytes);
                 Err(EpError::KernelFailed(format!(
                     "cuda_ep: decommit of {offset}..{} could not be rolled back; the whole \
                      allocation at {:#x} is quarantined with {} byte(s) of physical ownership \
@@ -4863,7 +5017,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         let Some(owner) = buffer.bound_owner() else {
             return buffer.len();
         };
-        match self.bound_virtual_backing("querying committed bytes") {
+        match self
+            .allocation_domain
+            .bound_virtual_backing("querying committed bytes")
+        {
             Ok(Some(virtual_backing)) => virtual_backing
                 .allocation_committed_bytes(owner)
                 .unwrap_or(buffer.len()),
@@ -4926,12 +5083,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         };
         let binding_identity = ownership.owner().identity().binding();
         let known_mechanism = binding_identity.mechanism()
-            == self.memory_binding.mechanism.identity()
+            == self.allocation_domain.memory_binding.mechanism.identity()
             || self
                 .retired_memory_mechanisms
                 .iter()
                 .any(|mechanism| mechanism.identity() == binding_identity.mechanism());
-        if binding_identity.provider_context() != self.memory_binding.context.identity()
+        if binding_identity.provider_context()
+            != self.allocation_domain.memory_binding.context.identity()
             || !known_mechanism
         {
             return Err(EpError::KernelFailed(format!(
@@ -4942,8 +5100,12 @@ impl ExecutionProvider for CudaExecutionProvider {
                 self.device.index
             )));
         }
-        enqueue_native_release(&self.release_queue, ownership, self.release_accounting())
-            .map(|()| 0)
+        enqueue_native_release(
+            &self.allocation_domain.release_queue,
+            ownership,
+            self.allocation_domain.release_accounting(),
+        )
+        .map(|()| 0)
     }
 
     fn wait_for_deferred_releases(&self) -> Result<()> {
@@ -4951,16 +5113,17 @@ impl ExecutionProvider for CudaExecutionProvider {
         // enqueueing ownership. Wait on those structured fences; do not add an
         // unrelated stream/device synchronization at teardown.
         if !self
+            .allocation_domain
             .release_queue
             .wait_until_idle(std::time::Duration::from_secs(30))
         {
-            let stats = self.release_queue.stats();
+            let stats = self.allocation_domain.release_queue.stats();
             record_allocator_release_observation(stats);
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep: timed out waiting for deferred allocator releases to settle: {stats:?}"
             )));
         }
-        let stats = self.release_queue.stats();
+        let stats = self.allocation_domain.release_queue.stats();
         record_allocator_release_observation(stats);
         if stats.quarantined != 0 || stats.retained != 0 {
             return Err(EpError::KernelFailed(format!(
@@ -5475,7 +5638,9 @@ impl ExecutionProvider for CudaExecutionProvider {
                 .fail_allocation_after_required_report
                 .swap(false, Ordering::AcqRel)
         {
-            self.fail_next_allocation.store(true, Ordering::Release);
+            self.allocation_domain
+                .fail_next_allocation
+                .store(true, Ordering::Release);
         }
         Ok(ExecutorArtifactReport::observed(
             provider,
@@ -5562,8 +5727,12 @@ impl ExecutionProvider for CudaExecutionProvider {
         // anything without ever going red.
         let counts = self.runtime.allocation_counts();
         Some((
-            counts.allocations + self.ep_allocations.load(Ordering::Relaxed),
-            counts.frees + self.ep_frees.load(Ordering::Relaxed),
+            counts.allocations
+                + self
+                    .allocation_domain
+                    .ep_allocations
+                    .load(Ordering::Relaxed),
+            counts.frees + self.allocation_domain.ep_frees.load(Ordering::Relaxed),
         ))
     }
 
@@ -5571,56 +5740,6 @@ impl ExecutionProvider for CudaExecutionProvider {
         &self,
     ) -> Vec<onnx_runtime_ep_api::RawDeviceAllocationSiteStats> {
         self.runtime.raw_allocation_site_stats()
-    }
-
-    fn prepare_mapped_growth(
-        &self,
-        bytes: u64,
-        role: onnx_runtime_memory_api::MemoryRole,
-    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
-        if bytes == 0 || !dynamic_lending_enabled() || self.managed_vmm().is_none() {
-            return Ok(None);
-        }
-        let Some(governor) = self.governor.as_deref() else {
-            eprintln!(
-                "cuda_ep: WARNING: dynamic mapped growth requested without an authority \
-                 participant; continuing with ordinary allocator admission"
-            );
-            return Ok(None);
-        };
-        let mut requesters = self
-            .attribution
-            .requesters
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Content roles remain distinct in their leases and metrics, but every
-        // allocation in this suballocating arena shares one mapped allowance.
-        let role = mapped_attribution_role(role);
-        let requester = match requesters.entry(role) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let holder = match role {
-                    onnx_runtime_memory_api::MemoryRole::KvCache => {
-                        onnx_runtime_memory_governor::HolderId::new(65)
-                    }
-                    _ => onnx_runtime_memory_governor::HolderId::new(66),
-                };
-                entry.insert(
-                    governor
-                        .reserve_mapped_allowance(
-                            onnx_runtime_memory_api::Tier::Device,
-                            0,
-                            role,
-                            holder,
-                        )
-                        .map_err(EpError::Memory)?,
-                )
-            }
-        };
-        governor
-            .prepare_mapped_growth(requester, bytes)
-            .map(Some)
-            .map_err(EpError::Memory)
     }
 
     fn release_mapped_growth(&self, bytes: u64, role: onnx_runtime_memory_api::MemoryRole) {
@@ -5637,7 +5756,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     /// False only when a caller has injected an allocator that takes physical
     /// memory at the moment it is asked for, the way `cuMemAlloc` does.
     fn commits_on_demand(&self) -> bool {
-        self.memory().commits_on_demand()
+        self.allocation_domain.memory().commits_on_demand()
     }
 
     fn set_weight_residency_budget(&self, budget_bytes: u64) -> Result<Option<u64>> {
@@ -5661,7 +5780,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         tier: onnx_runtime_memory_api::Tier,
         holder: onnx_runtime_memory_governor::HolderId,
     ) -> Result<u64> {
-        if let Some(arena) = self.memory.vmm() {
+        if let Some(arena) = self.allocation_domain.memory.vmm() {
             if let Some(authority) = arena.physical_pool_authority()
                 && authority != governor.authority_id(tier)
             {
@@ -5746,7 +5865,7 @@ impl Drop for CudaExecutionProvider {
     /// and every request's ownership, so pending releases complete after this
     /// returns. Nothing here panics, synchronizes, or joins a thread.
     fn drop(&mut self) {
-        self.closed.store(true, Ordering::Release);
+        self.allocation_domain.closed.store(true, Ordering::Release);
         // Graph executables are the final owners of any sealed allocations whose
         // addresses they embedded. Destroy both slots while the release queue is
         // still open so those owners can enqueue exactly-once, stream-ordered
@@ -5758,8 +5877,8 @@ impl Drop for CudaExecutionProvider {
         // queue is closed: nothing else can reach this provider afterwards.
         self.retire_residency();
         self.arm_memory_cleanup();
-        self.release_queue.close_after_drain();
-        self.release_queue.poll();
+        self.allocation_domain.release_queue.close_after_drain();
+        self.allocation_domain.release_queue.poll();
         self.report_release_state("provider teardown");
     }
 }
@@ -5832,7 +5951,10 @@ mod tests {
         let before = manager.snapshot().unwrap().allocations.len();
         let counts = provider.device_allocation_counts().unwrap();
         let transfers = runtime.transfer_counts();
-        provider.fail_next_allocation.store(true, Ordering::Release);
+        provider
+            .allocation_domain
+            .fail_next_allocation
+            .store(true, Ordering::Release);
         let exclusion = onnx_runtime_cuda_memory::capture_gate::CaptureExclusion::acquire();
         runtime
             .stream()
@@ -5849,7 +5971,10 @@ mod tests {
             assert!(error.to_string().contains("capture"), "{error}");
         }
         assert!(
-            provider.fail_next_allocation.load(Ordering::Acquire),
+            provider
+                .allocation_domain
+                .fail_next_allocation
+                .load(Ordering::Acquire),
             "capture refusal cannot consume the next real allocation's injected failure"
         );
         assert_eq!(manager.snapshot().unwrap().allocations.len(), before);
@@ -5865,7 +5990,12 @@ mod tests {
             provider.upload_sealed(&bytes, 256).err().unwrap(),
             EpError::OutOfMemory { .. }
         ));
-        assert!(!provider.fail_next_allocation.load(Ordering::Acquire));
+        assert!(
+            !provider
+                .allocation_domain
+                .fail_next_allocation
+                .load(Ordering::Acquire)
+        );
         assert_eq!(manager.snapshot().unwrap().allocations.len(), before);
 
         let owner = provider.upload_sealed(&bytes, 256).unwrap();
@@ -6170,7 +6300,11 @@ extern "C" __global__ void spin_delay(long long spin) {
             residency.stable_va_paging_active(),
             "the governed no-pool VMM path must still install stable-VA weight paging"
         );
-        let arena = provider.memory.vmm().expect("built-in VMM allocator");
+        let arena = provider
+            .allocation_domain
+            .memory
+            .vmm()
+            .expect("built-in VMM allocator");
         assert!(
             arena.physical_pool_stats().is_none(),
             "premise: this covers the no-pool governed VMM path"
@@ -6238,7 +6372,13 @@ extern "C" __global__ void spin_delay(long long spin) {
             residency.stable_va_paging_active(),
             "the governed no-pool VMM path must still install stable-VA weight paging"
         );
-        let arena = Arc::clone(provider.memory.vmm().expect("built-in VMM allocator"));
+        let arena = Arc::clone(
+            provider
+                .allocation_domain
+                .memory
+                .vmm()
+                .expect("built-in VMM allocator"),
+        );
         assert!(
             arena.physical_pool_stats().is_none(),
             "premise: this covers the no-pool governed VMM path"
@@ -6891,12 +7031,14 @@ extern "C" __global__ void spin_delay(long long spin) {
         let provider = CudaExecutionProvider::new(0).expect("public CUDA provider");
         assert!(
             provider
+                .allocation_domain
                 .memory
                 .vmm()
                 .is_some_and(|arena| arena.physical_pool_stats().is_some()),
             "public constructor must use the configured physical pool"
         );
         let stats = provider
+            .allocation_domain
             .memory
             .vmm()
             .and_then(|arena| arena.physical_pool_stats())
@@ -7126,6 +7268,7 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
             "the VMM arena, not the cuMemAlloc path, must serve allocations on the plugin path"
         );
         let stats = provider
+            .allocation_domain
             .memory
             .vmm()
             .and_then(|arena| arena.physical_pool_stats())
@@ -7181,6 +7324,7 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         )
         .expect("governed VMM provider");
         provider
+            .allocation_domain
             .attribution
             .requesters
             .lock()
@@ -7218,6 +7362,7 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
                 .expect("governed workspace");
             let ordinary = provider.allocate(4096, 256).expect("ordinary neighbor");
             let requester = provider
+                .allocation_domain
                 .attribution
                 .allowance(zone_role)
                 .expect("canonical arena allowance");
@@ -7340,6 +7485,7 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         .expect("first provider");
         let runtime = first.runtime().clone();
         let stats = first
+            .allocation_domain
             .memory
             .vmm()
             .and_then(|arena| arena.physical_pool_stats())
