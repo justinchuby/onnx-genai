@@ -357,6 +357,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "ArgMax",
     "ArgMin",
     "GatherND",
+    "DepthToSpace",
     "SpaceToDepth",
     "EyeLike",
     "Pad",
@@ -558,6 +559,7 @@ static CUDA_EINSUM_DTYPES: &[DataType] = &[
 pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     match (op_type, domain) {
         ("Gemm", "" | "ai.onnx") => gemm::DTYPES,
+        ("DepthToSpace" | "SpaceToDepth", "" | "ai.onnx") => onnx_runtime_ir::space_depth::DTYPES,
         ("BitCast", "") => BIT_CAST_TYPES,
         ("CumProd", "") => CUM_PROD_TYPES,
         ("DFT", "") => CUDA_DFT_DTYPES,
@@ -981,13 +983,15 @@ pub(crate) fn build_cuda_registry_for_contract(
             }),
         );
     }
-    reg.register(
-        OpKey::new("SpaceToDepth", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(structural::SpaceToDepthFactory {
-            runtime: runtime.clone(),
-        }),
-    );
+    for op in ["DepthToSpace", "SpaceToDepth"] {
+        reg.register(
+            OpKey::new(op, "", 1),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(structural::SpaceDepthFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+    }
     reg.register(
         OpKey::new("EyeLike", "", 9),
         onnx_runtime_ep_api::WorkspacePlanning::None,

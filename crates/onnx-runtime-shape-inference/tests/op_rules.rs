@@ -3042,7 +3042,7 @@ fn depth_to_space_known_dims_and_modes_across_schema_versions() {
     assert_eq!(out_shape(&outs), vec![c(2), c(3), c(10), c(14)]);
     assert_eq!(out_dtype(&outs), DataType::Uint8);
 
-    for opset in [11, 13] {
+    for opset in [11, 13, 28] {
         for mode in ["DCR", "CRD"] {
             let n = with_attr(
                 with_attr(node("DepthToSpace", 1, 1), "blocksize", Attribute::Int(2)),
@@ -3080,8 +3080,17 @@ fn depth_to_space_rejects_non_divisible_channels() {
 
 #[test]
 fn space_to_depth_known_dims_across_schema_versions() {
-    for opset in [1, 13] {
-        let n = with_attr(node("SpaceToDepth", 1, 1), "blocksize", Attribute::Int(2));
+    for (opset, mode) in [
+        (1, None),
+        (13, None),
+        (28, None),
+        (28, Some("DCR")),
+        (28, Some("CRD")),
+    ] {
+        let mut n = with_attr(node("SpaceToDepth", 1, 1), "blocksize", Attribute::Int(2));
+        if let Some(mode) = mode {
+            n = with_attr(n, "mode", Attribute::String(mode.as_bytes().to_vec()));
+        }
         let outs = run(
             &n,
             vec![tin(DataType::Int32, vec![c(2), c(3), c(10), c(14)])],
@@ -3089,6 +3098,27 @@ fn space_to_depth_known_dims_across_schema_versions() {
         );
         assert_eq!(out_shape(&outs), vec![c(2), c(12), c(5), c(7)]);
         assert_eq!(out_dtype(&outs), DataType::Int32);
+    }
+}
+
+#[test]
+fn spatial_rearrangements_validate_mode_at_effective_opset() {
+    for (op, first) in [("DepthToSpace", 11), ("SpaceToDepth", 28)] {
+        let mut n = with_attr(
+            with_attr(node(op, 1, 1), "blocksize", Attribute::Int(2)),
+            "mode",
+            Attribute::String(b"CRD".to_vec()),
+        );
+        let inputs = || vec![f32in(vec![c(1), c(8), c(4), c(6)])];
+        let err = try_run(&n, inputs(), first - 1).unwrap_err().to_string();
+        assert!(err.contains("'mode' is not defined"), "{err}");
+        n.version = Some(first as i64);
+        assert!(try_run(&n, inputs(), first - 1).is_ok());
+        for value in [Attribute::String(b"crd".to_vec()), Attribute::Int(1)] {
+            n.attributes.insert("mode".into(), value);
+            let err = try_run(&n, inputs(), first).unwrap_err().to_string();
+            assert!(err.contains("must be DCR or CRD"), "{err}");
+        }
     }
 }
 
@@ -7479,6 +7509,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "DepthToSpace", 1),
     ("", "DepthToSpace", 11),
     ("", "DepthToSpace", 13),
+    ("", "DepthToSpace", 28),
     ("", "DequantizeLinear", 10),
     ("", "DequantizeLinear", 13),
     ("", "DequantizeLinear", 19),
@@ -7644,6 +7675,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Softsign", 1),
     ("", "SpaceToDepth", 1),
     ("", "SpaceToDepth", 13),
+    ("", "SpaceToDepth", 28),
     ("", "Split", 1),
     ("", "SplitToSequence", 11),
     ("", "Sqrt", 1),

@@ -381,6 +381,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("OneHot", "")
         | ("Dropout", "")
         | ("Unique", "") => ALL_DTYPES,
+        ("DepthToSpace" | "SpaceToDepth", "" | "ai.onnx") => onnx_runtime_ir::space_depth::DTYPES,
 
         ("StringConcat", "") => STRING_ONLY,
         ("RegexFullMatch", "") => STRING_BOOL_DTYPES,
@@ -614,7 +615,6 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("AffineGrid", "")
         | ("Col2Im", "")
         | ("CenterCropPad", "")
-        | ("SpaceToDepth", "")
         | ("BatchNormalization", "")
         | ("InstanceNormalization", "")
         | ("GroupNormalization", "")
@@ -762,7 +762,7 @@ operator_group_modules!(
     pooling,
     resize,
     roi_align,
-    space_to_depth,
+    space_depth,
 );
 
 #[cfg(all(feature = "ops-cnn", feature = "mlas"))]
@@ -1050,11 +1050,13 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(pooling::GlobalLpPoolFactory),
     );
-    registry.register(
-        OpKey::new("SpaceToDepth", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(space_to_depth::SpaceToDepthFactory),
-    );
+    for op in ["DepthToSpace", "SpaceToDepth"] {
+        registry.register(
+            OpKey::new(op, "", 1),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(space_depth::SpaceDepthFactory),
+        );
+    }
     // BatchNormalization inference semantics are stable since opset 7, when
     // the legacy `is_test` attribute was removed.
     registry.register(

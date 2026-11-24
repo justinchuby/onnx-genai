@@ -84,6 +84,7 @@ const DECLINED: &[(&str, &str)] = &[
     ("", "LpPool"),
     ("", "MaxPool"),
     ("", "SpaceToDepth"),
+    ("", "DepthToSpace"),
     //       Inferrable from attributes or a fixed rule.
     ("", "ArgMax"), // reduce over `axis`, honouring `keepdims`
     ("", "ArgMin"),

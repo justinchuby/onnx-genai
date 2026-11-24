@@ -3194,6 +3194,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     // Batch 6 (issue #67): model-shaping/indexing structural operators.
     p.push(sweep("GatherND", gather_nd_cases()));
     p.push(sweep("SpaceToDepth", space_to_depth_cases()));
+    p.push(dedicated(
+        "DepthToSpace",
+        "cuda_conformance_gpu.rs",
+        "Independent DCR/CRD value fixtures in space_depth_modes_match_onnx",
+    ));
     p.push(sweep("EyeLike", eye_like_cases()));
 
     // Batch 7 (issue #67): general padding/cropping and sequence construction.
@@ -3944,6 +3949,69 @@ fn resize_19_symmetric_matches_onnx_and_cpu() {
         );
     }
 }
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn space_depth_modes_match_onnx() {
+    let ep = require_cuda();
+    let values: Vec<f32> = (0..16).map(|value| value as f32).collect();
+    for (op, src, dst, dcr, crd) in [
+        (
+            "SpaceToDepth",
+            [1, 2, 2, 4],
+            [1, 8, 1, 2],
+            [
+                0., 2., 8., 10., 1., 3., 9., 11., 4., 6., 12., 14., 5., 7., 13., 15.,
+            ],
+            [
+                0., 2., 1., 3., 4., 6., 5., 7., 8., 10., 9., 11., 12., 14., 13., 15.,
+            ],
+        ),
+        (
+            "DepthToSpace",
+            [1, 8, 1, 2],
+            [1, 2, 2, 4],
+            [
+                0., 4., 1., 5., 8., 12., 9., 13., 2., 6., 3., 7., 10., 14., 11., 15.,
+            ],
+            [
+                0., 2., 1., 3., 4., 6., 5., 7., 8., 10., 9., 11., 12., 14., 13., 15.,
+            ],
+        ),
+    ] {
+        for (opset, mode, expected) in [
+            (1, None, dcr),
+            (28, None, dcr),
+            (28, Some("DCR"), dcr),
+            (28, Some("CRD"), crd),
+        ] {
+            let mut attrs = vec![("blocksize", Attribute::Int(2))];
+            if let Some(mode) = mode {
+                attrs.push(("mode", Attribute::String(mode.as_bytes().to_vec())));
+            }
+            let case = Case {
+                label: format!("{op}-{opset}[{mode:?}]"),
+                op,
+                domain: "",
+                opset,
+                inputs: vec![input(DataType::Float32, &src, &values)],
+                outputs: vec![(DataType::Float32, dst.to_vec())],
+                attrs,
+                compare: Compare::ExactBytes,
+            };
+            let output = run_case(&ep, &case);
+            assert_eq!(
+                decode_floats(&output[0], DataType::Float32),
+                expected,
+                "{}",
+                case.label
+            );
+        }
+    }
+}
+
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"

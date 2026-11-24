@@ -595,6 +595,16 @@ impl ExecutionProvider for CpuExecutionProvider {
         if let Some(reason) = factory.unsupported_reason(op, opset, shapes, input_dtypes) {
             return KernelMatch::unsupported(reason);
         }
+        if onnx_runtime_ir::space_depth::Direction::from_node(op).is_some()
+            && let Err(reason) = onnx_runtime_ir::space_depth::SpaceDepth::validate_claim(
+                op,
+                opset,
+                shapes,
+                input_dtypes,
+            )
+        {
+            return KernelMatch::unsupported(format!("{}: {reason}", op.op_type));
+        }
         if op.op_type == "GatherND"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(&dtype) = input_dtypes.get(1)

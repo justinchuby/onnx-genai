@@ -66,6 +66,7 @@ pub const CPU_OPERATOR_CATALOG: &[OperatorCatalogEntry] = &[
     entry("", "Conv", 1, OPS_CNN),
     entry("", "ConvTranspose", 1, OPS_CNN),
     entry("", "DeformConv", 19, OPS_CNN),
+    entry("", "DepthToSpace", 1, OPS_CNN),
     entry("", "GlobalAveragePool", 1, OPS_CNN),
     entry("", "GlobalMaxPool", 1, OPS_CNN),
     entry("", "GlobalLpPool", 2, OPS_CNN),
@@ -77,7 +78,7 @@ pub const CPU_OPERATOR_CATALOG: &[OperatorCatalogEntry] = &[
     entry("", "MaxPool", 1, OPS_CNN),
     entry("", "PRelu", 16, OPS_CNN),
     entry("", "Resize", 10, OPS_CNN),
-    entry("", "SpaceToDepth", 13, OPS_CNN),
+    entry("", "SpaceToDepth", 1, OPS_CNN),
 ];
 
 const fn entry(
