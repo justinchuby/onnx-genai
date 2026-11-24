@@ -1484,3 +1484,193 @@ restacked unchanged onto current main and the full functional graph passed
 again. A private versioned-inference-row name addresses an inherited strict
 lint without changing registration behavior. Per owner instruction this work
 does not wait for blocked remote CI.
+
+### Lazy grammar activation in progress
+
+The raw grammar engine now has an explicit resolved-token activation entry
+point. Before a trigger is accepted it leaves valid vocabulary candidates,
+including endings, unconstrained. The trigger itself starts the constrained
+history, retaining its model token identity rather than converting it to text.
+Activation is derived from each supplied history, so replacement and speculative
+rollback can return to an untriggered state. Invalid committed suffixes remain
+errors and the existing parser reset permits recovery with a valid history.
+
+This is an engine prerequisite, not completed server support. Server admission
+still rejects active lazy requests until all trigger modes and their tokenizer
+resolution are integrated. The pinned upstream
+[`common/sampling.cpp`](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/sampling.cpp)
+resolves a single-token word into a preserved-token trigger; multi-token words
+remain literal patterns. Token triggers take precedence over patterns in each
+accepted token. Pattern order is configuration order, and replay starts at the
+first nonempty capture, or the full match when none is nonempty. As shown in
+[`src/llama-grammar.cpp`](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-grammar.cpp),
+a replay start can fall inside a token: the first piece is truncated while its
+original token identity survives. A synthetic text prefix alone cannot establish
+that contract for model-token references. Pattern matching also uses byte-based
+ECMAScript regex semantics, which must not silently become Unicode Rust regex
+semantics. The upstream raw `%llguidance` branch constructs its sampler before
+the GBNF lazy branch; its behavior needs separate conformance coverage.
+
+Four selected activation tests passed, including model-token references, root
+completion, rollback/replacement, invalid-history recovery and trigger vocabulary
+validation. The full engine library regression passed: 956 tests and one
+inherited ignore. Strict engine all-target Clippy and formatting passed.
+Word/pattern activation, partial-token replay, reasoning
+suppression, server mapping and real HTTP conformance remain required.
+
+### Token-aware GBNF replay prerequisite
+
+A raw replay cursor now compiles the existing bounded GBNF syntax tree into
+explicit scalar/token states. Token-reference branches inspect the original
+model token ID even when a trigger truncates its piece, including a truncation
+inside UTF-8. Character branches instead consume the supplied bytes. Ambiguous
+text and token branches survive independently, and cursor clones provide
+independent rollback checkpoints. Character classes, finite/unbounded repetition
+and consuming recursion use the existing parser's validation. Pending Unicode
+prefixes are checked against the next scalar ranges before being admitted.
+
+Expansion checks bound queued and visited stack cells before queue insertion;
+accepted replay has a separate explicit byte budget. A rejected piece or budget
+error leaves the previous cursor unchanged. This provides the missing replay
+capability without mutating llguidance's private token history or replacing a
+model-token reference with synthetic text. It is still a prerequisite: the
+server's active lazy admission remains closed until trigger matching, vocabulary
+resolution and request/runtime integration are complete.
+
+Nine selected tests passed. Besides the truncated-token and Unicode cases, they
+cover ambiguity, independent clones, rejection recovery, finite repetition, byte
+budget failures and bounded ambiguous recursive expansion. A cross-check walks
+accepted histories and compares each next-token decision with the current
+llguidance backend for five grammars covering character classes, recursion,
+repetition, positive token references and negated token references. This is
+regression evidence for those complete-token cases, not a claim of full upstream
+or HTTP conformance.
+
+The final engine regression passed 965 tests / one inherited ignore. Strict
+engine all-target Clippy, formatting and diff checks passed on this replay
+implementation. No active server lazy behavior is claimed by those checks.
+
+### Byte-oriented trigger pattern matching in progress
+
+The trigger matcher now explicitly translates the admitted C-locale
+`std::regex<char>` ECMAScript syntax into the bounded `fancy-regex` backend
+already present in the dependency graph. Each original input byte is represented
+by one Latin-1 scalar; captures are converted back to original byte offsets.
+ASCII word boundaries and character classes do not inherit Unicode semantics.
+Dot excludes both CR and LF. C-locale named character classes, empty/negated
+empty classes, control escapes and byte-narrowed Unicode escapes have explicit
+translations. Backend-only group extensions and references preceding their
+captures are rejected. Unmatched/open capture references retain the upstream
+nonmatching behavior.
+
+The matcher selects the first nonempty captured group, falling back to the
+whole match. Captures inside lookahead can therefore move the replay start
+beyond the whole match. A pattern with leading `^` and trailing `$` uses actual
+complete matching with alternative backtracking, rather than post-filtering
+one shorter search result. A standalone harness running the pinned upstream
+`llama_grammar_trigger_pattern::find` supplied the capture and invalid-syntax
+expectations used by the Rust tests. The harness also exposed JavaScript
+backreference/extension differences in a separate candidate library; that
+library was not added to the repository.
+
+Compilation limits include 128 group nesting levels, 1024 captures, repetition
+bounds of 2000 and a one-MiB translated-program budget. Matching has a one-million
+backtrack limit and the explicit input byte budget. Exhaustion is an actionable
+error, not a fabricated nonmatch. Seven selected matcher tests passed, including
+resource rejection and a catastrophically backtracking expression. The full
+engine regression passed 972 tests / one inherited ignore.
+Final strict engine all-target Clippy, formatting and diff checks passed.
+Character classes separately cap their collected ranges at 65536 items.
+
+This matcher is not yet connected to active lazy server admission. Production
+trigger resolution, token-aware constraint ownership, reasoning suppression and
+HTTP conformance remain open. C++ collating/equivalence bracket forms also still
+need explicit conformance and implementation; the current matcher does not
+establish complete coverage of every platform-specific std::regex extension.
+
+### Runtime lazy-GBNF integration — self-review in progress
+
+Typed nonempty `GrammarActivation` and four `GrammarTrigger` variants now lower
+through the actual processor chain and HTTP request builders. The runtime
+preserves trigger priority and authored pattern order, uses model-backed word
+resolution, replays truncated token pieces and reconstructs activation after
+rollback. Combined source/program/history budgets are enforced. Errors retain
+the original `grammar_triggers[index]` even after token triggers are separated
+from patterns. The earlier token-only llguidance activation path was removed;
+the unified runtime owns activation.
+
+A protocol-only reasoning cursor reuses the existing reasoning machine. It
+hides accepted thinking tokens from the lazy grammar, suppresses its mask while
+reasoning is active, and replays the complete matched ending sequence. The
+matcher retains its original sequences to recover the longest matched closer.
+Forced-history validation remains with the existing budget processor; the
+grammar cursor does not reinterpret old accepted tokens with the current live
+control revision. Unit coverage includes manual control, finite budgets, partial
+closers, existing prefill, longest endings and speculative rollback.
+
+Positive validation passed before the additional adversarial matcher case:
+engine 978 / one inherited ignore, server 451 / two inherited ignores, HTTP 37,
+CLI 71 and both profile subprocesses. Strict engine/server/CLI all-target Clippy
+with the ORT CUDA feature and formatting passed. Real Native and ORT HTTP tests
+cover all four trigger tags on five route spellings, buffered and SSE output,
+pre-SSE invalid-field rejection, reasoning-budget-zero closure and the pinned
+raw-Lark behavior. These are functional CPU tests, not performance/GPU claims.
+
+The change is not ready to merge. Independent upstream std::regex comparison
+found that `x(?:(a)|b)+` on `xab` must clear its capture in the final repetition
+and return byte offset 0; the current fancy-regex backend returns 1. Finite and
+unbounded repetition and a backreference variant reproduce the same semantic
+gap. The formal capture-oracle regression now selects one test and fails on
+this mismatch. Correct repetition capture clearing is required before landing;
+passing ordinary HTTP cases does not establish that compatibility.
+
+### Byte-native trigger VM replaces backend capture semantics
+
+The independent capture-reset failure above is addressed by an owned byte VM,
+rather than translating captures through a general regex backend. Repetition
+clears the capture span of its body before each iteration; an unset
+backreference fails. Lookahead owns an atomic choice stack and shares the
+execution budget. Full matching backtracks before rejecting a partial match.
+Byte classes, captures and anchors operate directly on the original byte buffer.
+The engine no longer directly depends on fancy-regex for this feature.
+
+Execution bounds cover shared instruction fuel and live choice/capture/operation
+cells, including nested lookahead and backreference comparisons. Compilation
+retains source, node, byte, capture, depth and repetition limits. A fixture from
+the pinned upstream find() function and libc++ ECMAScript enumerates 24 patterns
+against all 121 abx strings of length zero through four (2904 comparisons),
+covering nullable repetition, greediness, capture reset, lookahead and backrefs.
+These cases complement the original invalid syntax and resource-limit tests.
+
+### Recovery after a truncated UTF-8 token reference
+
+Self-review extended the production lazy-chain truncation case from a following
+raw token reference to a following literal. The previous implementation selected
+one test and failed: the accepted token reference's invalid byte suffix poisoned
+all later text, leaving no finite candidate. The pinned upstream decoder stores
+a negative remaining-byte count for that event, then decodes the next piece
+fresh; a harness copied from that decoder verifies the subsequent ASCII `B`.
+
+Replay now retains only a valid incomplete scalar between pieces. Invalid bytes
+can satisfy an explicit token terminal without permanently invalidating later
+scalar terminals. Current invalid scalar candidates still fail transactionally.
+The replay test covers continuation bytes, invalid leading bytes and malformed
+sequences, independent clones and recovery after rejecting a wrong next piece.
+The production processor-chain test now covers both token and literal successors
+when a byte pattern activates inside a multibyte model token.
+
+### Lazy raw GBNF validation completed
+
+The byte VM and UTF-8 recovery fixes passed the complete local functional graph
+on the current-main restack: engine 979 / one inherited ignore, server 451 / two
+inherited ignores, CLI 71, HTTP 37 and both CLI profile subprocesses. Strict
+engine/server/CLI all-target Clippy with the ORT CUDA feature, formatting and diff
+checks passed. The earlier capture/reset and truncated-byte failures above are
+resolved, with their regression coverage retained. Execution fuel also charges
+state/capture copying and sequence expansion, rather than just VM dispatch.
+
+PR #2525 lands this raw-GBNF compatibility increment after local self-review;
+the owner explicitly requested bypassing blocked remote CI. Lazy JSON, C++
+collating/equivalence classes, remaining model/slot/adapter protocols and complete
+Native Value/MTP isolation remain broader goal work. These CPU functional and
+compile checks do not establish GPU execution or performance results.

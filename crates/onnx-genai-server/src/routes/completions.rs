@@ -2299,6 +2299,7 @@ fn build_generate_options(
             }
         } else {
             GenerateConstraint::Gbnf {
+                activation: None,
                 grammar: grammar.clone(),
             }
         });
@@ -2484,6 +2485,28 @@ pub(super) fn build_generate_options_with_tokenizer(
             })?;
         if let [id] = ids.as_slice() {
             options.preserved_tokens.insert(*id);
+        }
+    }
+    if let Some(activation) = request.grammar_activation()? {
+        if matches!(options.constraint, Some(GenerateConstraint::Gbnf { .. })) {
+            activation.validate_with_tokenizer(
+                tokenizer,
+                options.max_constraint_bytes,
+                &options.effective_preserved_tokens(),
+            )?;
+            if request.grammar_lazy
+                && let Some(GenerateConstraint::Gbnf {
+                    activation: selected,
+                    ..
+                }) = &mut options.constraint
+            {
+                *selected = Some(activation);
+            }
+        } else {
+            // The pinned raw-Lark sampler bypasses lazy token/pattern effects,
+            // while common word-trigger resolution still checks preservation.
+            activation
+                .validate_words_with_tokenizer(tokenizer, &options.effective_preserved_tokens())?;
         }
     }
     options.validate_preserved_tokens(tokenizer)?;

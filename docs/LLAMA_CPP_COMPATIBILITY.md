@@ -501,9 +501,48 @@ Non-byte contextual decoders and stream-initial stripping currently return an
 actionable capability error before SSE.
 
 Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and
-`ignore_eos=true`. Neutral `grammar_lazy=false`, `grammar_triggers=[]` and
-`preserved_tokens=[]` are accepted. Active lazy grammars and triggers remain
-open compatibility work. Request-local token preservation is described below. Native probability reporting is described below.
+`ignore_eos=true`. Raw GBNF accepts `grammar_lazy=true` with nonempty
+`grammar_triggers`. The native numeric trigger tags are 0 (token: requires
+`token` and a string `value`), 1 (word), 2 (pattern), and 3 (full pattern).
+Token triggers take precedence over patterns on each accepted token; patterns
+are checked in configuration order. The trigger itself belongs to the grammar.
+A pattern starts replay at its first nonempty capture, or the complete match
+when all captures are empty. Replay retains the original model token identity
+even when that byte offset falls inside a token. Full patterns match the entire
+unconstrained buffer. Matching uses explicit C-locale byte semantics and bounded
+backtracking; Unicode text matching and backend-only pattern extensions are not
+silently substituted.
+
+A word resolving to one model token must also occur in `preserved_tokens`;
+multitoken words use literal byte matching. Before activation the grammar does
+not constrain vocabulary candidates or EOS. After activation, ending roles
+require a completed root. Reasoning budgets suppress the lazy grammar while the
+thinking block is active and replay its complete matched closing sequence when
+reasoning ends; that sequence can activate the grammar. Speculative rollback
+and replacement reconstruct activation from the surviving history.
+
+For example, these request fields allow a free prefix before a constrained
+answer (alongside the route's normal prompt/messages fields):
+
+```json
+{
+  "grammar": "root ::= \"ANSWER:\" [a-z]+",
+  "grammar_lazy": true,
+  "grammar_triggers": [{"type": 1, "value": "ANSWER:"}],
+  "preserved_tokens": ["ANSWER:"]
+}
+```
+
+As in the pinned upstream sampler, raw `%llguidance` Lark remains eager and
+ignores lazy token/pattern effects, while tokenizer-level word preservation is
+still validated. Lazy JSON `response_format` without a raw GBNF grammar is still
+unsupported and returns a pre-SSE error. Collating/equivalence bracket forms are
+also explicitly unsupported. Trigger source/input bytes, combined translated
+program size, captures, nesting, repetitions, character-class items, history
+length and backtracking have declared bounds; exhaustion is an actionable error.
+Neutral `grammar_lazy=false`, `grammar_triggers=[]` and `preserved_tokens=[]`
+remain accepted. Request-local token preservation and native probability
+reporting are described below.
 
 
 ## Native token probabilities

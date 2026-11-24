@@ -761,20 +761,18 @@ impl Constraint for LlguidanceConstraint {
         context: &ProcessorContext,
         candidates: &[TokenCandidate],
     ) -> anyhow::Result<Vec<bool>> {
+        let history = context.generated_tokens.as_slice();
         let mut inner = self.inner.lock().map_err(|_| {
             anyhow::anyhow!(
                 "{} parser lock is poisoned; restart this generation with a fresh grammar state",
                 self.name()
             )
         })?;
-        if !context
-            .generated_tokens
-            .starts_with(&inner.committed_tokens)
-        {
+        if !history.starts_with(&inner.committed_tokens) {
             inner.reset();
         }
         let result = (|| -> anyhow::Result<Vec<bool>> {
-            for &token in &context.generated_tokens[inner.committed_tokens.len()..] {
+            for &token in &history[inner.committed_tokens.len()..] {
                 anyhow::ensure!(
                     (token as usize) < self.sampled_vocab_size,
                     "grammar history token {token} is outside the sampled vocabulary of {} entries; repair generated history or its tokenizer",
@@ -826,7 +824,7 @@ impl Constraint for LlguidanceConstraint {
                 format!(
                     "compute {} after {} generated tokens",
                     self.name(),
-                    context.generated_tokens.len()
+                    history.len()
                 )
             })?;
             if step.is_stop() {

@@ -1711,13 +1711,64 @@ pub(crate) enum TextGrammar {
     Lark(String),
 }
 
+/// Authored raw-grammar activation conditions, resolved against the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrammarTrigger {
+    Token(TokenId),
+    Word(String),
+    Pattern(String),
+    PatternFull(String),
+}
+
+/// A nonempty, bounded set of lazy activation conditions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrammarActivation {
+    triggers: Vec<GrammarTrigger>,
+}
+impl GrammarActivation {
+    pub fn new(triggers: Vec<GrammarTrigger>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !triggers.is_empty(),
+            "lazy grammar has no triggers; provide at least one token, word or pattern trigger"
+        );
+        anyhow::ensure!(
+            triggers.len() <= 1024,
+            "lazy grammar exceeds 1024 triggers; combine patterns or use fewer triggers"
+        );
+        Ok(Self { triggers })
+    }
+    pub fn validate_with_tokenizer(
+        &self,
+        tokenizer: &onnx_genai_ort::Tokenizer,
+        max_bytes: usize,
+        preserved: &BTreeSet<TokenId>,
+    ) -> anyhow::Result<()> {
+        crate::gbnf::lazy::validate_activation(tokenizer, self, max_bytes, preserved)
+    }
+    /// Validate only the tokenizer-level word contract for samplers whose
+    /// upstream raw-Lark path intentionally ignores lazy pattern/token effects.
+    pub fn validate_words_with_tokenizer(
+        &self,
+        tokenizer: &onnx_genai_ort::Tokenizer,
+        preserved: &BTreeSet<TokenId>,
+    ) -> anyhow::Result<()> {
+        crate::gbnf::lazy::validate_words(tokenizer, self, preserved)
+    }
+    pub fn triggers(&self) -> &[GrammarTrigger] {
+        &self.triggers
+    }
+}
+
 /// Built-in constrained decoding grammars. Prefix fields apply to raw text;
 /// leave them empty when response_projection owns the declared assistant prefill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateConstraint {
     /// llama.cpp GBNF over the raw newly generated stream, including channel
     /// markers and model-token references. Assistant prefill is not consumed.
-    Gbnf { grammar: String },
+    Gbnf {
+        grammar: String,
+        activation: Option<GrammarActivation>,
+    },
     /// Raw llguidance Lark over new model output, without assistant-prefill
     /// consumption or response-content projection. Keep the %llguidance header.
     RawLark { grammar: String },
