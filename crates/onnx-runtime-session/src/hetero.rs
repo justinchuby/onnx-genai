@@ -866,10 +866,10 @@ pub(crate) fn validate_top_level_tensor_graph(graph: &Graph) -> Result<()> {
                 ),
             });
         }
-        if crate::executor::is_sequence_op(&node.op_type, &node.domain) {
+        if crate::executor::is_container_op(&node.op_type, &node.domain) {
             return Err(SessionError::HeterogeneousExecutionUnsupported {
                 placement_summary: format!(
-                    "node {} ({domain}::{}@{opset}) consumes or produces a sequence; the first \
+                    "node {} ({domain}::{}@{opset}) uses a structural container operator; the first \
                      execution slice supports tensor values only",
                     node_id.0, node.op_type
                 ),

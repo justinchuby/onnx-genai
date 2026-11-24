@@ -602,6 +602,8 @@ pub(crate) struct Executor {
     /// build; these values own no [`DeviceBuffer`] and are skipped by buffer
     /// sizing — their storage lives in [`Self::sequences`] at run time.
     pub(super) sequence_values: HashSet<ValueId>,
+    pub(super) optional_values: HashMap<ValueId, super::optional_ops::PayloadKind>,
+    pub(super) optionals: HashMap<ValueId, Option<super::optional_ops::OptionalPayload>>,
     /// Most recent activation-memory planner result from a measured top-level
     /// eager run once shapes and view aliases are concrete. Stage-2 replay and
     /// nested runs skip re-planning and leave this as the last measured top-level

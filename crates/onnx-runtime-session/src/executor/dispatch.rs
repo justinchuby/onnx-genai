@@ -177,6 +177,11 @@ impl Executor {
         };
         if is_control_flow {
             self.exec_control_flow(pi, resolved, outer_scope, external)
+        } else if optional_ops::is_optional_op(
+            &self.graph.node(self.plan[pi].node_id).op_type,
+            &self.graph.node(self.plan[pi].node_id).domain,
+        ) {
+            self.exec_optional_node(pi, resolved, external)
         } else if is_sequence {
             self.exec_sequence_node(pi, resolved, external)
         } else {

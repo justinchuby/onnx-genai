@@ -870,6 +870,10 @@ pub(crate) fn is_sequence_op(op_type: &str, domain: &str) -> bool {
         )
 }
 
+pub(crate) fn is_container_op(op_type: &str, domain: &str) -> bool {
+    is_sequence_op(op_type, domain) || optional_ops::is_optional_op(op_type, domain)
+}
+
 fn heterogeneous_api_error(operation: &str) -> SessionError {
     SessionError::HeterogeneousExecutionUnsupported {
         placement_summary: format!(
@@ -1102,6 +1106,7 @@ mod capture;
 mod control_flow;
 mod dispatch;
 pub(crate) mod host_strings;
+mod optional_ops;
 mod platform;
 mod prefetch;
 mod run;

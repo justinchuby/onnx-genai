@@ -387,7 +387,7 @@ fn check_operator_coverage(
         if graph_claims.contains(node_id)
             || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
-            || is_sequence_op(&node.op_type, &node.domain)
+            || is_container_op(&node.op_type, &node.domain)
         {
             continue;
         }
@@ -563,7 +563,7 @@ pub(super) fn collect_cuda_coverage_issues(
         if graph_claims.contains(node_id)
             || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
-            || is_sequence_op(&node.op_type, &node.domain)
+            || is_container_op(&node.op_type, &node.domain)
         {
             continue;
         }
@@ -1387,8 +1387,10 @@ impl Executor {
         let has_symbols =
             Self::collect_value_metadata(&graph, &order, &mut value_shapes, &mut value_dtypes);
 
-        let (sequence_values, control_flow_output_values) =
+        let (mut sequence_values, control_flow_output_values) =
             Self::classify_special_values(&graph, &order);
+        let optional_values =
+            optional_ops::classify_optional_values(&graph, &order, &mut sequence_values)?;
         let all_value_ids = value_shapes.keys().copied().collect();
 
         // 3) Build the structural per-node plan.
@@ -1432,7 +1434,11 @@ impl Executor {
             string_initializers,
             string_values: HashMap::new(),
             buffer_shapes,
-            has_unknown_rank: value_shapes.values().any(Option::is_none),
+            has_unknown_rank: value_shapes.iter().any(|(vid, shape)| {
+                shape.is_none()
+                    && !sequence_values.contains(vid)
+                    && !optional_values.contains_key(vid)
+            }),
             value_shapes,
             value_dtypes,
             plan,
@@ -1452,6 +1458,8 @@ impl Executor {
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
+            optional_values,
+            optionals: HashMap::new(),
             activation_memory_plan: None,
             shared_buffers: HashMap::new(),
             parked_input_buffers: Vec::new(),
@@ -1731,7 +1739,9 @@ impl Executor {
         // (a wrapped `CycleDetected`, or an opset-import invariant instead of the
         // unsupported-operator error) with a structural error. Mirrors the
         // control-flow signature check above.
-        graph.topological_order()?;
+        let order = graph.topological_order()?;
+        let (mut sequences, _) = Self::classify_special_values(graph, &order);
+        optional_ops::classify_optional_values(graph, &order, &mut sequences)?;
         reject_unsupported_operators(graph, ep.as_ref(), ordered_probe)?;
         let graph_before_ep_passes = graph.clone();
         let ep_pass_nodes_before = graph.num_nodes();
@@ -2249,7 +2259,7 @@ impl Executor {
             // Sequence-typed values have no meaningful tensor shape and are
             // never buffer-sized; skip them so a static graph does not trip the
             // unresolved-shape check on a sequence value.
-            if self.sequence_values.contains(&vid) {
+            if self.is_container_value(vid) {
                 continue;
             }
             match shape.as_ref().and_then(|shape| substitute(shape, bindings)) {
@@ -2719,7 +2729,7 @@ impl Executor {
             }
             // Sequence-typed values own no tensor buffer (their list lives in
             // `sequences` at run time), so never size one for them.
-            if self.sequence_values.contains(&vid) {
+            if self.is_container_value(vid) {
                 continue;
             }
             let dtype = self.value_dtypes[&vid];
@@ -2798,7 +2808,7 @@ impl Executor {
             // Sequence ops are executor-handled (they operate on sequence-of-
             // tensor values, not tensor views) — they have no EP kernel and must
             // not be compiled here, exactly like control-flow ops.
-            if is_sequence_op(&node.op_type, &node.domain) {
+            if is_container_op(&node.op_type, &node.domain) {
                 if span.is_some() {
                     skipped_sequence += 1;
                 }
