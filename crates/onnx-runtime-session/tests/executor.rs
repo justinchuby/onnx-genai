@@ -1385,6 +1385,37 @@ fn standard_gelu_graph(opset: u64) -> Graph {
 }
 
 #[test]
+fn session_topk_bfloat16_requires_opset_24() {
+    let graph = |opset| {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), opset);
+        let x = input(&mut graph, "x", DataType::BFloat16, &[2]);
+        let k = i64_init(&mut graph, "k", &[1], &[1]);
+        let values = graph.create_named_value("values", DataType::BFloat16, static_shape([1]));
+        let indices = graph.create_named_value("indices", DataType::Int64, static_shape([1]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "TopK",
+            vec![Some(x), Some(k)],
+            vec![values, indices],
+        ));
+        graph.add_output(values);
+        graph.add_output(indices);
+        graph
+    };
+
+    let reason = match InferenceSession::from_graph(graph(23)) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a native session must reject BF16 TopK at opset 23"),
+    };
+    assert!(
+        reason.contains("TopK") && reason.contains("BFloat16") && reason.contains("opset 24"),
+        "{reason}"
+    );
+    InferenceSession::from_graph(graph(24)).expect("a native session must admit BF16 TopK-24");
+}
+
+#[test]
 fn too_new_kernel_is_declined_at_claim_time_with_actionable_reason() {
     let error = match InferenceSession::from_graph(standard_gelu_graph(19)) {
         Err(error) => error,
