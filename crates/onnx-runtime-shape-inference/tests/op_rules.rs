@@ -679,7 +679,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        303,
+        304,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -2728,6 +2728,22 @@ fn one_hot_inserts_known_depth_at_axis_for_opsets_9_and_11() {
             assert_eq!(out_dtype(&outs), DataType::Float16);
         }
     }
+}
+
+#[test]
+fn one_hot_opset28_infers_bf16_output_with_inserted_depth() {
+    let n = with_attr(node("OneHot", 3, 1), "axis", Attribute::Int(-2));
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Int64, vec![c(2), c(3)]),
+            sd_int_scalar(DataType::Int64, c(5)),
+            tin(DataType::BFloat16, vec![c(2)]),
+        ],
+        28,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(5), c(3)]);
+    assert_eq!(out_dtype(&outs), DataType::BFloat16);
 }
 
 #[test]
@@ -7658,6 +7674,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Not", 1),
     ("", "OneHot", 9),
     ("", "OneHot", 11),
+    ("", "OneHot", 28),
     ("", "Optional", 15),
     ("", "OptionalGetElement", 15),
     ("", "OptionalHasElement", 15),

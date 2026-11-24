@@ -1337,7 +1337,7 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
-    for (opset, wrap_negative) in [(9, false), (11, true)] {
+    for (opset, wrap_negative) in [(9, false), (11, true), (28, true)] {
         reg.register(
             OpKey::new("OneHot", "", opset),
             onnx_runtime_ep_api::WorkspacePlanning::None,

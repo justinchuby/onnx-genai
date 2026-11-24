@@ -20,6 +20,7 @@ pub(crate) fn unsupported_reason_at_opset(
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
+        "OneHot" => one_hot(node, opset, input_dtypes),
         "GridSample" => match conv_transpose_contract {
             super::conv_transpose::Contract::Standalone => {
                 super::grid_sample::validate_claim(node, opset, input_shapes, input_dtypes)
@@ -87,7 +88,6 @@ pub(crate) fn unsupported_reason(
         "Expand" => expand(node, input_dtypes),
         "ConstantOfShape" => constant_of_shape(node, input_dtypes),
         "Gelu" => gelu(node, input_dtypes),
-        "OneHot" => one_hot(node, input_dtypes),
         "SpaceToDepth" => legacy_space_to_depth(node, input_dtypes),
         "EyeLike" => eye_like(node, input_dtypes),
         "ReduceProd" | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum"
@@ -835,7 +835,7 @@ fn gelu(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     }
 }
 
-fn one_hot(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn one_hot(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 3, 1, 1)?;
     require_one_of(
         input_dtypes,
@@ -849,7 +849,8 @@ fn one_hot(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
         &[DataType::Int32, DataType::Int64],
         "depth",
     )?;
-    require_fixed_width(input_dtypes, 2, "values")
+    require_fixed_width(input_dtypes, 2, "values")?;
+    onnx_runtime_ep_api::one_hot::validate_values_dtype(opset, input_dtypes)
 }
 
 /// `ReduceProd`/`ReduceSumSquare`/`ReduceL1`/`ReduceL2`/`ReduceLogSum`/

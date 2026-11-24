@@ -2164,11 +2164,13 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(tensor_scatter::TensorScatterFactory),
     );
-    rec.register(
-        OpKey::new("OneHot", "", 11),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(onehot::OneHotFactory),
-    );
+    for version in [11, 28] {
+        rec.register(
+            OpKey::new("OneHot", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(onehot::OneHotFactory),
+        );
+    }
     rec.register(
         OpKey::new("BitShift", "", 11),
         onnx_runtime_ep_api::WorkspacePlanning::None,
