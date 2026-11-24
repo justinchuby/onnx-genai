@@ -913,11 +913,16 @@ pub(crate) fn run_declared_generation(
 
     // A core that scored each token already delivered it. Replaying the stream
     // here would double every token a server streamed.
+    let logprobs = core.as_deref().and_then(GenerationCore::logprobs);
     let already_streamed = core.as_deref().is_some_and(GenerationCore::streams_tokens);
     if let (Some(callback), false) = (callback.as_mut(), already_streamed) {
         let pieces = crate::tokenization::token_texts(tokenizer, &token_ids)?;
         for (index, (token_id, token_text)) in token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
+                logprob: logprobs
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .cloned(),
                 token_id,
                 text: token_text,
                 finish_reason: (index + 1 == token_ids.len()).then(|| finish_reason.clone()),
@@ -941,7 +946,7 @@ pub(crate) fn run_declared_generation(
         // Logprobs are the scoring core's record. A package whose sampler is an
         // ONNX component never scored on the host, so it has none to report —
         // which is a fact about the package, not a missing feature.
-        logprobs: core.as_deref().and_then(GenerationCore::logprobs),
+        logprobs,
         budget_cap: None,
     })
 }
