@@ -629,6 +629,8 @@ pub(crate) struct Executor {
     pub(super) pending_opaque_inputs: HashMap<ValueId, OpaqueValue>,
     /// Runtime-selected physical state policy; graph semantics remain unchanged.
     pub(super) state_config: StateRuntimeConfig,
+    /// Observational work counters for compact-visibility validation.
+    pub(super) attention_traversal_stats: crate::AttentionTraversalStats,
     /// Run-scoped **zero-copy** backing for a *tensor* value whose bytes are a
     /// shared sequence element (the output of `SequenceAt`): the tensor aliases
     /// the element's `Arc` instead of owning a `DeviceBuffer`, so no bytes are

@@ -33,6 +33,27 @@ fn tensor_type(dims: &[Option<i64>], dtype: i32) -> onnx::TypeProto {
     }
 }
 
+fn unbound_tensor_type(dims: &[Option<i64>], dtype: i32) -> onnx::TypeProto {
+    use onnx::tensor_shape_proto::{Dimension, dimension::Value};
+    onnx::TypeProto {
+        value: Some(onnx::type_proto::Value::TensorType(
+            onnx::type_proto::Tensor {
+                elem_type: dtype,
+                shape: Some(onnx::TensorShapeProto {
+                    dim: dims
+                        .iter()
+                        .map(|dim| Dimension {
+                            value: dim.map(Value::DimValue),
+                            ..Default::default()
+                        })
+                        .collect(),
+                }),
+            },
+        )),
+        ..Default::default()
+    }
+}
+
 fn opaque_type(name: &str) -> onnx::TypeProto {
     onnx::TypeProto {
         value: Some(onnx::type_proto::Value::OpaqueType(
@@ -161,6 +182,140 @@ fn ragged_attention_model() -> Vec<u8> {
         }],
         ..Default::default()
     })
+}
+
+fn packed_attention_model(compact_visibility: bool) -> Vec<u8> {
+    let packed = unbound_tensor_type(&[None, Some(1)], 1);
+    let offsets = unbound_tensor_type(&[None], 7);
+    let positions = unbound_tensor_type(&[None], 7);
+    let mut inputs = vec![
+        info("Q", packed.clone()),
+        info("K", packed.clone()),
+        info("V", packed.clone()),
+        info("cache", opaque_type("KVCache")),
+        info("q_positions", positions.clone()),
+        info("kv_positions", positions),
+        info("q_offsets", offsets.clone()),
+        info("kv_offsets", offsets.clone()),
+    ];
+    let mut node_inputs = vec![
+        "Q".into(),
+        "K".into(),
+        "V".into(),
+        String::new(),
+        "cache".into(),
+        "q_positions".into(),
+        "kv_positions".into(),
+        String::new(),
+        "q_offsets".into(),
+        "kv_offsets".into(),
+    ];
+    let mut attributes = vec![int_attr("q_num_heads", 1), int_attr("kv_num_heads", 1)];
+    if compact_visibility {
+        inputs.extend([
+            info("visibility_rows", offsets.clone()),
+            info("visibility_blocks", offsets.clone()),
+            info("partial_indices", offsets),
+            info(
+                "partial_mask",
+                unbound_tensor_type(&[None, Some(1), Some(1)], 13),
+            ),
+            info(
+                "attn_bias",
+                unbound_tensor_type(&[None, Some(1), Some(2)], 1),
+            ),
+        ]);
+        node_inputs.extend([
+            "visibility_rows".into(),
+            "visibility_blocks".into(),
+            "partial_indices".into(),
+            "partial_mask".into(),
+            "attn_bias".into(),
+        ]);
+        attributes.extend([
+            int_attr("visibility_q_block_size", 1),
+            int_attr("visibility_k_block_size", 2),
+        ]);
+    }
+    model(onnx::GraphProto {
+        input: inputs,
+        output: vec![
+            info("Y", packed),
+            info("present_cache", opaque_type("KVCache")),
+        ],
+        node: vec![onnx::NodeProto {
+            name: "attention".to_string(),
+            op_type: "AttentionWithCache".to_string(),
+            domain: DOMAIN.to_string(),
+            input: node_inputs,
+            output: vec!["Y".into(), "present_cache".into()],
+            attribute: attributes,
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+}
+
+fn packed_per_head_visibility_model() -> Vec<u8> {
+    let query = unbound_tensor_type(&[None, Some(2)], 1);
+    let kv = unbound_tensor_type(&[None, Some(1)], 1);
+    let offsets = unbound_tensor_type(&[None], 7);
+    let positions = unbound_tensor_type(&[None], 7);
+    model(onnx::GraphProto {
+        input: vec![
+            info("Q", query.clone()),
+            info("K", kv.clone()),
+            info("V", kv),
+            info("cache", opaque_type("KVCache")),
+            info("q_positions", positions.clone()),
+            info("kv_positions", positions),
+            info("q_offsets", offsets.clone()),
+            info("kv_offsets", offsets.clone()),
+            info("visibility_rows", offsets.clone()),
+            info("visibility_blocks", offsets),
+        ],
+        output: vec![
+            info("Y", query),
+            info("present_cache", opaque_type("KVCache")),
+        ],
+        node: vec![onnx::NodeProto {
+            name: "attention".to_string(),
+            op_type: "AttentionWithCache".to_string(),
+            domain: DOMAIN.to_string(),
+            input: vec![
+                "Q".into(),
+                "K".into(),
+                "V".into(),
+                String::new(),
+                "cache".into(),
+                "q_positions".into(),
+                "kv_positions".into(),
+                String::new(),
+                "q_offsets".into(),
+                "kv_offsets".into(),
+                "visibility_rows".into(),
+                "visibility_blocks".into(),
+            ],
+            output: vec!["Y".into(), "present_cache".into()],
+            attribute: vec![
+                int_attr("q_num_heads", 2),
+                int_attr("kv_num_heads", 1),
+                int_attr("visibility_num_heads", 2),
+                int_attr("visibility_q_block_size", 1),
+                int_attr("visibility_k_block_size", 2),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+}
+
+fn u64_tensor(shape: &[usize], values: &[u64]) -> Tensor {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    Tensor::from_raw(onnx_runtime_ir::DataType::Uint64, shape.to_vec(), &bytes).unwrap()
 }
 
 fn two_attention_slots_model() -> Vec<u8> {
@@ -343,6 +498,266 @@ fn attention_dense_and_paged_match_chunked_and_preserve_snapshots() {
             .unwrap();
         assert_ne!(tensor_output(&alternate), tensor_output(&second));
     }
+}
+
+#[test]
+fn packed_attention_matches_padded_oracle_across_modes_and_zero_length_rows() {
+    let padded_bytes = ragged_attention_model();
+    let mut padded = InferenceSession::load_bytes(&padded_bytes).unwrap();
+    let padded_q = Tensor::from_f32(&[2, 3, 1, 1], &[1.; 6]).unwrap();
+    let padded_k = Tensor::from_f32(&[2, 3, 1, 1], &[1.; 6]).unwrap();
+    let padded_v = Tensor::from_f32(&[2, 3, 1, 1], &[1., 2., 3., 10., 0., 0.]).unwrap();
+    let padded_positions = Tensor::from_i64(&[2, 3], &[0, 1, 2, 0, 1, 2]).unwrap();
+    let nonpad = Tensor::from_i64(&[2], &[3, 1]).unwrap();
+    let oracle = padded
+        .run_values(&[
+            ("Q", SessionInput::Tensor(&padded_q)),
+            ("K", SessionInput::Tensor(&padded_k)),
+            ("V", SessionInput::Tensor(&padded_v)),
+            ("q_positions", SessionInput::Tensor(&padded_positions)),
+            ("kv_positions", SessionInput::Tensor(&padded_positions)),
+            ("nonpad", SessionInput::Tensor(&nonpad)),
+        ])
+        .unwrap();
+    let oracle = tensor_output(&oracle);
+
+    let bytes = packed_attention_model(false);
+    for attention in [
+        AttentionCacheMode::Dense,
+        AttentionCacheMode::Paged { page_size: 2 },
+    ] {
+        let mut session = InferenceSession::load_bytes(&bytes).unwrap();
+        session
+            .set_state_runtime_config(StateRuntimeConfig {
+                attention,
+                ..Default::default()
+            })
+            .unwrap();
+        let q0 = Tensor::from_f32(&[3, 1], &[1.; 3]).unwrap();
+        let k0 = Tensor::from_f32(&[3, 1], &[1.; 3]).unwrap();
+        let v0 = Tensor::from_f32(&[3, 1], &[1., 2., 10.]).unwrap();
+        let qpos0 = Tensor::from_i64(&[3], &[0, 1, 0]).unwrap();
+        let kvpos0 = Tensor::from_i64(&[3], &[0, 1, 0]).unwrap();
+        let offsets0 = Tensor::from_i64(&[3], &[0, 2, 3]).unwrap();
+        let first = session
+            .run_values(&[
+                ("Q", SessionInput::Tensor(&q0)),
+                ("K", SessionInput::Tensor(&k0)),
+                ("V", SessionInput::Tensor(&v0)),
+                ("q_positions", SessionInput::Tensor(&qpos0)),
+                ("kv_positions", SessionInput::Tensor(&kvpos0)),
+                ("q_offsets", SessionInput::Tensor(&offsets0)),
+                ("kv_offsets", SessionInput::Tensor(&offsets0)),
+            ])
+            .unwrap();
+        assert_eq!(tensor_output(&first), vec![oracle[0], oracle[1], oracle[3]]);
+        let snapshot = first[1].as_opaque().unwrap().clone();
+
+        let q1 = Tensor::from_f32(&[1, 1], &[1.]).unwrap();
+        let k1 = Tensor::from_f32(&[1, 1], &[1.]).unwrap();
+        let v1 = Tensor::from_f32(&[1, 1], &[3.]).unwrap();
+        let pos1 = Tensor::from_i64(&[1], &[2]).unwrap();
+        let q_offsets1 = Tensor::from_i64(&[3], &[0, 1, 1]).unwrap();
+        let kv_offsets1 = Tensor::from_i64(&[3], &[0, 1, 1]).unwrap();
+        let second = session
+            .run_values(&[
+                ("Q", SessionInput::Tensor(&q1)),
+                ("K", SessionInput::Tensor(&k1)),
+                ("V", SessionInput::Tensor(&v1)),
+                ("cache", SessionInput::Opaque(&snapshot)),
+                ("q_positions", SessionInput::Tensor(&pos1)),
+                ("kv_positions", SessionInput::Tensor(&pos1)),
+                ("q_offsets", SessionInput::Tensor(&q_offsets1)),
+                ("kv_offsets", SessionInput::Tensor(&kv_offsets1)),
+            ])
+            .unwrap();
+        assert_eq!(tensor_output(&second), vec![oracle[2]]);
+    }
+}
+
+#[test]
+fn compact_visibility_skips_blocks_supports_partial_bias_and_zero_rows() {
+    let bytes = packed_attention_model(true);
+    for attention in [
+        AttentionCacheMode::Dense,
+        AttentionCacheMode::Paged { page_size: 2 },
+    ] {
+        let mut session = InferenceSession::load_bytes(&bytes).unwrap();
+        session
+            .set_state_runtime_config(StateRuntimeConfig {
+                attention,
+                ..Default::default()
+            })
+            .unwrap();
+        let empty = Tensor::from_f32(&[0, 1], &[]).unwrap();
+        let keys = Tensor::from_f32(&[5, 1], &[0.; 5]).unwrap();
+        let values = Tensor::from_f32(&[5, 1], &[1., 2., 3., 4., 5.]).unwrap();
+        let empty_positions = Tensor::from_i64(&[0], &[]).unwrap();
+        let kv_positions = Tensor::from_i64(&[5], &[0, 1, 2, 3, 4]).unwrap();
+        let q_offsets = Tensor::from_i64(&[2], &[0, 0]).unwrap();
+        let kv_offsets = Tensor::from_i64(&[2], &[0, 5]).unwrap();
+        let visibility_rows = Tensor::from_i64(&[1], &[0]).unwrap();
+        let no_blocks = Tensor::from_i64(&[0], &[]).unwrap();
+        let no_mask = u64_tensor(&[0, 1, 1], &[]);
+        let no_bias = Tensor::from_f32(&[0, 1, 2], &[]).unwrap();
+        let seeded = session
+            .run_values(&[
+                ("Q", SessionInput::Tensor(&empty)),
+                ("K", SessionInput::Tensor(&keys)),
+                ("V", SessionInput::Tensor(&values)),
+                ("q_positions", SessionInput::Tensor(&empty_positions)),
+                ("kv_positions", SessionInput::Tensor(&kv_positions)),
+                ("q_offsets", SessionInput::Tensor(&q_offsets)),
+                ("kv_offsets", SessionInput::Tensor(&kv_offsets)),
+                ("visibility_rows", SessionInput::Tensor(&visibility_rows)),
+                ("visibility_blocks", SessionInput::Tensor(&no_blocks)),
+                ("partial_indices", SessionInput::Tensor(&no_blocks)),
+                ("partial_mask", SessionInput::Tensor(&no_mask)),
+                ("attn_bias", SessionInput::Tensor(&no_bias)),
+            ])
+            .unwrap();
+        assert!(tensor_output(&seeded).is_empty());
+        let cache = seeded[1].as_opaque().unwrap().clone();
+
+        let queries = Tensor::from_f32(&[2, 1], &[0., 0.]).unwrap();
+        let query_positions = Tensor::from_i64(&[2], &[4, 4]).unwrap();
+        let q_offsets = Tensor::from_i64(&[2], &[0, 2]).unwrap();
+        let kv_offsets = Tensor::from_i64(&[2], &[0, 0]).unwrap();
+        let rows = Tensor::from_i64(&[3], &[0, 2, 3]).unwrap();
+        let blocks = Tensor::from_i64(&[3], &[0, 2, 0]).unwrap();
+        let partial_indices = Tensor::from_i64(&[2], &[0, 2]).unwrap();
+        let partial_mask = u64_tensor(&[2, 1, 1], &[0b10, 0]);
+        let bias = Tensor::from_f32(&[3, 1, 2], &[0., 0., 3.0f32.ln(), 0., 0., 0.]).unwrap();
+        let output = session
+            .run_values(&[
+                ("Q", SessionInput::Tensor(&queries)),
+                ("K", SessionInput::Tensor(&empty)),
+                ("V", SessionInput::Tensor(&empty)),
+                ("cache", SessionInput::Opaque(&cache)),
+                ("q_positions", SessionInput::Tensor(&query_positions)),
+                ("kv_positions", SessionInput::Tensor(&empty_positions)),
+                ("q_offsets", SessionInput::Tensor(&q_offsets)),
+                ("kv_offsets", SessionInput::Tensor(&kv_offsets)),
+                ("visibility_rows", SessionInput::Tensor(&rows)),
+                ("visibility_blocks", SessionInput::Tensor(&blocks)),
+                ("partial_indices", SessionInput::Tensor(&partial_indices)),
+                ("partial_mask", SessionInput::Tensor(&partial_mask)),
+                ("attn_bias", SessionInput::Tensor(&bias)),
+            ])
+            .unwrap();
+        let actual = tensor_output(&output);
+        assert!((actual[0] - 4.25).abs() < 1e-6, "{actual:?}");
+        assert_eq!(actual[1], 0.0);
+        let stats = session.attention_traversal_stats();
+        assert_eq!(stats.logical_key_candidates, 10);
+        assert_eq!(stats.evaluated_key_candidates, 2);
+        assert_eq!(stats.full_block_visits, 1);
+        assert_eq!(stats.partial_block_visits, 2);
+    }
+}
+
+#[test]
+fn compact_visibility_supports_exact_per_query_head_rows() {
+    let bytes = packed_per_head_visibility_model();
+    let mut session = InferenceSession::load_bytes(&bytes).unwrap();
+    let empty_query = Tensor::from_f32(&[0, 2], &[]).unwrap();
+    let empty_kv = Tensor::from_f32(&[0, 1], &[]).unwrap();
+    let keys = Tensor::from_f32(&[3, 1], &[0.; 3]).unwrap();
+    let values = Tensor::from_f32(&[3, 1], &[1., 2., 3.]).unwrap();
+    let no_positions = Tensor::from_i64(&[0], &[]).unwrap();
+    let key_positions = Tensor::from_i64(&[3], &[0, 1, 2]).unwrap();
+    let q_offsets = Tensor::from_i64(&[2], &[0, 0]).unwrap();
+    let kv_offsets = Tensor::from_i64(&[2], &[0, 3]).unwrap();
+    let empty_rows = Tensor::from_i64(&[1], &[0]).unwrap();
+    let no_blocks = Tensor::from_i64(&[0], &[]).unwrap();
+    let seeded = session
+        .run_values(&[
+            ("Q", SessionInput::Tensor(&empty_query)),
+            ("K", SessionInput::Tensor(&keys)),
+            ("V", SessionInput::Tensor(&values)),
+            ("q_positions", SessionInput::Tensor(&no_positions)),
+            ("kv_positions", SessionInput::Tensor(&key_positions)),
+            ("q_offsets", SessionInput::Tensor(&q_offsets)),
+            ("kv_offsets", SessionInput::Tensor(&kv_offsets)),
+            ("visibility_rows", SessionInput::Tensor(&empty_rows)),
+            ("visibility_blocks", SessionInput::Tensor(&no_blocks)),
+        ])
+        .unwrap();
+    let cache = seeded[1].as_opaque().unwrap().clone();
+
+    let query = Tensor::from_f32(&[1, 2], &[0., 0.]).unwrap();
+    let query_position = Tensor::from_i64(&[1], &[2]).unwrap();
+    let q_offsets = Tensor::from_i64(&[2], &[0, 1]).unwrap();
+    let kv_offsets = Tensor::from_i64(&[2], &[0, 0]).unwrap();
+    let rows = Tensor::from_i64(&[3], &[0, 1, 2]).unwrap();
+    let blocks = Tensor::from_i64(&[2], &[0, 1]).unwrap();
+    let output = session
+        .run_values(&[
+            ("Q", SessionInput::Tensor(&query)),
+            ("K", SessionInput::Tensor(&empty_kv)),
+            ("V", SessionInput::Tensor(&empty_kv)),
+            ("cache", SessionInput::Opaque(&cache)),
+            ("q_positions", SessionInput::Tensor(&query_position)),
+            ("kv_positions", SessionInput::Tensor(&no_positions)),
+            ("q_offsets", SessionInput::Tensor(&q_offsets)),
+            ("kv_offsets", SessionInput::Tensor(&kv_offsets)),
+            ("visibility_rows", SessionInput::Tensor(&rows)),
+            ("visibility_blocks", SessionInput::Tensor(&blocks)),
+        ])
+        .unwrap();
+    assert_eq!(tensor_output(&output), vec![1.5, 3.0]);
+}
+
+#[test]
+fn packed_attention_rejects_malformed_offsets_and_visibility() {
+    let bytes = packed_attention_model(false);
+    let mut session = InferenceSession::load_bytes(&bytes).unwrap();
+    let one = Tensor::from_f32(&[1, 1], &[1.]).unwrap();
+    let position = Tensor::from_i64(&[1], &[0]).unwrap();
+    let bad_offsets = Tensor::from_i64(&[2], &[0, 2]).unwrap();
+    let error = session
+        .run_values(&[
+            ("Q", SessionInput::Tensor(&one)),
+            ("K", SessionInput::Tensor(&one)),
+            ("V", SessionInput::Tensor(&one)),
+            ("q_positions", SessionInput::Tensor(&position)),
+            ("kv_positions", SessionInput::Tensor(&position)),
+            ("q_offsets", SessionInput::Tensor(&bad_offsets)),
+            ("kv_offsets", SessionInput::Tensor(&bad_offsets)),
+        ])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ends at 2"), "{error}");
+    assert!(error.contains("has 1 tokens"), "{error}");
+
+    let bytes = packed_attention_model(true);
+    let mut session = InferenceSession::load_bytes(&bytes).unwrap();
+    let four = Tensor::from_f32(&[4, 1], &[1.; 4]).unwrap();
+    let offsets = Tensor::from_i64(&[2], &[0, 4]).unwrap();
+    let positions = Tensor::from_i64(&[4], &[0, 1, 2, 3]).unwrap();
+    let rows = Tensor::from_i64(&[5], &[0, 2, 2, 2, 2]).unwrap();
+    let unsorted = Tensor::from_i64(&[2], &[1, 0]).unwrap();
+    let no_partial = Tensor::from_i64(&[0], &[]).unwrap();
+    let no_mask = u64_tensor(&[0, 1, 1], &[]);
+    let bias = Tensor::from_f32(&[2, 1, 2], &[0.; 4]).unwrap();
+    let error = session
+        .run_values(&[
+            ("Q", SessionInput::Tensor(&four)),
+            ("K", SessionInput::Tensor(&four)),
+            ("V", SessionInput::Tensor(&four)),
+            ("q_positions", SessionInput::Tensor(&positions)),
+            ("kv_positions", SessionInput::Tensor(&positions)),
+            ("q_offsets", SessionInput::Tensor(&offsets)),
+            ("kv_offsets", SessionInput::Tensor(&offsets)),
+            ("visibility_rows", SessionInput::Tensor(&rows)),
+            ("visibility_blocks", SessionInput::Tensor(&unsorted)),
+            ("partial_indices", SessionInput::Tensor(&no_partial)),
+            ("partial_mask", SessionInput::Tensor(&no_mask)),
+            ("attn_bias", SessionInput::Tensor(&bias)),
+        ])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("sorted and unique"), "{error}");
 }
 
 #[test]

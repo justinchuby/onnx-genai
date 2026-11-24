@@ -425,6 +425,7 @@ impl Executor {
                 .map(|(&id, value)| (id, value.clone())),
         );
         self.string_values.clear();
+        self.attention_traversal_stats = crate::AttentionTraversalStats::default();
         self.restore_shared_buffers()?;
         Ok(())
     }

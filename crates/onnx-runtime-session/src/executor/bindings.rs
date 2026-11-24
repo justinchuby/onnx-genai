@@ -197,6 +197,10 @@ pub(super) fn merge_workspace_peak(
 }
 
 impl Executor {
+    pub(crate) fn attention_traversal_stats(&self) -> crate::AttentionTraversalStats {
+        self.attention_traversal_stats
+    }
+
     pub(crate) fn set_state_runtime_config(&mut self, config: StateRuntimeConfig) -> Result<()> {
         if let crate::AttentionCacheMode::Paged { page_size: 0 } = config.attention {
             return Err(SessionError::StateOp {

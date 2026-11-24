@@ -44,6 +44,21 @@ pub struct StateRuntimeConfig {
     pub causal_conv: CausalConvStateMode,
 }
 
+/// Work counters from the most recent inference call containing
+/// `AttentionWithCache`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttentionTraversalStats {
+    /// Key/query/head pairs in the logical post-append cache before visibility.
+    pub logical_key_candidates: u64,
+    /// Dot products actually evaluated after compact visibility and position
+    /// constraints.
+    pub evaluated_key_candidates: u64,
+    /// Full visibility-block visits, including broadcast across query heads.
+    pub full_block_visits: u64,
+    /// Partial visibility-block visits, including broadcast across query heads.
+    pub partial_block_visits: u64,
+}
+
 impl Default for StateRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -82,7 +97,8 @@ pub(crate) enum KvRows {
 pub(crate) struct KvState {
     pub batch: usize,
     pub heads: usize,
-    pub head_dim: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
     pub rows: Arc<Vec<KvRows>>,
 }
 

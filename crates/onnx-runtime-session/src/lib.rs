@@ -45,8 +45,8 @@ pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };
 pub use opaque::{
-    AttentionCacheMode, CausalConvStateMode, LinearAttentionStateMode, OpaqueStateKind,
-    OpaqueValue, SessionInput, StateRuntimeConfig,
+    AttentionCacheMode, AttentionTraversalStats, CausalConvStateMode, LinearAttentionStateMode,
+    OpaqueStateKind, OpaqueValue, SessionInput, StateRuntimeConfig,
 };
 pub use plugin_provider::{PluginExecutionProvider, is_plugin_fused_node};
 pub use tensor::{
@@ -1398,6 +1398,12 @@ impl InferenceSession {
     /// Select physical storage policies for prototype opaque state values.
     pub fn set_state_runtime_config(&mut self, config: StateRuntimeConfig) -> Result<()> {
         self.exec.set_state_runtime_config(config)
+    }
+
+    /// Work counters from the most recent call containing
+    /// `AttentionWithCache`.
+    pub fn attention_traversal_stats(&self) -> AttentionTraversalStats {
+        self.exec.attention_traversal_stats()
     }
 
     /// F5 Stage 1 decode-plan memo activity counters `(primed, rebuilt, replayed,

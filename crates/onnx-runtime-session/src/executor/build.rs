@@ -1197,6 +1197,7 @@ impl Executor {
             opaque_values: HashMap::new(),
             pending_opaque_inputs: HashMap::new(),
             state_config: StateRuntimeConfig::default(),
+            attention_traversal_stats: crate::AttentionTraversalStats::default(),
             seq_elem_values: HashMap::new(),
             execution_provider_fallback_report,
             trace: TraceContext::noop(),
