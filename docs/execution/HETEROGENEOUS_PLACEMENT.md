@@ -18,15 +18,18 @@ or `InferenceSession::from_graph_with_providers`. Built-in and caller-supplied
 providers use the same `ExecutionProvider` contract. The session does not search
 for installed providers. Existing single-provider callers keep their placement behavior.
 
-For top-level numeric tensor graphs, the ordered path selects the first
-configured EP that covers the whole graph. If none does, `ONNX_GENAI_HETERO=1`
-permits eligible static splits across the configured EPs and the CPU fallback.
-If splitting is ineligible, the session uses the existing CUDA-to-CPU fallback,
-or an explicitly configured CPU fallback for other primaries. Provider build
-errors are not retried on another provider. Text, control flow, sequences, and
-compiled EPContext graphs retain their existing placement rules. The loader
-still uses the primary EP to decide which model-local calls to retain for
-fusion; secondary-only function retention is outside this slice.
+The ordered path selects the first configured EP that covers the whole graph,
+including managed strings and the bodies of control-flow nodes executed by the
+runtime. If none does, `ONNX_GENAI_HETERO=1` permits eligible static splits
+across the configured EPs and the CPU fallback. Managed-string splits for a
+CUDA primary still use the existing CUDA/host placement path. Control-flow
+and sequence graphs cannot split; they use the existing CUDA-to-CPU fallback
+or an explicitly configured CPU fallback for other primaries. Only a
+capability decline advances provider selection; other provider build errors
+and runtime errors are not retried on another provider. Compiled EPContext
+artifacts are restored on the primary and do not participate in ordered
+selection. The loader still uses the primary EP to decide which model-local
+calls to retain for fusion; secondary-only function retention is outside this slice.
 
 The flag is not a speed guarantee: automatic numeric splitting needs
 transfer-cost and end-to-end measurements across representative graphs and devices.
