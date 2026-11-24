@@ -43,7 +43,6 @@ pub struct GbnfReplay {
     nodes: Arc<Vec<Node>>,
     stacks: Vec<Stack>,
     pending_utf8: Vec<u8>,
-    invalid_utf8: bool,
     bytes: usize,
     max_bytes: usize,
 }
@@ -173,7 +172,6 @@ impl GbnfReplay {
             nodes: Arc::new(compiler.nodes),
             stacks: Vec::new(),
             pending_utf8: Vec::new(),
-            invalid_utf8: false,
             bytes: 0,
             max_bytes,
         };
@@ -274,18 +272,17 @@ impl GbnfReplay {
         );
         let mut combined = self.pending_utf8.clone();
         combined.extend_from_slice(piece);
-        let (text, pending, invalid_utf8) = if self.invalid_utf8 {
-            ("", &[][..], true)
-        } else {
-            match std::str::from_utf8(&combined) {
-                Ok(text) => (text, &[][..], false),
-                Err(error) if error.error_len().is_none() => (
-                    std::str::from_utf8(&combined[..error.valid_up_to()])?,
-                    &combined[error.valid_up_to()..],
-                    false,
-                ),
-                Err(_) => ("", &[][..], true),
-            }
+        // Invalid bytes can still satisfy an explicit token reference. The
+        // upstream decoder starts fresh on the next piece after that invalid
+        // event; only a valid incomplete UTF-8 scalar carries between pieces.
+        let (text, pending, invalid_utf8) = match std::str::from_utf8(&combined) {
+            Ok(text) => (text, &[][..], false),
+            Err(error) if error.error_len().is_none() => (
+                std::str::from_utf8(&combined[..error.valid_up_to()])?,
+                &combined[error.valid_up_to()..],
+                false,
+            ),
+            Err(_) => ("", &[][..], true),
         };
         let mut accepted = Vec::new();
         let mut text_stacks = Vec::new();
@@ -333,7 +330,6 @@ impl GbnfReplay {
         }
         self.stacks = stacks;
         self.pending_utf8 = pending.to_vec();
-        self.invalid_utf8 = invalid_utf8;
         self.bytes = next_bytes;
         Ok(true)
     }
@@ -412,6 +408,15 @@ mod tests {
         let mut cursor = grammar("root ::= <[7]>");
         assert!(cursor.consume(7, &[0xa9]).unwrap());
         assert!(cursor.is_accepting());
+        for piece in [&[0xa9][..], &[0xff][..], &[0xc3, 0x28][..]] {
+            let mut cursor = grammar(r#"root ::= <[7]> "x""#);
+            assert!(cursor.consume(7, piece).unwrap());
+            let mut checkpoint = cursor.clone();
+            assert!(!cursor.consume(9, b"wrong").unwrap());
+            assert!(cursor.consume(9, b"x").unwrap());
+            assert!(checkpoint.consume(9, b"x").unwrap());
+            assert!(cursor.is_accepting() && checkpoint.is_accepting());
+        }
     }
     #[test]
     fn replay_singleton_class_quantifiers_and_finite_bounds() {

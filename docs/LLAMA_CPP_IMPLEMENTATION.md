@@ -1641,3 +1641,20 @@ the pinned upstream find() function and libc++ ECMAScript enumerates 24 patterns
 against all 121 abx strings of length zero through four (2904 comparisons),
 covering nullable repetition, greediness, capture reset, lookahead and backrefs.
 These cases complement the original invalid syntax and resource-limit tests.
+
+### Recovery after a truncated UTF-8 token reference
+
+Self-review extended the production lazy-chain truncation case from a following
+raw token reference to a following literal. The previous implementation selected
+one test and failed: the accepted token reference's invalid byte suffix poisoned
+all later text, leaving no finite candidate. The pinned upstream decoder stores
+a negative remaining-byte count for that event, then decodes the next piece
+fresh; a harness copied from that decoder verifies the subsequent ASCII `B`.
+
+Replay now retains only a valid incomplete scalar between pieces. Invalid bytes
+can satisfy an explicit token terminal without permanently invalidating later
+scalar terminals. Current invalid scalar candidates still fail transactionally.
+The replay test covers continuation bytes, invalid leading bytes and malformed
+sequences, independent clones and recovery after rejecting a wrong next piece.
+The production processor-chain test now covers both token and literal successors
+when a byte pattern activates inside a multibyte model token.

@@ -472,12 +472,11 @@ mod tests {
             assert_eq!(allowed(&chain, &[22, 23]).unwrap(), [24]);
             assert_eq!(allowed(&chain, &[22, 23, 24]).unwrap(), [3]);
         }
-        let chain = chain(
-            "root ::= <[31]> <[24]>",
-            vec![GrammarTrigger::Pattern(r"\xA9".into())],
-        );
-        assert_eq!(allowed(&chain, &[31]).unwrap(), [24]);
-        assert_eq!(allowed(&chain, &[31, 24]).unwrap(), [3]);
+        for grammar in ["root ::= <[31]> <[24]>", r#"root ::= <[31]> "B""#] {
+            let chain = chain(grammar, vec![GrammarTrigger::Pattern(r"\xA9".into())]);
+            assert_eq!(allowed(&chain, &[31]).unwrap(), [24]);
+            assert_eq!(allowed(&chain, &[31, 24]).unwrap(), [3]);
+        }
     }
     #[test]
     fn lazy_chain_prioritizes_token_triggers_then_pattern_configuration_order() {
