@@ -5,7 +5,7 @@ use std::sync::Arc;
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{DeviceGraphResource, EpError, Result};
 
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation};
+use crate::runtime::{CudaRuntime, NativeDeviceAllocation};
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -32,7 +32,7 @@ fn contextual_error(label: &str, stage: &'static str, source: EpError) -> EpErro
 #[derive(Debug)]
 struct PreparedDeviceMetadata<K> {
     key: K,
-    allocation: Arc<GraphDeviceAllocation>,
+    allocation: Arc<NativeDeviceAllocation>,
 }
 
 /// A single-entry cache, not another allocator or quota authority. Kernels
@@ -75,7 +75,7 @@ impl<K> DeviceMetadataCache<K> {
         {
             if self.runtime.is_capturing()? {
                 self.runtime.require_captured_address_owner(
-                    GraphDeviceAllocation::device_graph_resource(&current.allocation).identity(),
+                    NativeDeviceAllocation::device_graph_resource(&current.allocation).identity(),
                     label,
                 )?;
             }
@@ -95,7 +95,7 @@ impl<K> DeviceMetadataCache<K> {
         }
         let (key, bytes) =
             build().map_err(|error| contextual("encoding replacement metadata", error))?;
-        let allocation = GraphDeviceAllocation::allocate(
+        let allocation = NativeDeviceAllocation::allocate_shared(
             &self.runtime,
             bytes.len(),
             onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
@@ -114,13 +114,13 @@ impl<K> DeviceMetadataCache<K> {
     pub(crate) fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
         self.current
             .as_ref()
-            .map(|current| GraphDeviceAllocation::device_graph_resource(&current.allocation))
+            .map(|current| NativeDeviceAllocation::device_graph_resource(&current.allocation))
     }
 
     /// Borrow the prepared binding without introducing another owner or
     /// independently cached pointer/extent. Graph retention uses the resource
     /// method above rather than cloning this allocation into kernel state.
-    pub(crate) fn allocation(&self) -> Option<&GraphDeviceAllocation> {
+    pub(crate) fn allocation(&self) -> Option<&NativeDeviceAllocation> {
         self.current
             .as_ref()
             .map(|current| current.allocation.as_ref())

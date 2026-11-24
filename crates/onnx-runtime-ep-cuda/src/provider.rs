@@ -469,6 +469,44 @@ impl ReleaseObserver for ManagedCudaReleaseAccounting {
     }
 }
 
+/// Prepared ownership keeps managed settlement paired until either enqueue or
+/// explicit quarantine. Both paths preserve the original typed prepare error.
+enum NativePreparedRelease {
+    Binding(onnx_runtime_memory_api::PreparedAllocationRelease),
+    Managed(onnx_runtime_memory_governor::ManagedPreparedRelease),
+}
+
+impl NativePreparedRelease {
+    fn quarantine(
+        self,
+        reason: onnx_runtime_memory_api::QuarantineReason,
+    ) -> AllocationReleaseOutcome {
+        match self {
+            Self::Binding(prepared) => prepared.quarantine(reason),
+            Self::Managed(prepared) => prepared.quarantine(reason),
+        }
+    }
+}
+
+fn prepare_native_release(ownership: BoundBufferOwnership) -> Result<NativePreparedRelease> {
+    match ownership {
+        BoundBufferOwnership::Binding(owner) => owner.prepare_release().map(NativePreparedRelease::Binding).map_err(|error| {
+            let (error, _owner) = error.into_parts();
+            EpError::Backend {
+                operation: "prepare native CUDA allocation retirement; retire all views before consuming the owner",
+                source: Box::new(error),
+            }
+        }),
+        BoundBufferOwnership::Managed(owner) => owner.prepare_release().map(NativePreparedRelease::Managed).map_err(|error| {
+            let (error, _owner) = error.into_parts();
+            EpError::Backend {
+                operation: "prepare managed CUDA allocation retirement; retire all views before consuming the owner",
+                source: Box::new(AllocationTransactionError::Binding(error)),
+            }
+        }),
+    }
+}
+
 /// The single consuming retirement path after the caller validates provenance.
 /// This core owns neither the runtime nor another quota authority. Queue success
 /// is accepted ordering only; settlement observes the eventual physical outcome.
@@ -478,27 +516,9 @@ fn enqueue_native_release(
     accounting: Arc<dyn ReleaseObserver>,
 ) -> Result<()> {
     let identity = ownership.owner().identity();
-    let (prepared, settlement, observer) = match ownership {
-        BoundBufferOwnership::Binding(owner) => {
-            let prepared = owner.prepare_release().map_err(|error| {
-                    let (error, _owner) = error.into_parts();
-                    // Nothing was mutated and the owner is handed back to its
-                    // `Drop`, which quarantines rather than frees.
-                    EpError::Backend {
-                        operation: "prepare native CUDA allocation retirement; retire all views before consuming the owner",
-                        source: Box::new(error),
-                    }
-                })?;
-            (prepared, None, Arc::clone(&accounting))
-        }
-        BoundBufferOwnership::Managed(owner) => {
-            let prepared = owner.prepare_release().map_err(|error| {
-                    let (error, _owner) = error.into_parts();
-                    EpError::Backend {
-                        operation: "prepare managed CUDA allocation retirement; retire all views before consuming the owner",
-                        source: Box::new(AllocationTransactionError::Binding(error)),
-                    }
-                })?;
+    let (prepared, settlement, observer) = match prepare_native_release(ownership)? {
+        NativePreparedRelease::Binding(prepared) => (prepared, None, accounting),
+        NativePreparedRelease::Managed(prepared) => {
             // SAFETY: the request and settlement remain paired in the queue
             // observer and in the enqueue-refusal branch below.
             let (prepared, settlement) = unsafe { prepared.into_parts() };
@@ -688,12 +708,32 @@ impl std::fmt::Debug for CudaMemoryBinding {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("cuda_ep: {operation}: {source}")]
+struct CudaMemoryFailure<E: std::error::Error + Send + Sync + 'static> {
+    operation: String,
+    #[source]
+    source: E,
+}
+
 fn binding_failure(operation: &str, error: BindingError) -> EpError {
-    EpError::KernelFailed(format!("cuda_ep: {operation}: {error}"))
+    EpError::Backend {
+        operation: "register CUDA memory backing",
+        source: Box::new(CudaMemoryFailure {
+            operation: operation.into(),
+            source: error,
+        }),
+    }
 }
 
 fn manager_failure(operation: &str, error: AllocationTransactionError) -> EpError {
-    EpError::KernelFailed(format!("cuda_ep: {operation}: {error}"))
+    EpError::Backend {
+        operation: "manage CUDA memory ownership",
+        source: Box::new(CudaMemoryFailure {
+            operation: operation.into(),
+            source: error,
+        }),
+    }
 }
 
 /// A minimal synchronous host→device uploader backed by the shared CUDA
@@ -1220,6 +1260,19 @@ impl CudaAllocationDomain {
         if buffer.is_borrowed() {
             return Ok(());
         }
+        let ownership = self.take_owned(buffer)?;
+        enqueue_native_release(&self.release_queue, ownership, self.release_accounting())
+    }
+
+    pub(crate) fn quarantine_owned(
+        &self,
+        buffer: DeviceBuffer,
+        reason: onnx_runtime_memory_api::QuarantineReason,
+    ) -> Result<AllocationReleaseOutcome> {
+        prepare_native_release(self.take_owned(buffer)?).map(|prepared| prepared.quarantine(reason))
+    }
+
+    fn take_owned(&self, buffer: DeviceBuffer) -> Result<BoundBufferOwnership> {
         let ownership = match buffer.into_bound_ownership() {
             Ok(owner) => owner,
             Err(foreign) => {
@@ -1251,7 +1304,7 @@ impl CudaAllocationDomain {
                 self.device.index
             )));
         }
-        enqueue_native_release(&self.release_queue, ownership, self.release_accounting())
+        Ok(ownership)
     }
 
     fn new(
@@ -6605,17 +6658,17 @@ extern "C" __global__ void spin_delay(long long spin) {
             "cold native admission must be visible"
         );
         let weak = Arc::downgrade(&domain);
-        let artifact = Arc::new(crate::runtime::GraphDeviceAllocation::from_owned(
+        let artifact = Arc::new(crate::runtime::NativeDeviceAllocation::from_owned(
             buffer,
             Arc::clone(&domain),
             Weak::new(),
             128,
         ));
-        let resource = crate::runtime::GraphDeviceAllocation::device_graph_resource(&artifact);
+        let resource = crate::runtime::NativeDeviceAllocation::device_graph_resource(&artifact);
         let identity = resource.identity();
         for _ in 0..4 {
             assert_eq!(
-                crate::runtime::GraphDeviceAllocation::device_graph_resource(&artifact).identity(),
+                crate::runtime::NativeDeviceAllocation::device_graph_resource(&artifact).identity(),
                 identity
             );
         }
@@ -6661,6 +6714,93 @@ extern "C" __global__ void spin_delay(long long spin) {
     }
 
     #[test]
+    fn native_capacity_refusal_preserves_the_manager_error_type_and_context() {
+        let (queue, _) = native_release_queue(false);
+        let domain = host_artifact_domain(queue);
+        let error = domain
+            .allocate_transaction(
+                8192,
+                16,
+                std::slice::from_ref(&(0..8192)),
+                MemoryRole::Weights,
+                true,
+            )
+            .unwrap_err();
+        let mut cause: &dyn std::error::Error = &error;
+        loop {
+            if let Some(transaction) = cause.downcast_ref::<AllocationTransactionError>() {
+                assert!(matches!(transaction, AllocationTransactionError::Memory(_)));
+                break;
+            }
+            cause = cause
+                .source()
+                .expect("native allocation must retain its typed transaction cause");
+        }
+        assert!(
+            error.to_string().contains("allocation transaction"),
+            "{error}"
+        );
+        assert_eq!(domain.ep_allocations.load(Ordering::Relaxed), 0);
+        assert!(
+            domain
+                .memory_binding
+                .manager
+                .snapshot()
+                .unwrap()
+                .allocations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_explicit_quarantine_preserves_charge_without_enqueue_or_successful_free() {
+        let (queue, _) = native_release_queue(false);
+        let domain = host_artifact_domain(Arc::clone(&queue));
+        let buffer = domain
+            .allocate_transaction(
+                128,
+                16,
+                std::slice::from_ref(&(0..128)),
+                MemoryRole::Weights,
+                true,
+            )
+            .unwrap();
+        let wait = buffer.managed_settlement_wait().unwrap();
+        let mut owner = crate::runtime::NativeDeviceAllocation::from_owned(
+            buffer,
+            Arc::clone(&domain),
+            Weak::new(),
+            128,
+        );
+        let outcome = owner
+            .quarantine(onnx_runtime_memory_api::QuarantineReason::CompletionUnknown)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome.residual().unwrap().reason,
+            onnx_runtime_memory_api::QuarantineReason::CompletionUnknown
+        );
+        assert!(matches!(
+            wait.status(),
+            AllocationSettlementStatus::Retained(_)
+        ));
+        assert_eq!(
+            domain
+                .memory_binding
+                .manager
+                .snapshot()
+                .unwrap()
+                .allocations[0]
+                .charged_bytes,
+            128
+        );
+        owner.release().unwrap();
+        drop(owner);
+        assert_eq!(domain.ep_frees.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.stats().accepted, 0);
+    }
+
+    #[test]
     fn graph_artifact_retirement_failure_retains_charge_and_never_retries_consumed_owner() {
         for fail_recording in [false, true] {
             let (queue, _) = native_release_queue(fail_recording);
@@ -6678,7 +6818,7 @@ extern "C" __global__ void spin_delay(long long spin) {
             if !fail_recording {
                 queue.close();
             }
-            let mut artifact = crate::runtime::GraphDeviceAllocation::from_owned(
+            let mut artifact = crate::runtime::NativeDeviceAllocation::from_owned(
                 buffer,
                 Arc::clone(&domain),
                 Weak::new(),

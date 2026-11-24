@@ -15,7 +15,7 @@ use onnx_runtime_ir::{DataType, Node};
 use crate::blas::{self, GemmDtype, GemmEpilogue, GemmEpilogueKind, GemmEx, GemmParams};
 use crate::error::driver_err;
 use crate::kernels::marlin_gemm;
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr, raw_ptr};
+use crate::runtime::{CudaRuntime, NativeDeviceAllocation, cuptr, raw_ptr};
 
 const DEQUANT_MODULE: &str = "matmul_nbits_dequant_f32";
 const DEQUANT_ENTRY: &str = "matmul_nbits_dequant_f32";
@@ -7198,7 +7198,7 @@ impl Accuracy4Geometry {
 struct PreparedBf16Constants {
     signature: Vec<(CUdeviceptr, usize)>,
     layout: WorkspaceLayout<BF16_MAX_CACHED_SCALES>,
-    allocation: Option<Arc<GraphDeviceAllocation>>,
+    allocation: Option<Arc<NativeDeviceAllocation>>,
 }
 
 fn bf16_constant_layout(
@@ -7294,7 +7294,7 @@ impl Bf16ConstCache {
             let entry = self.current.as_ref().unwrap();
             if capturing && let Some(owner) = &entry.allocation {
                 self.runtime.require_captured_address_owner(
-                    GraphDeviceAllocation::device_graph_resource(owner).identity(),
+                    NativeDeviceAllocation::device_graph_resource(owner).identity(),
                     "MatMulNBits BF16 constants",
                 )?;
             }
@@ -7313,7 +7313,7 @@ impl Bf16ConstCache {
             let allocation = if layout.bytes() == 0 {
                 None
             } else {
-                Some(GraphDeviceAllocation::allocate(
+                Some(NativeDeviceAllocation::allocate_shared(
                     &self.runtime,
                     layout.bytes(), onnx_runtime_memory_api::MemoryRole::Weights).map_err(|source| contextual(
                     "allocate immutable MatMulNBits BF16 constant composite; free device capacity or reduce constant shapes", source,
@@ -7354,7 +7354,7 @@ impl Bf16ConstCache {
             .as_ref()?
             .allocation
             .as_ref()
-            .map(GraphDeviceAllocation::device_graph_resource)
+            .map(NativeDeviceAllocation::device_graph_resource)
     }
 }
 
@@ -11963,19 +11963,19 @@ mod tests {
         let (_provider, runtime) = crate::test_support::maybe_native_runtime()
             .expect("retained artifact test requires native CUDA provider backing");
         runtime.set_defer_eager_sync(true);
-        let source_a = GraphDeviceAllocation::allocate(
+        let source_a = NativeDeviceAllocation::allocate_shared(
             &runtime,
             4,
             onnx_runtime_memory_api::MemoryRole::Weights,
         )
         .unwrap();
-        let source_b = GraphDeviceAllocation::allocate(
+        let source_b = NativeDeviceAllocation::allocate_shared(
             &runtime,
             4,
             onnx_runtime_memory_api::MemoryRole::Weights,
         )
         .unwrap();
-        let output = GraphDeviceAllocation::allocate(
+        let output = NativeDeviceAllocation::allocate_shared(
             &runtime,
             8,
             onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
@@ -12023,7 +12023,7 @@ mod tests {
                 &[],
                 vec![
                     first_resource,
-                    GraphDeviceAllocation::device_graph_resource(&output),
+                    NativeDeviceAllocation::device_graph_resource(&output),
                 ],
             )
             .unwrap();
@@ -12183,7 +12183,7 @@ mod tests {
         let owner = if requirement.bytes == 0 {
             None
         } else {
-            Some(GraphDeviceAllocation::allocate(
+            Some(NativeDeviceAllocation::allocate_shared(
                 &kernel.runtime,
                 usize::try_from(requirement.bytes)
                     .map_err(|_| error("test workspace size exceeds usize"))?,
@@ -12419,7 +12419,7 @@ mod tests {
             ".alloc_raw(",
             ".free_raw(",
             ".lock()",
-            "GraphDeviceAllocation",
+            "NativeDeviceAllocation",
         ] {
             assert!(
                 !source[begin..end].contains(bypass),
@@ -13470,7 +13470,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 .collect::<Vec<_>>();
             let requirement = kernel.workspace_requirement_for(&metadata).unwrap();
             let owner = (requirement.bytes != 0).then(|| {
-                GraphDeviceAllocation::allocate(
+                NativeDeviceAllocation::allocate_shared(
                     &runtime,
                     requirement.bytes as usize,
                     onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
