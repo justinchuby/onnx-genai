@@ -157,6 +157,7 @@ fn claims(ep: &dyn ExecutionProvider) {
 }
 
 #[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "CUDA test target requires gpu-tests")]
 fn mean_variance_normalization_cpu_goldens_and_claims() {
     claims(&CpuExecutionProvider::new());
     goldens(None);

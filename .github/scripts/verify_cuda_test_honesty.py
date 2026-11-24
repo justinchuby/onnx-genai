@@ -95,6 +95,7 @@ EXPECTED_CUDA_TARGETS_BY_DIR = {
             "matmul_gpu",
             "matmul_nbits_gpu",
             "matmul_nbits_marlin_numerics",
+            "mean_variance_normalization_gpu",
             "megakernel_headroom_gpu",
             "movement_gpu",
             "multi_head_attention_gpu",
