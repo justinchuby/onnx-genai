@@ -156,7 +156,8 @@ enum FirstInputIdentity {
     ShiftedBase,
 }
 
-struct SemanticIdentityFixture {
+struct SemanticIdentityFixture<'a> {
+    caller: common::EinsumCallerLane<'a>,
     kernel: Box<dyn onnx_runtime_ep_api::Kernel>,
     inputs: Vec<Tensor>,
     buffers: Vec<onnx_runtime_ep_api::DeviceBuffer>,
@@ -169,8 +170,8 @@ struct SemanticIdentityFixture {
     device: DeviceId,
 }
 
-impl SemanticIdentityFixture {
-    fn new(ep: &CudaExecutionProvider, route: EinsumRouteOverride) -> Self {
+impl<'a> SemanticIdentityFixture<'a> {
+    fn new(ep: &'a CudaExecutionProvider, route: EinsumRouteOverride) -> Self {
         let (equation, input_shapes, output_shape) = match route {
             EinsumRouteOverride::GenericNative => ("ij->i", vec![vec![2usize, 3]], vec![2usize]),
             EinsumRouteOverride::Optimized => (
@@ -197,6 +198,7 @@ impl SemanticIdentityFixture {
             .collect();
         let output_strides = compute_contiguous_strides(&output_shape);
         Self {
+            caller: common::EinsumCallerLane::new(ep),
             kernel,
             inputs,
             buffers,
@@ -257,7 +259,7 @@ impl SemanticIdentityFixture {
         } else {
             self.output.as_mut_ptr()
         };
-        execute_einsum_with_route(
+        self.caller.execute(
             self.kernel.as_ref(),
             &views,
             &mut [TensorMut::new(
@@ -281,6 +283,7 @@ impl SemanticIdentityFixture {
     }
 
     fn deallocate(self, ep: &CudaExecutionProvider) {
+        drop(self.caller);
         for buffer in self.buffers {
             ep.deallocate(buffer).unwrap();
         }
@@ -1078,6 +1081,8 @@ fn forced_f16_cublaslt_narrows_once_and_rejects_unregistered_workspace_capture()
         EinsumRouteOverride::CudaCublas,
         None,
     )
+    .unwrap()
+    .require_ready()
     .unwrap();
     assert_eq!(
         runtime.allocation_counts(),
@@ -1930,6 +1935,18 @@ fn failed_layout_rewarm_preserves_complete_direct_snapshot() {
         "failed rewarm must retain the complete prior resource snapshot"
     );
 
+    execute_layout_matrix(
+        &ep,
+        kernel.as_ref(),
+        &buffers[0],
+        &contiguous_a_strides,
+        0,
+        &buffers[1],
+        &mut output,
+        &output_strides,
+        &caller,
+    )
+    .unwrap();
     runtime
         .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
         .unwrap();
@@ -2439,7 +2456,7 @@ fn warm_plan_is_allocation_free_with_stable_workspace_through_capture_and_replay
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn captured_private_resources_outlive_dropped_einsum_kernels() {
+fn captured_einsum_resources_outlive_kernel_and_caller_owners() {
     let _lock = suite_lock();
     let ep = require_cuda();
     let caller = common::EinsumCallerLane::new(&ep);
@@ -2601,7 +2618,7 @@ fn captured_private_resources_outlive_dropped_einsum_kernels() {
     assert!(
         counts_after_reset.frees > counts_before_reset.frees
             || pooled_after_reset > pooled_before_reset,
-        "destroying the graph must release its private workspace/metadata owners"
+        "destroying the graph must release its caller workspace and immutable metadata owners"
     );
 
     for buffer in gemm_buffers {
@@ -2832,6 +2849,7 @@ fn generic_failed_rewarm_preserves_capture_ready_snapshot() {
     };
     assert_eq!(decode_floats(&untouched, DataType::Float32), [123.0, 456.0]);
 
+    run(&a_view, &mut a_output).unwrap();
     runtime
         .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
         .unwrap();
@@ -2897,11 +2915,15 @@ fn semantic_signatures_bind_raw_base_offset_and_rewarm_transactionally() {
             "{route:?}: a different raw base plus byte_offset must not alias the warmed identity"
         );
         assert_eq!(rewarm.plan_rewarms, 1, "{route:?}");
-        assert_ne!(
-            fixture.resources(),
-            warm_resources,
-            "{route:?}: successful eager rewarm must atomically publish the new snapshot"
-        );
+        if rewarm.persistent_metadata_bytes != 0 {
+            assert_ne!(
+                fixture.resources(),
+                warm_resources,
+                "{route:?}: address-bearing metadata must publish a fresh owner"
+            );
+        } else {
+            assert!(fixture.resources().is_empty());
+        }
         fixture.deallocate(&ep);
     }
 }
@@ -3014,7 +3036,10 @@ fn semantic_capture_mismatch_is_pre_mutation_and_preserves_snapshot() {
             .unwrap();
         let resources_before = fixture.resources();
         runtime
-            .begin_graph_capture(&[fixture.kernel.as_ref()])
+            .begin_graph_capture_with_resources(
+                &[fixture.kernel.as_ref()],
+                fixture.caller.resources(),
+            )
             .unwrap();
         let allocations_before = runtime.allocation_counts();
         let transfers_before = runtime.transfer_counts();
@@ -3119,8 +3144,19 @@ fn failed_semantic_rewarm_preserves_complete_snapshot_for_both_routes() {
         assert_eq!(einsum_execution_stats().plan_rewarms, 0, "{route:?}");
         assert_eq!(fixture.resources(), resources_before, "{route:?}");
 
+        fixture
+            .execute(
+                FirstInputIdentity::BaseWithOffset,
+                ep.device_id(),
+                ep.device_id(),
+                false,
+            )
+            .unwrap();
         runtime
-            .begin_graph_capture(&[fixture.kernel.as_ref()])
+            .begin_graph_capture_with_resources(
+                &[fixture.kernel.as_ref()],
+                fixture.caller.resources(),
+            )
             .unwrap();
         fixture
             .execute(
@@ -3265,7 +3301,14 @@ fn captured_optimized_plan_resources_outlive_dropped_kernel() {
         Some(onnx_runtime_ep_cuda::CudaEinsumRoute::OptimizedDp)
     );
     assert!(stats.optimized_cublas_launches > 0);
-    assert!(!kernel.device_graph_resources().is_empty());
+    assert_eq!(
+        kernel.device_graph_resources().len(),
+        usize::from(stats.persistent_metadata_bytes != 0)
+    );
+    assert_eq!(
+        caller.resources().len(),
+        usize::from(stats.workspace_bytes != 0)
+    );
     runtime
         .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
         .unwrap();
@@ -4623,4 +4666,310 @@ fn einsum_captured_descriptor_benchmark() {
         );
     }
     hostlock_provenance("sweep-end", expect_runnable);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+#[test]
+fn semantic_einsum_uses_caller_prefix_rebinds_transactionally_and_pins_capture() {
+    #[cfg(feature = "gpu-tests")]
+    semantic_einsum_caller_workspace_gpu();
+}
+
+#[cfg(feature = "gpu-tests")]
+fn semantic_einsum_caller_workspace_gpu() {
+    use onnx_runtime_ep_api::{WorkspaceExecutionPreparation, WorkspaceView};
+    let _lock = suite_lock();
+    let injected = Arc::new(common::ExternalEagerAllocator::new(
+        common::require_context("semantic Einsum caller workspace"),
+    ));
+    let ep = CudaExecutionProvider::new_default()
+        .unwrap()
+        .with_memory(injected.clone() as Arc<dyn onnx_runtime_memory_api::DeviceAllocator>)
+        .unwrap();
+    let runtime = ep.runtime();
+    let (m, k, n, p) = (8, 16, 12, 10);
+    let shapes = [vec![m, k], vec![k, n], vec![n, p]];
+    let output_shape = [m, p];
+    let kernel = make_typed_einsum_kernel(
+        &ep,
+        "ab,bc,cd->ad",
+        12,
+        DataType::Float32,
+        &shapes,
+        &output_shape,
+    );
+    let buffers = shapes
+        .iter()
+        .map(|shape| {
+            let bytes = common::raw(&vec![1f32; shape.iter().product()]);
+            let buffer = ep.allocate(bytes.len(), 256).unwrap();
+            // SAFETY: live real CUDA input backing covers this synchronous upload.
+            unsafe {
+                runtime.htod(&bytes, cuptr(buffer.as_ptr())).unwrap();
+            }
+            buffer
+        })
+        .collect::<Vec<_>>();
+    let strides = shapes
+        .iter()
+        .map(|shape| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+    let views = buffers
+        .iter()
+        .zip(&shapes)
+        .zip(&strides)
+        .map(|((buffer, shape), strides)| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr()),
+                DataType::Float32,
+                shape,
+                strides,
+                ep.device_id(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let output = ep.allocate(m * p * 4, 256).unwrap();
+    let output_strides = compute_contiguous_strides(&output_shape);
+    macro_rules! output {
+        () => {
+            TensorMut::new(
+                DevicePtrMut(output.as_ptr() as *mut c_void),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            )
+        };
+    }
+    macro_rules! refine {
+        () => {
+            onnx_runtime_ep_cuda::einsum_workspace_requirement_for_route(
+                kernel.as_ref(),
+                &views,
+                &[output!()],
+                EinsumRouteOverride::Optimized,
+                None,
+            )
+            .unwrap()
+        };
+    }
+    macro_rules! execute {
+        ($view:expr) => {
+            execute_einsum_with_route(
+                kernel.as_ref(),
+                &views,
+                &mut [output!()],
+                EinsumRouteOverride::Optimized,
+                $view,
+            )
+        };
+    }
+    macro_rules! resolve {
+        ($owner:expr) => {
+            refine!()
+                .resolve(kernel.as_ref(), |requirement| {
+                    common::prepare_workspace(&ep, requirement, $owner)
+                })
+                .unwrap()
+        };
+    }
+    reset_einsum_execution_stats();
+    let raw_before = runtime.allocation_counts();
+    let transfer_before = runtime.transfer_counts();
+    let external_before = injected.cumemalloc_calls();
+    let preparation = refine!();
+    let WorkspaceExecutionPreparation::Bind(prefix) = preparation else {
+        panic!("a cold multilinear BLAS program needs a real arithmetic prefix")
+    };
+    assert!(prefix.bytes > 0);
+    assert_eq!(
+        prefix.lifetime,
+        onnx_runtime_ep_api::WorkspaceLifetime::SessionPersistent
+    );
+    assert_eq!(runtime.allocation_counts(), raw_before);
+    assert_eq!(runtime.transfer_counts(), transfer_before);
+    assert_eq!(injected.cumemalloc_calls(), external_before);
+    let mut owner = None;
+    injected.fail_next_allocation();
+    let failure = preparation
+        .resolve(kernel.as_ref(), |requirement| {
+            common::prepare_workspace(&ep, requirement, &mut owner)
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        failure.contains("injected workspace allocation failure"),
+        "{failure}"
+    );
+    assert!(kernel.device_graph_resources().is_empty());
+    let (requirement, _) = preparation
+        .resolve(kernel.as_ref(), |requirement| {
+            common::prepare_workspace(&ep, requirement, &mut owner)
+        })
+        .unwrap();
+    assert!(requirement.bytes >= prefix.bytes);
+    assert_eq!(
+        runtime.allocation_counts(),
+        raw_before,
+        "both preparation phases contain host plans only"
+    );
+    assert_eq!(runtime.transfer_counts(), transfer_before);
+    let missing = execute!(None).unwrap_err().to_string();
+    assert!(missing.contains("workspace needs"), "{missing}");
+    assert!(!kernel.capture_support().is_supported());
+    assert_eq!(runtime.allocation_counts(), raw_before);
+    let (short_requirement, prepared) = resolve!(&mut owner);
+    let full = prepared.unwrap();
+    let short = WorkspaceView::new(full.ptr(), short_requirement.bytes as usize - 1);
+    let error = execute!(Some(short)).unwrap_err().to_string();
+    assert!(error.contains("workspace needs"), "{error}");
+    assert_eq!(runtime.allocation_counts(), raw_before);
+    assert_eq!(runtime.transfer_counts(), transfer_before);
+    let (requirement, prepared) = resolve!(&mut owner);
+    let view = prepared.unwrap();
+    execute!(Some(view)).unwrap();
+    let warmed = einsum_execution_stats();
+    assert!(warmed.workspace_bytes >= prefix.bytes);
+    assert_eq!(
+        kernel.device_graph_resources().len(),
+        usize::from(warmed.persistent_metadata_bytes != 0)
+    );
+    assert_eq!(
+        runtime.allocation_counts().allocations - raw_before.allocations,
+        u64::from(warmed.persistent_metadata_bytes != 0),
+        "only immutable metadata may allocate privately"
+    );
+    let raw_warm = runtime.allocation_counts();
+    let transfers_warm = runtime.transfer_counts();
+    let external_warm = injected.cumemalloc_calls();
+    for _ in 0..8 {
+        assert!(matches!(refine!(), WorkspaceExecutionPreparation::Ready(_)));
+        let (_, prepared) = resolve!(&mut owner);
+        execute!(prepared).unwrap();
+    }
+    assert_eq!(runtime.allocation_counts(), raw_warm);
+    assert_eq!(runtime.transfer_counts(), transfers_warm);
+    assert_eq!(injected.cumemalloc_calls(), external_warm);
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    let missing_pin = execute!(Some(view)).unwrap_err().to_string();
+    runtime.abort_graph_capture().unwrap();
+    assert!(
+        missing_pin.contains("real workspace owner"),
+        "{missing_pin}"
+    );
+    execute!(Some(view)).unwrap();
+    let pin = owner
+        .as_ref()
+        .unwrap()
+        .device_graph_resource()
+        .unwrap()
+        .unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], vec![pin])
+        .unwrap();
+    execute!(Some(view)).unwrap();
+    runtime.end_graph_capture().unwrap();
+    for _ in 0..3 {
+        // SAFETY: the original caller owner remains live, and the upload drains
+        // preceding compute before dirtying disposable scratch between replays.
+        unsafe {
+            runtime
+                .htod(&vec![0xff; view.bytes()], cuptr(view.ptr().0.cast_const()))
+                .unwrap();
+        }
+        runtime.replay_graph().unwrap();
+        let mut bytes = vec![0; m * p * 4];
+        // SAFETY: live real output backing; synchronous D2H proves completion.
+        unsafe {
+            runtime.dtoh(&mut bytes, cuptr(output.as_ptr())).unwrap();
+        }
+        assert!(
+            decode_floats(&bytes, DataType::Float32)
+                .iter()
+                .all(|&value| value == (k * n) as f32)
+        );
+    }
+    // A different root caller may lend another fitting owner. Program identity
+    // is unchanged; every address-bearing snapshot must use the new final base.
+    let builds = einsum_execution_stats().plan_builds;
+    let mut other_owner = None;
+    let (_, other_view) = resolve!(&mut other_owner);
+    let other_view = other_view.unwrap();
+    assert_ne!(other_view.ptr().0, view.ptr().0);
+    execute!(Some(other_view)).unwrap();
+    assert_eq!(einsum_execution_stats().plan_builds, builds);
+    assert_eq!(
+        einsum_execution_stats().workspace_ptr,
+        cuptr(other_view.ptr().0.cast_const())
+    );
+    let metadata = kernel
+        .device_graph_resources()
+        .iter()
+        .map(|resource| resource.identity())
+        .collect::<Vec<_>>();
+    runtime.fail_warm_transaction_at_for_test(1);
+    let error = execute!(Some(view)).unwrap_err().to_string();
+    assert!(
+        error.contains("injected staged warm-cache failure"),
+        "{error}"
+    );
+    assert_eq!(
+        kernel
+            .device_graph_resources()
+            .iter()
+            .map(|resource| resource.identity())
+            .collect::<Vec<_>>(),
+        metadata
+    );
+    let raw_after_failure = runtime.allocation_counts();
+    let transfers_after_failure = runtime.transfer_counts();
+    execute!(Some(other_view)).unwrap();
+    assert_eq!(runtime.allocation_counts(), raw_after_failure);
+    assert_eq!(runtime.transfer_counts(), transfers_after_failure);
+    let pin = owner
+        .as_ref()
+        .unwrap()
+        .device_graph_resource()
+        .unwrap()
+        .unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], vec![pin])
+        .unwrap();
+    let error = execute!(Some(view)).unwrap_err().to_string();
+    runtime.abort_graph_capture().unwrap();
+    assert!(error.contains("binding changed during capture"), "{error}");
+    assert_eq!(runtime.allocation_counts(), raw_after_failure);
+    assert_eq!(runtime.transfer_counts(), transfers_after_failure);
+    drop(kernel);
+    let frees = injected.frees();
+    ep.deallocate_workspace(owner.take().unwrap()).unwrap();
+    assert_eq!(
+        injected.frees(),
+        frees,
+        "the installed graph keeps the original real caller owner"
+    );
+    runtime.replay_graph().unwrap();
+    let mut bytes = vec![0; m * p * 4];
+    // SAFETY: real output remains live through the graph and synchronous copy.
+    unsafe {
+        runtime.dtoh(&mut bytes, cuptr(output.as_ptr())).unwrap();
+    }
+    assert!(
+        decode_floats(&bytes, DataType::Float32)
+            .iter()
+            .all(|&value| value == (k * n) as f32)
+    );
+    assert!(runtime.reset_graph().unwrap());
+    ep.deallocate_workspace(other_owner.take().unwrap())
+        .unwrap();
+    for buffer in buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(output).unwrap();
+    common::drain_releases(&ep, "semantic Einsum caller workspace teardown");
+    assert_eq!(injected.frees(), injected.cumemalloc_calls());
+    assert!(requirement.bytes > 0);
 }

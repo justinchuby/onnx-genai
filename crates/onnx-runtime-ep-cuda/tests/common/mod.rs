@@ -760,10 +760,12 @@ impl EinsumCallerWorkspace {
         route: onnx_runtime_ep_cuda::EinsumRouteOverride,
         ceiling: Option<u128>,
     ) -> onnx_runtime_ep_api::Result<()> {
-        let requirement = onnx_runtime_ep_cuda::einsum_workspace_requirement_for_route(
+        let preparation = onnx_runtime_ep_cuda::einsum_workspace_requirement_for_route(
             kernel, inputs, outputs, route, ceiling,
         )?;
-        let view = prepare_workspace(ep, requirement, &mut self.owner.borrow_mut())?;
+        let (_, view) = preparation.resolve(kernel, |requirement| {
+            prepare_workspace(ep, requirement, &mut self.owner.borrow_mut())
+        })?;
         match ceiling {
             Some(ceiling) => onnx_runtime_ep_cuda::execute_einsum_with_route_and_memory_ceiling(
                 kernel, inputs, outputs, route, ceiling, view,
