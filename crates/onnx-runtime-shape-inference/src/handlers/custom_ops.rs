@@ -398,14 +398,27 @@ fn causal_conv_with_state_standard(ctx: &mut InferenceContext) -> Result<(), Sha
             "weight must be [C, 1, K] with K >= 1, got {w:?}"
         )));
     }
-    let history = if let Some(w) = &weight_shape {
-        if let Some(kernel) = w[2].as_const() {
-            c(dilation.history(kernel).map_err(invalid)?)
-        } else {
-            w[2].sub(&c(1)).mul(&c(dilation.value()))
+    let kernel = weight_shape.as_ref().map(|w| &w[2]);
+    let past_history = past_shape.as_ref().map(|past| &past[2]);
+    let history = if let Some(kernel) = kernel.and_then(DimExpr::as_const) {
+        c(dilation.history(kernel).map_err(invalid)?)
+    } else if let Some(history) = past_history.and_then(DimExpr::as_const) {
+        if history == i64::MAX {
+            return Err(invalid(format!(
+                "past_state history {history} plus one exceeds int64; reduce kernel width or dilation"
+            )));
         }
-    } else if let Some(past) = &past_shape {
-        past[2].clone()
+        if history < 0 || history % dilation.value() != 0 {
+            return Err(invalid(format!(
+                "past_state history must be a nonnegative multiple of dilation {}, got {history}",
+                dilation.value()
+            )));
+        }
+        c(history)
+    } else if let Some(kernel) = kernel {
+        kernel.sub(&c(1)).mul(&c(dilation.value()))
+    } else if let Some(history) = past_history {
+        history.clone()
     } else {
         ctx.fresh_dim()
     };

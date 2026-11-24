@@ -286,4 +286,30 @@ fn causal_conv_rejects_dilation_in_older_schemas_and_invalid_opset29_values() {
         let error = ep.get_kernel(&node, &[], opset).err().unwrap().to_string();
         assert!(error.contains(message), "opset {opset}: {error}");
     }
+
+    #[test]
+    fn causal_conv_opset29_requires_one_dtype_for_all_inputs() {
+        let shape = [1, 1, 1];
+        let input = Tensor::floats(FloatDType::F32, &shape, &[1.0]);
+        let weight = Tensor::floats(FloatDType::F16, &shape, &[1.0]);
+        let mut output = Tensor::zeros(FloatDType::F32, &shape);
+        let mut present = Tensor::zeros(FloatDType::F32, &[1, 1, 0]);
+        let kernel = make_kernel(
+            "CausalConvWithState",
+            [],
+            &[shape.to_vec(), shape.to_vec()],
+            29,
+        );
+        let error = kernel
+            .execute(
+                &[input.view(), weight.view()],
+                &mut [output.view_mut(), present.view_mut()],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("weight dtype Float16 must match input dtype Float32"),
+            "{error}"
+        );
+    }
 }

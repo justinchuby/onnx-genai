@@ -165,6 +165,20 @@ impl Kernel for CausalConvWithStateKernel {
         // opset-27 decode form `(input, weight, "", past_state)`.
         let has_bias = inputs.len() >= 3 && !inputs[2].is_absent();
         let has_state = inputs.len() >= 4 && !inputs[3].is_absent();
+        if self.standard {
+            for (slot, name, present) in [
+                (1, "weight", true),
+                (2, "bias", has_bias),
+                (3, "past_state", has_state),
+            ] {
+                if present && inputs[slot].dtype != inputs[0].dtype {
+                    return Err(EpError::KernelFailed(format!(
+                        "CausalConvWithState: {name} dtype {:?} must match input dtype {:?}; cast all inputs to the same float type",
+                        inputs[slot].dtype, inputs[0].dtype
+                    )));
+                }
+            }
+        }
         let present_shape = [batch, channels, pad];
         for (name, output, shape) in [
             ("output", outputs.first(), x_shape),
