@@ -82,6 +82,19 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     pub replay_buffer_bytes: usize,
 
+    /// Enable host filesystem/command tools for trusted clients: all or a comma-separated list.
+    #[arg(long, value_delimiter = ',', env = "NXRT_TOOLS")]
+    pub tools: Vec<crate::BuiltinTool>,
+    /// Maximum in-flight host-tool calls, including responses still being consumed.
+    #[arg(long, default_value = "8")]
+    pub tools_max_concurrent: std::num::NonZeroUsize,
+    /// Host memory budget for tool request/response and file I/O staging, in bytes.
+    #[arg(long, default_value = "268435456")]
+    pub tools_max_host_bytes: std::num::NonZeroU64,
+    /// Additional trusted browser origin permitted to invoke host tools.
+    #[arg(long)]
+    pub tools_allow_origin: Vec<String>,
+
     /// Enable the official chat frontend's HTTP(S) MCP proxy (off by default).
     #[arg(long)]
     pub ui_mcp_proxy: bool,
@@ -207,6 +220,12 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
     ServerConfig {
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
+        tools: crate::ToolsConfig {
+            enabled: args.tools.clone(),
+            max_concurrent: args.tools_max_concurrent,
+            max_host_bytes: args.tools_max_host_bytes,
+            allow_origins: args.tools_allow_origin.clone(),
+        },
         max_completion_prompts: args.max_completion_prompts,
         max_rerank_input_tokens: args.max_rerank_input_tokens,
         max_rerank_documents: args.max_rerank_documents,
@@ -333,6 +352,44 @@ mod tests {
             "--slot-save-max-total-bytes",
             "--slot-save-max-files",
         ] {
+            assert!(TestCli::try_parse_from(["test", "model-dir", flag, "0"]).is_err());
+        }
+    }
+
+    #[test]
+    fn builtin_tools_require_explicit_selection_and_bounded_resources() {
+        let disabled = TestCli::parse_from(["test", "model-dir"]);
+        assert!(
+            server_config_from_args(&disabled.serve)
+                .tools
+                .enabled
+                .is_empty()
+        );
+        let enabled = TestCli::parse_from([
+            "test",
+            "model-dir",
+            "--tools",
+            "read_file,exec_shell_command",
+            "--tools-max-concurrent",
+            "2",
+            "--tools-max-host-bytes",
+            "1048576",
+            "--tools-allow-origin",
+            "https://trusted.invalid",
+        ]);
+        let config = server_config_from_args(&enabled.serve);
+        assert_eq!(
+            config.tools.enabled,
+            vec![
+                crate::BuiltinTool::ReadFile,
+                crate::BuiltinTool::ExecShellCommand
+            ]
+        );
+        assert_eq!(config.tools.max_concurrent.get(), 2);
+        assert_eq!(config.tools.max_host_bytes.get(), 1048576);
+        assert_eq!(config.tools.allow_origins, vec!["https://trusted.invalid"]);
+        assert!(TestCli::try_parse_from(["test", "model-dir", "--tools", "unknown"]).is_err());
+        for flag in ["--tools-max-concurrent", "--tools-max-host-bytes"] {
             assert!(TestCli::try_parse_from(["test", "model-dir", flag, "0"]).is_err());
         }
     }

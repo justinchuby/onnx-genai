@@ -96,6 +96,7 @@ pub(crate) async fn props(
         "cors_proxy_enabled": state.config.mcp_proxy_policy.is_enabled(),
         "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION")),
         "nxrt_capabilities": {
+            "server_tools": state.tools.is_some(),
             "resumable_streams": true, "reasoning_control": true,
             "tools": handle.tool_protocol.is_some(), "custom_sampler_order": handle.engine.runtime_sampling,
             "lora": handle.engine.adapters.is_some(),
