@@ -1,0 +1,260 @@
+[
+  {
+    "display_name": "Read file",
+    "tool": "read_file",
+    "type": "server",
+    "permissions": {
+      "write": false
+    },
+    "uses_cwd": true,
+    "definition": {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a file, optionally selecting 1-based inclusive lines and prefixing line numbers.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "start_line": {
+              "type": "integer"
+            },
+            "end_line": {
+              "type": "integer"
+            },
+            "append_loc": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "display_name": "File search",
+    "tool": "file_glob_search",
+    "type": "server",
+    "permissions": {
+      "write": false
+    },
+    "uses_cwd": true,
+    "definition": {
+      "type": "function",
+      "function": {
+        "name": "file_glob_search",
+        "description": "Find files or directories with include/exclude globs; file listings respect git ignore rules.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "include": {
+              "type": "string"
+            },
+            "exclude": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            },
+            "max_depth": {
+              "type": "integer"
+            },
+            "limit": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "display_name": "Grep search",
+    "tool": "grep_search",
+    "type": "server",
+    "permissions": {
+      "write": false
+    },
+    "uses_cwd": true,
+    "definition": {
+      "type": "function",
+      "function": {
+        "name": "grep_search",
+        "description": "Search file contents with a regex or literal, optional case folding and context.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "pattern": {
+              "type": "string"
+            },
+            "include": {
+              "type": "string"
+            },
+            "exclude": {
+              "type": "string"
+            },
+            "return_line_numbers": {
+              "type": "boolean"
+            },
+            "literal": {
+              "type": "boolean"
+            },
+            "ignore_case": {
+              "type": "boolean"
+            },
+            "context_lines": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "path",
+            "pattern"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "display_name": "Execute shell command",
+    "tool": "exec_shell_command",
+    "type": "server",
+    "permissions": {
+      "write": true
+    },
+    "uses_cwd": true,
+    "definition": {
+      "type": "function",
+      "function": {
+        "name": "exec_shell_command",
+        "description": "Execute a shell command; return combined stdout/stderr. Timeout defaults to 10 seconds, capped at 60; max_output_size defaults to 16384 bytes.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "timeout": {
+              "type": "integer"
+            },
+            "max_output_size": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "display_name": "Write file",
+    "tool": "write_file",
+    "type": "server",
+    "permissions": {
+      "write": true
+    },
+    "uses_cwd": true,
+    "definition": {
+      "type": "function",
+      "function": {
+        "name": "write_file",
+        "description": "Write content to a file, creating parent directories if needed.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "display_name": "Edit file",
+    "tool": "edit_file",
+    "type": "server",
+    "permissions": {
+      "write": true
+    },
+    "uses_cwd": true,
+    "definition": {
+      "type": "function",
+      "function": {
+        "name": "edit_file",
+        "description": "Apply non-overlapping unique text replacements against the original file.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "edits": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "old_text": {
+                    "type": "string"
+                  },
+                  "new_text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "old_text",
+                  "new_text"
+                ]
+              }
+            }
+          },
+          "required": [
+            "path",
+            "edits"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "display_name": "Get Runtime Info",
+    "tool": "get_info",
+    "type": "server",
+    "permissions": {
+      "write": false
+    },
+    "uses_cwd": true,
+    "definition": {
+      "type": "function",
+      "function": {
+        "name": "get_info",
+        "description": "Return the operating system and working directory.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    }
+  }
+]
