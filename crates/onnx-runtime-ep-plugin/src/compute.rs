@@ -344,6 +344,15 @@ impl ShapeInference {
     ///
     /// `num_outputs` is how many output slots the node has in the graph.
     pub fn for_node(node: &Node, input_shapes: &[Vec<Option<usize>>], num_outputs: usize) -> Self {
+        // Plugin callers can construct nodes before the loader's canonical
+        // IR boundary. Normalize once here so registry and shared rules use
+        // the same domain identity, including the node retained for inference.
+        let domain = onnx_runtime_ir::normalize_domain(&node.domain);
+        if domain != node.domain {
+            let mut canonical = node.clone();
+            canonical.domain = domain.into();
+            return Self::for_node(&canonical, input_shapes, num_outputs);
+        }
         let op = node.op_type.as_str();
         let domain = node.domain.as_str();
         let opset = node.version.unwrap_or(0);

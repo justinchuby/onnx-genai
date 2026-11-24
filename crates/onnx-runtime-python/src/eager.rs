@@ -12,7 +12,8 @@ fn eager_error(op_type: &str, domain: &str, err: EagerError) -> PyErr {
     let message = format!(
         "eager dispatch failed for operator {op_type:?} in domain {domain:?}: {err}. \
          Verify the operator/domain/opset is supported by nxrt's CPU execution provider, \
-         and that input dtypes and shapes satisfy the ONNX schema."
+         and that input dtypes and shapes satisfy the ONNX schema. For provider failures, \
+         inspect the reported execution/workspace cause and available device memory before retrying."
     );
     match err {
         EagerError::NoKernel { .. }
@@ -22,7 +23,9 @@ fn eager_error(op_type: &str, domain: &str, err: EagerError) -> PyErr {
         | EagerError::ShapeInference { .. }
         | EagerError::ShapeInferEngine(_)
         | EagerError::Ir(_) => PyValueError::new_err(message),
-        EagerError::Kernel(_) => PyRuntimeError::new_err(message),
+        EagerError::Kernel(_)
+        | EagerError::Execution { .. }
+        | EagerError::WorkspaceRelease { .. } => PyRuntimeError::new_err(message),
     }
 }
 
@@ -212,4 +215,52 @@ pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
         .cast_into::<PyDict>()?
         .set_item("nxrt.eager", &module)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    use onnx_runtime_ep_api::EpError;
+    use onnx_runtime_ir::DeviceId;
+
+    #[test]
+    fn eager_workspace_failures_keep_runtime_class_and_both_causes() {
+        Python::initialize();
+        Python::attach(|py| {
+            let failed =
+                |message: &str| Box::new(EagerError::Kernel(EpError::KernelFailed(message.into())));
+            let cases = [
+                (
+                    EagerError::Execution {
+                        op_type: "MatMul".into(),
+                        domain: "ai.onnx".into(),
+                        device: DeviceId::cpu(),
+                        source: failed("workspace admission rejected"),
+                    },
+                    vec!["MatMul", "ai.onnx", "workspace admission rejected"],
+                ),
+                (
+                    EagerError::WorkspaceRelease {
+                        op: "MatMul".into(),
+                        execution: failed("original kernel failure"),
+                        release: failed("original retirement failure"),
+                    },
+                    vec!["original kernel failure", "original retirement failure"],
+                ),
+            ];
+            for (failure, causes) in cases {
+                let error = eager_error("MatMul", "ai.onnx", failure);
+                assert!(error.is_instance_of::<PyRuntimeError>(py));
+                let message = error.to_string();
+                for cause in causes {
+                    assert!(message.contains(cause), "{message}");
+                }
+                assert!(message.contains("available device memory"), "{message}");
+            }
+            assert!(
+                eager_error("MatMul", "ai.onnx", EagerError::InvalidOutputCount)
+                    .is_instance_of::<PyValueError>(py)
+            );
+        });
+    }
 }
