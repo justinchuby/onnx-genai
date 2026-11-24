@@ -262,6 +262,7 @@ fn packed_fusion_cpu_release_ab() {
 #[cfg(feature = "gpu-tests")]
 #[test]
 #[ignore = "release performance probe; hold the shared host lock"]
+#[allow(clippy::assertions_on_constants)]
 fn packed_fusion_cuda_release_ab() {
     use onnx_runtime_ep_cuda::CudaExecutionProvider;
     use std::{path::Path, sync::Arc};

@@ -205,6 +205,37 @@ Host C ABI tests use real governed backing, zero-byte issuer positive controls,
 serial peak reuse, failure retirement and preflight refusal. They do not prove
 CUDA execution, asynchronous ordering, capture behavior or throughput.
 
+### Scoped control-flow workspace loans
+
+Native control flow loans the actual parent workspace owners for the duration of
+a child run, replacing copied raw `(base, length)` inheritance. The parent is
+paused; a stack guard moves the two lifetime-separated owners into the child and
+returns their final state on every exit, including errors and unwinding. Grandchildren
+continue borrowing the same root owners. No child-private budget is created.
+The exact provider Arc must match, and a child with private active/idle owners or
+installed graphs must retire that independent state before accepting a loan.
+
+A loan marks enclosing completion Pending before work. Child idle restore and
+recycle are disabled during the loan, so no child pressure pool can capture the
+parent owner. Only the enclosing execution boundary can establish completion.
+The guard's Drop only moves ownership and clears the loan policy; it performs no
+provider callback, release, synchronization, allocation or fallible operation.
+
+Fitting warm demands borrow the retained region with zero issuer callbacks.
+Cold growth uses the original provider's synchronization and consuming replacement
+path; bytes and alignment both retain their high-water marks. Every enclosing
+capture slot's replacement policy is propagated through all nesting levels.
+Independent child capture is refused; installed graphs keep their original
+address-growth protection. Complete prepared requirements still work normally,
+and strict metadata preparation has not been converted to an incomplete promise.
+
+Host regressions cover nested cold growth, one real authority owner, warm zero
+issuer callbacks, parent Verify-slot refusal, consuming replacement failure,
+planner/kernel errors and unwinding, child idle isolation and provider identity.
+Actual backing span/alignment checks apply before both ordinary and kernel-sized
+launches. Host tests and GPU-target compilation do not establish device numerical,
+asynchronous lifetime, capture replay or throughput behavior.
+
 ### Workspace capture ownership
 
 The canonical owned-capture hook accepts caller resources alongside kernels.
@@ -223,10 +254,10 @@ the same real resource Arcs as the graph lifecycle. Providers that do not retain
 caller resources explicitly refuse the capture rather than dropping pins.
 
 Raw workspace has no transferable binding ownership and is refused at this
-capture boundary. Inherited child views cannot manufacture a parent owner;
-independent capture must be driven by the executor that owns the backing. Current
-child execution remains scoped execution through the parent's live workspace.
-This bridge adds no allocator, pool, quota ledger, or warm inference callback.
+capture boundary. A child borrowing its parent's lane cannot start independent
+capture, even though its scope temporarily holds the actual owner. Capture is
+driven by the enclosing executor; all enclosing graph slots constrain growth.
+The loan adds no allocator, pool, quota ledger or warm issuer callback.
 GQA below now consumes this ownership bridge for its complete borrowed composite.
 
 ### CUDA standard Attention temporary storage
@@ -375,9 +406,9 @@ identify the input name, type, shape, byte count and provider device.
 No quota protocol, pool or persistent cache is introduced. Host regressions
 reproduce the original partial-binding error and verify failure/panic behavior,
 recovery, storage-only preparation, stable fitting backings and external-input
-exclusion. The exact shape/storage epoch and view/in-place facts required for
-MatMul admission remain subsequent work; allocating a value buffer alone does
-not prove that execution will use it as the final tensor origin.
+exclusion. Exact dispatch refinement still follows the real view/in-place
+and materialization decisions. Allocating a value buffer alone does not prove
+that execution will use it as the final tensor origin.
 
 ### Output storage ownership during workspace planning
 
@@ -434,17 +465,18 @@ a substitute algorithm, and a fixed 32-MiB reservation are not valid bounds.
 Exhaustively querying all pointer-alignment classes would add hundreds of cold
 heuristic calls and is not required by this contract.
 
-The remaining native barrier is storage preparation, not another quota API.
-The engine currently plans from metadata with physical-capacity symbol bounds,
-whereas execution can use a smaller logical shape and resolve view aliases only
-at dispatch. Workspace sizes across these shapes are not monotonic. Exact
-ActualAddress planning must reuse real per-value backings, resolve the execution
-shape and aliases, then refine and reserve before publishing a storage/plan
-epoch. A changed shape or binding requires cold preparation before submission.
-The activation-memory plan is currently observational and does not establish
-actual origins. Statically preparable children must contribute their concrete
-requirements to the parent lane; runtime-created data-dependent child storage
-cannot be covered by an invented zero demand or an independent child budget.
+Native eager dispatch already supports cold growth of its governed lane. A full
+static storage/alias epoch is therefore not a prerequisite for precise admission.
+The simpler next boundary is an explicit complete/deferred preparation report:
+reserve the known metadata peak without claiming unknown demand is zero, then
+resolve the remaining demand at actual dispatch after view/in-place decisions.
+Dense MatMul migration still needs this report and matching host-plan selection;
+the current strict metadata-only public prepare continues to refuse Deferred.
+ActualAddress workspace sizes across shapes need not be monotonic, and neither
+physical-capacity symbols nor the observational activation plan establish a bound
+for all selected algorithms. Capture still requires a successful warm route and
+stable, pinned backing. No independent child budget may stand in for deferred
+parent demand.
 
 Resource accounting stays coarse: each concurrent workspace lane owns its
 physical peak, serial kernels share the maximum, and simultaneously live regions

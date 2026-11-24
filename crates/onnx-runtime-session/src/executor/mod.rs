@@ -1104,7 +1104,9 @@ mod geometry;
 use dynamic_shapes::*;
 use geometry::*;
 mod workspace_reuse;
-use workspace_reuse::{WorkspaceCompletion, WorkspaceReplacement, WorkspaceReuse};
+use workspace_reuse::{
+    WorkspaceCompletion, WorkspaceReplacement, WorkspaceReuse, workspace_high_water,
+};
 mod bindings;
 #[cfg(test)]
 use bindings::{AxisBound, PlannedInputShape};

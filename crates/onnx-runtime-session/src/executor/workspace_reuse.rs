@@ -34,6 +34,14 @@ impl WorkspaceReplacement {
         }
     }
 
+    pub(super) fn including(self, enclosing: Option<Self>) -> Self {
+        if matches!(self, Self::CapturePinned) || matches!(enclosing, Some(Self::CapturePinned)) {
+            Self::CapturePinned
+        } else {
+            Self::Allowed
+        }
+    }
+
     pub(super) fn check(
         self,
         slot: Option<&PreparedWorkspace>,
@@ -203,9 +211,29 @@ impl WorkspaceReuse {
     }
 }
 
+/// Keep both dimensions of the physical lane peak when either must grow.
+pub(super) fn workspace_high_water(
+    requirement: WorkspaceRequirement,
+    old: Option<&PreparedWorkspace>,
+) -> WorkspaceRequirement {
+    match old {
+        Some(old) => WorkspaceRequirement {
+            bytes: requirement.bytes.max(old.bytes as u64),
+            alignment: requirement.alignment.max(old.alignment),
+            ..requirement
+        },
+        None => requirement,
+    }
+}
+
 impl Executor {
+    pub(super) fn workspace_replacement(&self) -> WorkspaceReplacement {
+        WorkspaceReplacement::for_captures(&self.slot_capture)
+            .including(self.parent_workspace_policy)
+    }
+
     pub(super) fn restore_completed_step_workspace(&mut self) {
-        if self.step_workspace.is_none() {
+        if self.parent_workspace_policy.is_none() && self.step_workspace.is_none() {
             self.step_workspace = self.workspace_reuse.take();
         }
     }

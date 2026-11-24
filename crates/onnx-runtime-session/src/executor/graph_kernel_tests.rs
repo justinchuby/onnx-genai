@@ -923,7 +923,7 @@ fn claimed_dynamic_outputs_use_prepared_scratch_without_lending_it_to_outputs() 
 }
 
 #[test]
-fn claimed_dynamic_outputs_reject_short_or_misaligned_inherited_scratch_before_execution() {
+fn claimed_dynamic_outputs_reject_short_frozen_or_misaligned_backing_before_execution() {
     let mut provider = PatternGraphEp::new(false);
     provider.scratch_bytes = 64;
     let ep = Arc::new(provider);
@@ -934,13 +934,25 @@ fn claimed_dynamic_outputs_reject_short_or_misaligned_inherited_scratch_before_e
     executor
         .prepare_with_device_bindings(&[("x", &x), ("condition", &cond)], &mut [])
         .unwrap();
+    if let Some(old) = executor.step_workspace.take() {
+        ep.deallocate_workspace(old.buffer).unwrap();
+    }
+    executor.parent_workspace_policy = Some(WorkspaceReplacement::CapturePinned);
     let mut backing = [0u128; 8];
     let address = backing.as_mut_ptr() as usize;
     for (ptr, bytes, message) in [
-        (address, 63, "workspace invariant mismatch"),
+        (address, 63, "cannot grow"),
         (address + 1, 64, "live, aligned enclosing workspace"),
     ] {
-        executor.inherited_workspace.step = Some((ptr, bytes));
+        let buffer = unsafe {
+            DeviceBuffer::from_borrowed_mut_parts(ptr as *mut _, ep.device_id(), bytes, 1)
+        }
+        .unwrap();
+        executor.step_workspace = Some(PreparedWorkspace {
+            buffer: WorkspaceAllocation::new(buffer),
+            bytes,
+            alignment: 16,
+        });
         let error = executor
             .run(&[("x", &x), ("condition", &cond)])
             .unwrap_err()
@@ -952,5 +964,6 @@ fn claimed_dynamic_outputs_reject_short_or_misaligned_inherited_scratch_before_e
             "rejected backing must fail before executing or publishing dynamic outputs"
         );
     }
-    executor.inherited_workspace.step = None;
+    drop(executor.step_workspace.take());
+    executor.parent_workspace_policy = None;
 }
