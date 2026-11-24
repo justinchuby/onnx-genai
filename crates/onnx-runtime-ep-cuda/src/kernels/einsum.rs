@@ -2059,7 +2059,7 @@ impl EinsumKernel {
                 self.plan.equation()
             ))
         })?;
-        let metadata_candidate = metadata.stage(&candidate.metadata, "Einsum view")?;
+        let metadata_candidate = metadata.stage(&candidate.metadata, "Einsum view metadata")?;
         let metadata_ptr = metadata_candidate.ptr("Einsum view")?;
         let metadata_bytes = metadata_candidate.allocation_bytes();
         launch_persistent_metadata(

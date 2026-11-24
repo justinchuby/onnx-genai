@@ -1220,6 +1220,30 @@ failure retention, capture miss rejection and replay after owner replacement
 and kernel drop. Host/type checks and GPU-feature compilation can verify the
 interfaces here; device execution and performance need CUDA hardware.
 
+The same cache now backs `ScatterElements`, `GatherElements` and the shared
+`PersistentMetadata` adapter used by movement, Einsum views, ScatterND,
+GatherND and TensorScatter. Scatter and Gather keep distinct typed keys and
+three-/four-table encoding ABIs. Their cache-hit shape comparison borrows the
+input slices before allocating any replacement key. `PersistentMetadata`
+compares its callers' already-encoded values; candidate cloning shares the
+complete record rather than copying those values. Its pointer, logical byte
+extent and graph resource derive from that record through a borrowed allocation
+accessor. Empty metadata retains the initialized u64 sentinel, including exact
+signed-stride bit patterns in nonempty payloads.
+
+For this adapter, a content miss now adds the common explicit
+`drain_for_unmap` before replacement, independent of deferred per-op eager sync;
+its fitting warm path adds no drain or upload. Cold preparation materializes
+an owned byte payload. Existing kernel-specific signature checks, dynamic
+control readbacks, identity/empty paths and launch-success publication remain
+in their callers. The artifact labels passed to staging are borrowed, avoiding
+new warm formatting. Host regressions pin table ABI and sentinel/signed-bit
+encoding; the Transpose device fixture additionally checks warm allocation/
+transfer/drain stability and mandatory drains for failed and successful rewarm,
+while retaining its old-graph replay after rewarm and kernel drop. Slice still
+has two independently prepared tables at this stage; unifying their common
+physical lifetime is a separate change.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
