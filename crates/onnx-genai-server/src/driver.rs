@@ -2067,8 +2067,10 @@ fn route_continuous_events(
                     // The terminal event must reach the consumer even when the
                     // channel is momentarily full; losing it closes the stream and
                     // the caller reports "generation stream ended before result".
+                    let events = route.events.clone();
+                    drop(route);
                     let _ = deliver_driver_event(
-                        &route.events,
+                        &events,
                         DriverEvent::Finished(result),
                         DELIVERY_GRACE,
                     );
@@ -2495,7 +2497,7 @@ fn run_generation(
         lease,
         admission,
         events,
-        permit: _permit,
+        permit,
     } = pending;
     let mut metrics = GenerationMetrics::start();
     let bound = match input
@@ -2510,6 +2512,7 @@ fn run_generation(
         Ok(bound) => bound,
         Err(error) => {
             let failure = DriverFailure::internal(format!("{error:#}"));
+            drop(permit);
             let _ = admission.send(Err(failure.clone()));
             let _ = events.try_send(DriverEvent::Error(failure));
             return;
@@ -2569,6 +2572,9 @@ fn run_generation(
     // still in flight. A turn admitted at this instant still runs after this
     // one — the worker that would run it is this thread, and it is here.
     drop(lease);
+    // Completion also makes admission capacity available before the client can
+    // observe its terminal event and immediately submit another request.
+    drop(permit);
     match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
@@ -2619,7 +2625,7 @@ fn run_fim_generation(
         WorkerPermit,
     ),
 ) {
-    let (admission, events, _permit) = delivery;
+    let (admission, events, permit) = delivery;
     let mut metrics = GenerationMetrics::start();
     let mut admission = Some(admission);
     let result = {
@@ -2637,6 +2643,7 @@ fn run_fim_generation(
             None,
         )
     };
+    drop(permit);
     match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);

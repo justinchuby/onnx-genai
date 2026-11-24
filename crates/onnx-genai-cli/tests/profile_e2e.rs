@@ -40,6 +40,7 @@ fn scratch(name: &str) -> PathBuf {
 fn run_cli(arguments: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
         .args(arguments)
+        .env_remove("ONNX_GENAI_BACKEND")
         .env("ONNX_GENAI_EP", "cpu")
         .output()
         .expect("the onnx-genai binary must start");
@@ -63,10 +64,36 @@ fn profile_execution_provider(path: &Path) -> String {
 }
 
 #[test]
-fn generate_profile_provider_comes_from_live_command_profile() {
-    let directory = scratch("generate");
+fn generate_profile_provider_comes_from_explicit_ort_reference_run() {
+    let directory = scratch("generate-ort");
     let profile = directory.join("profile.json");
 
+    run_cli(&[
+        "--profile-json",
+        &profile.display().to_string(),
+        "generate",
+        &fixture("tiny-llm").display().to_string(),
+        "hi",
+        "--backend",
+        "ort",
+        "--max-new-tokens",
+        "1",
+        "--no-stats",
+        "--cpu-cores",
+        "1",
+    ]);
+
+    assert_eq!(profile_execution_provider(&profile), "cpu");
+    std::fs::remove_dir_all(directory).expect("the scratch directory must be removed");
+}
+
+/// Exercise the process entry point as well as Native generation: Windows'
+/// small process-main stack must not prevent the default command from running.
+#[cfg(feature = "native-backend")]
+#[test]
+fn generate_defaults_to_native_and_profiles_the_actual_backend() {
+    let directory = scratch("generate-native");
+    let profile = directory.join("profile.json");
     run_cli(&[
         "--profile-json",
         &profile.display().to_string(),
@@ -79,7 +106,11 @@ fn generate_profile_provider_comes_from_live_command_profile() {
         "--cpu-cores",
         "1",
     ]);
-
-    assert_eq!(profile_execution_provider(&profile), "cpu");
+    assert_eq!(profile_execution_provider(&profile), "native");
+    let value: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&profile).expect("Native profile must be written"),
+    )
+    .expect("Native profile must be valid JSON");
+    assert_eq!(value["decode_backend"], "native");
     std::fs::remove_dir_all(directory).expect("the scratch directory must be removed");
 }

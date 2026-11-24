@@ -978,6 +978,7 @@ impl Engine {
     pub(crate) fn tool_call_observer(
         &self,
         policy: &ToolCallPolicy,
+        projection: Option<&crate::response_template::ResponseProjection>,
     ) -> anyhow::Result<Option<crate::pipeline::ToolCallStagedOutputObserver>> {
         if !policy.observes_output() {
             return Ok(None);
@@ -999,10 +1000,15 @@ impl Engine {
             )?;
         let protocol = onnx_genai_metadata::ToolProtocol::from_declaration(declaration)
             .map_err(anyhow::Error::new)?;
-        Ok(Some(crate::pipeline::ToolCallStagedOutputObserver::new(
-            protocol,
-            policy.clone(),
-        )))
+        let observer = crate::pipeline::ToolCallStagedOutputObserver::new(protocol, policy.clone());
+        Ok(Some(match projection {
+            Some(projection) => {
+                observer.with_projection(projection.clone(), self.tokenizer.as_deref()).map_err(|source| crate::logits::ConstraintPrefixError {
+                    source: anyhow::Error::new(source).context("validate declared assistant tool prefix before generation; repair continue_final_message content or the model chat_template"),
+                })?
+            }
+            None => observer,
+        }))
     }
 
     pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
@@ -1041,7 +1047,8 @@ impl Engine {
         }
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
-        let mut tool_observer = self.tool_call_observer(&tool_call_policy)?;
+        let mut tool_observer =
+            self.tool_call_observer(&tool_call_policy, options.response_projection.as_ref())?;
         // Speculation is an optimization. Until its accepted-token callback can
         // carry a normal host stop, tool-aware requests use the ordinary
         // declared loop rather than losing transactional observation.
@@ -2137,7 +2144,10 @@ impl Engine {
         self.require_workflow_execution_admitted()?;
         // Resolve the exact protocol and request policy before a cold path can
         // allocate its short-lived session or admit scheduler state.
-        let _ = self.tool_call_observer(&tool_call_policy)?;
+        let _ = self.tool_call_observer(
+            &tool_call_policy,
+            request.options.response_projection.as_ref(),
+        )?;
         // One entry point, one interpreter, one declared loop. What varies is
         // whether this runtime holds the fused decode session that implements
         // the package's declared `autoregressive-decode` step. Without one, the
@@ -2417,7 +2427,10 @@ impl Engine {
                 callback,
             );
         }
-        let mut tool_observer = self.tool_call_observer(&tool_call_policy)?;
+        let mut tool_observer = self.tool_call_observer(
+            &tool_call_policy,
+            request.options.response_projection.as_ref(),
+        )?;
         request.options.validate()?;
         let mut options = request.options.clone();
         self.apply_eos_defaults(&mut options)?;
@@ -4135,7 +4148,8 @@ impl Engine {
         }
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
-        let mut tool_observer = self.tool_call_observer(&tool_call_policy)?;
+        let mut tool_observer =
+            self.tool_call_observer(&tool_call_policy, options.response_projection.as_ref())?;
         if native_speculation_plan(&options, &chain).is_some() {
             anyhow::bail!(
                 "native session generation does not support speculative decoding; use stateless generate() for native prompt-lookup/shared-KV speculation"
@@ -5408,7 +5422,13 @@ mod tests {
     #[test]
     fn prompt_only_prefill_publishes_real_ort_cache_without_output() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let prompt = [2, 4, 3];
         let result = engine.prefill(prefill_request(&prompt))?;
         assert_eq!(
@@ -5490,7 +5510,14 @@ mod tests {
         request.options.stop_on_eos = false;
         let generated = engine.generate(request.clone())?;
         assert!(generated.prefix_cache_hit_len > 0);
-        let oracle = Engine::from_dir(&fixture, EngineConfig::default())?.generate(request)?;
+        let oracle = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?
+        .generate(request)?;
         assert_eq!(generated.token_ids, oracle.token_ids);
         assert_eq!(generated.text, oracle.text);
         Ok(())
@@ -5556,6 +5583,7 @@ mod tests {
         let mut engine = Engine::from_dir(
             &fixture,
             EngineConfig {
+                decode_backend: EngineDecodeBackend::Ort,
                 kv_connector: KvConnectorConfig {
                     backend: KvConnectorBackend::LocalTiered(onnx_genai_kv::LocalTieredConfig {
                         chunk_size: 2,
@@ -5698,6 +5726,7 @@ mod tests {
             .canonicalize()?;
         let chunk_size = 2;
         let config = EngineConfig {
+            decode_backend: EngineDecodeBackend::Ort,
             kv_connector: KvConnectorConfig {
                 backend: KvConnectorBackend::LocalTiered(onnx_genai_kv::LocalTieredConfig {
                     chunk_size,

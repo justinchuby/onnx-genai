@@ -17,20 +17,20 @@ struct Boundary {
 }
 
 #[derive(Debug)]
-struct JsonBoundaryRefusal {
+struct ConstraintBoundaryRefusal {
     field: String,
     cause: std::sync::Arc<anyhow::Error>,
 }
-impl std::fmt::Display for JsonBoundaryRefusal {
+impl std::fmt::Display for ConstraintBoundaryRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "response_template field {:?} cannot resolve its regex byte-prefix boundary for JSON sampling: {:#}; simplify the regex or remove unsupported look assertions",
+            "response_template field {:?} cannot resolve its regex byte-prefix boundary for constrained sampling: {:#}; simplify the regex or remove unsupported look assertions",
             self.field, self.cause
         )
     }
 }
-impl std::error::Error for JsonBoundaryRefusal {
+impl std::error::Error for ConstraintBoundaryRefusal {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.cause.as_ref().as_ref())
     }
@@ -214,8 +214,9 @@ impl Boundary {
         );
         let mut seen = std::collections::HashSet::new();
         literals.retain(|literal| seen.insert(literal.clone()));
-        literals.sort_by_key(|literal| std::cmp::Reverse(literal.chars().count()));
-        let pattern = literals
+        let mut matching_order = literals.iter().collect::<Vec<_>>();
+        matching_order.sort_by_key(|literal| std::cmp::Reverse(literal.chars().count()));
+        let pattern = matching_order
             .iter()
             .map(|literal| regex::escape(literal))
             .collect::<Vec<_>>()
@@ -269,6 +270,27 @@ impl Boundary {
             partial,
             minimum_bytes: hir.properties().minimum_len(),
         })
+    }
+
+    /// Authored order is significant when a controller must choose one closer;
+    /// scanning still uses longest-first regex priority independently.
+    pub fn literal_alternatives(&self) -> Option<&[String]> {
+        match &self.partial {
+            PartialBoundary::Literal(literals) => Some(literals),
+            _ => None,
+        }
+    }
+
+    pub fn validate_literal(&self, literal: &str) -> anyhow::Result<()> {
+        ensure!(
+            !literal.is_empty()
+                && self
+                    .regex
+                    .find(literal)
+                    .is_some_and(|matched| matched.range() == (0..literal.len())),
+            "reasoning delimiter {literal:?} does not fully match its declared response_template boundary; use one declared delimiter or repair the template"
+        );
+        Ok(())
     }
 
     pub fn can_match_empty(&self) -> bool {
@@ -389,6 +411,54 @@ pub(crate) struct ResponseBufferExceeded {
     pub(crate) limit: usize,
 }
 
+/// Validated request-local response framing shared by constraints and tool
+/// observation. The rendered assistant prefix is resolved once for both users.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseProjection {
+    template: std::sync::Arc<ResponseTemplate>,
+    prefix: String,
+    max_bytes: usize,
+}
+impl ResponseProjection {
+    pub fn resolve(
+        template: std::sync::Arc<ResponseTemplate>,
+        prefix: String,
+        max_bytes: usize,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            max_bytes > 0,
+            "response projection max_bytes must be positive; configure a nonzero response buffer"
+        );
+        ResponseParser::new(template.clone(), &prefix, PrefixOutput::Include, max_bytes).context(
+            "resolve response projection from the declared template and assistant prefix",
+        )?;
+        Ok(Self {
+            template,
+            prefix,
+            max_bytes,
+        })
+    }
+    pub fn template(&self) -> &std::sync::Arc<ResponseTemplate> {
+        &self.template
+    }
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+    pub(crate) fn project(&self, bytes: &[u8], terminal: bool) -> anyhow::Result<String> {
+        let mut parser = ResponseParser::new(
+            self.template.clone(),
+            &self.prefix,
+            PrefixOutput::Include,
+            self.max_bytes,
+        )?;
+        parser.commit_unpublished(bytes)?;
+        parser.with_preview(b"", terminal, |parser| Ok(parser.content_text(terminal)))
+    }
+}
+
 /// Compiled response channels from a declared tokenizer response template.
 #[derive(Debug)]
 pub struct ResponseTemplate {
@@ -397,6 +467,24 @@ pub struct ResponseTemplate {
     fields: Vec<Field>,
     implicit: Option<usize>,
     defaults: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Declared transitions into reasoning and from reasoning to answer content.
+/// An absent opener denotes the template's implicit reasoning channel.
+pub struct ReasoningBoundaries<'a> {
+    pub start: Option<ReasoningBoundary<'a>>,
+    pub end: ReasoningBoundary<'a>,
+}
+
+/// A validated channel boundary without exposing the parser's matcher state.
+pub struct ReasoningBoundary<'a>(&'a Boundary);
+impl ReasoningBoundary<'_> {
+    pub fn literal_alternatives(&self) -> Option<&[String]> {
+        self.0.literal_alternatives()
+    }
+    pub fn validate_literal(&self, literal: &str) -> anyhow::Result<()> {
+        self.0.validate_literal(literal)
+    }
 }
 
 impl PartialEq for ResponseTemplate {
@@ -488,11 +576,47 @@ impl ResponseTemplate {
         watch
     }
 
-    pub(crate) fn require_json_boundaries(&self) -> anyhow::Result<()> {
+    fn generation_start(&self, prompt: &str) -> Option<usize> {
+        self.anchor
+            .regex
+            .find_iter(prompt)
+            .last()
+            .map(|matched| matched.end())
+    }
+
+    /// Isolate only the final rendered assistant prefill, using the declared
+    /// anchor rather than matching protocol-looking text in old messages.
+    pub fn generation_prefix<'a>(&self, prompt: &'a str) -> anyhow::Result<&'a str> {
+        let at=self.generation_start(prompt).context("reasoning budget requires the rendered prompt to contain response_template.start_anchor; repair chat rendering or the declared anchor")?;
+        Ok(&prompt[at..])
+    }
+
+    fn reasoning_field(&self) -> Option<&Field> {
+        self.fields
+            .iter()
+            .find(|field| field.name == "reasoning_content")
+    }
+
+    pub fn has_reasoning_channel(&self) -> bool {
+        self.reasoning_field().is_some()
+    }
+
+    pub fn reasoning_boundaries(&self) -> anyhow::Result<ReasoningBoundaries<'_>> {
+        let reasoning=self.reasoning_field()
+            .context("reasoning budget requires response_template.fields.reasoning_content; declare the channel or supply an explicit token protocol")?;
+        let end=reasoning.close.as_ref().or_else(||self.fields.iter().find(|field|field.name=="content").and_then(|field|field.open.as_ref()))
+            .context("reasoning budget needs a declared reasoning close boundary or content open boundary; declare how the response transitions to its answer")?;
+        Ok(ReasoningBoundaries {
+            start: reasoning.open.as_ref().map(ReasoningBoundary),
+            end: ReasoningBoundary(end),
+        })
+    }
+
+    pub(crate) fn require_constraint_boundaries(&self) -> anyhow::Result<()> {
         for field in &self.fields {
             for boundary in [&field.open, &field.close].into_iter().flatten() {
                 if let PartialBoundary::Buffered(reason) = &boundary.partial {
-                    return Err(JsonBoundaryRefusal {
+                    return Err(ConstraintBoundaryRefusal {
                         field: field.name.clone(),
                         cause: reason.clone(),
                     }
@@ -858,12 +982,7 @@ impl ResponseParser {
         prefix_output: PrefixOutput,
         max_bytes: usize,
     ) -> anyhow::Result<Self> {
-        let at = spec
-            .anchor
-            .regex
-            .find_iter(prefix)
-            .last()
-            .map_or(0, |matched| matched.end());
+        let at = spec.generation_start(prefix).unwrap_or(0);
         let prefix = &prefix[at..];
         ensure!(
             max_bytes > 0,
@@ -1164,11 +1283,11 @@ impl ResponseParser {
         self.process(false)
     }
 
-    pub(crate) fn json_content(&self, final_chunk: bool) -> String {
+    pub(crate) fn content_text(&self, final_chunk: bool) -> String {
         self.field_chunks("content", final_chunk).collect()
     }
 
-    pub(crate) fn grammar_json_content(&self) -> String {
+    pub(crate) fn grammar_content_text(&self) -> String {
         self.field_chunks_mode("content", false, true).collect()
     }
 
@@ -1194,7 +1313,7 @@ impl ResponseParser {
             .any(|c| c.as_bytes().starts_with(pending))
     }
 
-    pub(crate) fn pending_json_bytes(&self) -> anyhow::Result<Option<&[u8]>> {
+    pub(crate) fn pending_content_bytes(&self) -> anyhow::Result<Option<&[u8]>> {
         let pending = self.utf8_tail.bytes();
         if pending.is_empty()
             || self
@@ -1349,7 +1468,7 @@ mod tests {
 
     #[test]
     fn projected_content_schema_checks_use_the_first_declared_channel_boundary() {
-        use crate::json_cursor::{JsonByteCursor, JsonCandidate};
+        use crate::byte_grammar::{GrammarByteCursor, GrammarCandidate};
         use crate::json_prefix::JsonPrefix;
         let spec = ResponseTemplate::compile(&serde_json::json!({"start_anchor":"A","fields":{
             "reasoning_content":{"open":"[r]","close":"[/r]"}, "content":{}
@@ -1358,7 +1477,7 @@ mod tests {
         let schema = serde_json::json!({"type":"object","properties":{
             "n":{"const":1}, "x":{"type":"string"}
         },"required":["n"]});
-        let mut json_cursor = JsonByteCursor::new(&schema, 4096).unwrap();
+        let mut byte_grammar = GrammarByteCursor::json_schema(&schema, 4096).unwrap();
         let mut parser =
             ResponseParser::new(spec, "A[r]existing", PrefixOutput::Exclude, 4096).unwrap();
         for (candidate, expected) in [
@@ -1373,13 +1492,13 @@ mod tests {
                     let content = view.field_chunks("content", true).collect::<String>();
                     let canonical = JsonPrefix::parse(&content)?.canonical;
                     Ok(matches!(
-                        json_cursor.preview(canonical.as_bytes())?,
-                        JsonCandidate::Viable { complete: true }
+                        byte_grammar.preview(canonical.as_bytes())?,
+                        GrammarCandidate::Viable { complete: true }
                     ))
                 })
                 .unwrap();
             assert_eq!(accepted, expected, "candidate={candidate:?}");
-            assert_eq!(json_cursor.committed_bytes(), 0);
+            assert_eq!(byte_grammar.committed_bytes(), 0);
             assert_eq!(parser.buffer, "[r]existing");
             parser
                 .require_open_text_channel("reasoning_content")
@@ -1999,9 +2118,9 @@ mod tests {
             "content":{"close_pattern":r"\bEND\b"}
         }}))
         .unwrap();
-        let error = spec.require_json_boundaries().unwrap_err();
+        let error = spec.require_constraint_boundaries().unwrap_err();
         let refusal = error
-            .downcast_ref::<JsonBoundaryRefusal>()
+            .downcast_ref::<ConstraintBoundaryRefusal>()
             .expect("typed capability refusal");
         assert_eq!(refusal.field, "content");
         assert!(std::error::Error::source(refusal).is_some());
@@ -2111,5 +2230,59 @@ mod tests {
                 .can_match_empty()
         );
         assert!(anchored.scan_text("α\nΩ", 1, false).is_err());
+    }
+    #[test]
+    fn reasoning_budget_boundaries_preserve_authored_closer_order_and_final_prefill() {
+        let template = ResponseTemplate::compile(&serde_json::json!({"start_anchor":"A","fields":{
+            "reasoning_content":{"open":["[r]","[reasoning]"],"close":["X","Xlong"]},"content":{}
+        }}))
+        .unwrap();
+        let boundaries = template.reasoning_boundaries().unwrap();
+        assert_eq!(
+            boundaries.start.unwrap().literal_alternatives().unwrap(),
+            ["[r]", "[reasoning]"]
+        );
+        assert_eq!(
+            boundaries.end.literal_alternatives().unwrap(),
+            ["X", "Xlong"]
+        );
+        boundaries.end.validate_literal("Xlong").unwrap();
+        assert!(boundaries.end.validate_literal("wrong").is_err());
+        assert_eq!(
+            template
+                .generation_prefix("A[r]oldXlong user A[r]partial")
+                .unwrap(),
+            "[r]partial"
+        );
+        assert!(
+            template
+                .generation_prefix("missing")
+                .unwrap_err()
+                .to_string()
+                .contains("start_anchor")
+        );
+        let mut parser =
+            ResponseParser::new(template, "A[r]", PrefixOutput::Exclude, 4096).unwrap();
+        let mut output = parser.feed("valueX").unwrap();
+        output
+            .content
+            .push_str(&parser.feed("next").unwrap().content);
+        assert_eq!(output.content, "next");
+    }
+
+    #[test]
+    fn reasoning_budget_boundaries_support_implicit_reasoning_and_content_transition() {
+        let template = ResponseTemplate::compile(&serde_json::json!({"start_anchor":"A","fields":{
+            "reasoning_content":{},"content":{"open":"<answer>"}
+        }}))
+        .unwrap();
+        let boundaries = template.reasoning_boundaries().unwrap();
+        assert!(boundaries.start.is_none());
+        assert_eq!(boundaries.end.literal_alternatives().unwrap(), ["<answer>"]);
+        let absent = ResponseTemplate::compile(
+            &serde_json::json!({"start_anchor":"A","fields":{"content":{}}}),
+        )
+        .unwrap();
+        assert!(absent.reasoning_boundaries().is_err());
     }
 }

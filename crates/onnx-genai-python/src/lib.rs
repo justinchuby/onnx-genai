@@ -1,10 +1,8 @@
 //! Python extension module `onnx_genai`.
 //!
-//! Exposes the ONNX Runtime-backed genai `Engine` and `GenerateResult` at the
-//! top level of the `onnx_genai` module. The API mirrors `nxrt.genai`, but this
-//! module runs on ONNX Runtime (the default `onnx-genai-engine` backend), so it
-//! is ONNX Runtime compatible; `nxrt.genai` provides the same API backed by the
-//! native nxrt runtime.
+//! Exposes the genai `Engine` and `GenerateResult` at the top level of
+//! `onnx_genai`, with the same API as `nxrt.genai`. Native execution is the
+//! shared engine's default; ORT is retained for explicit reference testing.
 
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -450,8 +448,7 @@ impl Engine {
 #[pymodule]
 fn _onnx_genai(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", VERSION)?;
-    let doc = "onnx_genai — ONNX Runtime-backed text generation. Same API as nxrt.genai, \
-               implemented on ONNX Runtime.";
+    let doc = "onnx_genai — Native text generation. Same API as nxrt.genai.";
     m.add("__doc__", PyString::new(m.py(), doc))?;
     m.add_class::<Engine>()?;
     m.add_class::<GenerateResult>()?;

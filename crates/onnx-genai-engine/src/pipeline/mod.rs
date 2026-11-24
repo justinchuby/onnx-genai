@@ -382,7 +382,10 @@ mod dflash_constructor_admission_tests {
 
         let error = WorkflowRuntime::from_dir_with_session_options(
             &root,
-            EngineConfig::default(),
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
             SessionOptions::default(),
         )
         .err()

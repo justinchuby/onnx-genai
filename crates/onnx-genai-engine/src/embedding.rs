@@ -59,6 +59,25 @@ impl Engine {
             anyhow::bail!("embedding input must contain at least one token");
         }
 
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == crate::EngineDecodeBackend::Native {
+            let native = self.native_session.as_mut().context("native embedding extraction requires a declared decoder component with a hidden-state output")?;
+            let (shape, data, name) = native
+                .embedding_hidden_sequence(input_ids, options.hidden_state_output.as_deref())?;
+            let shape = shape
+                .into_iter()
+                .map(i64::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            let hidden = validate_hidden_sequence(data, &shape, &name, input_ids.len())?;
+            return pool_hidden_states(
+                &hidden.data,
+                hidden.positions,
+                hidden.hidden_size,
+                options.pooling,
+                options.normalize,
+            );
+        }
+
         let session = self
             .session
             .as_deref()
@@ -153,6 +172,15 @@ fn extract_hidden_sequence(
         .to_vec_f32_lossy()
         .map_err(|error| anyhow::anyhow!("failed to read hidden-state output: {error}"))?;
 
+    validate_hidden_sequence(data, shape, output_name, input_len)
+}
+
+fn validate_hidden_sequence(
+    data: Vec<f32>,
+    shape: &[i64],
+    output_name: &str,
+    input_len: usize,
+) -> anyhow::Result<HiddenSequence> {
     let (positions, hidden_size) = match shape {
         [hidden] if input_len == 1 && *hidden > 0 => (1, *hidden as usize),
         [positions, hidden] if *positions == input_len as i64 && *positions > 0 && *hidden > 0 => {
@@ -292,7 +320,13 @@ mod tests {
     #[test]
     fn pools_fixture_hidden_states_with_mean_last_and_normalization() -> anyhow::Result<()> {
         let _guard = model_test_lock();
-        let mut engine = engine("tiny-mtp-full")?;
+        let mut engine = Engine::from_dir(
+            &fixture("tiny-mtp-full")?,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..Default::default()
+            },
+        )?;
         let input_ids = [2, 4, 3];
         let session = engine.session.as_deref().expect("ORT test engine");
         let io = engine
@@ -334,6 +368,27 @@ mod tests {
         assert_close(&mean, &expected_mean);
         assert_close(&last, &expected_last);
 
+        #[cfg(feature = "native-backend")]
+        {
+            let mut native = Engine::from_dir(&fixture("tiny-mtp-full")?, EngineConfig::default())?;
+            assert_eq!(native.decode_backend, crate::EngineDecodeBackend::Native);
+            assert!(native.session.is_none());
+            assert!(native.native_session.is_some());
+            for (pooling, expected) in [
+                (EmbeddingPooling::Mean, &expected_mean),
+                (EmbeddingPooling::LastToken, &expected_last),
+            ] {
+                let actual = native.embed_with_options(
+                    &input_ids,
+                    EmbeddingOptions {
+                        pooling,
+                        ..Default::default()
+                    },
+                )?;
+                assert_close(&actual, expected);
+            }
+        }
+
         let normalized = engine.embed_with_options(
             &input_ids,
             EmbeddingOptions {
@@ -348,6 +403,34 @@ mod tests {
             .sum::<f32>()
             .sqrt();
         assert!((norm - 1.0).abs() <= f32::EPSILON * 4.0, "{norm}");
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_embedding_does_not_change_live_conversation() -> anyhow::Result<()> {
+        use crate::{GeneratePrompt, GenerateRequest};
+        let _guard = model_test_lock();
+        let mut actual = engine("tiny-mtp-full")?;
+        let mut control = engine("tiny-mtp-full")?;
+        let actual_session = actual.create_session()?;
+        let control_session = control.create_session()?;
+        for (turn, tokens) in [vec![2, 4, 3], vec![5, 7]].into_iter().enumerate() {
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(tokens));
+            request.options.max_new_tokens = 2;
+            request.options.temperature = 0.0;
+            request.options.stop_on_eos = false;
+            if turn == 1 {
+                actual.embed(&[2, 8, 4, 3])?;
+            }
+            let result = actual.generate_in_session(actual_session, request.clone())?;
+            let expected = control.generate_in_session(control_session, request)?;
+            assert_eq!(result.token_ids, expected.token_ids);
+            assert_eq!(
+                actual.session_token_count(actual_session)?,
+                control.session_token_count(control_session)?
+            );
+        }
         Ok(())
     }
 

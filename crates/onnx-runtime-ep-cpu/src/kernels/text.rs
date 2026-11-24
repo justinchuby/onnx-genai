@@ -53,12 +53,20 @@ fn require_inputs<'a>(op: &str, inputs: &'a [HostStringInput<'a>], arity: usize)
 fn broadcast_shape(op: &str, lhs: &[usize], rhs: &[usize]) -> Result<Vec<usize>> {
     let rank = lhs.len().max(rhs.len());
     let mut output = vec![1usize; rank];
-    for output_axis in 0..rank {
+    for (output_axis, extent) in output.iter_mut().enumerate() {
         let lhs_axis = lhs.len() as isize - rank as isize + output_axis as isize;
         let rhs_axis = rhs.len() as isize - rank as isize + output_axis as isize;
-        let a = (lhs_axis >= 0).then(|| lhs[lhs_axis as usize]).unwrap_or(1);
-        let b = (rhs_axis >= 0).then(|| rhs[rhs_axis as usize]).unwrap_or(1);
-        output[output_axis] = if a == b || b == 1 {
+        let a = if lhs_axis >= 0 {
+            lhs[lhs_axis as usize]
+        } else {
+            1
+        };
+        let b = if rhs_axis >= 0 {
+            rhs[rhs_axis as usize]
+        } else {
+            1
+        };
+        *extent = if a == b || b == 1 {
             a
         } else if a == 1 {
             b

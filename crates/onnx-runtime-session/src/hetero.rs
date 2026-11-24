@@ -1824,10 +1824,11 @@ impl HeterogeneousExecutor {
                     continue;
                 };
                 *remaining -= 1;
-                if *remaining == 0 && !graph_outputs.contains(&value) {
-                    if host_strings.remove(&value).is_none() {
-                        self.release_value(value, &mut residents)?;
-                    }
+                if *remaining == 0
+                    && !graph_outputs.contains(&value)
+                    && host_strings.remove(&value).is_none()
+                {
+                    self.release_value(value, &mut residents)?;
                 }
             }
         }
