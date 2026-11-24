@@ -390,7 +390,9 @@ broaden an operator schema.
   through the native host kernel boundary. Rust callers use `Tensor::from_strings`
   and `Tensor::as_strings`; Python session feeds accept NumPy string or object
   arrays and return object arrays. A CUDA-requested text graph uses the session's reported
-  CPU fallback; no string values are copied to the GPU or available through raw
+  CPU placement for text nodes; eligible numeric subgraphs can run on CUDA
+  in the [native static mixed-placement slice](../execution/HETEROGENEOUS_PLACEMENT.md).
+  No string values are copied to the GPU or available through raw
   device bindings or the EP plugin ABI. `StringSplit` determines its added axis
   from the current input values, not the previous run's output. String sequence
   elements and string-valued control-flow boundaries are not supported.

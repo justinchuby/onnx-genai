@@ -74,7 +74,7 @@ impl ExecutionProvider for AcceleratorEp {
         "accel_ep"
     }
     fn device_type(&self) -> DeviceType {
-        DeviceType::Mlx
+        self.device.device_type
     }
     fn device_id(&self) -> DeviceId {
         self.device
@@ -1277,6 +1277,182 @@ fn default_executor_opt_in_uses_mixed_plan_instead_of_whole_cpu_fallback() {
         Ok(_) => panic!("mixed-provider capture must fail closed"),
     };
     assert!(capture_error.contains("device-graph capture"));
+}
+
+#[test]
+fn strict_cuda_declines_text_before_partition_execution() {
+    let graph = string_then_numeric_graph();
+    let mut cuda = AcceleratorEp::new(vec!["Neg"]);
+    cuda.device = DeviceId::new(DeviceType::Cuda, 0);
+    let error = Executor::build_with_mode(graph, weights(), Arc::new(cuda), true, false, None)
+        .err()
+        .expect("strict CUDA must reject a graph with managed string nodes");
+    let crate::SessionError::HeterogeneousPlacementRequired { unsupported_nodes } = error else {
+        panic!("unexpected strict CUDA failure: {error}");
+    };
+    assert!(
+        unsupported_nodes.contains("StringConcat"),
+        "{unsupported_nodes}"
+    );
+    assert!(
+        unsupported_nodes.contains("no device representation"),
+        "{unsupported_nodes}"
+    );
+}
+
+#[test]
+fn producerless_string_output_keeps_cuda_nodes_and_declines_strict_cuda() {
+    let mut graph = build_chain(&["Neg"]);
+    let text = graph.create_named_value("passthrough", DataType::String, static_shape([4]));
+    graph.add_input(text);
+    graph.add_output(text);
+    let mut cuda = AcceleratorEp::new(vec!["Neg"]);
+    cuda.device = DeviceId::new(DeviceType::Cuda, 0);
+    let cuda: Arc<dyn ExecutionProvider> = Arc::new(cuda);
+    let providers = [
+        ProviderPlacement {
+            ep: EpId(0),
+            provider: Arc::clone(&cuda),
+        },
+        ProviderPlacement {
+            ep: EpId(1),
+            provider: Arc::new(AcceleratorEp::new(vec!["Neg"])),
+        },
+    ];
+    let PlacementDecision::Heterogeneous(placement) =
+        classify_placement(&graph, &providers).unwrap()
+    else {
+        panic!("a CUDA node and a host string output need separate storage");
+    };
+    assert_eq!(placement.partitions.len(), 1);
+    assert_eq!(placement.partitions[0].ep, EpId(0));
+    assert!(placement.transfers.is_empty());
+    assert!(
+        placement_summary(&placement, &graph, &providers)
+            .contains("1 producerless string output(s) kept on host")
+    );
+    let error = Executor::build_with_mode(graph, weights(), cuda, true, false, None)
+        .err()
+        .expect("strict CUDA must reject a host string output")
+        .to_string();
+    assert!(error.contains("graph output 'passthrough'"), "{error}");
+    assert!(error.contains("no device representation"), "{error}");
+}
+
+fn string_then_numeric_graph() -> Graph {
+    let mut graph = build_chain(&["Neg"]);
+    graph.opset_imports.insert(String::new(), 20);
+    let input = graph.create_named_value("text", DataType::String, static_shape([4]));
+    graph.add_input(input);
+    let joined = graph.create_named_value("joined", DataType::String, static_shape([4]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "StringConcat",
+        vec![Some(input), Some(input)],
+        vec![joined],
+    ));
+    graph.add_output(joined);
+    graph
+}
+
+#[test]
+fn planner_declines_device_string_claims_and_rejects_cross_provider_string_transfer() {
+    let mut graph = string_then_numeric_graph();
+    let joined = *graph.outputs.last().unwrap();
+    let matches = graph.create_named_value("matches", DataType::Bool, static_shape([4]));
+    let mut regex = Node::new(
+        NodeId(0),
+        "RegexFullMatch",
+        vec![Some(joined)],
+        vec![matches],
+    );
+    regex
+        .attributes
+        .insert("pattern".into(), Attribute::String(b"aa".to_vec()));
+    let regex = graph.insert_node(regex);
+    graph.add_output(matches);
+
+    // Even an EP whose declared kernel capability accepts a string op cannot
+    // claim it on a device with no representation for the operand.
+    let mut device = AcceleratorEp::new(vec!["RegexFullMatch", "Neg"]);
+    device.device = DeviceId::new(DeviceType::Cuda, 0);
+    let providers = [
+        ProviderPlacement {
+            ep: EpId(0),
+            provider: Arc::new(device),
+        },
+        ProviderPlacement {
+            ep: EpId(1),
+            provider: Arc::new(AcceleratorEp::new(vec!["StringConcat", "RegexFullMatch"])),
+        },
+    ];
+    let placed = plan(&graph, &providers).unwrap();
+    assert_eq!(placed.node_placement[&regex], EpId(1));
+    assert!(placed.transfers.is_empty());
+
+    let providers = [
+        ProviderPlacement {
+            ep: EpId(0),
+            provider: Arc::new(AcceleratorEp::new(vec!["RegexFullMatch", "Neg"])),
+        },
+        ProviderPlacement {
+            ep: EpId(1),
+            provider: Arc::new(AcceleratorEp::new(vec!["StringConcat"])),
+        },
+    ];
+    let error = plan(&graph, &providers).unwrap_err().to_string();
+    assert!(error.contains("tensor(string) 'joined'"), "{error}");
+    assert!(error.contains("crosses EpId(1) -> EpId(0)"), "{error}");
+}
+
+#[test]
+fn mixed_string_outputs_stay_host_owned_and_keep_graph_order() {
+    let mut graph = string_then_numeric_graph();
+    let joined = graph.outputs.pop().unwrap();
+    let matches = graph.create_named_value("matches", DataType::Bool, static_shape([4]));
+    let mut regex = Node::new(
+        NodeId(0),
+        "RegexFullMatch",
+        vec![Some(joined)],
+        vec![matches],
+    );
+    regex
+        .attributes
+        .insert("pattern".into(), Attribute::String(b"aa".to_vec()));
+    graph.insert_node(regex);
+    let mask = graph.create_named_value("mask", DataType::Float32, static_shape([4]));
+    let mut cast = Node::new(NodeId(0), "Cast", vec![Some(matches)], vec![mask]);
+    cast.attributes
+        .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+    graph.insert_node(cast);
+    graph.add_output(mask);
+    graph.add_output(joined);
+
+    let providers = [
+        ProviderPlacement {
+            ep: EpId(0),
+            provider: Arc::new(AcceleratorEp::new(vec!["Neg", "Cast"])),
+        },
+        ProviderPlacement {
+            ep: EpId(1),
+            provider: Arc::new(AcceleratorEp::new(vec!["StringConcat", "RegexFullMatch"])),
+        },
+    ];
+    let plan = plan(&graph, &providers).unwrap();
+    let mut executor = HeterogeneousExecutor::build(plan, &graph, &weights(), &providers).unwrap();
+    let x = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let text = Tensor::from_strings(
+        vec![4],
+        ["a", "b", "a", ""].into_iter().map(String::from).collect(),
+    )
+    .unwrap();
+    let outputs = executor.run(&[("x", &x), ("text", &text)]).unwrap();
+    assert_eq!(executor.last_transfer_count(), 1);
+    assert_eq!(outputs[0].to_vec_f32(), vec![-1.0, -2.0, -3.0, -4.0]);
+    assert_eq!(outputs[1].to_vec_f32(), vec![1.0, 0.0, 1.0, 0.0]);
+    assert_eq!(outputs[2].as_strings().unwrap(), &["aa", "bb", "aa", ""]);
+    assert!(outputs[2].device().is_host_accessible());
+    assert!(outputs[2].device_ptr().is_null());
 }
 
 #[test]

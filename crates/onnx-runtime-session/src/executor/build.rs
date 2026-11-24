@@ -314,10 +314,8 @@ pub(super) fn validate_control_flow_signatures(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
-/// Whether opt-in per-op heterogeneous placement is enabled on the default
-/// session build path (`ONNX_GENAI_HETERO`). Default OFF: unset/empty and the
-/// explicit `0`/`false`/`off` values (case-insensitive) all disable it, so the
-/// whole-session fallback stays byte-identical unless a caller opts in.
+/// Whether to opt into heterogeneous placement beyond CUDA graphs with
+/// managed string operations (`ONNX_GENAI_HETERO`).
 pub(super) fn hetero_placement_env_enabled() -> bool {
     match std::env::var("ONNX_GENAI_HETERO") {
         Ok(value) => matches!(
@@ -408,6 +406,19 @@ pub(super) fn cuda_fallback_report(
 
     let mut issues = Vec::new();
     collect_cuda_coverage_issues(graph, graph, ep, artifact_config, "graph", &mut issues)?;
+    for value_id in super::host_strings::producerless_string_outputs(graph) {
+        let value = graph.value(value_id);
+        issues.push(ExecutionProviderDecline {
+            node: format!(
+                "graph output '{}' (value#{})",
+                value.name.as_deref().unwrap_or("<unnamed>"),
+                value_id.0
+            ),
+            domain: "ai.onnx".into(),
+            op_type: "<graph output>".into(),
+            reason: super::host_strings::MANAGED_STRING_DEVICE_DECLINE.into(),
+        });
+    }
     if issues.is_empty() {
         return Ok(None);
     }
@@ -482,7 +493,7 @@ pub(super) fn collect_cuda_coverage_issues(
                 node: format_node_identity(scope, node_id, node),
                 domain: canonical_domain(node),
                 op_type: node.op_type.clone(),
-                reason: "managed tensor(string) values have no device representation; use a string-aware host provider".into(),
+                reason: super::host_strings::MANAGED_STRING_DEVICE_DECLINE.into(),
             });
             continue;
         }
@@ -946,7 +957,7 @@ impl Executor {
         Self::build_with_mode(graph, weights, ep, false, true, None)
     }
 
-    pub(super) fn build_with_mode(
+    pub(crate) fn build_with_mode(
         mut graph: Graph,
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
@@ -958,7 +969,18 @@ impl Executor {
             validate_cpu_fallback(fallback.as_ref())?;
         }
         prepare_execution(&mut graph)?;
-        if hetero_enabled && !require_cuda && ep.device_type() != DeviceType::Cpu {
+        let needs_host_strings = ep.device_type() == DeviceType::Cuda
+            && (graph
+                .nodes
+                .iter()
+                .any(|(_, node)| super::host_strings::uses_managed_strings(&graph, node))
+                || super::host_strings::producerless_string_outputs(&graph)
+                    .next()
+                    .is_some());
+        if (hetero_enabled || needs_host_strings)
+            && !require_cuda
+            && ep.device_type() != DeviceType::Cpu
+        {
             let cpu = resolve_cpu_fallback(fallback_ep.as_ref())?;
             let providers = vec![
                 crate::hetero::ProviderPlacement {
