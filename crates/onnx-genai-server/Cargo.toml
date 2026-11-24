@@ -78,10 +78,15 @@ onnx-genai-preprocess = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true, features = ["multipart"] }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 serde_path_to_error = { workspace = true }
 serde_yaml = { workspace = true }
 regex = "1.12"
+glob = "0.3"
+http-body-util = "0.1"
+fancy-regex = "0.18"
+tower-http = { version = "0.6", features = ["cors"] }
+tempfile = "3"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
@@ -96,12 +101,12 @@ image = { workspace = true, features = ["png"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+nix = { version = "0.31", features = ["signal", "process"] }
 
 [dev-dependencies]
 onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.6", default-features = false, features = ["test-output-staging"] }
 onnx-runtime-virtual-memory = { workspace = true }
 tower = { workspace = true }
-tempfile = "3"
 
 [dev-dependencies.cudarc]
 version = "0.19"

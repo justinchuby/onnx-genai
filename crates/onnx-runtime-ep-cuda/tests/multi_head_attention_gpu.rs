@@ -531,9 +531,9 @@ fn bias_mask_and_present_together_match_cpu() {
 )]
 #[test]
 fn mha_prepared_workspace_reuses_backing_and_preserves_present_output_holes() {
+    let _guard = lock_mha_gpu();
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
     use onnx_runtime_ir::{Node, NodeId, ValueId, compute_contiguous_strides};
-    let _guard = lock_mha_gpu();
     let ep = require_cuda();
     let shape = [1usize, 2, 4];
     let input_shapes = vec![shape.to_vec(); 3];
