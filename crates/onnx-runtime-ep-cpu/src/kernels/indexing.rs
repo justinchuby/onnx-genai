@@ -179,13 +179,107 @@ fn contiguous(shape: &[usize]) -> Vec<usize> {
     result
 }
 
-#[derive(Clone, Copy)]
-enum ScatterReduction {
-    None,
-    Add,
-    Mul,
-    Max,
-    Min,
+use onnx_runtime_ir::scatter::{ScatterReduction, validate_nd_index_type};
+
+trait ScatterElem: NumericElem {
+    type Sum: Copy + Default + std::ops::AddAssign;
+    fn sum_value(self) -> Self::Sum;
+    fn mean(sum: Self::Sum, count: usize) -> Self;
+}
+
+macro_rules! scatter_elem {
+    ($sum:ty; $($ty:ty),+) => {$(
+        impl ScatterElem for $ty {
+            type Sum = $sum;
+            #[inline]
+            fn sum_value(self) -> $sum { self as $sum }
+            #[inline]
+            fn mean(sum: $sum, count: usize) -> Self { (sum / count as $sum) as Self }
+        }
+    )+};
+}
+scatter_elem!(i128; i8, i16, i32, i64, u8, u16, u32, u64);
+scatter_elem!(f64; f32, f64);
+
+macro_rules! scatter_half {
+    ($($ty:ty),+) => {$(
+        impl ScatterElem for $ty {
+            type Sum = f64;
+            #[inline]
+            fn sum_value(self) -> f64 { self.to_f64() }
+            #[inline]
+            fn mean(sum: f64, count: usize) -> Self {
+                Self::from_f32(round_to_odd_f32(sum / count as f64))
+            }
+        }
+    )+};
+}
+scatter_half!(half::f16, half::bf16);
+
+// Preserve the sticky bit in the f32 intermediate so narrowing again cannot
+// turn an inexact value into an apparent FP16/BF16 midpoint.
+fn round_to_odd_f32(value: f64) -> f32 {
+    let narrowed = value as f32;
+    let bits = narrowed.to_bits();
+    if narrowed.is_finite() && f64::from(narrowed) != value && bits & 1 == 0 {
+        let adjusted = if f64::from(narrowed.abs()) < value.abs() {
+            bits + 1
+        } else {
+            bits - 1
+        };
+        f32::from_bits(adjusted)
+    } else {
+        narrowed
+    }
+}
+
+// Keep a separate wide sum until the last contribution; in particular, an
+// integer sum can overflow its element type even when the mean is in range.
+struct MeanValues<S>(Vec<(S, usize)>);
+
+impl<S: Copy + Default + std::ops::AddAssign> MeanValues<S> {
+    fn add<T: ScatterElem<Sum = S>>(&mut self, at: usize, original: T, update: T) {
+        let (sum, count) = &mut self.0[at];
+        if *count == 0 {
+            *sum = original.sum_value();
+            *count = 1;
+        }
+        *sum += update.sum_value();
+        *count += 1;
+    }
+
+    fn finish<T: ScatterElem<Sum = S>>(self, out: &mut [T]) {
+        for (value, (sum, count)) in out.iter_mut().zip(self.0) {
+            if count != 0 {
+                *value = T::mean(sum, count);
+            }
+        }
+    }
+}
+
+#[inline]
+fn scatter_update<T: ScatterElem>(
+    out: &mut [T],
+    mean: &mut Option<MeanValues<T::Sum>>,
+    reduction: ScatterReduction,
+    at: usize,
+    update: T,
+) where
+    T::Acc: PartialOrd,
+{
+    out[at] = match reduction {
+        ScatterReduction::None => update,
+        ScatterReduction::Add => T::from_acc(out[at].to_acc().c_add(update.to_acc())),
+        ScatterReduction::Mul => T::from_acc(out[at].to_acc().c_mul(update.to_acc())),
+        ScatterReduction::Max => T::from_acc(out[at].to_acc().c_max(update.to_acc())),
+        ScatterReduction::Min => T::from_acc(out[at].to_acc().c_min(update.to_acc())),
+        ScatterReduction::Mean => {
+            mean.as_mut()
+                .expect("mean scratch allocated")
+                .add(at, out[at], update);
+            return;
+        }
+    };
 }
 
 pub struct ScatterElementsKernel {
@@ -196,25 +290,35 @@ pub struct ScatterElementsKernel {
 /// `ScatterND`: update slices selected by the trailing index tuples.
 pub struct ScatterNDKernel {
     reduction: ScatterReduction,
+    opset: u64,
 }
 
-pub struct ScatterNDFactory;
+pub struct ScatterNDFactory(pub u64);
 
 impl KernelFactory for ScatterNDFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(ScatterNDKernel {
-            reduction: parse_scatter_reduction("ScatterND", node)?,
+            reduction: ScatterReduction::parse(node, self.0).map_err(EpError::KernelFailed)?,
+            opset: self.0,
         }))
     }
 }
 
-pub(crate) fn scatter_nd_unsupported_reason(input_dtypes: &[DataType]) -> Option<String> {
+pub(crate) fn scatter_unsupported_reason(
+    node: &Node,
+    opset: u64,
+    input_dtypes: &[DataType],
+) -> Option<String> {
+    if let Err(reason) = ScatterReduction::parse(node, opset) {
+        return Some(reason);
+    }
     if input_dtypes.is_empty() {
         return None;
     }
+    let op = &node.op_type;
     if input_dtypes.len() != 3 {
         return Some(format!(
-            "ScatterND requires 3 inputs, got {}",
+            "{op} requires 3 inputs, got {}",
             input_dtypes.len()
         ));
     }
@@ -235,35 +339,26 @@ pub(crate) fn scatter_nd_unsupported_reason(input_dtypes: &[DataType]) -> Option
             | DataType::Uint64
     ) {
         return Some(format!(
-            "ScatterND: data dtype {data_dtype:?} is not implemented by the CPU kernel"
+            "{op}: data dtype {data_dtype:?} is not implemented by the CPU kernel"
         ));
     }
-    if input_dtypes[1] != DataType::Int64 {
+    if op == "ScatterND" {
+        if let Err(reason) = validate_nd_index_type(op, opset, input_dtypes[1]) {
+            return Some(reason);
+        }
+    } else if !matches!(input_dtypes[1], DataType::Int32 | DataType::Int64) {
         return Some(format!(
-            "ScatterND: indices must have Int64 dtype, got {:?}",
+            "{op}: indices must be Int32 or Int64, got {:?}",
             input_dtypes[1]
         ));
     }
     if input_dtypes[2] != data_dtype {
         return Some(format!(
-            "ScatterND: updates dtype {:?} must match data dtype {data_dtype:?}",
+            "{op}: updates dtype {:?} must match data dtype {data_dtype:?}",
             input_dtypes[2]
         ));
     }
     None
-}
-
-fn parse_scatter_reduction(op: &str, node: &Node) -> Result<ScatterReduction> {
-    match node.attr("reduction").and_then(Attribute::as_str) {
-        None | Some("none") => Ok(ScatterReduction::None),
-        Some("add") => Ok(ScatterReduction::Add),
-        Some("mul") => Ok(ScatterReduction::Mul),
-        Some("max") => Ok(ScatterReduction::Max),
-        Some("min") => Ok(ScatterReduction::Min),
-        Some(value) => Err(EpError::KernelFailed(format!(
-            "{op}: unsupported reduction {value:?}"
-        ))),
-    }
 }
 
 impl Kernel for ScatterNDKernel {
@@ -278,12 +373,12 @@ impl Kernel for ScatterNDKernel {
         true
     }
 }
-pub struct ScatterElementsFactory;
+pub struct ScatterElementsFactory(pub u64);
 impl KernelFactory for ScatterElementsFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(ScatterElementsKernel {
             axis: node.attr("axis").and_then(Attribute::as_int).unwrap_or(0),
-            reduction: parse_scatter_reduction("ScatterElements", node)?,
+            reduction: ScatterReduction::parse(node, self.0).map_err(EpError::KernelFailed)?,
         }))
     }
 }
@@ -300,7 +395,7 @@ impl Kernel for ScatterElementsKernel {
     }
 }
 
-fn scatter_elements_typed<T: NumericElem>(
+fn scatter_elements_typed<T: ScatterElem>(
     kernel: &ScatterElementsKernel,
     inputs: &[TensorView],
     outputs: &mut [TensorMut],
@@ -311,9 +406,9 @@ where
     let data = &inputs[0];
     let indices = &inputs[1];
     let updates = &inputs[2];
-    if indices.dtype != DataType::Int64 {
+    if !matches!(indices.dtype, DataType::Int32 | DataType::Int64) {
         return Err(EpError::KernelFailed(
-            "ScatterElements: indices must be Int64".into(),
+            "ScatterElements: indices must be Int32 or Int64".into(),
         ));
     }
     if updates.dtype != T::DTYPE || outputs[0].dtype != T::DTYPE {
@@ -347,6 +442,8 @@ where
     let updates = to_dense::<T>(updates)?;
     let index_strides = contiguous(inputs[1].shape);
     let data_strides = contiguous(data.shape);
+    let mut mean = (kernel.reduction == ScatterReduction::Mean && !updates.is_empty())
+        .then(|| MeanValues(vec![Default::default(); out.len()]));
     for (linear, update) in updates.into_iter().enumerate() {
         let mut rem = linear;
         let mut data_offset = 0;
@@ -371,18 +468,15 @@ where
             };
             data_offset += coordinate * data_strides[d];
         }
-        out[data_offset] = match kernel.reduction {
-            ScatterReduction::None => update,
-            ScatterReduction::Add => T::from_acc(out[data_offset].to_acc().c_add(update.to_acc())),
-            ScatterReduction::Mul => T::from_acc(out[data_offset].to_acc().c_mul(update.to_acc())),
-            ScatterReduction::Max => T::from_acc(out[data_offset].to_acc().c_max(update.to_acc())),
-            ScatterReduction::Min => T::from_acc(out[data_offset].to_acc().c_min(update.to_acc())),
-        };
+        scatter_update(&mut out, &mut mean, kernel.reduction, data_offset, update);
+    }
+    if let Some(mean) = mean {
+        mean.finish(&mut out);
     }
     write_dense::<T>(&mut outputs[0], &out)
 }
 
-fn scatter_nd_typed<T: NumericElem>(
+fn scatter_nd_typed<T: ScatterElem>(
     kernel: &ScatterNDKernel,
     inputs: &[TensorView],
     outputs: &mut [TensorMut],
@@ -393,19 +487,16 @@ where
     let data = &inputs[0];
     let indices = &inputs[1];
     let updates = &inputs[2];
-    if indices.dtype != DataType::Int64 {
-        return Err(EpError::KernelFailed(
-            "ScatterND: indices must be Int64".into(),
-        ));
-    }
+    validate_nd_index_type("ScatterND", kernel.opset, indices.dtype)
+        .map_err(EpError::KernelFailed)?;
     if updates.dtype != T::DTYPE || outputs[0].dtype != T::DTYPE {
         return Err(EpError::KernelFailed(
             "ScatterND: data, updates, and output must share a dtype".into(),
         ));
     }
-    if indices.shape.is_empty() {
+    if data.shape.is_empty() || indices.shape.is_empty() {
         return Err(EpError::KernelFailed(
-            "ScatterND: indices must have rank at least 1".into(),
+            "ScatterND: data and indices must have rank at least 1".into(),
         ));
     }
     if outputs[0].shape != data.shape {
@@ -436,6 +527,8 @@ where
     let indices = to_dense_i64(indices)?;
     let updates = to_dense::<T>(updates)?;
     let data_strides = contiguous(data.shape);
+    let mut mean = (kernel.reduction == ScatterReduction::Mean && !updates.is_empty())
+        .then(|| MeanValues(vec![Default::default(); out.len()]));
     for tuple in 0..tuple_count {
         let mut destination = 0usize;
         for dimension in 0..index_depth {
@@ -452,22 +545,11 @@ where
         for element in 0..slice_len {
             let destination = destination + element;
             let update = updates[tuple * slice_len + element];
-            out[destination] = match kernel.reduction {
-                ScatterReduction::None => update,
-                ScatterReduction::Add => {
-                    T::from_acc(out[destination].to_acc().c_add(update.to_acc()))
-                }
-                ScatterReduction::Mul => {
-                    T::from_acc(out[destination].to_acc().c_mul(update.to_acc()))
-                }
-                ScatterReduction::Max => {
-                    T::from_acc(out[destination].to_acc().c_max(update.to_acc()))
-                }
-                ScatterReduction::Min => {
-                    T::from_acc(out[destination].to_acc().c_min(update.to_acc()))
-                }
-            };
+            scatter_update(&mut out, &mut mean, kernel.reduction, destination, update);
         }
+    }
+    if let Some(mean) = mean {
+        mean.finish(&mut out);
     }
     write_dense::<T>(&mut outputs[0], &out)
 }
@@ -647,6 +729,7 @@ mod tests {
         let mut out = Owned::zeros_f32(&[2, 3, 2]);
         ScatterNDKernel {
             reduction: ScatterReduction::None,
+            opset: 11,
         }
         .execute(
             &[data.view(), indices.view(), updates.view()],
@@ -668,6 +751,7 @@ mod tests {
         let mut out = Owned::zeros(DataType::Int32, &[2, 2]);
         ScatterNDKernel {
             reduction: ScatterReduction::Add,
+            opset: 16,
         }
         .execute(
             &[data.view(), indices.view(), updates.view()],
@@ -685,6 +769,7 @@ mod tests {
         let mut out = Owned::zeros(DataType::Int32, &[2, 2]);
         ScatterNDKernel {
             reduction: ScatterReduction::Mul,
+            opset: 16,
         }
         .execute(
             &[data.view(), indices.view(), updates.view()],

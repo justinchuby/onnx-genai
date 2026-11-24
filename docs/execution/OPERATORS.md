@@ -53,7 +53,7 @@ plugin EPs (via C ABI bridge) handle them.
 | Expand | 8 | Broadcasting. |
 | Shape | 1 | Dynamic shape queries. |
 | ConstantOfShape | 9 | Mask/padding creation. |
-| ScatterND | 11 | KV cache update, pre-opset-24 spelling. |
+| ScatterND | 11 | Slice update; opset 29 adds Int32 indices and mean reduction on native CPU/CUDA. |
 | TensorScatter | 24 | KV cache update, standardized. Fixed-capacity buffer written at a per-sample `write_indices` offset; `linear` (append) and `circular` (ring) modes. Prefill omits `write_indices`; decode supplies it. |
 | GatherElements | 11 | Top-k/sampling. |
 | TopK | 11 | Sampling. |
@@ -84,7 +84,7 @@ plugin EPs (via C ABI bridge) handle them.
 | LinearAttention | 27 | Packed recurrent attention, all four update rules, forward GQA, and a separately typed state. Contrib behavior is unchanged. |
 | CumSum | 11 | Position computation. |
 | NonZero | 9 | Sparse operations. |
-| ScatterElements | 11 | CPU implemented for opsets 11/16. |
+| ScatterElements | 11 | Native CPU/CUDA; opset 29 adds mean reduction. |
 | OneHot | 9 | CPU implemented; categorical/position encodings. |
 | Trilu | 14 | CPU implemented; causal mask generation, optional int64 `k` input. |
 | RotaryEmbedding | 22 | Added in opset 22 (ONNX standard). |

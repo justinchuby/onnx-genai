@@ -607,10 +607,18 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
-        if op.op_type == "ScatterND"
+        if matches!(op.op_type.as_str(), "ScatterND" | "ScatterElements")
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =
-                crate::kernels::indexing::scatter_nd_unsupported_reason(input_dtypes)
+                crate::kernels::indexing::scatter_unsupported_reason(op, opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.op_type == "GatherND"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(&dtype) = input_dtypes.get(1)
+            && let Err(reason) =
+                onnx_runtime_ir::scatter::validate_nd_index_type("GatherND", opset, dtype)
         {
             return KernelMatch::unsupported(reason);
         }
