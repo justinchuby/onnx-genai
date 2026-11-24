@@ -310,11 +310,31 @@ caller owner, including pending work and capture pins. Existing SessionPersisten
 capacity policy remains, with no new pool, quota interface or per-step issuer call.
 Ordinary empty half outputs now return before the single-row decode launch.
 
-The separate immutable BF16 conversion backing, Marlin caches and generic
-f32 dequantized weights remain distinct ownership domains. Dynamic BF16 staging
+The separate immutable BF16 conversion backing and Marlin caches remain distinct
+ownership domains. Generic f32 dequantized weights now borrow caller workspace
+as described below. Dynamic BF16 staging
 now joins this same composite as described below. Portable prefill capture
 eligibility remains conservative. Host layout checks and GPU-target compilation
 do not validate device arithmetic, asynchronous failure ordering or throughput.
+
+### CUDA quantized MatMul f32 dequantization
+
+The generic f32 route borrows one SessionPersistent composite containing the
+checked `K*N*4` dequantized weight prefix and an aligned, disjoint BLAS suffix.
+Even a zero-byte BLAS plan needs the weight prefix. A single route classifier
+is shared by planning and execution: empty rows need no backing; single-row
+GEMV without group indices and the direct accuracy-4 tiled route keep their
+existing behavior; grouped single-row input still takes dequantization.
+
+The weight, activation and output matrix spans are checked before the first
+launch. Execution binds the prefix once and offers the remaining capacity to
+the existing governed BLAS launch, without another planner query or a private
+allocation/free fallback. Caller/provider ownership covers partial submission
+errors and deferred completion; successful launches preserve the existing
+synchronization policy. Capture support is unchanged. Half and BF16 routes
+use an empty, alignment-one weight prefix, preserving their existing offsets.
+Host layout tests and GPU-target compilation do not establish CUDA numerical,
+asynchronous-lifetime, capture or throughput correctness.
 
 ### CUDA quantized MatMul BF16 staging
 
@@ -344,8 +364,8 @@ workspace retirement, and partial submission errors retain the original
 provider's deferred-release/settlement contract. BF16_DIRECT_OUT restoration
 remains before error propagation.
 
-The immutable conversion cache, Marlin caches and generic f32 dequantized weights
-still require separate governed-ownership work. This migration adds no pool,
+The immutable conversion cache and Marlin caches still require separate
+governed-ownership work. This migration adds no pool,
 quota protocol or public EP trait hook. The generic ORT adapter now serves
 nonzero SessionPersistent requests through its registered state-owned lane;
 see the [adapter contract](#ort-persistent-workspace-adapter). Native sessions
@@ -475,7 +495,8 @@ The dated audit and measurements below preserve historical evidence. The current
 GQA, quantized MatMul prefill/BF16 staging, and variadic Sum/Mean contracts above
 supersede their old private-scratch and fallback descriptions. GQA now requires
 prepared backing for sequence metadata as well as its other temporary regions;
-MatMul dynamic BF16 staging and portable half-prefill no longer own raw scratch.
+MatMul dynamic BF16 staging, portable half-prefill and generic f32 dequantization
+no longer own raw scratch.
 
 
 Updated through #736 (default-domain `Attention` staged K/V) on 2026-08-12.
