@@ -13,6 +13,34 @@ pub struct Layout {
     pub lanes: usize,
 }
 
+/// Validate and return `(rows, row_elements)` for an axis-0 packed row gather.
+///
+/// Each gathered axis-0 slice must address an integral number of self-contained
+/// GGUF blocks (`row_elements % width == 0`). Standard `DequantizePacked` only
+/// constrains its innermost dimension, so rank-1 `[N]` tensors are valid for
+/// standalone `DequantizePacked` (`row_elements == 1`) but cannot be gathered
+/// as whole packed blocks along axis 0.
+pub fn row_geometry(metadata: &Metadata) -> Result<(usize, usize), String> {
+    let (&rows, tail) = metadata
+        .shape()
+        .split_first()
+        .ok_or("decoded data must have rank at least one")?;
+    let row_elements = tail
+        .iter()
+        .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+        .ok_or_else(|| format!("decoded row shape {tail:?} overflows host indexing"))?;
+    let (width, _) = metadata.format().block();
+    if !row_elements.is_multiple_of(width) {
+        return Err(format!(
+            "decoded row has {row_elements} elements, which is not a whole number of \
+             {}-element {} blocks",
+            width,
+            metadata.format().name()
+        ));
+    }
+    Ok((rows, row_elements))
+}
+
 pub fn layout(
     metadata: &Metadata,
     packed_dtype: DataType,
@@ -28,17 +56,14 @@ pub fn layout(
             "indices must be INT32 or INT64, got {indices_dtype:?}"
         ));
     }
-    let (&rows, tail) = metadata
-        .shape()
-        .split_first()
-        .ok_or("decoded data must have rank at least one")?;
+    let (rows, row_elements) = row_geometry(metadata)?;
+    let tail = &metadata.shape()[1..];
     let product = |shape: &[usize], what: &str| {
         shape
             .iter()
             .try_fold(1usize, |n, &dim| n.checked_mul(dim))
             .ok_or_else(|| format!("{what} shape {shape:?} overflows host indexing"))
     };
-    let row_elements = product(tail, "decoded row")?;
     let indices = product(indices_shape, "indices")?;
     let lanes = indices
         .checked_mul(row_elements)
@@ -52,15 +77,6 @@ pub fn layout(
     }
     if lanes != product(output_shape, "output")? {
         return Err("output element count does not match Gather geometry".into());
-    }
-    let (width, _) = metadata.format().block();
-    if row_elements % width != 0 {
-        return Err(format!(
-            "decoded row has {row_elements} elements, which is not a whole number of \
-             {}-element {} blocks",
-            width,
-            metadata.format().name()
-        ));
     }
     Ok(Layout {
         rows,
@@ -78,11 +94,13 @@ pub fn recognize(
     if gather.op_type != "Gather"
         || !is_default_domain(&gather.domain)
         || !gather.overload.is_empty()
-        || gather.outputs.len() != 1
         || gather.attributes.keys().any(|key| key != "axis")
     {
         return Err("not a standard single-output Gather".into());
     }
+    let [Some(output)] = gather.outputs.as_slice() else {
+        return Err("not a standard single-output Gather".into());
+    };
     let [Some(decoded), Some(indices)] = gather.inputs.as_slice() else {
         return Err("Gather requires data and indices".into());
     };
@@ -127,12 +145,13 @@ pub fn recognize(
         return Err("not a supported standard DequantizePacked-29".into());
     }
     let metadata = Metadata::from_node(dq)?;
-    if metadata.shape().is_empty() {
-        return Err("decoded data must have rank at least one".into());
-    }
+    row_geometry(&metadata)?;
     let packed = dq.inputs[0].unwrap();
     let packed_value = graph.value(packed);
-    metadata.validate_input_dtype(packed_value.dtype)?;
+    let packed_dtype = packed_value
+        .tensor_dtype()
+        .ok_or("packed input dtype is unknown")?;
+    metadata.validate_input_dtype(packed_dtype)?;
     if packed_value.rank() != Some(1) {
         return Err("packed input must have rank one".into());
     }
@@ -148,12 +167,16 @@ pub fn recognize(
                 .zip(metadata.shape())
                 .all(|(actual, &expected)| actual.as_static() == Some(expected))
     });
-    if decoded_value.dtype != metadata.dtype()
+    if decoded_value.tensor_dtype() != Some(metadata.dtype())
         || !decoded_shape_matches
         || !matches!(
-            graph.value(*indices).dtype,
-            DataType::Int32 | DataType::Int64
+            graph.value(*indices).tensor_dtype(),
+            Some(DataType::Int32 | DataType::Int64)
         )
+        || graph
+            .value(*output)
+            .tensor_dtype()
+            .is_some_and(|dtype| dtype != metadata.dtype())
     {
         return Err(
             "decoded value must match DequantizePacked metadata and indices must be integer".into(),
@@ -235,6 +258,71 @@ mod tests {
             vec![Some(decoded)],
             vec![extra],
         ));
+        assert!(recognize(&graph, graph.node(gather), &|_| false).is_err());
+    }
+
+    #[test]
+    fn declines_rank_one_and_overflowing_zero_row_decode() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 29);
+        let packed = graph.create_named_value("packed", DataType::Uint8, static_shape([36]));
+        let indices = graph.create_named_value("indices", DataType::Int64, static_shape([2]));
+        let decoded = graph.create_named_value("decoded", DataType::Float32, static_shape([64]));
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+        graph.add_input(packed);
+        graph.add_input(indices);
+        let mut dq = Node::new(
+            NodeId(0),
+            "DequantizePacked",
+            vec![Some(packed)],
+            vec![decoded],
+        );
+        dq.attributes
+            .insert("format".into(), Attribute::String(b"gguf:nvfp4".to_vec()));
+        dq.attributes
+            .insert("shape".into(), Attribute::Ints(vec![64]));
+        let dq_id = graph.insert_node(dq);
+        let gather = graph.insert_node(Node::new(
+            NodeId(0),
+            "Gather",
+            vec![Some(decoded), Some(indices)],
+            vec![output],
+        ));
+        graph.add_output(output);
+
+        let err = recognize(&graph, graph.node(gather), &|_| false).unwrap_err();
+        assert!(err.contains("whole number of 64-element"), "{err}");
+
+        graph
+            .value_mut(packed)
+            .set_tensor_facts(DataType::Uint8, static_shape([0]));
+        graph
+            .value_mut(decoded)
+            .set_tensor_facts(DataType::Float32, static_shape([0, i64::MAX as usize, 64]));
+        graph
+            .value_mut(output)
+            .set_tensor_facts(DataType::Float32, static_shape([2, i64::MAX as usize, 64]));
+        graph
+            .node_mut(dq_id)
+            .attributes
+            .insert("shape".into(), Attribute::Ints(vec![0, i64::MAX, 64]));
+        let err = recognize(&graph, graph.node(gather), &|_| false).unwrap_err();
+        assert!(err.contains("overflows host indexing"), "{err}");
+    }
+
+    #[test]
+    fn declines_missing_or_mismatched_gather_output() {
+        let (mut graph, gather, _) = graph();
+        let output = graph.node(gather).outputs[0].unwrap();
+        graph
+            .value_mut(output)
+            .set_tensor_facts(DataType::Float16, static_shape([2, 64]));
+        assert!(recognize(&graph, graph.node(gather), &|_| false).is_err());
+
+        graph
+            .value_mut(output)
+            .set_tensor_facts(DataType::Float32, static_shape([2, 64]));
+        graph.node_mut(gather).outputs = vec![None];
         assert!(recognize(&graph, graph.node(gather), &|_| false).is_err());
     }
 }

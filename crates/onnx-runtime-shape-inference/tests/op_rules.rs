@@ -205,6 +205,83 @@ fn dequantize_packed_resolves_shape_and_checks_exact_payload() {
     }
 }
 
+#[test]
+fn dequantize_packed_gather_enforces_row_block_and_operand_contracts() {
+    let packed_gather = |dims: Vec<i64>| {
+        let mut n = node("DequantizePackedGather", 2, 1);
+        n.domain = "pkg.nxrt".into();
+        n = with_attr(n, "format", Attribute::String(b"gguf:q5_1".to_vec()));
+        with_attr(n, "shape", Attribute::Ints(dims))
+    };
+    let good = with_attr(
+        packed_gather(vec![2, 2, 32]),
+        "output_dtype",
+        Attribute::Int(10),
+    );
+    let inferred = run(
+        &good,
+        vec![
+            tin(DataType::Uint8, vec![c(96)]),
+            tin(DataType::Int32, vec![sym(3), c(4)]),
+        ],
+        1,
+    );
+    assert_eq!(out_dtype(&inferred), DataType::Float16);
+    assert_eq!(out_shape(&inferred), [sym(3), c(4), c(2), c(32)]);
+
+    for (node, packed_in, indices_in, reason) in [
+        (
+            packed_gather(vec![64]),
+            tin(DataType::Uint8, vec![c(48)]),
+            tin(DataType::Int64, vec![c(2)]),
+            "whole number of 32-element",
+        ),
+        (
+            packed_gather(vec![0, i64::MAX, 32]),
+            tin(DataType::Uint8, vec![c(0)]),
+            tin(DataType::Int64, vec![c(2)]),
+            "overflows host indexing",
+        ),
+        (
+            packed_gather(vec![2, 64]),
+            tin(DataType::Int8, vec![c(96)]),
+            tin(DataType::Int64, vec![c(2)]),
+            "UINT8",
+        ),
+        (
+            packed_gather(vec![2, 64]),
+            tin(DataType::Uint8, vec![c(95)]),
+            tin(DataType::Int64, vec![c(2)]),
+            "exactly 96",
+        ),
+        (
+            packed_gather(vec![2, 64]),
+            tin(DataType::Uint8, vec![c(96)]),
+            tin(DataType::Float32, vec![c(2)]),
+            "INT32 or INT64",
+        ),
+    ] {
+        assert_invalid(
+            try_run(&node, vec![packed_in, indices_in], 1).unwrap_err(),
+            "DequantizePackedGather",
+            reason,
+        );
+    }
+
+    let mut missing_input = packed_gather(vec![2, 64]);
+    missing_input.inputs[0] = None;
+    assert_invalid(
+        try_run(
+            &missing_input,
+            vec![NodeIo::default(), tin(DataType::Int64, vec![c(2)])],
+            1,
+        )
+        .unwrap_err(),
+        "DequantizePackedGather",
+        "requires packed data, indices, and one output",
+    );
+}
+
 fn sym(n: u32) -> DimExpr {
     DimExpr::symbol(SymbolId(n))
 }
