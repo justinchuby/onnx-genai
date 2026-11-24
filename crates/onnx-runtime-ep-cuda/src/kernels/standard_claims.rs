@@ -18,6 +18,11 @@ pub(crate) fn unsupported_reason_at_opset(
         "GatherND" => gather_nd(node, opset, input_dtypes),
         "Celu" => required_arity(node, input_dtypes, 1, 1, 1)
             .and_then(|()| require_one_of(input_dtypes, 0, super::celu_dtypes(opset), "X")),
+        "AveragePool" => {
+turn super::pooling::validate_average_claim(node, opset, input_shapes, input_dtypes)
+                .err()
+                .map(|error| error.to_string());
+        }
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result

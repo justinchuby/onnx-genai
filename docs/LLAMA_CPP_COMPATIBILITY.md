@@ -58,7 +58,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/v1/audio/speech`, `/audio/speech`, `/tts` | Declared buffered speech workflow; native input/prompt and raw-prompt handling |
 | GET | `/models/sse` | Initial state and changes to committed model load status; one-second polling, no invented progress |
 | POST | `/models/load`, `/models/unload` | Configured model IDs; requires `--enable-admin-endpoints` |
-| GET, POST | `/cors-proxy` | Optional HTTP(S) MCP transport; explicit forwarding headers, checked and pinned target addresses, bounded streaming |
+| GET, POST | `/tools`, `/cors-proxy` | Outside scope: execution and MCP transport belong to an external harness |
 | GET, POST | `/lora-adapters` | Model-bound declared catalog and atomic default scale replacement; request `lora` overrides execute actual adapter weights |
 | GET | `/slots` | Actual serial Native slot status; model/autoload selection and fail-on-busy polling |
 | POST | `/slots/{id_slot}?action=save\|restore\|erase` | Owner-thread state actions under opt-in bounded `--slot-save-path`; nxrt state file encoding |
@@ -435,30 +435,21 @@ and does not read or change generation settings. `GET /props` advertises the
 configured `endpoint_props` value in router and model modes. When disabled, POST
 returns upstream-compatible `501 not_supported_error`. This is not an API
 for changing generation defaults.
-`GET/POST /tools` now supports the seven explicitly enabled host built-ins,
-including command SSE, file selection and editing. See [host tools](SERVER_TOOLS.md)
-for limits, trusted-origin policy and remaining MCP/container/SSH integrations. The MCP
-HTTP proxy is separately opt-in with `--ui-mcp-proxy`; `/props` reports
-`cors_proxy_enabled` from that setting. `GET` and `POST /cors-proxy?url=...`
-forward only headers explicitly prefixed with `x-llama-server-proxy-header-`.
-Ambient server credentials and cookies are never forwarded. HTTP(S) targets
-must resolve entirely to public addresses unless the operator also supplies
-`--ui-mcp-proxy-allow-private-urls`. Connections use those checked DNS results;
-environment proxies cannot override the chosen destination. Redirects return
-through `/cors-proxy` for fresh admission, with credential and arbitrary forwarding headers
-removed when the target origin changes; only explicit `Accept`, `Content-Type`
-and `Content-Encoding` representation headers survive that redirect. Remote cookies and hop-by-hop headers
-are removed from responses; proxied documents receive a sandbox CSP.
+Tool execution belongs to an external harness. nxrt does not register `/tools`
+or `/cors-proxy`, launch MCP children, execute filesystem/shell tools, or provide
+Docker/Podman/SSH tool runtimes. These are deliberate scope exclusions, not
+pending compatibility work. `/props` reports `server_tools: false` in
+`nxrt_capabilities` and `cors_proxy_enabled: false` in both router and model modes.
+The former tool/MCP/proxy CLI options and library configuration types are removed.
 
-Transfers stream through a bounded queue and stop on consumer disconnect. At most
-16 outbound transfers run concurrently (`--ui-mcp-proxy-max-connections`); excess
-requests receive `503` with `Retry-After`, and disconnect/timeout releases the slot. The
-request and response byte limit defaults to 64 MiB (`--ui-mcp-proxy-max-bytes`),
-and the idle transfer timeout defaults to 600 seconds
-(`--ui-mcp-proxy-timeout-secs`). Progress resets that timeout, so active SSE
-sessions can outlive it. Streaming failures surface as body errors;
-pre-response failures return actionable HTTP errors. The proxy does not execute
-local tools or shell commands.
+Chat tool calling remains supported: clients send `tools`/`tool_choice`, consume
+assistant `tool_calls` (including streaming deltas), execute those calls in their
+harness, and return `role: "tool"` messages with the matching `tool_call_id`.
+Model metadata still determines which tool protocol is admitted. For example, a
+harness can submit `{"role":"tool","tool_call_id":"call_1","content":"result"}`
+as part of the next `/v1/chat/completions` request. The server never executes the
+function named by a generated call.
+
 Other unknown paths return JSON 404 errors rather than the HTML app.
 Existing nxrt sessions/admin/debug/image APIs remain available with their own
 contracts. Capability flags are derived from admitted package metadata; ONNX

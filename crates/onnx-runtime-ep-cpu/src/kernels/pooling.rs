@@ -69,13 +69,11 @@ impl PoolParams {
                     let numerator =
                         spatial[axis] as i64 + pads[axis] as i64 + pads[axis + dims] as i64
                             - effective as i64;
-                    let mut out = if ceil_mode {
-                        ((numerator + self.strides[axis] as i64 - 1) / self.strides[axis] as i64
-                            + 1)
-                        .max(0) as usize
-                    } else {
-                        (numerator / self.strides[axis] as i64 + 1).max(0) as usize
-                    };
+                    let stride = self.strides[axis] as i64;
+                    let mut out = (numerator.div_euclid(stride)
+                        + i64::from(ceil_mode && numerator.rem_euclid(stride) != 0)
+                        + 1)
+                    .max(0) as usize;
                     if ceil_mode
                         && out > 0
                         && (out - 1) * self.strides[axis] >= spatial[axis] + pads[axis]
@@ -208,7 +206,13 @@ impl KernelFactory for AveragePoolFactory {
             .ok_or_else(|| {
                 EpError::KernelFailed("AveragePool: input must have rank >= 3".into())
             })?;
-        let (params, auto_pad, ceil_mode) = pool_params(node, dims)?;
+        let (mut params, mut auto_pad, ceil_mode) = pool_params(node, dims)?;
+        if matches!(auto_pad, AutoPad::Valid) {
+            // ONNX shape inference resolves VALID to zero pads before
+            // applying AveragePool's ceil_mode.
+            params.pads.fill(0);
+            auto_pad = AutoPad::NotSet;
+        }
         Ok(Box::new(PoolKernel {
             params,
             auto_pad,
