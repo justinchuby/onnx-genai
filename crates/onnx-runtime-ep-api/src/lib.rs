@@ -38,6 +38,7 @@ pub mod affine_gather;
 pub mod attention_window;
 pub mod bit_cast;
 pub mod epcontext;
+pub mod gemm;
 pub mod host_parallel;
 pub mod kernel;
 pub mod packed_routed;

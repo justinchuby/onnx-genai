@@ -1281,6 +1281,42 @@ fn gemm_transb() {
     assert_eq!(out_shape(&outs), vec![c(8), c(32)]);
 }
 
+#[test]
+fn gemm_29_infers_vector_and_symbolic_batches_but_rejects_bad_bias() {
+    let n = with_attr(node("Gemm", 3, 1), "transA", Attribute::Int(1));
+    let vector = vec![f32in(vec![c(3)]), f32in(vec![c(3), c(5)]), f32in(vec![])];
+    assert_eq!(out_shape(&run(&n, vector.clone(), 29)), vec![c(5)]);
+    assert!(try_run(&n, vector.clone(), 28).is_err());
+    assert!(try_run(&with_version(n.clone(), 28), vector, 29).is_err());
+
+    let batched = |bias| {
+        vec![
+            f32in(vec![sym(7), c(2), c(3), c(4)]),
+            f32in(vec![c(3), c(5)]),
+            f32in(bias),
+        ]
+    };
+    let shape = vec![sym(7), c(2), c(4), c(5)];
+    assert_eq!(
+        out_shape(&run(&n, batched(vec![c(2), c(1), c(5)]), 29)),
+        shape,
+    );
+    assert!(
+        try_run(&n, batched(vec![c(3), c(5)]), 29)
+            .unwrap_err()
+            .to_string()
+            .contains("does not broadcast")
+    );
+    let mut invalid_b = batched(vec![]);
+    invalid_b[1] = f32in(vec![c(1), c(3), c(5)]);
+    assert!(
+        try_run(&n, invalid_b, 29)
+            .unwrap_err()
+            .to_string()
+            .contains("B must have rank 2")
+    );
+}
+
 // --- FusedMatMul (com.microsoft) ------------------------------------------
 
 /// A `com.microsoft::FusedMatMul` node with the given int attributes.
