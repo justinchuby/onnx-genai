@@ -1201,10 +1201,12 @@ pub fn launch_planar_moe(
 ) -> Result<()> {
     let ptrs = validate_planar_moe_buffers(admission, buffers)?;
     let runtime = admission.provider.runtime();
-    runtime.require_registered_address_capture(
-        Arc::as_ptr(&admission.banks) as usize,
-        "planar MoE projection banks",
-    )?;
+    if runtime.is_capturing()? {
+        runtime.require_captured_address_owner(
+            Arc::as_ptr(&admission.banks) as usize,
+            "planar MoE projection banks",
+        )?;
+    }
     let dims = admission.dims();
     let routes = admission.routes;
 

@@ -993,6 +993,31 @@ fn unregistered_capture_and_foreign_context_are_rejected_before_launch() {
     assert!(error.to_string().contains("no registered ownership token"));
     runtime.test_end_unregistered_graph_capture().unwrap();
 
+    runtime
+        .stream()
+        .begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .unwrap();
+    let before = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let error = launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no registered ownership token"), "{error}");
+    assert_eq!(runtime.allocation_counts(), before);
+    assert_eq!(runtime.transfer_counts(), transfers);
+    runtime.test_end_unregistered_graph_capture().unwrap();
+    runtime.begin_graph_capture(&[]).unwrap();
+    let error = launch_planar_linear(&admission, PlanarActivationDtype::F32, &a_buf, &mut out_buf)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("did not retain the ownership token"),
+        "{error}"
+    );
+    runtime.abort_graph_capture().unwrap();
+
     let foreign = require_cuda();
     let foreign_a = upload(&foreign, &a_bytes);
     let mut foreign_out = foreign.allocate(32 * 4, 256).unwrap();

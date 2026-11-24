@@ -1137,6 +1137,39 @@ fn block_quantized_moe_mixed_decode_capture_replays_without_fallback() {
     // SAFETY: destination exactly covers the output allocation.
     unsafe { runtime.dtoh(&mut eager, output_ptr).unwrap() };
 
+    let allocations_before_bad_span = runtime.allocation_counts();
+    let transfers_before_bad_span = runtime.transfer_counts();
+    for offered in [
+        None,
+        Some(WorkspaceView::new(
+            DevicePtrMut(workspace_ptr),
+            workspace_bytes - 1,
+        )),
+        Some(WorkspaceView::new(
+            DevicePtrMut(std::ptr::null_mut()),
+            workspace_bytes,
+        )),
+        Some(WorkspaceView::new(
+            DevicePtrMut(workspace_ptr.cast::<u8>().wrapping_add(1).cast()),
+            workspace_bytes,
+        )),
+        Some(WorkspaceView::new(
+            DevicePtrMut((usize::MAX & !255) as *mut _),
+            workspace_bytes,
+        )),
+    ] {
+        let error = kernel
+            .execute_with_workspace(&views, &mut [output_view()], offered)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("BlockQuantizedMoE complete caller workspace")
+                && error.contains("workspace needs"),
+            "{error}"
+        );
+    }
+    assert_eq!(runtime.allocation_counts(), allocations_before_bad_span);
+    assert_eq!(runtime.transfer_counts(), transfers_before_bad_span);
     let allocations = runtime.allocation_counts();
     let transfers = runtime.transfer_counts();
     let synchronizations = runtime.forced_synchronization_count();
@@ -1158,7 +1191,57 @@ fn block_quantized_moe_mixed_decode_capture_replays_without_fallback() {
         synchronizations,
         "warmed eager operator synchronizations"
     );
+    runtime
+        .stream()
+        .begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .unwrap();
+    let error = kernel
+        .execute_with_workspace(&views, &mut [output_view()], Some(workspace_view()))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("real workspace owner"), "{error}");
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(runtime.transfer_counts(), transfers);
+    assert_eq!(runtime.forced_synchronization_count(), synchronizations);
+    runtime.test_end_unregistered_graph_capture().unwrap();
     runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    let before_missing_pin = runtime.allocation_counts();
+    let error = kernel
+        .execute_with_workspace(&views, &mut [output_view()], Some(workspace_view()))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("real workspace owner"), "{error}");
+    assert_eq!(runtime.allocation_counts(), before_missing_pin);
+    runtime.abort_graph_capture().unwrap();
+    let only_workspace_pin =
+        onnx_runtime_ep_api::DeviceGraphResource::for_workspace(workspace.bound_owner().unwrap())
+            .unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[], vec![only_workspace_pin])
+        .unwrap();
+    let error = kernel
+        .execute_with_workspace(&views, &mut [output_view()], Some(workspace_view()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("BlockQuantizedMoE projection banks")
+            && error.contains("did not retain the ownership token"),
+        "{error}"
+    );
+    runtime.abort_graph_capture().unwrap();
+    let allocations = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let workspace_pin = onnx_runtime_ep_api::DeviceGraphResource::for_workspace(
+        workspace
+            .bound_owner()
+            .expect("real caller workspace binding"),
+    )
+    .unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], vec![workspace_pin])
+        .unwrap();
     kernel
         .execute_with_workspace(&views, &mut [output_view()], Some(workspace_view()))
         .unwrap();
@@ -1356,7 +1439,15 @@ fn measure_captured_moe(
         .execute_with_workspace(&views, &mut [output_view()], Some(workspace_view()))
         .unwrap();
     runtime.synchronize().unwrap();
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    let workspace_pin = onnx_runtime_ep_api::DeviceGraphResource::for_workspace(
+        workspace
+            .bound_owner()
+            .expect("real caller workspace binding"),
+    )
+    .unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], vec![workspace_pin])
+        .unwrap();
     kernel
         .execute_with_workspace(&views, &mut [output_view()], Some(workspace_view()))
         .unwrap();

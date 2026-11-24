@@ -1317,17 +1317,15 @@ The shared metadata hit path already queries the driver's capture status. It
 now uses a strict captured-owner check: an actual capture must have a registered
 ownership sink retaining the exact metadata identity, even if capture was begun
 directly on the stream without runtime flags. A single validator handles owner
-classification and diagnostics. Existing unconditional bank launch checks keep
-their tracked-capture atomic fast path and delegate to that validator only when
-tracked capture is active. Direct external capture for those other bank/planar
-routes remains a separate audit; this is a metadata-path correction.
+classification and diagnostics. The bank/planar entry points now use this same
+strict owner validator after a real stream observation, as described below.
 
 Skip's old cache hit did not perform this capture-status query. Adopting the
 shared helper therefore adds that Host-side check and its existing graph
 lifecycle mutex acquisition to Skip metadata hits; no zero-query, zero-lock or
 end-to-end speedup is claimed. It adds no pool, budget, metadata mutex, quota
 callback, H2D upload or retirement drain to fitting metadata hits. GPU
-fixtures cover stable warm counters, flagged and truly external raw-capture
+fixtures cover stable warm counters, test-helper and direct-stream raw-capture
 refusal, registered capture without a metadata pin, capture-time key mismatch,
 post-upload failure/ready revocation, and replay of A after B rewarm/kernel drop.
 Host checks pin broadcast-table ABI and owner-registration classification.
@@ -1366,6 +1364,43 @@ and rebinding refusal with stable allocation/transfer/rewarm state. Existing
 registered capture/replay, workspace dirtying and transactional failure fixtures
 remain in place. CUDA source, layout and numerical routes are unchanged; device
 execution and performance still require hardware validation.
+
+### Sealed banks and the complete BlockQuantizedMoE workspace
+
+Planar linear/MoE and BlockQuantizedMoE now observe real stream capture at their
+logical launch entry and use the strict retained-owner validator before any
+pipeline launch. BlockQuantizedMoE reuses that observation for its projection
+banks, selected telemetry record and caller composite span. Reduce and QMoE
+telemetry already observed real capture and now call the same strict validator.
+The old tracked-only address check and redundant unregistered-capture flag are
+removed. The remaining registered flag identifies an actual ownership sink; it
+is not a substitute for driver capture status. Prefill retains its separate
+transfer capability, which already queries real stream state conservatively.
+
+BlockQuantizedMoE's cold geometry now constructs `WorkspaceLayout<6>` instead of
+storing manual offsets/bytes and redoing raw pointer additions. Nonempty regions
+retain their original order and 256-byte alignment; absent regions have zero
+size/alignment one and are not dereferenced. No padding is added for an absent
+FC3 table or after the last region. Warm execution only binds the precomputed
+layout, rejecting missing, short, null, misaligned or wrapping backing before
+launch. Capture requires one real owner covering the composite used prefix,
+not every region as a separate grant or the whole retained capacity. A zero-work
+geometry still returns before binding, observing capture or acquiring backing.
+
+The direct planar APIs continue their existing caller-retained I/O lifetime
+contract; the stricter check here concerns their sealed bank owner. Logical
+launch entry now gains a driver query and its existing graph-lifecycle lock
+compared with the old flag shortcut, but sub-kernels reuse that entry decision.
+No allocator, pool, quota callback or per-region owner is added. Query/binding
+cost and GPU throughput remain unmeasured.
+
+Host fixtures pin nonzero region offsets and total bytes with/without FC3,
+zero-work behavior, overflow and complete-span failures. Device fixtures include
+direct stream capture and registered capture missing the bank owner, malformed
+workspace, missing caller pin, successful capture with both real pins, and the
+existing replay/drop/host-allocation/preparation-counter assertions. The timing
+fixture now registers the same real caller workspace pin as other capture users.
+These fixtures are compiled; execution and performance require CUDA hardware.
 
 ### CUDA raw allocation audit (#736, 2026-08-10)
 

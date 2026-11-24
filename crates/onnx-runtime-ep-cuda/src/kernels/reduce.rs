@@ -1145,7 +1145,7 @@ impl ReduceKernel {
             )));
         }
         for resource in resources {
-            self.runtime.require_registered_address_capture(
+            self.runtime.require_captured_address_owner(
                 resource.identity(),
                 "Reduce metadata allocation",
             )?;

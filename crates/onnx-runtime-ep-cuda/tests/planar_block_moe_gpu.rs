@@ -1221,6 +1221,31 @@ fn capture_replay_parity() {
     runtime.synchronize().unwrap();
     let eager = download_f32(&ep, &buffers.output, dims.rows * hidden);
 
+    runtime
+        .stream()
+        .begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .unwrap();
+    let before = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let error = launch_planar_moe(&admission, &mut buffers.launch_buffers())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no registered ownership token"), "{error}");
+    assert_eq!(runtime.allocation_counts(), before);
+    assert_eq!(runtime.transfer_counts(), transfers);
+    runtime.test_end_unregistered_graph_capture().unwrap();
+    runtime.begin_graph_capture(&[]).unwrap();
+    let error = launch_planar_moe(&admission, &mut buffers.launch_buffers())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("did not retain the ownership token"),
+        "{error}"
+    );
+    runtime.abort_graph_capture().unwrap();
+
     // Capture the warmed pipeline, then replay ≥3× and compare byte-for-byte.
     let capture_allocations = runtime.allocation_counts();
     let capture_transfers = runtime.transfer_counts();
