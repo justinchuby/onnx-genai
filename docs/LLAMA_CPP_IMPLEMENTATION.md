@@ -1623,3 +1623,21 @@ unbounded repetition and a backreference variant reproduce the same semantic
 gap. The formal capture-oracle regression now selects one test and fails on
 this mismatch. Correct repetition capture clearing is required before landing;
 passing ordinary HTTP cases does not establish that compatibility.
+
+### Byte-native trigger VM replaces backend capture semantics
+
+The independent capture-reset failure above is addressed by an owned byte VM,
+rather than translating captures through a general regex backend. Repetition
+clears the capture span of its body before each iteration; an unset
+backreference fails. Lookahead owns an atomic choice stack and shares the
+execution budget. Full matching backtracks before rejecting a partial match.
+Byte classes, captures and anchors operate directly on the original byte buffer.
+The engine no longer directly depends on fancy-regex for this feature.
+
+Execution bounds cover shared instruction fuel and live choice/capture/operation
+cells, including nested lookahead and backreference comparisons. Compilation
+retains source, node, byte, capture, depth and repetition limits. A fixture from
+the pinned upstream find() function and libc++ ECMAScript enumerates 24 patterns
+against all 121 abx strings of length zero through four (2904 comparisons),
+covering nullable repetition, greediness, capture reset, lookahead and backrefs.
+These cases complement the original invalid syntax and resource-limit tests.

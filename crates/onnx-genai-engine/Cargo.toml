@@ -168,8 +168,6 @@ tokenizers = { workspace = true }
 rand = "0.9.5"
 half = { workspace = true, features = ["use-intrinsics"] }
 regex = "1.12"
-# Same bounded backtracking backend already used by the grammar dependency graph.
-fancy-regex = "0.18"
 regex-automata = "0.4.16"
 regex-syntax = "0.8.11"
 llguidance = "1.9.1"

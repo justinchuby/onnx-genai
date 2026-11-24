@@ -1983,7 +1983,6 @@ version = "0.1.0-dev.6"
 dependencies = [
  "anyhow",
  "async-trait",
- "fancy-regex 0.18.0",
  "half",
  "libc",
  "llguidance",

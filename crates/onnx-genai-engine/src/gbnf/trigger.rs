@@ -1,19 +1,18 @@
-//! Bounded byte-oriented ECMAScript trigger patterns for the native protocol.
-//!
-//! Encode each input byte as a Latin-1 scalar, so the regex backend's Unicode
-//! storage cannot turn a model byte offset into a decoded-text offset. Translate
-//! the accepted ECMAScript syntax explicitly; never expose backend extensions.
-use super::MAX_ITEMS;
+//! Bounded byte-native ECMAScript trigger patterns for the native protocol.
+//! Captures are reset on entry to every repetition, and an unset backreference
+//! fails. These C++ semantics differ from the general Rust/JavaScript backends.
+use super::{
+    MAX_ITEMS,
+    trigger_vm::{Id, Kind, Node, Program},
+};
 use anyhow::{Context, Result, ensure};
-use fancy_regex::{Regex, RegexBuilder};
-
+use std::ops::Range;
 const MAX_DEPTH: usize = 128;
 const MAX_REPETITION: usize = 2000;
-const BACKTRACK_LIMIT: usize = 1_000_000;
 const PROGRAM_BYTES: usize = 1 << 20;
 
 pub struct EcmaBytePattern {
-    regex: Regex,
+    program: Program,
     max_bytes: usize,
     program_bytes: usize,
 }
@@ -23,71 +22,54 @@ impl EcmaBytePattern {
             max_bytes > 0 && pattern.len() <= max_bytes,
             "grammar trigger pattern exceeds max_constraint_bytes={max_bytes}; shorten it or configure a positive sufficient budget"
         );
-        let mut parser = Translator {
+        let mut parser = Parser {
             bytes: pattern.as_bytes(),
             position: 0,
             captures: 0,
             open: Vec::new(),
             emitted: 0,
+            nodes: Vec::new(),
         };
-        let mut translated = parser.expression(0)?;
+        let root = parser.expression(0)?;
         ensure!(
             parser.position == pattern.len(),
             "grammar trigger pattern has an unmatched ')' at byte {}; balance its groups",
             parser.position
         );
-        // The upstream uses regex_match, rather than search, only with both
-        // anchors. Wrapping is essential: post-filtering a shorter first match
-        // would lose a later alternative that satisfies the complete match.
-        if pattern.starts_with('^') && pattern.ends_with('$') {
-            translated = format!(r"\A(?:{translated})\z");
-        }
-        let regex = RegexBuilder::new(&translated)
-            .backtrack_limit(BACKTRACK_LIMIT)
-            .delegate_size_limit(1 << 20)
-            .delegate_dfa_size_limit(1 << 20)
-            .build().context("compile grammar trigger ECMAScript pattern; repair its syntax or simplify the expression")?;
+        let program_bytes = parser.emitted;
+        let program = Program {
+            root,
+            nodes: parser.nodes,
+            captures: parser.captures,
+            full: pattern.starts_with('^') && pattern.ends_with('$'),
+        };
         Ok(Self {
-            regex,
+            program,
             max_bytes,
-            program_bytes: translated.len(),
+            program_bytes,
         })
     }
-
     pub(crate) fn program_bytes(&self) -> usize {
         self.program_bytes
     }
-
-    /// First nonempty captured group's byte offset, falling back to the whole
-    /// match. A capture in a lookahead may start after the whole match ends.
+    /// First nonempty captured group, falling back to the complete match.
     pub fn find(&self, bytes: &[u8]) -> Result<Option<usize>> {
         ensure!(
             bytes.len() <= self.max_bytes,
             "grammar trigger buffer exceeds max_constraint_bytes={}; shorten output or increase the explicit byte budget",
             self.max_bytes
         );
-        let input = bytes.iter().copied().map(char::from).collect::<String>();
-        let Some(captures) = self.regex.captures(&input).context("match grammar trigger pattern within its backtracking budget; simplify the pattern or use a literal/token trigger")? else { return Ok(None); };
-        let whole = captures.get(0).context("grammar trigger backend omitted its whole match; restart with a fresh compiled pattern")?;
-        let offset = captures
-            .iter()
-            .skip(1)
-            .flatten()
-            .find(|m| m.start() != m.end())
-            .map_or(whole.start(), |m| m.start());
-        let prefix = input.get(..offset).context("grammar trigger backend returned a non-scalar Latin-1 offset; use a pattern over complete byte events")?;
-        Ok(Some(prefix.chars().count()))
+        self.program.find(bytes)
     }
 }
-
-struct Translator<'a> {
+struct Parser<'a> {
     bytes: &'a [u8],
     position: usize,
     captures: usize,
     open: Vec<usize>,
     emitted: usize,
+    nodes: Vec<Node>,
 }
-
 enum ClassAtom {
     Scalar(u32),
     Set(Vec<(u32, u32)>),
@@ -101,43 +83,44 @@ impl ClassAtom {
     }
 }
 
-fn class_text(ranges: &[(u32, u32)], negate: bool) -> String {
-    let mut members = [false; 256];
-    for &(lo, hi) in ranges {
-        for byte in lo..=hi.min(255) {
-            members[byte as usize] = true;
-        }
-    }
-    let mut text = String::from("[");
-    for (byte, &present) in members.iter().enumerate() {
-        if present != negate {
-            text.push_str(&format!(r"\u{{{byte:x}}}"));
-        }
-    }
-    if text == "[" {
-        return "(?!)".into();
-    }
-    text.push(']');
-    text
-}
-fn literal(value: u32) -> String {
-    if value > 255 {
-        "(?!)".into()
-    } else {
-        format!(r"\u{{{value:x}}}")
-    }
-}
-impl Translator<'_> {
-    fn reserve(&mut self, bytes: usize) -> Result<()> {
+impl Parser<'_> {
+    fn node(&mut self, kind: Kind, captures: Range<usize>) -> Result<Id> {
+        let extra = match &kind {
+            Kind::Seq(items) | Kind::Alt(items) => items.len() * std::mem::size_of::<Id>(),
+            _ => 0,
+        };
         self.emitted = self
             .emitted
-            .checked_add(bytes)
+            .checked_add(std::mem::size_of::<Node>() + extra)
             .context("grammar trigger translated program size overflow; simplify the pattern")?;
         ensure!(
-            self.emitted <= PROGRAM_BYTES,
-            "grammar trigger translated program exceeds {PROGRAM_BYTES} bytes; simplify nested groups or character classes"
+            self.emitted <= PROGRAM_BYTES && self.nodes.len() < MAX_ITEMS,
+            "grammar trigger translated program exceeds its byte/node budget; simplify nested groups or character classes"
         );
-        Ok(())
+        let id = Id(self.nodes.len());
+        self.nodes.push(Node { kind, captures });
+        Ok(id)
+    }
+    fn set(&mut self, ranges: &[(u32, u32)], negate: bool) -> Result<Id> {
+        let mut set = [if negate { u64::MAX } else { 0 }; 4];
+        for &(lo, hi) in ranges {
+            for byte in lo..=hi.min(255) {
+                let bit = 1u64 << (byte % 64);
+                if negate {
+                    set[byte as usize / 64] &= !bit;
+                } else {
+                    set[byte as usize / 64] |= bit;
+                }
+            }
+        }
+        self.node(Kind::Set(set), 0..0)
+    }
+    fn sequence(&mut self, items: Vec<Id>, span: Range<usize>) -> Result<Id> {
+        if items.len() == 1 {
+            Ok(items[0])
+        } else {
+            self.node(Kind::Seq(items), span)
+        }
     }
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.position).copied()
@@ -174,20 +157,26 @@ impl Translator<'_> {
             .parse()
             .context("grammar trigger decimal bound overflows usize; use a smaller bound")
     }
-    fn expression(&mut self, depth: usize) -> Result<String> {
+    fn expression(&mut self, depth: usize) -> Result<Id> {
         ensure!(
             depth <= MAX_DEPTH,
             "grammar trigger groups exceed depth {MAX_DEPTH}; simplify nested groups"
         );
-        let mut output = String::new();
+        let start = self.captures + 1;
+        let mut branch_start = start;
+        let mut branches = Vec::new();
+        let mut sequence = Vec::new();
         while let Some(byte) = self.peek() {
             if byte == b')' {
                 break;
             }
             if byte == b'|' {
                 self.position += 1;
-                self.reserve(1)?;
-                output.push('|');
+                branches.push(self.sequence(
+                    std::mem::take(&mut sequence),
+                    branch_start..self.captures + 1,
+                )?);
+                branch_start = self.captures + 1;
                 continue;
             }
             let (mut atom, assertion) = match self.take()? {
@@ -195,18 +184,18 @@ impl Translator<'_> {
                     let kind = if self.peek() == Some(b'?') {
                         self.position += 1;
                         match self.take()? {
-                            b':' => "?:",
-                            b'=' => "?=",
-                            b'!' => "?!",
+                            b':' => 1,
+                            b'=' => 2,
+                            b'!' => 3,
                             _ => anyhow::bail!(
                                 "grammar trigger group at byte {} is not ECMAScript capturing, noncapturing or lookahead syntax; remove backend-specific group extensions",
                                 self.position.saturating_sub(3)
                             ),
                         }
                     } else {
-                        ""
+                        0
                     };
-                    let capture = if kind.is_empty() {
+                    let capture = if kind == 0 {
                         self.captures += 1;
                         ensure!(
                             self.captures <= 1024,
@@ -219,24 +208,47 @@ impl Translator<'_> {
                     };
                     let body = self.expression(depth + 1)?;
                     self.expect(b')')?;
-                    if capture.is_some() {
+                    let node = if let Some(group) = capture {
                         self.open.pop();
-                    }
-                    (format!("({kind}{body})"), kind == "?=" || kind == "?!")
+                        self.node(Kind::Capture { group, body }, group..self.captures + 1)?
+                    } else if kind == 1 {
+                        body
+                    } else {
+                        let span = self.nodes[body.0].captures.clone();
+                        self.node(
+                            Kind::Look {
+                                positive: kind == 2,
+                                body,
+                            },
+                            span,
+                        )?
+                    };
+                    (node, kind >= 2)
                 }
                 b'[' => (self.character_class()?, false),
-                b'.' => (r"[^\r\n]".into(), false),
-                b'^' => ("^".into(), true),
-                b'$' => ("$".into(), true),
+                b'.' => (self.set(&[(10, 10), (13, 13)], true)?, false),
+                b'^' => (self.node(Kind::Start, 0..0)?, true),
+                b'$' => (self.node(Kind::End, 0..0)?, true),
                 b'\\' => self.escape()?,
                 b'*' | b'+' | b'?' | b'{' | b'}' | b']' => anyhow::bail!(
                     "grammar trigger pattern has an unescaped syntax character at byte {}; escape literals or attach one valid quantifier to an atom",
                     self.position - 1
                 ),
-                byte => (literal(u32::from(byte)), false),
+                byte => (self.node(Kind::Byte(byte), 0..0)?, false),
             };
-            let quantifier = match self.peek() {
-                Some(b'*' | b'+' | b'?') => Some(char::from(self.take()?).to_string()),
+            let bounds = match self.peek() {
+                Some(b'*') => {
+                    self.position += 1;
+                    Some((0, None))
+                }
+                Some(b'+') => {
+                    self.position += 1;
+                    Some((1, None))
+                }
+                Some(b'?') => {
+                    self.position += 1;
+                    Some((0, Some(1)))
+                }
                 Some(b'{') => {
                     self.position += 1;
                     let min = self.number()?;
@@ -252,47 +264,50 @@ impl Translator<'_> {
                     };
                     self.expect(b'}')?;
                     ensure!(
-                        max.is_none_or(|max| min <= max),
+                        max.is_none_or(|m| min <= m),
                         "grammar trigger repetition ends below its minimum; repair the quantifier"
                     );
                     ensure!(
-                        min <= MAX_REPETITION && max.is_none_or(|max| max <= MAX_REPETITION),
+                        min <= MAX_REPETITION && max.is_none_or(|m| m <= MAX_REPETITION),
                         "grammar trigger repetition exceeds {MAX_REPETITION}; use a smaller bound"
                     );
-                    Some(match max {
-                        Some(max) if max == min => format!("{{{min}}}"),
-                        Some(max) => format!("{{{min},{max}}}"),
-                        None => format!("{{{min},}}"),
-                    })
+                    Some((min, max))
                 }
                 _ => None,
             };
-            if let Some(quantifier) = quantifier {
+            if let Some((min, max)) = bounds {
                 ensure!(
                     !assertion,
                     "grammar trigger quantifier follows an assertion; attach it to a consuming atom"
                 );
-                atom = format!("(?:{atom}){quantifier}");
-                if self.peek() == Some(b'?') {
+                let greedy = self.peek() != Some(b'?');
+                if !greedy {
                     self.position += 1;
-                    atom.push('?');
                 }
+                let span = self.nodes[atom.0].captures.clone();
+                atom = self.node(
+                    Kind::Repeat {
+                        body: atom,
+                        min,
+                        max,
+                        greedy,
+                    },
+                    span,
+                )?;
             }
-            self.reserve(atom.len())?;
-            output.push_str(&atom);
+            sequence.push(atom);
         }
-        Ok(output)
+        branches.push(self.sequence(sequence, branch_start..self.captures + 1)?);
+        if branches.len() == 1 {
+            Ok(branches[0])
+        } else {
+            self.node(Kind::Alt(branches), start..self.captures + 1)
+        }
     }
-    fn escape(&mut self) -> Result<(String, bool)> {
+    fn escape(&mut self) -> Result<(Id, bool)> {
         if matches!(self.peek(), Some(b'b' | b'B')) {
             let b = self.take()?;
-            let word = "[A-Za-z0-9_]";
-            let boundary = if b == b'b' {
-                format!("(?:(?<={word})(?!{word})|(?<!{word})(?={word}))")
-            } else {
-                format!("(?:(?<={word})(?={word})|(?<!{word})(?!{word}))")
-            };
-            return Ok((boundary, true));
+            return Ok((self.node(Kind::Boundary(b == b'b'), 0..0)?, true));
         }
         if self.peek().is_some_and(|c| matches!(c, b'1'..=b'9')) {
             let group = self.number()?;
@@ -300,16 +315,15 @@ impl Translator<'_> {
                 group <= self.captures,
                 "grammar trigger backreference \\{group} precedes its capture; reference a preceding capture group"
             );
-            return Ok((
-                if self.open.contains(&group) {
-                    "(?!)".into()
-                } else {
-                    format!(r"\{group}")
-                },
-                false,
-            ));
+            let kind = if self.open.contains(&group) {
+                Kind::Fail
+            } else {
+                Kind::Backref(group)
+            };
+            return Ok((self.node(kind, 0..0)?, false));
         }
-        Ok((class_text(&self.class_escape()?.ranges(), false), false))
+        let ranges = self.class_escape()?.ranges();
+        Ok((self.set(&ranges, false)?, false))
     }
     fn hex(&mut self, digits: usize) -> Result<u32> {
         let mut value = 0;
@@ -401,7 +415,7 @@ impl Translator<'_> {
             byte => Ok(ClassAtom::Scalar(u32::from(byte))),
         }
     }
-    fn character_class(&mut self) -> Result<String> {
+    fn character_class(&mut self) -> Result<Id> {
         let negate = self.peek() == Some(b'^');
         if negate {
             self.position += 1;
@@ -431,13 +445,35 @@ impl Translator<'_> {
             );
         }
         self.expect(b']')?;
-        Ok(class_text(&ranges, negate))
+        self.set(&ranges, negate)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn byte_patterns_match_exhaustive_upstream_oracle() -> Result<()> {
+        let mut checked = 0;
+        for row in include_str!("trigger_oracle.tsv")
+            .lines()
+            .filter(|row| !row.starts_with('#'))
+        {
+            let columns: Vec<_> = row.split('\t').collect();
+            assert_eq!(columns.len(), 3);
+            let expected = columns[2].parse::<isize>()?;
+            let actual = EcmaBytePattern::compile(columns[0], 4096)?.find(columns[1].as_bytes())?;
+            assert_eq!(
+                actual,
+                usize::try_from(expected).ok(),
+                "pattern {:?}, input {:?}",
+                columns[0],
+                columns[1]
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2904);
+        Ok(())
+    }
     #[test]
     fn byte_patterns_match_pinned_upstream_capture_oracle() -> Result<()> {
         for (pattern, input, expected) in [
@@ -540,7 +576,7 @@ mod tests {
     }
     #[test]
     fn byte_patterns_bound_translated_program_depth_and_captures() {
-        let expansion = EcmaBytePattern::compile(&r"\W".repeat(4096), 16384)
+        let expansion = EcmaBytePattern::compile(&r"\W".repeat(32768), 65536)
             .err()
             .unwrap();
         assert!(

@@ -6,6 +6,7 @@
 pub(crate) mod lazy;
 pub mod replay;
 pub mod trigger;
+mod trigger_vm;
 
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, HashSet};
