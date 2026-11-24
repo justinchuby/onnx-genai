@@ -1367,3 +1367,87 @@ runtime had already passed engine 948 / 1 inherited ignore, server 449 / 2
 inherited ignores, and HTTP 37. The incidental host-string lint repairs passed
 11 CPU text-kernel tests and 6 session text integration tests / 1 inherited
 benchmark ignore. Windows CI remains the platform-specific confirmation.
+
+### Raw llguidance protocol follow-up
+
+The pinned upstream sampling path dispatches a `grammar` beginning with
+`%llguidance` directly to Lark. The server now performs the same prefix dispatch
+on chat, legacy and native completion requests. `GenerateConstraint::RawLark`
+distinguishes this raw newly generated stream from the existing content/prefill
+Lark constraint. It shares the resolved byte vocabulary and completion-only EOS
+contract with GBNF, while preserving authored llguidance options. Source budgets
+are enforced for public Rust callers as well as HTTP; parser failures occur
+during request preparation before SSE.
+
+Validation: engine 948 passed / 1 inherited ignore; server 449 passed / 2
+inherited ignores; HTTP 37 passed; strict engine/server all-target Clippy passed.
+A subsequent targeted run selected and passed the Unicode/byte-budget test
+after its final budget assertion was added. Coverage includes actual Unicode byte fallback and
+compound-token choices, model token IDs, all three buffered/SSE endpoints on
+Native CPU and explicit ORT, invalid Lark syntax and out-of-range IDs. Active
+lazy grammars, preserved tokens and native probability reporting remain open.
+
+
+### Native probability protocol follow-up
+
+The pinned upstream server-context `populate_token_probs` distinguishes original
+model probabilities from processed sampler candidates. Native requests now parse
+`n_probs` and `post_sampling_probs` explicitly. `LogprobSource` selects the
+distribution, and an opt-in snapshot preserves model logits before mutation in
+shared decoding, continuous rows, speculative acceptance and bonus verification.
+No snapshot allocation occurs when reporting is disabled or processed logits
+are requested. Existing probability callers retain the processed-logit default. Native post-sampling
+reporting uses the effective sampler distribution, including greedy point mass.
+A foreign final sampler must request model or processed-logit scores because its
+internal distribution is not inspectable.
+
+Committed `GenerateToken` events carry their matching optional `TokenLogprob`;
+transactional publication also retains it. Native buffered and SSE outputs
+serialize IDs, actual byte pieces, finite scores and top-N alternatives. Partial
+UTF-8 is retained in bytes and truncated in token text, zero processed mass is
+excluded, and buffered stop-word probabilities are omitted using tokenization
+without automatic special tokens, matching the pinned upstream contract.
+
+Final implementation validation passed engine 950 / 1 inherited ignore; server
+450 / 2 inherited ignores; HTTP 37; CLI 71. This includes continuous-row
+metadata, UTF-8/zero-score, stop-word and greedy point-mass coverage. Full strict
+engine/server/CLI Clippy passed with -D warnings, including the final zero-mass
+and floating-point-underflow encoding assertions. Lazy activation,
+preserved tokens, slot/adapter persistence, model management/audio and the full
+acceptance matrix remain open; neither this increment nor a parent PR merge
+completes the overall goal.
+
+
+### Preserved-token prerequisite for lazy activation
+
+The pinned `common_sampling_add_grammar_triggers` requires a single-token word
+trigger to appear in `preserved_tokens`. That option also affects rendered
+special-token output; accepting it only as a grammar flag would lose real
+semantics. This increment resolves the spellings against actual model vocabulary
+and carries an immutable selection through live decoding and result publication.
+
+`TokenTextDecoder` filters unselected special IDs before its request-local stream
+decoder. Retained IDs are decoded together, preserving codec lookbehind without
+changing shared tokenizer flags. Final text and per-token replay use the same
+selection, including ordinary/native speculative verification, continuous rows,
+candidate-tree and DFlash publication. Results retain the resolved policy so
+protocol logprob chunks cannot reconstruct text using a different policy.
+
+A projection binds model-declared framing symbols to its tokenizer and unions
+those IDs with request selections. Literal boundaries resolve canonically;
+regex fragments can declare `response_template.preserved_tokens` explicitly.
+The chat channel gate consumes the engine's filtered text instead of decoding
+token IDs through an independent special-token policy. Buffered projection uses
+the committed result text. This keeps undeclared special tokens out of content
+without dropping the model's declared reasoning and tool frames.
+
+Validation passed: engine 952 / 1 inherited ignore, server 450 / 2 inherited
+ignores, HTTP 37 and CLI 71. Coverage includes ByteLevel/ByteFallback Unicode,
+decoder forks, invalid engine IDs, continuous-result policy and actual Native
+CPU/ORT requests across three endpoints with buffered/SSE and probability output.
+Self-review also fenced malformed framing decoder panics with actionable errors;
+the full engine suite passed again after that regression was added. Strict
+all-target engine/server/CLI Clippy passed on the final source. The Native
+benchmark API consumer compiled, without running a benchmark. Formatting and
+diff checks passed. Active lazy activation and triggers remain required
+follow-ups; the broader goal is open.

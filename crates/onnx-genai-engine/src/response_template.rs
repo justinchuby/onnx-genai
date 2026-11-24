@@ -414,17 +414,29 @@ pub(crate) struct ResponseBufferExceeded {
 /// Validated request-local response framing shared by constraints and tool
 /// observation. The rendered assistant prefix is resolved once for both users.
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenFraming {
+    Text,
+    Model(std::collections::BTreeSet<u32>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseProjection {
     template: std::sync::Arc<ResponseTemplate>,
     prefix: String,
     max_bytes: usize,
+    framing: TokenFraming,
 }
 impl ResponseProjection {
     pub fn resolve(
         template: std::sync::Arc<ResponseTemplate>,
         prefix: String,
         max_bytes: usize,
+        tokenizer: Option<&onnx_genai_ort::Tokenizer>,
     ) -> anyhow::Result<Self> {
+        let framing = match tokenizer {
+            Some(tokenizer) => TokenFraming::Model(template.framing_tokens(tokenizer)?),
+            None => TokenFraming::Text,
+        };
         ensure!(
             max_bytes > 0,
             "response projection max_bytes must be positive; configure a nonzero response buffer"
@@ -436,7 +448,28 @@ impl ResponseProjection {
             template,
             prefix,
             max_bytes,
+            framing,
         })
+    }
+    /// Token consumers must use the model binding resolved for their tokenizer.
+    pub fn validate_tokenizer(&self, tokenizer: &onnx_genai_ort::Tokenizer) -> anyhow::Result<()> {
+        let TokenFraming::Model(preserved) = &self.framing else {
+            anyhow::bail!(
+                "response_projection has a text-only binding; resolve it with Some(model_tokenizer) before token generation"
+            );
+        };
+        ensure!(
+            *preserved == self.template.framing_tokens(tokenizer)?,
+            "response_projection was resolved for another tokenizer; resolve it using the selected model tokenizer before generation"
+        );
+        Ok(())
+    }
+    /// Model-declared framing symbols; text hosts do not interpret token flags.
+    pub fn preserved_tokens(&self) -> Option<&std::collections::BTreeSet<u32>> {
+        match &self.framing {
+            TokenFraming::Text => None,
+            TokenFraming::Model(ids) => Some(ids),
+        }
     }
     pub fn template(&self) -> &std::sync::Arc<ResponseTemplate> {
         &self.template
@@ -467,6 +500,7 @@ pub struct ResponseTemplate {
     fields: Vec<Field>,
     implicit: Option<usize>,
     defaults: serde_json::Map<String, serde_json::Value>,
+    preserved_tokens: Option<Vec<String>>,
 }
 
 /// Declared transitions into reasoning and from reasoning to answer content.
@@ -555,6 +589,80 @@ fn boundary(
 }
 
 impl ResponseTemplate {
+    /// Resolve the model's literal framing symbols once, independently of any
+    /// caller's extra preserved tokens. Regex fragments may be declared explicitly.
+    pub fn framing_tokens(
+        &self,
+        tokenizer: &onnx_genai_ort::Tokenizer,
+    ) -> anyhow::Result<std::collections::BTreeSet<u32>> {
+        let encode = |text: &str| {
+            tokenizer.encode_with_options(
+                text,
+                onnx_genai_ort::TokenizationOptions {
+                    add_special: false,
+                    parse_special: true,
+                },
+            )
+        };
+        let decode = |ids: &[u32]| {
+            llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokenizer.decode_with_special_tokens(ids).map_err(anyhow::Error::from)
+            })).context("resolve response_template framing through tokenizer.decoder; repair tokenizer.json if decoding failed")
+        };
+        let mut ids = std::collections::BTreeSet::new();
+        if let Some(spellings) = &self.preserved_tokens {
+            for (index, spelling) in spellings.iter().enumerate() {
+                let encoded = match tokenizer.token_id(spelling) {
+                    Some(id) => vec![id],
+                    None => {
+                        let ids = encode(spelling)?;
+                        ensure!(
+                            decode(&ids)? == *spelling,
+                            "response_template.preserved_tokens[{index}] {spelling:?} is not a declared model token; use an existing vocabulary spelling"
+                        );
+                        ids
+                    }
+                };
+                ensure!(
+                    encoded.len() == 1,
+                    "response_template.preserved_tokens[{index}] must identify one model token; use individual registered token spellings"
+                );
+                ids.insert(encoded[0]);
+            }
+            return Ok(ids);
+        }
+        for boundary in self
+            .fields
+            .iter()
+            .flat_map(|field| [field.open.as_ref(), field.close.as_ref()])
+            .flatten()
+        {
+            if let Some(literals) = boundary.literal_alternatives() {
+                for literal in literals {
+                    let encoded = encode(literal)?;
+                    if decode(&encoded)? == *literal {
+                        ids.extend(encoded);
+                    }
+                }
+            } else {
+                let added = tokenizer.inner().get_added_vocabulary();
+                for (&id, token) in added.get_added_tokens_decoder() {
+                    if !added.is_special_token(&token.content) {
+                        continue;
+                    }
+                    let piece = decode(&[id])?;
+                    if let Some(found) = boundary.regex.find(piece.as_bytes())
+                        && found.start() == 0
+                        && found.end() == piece.len()
+                    {
+                        ids.insert(id);
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     fn watched(&self, current: Option<usize>) -> Vec<(usize, bool, &Boundary)> {
         let mut watch = Vec::new();
         if let Some(field) = current.filter(|field| Some(*field) != self.implicit) {
@@ -632,7 +740,12 @@ impl ResponseTemplate {
         ensure!(
             root.keys().all(|key| matches!(
                 key.as_str(),
-                "version" | "fields" | "defaults" | "start_anchor" | "start_anchor_pattern"
+                "version"
+                    | "fields"
+                    | "defaults"
+                    | "start_anchor"
+                    | "start_anchor_pattern"
+                    | "preserved_tokens"
             )),
             "response_template contains unsupported keys; use the version-1 response template fields"
         );
@@ -641,6 +754,8 @@ impl ResponseTemplate {
                 .is_none_or(|value| value.as_u64() == Some(1)),
             "response_template.version must be 1; re-emit a supported response template"
         );
+        let preserved_tokens=root.get("preserved_tokens").map(|value|serde_json::from_value::<Vec<String>>(value.clone())
+            .context("response_template.preserved_tokens must be a list of individual model-token spellings")).transpose()?;
         let defaults = root
             .get("defaults")
             .map(|value| object(value, "response_template.defaults").cloned())
@@ -783,6 +898,7 @@ impl ResponseTemplate {
             fields,
             implicit,
             defaults,
+            preserved_tokens,
         }))
     }
 }

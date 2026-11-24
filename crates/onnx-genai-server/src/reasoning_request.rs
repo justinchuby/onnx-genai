@@ -86,6 +86,7 @@ impl ReasoningRequest {
         &self,
         options: &mut GenerateOptions,
         context: &BudgetContext<'_>,
+        tokenizer: &Tokenizer,
     ) -> anyhow::Result<()> {
         let Some(explicit) = self.generation_prompt.as_deref() else {
             return Ok(());
@@ -114,6 +115,7 @@ impl ReasoningRequest {
                         projection.template().clone(),
                         explicit.to_owned(),
                         projection.max_bytes(),
+                        Some(tokenizer),
                     )?,
                 );
             }
@@ -170,7 +172,7 @@ impl ReasoningRequest {
         tokenizer: &Tokenizer,
         context: BudgetContext<'_>,
     ) -> anyhow::Result<()> {
-        self.apply_generation_prompt(options, &context)?;
+        self.apply_generation_prompt(options, &context, tokenizer)?;
         if self.limit().is_none() && !self.reasoning_control {
             return Ok(());
         }

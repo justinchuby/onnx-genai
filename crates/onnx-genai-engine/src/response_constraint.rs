@@ -10,7 +10,7 @@ use crate::response_template::{
     projection_extension,
 };
 use crate::text_projection::{ProjectionKind, TextProjection, TextView};
-use crate::tokenization::{NonMonotonicText, SpecialTokenHandling, TokenTextDecoder};
+use crate::tokenization::{NonMonotonicText, TokenTextDecoder};
 use anyhow::{Context, ensure};
 use onnx_genai_ort::Tokenizer;
 use std::{collections::HashSet, sync::Mutex};
@@ -37,10 +37,12 @@ enum DecoderState {
 }
 
 impl Codec {
-    fn new_state(&self, policy: SpecialTokenHandling) -> DecoderState {
+    fn new_state(&self, preserved: &std::collections::BTreeSet<u32>) -> DecoderState {
         match self {
             Self::Bytes(contract) => DecoderState::Bytes(contract.new_state()),
-            Self::Canonical(_) => DecoderState::Canonical(TokenTextDecoder::new(policy)),
+            Self::Canonical(_) => {
+                DecoderState::Canonical(TokenTextDecoder::with_preserved_tokens(preserved))
+            }
         }
     }
 }
@@ -117,6 +119,11 @@ struct State {
     ended: bool,
 }
 
+struct ConstraintTokens {
+    endings: Vec<TokenId>,
+    preserved: std::collections::BTreeSet<u32>,
+}
+
 pub(crate) struct ContentConstraint {
     normalization: Normalization,
     projection_kind: ProjectionKind,
@@ -126,6 +133,7 @@ pub(crate) struct ContentConstraint {
     vocabulary: HashSet<TokenId>,
     codec: Codec,
     plain_vocabulary: Option<GrammarTokenVocabulary>,
+    preserved: std::collections::BTreeSet<u32>,
     state: Mutex<State>,
 }
 
@@ -137,6 +145,7 @@ impl ContentConstraint {
         prefix: &str,
         max_bytes: usize,
         endings: Vec<TokenId>,
+        preserved: &std::collections::BTreeSet<u32>,
     ) -> anyhow::Result<Self> {
         Self::new(
             tokenizer,
@@ -145,7 +154,10 @@ impl ContentConstraint {
             projection_kind,
             prefix,
             max_bytes,
-            endings,
+            ConstraintTokens {
+                endings,
+                preserved: preserved.clone(),
+            },
         )
     }
     pub(crate) fn text(
@@ -155,6 +167,7 @@ impl ContentConstraint {
         prefix: &str,
         max_bytes: usize,
         endings: Vec<TokenId>,
+        preserved: &std::collections::BTreeSet<u32>,
     ) -> anyhow::Result<Self> {
         let cursor = match grammar {
             crate::config::TextGrammar::Regex(pattern) => {
@@ -169,7 +182,10 @@ impl ContentConstraint {
             ProjectionKind::Declared(template),
             prefix,
             max_bytes,
-            endings,
+            ConstraintTokens {
+                endings,
+                preserved: preserved.clone(),
+            },
         )
     }
     fn new(
@@ -179,16 +195,16 @@ impl ContentConstraint {
         projection_kind: ProjectionKind,
         prefix: &str,
         max_bytes: usize,
-        endings: Vec<TokenId>,
+        tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
+        let ConstraintTokens { endings, preserved } = tokens;
         let vocabulary = tokenizer
             .inner()
             .get_vocab(true)
             .values()
             .copied()
             .collect::<HashSet<_>>();
-        let codec = match ByteStreamContract::resolve(tokenizer, projection_kind.special_tokens())?
-        {
+        let codec = match ByteStreamContract::resolve_output(tokenizer, &preserved)? {
             Some(contract) => Codec::Bytes(contract),
             None => Codec::Canonical(Box::new(tokenizer.clone())),
         };
@@ -209,8 +225,7 @@ impl ContentConstraint {
             }
             _ => None,
         };
-        let special_tokens = projection_kind.special_tokens();
-        let decoder = codec.new_state(special_tokens);
+        let decoder = codec.new_state(&preserved);
         Ok(Self {
             normalization,
             projection_kind,
@@ -220,6 +235,7 @@ impl ContentConstraint {
             vocabulary,
             codec,
             plain_vocabulary,
+            preserved: preserved.clone(),
             state: Mutex::new(State {
                 projection,
                 decoder,
@@ -234,7 +250,7 @@ impl ContentConstraint {
 
     fn reset(&self, state: &mut State) -> anyhow::Result<()> {
         state.projection = self.projection_kind.create(&self.prefix, self.max_bytes)?;
-        state.decoder = self.codec.new_state(self.projection_kind.special_tokens());
+        state.decoder = self.codec.new_state(&self.preserved);
         state.history.clear();
         state.raw = state.projection.content(false)?;
         state.normalized = self.normalization.parse(&state.raw)?;
@@ -535,7 +551,7 @@ mod tests {
                 TextGrammar::Regex(r#"\{"n":1\}"#.into()),
                 TextGrammar::Lark(r#"start: "{\"n\":1}""#.into()),
             ] {
-                let mut options = options();
+                let mut options = options(&tokenizer);
                 options.constraint = Some(match grammar {
                     TextGrammar::Regex(pattern) => GenerateConstraint::Regex {
                         pattern,
@@ -581,18 +597,20 @@ mod tests {
         options: &mut GenerateOptions,
         template: std::sync::Arc<ResponseTemplate>,
         prefix: &str,
+        tokenizer: &Tokenizer,
     ) {
         options.response_projection = Some(
             crate::response_template::ResponseProjection::resolve(
                 template,
                 prefix.to_owned(),
                 options.max_constraint_bytes,
+                Some(tokenizer),
             )
             .unwrap(),
         );
     }
 
-    fn options() -> GenerateOptions {
+    fn options(tokenizer: &Tokenizer) -> GenerateOptions {
         GenerateOptions {
             max_constraint_bytes: 4096,
             eos_token_id: Some(3),
@@ -600,7 +618,7 @@ mod tests {
             response_projection: Some(crate::response_template::ResponseProjection::resolve(ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
                     "reasoning_content":{"open":"[r]","close":"[/r]"},"content":{"close":"<eos>"}
                 }}))
-                .unwrap(), "A[r]old".into(), 4096).unwrap()),
+                .unwrap(), "A[r]old".into(), 4096, Some(tokenizer)).unwrap()),
             constraint: Some(GenerateConstraint::JsonSchema { schema: (json!({"type":"object","properties":{"n":{"const":1}},"required":["n"],"additionalProperties":false})).to_string(), prefix: String::new() }),
             ..Default::default()
         }
@@ -760,6 +778,7 @@ mod tests {
                     .unwrap(),
                     "A<c>".into(),
                     4096,
+                    Some(&tokenizer),
                 )
                 .unwrap(),
             ),
@@ -814,6 +833,7 @@ mod tests {
             "",
             4096,
             vec![3],
+            &Default::default(),
         )
         .unwrap();
         let mut reference = ContentConstraint::json_schema(
@@ -823,6 +843,7 @@ mod tests {
             "",
             4096,
             vec![3],
+            &Default::default(),
         )
         .unwrap();
         assert!(fast.plain_vocabulary.is_some());
@@ -929,7 +950,7 @@ mod tests {
                 (23, "\\ud800\\u0000"),
             ],
         );
-        let mut options = options();
+        let mut options = options(&tokenizer);
         if let Some(GenerateConstraint::JsonSchema { schema, .. }) = &mut options.constraint {
             *schema = json!({"const":"A"}).to_string();
         }
@@ -968,6 +989,7 @@ mod tests {
                 &mut options,
                 template,
                 &format!("A[r]old[/r]{}", &spelling[..split]),
+                &tokenizer,
             );
             let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
             let mut history = Vec::new();
@@ -988,7 +1010,7 @@ mod tests {
             false,
             &[(4, "Ã"), (5, "©"), (16, "ÿ"), (22, "[/r]\""), (23, "\"")],
         );
-        let mut options = options();
+        let mut options = options(&tokenizer);
         if let Some(GenerateConstraint::JsonSchema { schema, .. }) = &mut options.constraint {
             *schema = json!({"const":"é"}).to_string();
         }
@@ -1019,7 +1041,7 @@ mod tests {
                 (22, "{\"n\":1}"),
             ],
         );
-        let mut options = options();
+        let mut options = options(&tokenizer);
         options.eos_token_id = Some(16);
         {
             let template = ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
@@ -1027,7 +1049,7 @@ mod tests {
             }}))
             .unwrap();
             let prefix: String = "A[r]old[/r]".into();
-            project(&mut options, template, &prefix);
+            project(&mut options, template, &prefix, &tokenizer);
         }
         let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
         assert!(mask(&chain, &[22])[4].is_finite());
@@ -1040,7 +1062,7 @@ mod tests {
     fn response_json_processor_checks_provisional_whitespace_inside_string_constants() {
         let tokenizer = byte_tokenizer(true, &[(6, " "), (22, "[/r]\"a"), (23, "\"")]);
         for (value, space_allowed) in [("a", false), ("a ", true)] {
-            let mut options = options();
+            let mut options = options(&tokenizer);
             if let Some(GenerateConstraint::JsonSchema { schema, .. }) = &mut options.constraint {
                 *schema = json!({"const":value}).to_string();
             }
@@ -1057,7 +1079,7 @@ mod tests {
     fn response_json_processor_resolves_overlapping_closers_before_partial_unicode() {
         let tokenizer = byte_tokenizer(false, &[(4, "Ã"), (5, "©"), (22, "{\"n\":1}"), (23, "X")]);
         for regex in [false, true] {
-            let mut options = options();
+            let mut options = options(&tokenizer);
             {
                 let field = if regex {
                     json!({"open_pattern":"<c>","close_pattern":"X終|X"})
@@ -1069,7 +1091,7 @@ mod tests {
                 }}))
                 .unwrap();
                 let prefix: String = "A<c>".into();
-                project(&mut options, template, &prefix);
+                project(&mut options, template, &prefix, &tokenizer);
             }
             let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
             // C3 cannot extend X終, so the complete X closes content before it.
@@ -1082,7 +1104,7 @@ mod tests {
     #[test]
     fn response_json_processor_budget_rejections_do_not_abort_other_candidates() {
         let tokenizer = tokenizer(false);
-        let mut options = options();
+        let mut options = options(&tokenizer);
         {
             let template = ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
                 "reasoning_content":{"open":"[r]","close":"[/r]"},"content":{"close":"<eos>"}
@@ -1095,7 +1117,7 @@ mod tests {
                 .unwrap()
                 .prefix()
                 .to_owned();
-            project(&mut options, template, &prefix);
+            project(&mut options, template, &prefix, &tokenizer);
             options.constraint = Some(GenerateConstraint::JsonSchema {
                 schema,
                 prefix: String::new(),
@@ -1117,7 +1139,7 @@ mod tests {
         for byte_level in [false, true] {
             let tokenizer = tokenizer(byte_level);
             for regex in [false, true] {
-                let mut options = options();
+                let mut options = options(&tokenizer);
                 if regex {
                     let template = ResponseTemplate::compile(&json!({"start_anchor":"A","fields":{
                         "reasoning_content":{"open_pattern":r"\[r\]","close_pattern":r"\[/r\]\s*"},
@@ -1130,7 +1152,7 @@ mod tests {
                         .unwrap()
                         .prefix()
                         .to_owned();
-                    project(&mut options, template, &prefix);
+                    project(&mut options, template, &prefix, &tokenizer);
                 }
                 let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
                 let mut logits = vec![0.0; 34];
@@ -1159,7 +1181,7 @@ mod tests {
     #[test]
     fn response_json_processor_replays_history_replacements_and_recovers_rejections() {
         let tokenizer = tokenizer(false);
-        let options = options();
+        let options = options(&tokenizer);
         let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
         for ids in [vec![], vec![25], vec![22], vec![25], vec![], vec![22]] {
             let context = ProcessorContext {

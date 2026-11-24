@@ -2,6 +2,7 @@
 use anyhow::{Context, bail, ensure};
 use llguidance::toktrie::TokTrie;
 use onnx_genai_ort::Tokenizer;
+use std::{collections::BTreeSet, sync::Arc};
 use tokenizers::Decoder as _;
 use tokenizers::decoders::DecoderWrapper;
 
@@ -25,6 +26,7 @@ pub enum SpecialTokenHandling {
 #[derive(Default, Clone)]
 pub struct TokenTextDecoder {
     special_tokens: SpecialTokenHandling,
+    preserved_tokens: Arc<BTreeSet<u32>>,
     ids: Vec<u32>,
     prefix: String,
     prefix_index: usize,
@@ -36,10 +38,34 @@ impl TokenTextDecoder {
             ..Default::default()
         }
     }
+    /// Preserve selected special IDs without changing the shared tokenizer.
+    pub fn with_preserved_tokens(preserved: &BTreeSet<u32>) -> Self {
+        Self {
+            preserved_tokens: Arc::new(preserved.clone()),
+            ..Default::default()
+        }
+    }
     pub fn step(&mut self, tokenizer: &Tokenizer, id: u32) -> anyhow::Result<String> {
+        if self.special_tokens == SpecialTokenHandling::Skip
+            && !self.preserved_tokens.contains(&id)
+            && tokenizer
+                .inner()
+                .get_added_vocabulary()
+                .get_added_tokens_decoder()
+                .get(&id)
+                .is_some_and(|token| {
+                    tokenizer
+                        .inner()
+                        .get_added_vocabulary()
+                        .is_special_token(&token.content)
+                })
+        {
+            return Ok(String::new());
+        }
+
         llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tokenizers::tokenizer::step_decode_stream(
-                tokenizer.inner(), vec![id], self.special_tokens==SpecialTokenHandling::Skip, &mut self.ids, &mut self.prefix, &mut self.prefix_index,
+                tokenizer.inner(), vec![id], false, &mut self.ids, &mut self.prefix, &mut self.prefix_index,
             ).map(|text| text.unwrap_or_default()).map_err(|error| {
                 if error.is::<tokenizers::tokenizer::DecodeStreamError>() {
                     anyhow::Error::new(NonMonotonicText)
@@ -53,11 +79,9 @@ impl TokenTextDecoder {
     /// replacement text for an incomplete final UTF-8 sequence.
     pub fn finish(&mut self, tokenizer: &Tokenizer) -> anyhow::Result<String> {
         let decoded = llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (match self.special_tokens {
-                SpecialTokenHandling::Skip => tokenizer.decode(&self.ids),
-                SpecialTokenHandling::Preserve => tokenizer.decode_with_special_tokens(&self.ids),
-            })
-            .map_err(anyhow::Error::from)
+            tokenizer
+                .decode_with_special_tokens(&self.ids)
+                .map_err(anyhow::Error::from)
         }))
         .context(
             "decode pending terminal token text; repair tokenizer.decoder if decoding panicked",
@@ -72,8 +96,45 @@ impl TokenTextDecoder {
     }
 }
 
-/// Decode a committed token batch with the same boundaries as live generation.
-pub fn token_texts(tokenizer: Option<&Tokenizer>, ids: &[u32]) -> anyhow::Result<Vec<String>> {
+/// Decode output while retaining only the requested special-token IDs.
+pub fn decode_output(
+    tokenizer: &Tokenizer,
+    ids: &[u32],
+    preserved: &BTreeSet<u32>,
+) -> anyhow::Result<String> {
+    llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    if preserved.is_empty() {
+        return tokenizer.decode(ids).map_err(Into::into);
+    }
+    let specials = tokenizer
+        .inner()
+        .get_added_vocabulary()
+        .get_added_tokens_decoder();
+    let visible = ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            preserved.contains(id)
+                || !specials.get(id).is_some_and(|token| {
+                    tokenizer
+                        .inner()
+                        .get_added_vocabulary()
+                        .is_special_token(&token.content)
+                })
+        })
+        .collect::<Vec<_>>();
+    tokenizer
+        .decode_with_special_tokens(&visible)
+        .map_err(Into::into)
+    })).context("decode generated token text; repair tokenizer.decoder or its vocabulary if decoding failed")
+}
+
+/// Decode committed token boundaries using the same request policy as live output.
+pub fn token_texts(
+    tokenizer: Option<&Tokenizer>,
+    ids: &[u32],
+    preserved: &BTreeSet<u32>,
+) -> anyhow::Result<Vec<String>> {
     let Some(tokenizer) = tokenizer else {
         return Ok(vec![String::new(); ids.len()]);
     };
@@ -81,9 +142,9 @@ pub fn token_texts(tokenizer: Option<&Tokenizer>, ids: &[u32]) -> anyhow::Result
     // decoder may revise an earlier prefix (e.g. an invalid final byte run);
     // defer that batch's text to its last token instead of publishing a prefix
     // that the immutable final result would later have to retract.
-    let final_text = tokenizer.decode(ids)?;
+    let final_text = decode_output(tokenizer, ids, preserved)?;
     let attempt = || -> anyhow::Result<Vec<String>> {
-        let mut decoder = TokenTextDecoder::default();
+        let mut decoder = TokenTextDecoder::with_preserved_tokens(preserved);
         let mut offset = 0;
         let mut pieces = Vec::with_capacity(ids.len());
         for id in ids {
@@ -198,7 +259,10 @@ pub fn token_pieces(tokenizer: &Tokenizer, ids: &[u32]) -> anyhow::Result<Vec<Ve
         let decoder = normalized
             .as_ref()
             .or_else(|| tokenizer.inner().get_decoder());
-        let specials = tokenizer.inner().get_added_tokens_decoder();
+        let specials = tokenizer
+            .inner()
+            .get_added_vocabulary()
+            .get_added_tokens_decoder();
         return ids.iter().zip(spellings).map(|(id,spelling)| {
             if specials.get(id).is_some_and(|token|token.special) { return Ok(spelling.into_bytes()); }
             match decoder {
@@ -262,6 +326,80 @@ mod tests {
         let path = scratch.path().join("tokenizer.json");
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         Tokenizer::from_file(path).unwrap()
+    }
+    #[test]
+    fn selected_special_output_is_request_local_and_keeps_unicode_lookbehind() {
+        for byte_level in [false, true] {
+            let tokenizer = tokenizer(byte_level);
+            let ids = [31, 4, 5, 31];
+            let preserved = BTreeSet::from([31]);
+            let mut decoder = TokenTextDecoder::with_preserved_tokens(&preserved);
+            let mut text = String::new();
+            text.push_str(&decoder.step(&tokenizer, 31).unwrap());
+            assert_eq!(decoder.step(&tokenizer, 4).unwrap(), "");
+            let mut fork = decoder.clone();
+            text.push_str(&decoder.step(&tokenizer, 5).unwrap());
+            text.push_str(&decoder.step(&tokenizer, 31).unwrap());
+            text.push_str(&decoder.finish(&tokenizer).unwrap());
+            assert_eq!(text, "tok31étok31");
+            assert_eq!(fork.step(&tokenizer, 5).unwrap(), "é");
+            assert_eq!(fork.finish(&tokenizer).unwrap(), "");
+            assert_eq!(decode_output(&tokenizer, &ids, &preserved).unwrap(), text);
+            assert_eq!(
+                token_texts(Some(&tokenizer), &ids, &preserved)
+                    .unwrap()
+                    .concat(),
+                text
+            );
+            assert_eq!(
+                decode_output(&tokenizer, &ids, &BTreeSet::new()).unwrap(),
+                "é"
+            );
+            assert_eq!(tokenizer.decode(&ids).unwrap(), "é");
+            let options = crate::GenerateOptions {
+                preserved_tokens: BTreeSet::from([9999]),
+                ..Default::default()
+            };
+            let error = options.validate_processors(&tokenizer).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("preserved_tokens contains absent token ID 9999"),
+                "{error:#}"
+            );
+        }
+    }
+    #[test]
+    fn declared_regex_frame_fragments_can_preserve_explicit_model_symbols() {
+        let tokenizer = tokenizer(false);
+        let template = crate::response_template::ResponseTemplate::compile(&json!({
+            "start_anchor":"A","preserved_tokens":["tok31"],
+            "fields":{"content":{"open_pattern":"tok31tok22"}}
+        }))
+        .unwrap();
+        let projection = crate::response_template::ResponseProjection::resolve(
+            template.clone(),
+            "A".into(),
+            4096,
+            Some(&tokenizer),
+        )
+        .unwrap();
+        let options = crate::GenerateOptions {
+            response_projection: Some(projection),
+            ..Default::default()
+        };
+        let selected = options.effective_preserved_tokens();
+        assert!(selected.contains(&31));
+        let text = decode_output(&tokenizer, &[31, 22, 23], &selected).unwrap();
+        let mut parser = crate::response_template::ResponseParser::new(
+            template,
+            "A",
+            crate::response_template::PrefixOutput::Include,
+            4096,
+        )
+        .unwrap();
+        let mut output = parser.feed(&text).unwrap();
+        output.content.push_str(&parser.finish().unwrap().content);
+        assert_eq!(output.content, "tok23");
+        assert_eq!(tokenizer.decode(&[31, 22, 23]).unwrap(), "tok22tok23");
     }
     #[test]
     fn candidate_decoder_forks_preserve_partial_unicode_and_special_policy() {
@@ -404,9 +542,10 @@ mod tests {
                 assert!(error.is::<NonMonotonicText>());
             }
             for ids in [vec![4], vec![4, 4], vec![4, 5, 4], vec![4, 5, 16]] {
-                let chunks = token_texts(Some(&tokenizer), &ids).unwrap_or_else(|error| {
-                    panic!("byte_level={byte_level} ids={ids:?}: {error:#}")
-                });
+                let chunks = token_texts(Some(&tokenizer), &ids, &Default::default())
+                    .unwrap_or_else(|error| {
+                        panic!("byte_level={byte_level} ids={ids:?}: {error:#}")
+                    });
                 assert_eq!(chunks.concat(), tokenizer.decode(&ids).unwrap(), "{ids:?}");
             }
         }
@@ -416,7 +555,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            token_texts(Some(&tokenizer), &[22, 22]).unwrap(),
+            token_texts(Some(&tokenizer), &[22, 22], &Default::default()).unwrap(),
             vec!["tok22", " tok22"]
         );
     }

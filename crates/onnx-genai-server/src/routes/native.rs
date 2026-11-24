@@ -10,9 +10,36 @@ struct NativeRequest {
     suffix: Option<String>,
     return_tokens: bool,
     prefill_only: bool,
+    probabilities: NativeProbabilities,
+}
+
+#[derive(Clone, Copy, Default)]
+struct NativeProbabilities {
+    top: usize,
+    post: bool,
 }
 
 fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, ApiError> {
+    let top = match body.remove("n_probs") {
+        None => 0,
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                ApiError::invalid_request(
+                    "n_probs must be a nonnegative integer; use 0 to disable token probabilities",
+                )
+            })?,
+    };
+    let post = match body.remove("post_sampling_probs") {
+        None => false,
+        Some(Value::Bool(value)) => value,
+        Some(_) => {
+            return Err(ApiError::invalid_request(
+                "post_sampling_probs must be a boolean; use false for model probabilities or true for processed probabilities",
+            ));
+        }
+    };
     let prompt = match body.remove("prompt") {
         Some(prompt) => prompt,
         None if infill => json!(""),
@@ -107,6 +134,7 @@ fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, Ap
         suffix,
         return_tokens,
         prefill_only,
+        probabilities: NativeProbabilities { top, post },
     })
 }
 
@@ -164,6 +192,7 @@ pub(crate) async fn completions(
             suffix: None,
             return_tokens: first.return_tokens,
             prefill_only: first.prefill_only,
+            probabilities: first.probabilities,
         });
     }
     validate_native_request(&first, &state.config)?;
@@ -366,6 +395,19 @@ fn prepare(
         output_budget,
     )
     .map_err(|err| ApiError::invalid_request(format!("{err:#}")))?;
+    if request.probabilities.top > 0 {
+        options.top_logprobs = Some(
+            request
+                .probabilities
+                .top
+                .min(handle.tokenizer.inner().get_vocab_size(true)),
+        );
+        options.logprob_source = if request.probabilities.post {
+            onnx_genai_engine::LogprobSource::Sampling
+        } else {
+            onnx_genai_engine::LogprobSource::Model
+        };
+    }
     options.max_constraint_bytes = state.config.replay_buffer_bytes;
     options.resolve_sampling_defaults(
         handle.generation_defaults.as_ref(),
@@ -431,6 +473,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
             });
         }
     };
+    let probabilities = ProbabilityOutput::new(request.probabilities, &handle.tokenizer)?;
     let prompt_tokens = tokens.len();
     let generation = if let Some(suffix) = &request.suffix {
         let MixedPrompt::Text(prefix) = &request.prompt else {
@@ -478,7 +521,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
         let result = super::completions::collect_generation_result(generation.events)
             .await
             .map_err(generation_failure)?;
-        return Ok(NativeOutput::Buffered(final_value(
+        let mut value = final_value(
             &model,
             prompt_tokens,
             &result,
@@ -486,7 +529,9 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
             false,
             index,
             &stops,
-        )));
+        );
+        probabilities.decorate_result(&mut value, &result, &handle.tokenizer, &stops)?;
+        return Ok(NativeOutput::Buffered(value));
     }
     let mut source = generation.events;
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(16);
@@ -503,7 +548,21 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                     if matches!(token.finish_reason, Some(FinishReason::StopSequence { .. })) {
                         stop_buffer.discard_pending();
                     }
-                    json!({"content":content,"tokens":if return_tokens {vec![token.token_id]} else {vec![]},"stop":false,"index":index})
+                    let mut value = json!({"content":content,"tokens":if return_tokens {vec![token.token_id]} else {vec![]},"stop":false,"index":index});
+                    if probabilities.config.top > 0 {
+                        let probability = token.logprob.as_ref().ok_or_else(|| ApiError::internal("native probability stream is missing a committed token distribution; select a decoder with probability reporting"))
+                            .and_then(|probability| probabilities.render(probability, content.as_bytes()));
+                        match probability {
+                            Ok(probability) => {
+                                value["completion_probabilities"] = json!([probability])
+                            }
+                            Err(error) => {
+                                let _ = tx.send(Ok(Event::default().event("error").data(json!({"error":{"message":error.message,"type":error.kind,"code":500},"index":index}).to_string()))).await;
+                                break;
+                            }
+                        }
+                    }
+                    value
                 }
                 Some(DriverEvent::WorkflowPublications(_)) => continue,
                 Some(DriverEvent::Finished(result)) => {
@@ -581,6 +640,116 @@ fn final_value(
         "stop":true,"index":index,"model":model,"tokens_predicted":result.token_ids.len(),
         "tokens_evaluated":prompt_tokens,"tokens_cached":result.prefix_cache_hit_len,
         "stop_type":stop_type,"truncated":matches!(result.finish_reason, FinishReason::Length)})
+}
+
+fn utf8_prefix(bytes: &[u8]) -> &str {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default(),
+    }
+}
+
+/// Resolve byte pieces once per request, preserving incomplete UTF-8 in bytes.
+struct ProbabilityOutput {
+    config: NativeProbabilities,
+    pieces: Vec<Vec<u8>>,
+}
+impl ProbabilityOutput {
+    fn new(
+        config: NativeProbabilities,
+        tokenizer: &onnx_genai_ort::Tokenizer,
+    ) -> Result<Self, ApiError> {
+        let ids = if config.top == 0 {
+            Vec::new()
+        } else {
+            (0..tokenizer.inner().get_vocab_size(true)).map(|id| u32::try_from(id)
+                .map_err(|_| ApiError::invalid_request("probability vocabulary exceeds u32 token IDs; select a smaller tokenizer")))
+                .collect::<Result<Vec<_>,_>>()?
+        };
+        let pieces =
+            onnx_genai_engine::tokenization::token_pieces(tokenizer, &ids).map_err(|error| {
+                ApiError::invalid_request(format!(
+                    "native probability token bytes cannot be resolved: {error:#}"
+                ))
+            })?;
+        Ok(Self { config, pieces })
+    }
+    fn render(
+        &self,
+        probability: &onnx_genai_engine::TokenLogprob,
+        text: &[u8],
+    ) -> Result<Value, ApiError> {
+        let score_key = if self.config.post { "prob" } else { "logprob" };
+        let score = |logprob: f32| {
+            if self.config.post {
+                logprob.exp()
+            } else if logprob.is_finite() && logprob.exp() != 0.0 {
+                logprob
+            } else {
+                f32::MIN
+            }
+        };
+        let mut top = Vec::new();
+        for &(id, logprob) in probability.top.iter().take(self.config.top) {
+            if self.config.post && logprob.exp() == 0.0 {
+                continue;
+            }
+            let bytes = self.pieces.get(id as usize).ok_or_else(|| ApiError::internal(format!("probability token ID {id} is outside the resolved vocabulary; repair decoder output")))?;
+            top.push(json!({"id":id,"token":utf8_prefix(bytes),"bytes":bytes,(score_key):score(logprob)}));
+        }
+        Ok(
+            json!({"id":probability.token_id,"token":utf8_prefix(text),"bytes":text,
+            (score_key):score(probability.logprob),
+            (if self.config.post {"top_probs"} else {"top_logprobs"}):top}),
+        )
+    }
+    fn decorate_result(
+        &self,
+        value: &mut Value,
+        result: &GenerateResult,
+        tokenizer: &onnx_genai_ort::Tokenizer,
+        stops: &[String],
+    ) -> Result<(), ApiError> {
+        if self.config.top == 0 {
+            return Ok(());
+        }
+        let values = result.logprobs.as_ref().filter(|values| values.len() == result.token_ids.len())
+            .ok_or_else(|| ApiError::internal("native completion did not return one probability per generated token; select a decoder with probability reporting"))?;
+        let texts = onnx_genai_engine::tokenization::token_texts(
+            Some(tokenizer),
+            &result.token_ids,
+            &result.preserved_tokens,
+        )
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "native probability text decoding failed: {error:#}"
+            ))
+        })?;
+        let stop_tokens = match result.finish_reason {
+            FinishReason::StopSequence { index } => match stops.get(index) {
+                Some(stop) => MixedPrompt::Text(stop.clone())
+                    .encode(
+                        tokenizer,
+                        onnx_genai_ort::TokenizationOptions {
+                            add_special: false,
+                            parse_special: true,
+                        },
+                    )?
+                    .len(),
+                None => 0,
+            },
+            _ => 0,
+        };
+        let visible = values.len().saturating_sub(stop_tokens);
+        value["completion_probabilities"] = Value::Array(
+            values[..visible]
+                .iter()
+                .zip(texts)
+                .map(|(probability, text)| self.render(probability, text.as_bytes()))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Ok(())
+    }
 }
 
 pub(crate) async fn embeddings(
@@ -691,6 +860,48 @@ pub(crate) async fn tts(
     }
     let request = serde_json::from_value(Value::Object(body)).map_err(|err| ApiError::invalid_request(format!("invalid native speech request: {err}; send input/prompt and optional model; voice cloning and undeclared synthesis controls require a capable package contract")))?;
     super::audio_speech(State(state), ApiJson(request)).await
+}
+
+#[cfg(test)]
+mod probability_tests {
+    use super::*;
+    #[test]
+    fn native_probability_bytes_preserve_partial_utf8_and_finite_zero_scores() {
+        let output = ProbabilityOutput {
+            config: NativeProbabilities {
+                top: 1,
+                post: false,
+            },
+            pieces: vec![vec![0xc3]],
+        };
+        let probability = onnx_genai_engine::TokenLogprob {
+            token_id: 0,
+            logprob: f32::NEG_INFINITY,
+            top: vec![(0, f32::NEG_INFINITY)],
+        };
+        let value = output.render(&probability, &[0xc3]).unwrap();
+        assert_eq!(value["token"], "");
+        assert_eq!(value["bytes"], json!([195]));
+        assert_eq!(value["logprob"], json!(f32::MIN));
+        assert_eq!(value["top_logprobs"][0]["token"], "");
+        assert_eq!(value["top_logprobs"][0]["bytes"], json!([195]));
+        let underflow = onnx_genai_engine::TokenLogprob {
+            logprob: -1000.0,
+            top: vec![(0, -1000.0)],
+            ..probability.clone()
+        };
+        assert_eq!(
+            output.render(&underflow, b"x").unwrap()["logprob"],
+            json!(f32::MIN)
+        );
+        let output = ProbabilityOutput {
+            config: NativeProbabilities { top: 1, post: true },
+            ..output
+        };
+        let value = output.render(&probability, &[0xc3]).unwrap();
+        assert_eq!(value["prob"], 0.0);
+        assert_eq!(value["top_probs"], json!([]));
+    }
 }
 
 #[cfg(test)]
