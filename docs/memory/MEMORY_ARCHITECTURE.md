@@ -1321,9 +1321,9 @@ classification and diagnostics. The bank/planar entry points now use this same
 strict owner validator after a real stream observation, as described below.
 
 Skip's old cache hit did not perform this capture-status query. Adopting the
-shared helper therefore adds that Host-side check and its existing graph
-lifecycle mutex acquisition to Skip metadata hits; no zero-query, zero-lock or
-end-to-end speedup is claimed. It adds no pool, budget, metadata mutex, quota
+shared helper therefore adds that Host-side driver query to Skip metadata
+hits. The current stream observation does not acquire a graph lifecycle mutex;
+query cost and end-to-end performance remain unmeasured. It adds no pool, budget, metadata mutex, quota
 callback, H2D upload or retirement drain to fitting metadata hits. GPU
 fixtures cover stable warm counters, test-helper and direct-stream raw-capture
 refusal, registered capture without a metadata pin, capture-time key mismatch,
@@ -1389,8 +1389,9 @@ geometry still returns before binding, observing capture or acquiring backing.
 
 The direct planar APIs continue their existing caller-retained I/O lifetime
 contract; the stricter check here concerns their sealed bank owner. Logical
-launch entry now gains a driver query and its existing graph-lifecycle lock
-compared with the old flag shortcut, but sub-kernels reuse that entry decision.
+launch entry now gains a driver query compared with the old flag shortcut;
+the current stream observation acquires no graph lifecycle lock, and sub-kernels
+reuse that entry decision.
 No allocator, pool, quota callback or per-region owner is added. Query/binding
 cost and GPU throughput remain unmeasured.
 
@@ -1430,6 +1431,39 @@ all three cold misses, unchanged module/fallback/allocation/transfer/sync state,
 warm module/pool reuse, intact capture and eager retry. It is compiled and
 listed on the Host, not executed without a CUDA device. Added cold query cost
 is unmeasured; warm-path source structure remains unchanged.
+
+### Stream observation is independent of graph lifecycle state
+
+`CudaRuntime::stream_capture_status` is the sole runtime capture-status query;
+`is_capturing` and cold resource preflight reuse it. The previous public
+`graph_capture_status` entry and lifecycle method are removed. The query binds
+the current context through cudarc and directly observes the runtime compute
+stream, shared by primary and verify slots. It reads no installation or owner
+state and acquires neither lifecycle mutex.
+
+This removes the H2D lock inversion: synchronous upload holds the process gate
+before querying status, while capture begin holds lifecycle state before waiting
+for the gate. Status observation can now finish without waiting for that state.
+The H2D refusal, eager synchronization/copy ordering, graph mutation locks and
+resource-owner checks remain in place. A status is a momentary observation, not
+a capture-exclusion or address-lifetime proof; unrelated external streams remain
+outside the registered gate contract.
+
+GPU fixtures hold both lifecycle mutexes while a worker queries status and does
+a real H2D upload. The receiver has a bounded wait and releases both locks before
+joining even on timeout, so the former dependency fails instead of hanging.
+They check no additional lifecycle acquisitions and read back uploaded bytes.
+Separate registered/raw capture cases check H2D refusal before overwrite, exact
+ACTIVE status, unchanged counters and successful eager upload after capture.
+These fixtures are compiled and listed on the Host; CUDA execution and latency
+are not verified here. Status callers remove a mutex acquisition but still issue
+their existing driver query; this is not a measured throughput claim.
+
+The Host synchronization census now excludes explicitly test-only files only
+when their leading nonempty line is `#![cfg(test)]`; nested attributes and raw
+strings cannot exclude a production file. Three stale unguarded entries were
+removed after verifying their current early capture refusals. The remaining
+allowlist and transitive synchronization checks remain enforced.
 
 ### CUDA raw allocation audit (#736, 2026-08-10)
 

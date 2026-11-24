@@ -164,6 +164,54 @@ fn kernel_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels")
 }
 
+/// Out-of-line test modules have an explicit crate-level test-only cfg. They
+/// must not enter a production synchronization census merely because they sit
+/// next to a kernel. Inline test sections are excluded as before.
+fn production_kernel_source(source: &str) -> Option<&str> {
+    let leading = source.lines().find(|line| !line.trim().is_empty());
+    if leading.is_some_and(|line| line.trim() == "#![cfg(test)]") {
+        return None;
+    }
+    Some(
+        source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(production, _)| production),
+    )
+}
+
+#[test]
+fn production_census_excludes_only_a_leading_test_only_cfg() {
+    assert!(production_kernel_source("\n#![cfg(test)]\nfn test_upload() {}").is_none());
+    for source in [
+        "fn production_upload() {}\nmod nested {\n#![cfg(test)]\nfn test_upload() {}\n}",
+        "fn production_upload() { let text = r#\"\n#![cfg(test)]\n\"#; }",
+        "fn production_upload() {}\n#[cfg(test)]\nmod tests {}",
+    ] {
+        let production =
+            production_kernel_source(source).expect("production must remain in census");
+        assert!(production.contains("fn production_upload()"));
+    }
+}
+
+fn production_kernel_sources(root: &Path) -> Vec<(std::path::PathBuf, String)> {
+    let mut sources = Vec::new();
+    for entry in fs::read_dir(root).expect("read CUDA kernel sources") {
+        let path = entry.expect("kernel source entry").path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("read CUDA kernel source");
+        if let Some(production) = production_kernel_source(&source) {
+            sources.push((path, production.to_owned()));
+        }
+    }
+    assert!(
+        !sources.is_empty(),
+        "production kernel source scan must not be empty"
+    );
+    sources
+}
+
 fn runtime_host_sync_methods() -> BTreeSet<String> {
     let source = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -375,7 +423,6 @@ fn allowlisted_unconditional_syncs() -> BTreeSet<String> {
         "attention.rs::run_attention_phase2a".to_string(),
         "fused_gemm.rs::run".to_string(),
         "gemm.rs::run".to_string(),
-        "mod_op.rs::run".to_string(),
         // MHA declares CaptureSupport::unsupported for the existing Phase-2a,
         // padding and output-transpose sync policy. A deferred policy success
         // is not a completion witness; prepared backing is not capture proof.
@@ -384,9 +431,7 @@ fn allowlisted_unconditional_syncs() -> BTreeSet<String> {
         // allocate the dynamic output before materialize. The per-kernel audit
         // below binds this entry to that explicit capture refusal.
         "non_max_suppression.rs::materialize".to_string(),
-        "nonzero.rs::execute".to_string(),
         "packed_varlen_attention.rs::execute".to_string(),
-        "pooling.rs::execute".to_string(),
         "pooling.rs::run".to_string(),
         "sparse_kv_gather.rs::execute".to_string(),
         // Same two-phase DeviceWorkspace contract as NonMaxSuppression: the
@@ -400,15 +445,8 @@ fn allowlisted_unconditional_syncs() -> BTreeSet<String> {
 fn unconditional_syncs_are_limited_to_capture_unsupported_paths() {
     let root = kernel_root();
     let mut unconditional = BTreeSet::new();
-    for entry in fs::read_dir(&root).expect("read CUDA kernel sources") {
-        let path = entry.expect("kernel source entry").path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
-            continue;
-        }
-        let source = fs::read_to_string(&path).expect("read CUDA kernel source");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .map_or(source.as_str(), |(before_tests, _)| before_tests);
+    for (path, source) in production_kernel_sources(&root) {
+        let production = source.as_str();
         for function in function_blocks(production) {
             if function.name == "drop"
                 || !function.body.contains(".synchronize()")
@@ -537,15 +575,8 @@ fn capture_supported_kernels_do_not_reach_host_synchronizing_runtime_operations(
     let runtime_syncs = runtime_host_sync_methods();
     let mut violations = Vec::new();
 
-    for entry in fs::read_dir(&root).expect("read CUDA kernel sources") {
-        let path = entry.expect("kernel source entry").path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
-            continue;
-        }
-        let source = fs::read_to_string(&path).expect("read CUDA kernel source");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .map_or(source.as_str(), |(before_tests, _)| before_tests);
+    for (path, source) in production_kernel_sources(&root) {
+        let production = source.as_str();
 
         for (signature, kernel_impl) in impl_blocks(production, "impl Kernel for ") {
             let Some(kernel_type) = impl_type_name(signature, true) else {
