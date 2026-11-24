@@ -254,7 +254,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `AffineGrid` | `` | ✅ | **NVRTC-custom** | Two- and three-dimensional sampling-grid construction for f32/f16/bf16 theta, including `align_corners` and singleton spatial dimensions (`data_transform.rs`). |
 | `Compress` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width selection with omitted-axis flattening, positive/negative axes, and short conditions (`data_transform.rs`). |
 | `DynamicQuantizeLinear` | `` | ✅ | **NVRTC-custom** | Float32 per-tensor dynamic uint8 quantization; one block derives min/max, scale, and ties-to-even zero point before quantizing (`quantization.rs`). |
-| `Pad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic constant/reflect/edge/wrap padding, negative-pad cropping, and opset-18 subset/negative axes (`pad.rs`). |
+| `Pad` | `` | ✅ | **NVRTC-custom** | Constant/reflect/edge/wrap, cropping, and subset/negative axes. Byte-aligned storage (including Pad-24 FLOAT8E8M0); native packed INT4/UINT4 (21+), FLOAT4E2M1 (23+), and INT2/UINT2 (25+) (`pad.rs`). |
 | `Range` | `` | ✅ | **NVRTC-custom** | FP32/FP64, FP16/BF16, and Int16/32/64; opset 27 supports FLOAT and DOUBLE stash precision. CUDA graph capture cannot resolve a scalar-dependent output length. The ORT CUDA plugin declines runtime-valued shape reads rather than claiming them. |
 | `ScatterND` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16/Int64 slice updates with negative index wrapping and ordered assignment/legacy reductions. Opset 29 adds Int32 indices and parallel `mean` including the original data, with exact integer sums and truncation toward zero (`indexing.rs`). |
 | `HannWindow`, `HammingWindow`, `BlackmanWindow` (v17) | `` | ✅ | **NVRTC-custom** | Periodic or symmetric signal windows generated directly on device in f16/bf16/f32/f64, with the scalar size and `output_datatype` contract matched to the CPU EP (`window.rs`). |
@@ -579,6 +579,11 @@ axes, cropping, reflect/wrap modes, fractional float steps, narrow float
 storage, and descending Int64 sequences. This raises the machine-verified
 `CUDA_COVERED_OPS` count from **134** to **136** and current CPU standard-domain
 parity from **105 / 141** to **107 / 141**.
+
+Packed `Pad` crops before selecting source lanes and uses one CUDA thread per
+output byte to avoid races and clear unused tail bits. The
+`pad_low_bit_native_cuda_conformance` selector in `cuda_conformance_gpu` checks
+independently packed reference bytes on the CUDA provider without CPU fallback.
 
 The issue #67 operator-coverage batch 8 adds `ScatterND`, `HannWindow`,
 `HammingWindow`, and `BlackmanWindow`. `ScatterND` performs deterministic,

@@ -632,6 +632,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "Pad"
+            && op.is_default_domain()
+            && let Some(&dtype) = input_dtypes.first().filter(|&&t| t != DataType::Undefined)
+            && let Err(reason) = onnx_runtime_ir::pad::validate_dtype(dtype, opset)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "GatherND"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(&dtype) = input_dtypes.get(1)

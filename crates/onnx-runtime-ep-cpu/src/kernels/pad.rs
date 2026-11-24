@@ -7,27 +7,20 @@
 //! `reflect`, `edge`, and `wrap`. The optional opset-18 `axes` input restricts
 //! the pads to a subset of axes (the rest pad by zero); negative axes and
 //! negative pads (which crop) follow the ONNX reference. The op copies raw
-//! element bytes, so every fixed-width dtype is supported.
+//! element bytes or packed lane codes without converting the data.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::pad::{self, Mode as PadMode};
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
 use super::{elem_size, to_dense_bytes, to_dense_i64, write_dense_bytes};
 use crate::strided::{next_index, numel};
 
-/// Padding mode.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PadMode {
-    Constant,
-    Reflect,
-    Edge,
-    Wrap,
-}
-
 /// `Pad` kernel carrying the resolved `mode` and the legacy compile-time
 /// `pads` / `value` attributes (used only when the corresponding inputs are
 /// absent).
 pub struct PadKernel {
+    opset: u64,
     mode: PadMode,
     pads_attr: Option<Vec<i64>>,
     value_attr: Option<f32>,
@@ -58,6 +51,7 @@ impl KernelFactory for PadFactory {
             .map(<[i64]>::to_vec);
         let value_attr = node.attr("value").and_then(Attribute::as_float);
         Ok(Box::new(PadKernel {
+            opset: node.local_opset().unwrap_or(1),
             mode,
             pads_attr,
             value_attr,
@@ -117,10 +111,10 @@ impl Kernel for PadKernel {
             ));
         }
 
-        let esize = elem_size(inputs[0].dtype)?;
+        let dtype = inputs[0].dtype;
+        pad::validate_dtype(dtype, self.opset).map_err(EpError::KernelFailed)?;
         let in_shape = inputs[0].shape.to_vec();
         let rank = in_shape.len();
-        let src = to_dense_bytes(&inputs[0])?;
 
         // `pads`: input 1 (opset 11+) else the legacy attribute.
         let pads: Vec<i64> = if inputs.len() >= 2 && !inputs[1].is_absent() {
@@ -168,6 +162,11 @@ impl Kernel for PadKernel {
             end[ax as usize] = pads[num_axes + j];
         }
 
+        if dtype.is_sub_byte() {
+            return self.execute_packed(inputs, &mut outputs[0], &begin, &end);
+        }
+        let esize = elem_size(dtype)?;
+        let src = to_dense_bytes(&inputs[0])?;
         let mut out_shape = Vec::with_capacity(rank);
         for d in 0..rank {
             let dim = in_shape[d] as i64 + begin[d] + end[d];
@@ -206,7 +205,7 @@ impl Kernel for PadKernel {
         } else if let Some(v) = self.value_attr {
             scalar_bytes(inputs[0].dtype, v as f64)
         } else {
-            vec![0u8; esize]
+            vec![pad::default_fill_byte(dtype); esize]
         };
 
         let in_strides = compute_contiguous_strides(&in_shape);
@@ -261,6 +260,133 @@ impl Kernel for PadKernel {
     }
 }
 
+impl PadKernel {
+    fn execute_packed(
+        &self,
+        inputs: &[TensorView],
+        output: &mut TensorMut,
+        begin: &[i64],
+        end: &[i64],
+    ) -> Result<()> {
+        let data = &inputs[0];
+        let dtype = data.dtype;
+        let axes = data
+            .shape
+            .iter()
+            .enumerate()
+            .map(|(i, &dim)| {
+                pad::packed_axis(self.mode, i, dim, begin[i], end[i]).map_err(EpError::KernelFailed)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let shape: Vec<_> = axes.iter().map(|axis| axis.output).collect();
+        if output.dtype != dtype || output.shape != shape {
+            return Err(EpError::KernelFailed(format!(
+                "Pad: packed output must have data dtype {dtype:?} and inferred shape {shape:?}; got {:?} {:?}",
+                output.dtype, output.shape
+            )));
+        }
+        let src = packed_tensor(data)?;
+        output.validate()?;
+        if !output.is_contiguous() {
+            return Err(EpError::KernelFailed(
+                "Pad: packed output must be contiguous; allocate a dense output".into(),
+            ));
+        }
+        let (elements, bytes) = packed_size(dtype, &shape)?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let bits = dtype.bit_size();
+        let lanes = 8 / bits;
+        let mask = (1u8 << bits) - 1;
+        let fill = if self.mode == PadMode::Constant
+            && let Some(value) = inputs.get(2).filter(|input| !input.is_absent())
+        {
+            if value.dtype != dtype || !value.shape.is_empty() {
+                return Err(EpError::KernelFailed(format!(
+                    "Pad: constant_value must be a scalar with the data dtype {dtype:?}"
+                )));
+            }
+            packed_tensor(value)?[0] & mask
+        } else {
+            0
+        };
+        // Avoid forming source strides for a tensor that can only supply fill.
+        let strides = if src.is_empty() {
+            Vec::new()
+        } else {
+            compute_contiguous_strides(data.shape)
+        };
+        let mut idx = vec![0; shape.len()];
+        let mut dense = vec![0; bytes];
+        for i in 0..elements {
+            let mut offset = 0;
+            let mut present = !src.is_empty();
+            if present {
+                for (d, axis) in axes.iter().enumerate() {
+                    let coord = idx[d] as i64 - axis.pad_begin;
+                    let n = axis.cropped as i64;
+                    let mapped = match self.mode {
+                        PadMode::Constant if !(0..n).contains(&coord) => {
+                            present = false;
+                            break;
+                        }
+                        PadMode::Constant => coord,
+                        PadMode::Reflect if (0..n).contains(&coord) => coord,
+                        PadMode::Reflect => reflect_index(coord, n),
+                        PadMode::Edge => coord.clamp(0, n - 1),
+                        PadMode::Wrap => coord.rem_euclid(n),
+                    };
+                    offset += (axis.crop_start + mapped as usize) * strides[d] as usize;
+                }
+            }
+            let code = if present {
+                src[offset / lanes] >> ((offset % lanes) * bits) & mask
+            } else {
+                fill
+            };
+            dense[i / lanes] |= code << ((i % lanes) * bits);
+            next_index(&shape, &mut idx);
+        }
+        // SAFETY: the validated contiguous output provides `bytes` writable bytes
+        // at its byte origin. The temporary packed result does not alias it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(dense.as_ptr(), output.data_ptr_mut::<u8>(), bytes);
+        }
+        Ok(())
+    }
+}
+
+fn packed_size(dtype: DataType, shape: &[usize]) -> Result<(usize, usize)> {
+    let elements = if shape.contains(&0) {
+        Some(0)
+    } else {
+        onnx_runtime_ir::checked_numel(shape)
+    };
+    elements
+                .filter(|&n| n <= isize::MAX as usize)
+                .and_then(|n| Some((n, dtype.checked_storage_bytes(n)?)))
+                .ok_or_else(|| EpError::KernelFailed(format!(
+                    "Pad: packed tensor shape {shape:?} with dtype {dtype:?} exceeds addressable storage; reduce the shape"
+                )))
+}
+
+fn packed_tensor<'a>(view: &'a TensorView) -> Result<&'a [u8]> {
+    view.validate()?;
+    if !view.is_contiguous() {
+        return Err(EpError::KernelFailed(
+            "Pad: packed data must be contiguous; materialize the input".into(),
+        ));
+    }
+    let (_, bytes) = packed_size(view.dtype, view.shape)?;
+    if bytes == 0 {
+        return Ok(&[]);
+    }
+    // SAFETY: the validated contiguous view provides `bytes` readable bytes
+    // at its byte origin for the lifetime of the view.
+    Ok(unsafe { std::slice::from_raw_parts(view.data_ptr::<u8>(), bytes) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,9 +394,159 @@ mod tests {
 
     fn constant_kernel(value: Option<f32>) -> PadKernel {
         PadKernel {
+            opset: 25,
             mode: PadMode::Constant,
             pads_attr: None,
             value_attr: value,
+        }
+    }
+
+    #[test]
+    fn pad_low_bit_constant_and_e8m0_reference_bytes() {
+        for (dtype, opset, raw, expected, late) in [
+            (
+                DataType::Int4,
+                21,
+                vec![0xf8, 0xe7],
+                vec![0x80, 0x7f, 0],
+                false,
+            ),
+            (DataType::Uint2, 25, vec![0xf2], vec![0xc8, 0], false),
+            (
+                DataType::Float8E8M0,
+                24,
+                vec![0x7f, 0x80, 0],
+                vec![0xff, 0x7f, 0x80, 0, 0xff],
+                true,
+            ),
+        ] {
+            let x = Owned {
+                bytes: raw,
+                shape: vec![3],
+                strides: vec![1],
+                dtype,
+            };
+            let pads = Owned::i64(&[2], &[1, 1]);
+            let mut out = Owned {
+                bytes: vec![0xa5; expected.len()],
+                shape: vec![5],
+                strides: vec![1],
+                dtype,
+            };
+            let inputs = [x.view(), pads.view()];
+            let kernel = PadKernel {
+                opset,
+                ..constant_kernel(None)
+            };
+            let rejected = PadKernel {
+                opset: opset - 1,
+                ..constant_kernel(None)
+            }
+            .execute(&inputs, &mut [out.view_mut()])
+            .unwrap_err()
+            .to_string();
+            assert!(
+                rejected.contains(&format!("requires opset {opset}")),
+                "{rejected}"
+            );
+            kernel.execute(&inputs, &mut [out.view_mut()]).unwrap();
+            assert_eq!(out.bytes, expected, "{dtype:?} (byte-aligned: {late})");
+        }
+    }
+
+    #[test]
+    fn pad_packed_fill_crosses_rows_and_masks_unused_fill_bits() {
+        // [1,2,3], [4,5,6] become [d,d,1,2,3], [d,d,4,5,6].
+        let dtype = DataType::Uint4;
+        let x = Owned {
+            bytes: vec![0x21, 0x43, 0x65],
+            shape: vec![2, 3],
+            strides: vec![3, 1],
+            dtype,
+        };
+        let pads = Owned::i64(&[2], &[2, 0]);
+        let fill = Owned {
+            bytes: vec![0xfd],
+            shape: vec![],
+            strides: vec![],
+            dtype,
+        };
+        let axes = Owned::i32(&[1], &[-1]);
+        let mut out = Owned {
+            bytes: vec![0xa5; 5],
+            shape: vec![2, 5],
+            strides: vec![5, 1],
+            dtype,
+        };
+        constant_kernel(None)
+            .execute(
+                &[x.view(), pads.view(), fill.view(), axes.view()],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(out.bytes, [0xdd, 0x21, 0xd3, 0x4d, 0x65]);
+    }
+
+    #[test]
+    fn pad_packed_indexed_modes_sample_the_cropped_domain() {
+        for (dtype, mode, raw, count, pads, size, expected) in [
+            (
+                DataType::Float4E2M1,
+                PadMode::Reflect,
+                vec![0x28, 0x6d],
+                4,
+                [-1, 2],
+                5,
+                [0xd2, 0xd6, 0x02].as_slice(),
+            ),
+            (
+                DataType::Int2,
+                PadMode::Wrap,
+                vec![0xe4, 0xfd],
+                5,
+                [3, -1],
+                7,
+                &[0x39, 0x39],
+            ),
+            (
+                DataType::Uint2,
+                PadMode::Edge,
+                vec![0xf2],
+                3,
+                [-1, 3],
+                5,
+                &[0xfc, 0x03],
+            ),
+            (
+                DataType::Uint2,
+                PadMode::Constant,
+                vec![0xf2],
+                3,
+                [-4, 6],
+                5,
+                &[0, 0],
+            ),
+        ] {
+            let x = Owned {
+                bytes: raw,
+                shape: vec![count],
+                strides: vec![1],
+                dtype,
+            };
+            let pads = Owned::i64(&[2], &pads);
+            let mut out = Owned {
+                bytes: vec![0xa5; expected.len()],
+                shape: vec![size],
+                strides: vec![1],
+                dtype,
+            };
+            PadKernel {
+                mode,
+                ..constant_kernel(None)
+            }
+            .execute(&[x.view(), pads.view()], &mut [out.view_mut()])
+            .unwrap();
+            assert_eq!(out.bytes, expected, "{dtype:?}, {mode:?}");
         }
     }
 
@@ -324,6 +600,7 @@ mod tests {
         let pads = Owned::i64(&[2], &[2, 2]);
         let mut out = Owned::zeros_f32(&[8]);
         PadKernel {
+            opset: 25,
             mode: PadMode::Reflect,
             pads_attr: None,
             value_attr: None,
@@ -340,6 +617,7 @@ mod tests {
         let pads = Owned::i64(&[2], &[2, 1]);
         let mut out = Owned::zeros_f32(&[6]);
         PadKernel {
+            opset: 25,
             mode: PadMode::Edge,
             pads_attr: None,
             value_attr: None,
@@ -356,6 +634,7 @@ mod tests {
         let pads = Owned::i64(&[2], &[2, 2]);
         let mut out = Owned::zeros_f32(&[7]);
         PadKernel {
+            opset: 25,
             mode: PadMode::Wrap,
             pads_attr: None,
             value_attr: None,

@@ -655,7 +655,6 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("TensorScatter", _)
         | ("Shape", _)
         | ("Size", _)
-        | ("Pad", _)
         | ("ConstantOfShape", _)
         | ("Constant", _)
         | ("Tile", _)
@@ -669,6 +668,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("CastLike", _)
         | ("TopK", _)
         | ("EyeLike", _) => CUDA_ALL_DTYPES,
+        ("Pad", "") => onnx_runtime_ir::pad::DTYPES,
         ("Range", "") => &[
             DataType::Float32, DataType::Float64, DataType::Float16, DataType::BFloat16,
             DataType::Int16, DataType::Int32, DataType::Int64,

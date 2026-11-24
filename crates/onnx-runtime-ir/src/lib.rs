@@ -66,6 +66,7 @@ pub mod onnx;
 pub mod opset26;
 pub mod packed_matmul;
 pub mod packed_routed;
+pub mod pad;
 pub mod pattern;
 pub mod quantized_grouped;
 pub mod quantized_matmul;

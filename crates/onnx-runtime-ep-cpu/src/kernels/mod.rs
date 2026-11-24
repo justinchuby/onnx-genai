@@ -355,7 +355,6 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("ScatterND", "")
         | ("Shape", "")
         | ("Size", "")
-        | ("Pad", "")
         | ("ConstantOfShape", "")
         | ("Constant", "")
         | ("Tile", "")
@@ -364,6 +363,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("OneHot", "")
         | ("Dropout", "")
         | ("Unique", "") => ALL_DTYPES,
+        ("Pad", "") => onnx_runtime_ir::pad::DTYPES,
 
         ("StringConcat", "") => STRING_ONLY,
         ("RegexFullMatch", "") => STRING_BOOL_DTYPES,
