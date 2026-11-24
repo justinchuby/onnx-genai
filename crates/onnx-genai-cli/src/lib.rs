@@ -1032,11 +1032,9 @@ mod tests {
 
 /// PyO3 extension module backing the `onnx-genai-server` wheel.
 ///
-/// The wheel's Python console entry point (`onnx_genai_server:main`) preloads
-/// libonnxruntime from the installed `onnxruntime` wheel and then calls
-/// `_run_cli(sys.argv)`. This is how a wheel-installed `onnx-genai` command
-/// finds ONNX Runtime without bundling it (a plain binary has no import-time
-/// hook to locate the onnxruntime package).
+/// The console entry point discovers optional runtime paths without importing
+/// their packages, then calls `_run_cli(sys.argv)`. Rust selects Native by
+/// default; explicit ORT reference runs load the optional library on demand.
 #[cfg(feature = "python")]
 #[pyo3::pymodule]
 fn _onnx_genai_server(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
@@ -1044,7 +1042,7 @@ fn _onnx_genai_server(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::
 
     /// Run the CLI with `args` (an argv list including the program name) and
     /// return a process exit code. The GIL is released while the command runs.
-    #[pyfn(module)]
+    #[pyfunction]
     #[pyo3(name = "_run_cli")]
     fn run_cli(python: Python<'_>, args: Vec<String>) -> i32 {
         python.detach(|| match run(args) {
@@ -1056,6 +1054,7 @@ fn _onnx_genai_server(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::
         })
     }
 
+    module.add_function(pyo3::wrap_pyfunction!(run_cli, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

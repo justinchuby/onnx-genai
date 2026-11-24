@@ -403,7 +403,7 @@ jobs:
     runs-on: ${{ matrix.platform.os }}
     env:
       CIBW_ARCHS: ${{ matrix.platform.archs }}
-      CIBW_BUILD: "cp311-*"
+      CIBW_BUILD: "cp312-*"
       CIBW_SKIP: "*-musllinux_*"
       # Do NOT vendor libonnxruntime. Windows/macOS wheel tags are already valid
       # for PyPI, so skip repair there; on Linux auditwheel retags the wheel
@@ -423,7 +423,7 @@ jobs:
           submodules: recursive
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
       # Keep release publishing on Rust stable deliberately: this follows Rust's
       # stability promise without freezing security fixes.
       - name: Install Rust stable toolchain
@@ -436,18 +436,26 @@ jobs:
       # when we add `cuda` we must re-add every feature the package needs to build
       # its pyo3 module. onnx-genai (extension) has non-optional pyo3, so `cuda`
       # alone is enough. onnx-genai-server (CLI) has optional pyo3 behind the
-      # `python` feature, so it needs `python,ort-cuda` or maturin sees no bindings and
-      # fails installing cffi. macOS builds no cuda feature (pyproject applies).
+      # `python` feature; preserve the complete abi3 extension feature list when
+      # adding `ort-cuda`. macOS uses the pyproject feature list directly.
       - name: Select build features
         shell: bash
         run: |
+          if [ "${{ matrix.package }}" = "onnx-genai-server" ]; then
+            # Native CLI startup requires no installed ORT wheel on any platform.
+            echo "CIBW_TEST_SKIP=" >> "$GITHUB_ENV"
+          fi
           if [ "${{ matrix.platform.cuda }}" != "true" ]; then
             echo "CIBW_CONFIG_SETTINGS=" >> "$GITHUB_ENV"
           elif [ "${{ matrix.package }}" = "onnx-genai-server" ]; then
-            echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=python,ort-cuda" >> "$GITHUB_ENV"
+            echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=python,ort-cuda,pyo3/abi3-py310,pyo3/extension-module" >> "$GITHUB_ENV"
           else
             echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=cuda" >> "$GITHUB_ENV"
           fi
+
+      - name: Check Native CLI optional-library discovery
+        if: matrix.package == 'onnx-genai-server'
+        run: python -m unittest discover -s crates/onnx-genai-cli/tests -p test_python_launcher.py -v
 
       - name: Build and smoke-test wheel
         uses: pypa/cibuildwheel@v4.3.5

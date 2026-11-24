@@ -42,7 +42,7 @@ python = ["dep:pyo3"]
 # ONNX Runtime CUDA only: enables ORT's built-in CUDAExecutionProvider (CUDA 13)
 # plus the cudarc GPU sampler, WITHOUT the nxrt-native CUDA kernel crate. This
 # is the wheel-compatible path; GPU ONNX Runtime is provided at runtime by the
-# `onnxruntime-gpu` wheel (`onnx-genai-server[cuda]`), and no CUDA code is
+# `onnxruntime-gpu` wheel (`onnx-genai-server[ort-cuda]`), and no CUDA code is
 # bundled, so this builds without a CUDA toolkit.
 ort-cuda = ["onnx-genai-server/ort-cuda"]
 # Native decoder execution for models containing native-only operators.
@@ -112,8 +112,7 @@ nix = { version = "0.31", default-features = false, features = ["term", "fs", "p
 [dependencies.pyo3]
 version = "0.29"
 # `abi3-py310` builds against the limited API (a single cp310-abi3 module usable
-# on CPython 3.10+); the real 3.11 minimum is enforced by the wheel's
-# requires-python and the onnxruntime dependency.
+# on standard CPython 3.10+). ORT is an optional reference/test dependency.
 features = ["abi3-py310"]
 optional = true
 

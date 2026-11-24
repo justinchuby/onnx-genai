@@ -5,17 +5,16 @@ execution by default. Select `--backend ort` only for reference runs.
 
 ```bash
 pip install onnx-genai-server            # Native CPU default (all platforms)
-pip install 'onnx-genai-server[cuda]'    # ORT CUDA reference runtime (Windows/Linux)
+pip install 'onnx-genai-server[ort]'     # Optional ORT CPU reference/testing runtime
+pip install 'onnx-genai-server[ort-cuda]' # Optional ORT CUDA reference (Windows/Linux)
 ```
 
-Workflow tensors retain their storage without constructing ORT handles. Native
-CPU binary generation is tested with an unavailable ORT library; explicit ORT
-bindings materialize reference views over the same storage. Metadata-declared
-MTP heads also execute on Native without an ORT environment. The Python launcher
-still preloads the installed `onnxruntime` wheel; removing that remaining
-dependency is ongoing.
-The `cuda` extra supplies the ORT reference runtime. Native CUDA execution uses
-a build with `--features native-cuda`.
+The default install supports standard CPython 3.10+ and does not install or
+preload ONNX Runtime. Metadata-declared MTP heads execute on Native too. The
+launcher discovers optional reference libraries without importing their Python
+packages; only an explicitly selected reference backend loads ORT. ORT 1.32
+reference extras require Python 3.11+. Native CUDA execution uses a build with
+`--features native-cuda`; the `ort-cuda` extra supplies a reference runtime.
 
 ## Commands
 
@@ -185,8 +184,8 @@ CUDA failure modes are intentionally distinct:
 - When CUDA is compiled in and available for the ORT/native session but the
   native CUDA EP cannot claim every executable node, the native runtime falls
   back to its CPU EP. Set `ONNX_GENAI_REQUIRE_CUDA=1` to reject that node-level
-  CPU fallback. On Apple Silicon, the `onnxruntime-ep-mlx` plugin is installed
-  by default.
+  CPU fallback. On Apple Silicon, install the optional plugin with
+  `pip install 'onnx-genai-server[mlx]'` and select its EP explicitly.
 
 Windows PowerShell example for the native CUDA path:
 

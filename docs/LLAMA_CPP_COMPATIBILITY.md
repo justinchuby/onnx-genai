@@ -10,7 +10,9 @@ Native workflow tensor construction, host access and no-copy aliases do not load
 ORT. A missing-library subprocess covers default Native CPU binary generation;
 ORT sessions/bindings resolve tensor views explicitly. Metadata-declared MTP
 heads also run on the selected Native executor without an ORT environment.
-The Python launcher's eager preload remains separate isolation work.
+The Python launcher discovers optional reference/plugin paths without importing
+their Python packages or preloading their libraries. The default wheel has no
+ORT dependency; `ort` and `ort-cuda` extras supply explicit test/reference runs.
 
 The server embeds the official Llama Chat frontend with a small capability adapter from
 [llama.cpp commit 8d60873dfb8619f2b5ed31adfbab07cccb40db5c](https://github.com/ggml-org/llama.cpp/tree/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/ui/apps/chat).
