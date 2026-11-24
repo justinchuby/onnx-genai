@@ -243,6 +243,16 @@ fn node_capability_inputs(
     (shapes, dtypes, layouts)
 }
 
+fn node_capability(graph: &Graph, node: &Node, provider: &dyn ExecutionProvider) -> KernelMatch {
+    use crate::executor::host_strings::{MANAGED_STRING_DEVICE_DECLINE, uses_managed_strings};
+    if !provider.device_id().is_host_accessible() && uses_managed_strings(graph, node) {
+        return KernelMatch::unsupported(MANAGED_STRING_DEVICE_DECLINE);
+    }
+    let opset = graph.effective_opset(node).unwrap_or(u64::MAX);
+    let (shapes, dtypes, layouts) = node_capability_inputs(graph, node);
+    provider.supports_op(node, opset, &shapes, &dtypes, &layouts)
+}
+
 /// Assign every node to the highest-priority provider that supports it.
 ///
 /// Returns an error naming the first node no provider can run, so placement
@@ -251,23 +261,9 @@ fn assign_nodes(graph: &Graph, providers: &[ProviderPlacement]) -> Result<HashMa
     let mut placement = HashMap::new();
     for (node_id, node) in graph.nodes.iter() {
         let opset = graph.effective_opset(node).unwrap_or(u64::MAX);
-        let (shapes, dtypes, layouts) = node_capability_inputs(graph, node);
         let matches = providers
             .iter()
-            .map(|slot| {
-                use crate::executor::host_strings::{
-                    MANAGED_STRING_DEVICE_DECLINE, uses_managed_strings,
-                };
-                let capability = if !slot.provider.device_id().is_host_accessible()
-                    && uses_managed_strings(graph, node)
-                {
-                    KernelMatch::unsupported(MANAGED_STRING_DEVICE_DECLINE)
-                } else {
-                    slot.provider
-                        .supports_op(node, opset, &shapes, &dtypes, &layouts)
-                };
-                (slot, capability)
-            })
+            .map(|slot| (slot, node_capability(graph, node, slot.provider.as_ref())))
             .collect::<Vec<_>>();
         let chosen = matches
             .iter()
@@ -820,7 +816,30 @@ fn plan_transfers(
     transfers
 }
 
-fn validate_execution_subset(graph: &Graph) -> Result<()> {
+pub(crate) fn validate_execution_subset(graph: &Graph) -> Result<()> {
+    validate_top_level_tensor_graph(graph)?;
+    for (value_id, value) in graph.values.iter() {
+        if value
+            .tensor_shape()
+            .and_then(|shape| as_static_shape(shape))
+            .is_none()
+        {
+            return Err(SessionError::HeterogeneousExecutionUnsupported {
+                placement_summary: format!(
+                    "value {} ({}) has unknown rank or symbolic shape {:?}; the first execution slice requires \
+                     fully static tensor shapes so all provider kernels and governed boundary \
+                     allocations are validated before any node executes",
+                    value_id.0,
+                    value.name.as_deref().unwrap_or("<unnamed>"),
+                    value.shape
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_top_level_tensor_graph(graph: &Graph) -> Result<()> {
     if !graph.subgraphs.is_empty() {
         return Err(SessionError::HeterogeneousExecutionUnsupported {
             placement_summary: format!(
@@ -862,24 +881,6 @@ fn validate_execution_subset(graph: &Graph) -> Result<()> {
                     "node {} ({domain}::{}@{opset}) is a compiled EPContext; the first execution \
                      slice cannot repartition an already-compiled provider context",
                     node_id.0, node.op_type
-                ),
-            });
-        }
-    }
-    for (value_id, value) in graph.values.iter() {
-        if value
-            .tensor_shape()
-            .and_then(|shape| as_static_shape(shape))
-            .is_none()
-        {
-            return Err(SessionError::HeterogeneousExecutionUnsupported {
-                placement_summary: format!(
-                    "value {} ({}) has unknown rank or symbolic shape {:?}; the first execution slice requires \
-                     fully static tensor shapes so all provider kernels and governed boundary \
-                     allocations are validated before any node executes",
-                    value_id.0,
-                    value.name.as_deref().unwrap_or("<unnamed>"),
-                    value.shape
                 ),
             });
         }
@@ -1025,6 +1026,26 @@ pub fn classify_placement(
             graph, legalized, providers, placement,
         )?)))
     }
+}
+
+/// Extracted partitions use per-op kernels, not graph-backed claim artifacts.
+pub(crate) fn classify_ordered_mixed_placement(
+    graph: &Graph,
+    providers: &[ProviderPlacement],
+) -> Result<PlacementDecision> {
+    validate_execution_subset(graph)?;
+    for slot in providers {
+        let claims = onnx_runtime_ep_api::GraphKernelClaims::query(slot.provider.as_ref(), graph)?;
+        if graph.nodes.iter().any(|(id, _)| claims.contains(id)) {
+            return Err(SessionError::HeterogeneousExecutionUnsupported {
+                placement_summary: format!(
+                    "provider '{}' uses graph-backed claims that cannot be carried into extracted partitions",
+                    slot.provider.name(),
+                ),
+            });
+        }
+    }
+    classify_placement(graph, providers)
 }
 
 /// Human-readable, per-op placement summary for diagnostics and fail-closed
