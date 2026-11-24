@@ -553,6 +553,7 @@ pub struct ConstraintPrefixError {
 /// unchanged while still using llguidance's compute-mask/commit-token loop.
 pub struct LlguidanceConstraint {
     kind: GrammarConstraintKind,
+    completion_only_eos: Option<Vec<TokenId>>,
     sampled_vocab_size: usize,
     inner: Mutex<LlguidanceState>,
 }
@@ -564,6 +565,13 @@ struct LlguidanceState {
 }
 
 impl LlguidanceConstraint {
+    /// GBNF endings terminate only at a completed root, even when a token
+    /// wildcard's lexeme mask also contains the EOS token ID.
+    pub(crate) fn with_completion_only_eos(mut self, endings: Vec<TokenId>) -> Self {
+        self.completion_only_eos = Some(endings);
+        self
+    }
+
     pub fn from_hf_tokenizer(
         kind: GrammarConstraintKind,
         grammar: &str,
@@ -626,7 +634,7 @@ impl LlguidanceConstraint {
         Self::from_token_bytes(kind, grammar, token_bytes, endings, &value_prefix)
     }
 
-    fn from_token_bytes(
+    pub(crate) fn from_token_bytes(
         kind: GrammarConstraintKind,
         grammar: &str,
         mut token_bytes: Vec<Vec<u8>>,
@@ -722,6 +730,7 @@ impl LlguidanceConstraint {
         }
         Ok(Self {
             kind,
+            completion_only_eos: None,
             sampled_vocab_size,
             inner: Mutex::new(LlguidanceState {
                 initial: constraint.deep_clone(),
@@ -783,6 +792,16 @@ impl Constraint for LlguidanceConstraint {
                     "{} history token {token} at offset {offset} continues after the grammar completed; truncate the stale suffix or start a new generation",
                     self.name()
                 );
+                if self
+                    .completion_only_eos
+                    .as_ref()
+                    .is_some_and(|endings| endings.contains(&token))
+                {
+                    anyhow::ensure!(
+                        inner.constraint.parser.is_accepting(),
+                        "GBNF history ending token {token} at offset {offset} precedes root completion; discard the invalid history suffix or start a new generation"
+                    );
+                }
                 let commit = inner
                     .constraint
                     .commit_token(Some(token))
@@ -818,12 +837,19 @@ impl Constraint for LlguidanceConstraint {
                     })
                     .collect());
             }
+            let eos_allowed =
+                self.completion_only_eos.is_none() || inner.constraint.parser.is_accepting();
             let mask=step.sample_mask.as_ref().with_context(||format!("{} returned neither a stop nor a sampling mask; use a grammar compatible with ordinary token sampling",self.name()))?;
             Ok(candidates
                 .iter()
                 .map(|candidate| {
                     let idx = candidate.token_id as usize;
-                    idx < self.sampled_vocab_size && idx < mask.len() && mask.get(idx)
+                    idx < self.sampled_vocab_size
+                        && if self.completion_only_eos.is_some() && candidate.is_eos {
+                            eos_allowed
+                        } else {
+                            idx < mask.len() && mask.get(idx)
+                        }
                 })
                 .collect())
         })();
@@ -4682,13 +4708,14 @@ mod tests {
         let path = scratch.path().join("tokenizer.json");
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         let tokenizer = onnx_genai_ort::Tokenizer::from_file(path).unwrap();
-        let constraint = crate::response_constraint::JsonContentConstraint::new(
+        let constraint = crate::response_constraint::ContentConstraint::json_schema(
             &tokenizer,
             &serde_json::Value::Bool(true),
-            crate::json_projection::ProjectionKind::Plain,
+            crate::text_projection::ProjectionKind::Plain,
             prefix,
             4096,
             vec![eos],
+            &Default::default(),
         )
         .unwrap();
         ConstraintProcessor::new(Box::new(constraint), texts, vec![eos])

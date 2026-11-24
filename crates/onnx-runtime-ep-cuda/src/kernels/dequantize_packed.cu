@@ -67,6 +67,11 @@ __device__ float decode_standalone(const unsigned char* b, int kind, int j) {
     return __uint_as_float(0x7fc00000u);  // unreachable for validated formats
 }
 
+__device__ __forceinline__ float decode_onnx_gguf(const unsigned char* b, int kind, int lane) {
+    return kind < 0 ? decode_standalone(b, -kind - 1, lane)
+                    : decode_block_weight<true>(b, kind - 32, lane);
+}
+
 __device__ unsigned short to_bfloat16(float value) {
     const unsigned int bits = __float_as_uint(value);
     if ((bits & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u;
@@ -75,15 +80,14 @@ __device__ unsigned short to_bfloat16(float value) {
 
 extern "C" __global__ void dequantize_packed(
     const unsigned char* x, unsigned char* y, unsigned long long count,
-    int width, int bytes, int kind, int shared_kind, int dtype)
+    int width, int bytes, int kind, int dtype)
 {
     unsigned long long j = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned long long stride = (unsigned long long)blockDim.x * gridDim.x;
     for (; j < count; j += stride) {
         const unsigned char* block = x + j / width * bytes;
         const int lane = j % width;
-        const float value = shared_kind < 0 ? decode_standalone(block, kind, lane)
-                                           : decode_block_weight<true>(block, shared_kind, lane);
+        const float value = decode_onnx_gguf(block, kind, lane);
         switch (dtype) {
         case 1: reinterpret_cast<float*>(y)[j] = value; break;
         case 11: reinterpret_cast<double*>(y)[j] = value; break;

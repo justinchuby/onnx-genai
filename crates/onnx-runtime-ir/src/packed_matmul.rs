@@ -30,6 +30,7 @@ impl PackedMatMul {
             return Err("MatMul requires one output");
         };
         if !matmul.is_default_domain()
+            || !matmul.overload.is_empty()
             || matmul.op_type != "MatMul"
             || !matmul.attributes.is_empty()
         {
@@ -46,26 +47,22 @@ impl PackedMatMul {
             if !graph.value_type_is_known(value) || value_info.dtype != DataType::Float32 {
                 return Err("GGUF MatMul requires a Float32 weight path");
             }
-            value_info
+            let producer = value_info
                 .producer
                 .map(|id| graph.node(id))
-                .ok_or("missing producer")
+                .ok_or("missing producer")?;
+            if !producer.is_default_domain()
+                || !producer.overload.is_empty()
+                || producer.outputs.as_slice() != [Some(value)]
+            {
+                return Err("expected a standard single-output producer");
+            }
+            Ok(producer)
         };
-        let transpose = private(*rhs, matmul.id, 1)?;
-        if !transpose.is_default_domain()
-            || transpose.op_type != "Transpose"
-            || !transpose.attributes.iter().all(|(key, attr)| {
-                key == "perm" && matches!(attr, Attribute::Ints(p) if p == &[1, 0])
-            })
-        {
-            return Err("packed GGUF RHS must swap N and K before MatMul");
-        }
-        let [Some(decoded)] = transpose.inputs.as_slice() else {
-            return Err("Transpose requires one input");
-        };
-        let producer = private(*decoded, transpose.id, 0)?;
-        let mut removed = vec![transpose.id];
-        let dq = if producer.is_default_domain() && producer.op_type == "Cast" {
+        let strip_cast = |producer: &Node, removed: &mut Vec<NodeId>| {
+            if producer.op_type != "Cast" {
+                return Ok(producer.id);
+            }
             let [Some(input)] = producer.inputs.as_slice() else {
                 return Err("Cast requires one input");
             };
@@ -75,12 +72,26 @@ impl PackedMatMul {
                 return Err("packed GGUF fusion only removes identity Float32 casts");
             }
             removed.push(producer.id);
-            private(*input, producer.id, 0)?
-        } else {
-            producer
+            Ok(private(*input, producer.id, 0)?.id)
         };
-        if !dq.is_default_domain()
-            || dq.op_type != "DequantizePacked"
+        let mut removed = Vec::new();
+        let transpose = graph.node(strip_cast(private(*rhs, matmul.id, 1)?, &mut removed)?);
+        if transpose.op_type != "Transpose"
+            || !transpose.attributes.iter().all(|(key, attr)| {
+                key == "perm" && matches!(attr, Attribute::Ints(p) if p == &[1, 0])
+            })
+        {
+            return Err("packed GGUF RHS must swap N and K before MatMul");
+        }
+        let [Some(decoded)] = transpose.inputs.as_slice() else {
+            return Err("Transpose requires one input");
+        };
+        removed.push(transpose.id);
+        let dq = graph.node(strip_cast(
+            private(*decoded, transpose.id, 0)?,
+            &mut removed,
+        )?);
+        if dq.op_type != "DequantizePacked"
             || graph.effective_opset(dq).unwrap_or(0) < 29
             || !dq
                 .attributes
@@ -106,16 +117,7 @@ impl PackedMatMul {
         {
             return Err("decoded RHS must be a plain [N,K] to [K,N] transpose");
         }
-        let format = metadata
-            .format()
-            .name()
-            .strip_prefix("gguf:")
-            .ok_or("missing standard GGUF profile")?;
-        // The legacy MXFP4 projection uses a separate scale/zero decoder.
-        // Size agreement is not enough to establish decoding equivalence.
-        if metadata.format() == crate::dequantize_packed::Format::Mxfp4 {
-            return Err("standard MXFP4 requires its standalone decoder");
-        }
+        let format = metadata.format().name();
         let (width, bytes) =
             block_layout(format).ok_or("device cannot execute this packed GGUF layout")?;
         if (width, bytes) != metadata.format().block()

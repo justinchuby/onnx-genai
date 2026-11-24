@@ -1,5 +1,5 @@
 //! JSON string spelling normalization, including unfinished UTF-16 escapes.
-use crate::json_cursor::{JsonByteCursor, JsonCandidate};
+use crate::byte_grammar::{GrammarByteCursor, GrammarCandidate};
 use anyhow::Context;
 use std::ops::RangeInclusive;
 
@@ -212,23 +212,23 @@ impl JsonPrefix {
 
     pub(crate) fn preview(
         &self,
-        cursor: &mut JsonByteCursor,
+        cursor: &mut GrammarByteCursor,
         committed: &str,
         pending_utf8: &[u8],
-    ) -> anyhow::Result<JsonCandidate> {
+    ) -> anyhow::Result<GrammarCandidate> {
         if let Some(pending) = &self.pending {
             // UTF-8 bytes cannot continue an ASCII JSON escape.
             if !pending_utf8.is_empty() {
-                return Ok(JsonCandidate::Rejected {
+                return Ok(GrammarCandidate::Rejected {
                     byte_offset: self.canonical.len(),
                 });
             }
             let mut trial = cursor.empty_fork()?;
             if matches!(
                 trial.preview(self.canonical.as_bytes())?,
-                JsonCandidate::Rejected { .. }
+                GrammarCandidate::Rejected { .. }
             ) {
-                return Ok(JsonCandidate::Rejected {
+                return Ok(GrammarCandidate::Rejected {
                     byte_offset: self.canonical.len(),
                 });
             }
@@ -249,11 +249,11 @@ impl JsonPrefix {
                     let lo = (*range.start()).max(*domain.start());
                     let hi = (*range.end()).min(*domain.end());
                     if lo <= hi && viable_scalar(&mut trial, lo, hi)? {
-                        return Ok(JsonCandidate::Viable { complete: false });
+                        return Ok(GrammarCandidate::Viable { complete: false });
                     }
                 }
             }
-            return Ok(JsonCandidate::Rejected {
+            return Ok(GrammarCandidate::Rejected {
                 byte_offset: self.canonical.len(),
             });
         }
@@ -277,15 +277,15 @@ fn scalar_spelling(scalar: u32) -> anyhow::Result<String> {
     }
 }
 
-fn viable_bytes(cursor: &mut JsonByteCursor, bytes: &[u8]) -> anyhow::Result<bool> {
+fn viable_bytes(cursor: &mut GrammarByteCursor, bytes: &[u8]) -> anyhow::Result<bool> {
     match cursor.preview(bytes) {
-        Ok(status) => Ok(matches!(status, JsonCandidate::Viable { .. })),
-        Err(error) if error.is::<crate::json_cursor::JsonByteBudgetExceeded>() => Ok(false),
+        Ok(status) => Ok(matches!(status, GrammarCandidate::Viable { .. })),
+        Err(error) if error.is::<crate::byte_grammar::GrammarByteBudgetExceeded>() => Ok(false),
         Err(error) => Err(error),
     }
 }
 
-fn viable_scalar(cursor: &mut JsonByteCursor, lo: u32, hi: u32) -> anyhow::Result<bool> {
+fn viable_scalar(cursor: &mut GrammarByteCursor, lo: u32, hi: u32) -> anyhow::Result<bool> {
     let left = scalar_spelling(lo)?;
     let right = scalar_spelling(hi)?;
     let common = left
@@ -309,7 +309,7 @@ mod tests {
     use serde_json::json;
 
     fn accepts(schema: &serde_json::Value, text: &str) -> bool {
-        let mut cursor = JsonByteCursor::new(schema, 1024).unwrap();
+        let mut cursor = GrammarByteCursor::json_schema(schema, 1024).unwrap();
         let prefix = match JsonPrefix::parse(text) {
             Ok(prefix) => prefix,
             Err(error) if error.is::<InvalidJsonEscape>() => return false,
@@ -317,7 +317,7 @@ mod tests {
         };
         matches!(
             prefix.preview(&mut cursor, "", b"").unwrap(),
-            JsonCandidate::Viable { .. }
+            GrammarCandidate::Viable { .. }
         )
     }
 
@@ -364,15 +364,15 @@ mod tests {
 
     #[test]
     fn json_prefix_partial_escape_never_permits_eof_or_invalid_utf8_continuation() {
-        let mut cursor = JsonByteCursor::new(&json!({"const":"A"}), 1024).unwrap();
+        let mut cursor = GrammarByteCursor::json_schema(&json!({"const":"A"}), 1024).unwrap();
         let prefix = JsonPrefix::parse(r#""\u004"#).unwrap();
         assert_eq!(
             prefix.preview(&mut cursor, "", b"").unwrap(),
-            JsonCandidate::Viable { complete: false }
+            GrammarCandidate::Viable { complete: false }
         );
         assert!(matches!(
             prefix.preview(&mut cursor, "", &[0xc3]).unwrap(),
-            JsonCandidate::Rejected { .. }
+            GrammarCandidate::Rejected { .. }
         ));
         assert_eq!(cursor.committed_bytes(), 0);
         assert!(matches!(
@@ -380,7 +380,7 @@ mod tests {
                 .unwrap()
                 .preview(&mut cursor, "", b"")
                 .unwrap(),
-            JsonCandidate::Viable { complete: true }
+            GrammarCandidate::Viable { complete: true }
         ));
     }
 
@@ -415,13 +415,13 @@ mod tests {
         assert!(!accepts(&schema, r#""\u01"#));
         // A longer escaped scalar exceeds this cursor's budget, but a printable
         // ASCII completion still fits. One rejected branch must not abort search.
-        let mut cursor = JsonByteCursor::new(&json!({"const":"A"}), 4).unwrap();
+        let mut cursor = GrammarByteCursor::json_schema(&json!({"const":"A"}), 4).unwrap();
         assert_eq!(
             JsonPrefix::parse(r#""\"#)
                 .unwrap()
                 .preview(&mut cursor, "", b"")
                 .unwrap(),
-            JsonCandidate::Viable { complete: false }
+            GrammarCandidate::Viable { complete: false }
         );
         let quoted = json!({"const":"\""});
         assert!(accepts(&quoted, r#""\u002"#));

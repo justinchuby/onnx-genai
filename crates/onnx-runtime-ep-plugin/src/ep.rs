@@ -700,6 +700,27 @@ pub(crate) fn node_passes_dtype_filter(
     let Some(entry) = entry else {
         return false;
     };
+    if node.is_default_domain() && node.op_type == "BitCast" {
+        use onnx_runtime_ir::opset26::{bit_cast_target, validate_bit_cast};
+        let input = node
+            .inputs
+            .first()
+            .copied()
+            .flatten()
+            .and_then(|id| ir_graph.values.get(id));
+        let output = node
+            .outputs
+            .first()
+            .copied()
+            .flatten()
+            .and_then(|id| ir_graph.values.get(id));
+        if !matches!(
+            (input, output, bit_cast_target(node)),
+            (Some(x), Some(y), Ok(to)) if y.dtype == to && validate_bit_cast(x.dtype, to).is_ok()
+        ) {
+            return false;
+        }
+    }
     // The slot sets describe which types the op can use; the attribute selects
     // the one dtype this particular node produces.
     if node.is_default_domain() && node.op_type == "DequantizePacked" {
@@ -1823,22 +1844,8 @@ unsafe extern "C" fn noop_kernel_create(
 
 /// Map `DataType` to `ONNXTensorElementDataType` enum value.
 fn dtype_to_onnx_tensor_elem(dtype: DataType) -> ort::ONNXTensorElementDataType {
-    match dtype {
-        DataType::Float32 => 1,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
-        DataType::Uint8 => 2,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8
-        DataType::Int8 => 3,      // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8
-        DataType::Uint16 => 4,    // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16
-        DataType::Int16 => 5,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16
-        DataType::Int32 => 6,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
-        DataType::Int64 => 7,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-        DataType::Bool => 9,      // ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL
-        DataType::Float16 => 10,  // ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
-        DataType::Float64 => 11,  // ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
-        DataType::Uint32 => 12,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32
-        DataType::Uint64 => 13,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64
-        DataType::BFloat16 => 16, // ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
-        _ => 0,                   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED
-    }
+    // Both enums follow TensorProto.DataType, including packed and float8 types.
+    dtype.to_onnx() as ort::ONNXTensorElementDataType
 }
 
 #[cfg(test)]
@@ -2109,6 +2116,22 @@ mod tests {
         assert_eq!(dtype_to_onnx_tensor_elem(DataType::Float16), 10);
         assert_eq!(dtype_to_onnx_tensor_elem(DataType::BFloat16), 16);
         assert_eq!(dtype_to_onnx_tensor_elem(DataType::Float32), 1);
+        for (dtype, expected) in [
+            (DataType::Complex64, 14),
+            (DataType::Complex128, 15),
+            (DataType::Float8E4M3FN, 17),
+            (DataType::Float8E4M3FNUZ, 18),
+            (DataType::Float8E5M2, 19),
+            (DataType::Float8E5M2FNUZ, 20),
+            (DataType::Uint4, 21),
+            (DataType::Int4, 22),
+            (DataType::Float4E2M1, 23),
+            (DataType::Float8E8M0, 24),
+            (DataType::Uint2, 25),
+            (DataType::Int2, 26),
+        ] {
+            assert_eq!(dtype_to_onnx_tensor_elem(dtype), expected);
+        }
     }
 
     /// KernelRegistryEntry can be constructed with static data.

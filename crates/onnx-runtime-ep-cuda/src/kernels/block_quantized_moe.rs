@@ -2054,6 +2054,7 @@ struct SealedPackedExperts<'a> {
 
 fn block_format_name(format: BlockFormat) -> &'static str {
     match format {
+        BlockFormat::Onnx(format) => format.name(),
         BlockFormat::Mxfp4 => "mxfp4",
         BlockFormat::Iq4Nl => "iq4_nl",
         BlockFormat::Iq4Xs => "iq4_xs",

@@ -95,6 +95,9 @@ pub(crate) fn native_shape_operands(node: &Node) -> Option<&'static [usize]> {
     let opset = node.local_opset()?;
     let op = node.op_type.as_str();
     if node.is_default_domain() {
+        if opset >= 26 && matches!(op, "BitCast" | "CumProd") {
+            return Some(&[]);
+        }
         if onnx_runtime_ir::standard_math::OPS
             .iter()
             .any(|&(name, since)| name == op && opset >= since)
@@ -107,7 +110,10 @@ pub(crate) fn native_shape_operands(node: &Node) -> Option<&'static [usize]> {
     } else if node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
         && matches!(
             op,
-            onnx_runtime_ir::affine_gather::OP | onnx_runtime_ir::quantized_grouped::OP
+            onnx_runtime_ir::affine_gather::OP
+                | onnx_runtime_ir::quantized_grouped::OP
+                | onnx_runtime_ir::dequantize_packed_gather::OP
+                | onnx_runtime_ir::quantized_grouped::PACKED_OP
         )
     {
         return Some(&[]);

@@ -732,8 +732,8 @@ impl ShapeInference {
             // `CastLike` and `EyeLike` take a second input for *dtype* only.
             // `Quantize`/`DequantizeLinear` take scale and zero-point, which
             // change how values map, not the extent — including under blocked
-            // quantization. `CumSum`/`CumProd` accumulate along an axis.
-            "BitwiseNot" | "CastLike" | "CumProd" | "CumSum" | "DequantizeLinear" | "EyeLike"
+            // quantization. `CumSum` accumulates along an axis.
+            "BitwiseNot" | "CastLike" | "CumSum" | "DequantizeLinear" | "EyeLike"
             | "QuantizeLinear" => Self::SameAsInput(0),
 
             // ── Shapes carried in input values ────────────────────────────

@@ -352,6 +352,31 @@ fn out_dtype(outs: &[NodeIo]) -> DataType {
 }
 
 #[test]
+fn opset26_bitcast_and_cumprod_validate_while_preserving_shape() {
+    let mut cast = node("BitCast", 1, 1);
+    cast.attributes.insert(
+        "to".into(),
+        Attribute::Int(i64::from(DataType::Int32.to_onnx())),
+    );
+    let shape = vec![c(2), c(5)];
+    let out = run(&cast, vec![f32in(shape.clone())], 26);
+    assert_eq!(out_dtype(&out), DataType::Int32);
+    assert_eq!(out_shape(&out), shape);
+    cast.attributes.insert(
+        "to".into(),
+        Attribute::Int(i64::from(DataType::Int64.to_onnx())),
+    );
+    assert!(try_run(&cast, vec![f32in(shape.clone())], 26).is_err());
+
+    let prod = node("CumProd", 2, 1);
+    let axis = |shape| tin(DataType::Int32, shape);
+    let out = run(&prod, vec![f32in(shape.clone()), axis(vec![])], 26);
+    assert_eq!(out_dtype(&out), DataType::Float32);
+    assert_eq!(out_shape(&out), shape);
+    assert!(try_run(&prod, vec![f32in(shape), axis(vec![c(1)])], 26).is_err());
+}
+
+#[test]
 fn text_ops_infer_broadcast_match_and_dynamic_split_shapes() {
     let a = tin(DataType::String, vec![c(2), c(1)]);
     let b = tin(DataType::String, vec![c(0)]);
@@ -509,7 +534,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        235,
+        237,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -518,7 +543,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        280,
+        282,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -7280,8 +7305,10 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("pkg.nxrt", "BlockQuantizedMatMul", 1),
     ("pkg.nxrt", "BlockQuantizedMoE", 1),
     ("pkg.nxrt", "CompressedSparseAttention", 1),
+    ("pkg.nxrt", "DequantizePackedGather", 1),
     ("pkg.nxrt", "IndexShare", 1),
     ("pkg.nxrt", "KvCacheCapacityAppend", 1),
+    ("pkg.nxrt", "PackedGroupedMatMul", 1),
     ("pkg.nxrt", "SparseKvGather", 1),
     ("pkg.nxrt", "VarlenAttention", 1),
 ];

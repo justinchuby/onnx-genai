@@ -208,10 +208,9 @@ pub struct CumProdKernel {
 pub struct CumProdFactory;
 impl KernelFactory for CumProdFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(CumProdKernel {
-            exclusive: node.attr("exclusive").and_then(|a| a.as_int()).unwrap_or(0) != 0,
-            reverse: node.attr("reverse").and_then(|a| a.as_int()).unwrap_or(0) != 0,
-        }))
+        let (exclusive, reverse) =
+            onnx_runtime_ir::opset26::cum_prod_flags(node).map_err(EpError::KernelFailed)?;
+        Ok(Box::new(CumProdKernel { exclusive, reverse }))
     }
 }
 impl Kernel for CumProdKernel {
@@ -227,6 +226,10 @@ impl Kernel for CumProdKernel {
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         true
+    }
+
+    fn can_run_in_place(&self, input_index: usize) -> bool {
+        input_index == 0
     }
 }
 
@@ -245,21 +248,47 @@ fn execute_cumulative(
     cumulative_op: CumulativeOp,
 ) -> Result<()> {
     check_arity(op, inputs, outputs, 2, 2, 1)?;
-    let axis_values = to_dense_i64(&inputs[1])?;
-    if axis_values.len() != 1 {
+    if matches!(cumulative_op, CumulativeOp::Product)
+        && (!inputs[1].shape.is_empty()
+            || !matches!(inputs[1].dtype, DataType::Int32 | DataType::Int64))
+    {
         return Err(EpError::KernelFailed(format!(
-            "{op}: axis must contain exactly one element"
+            "CumProd: axis must be an Int32 or Int64 rank-0 tensor, got {:?} {:?}",
+            inputs[1].dtype, inputs[1].shape
         )));
     }
     let rank = inputs[0].shape.len();
-    let raw = axis_values[0];
-    let axis = if raw < 0 { raw + rank as i64 } else { raw };
-    if axis < 0 || axis as usize >= rank {
-        return Err(EpError::KernelFailed(format!("{op}: axis out of range")));
-    }
-    if outputs[0].dtype != inputs[0].dtype {
+    let axis = if matches!(cumulative_op, CumulativeOp::Product) {
+        let axis = &inputs[1];
+        axis.validate()?;
+        // The validated scalar is host-resident; alignment is not guaranteed.
+        let raw = unsafe {
+            if axis.dtype == DataType::Int32 {
+                i64::from(axis.data_ptr::<i32>().read_unaligned())
+            } else {
+                axis.data_ptr::<i64>().read_unaligned()
+            }
+        };
+        onnx_runtime_ir::opset26::cum_prod_axis(raw, rank).map_err(EpError::KernelFailed)?
+    } else {
+        let axis_values = to_dense_i64(&inputs[1])?;
+        let [raw] = axis_values[..] else {
+            return Err(EpError::KernelFailed(format!(
+                "{op}: axis must contain exactly one element"
+            )));
+        };
+        let axis = if raw < 0 { raw + rank as i64 } else { raw };
+        if axis < 0 || axis as usize >= rank {
+            return Err(EpError::KernelFailed(format!("{op}: axis out of range")));
+        }
+        axis as usize
+    };
+    if outputs[0].dtype != inputs[0].dtype
+        || (matches!(cumulative_op, CumulativeOp::Product) && outputs[0].shape != inputs[0].shape)
+    {
         return Err(EpError::KernelFailed(format!(
-            "{op}: output dtype must match input"
+            "{op}: expected output {:?} {:?} matching the input, got {:?} {:?}",
+            inputs[0].dtype, inputs[0].shape, outputs[0].dtype, outputs[0].shape
         )));
     }
 
@@ -268,7 +297,7 @@ fn execute_cumulative(
             execute_cumulative_typed::<$ty>(
                 &inputs[0],
                 &mut outputs[0],
-                axis as usize,
+                axis,
                 exclusive,
                 reverse,
                 cumulative_op,
@@ -301,24 +330,85 @@ fn execute_cumulative_typed<T>(
 where
     T: NumericElem,
 {
+    if matches!(cumulative_op, CumulativeOp::Product) {
+        input.validate()?;
+        output.validate()?;
+        if input.shape.contains(&0) {
+            return Ok(());
+        }
+        if input.is_contiguous() && output.is_contiguous() {
+            let src = input.data_ptr::<T>();
+            let dst = output.data_ptr_mut::<T>();
+            // Both views have the same shape and dtype. The scan reads each
+            // logical element before writing that slot, including in-place.
+            scan_product::<T>(
+                input.shape,
+                axis,
+                exclusive,
+                reverse,
+                |i| unsafe { src.add(i).read_unaligned() },
+                |i, value| unsafe { dst.add(i).write_unaligned(value) },
+            );
+            return Ok(());
+        }
+        let mut values = to_dense::<T>(input)?;
+        let ptr = values.as_mut_ptr();
+        // The temporary is dense and uniquely owned; each slot is read before
+        // it is overwritten by the same lane.
+        scan_product::<T>(
+            input.shape,
+            axis,
+            exclusive,
+            reverse,
+            |i| unsafe { ptr.add(i).read() },
+            |i, value| unsafe { ptr.add(i).write(value) },
+        );
+        return write_dense::<T>(output, &values);
+    }
     let mut values = to_dense::<T>(input)?;
-    let identity = match cumulative_op {
-        CumulativeOp::Sum => 0.0,
-        CumulativeOp::Product => 1.0,
-    };
+    if values.is_empty() {
+        return write_dense::<T>(output, &values);
+    }
     scan(
         &mut values,
         input.shape,
         axis,
         exclusive,
         reverse,
-        T::from_f32_scalar(identity).to_acc(),
-        |left, right| match cumulative_op {
-            CumulativeOp::Sum => left.c_add(right),
-            CumulativeOp::Product => left.c_mul(right),
-        },
+        T::from_f32_scalar(0.0).to_acc(),
+        |left, right| left.c_add(right),
     );
     write_dense::<T>(output, &values)
+}
+
+#[inline]
+fn scan_product<T: NumericElem>(
+    shape: &[usize],
+    axis: usize,
+    exclusive: bool,
+    reverse: bool,
+    read: impl Fn(usize) -> T,
+    mut write: impl FnMut(usize, T),
+) {
+    let inner = numel(&shape[axis + 1..]);
+    let width = shape[axis];
+    let one = T::from_f32_scalar(1.0);
+    for outer in 0..numel(&shape[..axis]) {
+        for i in 0..inner {
+            let base = outer * width * inner + i;
+            let offset = |n| base + (if reverse { width - 1 - n } else { n }) * inner;
+            let mut total = read(offset(0));
+            write(offset(0), if exclusive { one } else { total });
+            for n in 1..width {
+                let i = offset(n);
+                let next = read(i);
+                // Feed back the product rounded in the input dtype.
+                let current = T::from_acc(total.to_acc().c_mul(next.to_acc()));
+                write(i, if exclusive { total } else { current });
+                total = current;
+            }
+        }
+    }
 }
 
 fn float_range_count(start: f32, limit: f32, delta: f32) -> Result<usize> {
@@ -559,7 +649,7 @@ mod tests {
     #[test]
     fn cumprod_negative_axis_int32_exclusive() {
         let x = Owned::i32(&[2, 3], &[1, 2, 3, 4, 5, 6]);
-        let axis = Owned::i64(&[], &[-1]);
+        let axis = Owned::i32(&[], &[-1]);
         let mut y = Owned::zeros(DataType::Int32, &[2, 3]);
         CumProdKernel {
             exclusive: true,
@@ -585,9 +675,56 @@ mod tests {
     }
 
     #[test]
+    fn cumprod_rejects_vector_and_out_of_range_axes_even_when_empty() {
+        let x = Owned::zeros_f32(&[2, 0, 3]);
+        let mut y = Owned::zeros_f32(&[2, 0, 3]);
+        let k = CumProdKernel {
+            exclusive: false,
+            reverse: false,
+        };
+        for (axis, msg) in [
+            (Owned::i64(&[1], &[0]), "rank-0"),
+            (Owned::i64(&[], &[-4]), "out of range"),
+            (Owned::f32(&[], &[1.0]), "Int32 or Int64"),
+        ] {
+            let err = k
+                .execute(&[x.view(), axis.view()], &mut [y.view_mut()])
+                .unwrap_err();
+            assert!(err.to_string().contains(msg), "{err}");
+        }
+        let axis = Owned::i64(&[], &[-2]);
+        k.execute(&[x.view(), axis.view()], &mut [y.view_mut()])
+            .unwrap();
+    }
+
+    #[test]
+    fn cumprod_preserves_first_nan_bits_and_matches_numpy_step_rounding() {
+        let k = CumProdKernel {
+            exclusive: false,
+            reverse: false,
+        };
+        let f32_data = Owned::f32(&[2], &[f32::from_bits(0xff81_2345), 1.0]);
+        let a = Owned::i32(&[], &[0]);
+        let mut f32_out = Owned::zeros_f32(&[2]);
+        k.execute(&[f32_data.view(), a.view()], &mut [f32_out.view_mut()])
+            .unwrap();
+        assert_eq!(f32_out.to_f32()[0].to_bits(), 0xff81_2345);
+
+        let x = Owned::f16(&[5], &[1.13; 5]);
+        let mut y = Owned::zeros(DataType::Float16, &[5]);
+        k.execute(&[x.view(), a.view()], &mut [y.view_mut()])
+            .unwrap();
+        let y = to_dense::<half::f16>(&y.view()).unwrap();
+        // np.cumprod(np.full(5, 1.13, dtype=np.float16)).view(np.uint16)
+        assert_eq!(
+            y.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            [0x3c85, 0x3d1b, 0x3dc5, 0x3e85, 0x3f5e]
+        );
+    }
+    #[test]
     fn cumprod_2d_axis_zero() {
         let x = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
-        let axis = Owned::i64(&[1], &[0]);
+        let axis = Owned::i64(&[], &[0]);
         let mut y = Owned::zeros_f32(&[2, 3]);
         CumProdKernel {
             exclusive: false,
@@ -597,6 +734,77 @@ mod tests {
         .unwrap();
         assert_eq!(y.to_f32(), vec![1., 2., 3., 4., 10., 18.]);
     }
+
+    #[test]
+    #[ignore = "release microbenchmark; run under the shared host lock"]
+    fn cumprod_cpu_microbenchmark() {
+        use std::{hint::black_box, time::Instant};
+
+        let axis = Owned::i64(&[], &[-1]);
+        let kernel = CumProdKernel {
+            exclusive: false,
+            reverse: false,
+        };
+        for (shape, iterations) in [([16, 8], 20_000usize), ([128, 4096], 50)] {
+            let [rows, width] = shape;
+            let x = Owned::f32(&shape, &vec![1.0001; rows * width]);
+            let mut out = Owned::zeros_f32(&shape);
+            for strided in [false, true] {
+                let mut input = x.view();
+                let transposed = [1, rows as i64];
+                if strided {
+                    input.strides = &transposed;
+                }
+                let mut baseline = || {
+                    let axis_slot = to_dense_i64(&axis.view()).unwrap();
+                    let ax = (axis_slot[0] + shape.len() as i64) as usize;
+                    let mut data = to_dense::<f32>(black_box(&input)).unwrap();
+                    scan(&mut data, &shape, ax, false, false, 1.0, |a, b| a * b);
+                    write_dense::<f32>(black_box(&mut out.view_mut()), &data).unwrap();
+                };
+                baseline();
+                let expected = out.to_f32();
+                kernel
+                    .execute(&[input, axis.view()], &mut [out.view_mut()])
+                    .unwrap();
+                assert_eq!(out.to_f32(), expected);
+                let mut samples = [Vec::new(), Vec::new()];
+                for rep in 0..5 {
+                    for arm in [rep % 2, 1 - rep % 2] {
+                        let start = Instant::now();
+                        for _ in 0..iterations {
+                            if arm == 0 {
+                                let ax = (to_dense_i64(black_box(&axis.view())).unwrap()[0] + 2)
+                                    as usize;
+                                let mut data = to_dense::<f32>(black_box(&input)).unwrap();
+                                scan(&mut data, &shape, ax, false, false, 1.0, |a, b| a * b);
+                                write_dense::<f32>(black_box(&mut out.view_mut()), &data).unwrap();
+                            } else {
+                                kernel
+                                    .execute(
+                                        black_box(&[input, axis.view()]),
+                                        black_box(&mut [out.view_mut()]),
+                                    )
+                                    .unwrap();
+                            }
+                        }
+                        samples[arm].push(start.elapsed().as_secs_f64() * 1e6 / iterations as f64);
+                    }
+                }
+                for (arm, times) in ["dense-buffer baseline", "native scan"]
+                    .into_iter()
+                    .zip(&mut samples)
+                {
+                    times.sort_by(f64::total_cmp);
+                    eprintln!(
+                        "CumProd CPU {shape:?} strided={strided} {arm}: {:.3} us [{:.3}, {:.3}]",
+                        times[2], times[0], times[4]
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn range_bf16_matches_widened_f32_reference() {
         let start = Owned::bf16(&[], &[-1.]);

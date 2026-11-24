@@ -196,6 +196,53 @@ fn cum_sum(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+fn cum_prod(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    use onnx_runtime_ir::{
+        DataType,
+        opset26::{CUM_PROD_TYPES, cum_prod_axis, cum_prod_flags},
+    };
+    let invalid = |detail| ShapeInferError::Invalid {
+        op: "CumProd".into(),
+        detail,
+    };
+    cum_prod_flags(ctx.node).map_err(invalid)?;
+    if let Some(dtype) = ctx.input_dtype(1)
+        && !matches!(dtype, DataType::Int32 | DataType::Int64)
+    {
+        return Err(invalid(format!(
+            "axis must be Int32 or Int64, got {dtype:?}"
+        )));
+    }
+    if let Some(rank) = ctx.input_rank(1)
+        && rank != 0
+    {
+        return Err(ShapeInferError::InvalidRank {
+            op: "CumProd".into(),
+            index: 1,
+            rank,
+            detail: "axis must be a rank-0 tensor".into(),
+        });
+    }
+    if let Some(input) = ctx.input_type(0).cloned() {
+        if !CUM_PROD_TYPES.contains(&input.dtype) {
+            return Err(invalid(format!(
+                "unsupported CumProd-26 input dtype {:?}",
+                input.dtype
+            )));
+        }
+        if input.rank() == 0 {
+            return Err(invalid(
+                "data must have rank at least one to select an axis".into(),
+            ));
+        }
+        if let Some([axis]) = const_ints(ctx, 1).as_deref() {
+            cum_prod_axis(*axis, input.rank()).map_err(invalid)?;
+        }
+        ctx.set_output_type(0, input);
+    }
+    Ok(())
+}
+
 /// Register sequence-construction and scan rules.
 pub fn register(reg: &mut InferenceRegistry) {
     // The CPU kernel implements only the modern two-input `(input, repeats)`
@@ -204,4 +251,5 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Range", 11, range);
     reg.register("", "CumSum", 11, cum_sum);
     reg.register("", "CumSum", 14, cum_sum);
+    reg.register("", "CumProd", 26, cum_prod);
 }

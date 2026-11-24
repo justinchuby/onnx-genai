@@ -1,5 +1,11 @@
 # llama.cpp protocol compatibility
 
+Native execution is enabled and selected by default in the engine, facade, CLI
+and server. ORT is an explicitly selected reference backend for tests and
+comparisons: use `--backend ort` or `EngineDecodeBackend::Ort`. Native failures
+remain visible instead of automatically switching production requests to ORT.
+The opt-in auto selector is also a reference/testing mode.
+
 The server embeds the official Llama Chat frontend with a small capability adapter from
 [llama.cpp commit 8d60873dfb8619f2b5ed31adfbab07cccb40db5c](https://github.com/ggml-org/llama.cpp/tree/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/ui/apps/chat).
 The integration patch gates automatically attached browser tools using the
@@ -25,6 +31,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/detokenize` | `tokens`, optional `model`; preserves special tokens, rejects absent vocabulary IDs |
 | POST | `/apply-template` | Chat request fields; same prompt renderer as chat inference |
 | POST | `/v1/chat/completions`, `/chat/completions` | Buffered/streaming text, tools, reasoning, declared image/audio inputs |
+| POST | `/control` | End the current reasoning block of an armed live chat/legacy completion |
 | POST | `/v1/completions` | OpenAI text/token/mixed prompt batches, shared controls, declared text FIM and optional stream usage |
 | POST | `/v1/embeddings` | Existing OpenAI embedding contract |
 | POST | `/completion`, `/completions`, `/infill` | Native buffered/streaming completion, bounded text/token/mixed batches, declared FIM metadata |
@@ -39,6 +46,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/v1/audio/speech`, `/audio/speech`, `/tts` | Declared buffered speech workflow; native input/prompt and raw-prompt handling |
 | GET | `/models/sse` | Initial state and changes to committed model load status; one-second polling, no invented progress |
 | POST | `/models/load`, `/models/unload` | Configured model IDs; requires `--enable-admin-endpoints` |
+| GET, POST | `/cors-proxy` | Optional HTTP(S) MCP transport; explicit forwarding headers, checked and pinned target addresses, bounded streaming |
 | GET | `/metrics` | Existing nxrt Prometheus metrics when compiled with `metrics`; names are not llama metric aliases |
 
 `/props?model=ID&autoload=false` never loads a model. The default is
@@ -81,6 +89,38 @@ rejected because these models execute in-process with explicit nxrt settings.
   token sequences. Matching does not cross complete breakers; partial sequences
   remain ordinary history. `dry_penalty_last_n` bounds prompt/generated history,
   with -1 for full history and 0 to disable DRY.
+
+Reasoning budgets use `reasoning_budget_tokens` or its upstream
+`thinking_budget_tokens` spelling; the former takes precedence if both are sent.
+`-1` leaves the counter unlimited, and `0` forces a close as soon as a declared
+reasoning block is active. Chat derives its opener/closers and final assistant
+prefill from `response_template`. Implicit reasoning channels may end at a
+content opener. Patterned boundaries require an explicit matching delimiter;
+forcing requires a lossless tokenizer round-trip. Native/legacy callers may
+supply `reasoning_budget_start_tag`, `reasoning_budget_end_tags` (or singular
+`reasoning_budget_end_tag`) and `generation_prompt` directly. The first closer
+is forced after optional `reasoning_budget_message` text. Existing assistant
+reasoning prefill counts toward the budget; old conversation turns do not.
+Each new reasoning block receives a fresh budget. Pending Unicode completes
+before forcing, and global output/context limits can still truncate the close.
+A closer banned by `logit_bias` is rejected before generation or SSE admission.
+
+`generation_prompt` also seeds JSON, JSON Schema, Regex and Lark grammars without
+requiring an enabled reasoning budget. It is not echoed in newly generated text.
+Anthropic `thinking.type=enabled` maps `budget_tokens` through the same counter,
+with the upstream default of 10,000 when omitted. Optional control hints on a
+model with no usable reasoning protocol leave its ordinary chat behavior intact.
+`POST /control` accepts `{"id":"<completion-id>","action":"reasoning_end"}`
+for live chat and legacy completion IDs. Requests must opt in with
+`reasoning_control=true` and resolve a usable reasoning protocol to be armed.
+Unknown/finished IDs and unarmed completions return `success:false`; missing IDs
+and unsupported actions return HTTP 400. A successful signal finishes the current
+reasoning block using the same Unicode-safe forced close. `nxrt_capabilities.reasoning_control`
+reports endpoint availability, not a claim that every model has a reasoning channel.
+Registrations are bounded by `max_queue_depth` across the server and released
+when their generation consumer ends; replay readers share their producer's
+registration. Native completions retain budget support but do not publish a
+completion ID for manual control.
 
 Legacy `/v1/completions` uses the same generation-control parser, validation,
 token biases, model sampling defaults and context admission as chat/native
@@ -184,7 +224,7 @@ reasoning and answer text retain separate fields. Content continuation uses the
 same channel-state check when a response template is declared. Plain Rust request
 builders reject reasoning continuation because they have no model parser contract.
 Tool-call messages and replay into a persistent inference session remain rejected.
-JSON response formats use a channel-aware generation constraint when a response
+JSON response formats and internal Regex/Lark policies use a channel-aware generation constraint when a response
 template is declared. The actual rendered prefill seeds the parser, and model
 token candidates constrain only projected content while reasoning remains free.
 This applies to implicit prefill and explicit reasoning continuation, with the
@@ -207,8 +247,22 @@ property name still has a backend lexical mismatch; its previously supported raw
 key spelling is preserved. Ordinary string values and free property names accept
 escaped DEL. Ordinary JSON output without a response template uses the same
 byte-oriented schema recognition, including split escapes and surrogate pairs.
-Forced tool/Lark output policies during
-reasoning continuation and thinking-budget controls also remain unsupported.
+Forced tool Lark policies use the same declared projection. Reasoning can precede
+the tool envelope, and tool-like examples inside reasoning are excluded from
+transactional tool parsing. Auto tool requests share this projection even without
+a grammar. Buffered and streamed tool turns retain their reasoning_content.
+Projected literal grammars preserve authored backslashes and Unicode spellings;
+only JSON Schema policy applies JSON escape normalization. Model-token references,
+token-count directives, per-rule temperatures and hidden stops cannot be treated
+as bytes and are rejected from projected byte grammars with an actionable error.
+Unprojected model-token Lark retains its existing token-aware behavior. User
+GBNF uses the separate raw-output path described below.
+
+Tool observation preserves strict byte fragments for resolved byte decoders, so
+split Unicode channel markers are never replaced by provisional glyphs in tool
+syntax. Unsupported contextual byte decoders defer tool parsing until terminal
+canonical decoding; the retained decoder reason is visible in observer Debug
+state. Rewind/abort restores the raw input and projected tool-parser history.
 
 Ordinary JSON decoding follows the tokenizer's normal special-token policy;
 protocol-channel projection preserves markers for its declared parser. An EOS
@@ -218,7 +272,7 @@ against the same compiled schema. Escape candidates, contextual non-byte decodin
 and pending UTF-16 spelling use semantic candidate inspection. Model-token masks
 and recognizer-byte masks have separate identities and cannot share cached bits.
 
-`GenerateOptions.max_json_bytes` bounds both raw response text and its canonical
+`GenerateOptions.max_constraint_bytes` bounds both raw response text and its canonical
 JSON prefix, with a 4 MiB Rust default. HTTP preparation uses the configured
 `--replay-buffer-bytes` limit for all JSON output modes. Exceeding the candidate
 budget rejects that candidate; backend errors preserve their cause. Constraints
@@ -259,8 +313,8 @@ spelling. Literal escaped backslashes keep their meaning. Grammar-only byte chun
 may still split UTF-8 scalars. Invalid schema prefixes return a typed 400 error. Tokenizers without an interpretable
 lossless byte codec fail explicitly rather than using lossy token decoding.
 Optional progress/control subscription fields from Llama Chat are accepted, but
-`/props.nxrt_capabilities` advertises resumable streams and reports realtime
-reasoning control as unavailable. Per-token timing/progress events are not promised.
+`/props.nxrt_capabilities` advertises resumable streams and the live reasoning
+control endpoint. Per-token timing/progress events are not promised.
 An SSE request with `X-Conversation-Id` retains generation independently of its
 HTTP reader. Reconnect with `/v1/stream?conv_id=ID&from=BYTE_OFFSET`; DELETE cancels
 the producer. Retention defaults to 16 streams and 4 MiB per stream, with completed
@@ -320,8 +374,7 @@ the actual admitted prompt count (including media/session expansion) from the
 shared chat transaction, carried in its first chunk as `nxrt_prompt_tokens`.
 
 Responses and Messages share the chat tool/package capability checks. Stateful
-Responses continuation/storage, hosted tools and explicit thinking budgets are
-rejected. Streaming adapters preserve reasoning, tool argument deltas, usage and
+Responses continuation/storage and hosted tools are rejected. Streaming adapters preserve reasoning, tool argument deltas, usage and
 termination, and report upstream stream failures as errors.
 
 Native `/tts` accepts `input` or `prompt`, optional model, and the package's
@@ -353,8 +406,28 @@ parity. These upstream protocols are still unimplemented:
 - Slot save/restore, LoRA hot swapping and realtime reasoning control.
 - GGUF/Hugging Face model downloads and deletion.
 
-`/tools`, `/cors-proxy`, model download/delete and mutable `/props` return
-`403 feature_disabled`; they never execute shell commands or proxy requests.
+`/tools`, model download/delete and mutable `/props` remain disabled. The MCP
+HTTP proxy is separately opt-in with `--ui-mcp-proxy`; `/props` reports
+`cors_proxy_enabled` from that setting. `GET` and `POST /cors-proxy?url=...`
+forward only headers explicitly prefixed with `x-llama-server-proxy-header-`.
+Ambient server credentials and cookies are never forwarded. HTTP(S) targets
+must resolve entirely to public addresses unless the operator also supplies
+`--ui-mcp-proxy-allow-private-urls`. Connections use those checked DNS results;
+environment proxies cannot override the chosen destination. Redirects return
+through `/cors-proxy` for fresh admission, with credential and arbitrary forwarding headers
+removed when the target origin changes; only explicit `Accept`, `Content-Type`
+and `Content-Encoding` representation headers survive that redirect. Remote cookies and hop-by-hop headers
+are removed from responses; proxied documents receive a sandbox CSP.
+
+Transfers stream through a bounded queue and stop on consumer disconnect. At most
+16 outbound transfers run concurrently (`--ui-mcp-proxy-max-connections`); excess
+requests receive `503` with `Retry-After`, and disconnect/timeout releases the slot. The
+request and response byte limit defaults to 64 MiB (`--ui-mcp-proxy-max-bytes`),
+and the idle transfer timeout defaults to 600 seconds
+(`--ui-mcp-proxy-timeout-secs`). Progress resets that timeout, so active SSE
+sessions can outlive it. Streaming failures surface as body errors;
+pre-response failures return actionable HTTP errors. The proxy does not execute
+local tools or shell commands.
 Other unknown paths return JSON 404 errors rather than the HTML app.
 Existing nxrt sessions/admin/debug/image APIs remain available with their own
 contracts. Capability flags are derived from admitted package metadata; ONNX
@@ -397,3 +470,74 @@ Temporary fixtures, proxy, Chrome and server processes are cleaned up, with
 bounded startup/observer waits. Append an optional screenshot path after the
 Playwright module path to save an image of the baseline chat. Coordinate this
 inference workload with other sessions using the shared host lock.
+
+
+## Raw GBNF and llguidance constraints
+
+The chat, legacy completion and native completion endpoints accept the llama.cpp
+`grammar` field as GBNF over newly generated raw output. A source beginning
+with `%llguidance` instead uses llguidance Lark, preserving its header and
+options. Existing assistant
+prefill is not consumed, and declared reasoning/content projection does not
+remove markers before this grammar sees them. This follows the pinned upstream
+[sampling contract](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/sampling.cpp).
+
+The supported syntax includes recursive rules, alternatives, groups, comments,
+Unicode literals and ranges, negated classes, dot, optional/repeated items and
+bounded repetition. Model token references use actual vocabulary IDs (`<[42]>`)
+or text that tokenizes to exactly one model token (`<think>`); `!` negates a token
+reference. Every legal token spelling remains available to the sampler, including
+compound tokens and partial UTF-8 byte pieces. Ending roles are eligible only
+when the root is complete, including endings covered by a negated token range.
+
+The parser requires `root`, rejects undefined rules and left recursion, and
+reports source line/column diagnostics. It bounds source bytes, rules, nesting,
+expanded items and repetitions. As in the pinned upstream parser, minimum
+repetitions above 2,000 are refused and larger upper bounds become unbounded.
+The model must declare a dense, resolved, token-local byte vocabulary. Actual
+raw pieces include special-token spellings; only explicitly declared ending IDs
+receive terminal semantics. Token names and angle brackets do not guess roles.
+Non-byte contextual decoders and stream-initial stripping currently return an
+actionable capability error before SSE.
+
+Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and
+`ignore_eos=true`. Neutral `grammar_lazy=false`, `grammar_triggers=[]` and
+`preserved_tokens=[]` are accepted. Active lazy grammars and triggers remain
+open compatibility work. Request-local token preservation is described below. Native probability reporting is described below.
+
+
+## Native token probabilities
+
+`/completion` and `/infill` accept nonnegative `n_probs` (0 disables reporting)
+and boolean `post_sampling_probs`. Counts are clamped to the actual vocabulary.
+The default reports the original model distribution before grammar masks,
+penalties, temperature or truncation. Setting `post_sampling_probs=true` reports
+the processed distribution instead. The sampling path and random stream are
+unchanged by reporting.
+
+Buffered responses contain `completion_probabilities`; streaming token events
+contain their own probability item. Each item includes `id`, `token`, `bytes` and
+either `logprob`/`top_logprobs` or `prob`/`top_probs`. Alternative entries carry
+their own IDs, decoded byte pieces and score. Invalid UTF-8 suffixes are omitted
+from `token` while original `bytes` remain intact. Zero probabilities use a
+finite lowest log-probability in JSON; processed alternatives with zero mass
+are excluded.
+
+
+## Preserved output tokens
+
+`preserved_tokens` accepts token spellings on chat, legacy and native completion
+requests. Each spelling is encoded with the requested model, without automatic
+BOS/EOS and with registered special tokens enabled. A spelling that resolves to
+one ID is retained in output; spellings resolving to multiple or no tokens are
+ignored, matching the pinned upstream normalization. Duplicate selections are
+collapsed. Token ending roles and stopping controls are unchanged.
+
+Preservation belongs to the request. A resolved `response_template` also retains
+its declared model framing symbols so reasoning/content/tool projection receives
+the same decoded text as generation. Literal boundary tokens are resolved from
+the tokenizer; regex boundaries can declare individual registered spellings in
+`response_template.preserved_tokens`. Other special IDs remain hidden. The model
+tokenizer is not mutated, and buffered/SSE output uses the same policy, including
+logprob delivery and transactional publication. UTF-8 decoder lookbehind remains
+request-local. Raw grammar recognition continues to inspect model bytes and IDs.

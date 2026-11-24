@@ -289,6 +289,99 @@ fn text_split_reads_onnx_string_initializer_and_declines_raw_binding() {
 }
 
 #[cfg(feature = "cuda")]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+#[test]
+fn requested_cuda_partitions_text_and_runs_connected_numeric_work() {
+    use std::{path::Path, sync::Arc};
+
+    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+    use onnx_runtime_loader::WeightStore;
+
+    const N: usize = 64;
+    let mut graph = graph(20);
+    let text = input(&mut graph, "text", &[N, 1]);
+    let joined = graph.create_named_value("joined", DataType::String, static_shape([N, 1]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "StringConcat",
+        vec![Some(text), Some(text)],
+        vec![joined],
+    ));
+    graph.add_output(joined);
+    let matches = graph.create_named_value("matches", DataType::Bool, static_shape([N, 1]));
+    let mut regex = Node::new(
+        NodeId(0),
+        "RegexFullMatch",
+        vec![Some(joined)],
+        vec![matches],
+    );
+    regex
+        .attributes
+        .insert("pattern".into(), Attribute::String(b"aa".to_vec()));
+    graph.insert_node(regex);
+    let mask = graph.create_named_value("mask", DataType::Float32, static_shape([N, 1]));
+    let mut cast = Node::new(NodeId(0), "Cast", vec![Some(matches)], vec![mask]);
+    cast.attributes
+        .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+    graph.insert_node(cast);
+    let matrix = graph.create_named_value("matrix", DataType::Float32, static_shape([N, N]));
+    graph.add_input(matrix);
+    let masked = graph.create_named_value("masked", DataType::Float32, static_shape([N, N]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Mul",
+        vec![Some(mask), Some(matrix)],
+        vec![masked],
+    ));
+    let scores = graph.create_named_value("scores", DataType::Float32, static_shape([N, N]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "MatMul",
+        vec![Some(masked), Some(matrix)],
+        vec![scores],
+    ));
+    graph.add_output(scores);
+
+    let mut cpu = InferenceSession::from_graph(graph.clone()).unwrap();
+    let cuda = Arc::new(CudaExecutionProvider::initialized(0).expect("initialize CUDA device 0"));
+    let mut mixed = InferenceSession::from_graph_with_provider(
+        graph,
+        Arc::new(WeightStore::new()),
+        Path::new("."),
+        cuda.clone(),
+        None,
+    )
+    .expect("build mixed CPU/CUDA text session without opting in");
+    let report = mixed.heterogeneous_placement_report().unwrap();
+    assert!(report.contains("3 node(s) on cuda_ep"), "{report}");
+    assert!(report.contains("2 node(s) on cpu_ep"), "{report}");
+    assert!(report.contains("1 cross-provider transfer(s)"), "{report}");
+    assert!(mixed.execution_provider_fallback_report().is_none());
+    let before = cuda.device_allocation_counts().unwrap().0;
+    let text = strings(
+        &[N, 1],
+        &(0..N)
+            .map(|i| if i % 2 == 0 { "a" } else { "b" })
+            .collect::<Vec<_>>(),
+    );
+    let matrix = Tensor::from_f32(&[N, N], &vec![1.0; N * N]).unwrap();
+    let inputs = &[("text", &text), ("matrix", &matrix)];
+    let expected = cpu.run(inputs).unwrap();
+    let actual = mixed.run(inputs).unwrap();
+    assert_eq!(
+        actual[0].as_strings().unwrap(),
+        expected[0].as_strings().unwrap()
+    );
+    assert_eq!(actual[1].to_vec_f32(), expected[1].to_vec_f32());
+    assert_eq!(
+        &actual[1].to_vec_f32()[..2 * N],
+        &[vec![N as f32; N], vec![0.0; N]].concat()
+    );
+    assert!(cuda.device_allocation_counts().unwrap().0 > before);
+}
+
+#[cfg(feature = "cuda")]
 #[test]
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
 fn requested_cuda_uses_reported_cpu_placement_for_text() {

@@ -50,9 +50,9 @@ pub use crate::config::{
     DynamicTemperatureConfig, Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend,
     FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest,
     GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
-    KvConnectorConfig, LayerWeightBytes, LimitParseError, MemoryPolicyApplication, MemoryStrategy,
-    MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
-    MtpConfig, MtpHiddenLayout, MtpWeightSource, PrefillRequest, PrefillResult,
+    KvConnectorConfig, LayerWeightBytes, LimitParseError, LogprobSource, MemoryPolicyApplication,
+    MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion,
+    MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource, PrefillRequest, PrefillResult,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
     RewindTokenCount, SamplerSequence, SamplerStage, SamplingOverrides, ScheduledGenerateArrival,
     SessionCheckpoint, SessionId, SessionPosition, SpeculativeMode, TokenLogprob, ToolCallPolicy,
@@ -1922,7 +1922,13 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         assert!(matches!(
             engine.decode_path,
             ModelDecodePath::PastPresent {
@@ -1963,8 +1969,20 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
-        let candidate = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut baseline = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
+        let candidate = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let shared_session = std::sync::Arc::clone(
             candidate
                 .session
@@ -1998,7 +2016,13 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm-scatter")
             .canonicalize()?;
-        let engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         assert!(!matches!(
             engine.decode_path,
             ModelDecodePath::StaticCache { .. }
@@ -2011,10 +2035,17 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut baseline = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let mut speculative = Engine::from_dir(
             &fixture,
             EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
                 draft_model: Some(fixture.clone()),
                 num_speculative_tokens: 3,
                 ..Default::default()
@@ -2087,7 +2118,13 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let session_id = engine.create_session()?;
 
         let mut first = GenerateRequest::new("hello");
@@ -2119,7 +2156,13 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         assert!(matches!(
             engine.decode_path,
             ModelDecodePath::PastPresent { .. }
@@ -2159,7 +2202,13 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let session_id = engine.create_session()?;
         engine
             .sessions
@@ -2192,8 +2241,20 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine_a = Engine::from_dir(&fixture, EngineConfig::default())?;
-        let mut engine_b = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine_a = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
+        let mut engine_b = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let source_a = engine_a.create_session()?;
         let source_b = engine_b.create_session()?;
         assert_eq!(
@@ -2232,7 +2293,13 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let source = engine.create_session()?;
         let plan = engine.prepare_session_fork(source, SessionPosition::new(0))?;
         let sessions_before = engine.sessions.len();
@@ -2262,7 +2329,13 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: crate::EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         engine.decode_path = ModelDecodePath::Generic;
         let parent = engine.create_session()?;
         let prompt = vec![2, 4, 3];
@@ -2398,7 +2471,10 @@ mod tests {
             EngineConfig {
                 draft_model: Some(fixture.clone()),
                 num_speculative_tokens: 2,
-                ..EngineConfig::default()
+                ..EngineConfig {
+                    decode_backend: crate::EngineDecodeBackend::Ort,
+                    ..EngineConfig::default()
+                }
             },
         )?;
         let parent = engine.create_session()?;
@@ -2499,6 +2575,7 @@ mod tests {
 
     fn local_tiered_engine_config(chunk_size: usize) -> EngineConfig {
         EngineConfig {
+            decode_backend: EngineDecodeBackend::Ort,
             kv_connector: KvConnectorConfig {
                 backend: KvConnectorBackend::LocalTiered(onnx_genai_kv::LocalTieredConfig {
                     chunk_size,

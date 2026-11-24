@@ -425,6 +425,8 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/attention.yaml"),
     include_str!("../../schemas/standard/attention_v25.yaml"),
     include_str!("../../schemas/standard/cast_like.yaml"),
+    include_str!("../../schemas/standard/bit_cast.yaml"),
+    include_str!("../../schemas/standard/cum_prod.yaml"),
     include_str!("../../schemas/standard/cum_sum.yaml"),
     include_str!("../../schemas/standard/greater_or_equal.yaml"),
     include_str!("../../schemas/standard/less_or_equal.yaml"),
@@ -737,11 +739,13 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 111);
-        assert_eq!(registry.iter().count(), 124);
+        assert_eq!(registry.schemas.len(), 113);
+        assert_eq!(registry.iter().count(), 126);
 
         for (name, since_version) in [
             ("DequantizePacked", 29),
+            ("BitCast", 26),
+            ("CumProd", 26),
             ("BitShift", 11),
             ("BitwiseAnd", 18),
             ("BitwiseOr", 18),

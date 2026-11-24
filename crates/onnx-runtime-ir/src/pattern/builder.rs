@@ -152,6 +152,8 @@ enum BindingClass {
 
 /// Compact, checked pattern construction. Methods record construction errors;
 /// `finish`/`finish_body` return all of them before invoking the shared compiler.
+/// Use for generated/composed patterns; prefer compile-once text for a fixed
+/// declarative graph. Both frontends share the matcher and validation rules.
 ///
 /// ```
 /// use onnx_runtime_ir::pattern::Pattern;
