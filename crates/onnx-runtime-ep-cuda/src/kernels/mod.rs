@@ -1159,6 +1159,7 @@ pub fn build_cuda_registry_with_metrics(
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(dropout::DropoutFactory {
                 runtime: runtime.clone(),
+                opset: version,
             }),
         );
     }

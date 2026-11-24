@@ -600,6 +600,14 @@ multi-output Dropout, multiple ranks, narrow float storage, signed zero, and
 NaN. This raises `CUDA_COVERED_OPS` from **140** to **144** and CPU
 standard-domain parity from **111 / 141** to **115 / 141**.
 
+CUDA `Dropout` accepts an optional scalar ratio (ignored in inference) and an
+omitted or false `training_mode`. Opset 22 adds BFloat16 ratios and the four ONNX
+FP8 data and ratio types. Explicit `training_mode` requires a scalar device
+read and therefore declines CUDA graph capture; omit it to keep capture
+available. CUDA rejects `training_mode=true`; stochastic training is not
+implemented on either provider. Both providers now reject off-schema integer
+data rather than treating it as inference identity.
+
 The issue #67 operator-coverage batch 10 adds `AffineGrid`,
 `BatchNormalization`, `Compress`, `DynamicQuantizeLinear`,
 `GlobalAveragePool`, `GlobalLpPool`, `GlobalMaxPool`, and `LpNormalization`.

@@ -53,6 +53,7 @@ pub mod dequantize_packed;
 pub mod dequantize_packed_gather;
 mod device;
 mod domain;
+pub mod dropout;
 mod dtype;
 mod einsum;
 mod error;
