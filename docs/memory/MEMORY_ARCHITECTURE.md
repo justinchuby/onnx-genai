@@ -957,6 +957,36 @@ returns to zero only after trim. CPU fixture results do not establish model
 throughput, CUDA correctness or universal zero overhead.
 
 
+### Caller-owned row-decoded destinations
+
+The shared dynamic row-decoded projection core writes an initialized caller
+destination instead of returning an owned Vec. Complete input/bias/output
+geometry is checked before any dispatch or write. Unit axes let the column
+producer write that destination directly; multirow/multicolumn execution keeps
+its temporary column-major buffer and transposes only after successful work.
+Later decoder/dispatch errors may modify staging, so staging is not permission
+to publish a partial tensor.
+
+QMoE's owned expert driver and the block-format test oracle allocate their
+existing result staging at the ownership edge. MatMulNBits deliberately retains
+independent staging and copies into its possibly direct Float32 tensor output
+only after success; this change does not weaken its failure protection. Decoder
+state, bounded tile allocation, scheduling, K reduction and bias order remain.
+No old returned-Vec alias or public EP interface is retained/added.
+
+This is the output-storage prerequisite for moving QMoE FC results into the
+shared expert banks. Its current governed workspace still covers grouped input
+only; FC/output and dynamic decoded-column/row storage remain separate until
+their actual callers migrate. No memory saving, quota change or inference
+performance result follows from this interface change alone.
+
+The QMoE bank follow-up must derive inter from FC2's packed input axis times
+8/bits, as execution does, and share that checked geometry between metadata
+preparation and dispatch. Single-row inference needs FC banks despite needing
+no gather. A zero hidden width must retain its existing validation/lifecycle
+until an independently justified empty-output rule replaces it. Prefetch keeps
+owned weights; only the main compute thread may borrow the FC lane.
+
 ### CPU float MoE projection banks
 
 Float MoE uses the same declared-workspace seam for gather, FC1/optional FC3,

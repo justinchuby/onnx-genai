@@ -1749,7 +1749,19 @@ fn write_grouped_contributions(
                 fc3.as_ref(),
                 fc3_bias.map(|bias| &bias[fc3_bias_range]),
                 attributes,
-                |projection, input, rows, bias| projection.apply(input, rows, bias),
+                |projection, input, rows, bias| {
+                    let elements = checked_product(
+                        &[rows, projection.out_features()],
+                        "expert projection output elements",
+                    )?;
+                    let mut output = super::decoded_projection::zeroed_f32(
+                        "QMoE NBits expert",
+                        "owned output staging",
+                        elements,
+                    )?;
+                    projection.apply_into(input, rows, bias, &mut output)?;
+                    Ok(output)
+                },
             )?
         }
     };
@@ -2060,14 +2072,21 @@ impl ExpertProjection for QuantizedExpertProjection<'_, '_> {
     }
 }
 impl QuantizedExpertProjection<'_, '_> {
-    fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
-        super::decoded_projection::linear_decoded_grouped::<1, _>(
+    fn apply_into(
+        &self,
+        input: &[f32],
+        rows: usize,
+        bias: Option<&[f32]>,
+        output: &mut [f32],
+    ) -> Result<()> {
+        super::decoded_projection::linear_decoded_grouped_into::<1, _>(
             "QMoE NBits expert",
             input,
             rows,
             self.in_features(),
             self.out_features(),
             bias,
+            output,
             || |row, output: &mut [f32]| self.source.decode_expert_row(self.expert, row, output),
             |input, row, output, rows, k, _features| {
                 super::matmul::gemm_bt_serial(input, row, output, rows, k, 1)
