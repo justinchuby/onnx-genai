@@ -52,8 +52,10 @@ __device__ double coordinate(Axis a, U64 bin, I64 sample) {
 
 __device__ double sample(const void* x, int dtype, U64 base, U64 h, U64 w,
                          double y, double u, bool max_pool) {
-    if (h == 0 || w == 0 || !(y >= -1.0 && y <= static_cast<double>(h))
-        || !(u >= -1.0 && u <= static_cast<double>(w))) return 0.0;
+    if (h == 0 || w == 0) return 0.0;
+    // Pinned ONNX uses zero weights and corner index zero for padding.
+    if (!(y >= -1.0 && y <= static_cast<double>(h))
+        || !(u >= -1.0 && u <= static_cast<double>(w))) return 0.0 * load(x, dtype, base);
     y = fmin(fmax(y, 0.0), static_cast<double>(h - 1));
     u = fmin(fmax(u, 0.0), static_cast<double>(w - 1));
     const U64 yl = static_cast<U64>(y);

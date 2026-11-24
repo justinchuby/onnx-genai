@@ -142,12 +142,12 @@ impl Kernel for Native {
 }
 
 fn sample(plane: &[f64], height: usize, width: usize, y: f64, x: f64, pool: Pool) -> f64 {
-    if height == 0
-        || width == 0
-        || !(-1.0..=height as f64).contains(&y)
-        || !(-1.0..=width as f64).contains(&x)
-    {
+    if height == 0 || width == 0 {
         return 0.0;
+    }
+    if !(-1.0..=height as f64).contains(&y) || !(-1.0..=width as f64).contains(&x) {
+        // Pinned ONNX uses zero weights and corner index zero for padding.
+        return 0.0 * plane[0];
     }
     let y = y.clamp(0.0, (height - 1) as f64);
     let x = x.clamp(0.0, (width - 1) as f64);

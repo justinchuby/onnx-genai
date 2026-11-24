@@ -164,6 +164,21 @@ fn pinned(provider: Arc<dyn ExecutionProvider>) {
     }));
 }
 
+fn pinned_non_finite_padding(provider: Arc<dyn ExecutionProvider>) {
+    let dtype = DataType::Float64;
+    let mut session = make_session(provider, 22, dtype, 3, &CASES[0]);
+    let mut x = [1.0; 36];
+    x[18] = f64::INFINITY;
+    let outputs = run(&mut session, dtype, &x, &[1, 0, 1]).unwrap();
+    let first = f64::from_le_bytes(outputs[0].as_bytes()[..8].try_into().unwrap());
+    // At least one sample is outside the feature map; ONNX multiplies a zero
+    // weight by the first value of this batch/channel plane.
+    assert!(
+        first.is_nan(),
+        "expected NaN from zero-weight padding, got {first}"
+    );
+}
+
 fn indices(provider: Arc<dyn ExecutionProvider>) {
     let dtype = DataType::Float32;
     let mut session = make_session(Arc::clone(&provider), 22, dtype, 3, &CASES[0]);
@@ -186,6 +201,7 @@ fn indices(provider: Arc<dyn ExecutionProvider>) {
 #[test]
 fn roi_align_cpu_pinned() {
     pinned(Arc::new(onnx_runtime_ep_cpu::CpuExecutionProvider::new()));
+    pinned_non_finite_padding(Arc::new(onnx_runtime_ep_cpu::CpuExecutionProvider::new()));
 }
 
 #[test]
@@ -196,10 +212,12 @@ fn roi_align_cpu_indices() {
 #[cfg(feature = "gpu-tests")]
 #[test]
 fn roi_align_cuda_pinned() {
-    pinned(Arc::new(
+    let provider: Arc<dyn ExecutionProvider> = Arc::new(
         onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(0)
             .expect("physical CUDA device required"),
-    ));
+    );
+    pinned(Arc::clone(&provider));
+    pinned_non_finite_padding(provider);
 }
 
 #[cfg(feature = "gpu-tests")]

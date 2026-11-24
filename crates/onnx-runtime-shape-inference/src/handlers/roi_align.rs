@@ -20,7 +20,7 @@ pub fn infer(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     })
     .map_err(invalid)?;
     let Some(dtype) = dtype else { return Ok(()) };
-    let count = [rois, indices]
+    let count = [indices, rois]
         .into_iter()
         .flatten()
         .map(|shape| &shape[0])
