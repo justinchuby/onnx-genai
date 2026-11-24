@@ -901,7 +901,7 @@ fn validate_offload_policy(policy: &DeviceOffloadPolicy) -> Result<()> {
 
 /// Refuse an allocator that does not serve `expected_index`.
 ///
-/// Split out of [`CudaExecutionProvider::with_memory`] so the decision can be
+/// Checked before CUDA initialization so the decision can be
 /// asserted on a machine with no CUDA device: it is decided entirely from
 /// [`DeviceAllocator::device`], and the consequence of getting it wrong — a
 /// host or foreign-device pointer handed to a kernel — only shows up inside a
@@ -919,34 +919,6 @@ fn reject_foreign_device(
              serves {:?} {}; its pointers would not be valid where this EP uses them. Supply an \
              allocator for CUDA device {}.",
             expected.index, offered.tier, offered.index, expected.index
-        ))
-    })
-}
-
-/// Refuse to replace a mechanism that has already handed memory out.
-///
-/// Injection is authoritative, which means the mechanism it replaces stops
-/// existing. Pointers already served belong to that mechanism and have to be
-/// released through it, so the replacement is only safe while nothing is
-/// outstanding. Checked on **two** axes because they can disagree: `served` is
-/// what this provider handed out, `committed` is what the built-in arena has
-/// mapped, and something that reached the arena without going through the
-/// provider's counters would be invisible on the first axis alone.
-///
-/// Split out of [`CudaExecutionProvider::with_memory`] so both axes can be
-/// asserted without a CUDA device.
-fn reject_live_mechanism_replacement(
-    expected_index: u32,
-    served: u64,
-    committed: usize,
-) -> Option<EpError> {
-    (served > 0 || committed > 0).then(|| {
-        EpError::KernelFailed(format!(
-            "cuda_ep: the mechanism this execution provider is already using on CUDA device \
-             {expected_index} has served {served} allocation(s) and has {committed} bytes \
-             committed; `with_memory` replaces the mechanism outright and cannot do so \
-             underneath pointers that must still be released through it. Inject the allocator \
-             before the provider allocates."
         ))
     })
 }
@@ -980,8 +952,8 @@ fn vmm_unavailable(
          allocation-granularity query is not a capability check, because a driver refusal or a \
          reported zero is replaced with a 2 MiB default.\nOptions: run on a device \
          and driver that support CUDA VMM, or supply your own allocator — including an eager \
-         cuMemAlloc one — through `CudaExecutionProvider::with_memory`, which is unchanged and \
-         still honoured.{}",
+         cuMemAlloc one — as `CudaProviderConfig::memory` when calling \
+         `CudaExecutionProvider::from_config`.{}",
         requested_limit
             .map(|bytes| format!(
                 "\nThis provider was additionally asked for a managed no-spill VRAM limit of \
@@ -995,9 +967,9 @@ fn vmm_unavailable(
 ///
 /// There is exactly one, and which one it is is decided once, at construction.
 /// [`Vmm`](Self::Vmm) is the built-in mechanism and is what every provider gets
-/// unless a caller explicitly replaces it; [`Injected`](Self::Injected) is a
-/// caller-supplied allocator installed through
-/// [`CudaExecutionProvider::with_memory`].
+/// unless a caller explicitly selects another at construction;
+/// [`Injected`](Self::Injected) is a caller-supplied allocator selected through
+/// [`CudaProviderConfig::memory`].
 ///
 /// The built-in variant stays concrete so its governor-specific capacity-token
 /// path keeps working without caching a second allocator or capability handle.
@@ -1189,6 +1161,30 @@ fn assert_commit_buffer_devices(expected: DeviceId, ranges: &[(&DeviceBuffer, us
             "cuda_ep: refusing to commit a buffer from device {:?}",
             buffer.device()
         );
+    }
+}
+
+/// Construction-only choices for one CUDA execution provider.
+/// Allocator and registration identities cannot be replaced after construction.
+pub struct CudaProviderConfig {
+    pub offload_policy: DeviceOffloadPolicy,
+    pub governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
+    pub manager: Option<ProcessMemoryManager>,
+    pub route_residency_config: ExecutorRouteResidencyConfig,
+    /// Authoritative external allocator; None selects the built-in VMM arena.
+    /// Its device must match the requested CUDA ordinal, checked before CUDA init.
+    pub memory: Option<Arc<dyn onnx_runtime_memory_api::DeviceAllocator>>,
+}
+
+impl Default for CudaProviderConfig {
+    fn default() -> Self {
+        Self {
+            offload_policy: DeviceOffloadPolicy::from_env(),
+            governor: None,
+            manager: None,
+            route_residency_config: CudaExecutionProvider::route_residency_config_from_env(),
+            memory: None,
+        }
     }
 }
 
@@ -1651,11 +1647,6 @@ pub struct CudaExecutionProvider {
     /// Selected allocator and native accounting. Declared after mapped reclaim
     /// registration so its teardown still observes the complete memory domain.
     allocation_domain: CudaAllocationDomain,
-    /// Retired allocator registrations that still have old binding-issued
-    /// allocations or queued releases. They share the current context/authority
-    /// and are removed by the same drain callback.
-    retired_memory_mechanisms: Vec<RegisteredMemoryMechanism>,
-    retired_allocator_teardown: Vec<Arc<AtomicBool>>,
     /// Executor-scoped route-residency lifecycle state. Sibling/base/MTP
     /// executors may share this EP, but each owns an independent finalization
     /// outcome, boundary, and retained bank artifacts.
@@ -1842,12 +1833,15 @@ impl CudaExecutionProvider {
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
     ) -> Result<Self> {
-        Self::new_with_policy_governor_manager_and_route_config(
+        Self::from_config(
             ordinal,
-            offload_policy,
-            None,
-            None,
-            Self::route_residency_config_from_env(),
+            CudaProviderConfig {
+                offload_policy,
+                governor: None,
+                manager: None,
+                route_residency_config: Self::route_residency_config_from_env(),
+                memory: None,
+            },
         )
     }
 
@@ -1858,12 +1852,15 @@ impl CudaExecutionProvider {
         offload_policy: DeviceOffloadPolicy,
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
     ) -> Result<Self> {
-        Self::new_with_policy_governor_manager_and_route_config(
+        Self::from_config(
             ordinal,
-            offload_policy,
-            Some(governor),
-            None,
-            Self::route_residency_config_from_env(),
+            CudaProviderConfig {
+                offload_policy,
+                governor: Some(governor),
+                manager: None,
+                route_residency_config: Self::route_residency_config_from_env(),
+                memory: None,
+            },
         )
     }
 
@@ -1874,12 +1871,15 @@ impl CudaExecutionProvider {
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
         manager: ProcessMemoryManager,
     ) -> Result<Self> {
-        Self::new_with_policy_governor_manager_and_route_config(
+        Self::from_config(
             ordinal,
-            offload_policy,
-            Some(governor),
-            Some(manager),
-            Self::route_residency_config_from_env(),
+            CudaProviderConfig {
+                offload_policy,
+                governor: Some(governor),
+                manager: Some(manager),
+                route_residency_config: Self::route_residency_config_from_env(),
+                memory: None,
+            },
         )
     }
 
@@ -1894,12 +1894,15 @@ impl CudaExecutionProvider {
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
         route_residency_config: ExecutorRouteResidencyConfig,
     ) -> Result<Self> {
-        Self::new_with_policy_governor_manager_and_route_config(
+        Self::from_config(
             ordinal,
-            offload_policy,
-            Some(governor),
-            None,
-            route_residency_config,
+            CudaProviderConfig {
+                offload_policy,
+                governor: Some(governor),
+                manager: None,
+                route_residency_config,
+                memory: None,
+            },
         )
     }
 
@@ -1911,13 +1914,21 @@ impl CudaExecutionProvider {
         }
     }
 
-    fn new_with_policy_governor_manager_and_route_config(
-        ordinal: u32,
-        offload_policy: DeviceOffloadPolicy,
-        governor: Option<Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>>,
-        manager: Option<ProcessMemoryManager>,
-        route_residency_config: ExecutorRouteResidencyConfig,
-    ) -> Result<Self> {
+    /// Construct with allocator selection complete before any runtime is exposed.
+    /// An injected allocator is authoritative: the built-in VMM is never created.
+    pub fn from_config(ordinal: u32, config: CudaProviderConfig) -> Result<Self> {
+        let CudaProviderConfig {
+            offload_policy,
+            governor,
+            manager,
+            route_residency_config,
+            memory,
+        } = config;
+        if let Some(memory) = memory.as_ref()
+            && let Some(error) = reject_foreign_device(ordinal, memory.device())
+        {
+            return Err(error);
+        }
         validate_offload_policy(&offload_policy)?;
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
         // CSA telemetry has no allocation authority; its scratch uses the same
@@ -1983,11 +1994,11 @@ impl CudaExecutionProvider {
         // a device whose address space will not take the generous ask is a
         // device we should still run on, so the ladder retries smaller.
         //
-        // There is no branch here any more. The arena is the only built-in
-        // mechanism, so this is a construction that either succeeds or fails
-        // the provider -- not a selection between two implementations whose
-        // invariants differ.
-        let memory = {
+        // The arena is the only built-in mechanism; an injected mechanism
+        // is selected before this construction and never creates a spare arena.
+        let memory = if let Some(memory) = memory {
+            CudaMemory::Injected(memory)
+        } else {
             let reservation_queue: Arc<dyn crate::virtual_memory::DeferredReservationQueue> =
                 Arc::clone(&release_queue)
                     as Arc<dyn crate::virtual_memory::DeferredReservationQueue>;
@@ -2103,8 +2114,6 @@ impl CudaExecutionProvider {
                 attribution,
                 release_queue,
             ),
-            retired_memory_mechanisms: Vec::new(),
-            retired_allocator_teardown: Vec::new(),
             route_residency_config,
             artifact_provider_id,
             route_executors: Mutex::new(HashMap::new()),
@@ -2430,17 +2439,13 @@ impl CudaExecutionProvider {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         self.memory_cleanup_armed.store(true, Ordering::Release);
-        for mechanism in self.retired_memory_mechanisms.iter().chain(std::iter::once(
-            &self.allocation_domain.memory_binding.mechanism,
-        )) {
-            self.allocation_domain
-                .memory_binding
-                .manager
-                .remove_mechanism(mechanism)
-                .map_err(|error| {
-                    manager_failure("cannot remove a terminated CUDA memory mechanism", error)
-                })?;
-        }
+        self.allocation_domain
+            .memory_binding
+            .manager
+            .remove_mechanism(&self.allocation_domain.memory_binding.mechanism)
+            .map_err(|error| {
+                manager_failure("cannot remove a terminated CUDA memory mechanism", error)
+            })?;
         self.allocation_domain
             .memory_binding
             .manager
@@ -2525,98 +2530,6 @@ impl CudaExecutionProvider {
             )));
         }
         Ok(owner)
-    }
-
-    /// Take device buffers from `memory` instead of from the built-in VMM
-    /// arena.
-    ///
-    /// The same `DeviceAllocator` a caller installs on the CPU EP or the ONNX
-    /// Runtime side. Removing the built-in eager allocator did not remove this:
-    /// an external mechanism — including an eager `cuMemAlloc` one — is still a
-    /// supported thing to run this provider on, it is just not something the
-    /// provider ships and silently falls back to.
-    ///
-    /// # What a successful call means
-    ///
-    /// It is **authoritative**. The built-in arena selected at construction is
-    /// retired and `memory` becomes the one mechanism; nothing is left holding
-    /// a second allocator, and no allocation is served by anything other than
-    /// what the last successful call installed. A call that cannot be honoured
-    /// that way returns an error rather than being quietly ignored.
-    ///
-    /// # Errors
-    ///
-    /// If `memory` does not serve this EP's device. Pointers from it are handed
-    /// to kernels as this device's addresses, so a host allocator or another
-    /// device's allocator would produce an address that is invalid where it is
-    /// used. That fails inside a kernel launch, far from the substitution that
-    /// caused it, so it is rejected here instead.
-    ///
-    /// If the mechanism being replaced has already served an allocation. The
-    /// replacement is a builder step, not a live swap: pointers already handed
-    /// out belong to the old mechanism and must be released through it, so
-    /// substituting underneath them would strand them. This is checked *before*
-    /// anything is allocated through `memory`, so a rejected call leaves the
-    /// provider exactly as it was.
-    pub fn with_memory(
-        mut self,
-        memory: Arc<dyn onnx_runtime_memory_api::DeviceAllocator>,
-    ) -> Result<Self> {
-        let key = memory.device();
-        let expected = onnx_runtime_memory_api::DeviceKey::device(self.device.index);
-        if let Some(error) = reject_foreign_device(expected.index, key) {
-            return Err(error);
-        }
-        let served = self
-            .allocation_domain
-            .ep_allocations
-            .load(Ordering::Relaxed);
-        let committed = self
-            .allocation_domain
-            .memory
-            .vmm()
-            .map(|arena| arena.committed_and_reserved().0)
-            .unwrap_or(0);
-        if let Some(error) = reject_live_mechanism_replacement(expected.index, served, committed) {
-            return Err(error);
-        }
-        // The binding is rebuilt *before* the allocator is swapped in, so no
-        // allocation can escape through the new allocator while the old binding
-        // is still the one that would validate its release. The previous
-        // mechanism is retired rather than removed: nothing has been allocated
-        // through it yet on this path, and retiring keeps any pins it holds
-        // intact instead of asserting that it is quiescent.
-        let rebound = Self::bind_allocator(
-            self.allocation_domain.memory_binding.manager.clone(),
-            self.allocation_domain.memory_binding.context.clone(),
-            self.allocation_domain.memory_binding.authority.clone(),
-            Some(self.allocation_domain.memory_binding.holder.clone()),
-            self.allocation_domain.memory_binding.cuda_context_identity,
-            Arc::clone(&memory),
-        )?;
-        let previous = std::mem::replace(&mut self.allocation_domain.memory_binding, rebound);
-        let previous_mechanism = previous.mechanism.clone();
-        let mut removed = false;
-        if let Err(error) = previous.manager.retire(&previous.mechanism) {
-            eprintln!(
-                "cuda_ep: WARNING: could not retire the construction-selected allocator binding \
-                 after `with_memory`: {error}"
-            );
-        } else if let Err(error) = previous.manager.remove_mechanism(&previous.mechanism) {
-            eprintln!(
-                "cuda_ep: WARNING: could not remove the unused construction-selected allocator \
-                 binding after `with_memory`: {error}"
-            );
-        } else {
-            removed = true;
-        }
-        if !removed {
-            self.retired_memory_mechanisms.push(previous_mechanism);
-            self.retired_allocator_teardown
-                .push(Arc::clone(&previous.allocator_teardown_complete));
-        }
-        self.allocation_domain.memory = CudaMemory::Injected(memory);
-        Ok(self)
     }
 
     /// Construct and initialize a CUDA execution provider with default settings.
@@ -3856,15 +3769,14 @@ impl CudaExecutionProvider {
             );
         }
         let manager = self.allocation_domain.memory_binding.manager.downgrade();
-        let mut mechanisms = self.retired_memory_mechanisms.clone();
-        mechanisms.push(self.allocation_domain.memory_binding.mechanism.clone());
-        let mut allocator_teardown = self.retired_allocator_teardown.clone();
-        allocator_teardown.push(Arc::clone(
+        let mechanism = self.allocation_domain.memory_binding.mechanism.clone();
+        let mut mechanism_removed = false;
+        let allocator_teardown = Arc::clone(
             &self
                 .allocation_domain
                 .memory_binding
                 .allocator_teardown_complete,
-        ));
+        );
         let holder = self.allocation_domain.memory_binding.holder.clone();
         let context = self.allocation_domain.memory_binding.context.clone();
         let authority = self.allocation_domain.memory_binding.authority.clone();
@@ -3872,52 +3784,36 @@ impl CudaExecutionProvider {
             let Some(manager) = manager.upgrade() else {
                 return true;
             };
-            let mut retry = false;
-            let mut retained = false;
-            mechanisms.retain(|mechanism| match manager.remove_mechanism(mechanism) {
-                Ok(()) => false,
-                Err(AllocationTransactionError::Binding(BindingError::UnregisteredMechanism(
-                    _,
-                ))) => false,
-                Err(AllocationTransactionError::Binding(BindingError::InactiveMechanism {
-                    ..
-                })) => {
-                    retry = true;
-                    true
-                }
-                Err(
-                    error @ AllocationTransactionError::Binding(
+            if !mechanism_removed {
+                match manager.remove_mechanism(&mechanism) {
+                    Ok(())
+                    | Err(AllocationTransactionError::Binding(
+                        BindingError::UnregisteredMechanism(_),
+                    )) => mechanism_removed = true,
+                    Err(AllocationTransactionError::Binding(
+                        BindingError::InactiveMechanism { .. },
+                    )) => return false,
+                    Err(error @ AllocationTransactionError::Binding(
                         BindingError::QuarantinedOwnership { quarantined, .. },
-                    ),
-                ) => {
-                    LAST_ALLOCATOR_RELEASE_QUARANTINED
-                        .fetch_max(quarantined as u64, Ordering::AcqRel);
-                    eprintln!(
-                        "cuda_ep: WARNING: CUDA memory mechanism teardown remains pinned by \
-                         quarantined ownership: {error}"
-                    );
-                    retained = true;
-                    true
+                    )) => {
+                        LAST_ALLOCATOR_RELEASE_QUARANTINED
+                            .fetch_max(quarantined as u64, Ordering::AcqRel);
+                        eprintln!(
+                            "cuda_ep: WARNING: CUDA memory mechanism teardown remains pinned by \
+                             quarantined ownership: {error}"
+                        );
+                        return true;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "cuda_ep: WARNING: could not remove a CUDA memory mechanism after queue \
+                             drain: {error}"
+                        );
+                        return true;
+                    }
                 }
-                Err(error) => {
-                    eprintln!(
-                        "cuda_ep: WARNING: could not remove a CUDA memory mechanism after queue \
-                         drain: {error}"
-                    );
-                    retained = true;
-                    true
-                }
-            });
-            if retry {
-                return false;
             }
-            if retained {
-                return true;
-            }
-            if allocator_teardown
-                .iter()
-                .any(|complete| !complete.load(Ordering::Acquire))
-            {
+            if !allocator_teardown.load(Ordering::Acquire) {
                 // The provider/binding still owns an allocator. Its destructor
                 // may enqueue reservation teardown, so keep the authority and
                 // process delegation pinned until a later post-drop idle pass.
@@ -5083,11 +4979,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         };
         let binding_identity = ownership.owner().identity().binding();
         let known_mechanism = binding_identity.mechanism()
-            == self.allocation_domain.memory_binding.mechanism.identity()
-            || self
-                .retired_memory_mechanisms
-                .iter()
-                .any(|mechanism| mechanism.identity() == binding_identity.mechanism());
+            == self.allocation_domain.memory_binding.mechanism.identity();
         if binding_identity.provider_context()
             != self.allocation_domain.memory_binding.context.identity()
             || !known_mechanism
@@ -6935,7 +6827,7 @@ extern "C" __global__ void spin_delay(long long spin) {
             "the diagnostic must state the documented capability boundary: {message}"
         );
         assert!(
-            message.contains("with_memory"),
+            message.contains("CudaProviderConfig::memory"),
             "the diagnostic must point at the supported way to run without the built-in \
              mechanism: {message}"
         );
@@ -6959,6 +6851,20 @@ extern "C" __global__ void spin_delay(long long spin) {
             with.contains("managed no-spill"),
             "the diagnostic must say which promise the limit belongs to: {with}"
         );
+    }
+
+    #[test]
+    fn construction_refuses_foreign_allocator_before_loading_cuda() {
+        let error = CudaExecutionProvider::from_config(
+            0,
+            CudaProviderConfig {
+                memory: Some(Arc::new(onnx_runtime_memory_api::HostAllocator)),
+                ..Default::default()
+            },
+        )
+        .expect_err("host memory must fail before attempting CUDA initialization");
+        assert!(error.to_string().contains("serves Host"), "{error}");
+        assert!(error.to_string().contains("CUDA device 0"), "{error}");
     }
 
     /// Criterion 4, on the axes that do not need a GPU. An injected mechanism
@@ -6986,32 +6892,6 @@ extern "C" __global__ void spin_delay(long long spin) {
             reject_foreign_device(0, onnx_runtime_memory_api::DeviceKey::device(0)).is_none(),
             "the matching device must be accepted, or injection is refused for everyone and \
              criterion 4 is met vacuously"
-        );
-    }
-
-    /// Both axes are load-bearing. `served` alone would miss an arena that
-    /// committed memory outside the provider's own counters, and `committed`
-    /// alone would miss an injected mechanism, which has no arena to ask.
-    #[test]
-    fn replacing_a_mechanism_that_already_served_memory_is_refused_on_both_axes() {
-        assert!(
-            reject_live_mechanism_replacement(0, 0, 0).is_none(),
-            "a fresh provider must accept injection, or the guard refuses everything"
-        );
-        let by_allocations = reject_live_mechanism_replacement(0, 1, 0)
-            .expect("an allocation was served, so the mechanism cannot be swapped")
-            .to_string();
-        assert!(
-            by_allocations.contains("served 1 allocation(s)"),
-            "the refusal must report what is outstanding: {by_allocations}"
-        );
-        let by_commitment = reject_live_mechanism_replacement(0, 0, 2 << 20)
-            .expect("the arena has memory mapped, so the mechanism cannot be swapped")
-            .to_string();
-        assert!(
-            by_commitment.contains("2097152 bytes committed"),
-            "the refusal must report committed bytes even when no allocation was counted: \
-             {by_commitment}"
         );
     }
 
