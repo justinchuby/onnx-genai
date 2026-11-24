@@ -2483,40 +2483,6 @@ fn causal_conv_opset29_infers_and_checks_dilated_history() {
         assert!(wrong_version.contains("opset 29"), "{wrong_version}");
     }
 
-    #[test]
-    fn causal_conv_opset29_checks_known_history_with_symbolic_kernel() {
-        let causal = with_attr(
-            node("CausalConvWithState", 4, 2),
-            "dilation",
-            Attribute::Int(3),
-        );
-        let inputs = |history| {
-            vec![
-                f32in(vec![c(2), c(4), c(0)]),
-                f32in(vec![c(4), c(1), sym(7)]),
-                f32in(vec![c(4)]),
-                f32in(vec![c(2), c(4), c(history)]),
-            ]
-        };
-        for history in [0, 9] {
-            let output = run(&causal, inputs(history), 29);
-            assert_eq!(
-                output[1].type_info.as_ref().unwrap().shape,
-                vec![c(2), c(4), c(history)]
-            );
-        }
-        for (history, expected) in [
-            (-3, "nonnegative multiple of dilation"),
-            (4, "nonnegative multiple of dilation"),
-            (i64::MAX, "exceeds int64"),
-        ] {
-            let error = try_run(&causal, inputs(history), 29)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(expected), "{error}");
-        }
-    }
-
     let causal = with_attr(
         node("CausalConvWithState", 2, 2),
         "dilation",
@@ -2533,6 +2499,40 @@ fn causal_conv_opset29_infers_and_checks_dilated_history() {
             .shape,
         vec![c(1), c(1), c(0)]
     );
+}
+
+#[test]
+fn causal_conv_opset29_checks_known_history_with_symbolic_kernel() {
+    let causal = with_attr(
+        node("CausalConvWithState", 4, 2),
+        "dilation",
+        Attribute::Int(3),
+    );
+    let inputs = |history| {
+        vec![
+            f32in(vec![c(2), c(4), c(0)]),
+            f32in(vec![c(4), c(1), sym(7)]),
+            f32in(vec![c(4)]),
+            f32in(vec![c(2), c(4), c(history)]),
+        ]
+    };
+    for history in [0, 9] {
+        let output = run(&causal, inputs(history), 29);
+        assert_eq!(
+            output[1].type_info.as_ref().unwrap().shape,
+            vec![c(2), c(4), c(history)]
+        );
+    }
+    for (history, expected) in [
+        (-3, "nonnegative multiple of dilation"),
+        (4, "nonnegative multiple of dilation"),
+        (i64::MAX, "exceeds int64"),
+    ] {
+        let error = try_run(&causal, inputs(history), 29)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
 }
 
 #[test]
