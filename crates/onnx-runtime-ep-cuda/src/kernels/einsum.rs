@@ -18,8 +18,8 @@ use std::time::Instant;
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
     CaptureSupport, DeviceGraphResource, EpError, Kernel, KernelFactory, OutputMetadata, Result,
-    TensorMetadata, TensorMut, TensorView, ViewOutput, WorkspaceLayout, WorkspacePreparation,
-    WorkspaceRequirement, WorkspaceView,
+    TensorMetadata, TensorMut, TensorView, ViewOutput, WorkspaceExecutionPreparation,
+    WorkspaceLayout, WorkspacePreparation, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{
     DataType, DeviceId, EinsumContractionPlan, EinsumInput, EinsumOperandPlan,
@@ -35,7 +35,7 @@ use crate::blas::{
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 pub use plan::CudaEinsumRoute;
-use plan::{CudaEinsumPlan, CudaEinsumRecipe, RequestedRoute};
+use plan::{CudaEinsumPlan, CudaEinsumProgram, CudaEinsumRecipe, RequestedRoute};
 
 /// Counters proving which CUDA Einsum route executed and what persistent state
 /// it established. Values are process-global diagnostics, so GPU tests serialize
@@ -993,6 +993,7 @@ impl ArithmeticExecutionSnapshot {
                 kind: ExecutionKind::Gemm(gemm),
                 ..
             }) => blas::governed_workspace_requirement(gemm.workspace_bytes()),
+            ArithmeticExecution::Semantic(plan) => plan.requirement(),
             _ => WorkspaceRequirement::NONE,
         }
     }
@@ -1000,12 +1001,6 @@ impl ArithmeticExecutionSnapshot {
         match &self.execution {
             ArithmeticExecution::Direct(_) => Vec::new(),
             ArithmeticExecution::Semantic(plan) => plan.resources(),
-        }
-    }
-    fn require_capture_resources(&self, runtime: &CudaRuntime) -> Result<()> {
-        match &self.execution {
-            ArithmeticExecution::Direct(_) => Ok(()),
-            ArithmeticExecution::Semantic(plan) => plan.require_capture_resources(runtime),
         }
     }
 }
@@ -1021,16 +1016,30 @@ enum PreparedArithmetic {
         snapshot: Box<ArithmeticExecutionSnapshot>,
         setup_ns: u64,
     },
-    Semantic {
+    SemanticRecipe {
         request: ArithmeticRequest,
-        signature: ArithmeticExecutionSignature,
+        recipe: Box<CudaEinsumRecipe>,
+        setup_ns: u64,
+    },
+    SemanticProgram {
+        request: ArithmeticRequest,
+        program: Box<CudaEinsumProgram>,
         setup_ns: u64,
     },
 }
 impl PreparedArithmetic {
     fn setup_ns(&self) -> u64 {
         match self {
-            Self::Direct { setup_ns, .. } | Self::Semantic { setup_ns, .. } => *setup_ns,
+            Self::Direct { setup_ns, .. }
+            | Self::SemanticRecipe { setup_ns, .. }
+            | Self::SemanticProgram { setup_ns, .. } => *setup_ns,
+        }
+    }
+    fn set_setup_ns(&mut self, value: u64) {
+        match self {
+            Self::Direct { setup_ns, .. }
+            | Self::SemanticRecipe { setup_ns, .. }
+            | Self::SemanticProgram { setup_ns, .. } => *setup_ns = value,
         }
     }
     fn matches(
@@ -1044,17 +1053,29 @@ impl PreparedArithmetic {
             Self::Direct { snapshot, .. } => Ok(snapshot
                 .mismatch_reason(request, eligibility, signature, pointers)?
                 .is_none()),
-            Self::Semantic {
+            Self::SemanticRecipe {
                 request: prepared,
-                signature: previous,
+                recipe,
                 ..
-            } => Ok(*prepared == request && *previous == *signature),
+            } => Ok(*prepared == request && recipe.matches(signature)),
+            Self::SemanticProgram {
+                request: prepared,
+                program,
+                ..
+            } => Ok(*prepared == request && program.matches(signature)),
         }
     }
-    fn requirement(&self) -> WorkspaceRequirement {
+    fn preparation(&self) -> WorkspaceExecutionPreparation {
         match self {
-            Self::Direct { snapshot, .. } => snapshot.requirement(),
-            Self::Semantic { .. } => WorkspaceRequirement::NONE,
+            Self::Direct { snapshot, .. } => {
+                WorkspaceExecutionPreparation::Ready(snapshot.requirement())
+            }
+            Self::SemanticRecipe { recipe, .. } => {
+                WorkspaceExecutionPreparation::Bind(recipe.prefix_requirement())
+            }
+            Self::SemanticProgram { program, .. } => {
+                WorkspaceExecutionPreparation::Ready(program.requirement())
+            }
         }
     }
 }
@@ -1481,21 +1502,44 @@ impl EinsumKernel {
             },
             EinsumRouteOverride::GenericNative | EinsumRouteOverride::Optimized => None,
         };
-        let setup_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        state.prepared = Some(match direct {
+        let mut prepared = match direct {
             Some(cached) => PreparedArithmetic::Direct {
                 snapshot: Box::new(ArithmeticExecutionSnapshot {
                     request,
                     execution: ArithmeticExecution::Direct(cached),
                 }),
-                setup_ns,
+                setup_ns: 0,
             },
-            None => PreparedArithmetic::Semantic {
-                request,
-                signature: signature.clone(),
-                setup_ns,
-            },
-        });
+            None => {
+                let requested = match request.route {
+                    EinsumRouteOverride::Auto => RequestedRoute::Auto,
+                    EinsumRouteOverride::GenericNative => RequestedRoute::GenericNative,
+                    EinsumRouteOverride::Optimized => RequestedRoute::Optimized,
+                    EinsumRouteOverride::CudaCublas => return Err(EpError::KernelFailed("cuda_ep Einsum: forced cuBLASLt lost its prepared host plan; repeat actual-view refinement".into())),
+                };
+                let recipe = CudaEinsumRecipe::build(
+                    Arc::clone(&self.plan),
+                    signature.clone(),
+                    requested,
+                    request.memory_ceiling_bytes,
+                )?;
+                if recipe.needs_binding() {
+                    PreparedArithmetic::SemanticRecipe {
+                        request,
+                        recipe: Box::new(recipe),
+                        setup_ns: 0,
+                    }
+                } else {
+                    PreparedArithmetic::SemanticProgram {
+                        request,
+                        program: Box::new(recipe.prepare_algorithms(&self.runtime, None)?),
+                        setup_ns: 0,
+                    }
+                }
+            }
+        };
+        prepared.set_setup_ns(start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        state.prepared = Some(prepared);
         Ok(false)
     }
 
@@ -1505,16 +1549,18 @@ impl EinsumKernel {
         outputs: &[TensorMut],
         route: EinsumRouteOverride,
         memory_ceiling_bytes: u128,
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<WorkspaceExecutionPreparation> {
         let result = (|| {
             self.validate_common(inputs, outputs)?;
             if route == EinsumRouteOverride::Auto && self.is_view_dispatch(inputs, outputs) {
-                return Ok(WorkspaceRequirement::NONE);
+                return Ok(WorkspaceExecutionPreparation::Ready(
+                    WorkspaceRequirement::NONE,
+                ));
             }
             let signature = self.semantic_signature(inputs, &outputs[0])?;
             let eligibility = self.direct_route_eligibility(inputs, &outputs[0], signature.clone());
             let mut state = self.arithmetic_execution.lock().map_err(|_| {
-                EpError::KernelFailed("cuda_ep Einsum: arithmetic preparation lock poisoned".into())
+                EpError::KernelFailed("cuda_ep Einsum: arithmetic preparation lock poisoned; inspect the prior panic and recreate the kernel".into())
             })?;
             let hit = self.ensure_arithmetic_prepared(
                 &mut state,
@@ -1527,9 +1573,11 @@ impl EinsumKernel {
                 &eligibility,
             )?;
             Ok(if hit {
-                state.published.as_ref().unwrap().requirement()
+                WorkspaceExecutionPreparation::Ready(
+                    state.published.as_ref().unwrap().requirement(),
+                )
             } else {
-                state.prepared.as_ref().unwrap().requirement()
+                state.prepared.as_ref().unwrap().preparation()
             })
         })();
         if result.is_err() {
@@ -1538,28 +1586,52 @@ impl EinsumKernel {
         result
     }
 
-    fn build_semantic_execution(
+    fn prepare_bound_workspace(
         &self,
-        request: ArithmeticRequest,
-        signature: &ArithmeticExecutionSignature,
-    ) -> Result<ArithmeticExecutionSnapshot> {
-        let requested = match request.route {
-            EinsumRouteOverride::Auto => RequestedRoute::Auto,
-            EinsumRouteOverride::GenericNative => RequestedRoute::GenericNative,
-            EinsumRouteOverride::Optimized => RequestedRoute::Optimized,
-            EinsumRouteOverride::CudaCublas => return Err(EpError::KernelFailed("cuda_ep Einsum: forced cuBLASLt lost its prepared host plan; repeat actual-view refinement".into())),
-        };
-        let recipe = CudaEinsumRecipe::build(
-            Arc::clone(&self.plan),
-            signature.clone(),
-            requested,
-            request.memory_ceiling_bytes,
-        )?;
-        let plan = recipe.bind_private_workspace(&self.runtime)?;
-        Ok(ArithmeticExecutionSnapshot {
-            request,
-            execution: ArithmeticExecution::Semantic(plan),
-        })
+        prefix: Option<WorkspaceView>,
+    ) -> Result<WorkspaceRequirement> {
+        let result = (|| {
+            if self.runtime.capture_active() {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep Einsum `{}`: cannot select a cold bound algorithm while recording; abort capture and eagerly prepare the exact workspace first",
+                    self.plan.equation()
+                )));
+            }
+            let mut state = self.arithmetic_execution.lock().map_err(|_| {
+                EpError::KernelFailed(
+                    "cuda_ep Einsum: bound preparation lock poisoned; recreate the kernel".into(),
+                )
+            })?;
+            if !matches!(
+                state.prepared,
+                Some(PreparedArithmetic::SemanticRecipe { .. })
+            ) {
+                return Err(EpError::KernelFailed("cuda_ep Einsum: no staged semantic recipe awaits a prefix; repeat actual-view preparation before binding workspace".into()));
+            }
+            let PreparedArithmetic::SemanticRecipe {
+                request,
+                recipe,
+                setup_ns,
+            } = state.prepared.take().unwrap()
+            else {
+                unreachable!()
+            };
+            let start = Instant::now();
+            let program = recipe.prepare_algorithms(&self.runtime, prefix)?;
+            let requirement = program.requirement();
+            let setup_ns = setup_ns
+                .saturating_add(start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+            state.prepared = Some(PreparedArithmetic::SemanticProgram {
+                request,
+                program: Box::new(program),
+                setup_ns,
+            });
+            Ok(requirement)
+        })();
+        if result.is_err() {
+            self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        }
+        result
     }
 
     fn run_arithmetic(
@@ -1594,7 +1666,7 @@ impl EinsumKernel {
             &direct_eligibility,
         )?;
         let start = Instant::now();
-        let candidate = if cache_hit {
+        let mut candidate = if cache_hit {
             PLAN_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             None
         } else {
@@ -1605,24 +1677,21 @@ impl EinsumKernel {
             let setup_ns = staged.setup_ns();
             let snapshot = match staged {
                 PreparedArithmetic::Direct { snapshot, .. } => *snapshot,
-                PreparedArithmetic::Semantic { .. } => {
-                    self.build_semantic_execution(request, &signature)?
-                }
+                PreparedArithmetic::SemanticProgram { program, .. } => ArithmeticExecutionSnapshot { request, execution: ArithmeticExecution::Semantic(program.into_plan()) },
+                PreparedArithmetic::SemanticRecipe { .. } => return Err(EpError::KernelFailed("cuda_ep Einsum: semantic plan needs an admitted prefix before execution; resolve the Bind preparation through the caller workspace owner".into())),
             };
             Some((snapshot, setup_ns))
         };
         let prepared = if cache_hit {
-            state.published.as_ref()
+            state.published.as_mut()
         } else {
-            candidate.as_ref().map(|(snapshot, _)| snapshot)
+            candidate.as_mut().map(|(snapshot, _)| snapshot)
         }
         .expect("an existing or staged arithmetic snapshot is present");
-        if capturing {
-            prepared.require_capture_resources(&self.runtime)?;
-        }
+        let mut semantic_rebound = false;
 
         let (route, workspace_bytes, workspace_ptr, metadata_bytes, capture_launches) =
-            match &prepared.execution {
+            match &mut prepared.execution {
                 ArithmeticExecution::Direct(cached) => {
                     signature
                         .validate_device_ownership(self.expected_device(), self.plan.equation())?;
@@ -1692,11 +1761,12 @@ impl EinsumKernel {
                     )
                 }
                 ArithmeticExecution::Semantic(plan) => {
-                    plan.launch(
+                    semantic_rebound = plan.launch(
                         &self.runtime,
                         self.expected_device(),
                         self.plan.equation(),
                         &signature,
+                        workspace,
                     )?;
                     let summary = plan.summary();
                     match summary.route {
@@ -1736,6 +1806,13 @@ impl EinsumKernel {
             let execution_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
             SETUP_NS_LAST.store(
                 preparation_ns.saturating_add(execution_ns),
+                Ordering::Relaxed,
+            );
+        }
+        if cache_hit && semantic_rebound {
+            PLAN_REWARMS.fetch_add(1, Ordering::Relaxed);
+            SETUP_NS_LAST.store(
+                start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
                 Ordering::Relaxed,
             );
         }
@@ -2086,7 +2163,13 @@ impl Kernel for EinsumKernel {
             EinsumRouteOverride::Auto,
             plan::DEFAULT_MEMORY_CEILING_BYTES,
         )
-        .map(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready)
+    }
+
+    fn workspace_requirement_for_bound_execution(
+        &self,
+        workspace: Option<WorkspaceView>,
+    ) -> Result<WorkspaceRequirement> {
+        self.prepare_bound_workspace(workspace)
     }
 
     fn view_outputs(
@@ -2187,7 +2270,7 @@ impl Kernel for EinsumKernel {
             | EinsumPlanningClassification::ReductionOrElementwise(_) => {
                 CaptureSupport::unsupported(format!(
                     "Einsum `{}` must warm its exact arithmetic route, dtype/shape/stride/address \
-                     signature, and private resources before capture",
+                     signature, caller workspace binding and immutable metadata before capture; resolve its workspace preparation and execute eagerly before recording",
                     self.plan.equation()
                 ))
             }
@@ -2257,7 +2340,7 @@ pub fn einsum_workspace_requirement_for_route(
     outputs: &[TensorMut],
     route: EinsumRouteOverride,
     memory_ceiling_bytes: Option<u128>,
-) -> Result<WorkspaceRequirement> {
+) -> Result<WorkspaceExecutionPreparation> {
     let kernel = kernel
         .as_any()
         .downcast_ref::<EinsumKernel>()

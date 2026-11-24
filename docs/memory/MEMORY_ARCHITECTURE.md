@@ -1089,10 +1089,10 @@ prefix/final growth, retryable preparation failures, refused final admission,
 consuming cleanup, warm zero issuer callbacks and final physical settlement.
 The ORT bridge keeps its existing conservative policy: any Compute error retires
 that state; retry uses a new state. The resolver does not weaken retirement.
-The seam itself does not migrate semantic Einsum scratch; its producer still
-needs actual bound BLAS planning and final-address metadata publication.
+Semantic Einsum now consumes this seam as described below; the common resolver
+contains no operator/EP identity checks or separate resource owner.
 
-### Einsum direct GEMM borrows caller scratch
+### Einsum direct and multi-step programs borrow caller scratch
 
 Einsum now refines Deferred requirements from actual input/output addresses before
 admission. Direct cuBLASLt candidates contain host descriptors only; the exact
@@ -1103,19 +1103,47 @@ published snapshot remains owned if candidate preparation or launch fails. Warm
 reuse neither replans nor allocates private direct scratch. Empty/zero-fill direct
 cases require no scratch.
 
-The semantic multi-step route is **not migrated**: its arithmetic and BLAS scratch
-still use private owners, and its caller requirement NONE describes only that
-current API behavior. `CudaEinsumRecipe` separates pure host tree/slot planning from
-the bound device snapshot. Full migration must connect that recipe to the
-canonical Bind phase: obtain actual arithmetic addresses, select ActualAddress BLAS plans,
-admit the serial BLAS tail, and revalidate address contracts after any relocation.
-No fabricated scratch pointer, TypedMinimum substitution or blind workspace upper
-bound closes that gap. Immutable metadata and installed graph pins must be formed
-only from the final binding.
+Multi-step preparation builds a pure `CudaEinsumRecipe`. Programs with optional
+BLAS steps return Bind for the exact arithmetic prefix. Only after that real
+prefix is admitted are ActualAddress algorithms selected. One checked composite
+contains the arithmetic slots and the maximum serial BLAS tail, with padding
+included in the memory-ceiling check. Algorithms that exceed the existing
+workspace ceiling still use the original generic-step fallback; admission or
+binding failure never becomes an algorithm fallback. Programs without BLAS
+candidates already know their complete requirement and return Ready directly.
+Accepted empty outputs retain route/ceiling validation but have no arithmetic
+slots, metadata artifact or launch steps. A zero prefix never allocates a
+placeholder. No fictional scratch address,
+TypedMinimum proof or blind fixed-size reservation participates in selection.
 
-Host tests cover exact direct-span refusal and pure recipe tree/ceiling selection.
-Device fixtures compile caller reuse and real-pin capture/replay lifetimes, but no
-CUDA device was available to execute them or measure inference overhead.
+The host Program owns no scratch. Its immutable shape/slot recipe and selected
+BLAS plans are independent of a final-address snapshot. Arithmetic base and every
+slot offset are aligned to the shared BLAS workspace alignment. Compile-time
+assertions require this alignment to be a power-of-two multiple of the BLAS
+ActualAddress reporting cap. A moved final owner therefore preserves the scratch
+alignment proof; final parameters are rebuilt and every selected plan's supports
+contract is checked before the first metadata upload or device submission.
+
+The snapshot binds only the actual used span, not retained arena capacity. A
+larger fitting view does not rebuild metadata. Changing the caller base eagerly
+builds a candidate snapshot from the same host Program and publishes it only
+after successful execution; failure preserves the old snapshot and revokes
+capture-ready. An installed graph independently retains its old immutable
+metadata owner. Recording requires an exact warmed binding, its complete real
+caller-span pin, and any immutable metadata pins; mismatch fails before upload
+or launch. Arithmetic and BLAS scratch have no private pool, slot or owner.
+Only immutable address-bearing metadata remains a private device artifact.
+
+Warm calls return Ready and neither reselect algorithms, encode metadata, upload
+nor allocate private scratch. The existing setup timing includes preparation and
+final binding, while a metadata-only rebind counts as a rewarm without another
+host Program build. Host tests cover composite overflow/padding/alignment,
+zero-demand geometry, real-used-span identity and final-origin metadata encoding.
+Compiled device probes cover caller admission failure, missing/short backing,
+warm allocation/transfer stability, dirty-scratch replay, transactional rebind,
+recording refusal, graph ownership after original caller retirement and final
+physical settlement. No CUDA hardware was available to execute these probes;
+GPU numerics, NVRTC, capture/lifetime behavior and performance remain unmeasured.
 
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
@@ -1159,6 +1187,8 @@ call; it owns the governed workspace preparation path
 | `kernels/group_query_attention.rs` `gqa_transpose_scratch` + `gqa_workspace_layout` (`WS_Q_BNSH` / `WS_OUT_BNSH`) | `GroupQueryAttention` Q/output BNSH transpose scratch | Q: `align256(B·sq·num_heads·head_dim·elem)` when `sq>1`, packed input, or RoPE; output: the same aligned bytes only when `sq>1` | prompt/dtype/route dependent | session-persistent | **governed by #736** in the existing GQA composite; unpacked non-RoPE `sq==1` uses Q/output directly and charges `NONE` absent another region; packed `sq==1` overlays Q extraction with packed-Q staging |
 | `kernels/group_query_attention.rs` `GqaWorkspace::reserve` | `GroupQueryAttention` remaining pooled slots (present K/V / metadata) | slot-specific `bytes.max(1)` | cache/batch dependent, then reused | session-persistent growable state | raw bypass; scores, packed Q/K/V staging, and BNSH transpose slots are excluded — carved from the prepared composite on governed execution |
 | `kernels/index_share.rs:708` | `pkg.nxrt::IndexShare` selected-token attention workspace | aligned sum of reachable present staging, `B * q_heads * q_seq * selected_width * 4`, and optional `2 * B * sizeof(i64)` | prompt/cache dependent | session-persistent | **governed by #751** via `workspace_requirement` + prepared workspace |
+| `kernels/einsum.rs`, `einsum/plan.rs` | direct and multilinear arithmetic/BLAS temporary regions | exact direct plan or checked arithmetic prefix plus max serial BLAS tail | shape/dtype/actual-address algorithm | SessionPersistent shared caller peak | Ready or one bound prefix phase; actual used-span capture pin; no private scratch owner |
+| `kernels/einsum/plan.rs` | immutable final-address launch metadata | exact encoded generic-step program | complete I/O identity and final used-span binding | independently pinned immutable device artifact | fresh candidate published only after successful execution; installed graphs retain older metadata |
 | `kernels/index_transform.rs` | CenterCropPad/Col2Im descriptors | respectively `4 * rank * 8` and `6 * control_elements * 8` | input rank / checked image-shape control length | SessionPersistent caller peak | complete bind before existing D2H; exact borrowed upload |
 | `kernels/indexing.rs` | ScatterElements/ScatterND mean accumulator state | `data_numel * (16 or 24)` | output shape/dtype dependent | session-persistent shared caller peak | governed metadata requirement; real used-span capture pin; no private scratch owner |
 | `kernels/indexing.rs` metadata caches | shape/indexing descriptors | `bytes.len().max(1)` | op/rank/shape dependent | shape-keyed persistent metadata artifact | existing raw artifact owner and capture pin; separate from disposable mean state |

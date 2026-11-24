@@ -383,7 +383,7 @@ pub struct GemmEpilogue {
 /// Phase 2b: pool this per-stream instead of allocating it per call.
 pub const WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 pub const WORKSPACE_ALIGNMENT: usize = 256;
-const MAX_REPORTED_POINTER_ALIGNMENT: u32 = 256;
+pub(crate) const MAX_REPORTED_POINTER_ALIGNMENT: u32 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MatmulPointers {

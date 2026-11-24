@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use cudarc::driver::LaunchConfig;
 use cudarc::driver::sys::CUdeviceptr;
-use onnx_runtime_ep_api::{DeviceGraphResource, EpError, Result};
+use onnx_runtime_ep_api::{
+    DeviceGraphResource, DevicePtrMut, EpError, Result, WorkspaceLifetime, WorkspaceRequirement,
+    WorkspaceView,
+};
 use onnx_runtime_ir::{
     DataType, DeviceId, EinsumAxis, EinsumBinaryContractionPlan, EinsumContractionTreeStep,
     EinsumOperandPlan, EinsumPlannerQuality, EinsumPrecisionPolicy, EinsumShapePlan,
@@ -19,7 +22,13 @@ use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, GraphDeviceAllocation, RawCudaFunction};
 
 const BLOCK: u32 = 256;
-const WORKSPACE_ALIGNMENT: usize = 256;
+const WORKSPACE_ALIGNMENT: usize = blas::WORKSPACE_ALIGNMENT;
+// ActualAddress heuristics observe scratch alignment only up to this cap.
+// A relocated prefix and every fixed slot therefore preserve the same proof.
+const _: () = assert!(blas::MAX_REPORTED_POINTER_ALIGNMENT.is_power_of_two());
+const _: () = assert!(WORKSPACE_ALIGNMENT.is_power_of_two());
+const _: () =
+    assert!(WORKSPACE_ALIGNMENT.is_multiple_of(blas::MAX_REPORTED_POINTER_ALIGNMENT as usize));
 pub(super) const DEFAULT_MEMORY_CEILING_BYTES: u128 = 64 * 1024 * 1024;
 
 const SOURCE: &str = r#"
@@ -329,7 +338,6 @@ enum PreparedLaunch {
         config: LaunchConfig,
     },
     Cublas {
-        plan: CaptureStridedBatchedGemmPlan,
         params: StridedBatchedGemmParams,
     },
 }
@@ -344,26 +352,95 @@ pub(super) struct CudaEinsumPlanSummary {
     pub cublas_launches: usize,
 }
 
-/// Immutable, exact-signature CUDA execution snapshot.
-///
-/// All device pointers embedded in the launch metadata, all workspace storage,
-/// the loaded kernel function, and launch geometry are installed atomically
-/// after a successful warm execution. CUDA graph recording can therefore only
-/// reuse this exact snapshot and retains every private allocation through
-/// [`DeviceGraphResource`] owners.
+/// One host algorithm program plus its last successfully executed binding.
+/// Scratch belongs exclusively to the caller; only immutable address-bearing
+/// metadata has a private device owner, independently pinned by installed graphs.
 pub(super) struct CudaEinsumPlan {
-    signature: ArithmeticExecutionSignature,
-    requested: RequestedRoute,
-    memory_ceiling_bytes: u128,
-    route: CudaEinsumRoute,
-    planner_quality: Option<EinsumPlannerQuality>,
+    program: CudaEinsumProgram,
+    binding: Option<BoundExecution>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BindingKey {
+    base: CUdeviceptr,
+    used_bytes: usize,
+}
+
+struct BoundExecution {
+    key: BindingKey,
     function: Option<RawCudaFunction>,
     launches: Vec<PreparedLaunch>,
     metadata: Option<Arc<GraphDeviceAllocation>>,
-    workspace: Option<Arc<GraphDeviceAllocation>>,
-    cublas_workspace: Option<Arc<GraphDeviceAllocation>>,
-    workspace_bytes: usize,
     metadata_bytes: usize,
+}
+
+/// Host-only, actual-address-selected algorithms. This type owns no scratch or
+/// immutable device metadata and does not need Sync or another lock/cache.
+pub(super) struct CudaEinsumProgram {
+    recipe: CudaEinsumRecipe,
+    cublas: Vec<Option<CaptureStridedBatchedGemmPlan>>,
+    workspace: SemanticWorkspace,
+}
+
+#[derive(Clone, Copy)]
+struct SemanticWorkspace {
+    layout: onnx_runtime_ep_api::WorkspaceLayout<2>,
+}
+struct BoundWorkspace {
+    key: BindingKey,
+    arithmetic: CUdeviceptr,
+    cublas: CUdeviceptr,
+    used: WorkspaceView,
+}
+impl SemanticWorkspace {
+    fn new(arithmetic_bytes: usize, cublas_bytes: usize) -> Result<Self> {
+        let region = |bytes| {
+            std::alloc::Layout::from_size_align(bytes, if bytes == 0 { 1 } else { WORKSPACE_ALIGNMENT })
+                .map_err(|_| EpError::KernelFailed(format!("cuda_ep Einsum: workspace region {bytes} bytes exceeds addressable capacity; reduce the contraction")))
+        };
+        Ok(Self {
+            layout: onnx_runtime_ep_api::WorkspaceLayout::new([
+                region(arithmetic_bytes)?,
+                region(cublas_bytes)?,
+            ])?,
+        })
+    }
+    fn requirement(&self) -> WorkspaceRequirement {
+        WorkspaceRequirement {
+            bytes: self.layout.bytes() as u64,
+            alignment: WORKSPACE_ALIGNMENT,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+        }
+    }
+    fn bind(&self, offered: Option<WorkspaceView>) -> Result<BoundWorkspace> {
+        let [arithmetic, cublas] =
+            self.layout
+                .bind(offered)
+                .map_err(|source| EpError::Backend {
+                    operation: "bind Einsum semantic caller workspace",
+                    source: Box::new(source),
+                })?;
+        let used_bytes = self.layout.bytes();
+        let base = if used_bytes == 0 {
+            0
+        } else {
+            offered.expect("nonzero binding was checked above").ptr().0 as CUdeviceptr
+        };
+        Ok(BoundWorkspace {
+            key: BindingKey { base, used_bytes },
+            arithmetic: if arithmetic.bytes() == 0 {
+                0
+            } else {
+                arithmetic.ptr().0 as CUdeviceptr
+            },
+            cublas: if cublas.bytes() == 0 {
+                0
+            } else {
+                cublas.ptr().0 as CUdeviceptr
+            },
+            used: WorkspaceView::new(DevicePtrMut(base as *mut c_void), used_bytes),
+        })
+    }
 }
 
 pub(super) struct CudaEinsumRecipe {
@@ -409,7 +486,7 @@ impl CudaEinsumRecipe {
             None
         };
 
-        let (route, planner_quality, workspace_layout, step_specs) =
+        let (route, planner_quality, mut workspace_layout, mut step_specs) =
             if let Some((quality, candidate)) = selected {
                 let workspace_layout = workspace_layout(
                     semantic,
@@ -459,6 +536,13 @@ impl CudaEinsumRecipe {
                 )
             };
 
+        // ONNX empty outputs have no arithmetic consumers. Preserve route
+        // eligibility/ceiling validation above, but publish no scratch or
+        // metadata/device launches for an accepted empty result.
+        if signature.output.shape.contains(&0) {
+            workspace_layout = WorkspaceLayout::default();
+            step_specs.clear();
+        }
         Ok(Self {
             semantic: semantic_owner,
             signature,
@@ -473,106 +557,127 @@ impl CudaEinsumRecipe {
         })
     }
 
-    /// Still uses existing private arithmetic/BLAS backing. A future canonical
-    /// bound-workspace refinement must supply real scratch addresses before
-    /// these ActualAddress algorithms and immutable metadata can be installed.
-    pub(super) fn bind_private_workspace(
+    pub(super) fn matches(&self, signature: &ArithmeticExecutionSignature) -> bool {
+        self.signature == *signature
+    }
+
+    pub(super) fn needs_binding(&self) -> bool {
+        self.step_specs.iter().any(|step| step.gemm.is_some())
+    }
+
+    pub(super) fn prefix_requirement(&self) -> WorkspaceRequirement {
+        WorkspaceRequirement {
+            bytes: self.workspace_layout.bytes as u64,
+            alignment: WORKSPACE_ALIGNMENT,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+        }
+    }
+
+    /// The supplied prefix is real admitted storage. Only host descriptors are
+    /// created here; no allocation/upload or device submission is permitted.
+    pub(super) fn prepare_algorithms(
         self,
         runtime: &Arc<CudaRuntime>,
-    ) -> Result<CudaEinsumPlan> {
-        let Self {
-            semantic: semantic_owner,
-            signature,
-            requested,
-            memory_ceiling_bytes,
-            dtype,
-            arithmetic,
-            route,
-            planner_quality,
-            workspace_layout,
-            step_specs,
-        } = self;
-        let semantic = semantic_owner.as_ref();
-        runtime.require_nvrtc_half_headers("Einsum")?;
-        let workspace = if workspace_layout.bytes == 0 {
-            None
+        prefix: Option<WorkspaceView>,
+    ) -> Result<CudaEinsumProgram> {
+        let workspace_ptr = if self.needs_binding() {
+            SemanticWorkspace::new(self.workspace_layout.bytes, 0)?
+                .bind(prefix)?
+                .arithmetic
         } else {
-            let allocation = GraphDeviceAllocation::allocate(runtime, workspace_layout.bytes)?;
-            runtime.staged_warm_cache_mutation("Einsum workspace allocation")?;
-            Some(allocation)
+            0
         };
-        let workspace_ptr = workspace.as_ref().map_or(0, |allocation| allocation.ptr());
-        let mut planned_cublas = Vec::with_capacity(step_specs.len());
-        let mut cublas_workspace_bytes = 0usize;
-        for spec in &step_specs {
-            let planned = if let Some(gemm) = spec.gemm.as_ref() {
-                let params = StridedBatchedGemmParams {
-                    dtype: GemmDtype::F32,
-                    a: resolve_pointer(&gemm.left, workspace_ptr, &workspace_layout)?,
-                    b: resolve_pointer(&gemm.right, workspace_ptr, &workspace_layout)?,
-                    c: resolve_pointer(&gemm.output, workspace_ptr, &workspace_layout)?,
-                    m: gemm.m,
-                    k: gemm.k,
-                    n: gemm.n,
-                    batch: gemm.batch,
-                    transpose_a: gemm.transpose_left,
-                    transpose_b: gemm.transpose_right,
-                    a_batch_stride: gemm.left_batch_stride,
-                    b_batch_stride: gemm.right_batch_stride,
-                };
-                blas::plan_capture_strided_batched_gemm(runtime.blas(), &params)
-                    .ok()
-                    .map(|plan| (plan, params))
+        let mut cublas = Vec::with_capacity(self.step_specs.len());
+        let mut cublas_bytes = 0;
+        for spec in &self.step_specs {
+            let plan = if let Some(gemm) = &spec.gemm {
+                let params = gemm.params(workspace_ptr, &self.workspace_layout)?;
+                // Preserve optional BLAS selection. Binding/layout errors above
+                // are never converted into an algorithm fallback.
+                blas::plan_capture_strided_batched_gemm(runtime.blas(), &params).ok()
             } else {
                 None
             };
-            if let Some((plan, _)) = &planned {
-                cublas_workspace_bytes = cublas_workspace_bytes.max(plan.workspace_bytes());
+            if let Some(plan) = &plan {
+                cublas_bytes = cublas_bytes.max(plan.workspace_bytes());
             }
-            planned_cublas.push(planned);
+            cublas.push(plan);
         }
-        if cublas_workspace_bytes > WORKSPACE_BYTES
-            || (workspace_layout.bytes as u128).saturating_add(cublas_workspace_bytes as u128)
-                > memory_ceiling_bytes
-        {
-            planned_cublas.iter_mut().for_each(|plan| *plan = None);
-            cublas_workspace_bytes = 0;
-        }
-        let cublas_workspace = if cublas_workspace_bytes == 0 {
-            None
+        let workspace = if cublas_bytes > WORKSPACE_BYTES {
+            cublas.iter_mut().for_each(|plan| *plan = None);
+            SemanticWorkspace::new(self.workspace_layout.bytes, 0)?
         } else {
-            let allocation = GraphDeviceAllocation::allocate(runtime, cublas_workspace_bytes)?;
-            runtime.staged_warm_cache_mutation("Einsum cuBLASLt workspace allocation")?;
-            Some(allocation)
+            let candidate = SemanticWorkspace::new(self.workspace_layout.bytes, cublas_bytes)?;
+            if candidate.layout.bytes() as u128 > self.memory_ceiling_bytes {
+                cublas.iter_mut().for_each(|plan| *plan = None);
+                SemanticWorkspace::new(self.workspace_layout.bytes, 0)?
+            } else {
+                candidate
+            }
         };
         runtime.staged_warm_cache_mutation("Einsum cuBLASLt candidate selection")?;
+        Ok(CudaEinsumProgram {
+            recipe: self,
+            cublas,
+            workspace,
+        })
+    }
+}
+
+impl CudaEinsumProgram {
+    pub(super) fn matches(&self, signature: &ArithmeticExecutionSignature) -> bool {
+        self.recipe.matches(signature)
+    }
+    pub(super) fn requirement(&self) -> WorkspaceRequirement {
+        self.workspace.requirement()
+    }
+    pub(super) fn into_plan(self) -> CudaEinsumPlan {
+        CudaEinsumPlan {
+            program: self,
+            binding: None,
+        }
+    }
+
+    fn encode_binding(
+        &self,
+        workspace: &BoundWorkspace,
+    ) -> Result<(Vec<PreparedLaunch>, Vec<u64>)> {
+        let recipe = &self.recipe;
+        let semantic = recipe.semantic.as_ref();
         let mut metadata_words = Vec::new();
-        let mut launches = Vec::new();
-        for (spec, cublas) in step_specs.into_iter().zip(planned_cublas) {
-            if let (Some(_), Some((cublas, params))) = (spec.gemm.as_ref(), cublas) {
-                launches.push(PreparedLaunch::Cublas {
-                    plan: cublas,
-                    params,
-                });
+        let mut launches = Vec::with_capacity(recipe.step_specs.len());
+        // Validate every final-address BLAS proof and encode the entire host
+        // payload before the first device allocation, upload or launch.
+        for (spec, cublas) in recipe.step_specs.iter().zip(&self.cublas) {
+            if let Some(cublas) = cublas {
+                let gemm = spec
+                    .gemm
+                    .as_ref()
+                    .expect("BLAS plans only exist for GEMM specs");
+                let params = gemm.params(workspace.arithmetic, &recipe.workspace_layout)?;
+                if !cublas.supports(&params) {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep Einsum `{}`: final caller base {:#x} for {} used bytes (arithmetic {:#x}, BLAS {:#x}) does not preserve selected algorithm {:?}; restore the prefix alignment/offset contract and eagerly prepare the final binding before capture",
+                        semantic.equation(),
+                        workspace.key.base,
+                        workspace.key.used_bytes,
+                        workspace.arithmetic,
+                        workspace.cublas,
+                        cublas.algorithm_contract()
+                    )));
+                }
+                launches.push(PreparedLaunch::Cublas { params });
             } else {
-                let offset = metadata_words
-                    .len()
-                    .checked_mul(std::mem::size_of::<u64>())
-                    .ok_or_else(|| {
-                        EpError::KernelFailed(format!(
-                            "cuda_ep Einsum `{}`: metadata byte offset overflowed",
-                            semantic.equation()
-                        ))
-                    })?;
+                let metadata_offset_bytes = metadata_words.len().checked_mul(std::mem::size_of::<u64>()).ok_or_else(|| EpError::KernelFailed(format!("cuda_ep Einsum `{}`: metadata byte offset overflowed; reduce the contraction", semantic.equation())))?;
                 encode_step(
                     semantic,
-                    &spec,
-                    workspace_ptr,
-                    &workspace_layout,
+                    spec,
+                    workspace.arithmetic,
+                    &recipe.workspace_layout,
                     &mut metadata_words,
                 )?;
                 launches.push(PreparedLaunch::Generic {
-                    metadata_offset_bytes: offset,
+                    metadata_offset_bytes,
                     config: LaunchConfig {
                         grid_dim: (
                             spec.output_elements.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32,
@@ -585,12 +690,23 @@ impl CudaEinsumRecipe {
                 });
             }
         }
+        Ok((launches, metadata_words))
+    }
+
+    fn bind_execution(
+        &self,
+        runtime: &Arc<CudaRuntime>,
+        workspace: &BoundWorkspace,
+    ) -> Result<BoundExecution> {
+        let recipe = &self.recipe;
+        let semantic = recipe.semantic.as_ref();
+        let (launches, metadata_words) = self.encode_binding(workspace)?;
         let metadata_bytes = metadata_words
             .len()
             .checked_mul(std::mem::size_of::<u64>())
             .ok_or_else(|| {
                 EpError::KernelFailed(format!(
-                    "cuda_ep Einsum `{}`: metadata byte count overflowed",
+                    "cuda_ep Einsum `{}`: metadata byte count overflowed; reduce the contraction",
                     semantic.equation()
                 ))
             })?;
@@ -602,7 +718,7 @@ impl CudaEinsumRecipe {
                 .iter()
                 .flat_map(|word| word.to_ne_bytes())
                 .collect::<Vec<_>>();
-            // SAFETY: the fresh allocation exactly covers `bytes`.
+            // SAFETY: the fresh immutable owner covers this exact synchronous upload.
             unsafe { runtime.htod(&bytes, allocation.ptr()) }?;
             runtime.staged_warm_cache_mutation("Einsum metadata allocation/upload")?;
             Some(allocation)
@@ -611,36 +727,21 @@ impl CudaEinsumRecipe {
             .iter()
             .any(|launch| matches!(launch, PreparedLaunch::Generic { .. }))
         {
+            runtime.require_nvrtc_half_headers("Einsum")?;
             Some(runtime.nvrtc_raw_function(
-                arithmetic.module_key(dtype),
+                recipe.arithmetic.module_key(recipe.dtype),
                 SOURCE,
-                arithmetic.entry(),
+                recipe.arithmetic.entry(),
             )?)
         } else {
             None
         };
         runtime.staged_warm_cache_mutation("Einsum algorithm/function selection")?;
-
-        Ok(CudaEinsumPlan {
-            signature,
-            requested,
-            memory_ceiling_bytes,
-            route,
-            planner_quality,
+        Ok(BoundExecution {
+            key: workspace.key,
             function,
             launches,
             metadata,
-            workspace,
-            cublas_workspace,
-            workspace_bytes: workspace_layout
-                .bytes
-                .checked_add(cublas_workspace_bytes)
-                .ok_or_else(|| {
-                    EpError::KernelFailed(format!(
-                        "cuda_ep Einsum `{}`: aggregate workspace byte count overflowed",
-                        semantic.equation()
-                    ))
-                })?,
             metadata_bytes,
         })
     }
@@ -653,133 +754,135 @@ impl CudaEinsumPlan {
         memory_ceiling_bytes: u128,
         signature: &ArithmeticExecutionSignature,
     ) -> bool {
-        self.requested == requested
-            && self.memory_ceiling_bytes == memory_ceiling_bytes
-            && self.signature == *signature
+        let recipe = &self.program.recipe;
+        recipe.requested == requested
+            && recipe.memory_ceiling_bytes == memory_ceiling_bytes
+            && recipe.signature == *signature
     }
-
     pub(super) fn mismatch_reason(
         &self,
         signature: &ArithmeticExecutionSignature,
     ) -> Option<String> {
-        self.signature.mismatch_reason(signature)
+        self.program.recipe.signature.mismatch_reason(signature)
+    }
+    pub(super) fn requirement(&self) -> WorkspaceRequirement {
+        self.program.requirement()
     }
 
+    /// Returns whether a new final-address snapshot was published. Warm calls
+    /// borrow the same exact binding without encoding/upload/allocation.
     pub(super) fn launch(
-        &self,
-        runtime: &CudaRuntime,
+        &mut self,
+        runtime: &Arc<CudaRuntime>,
         expected_device: DeviceId,
         equation: &str,
         signature: &ArithmeticExecutionSignature,
-    ) -> Result<()> {
-        if let Some(reason) = self.signature.mismatch_reason(signature) {
+        offered: Option<WorkspaceView>,
+    ) -> Result<bool> {
+        if let Some(reason) = self.program.recipe.signature.mismatch_reason(signature) {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Einsum: semantic execution signature changed after validation: {reason}"
             )));
         }
         signature.validate_device_ownership(expected_device, equation)?;
         signature.validate_alias_proof(equation)?;
-        for launch in &self.launches {
+        let workspace = self.program.workspace.bind(offered)?;
+        let hit = self
+            .binding
+            .as_ref()
+            .is_some_and(|binding| binding.key == workspace.key);
+        if runtime.capture_active() && !hit {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Einsum `{equation}`: semantic caller workspace binding changed during capture; abort capture and eagerly warm this exact workspace address/layout before recording"
+            )));
+        }
+        let candidate = if hit {
+            None
+        } else {
+            Some(self.program.bind_execution(runtime, &workspace)?)
+        };
+        let binding = candidate
+            .as_ref()
+            .or(self.binding.as_ref())
+            .expect("a warmed or new binding exists");
+        if runtime.capture_active() {
+            if workspace.used.bytes() != 0 {
+                runtime.require_registered_workspace_capture(
+                    workspace.used,
+                    "Einsum semantic caller workspace",
+                )?;
+            }
+            if let Some(metadata) = &binding.metadata {
+                runtime.require_registered_address_capture(
+                    GraphDeviceAllocation::device_graph_resource(metadata).identity(),
+                    "immutable CUDA Einsum metadata",
+                )?;
+            }
+        }
+        for (launch, plan) in binding.launches.iter().zip(&self.program.cublas) {
             match launch {
                 PreparedLaunch::Generic {
                     metadata_offset_bytes,
                     config,
                 } => {
-                    let function = self.function.as_ref().ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "cuda_ep Einsum: generic launch lost its prepared function".into(),
-                        )
-                    })?;
-                    let metadata = self.metadata.as_ref().ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "cuda_ep Einsum: generic launch lost its immutable metadata owner"
-                                .into(),
-                        )
-                    })?;
-                    let pointer = metadata
-                        .ptr()
-                        .checked_add(u64::try_from(*metadata_offset_bytes).map_err(|_| {
-                            EpError::KernelFailed(
-                                "cuda_ep Einsum: metadata byte offset does not fit u64".into(),
-                            )
-                        })?)
-                        .ok_or_else(|| {
-                            EpError::KernelFailed(
-                                "cuda_ep Einsum: metadata device-pointer offset overflowed".into(),
-                            )
-                        })?;
-                    let mut pointer_arg = pointer;
-                    let mut params = [(&mut pointer_arg as *mut CUdeviceptr).cast::<c_void>()];
-                    // SAFETY: the immutable metadata owner and every
-                    // exact-signature pointer it names remain live for the
-                    // stream operation. The one-argument ABI matches the entry.
+                    let function = binding.function.as_ref().ok_or_else(|| EpError::KernelFailed("cuda_ep Einsum: generic launch lost its prepared function; eagerly warm the exact binding".into()))?;
+                    let metadata = binding.metadata.as_ref().ok_or_else(|| EpError::KernelFailed("cuda_ep Einsum: generic launch lost its immutable metadata owner; eagerly warm the exact binding".into()))?;
+                    let mut pointer = metadata.ptr().checked_add(*metadata_offset_bytes as u64).ok_or_else(|| EpError::KernelFailed("cuda_ep Einsum: metadata device-pointer offset overflowed; reduce the contraction".into()))?;
+                    let mut params = [(&mut pointer as *mut CUdeviceptr).cast::<c_void>()];
+                    // SAFETY: complete current I/O signature and caller span,
+                    // immutable metadata owner, and one-argument kernel ABI.
                     unsafe { function.launch(runtime.stream(), *config, &mut params) }
                         .map_err(|error| driver_err("launch generic CUDA Einsum", error))?;
                 }
-                PreparedLaunch::Cublas { plan, params } => {
-                    // SAFETY: the immutable plan was selected for these exact
-                    // pointers/layouts, and the shared workspace owner remains
-                    // live for every sequential step.
+                PreparedLaunch::Cublas { params } => {
+                    let plan = plan.as_ref().expect("bound BLAS launch has its host plan");
+                    // SAFETY: final actual-address support was verified before
+                    // metadata publication; every serial step shares this tail.
                     unsafe {
                         plan.launch(
                             runtime.blas(),
                             runtime.stream_ptr(),
                             params,
-                            self.cublas_workspace
-                                .as_ref()
-                                .map_or(0, |workspace| workspace.ptr()),
+                            workspace.cublas,
                         )
                     }?;
                 }
             }
         }
-        Ok(())
+        if let Some(candidate) = candidate {
+            self.binding = Some(candidate);
+        }
+        Ok(!hit)
     }
-
     pub(super) fn resources(&self) -> Vec<DeviceGraphResource> {
-        let mut resources = Vec::with_capacity(2);
-        if let Some(metadata) = &self.metadata {
-            resources.push(GraphDeviceAllocation::device_graph_resource(metadata));
-        }
-        if let Some(workspace) = &self.workspace {
-            resources.push(GraphDeviceAllocation::device_graph_resource(workspace));
-        }
-        if let Some(workspace) = &self.cublas_workspace {
-            resources.push(GraphDeviceAllocation::device_graph_resource(workspace));
-        }
-        resources
+        self.binding
+            .as_ref()
+            .and_then(|binding| binding.metadata.as_ref())
+            .map(GraphDeviceAllocation::device_graph_resource)
+            .into_iter()
+            .collect()
     }
-
-    pub(super) fn require_capture_resources(&self, runtime: &CudaRuntime) -> Result<()> {
-        for resource in self.resources() {
-            runtime.require_registered_address_capture(
-                resource.identity(),
-                "immutable CUDA Einsum plan resource",
-            )?;
-        }
-        Ok(())
-    }
-
     pub(super) fn summary(&self) -> CudaEinsumPlanSummary {
+        let recipe = &self.program.recipe;
         CudaEinsumPlanSummary {
-            route: self.route,
-            planner_quality: self.planner_quality,
-            workspace_bytes: self.workspace_bytes,
-            metadata_bytes: self.metadata_bytes,
-            kernel_launches: self.launches.len(),
+            route: recipe.route,
+            planner_quality: recipe.planner_quality,
+            workspace_bytes: self.program.workspace.layout.bytes(),
+            metadata_bytes: self
+                .binding
+                .as_ref()
+                .map_or(0, |binding| binding.metadata_bytes),
+            kernel_launches: recipe.step_specs.len(),
             cublas_launches: self
-                .launches
+                .program
+                .cublas
                 .iter()
-                .filter(|launch| matches!(launch, PreparedLaunch::Cublas { .. }))
+                .filter(|plan| plan.is_some())
                 .count(),
         }
     }
-
     pub(super) fn workspace_ptr(&self) -> CUdeviceptr {
-        self.workspace
-            .as_ref()
-            .or(self.cublas_workspace.as_ref())
-            .map_or(0, |allocation| allocation.ptr())
+        self.binding.as_ref().map_or(0, |binding| binding.key.base)
     }
 }
 
@@ -1047,6 +1150,29 @@ struct GemmSpec {
     transpose_right: bool,
     left_batch_stride: usize,
     right_batch_stride: usize,
+}
+
+impl GemmSpec {
+    fn params(
+        &self,
+        workspace: CUdeviceptr,
+        layout: &WorkspaceLayout,
+    ) -> Result<StridedBatchedGemmParams> {
+        Ok(StridedBatchedGemmParams {
+            dtype: GemmDtype::F32,
+            a: resolve_pointer(&self.left, workspace, layout)?,
+            b: resolve_pointer(&self.right, workspace, layout)?,
+            c: resolve_pointer(&self.output, workspace, layout)?,
+            m: self.m,
+            k: self.k,
+            n: self.n,
+            batch: self.batch,
+            transpose_a: self.transpose_left,
+            transpose_b: self.transpose_right,
+            a_batch_stride: self.left_batch_stride,
+            b_batch_stride: self.right_batch_stride,
+        })
+    }
 }
 
 struct StepSpec {
@@ -1614,6 +1740,147 @@ mod tests {
             alias_proof: super::super::ArithmeticAliasProof::OutputDisjointFromEveryInput,
         };
         CudaEinsumRecipe::build(Arc::new(plan), signature, requested, ceiling)
+    }
+
+    #[test]
+    fn accepted_empty_semantic_output_has_no_scratch_metadata_or_launch_steps() {
+        let shapes: &[&[usize]] = &[&[0, 3], &[3, 4], &[4, 5]];
+        let semantic = Arc::new(
+            EinsumShapePlan::build_for_schema(
+                "ab,bc,cd->ad",
+                shapes,
+                onnx_runtime_ir::EinsumSchema::resolve(12).unwrap(),
+            )
+            .unwrap(),
+        );
+        let tensor = |shape: &[usize], pointer| ArithmeticTensorSignature {
+            device: DeviceId::cuda(0),
+            raw_base_pointer: pointer,
+            byte_offset: 0,
+            effective_pointer: pointer,
+            dtype: DataType::Float32,
+            shape: shape.to_vec(),
+            strides: compute_contiguous_strides(shape),
+        };
+        let signature = ArithmeticExecutionSignature {
+            inputs: shapes
+                .iter()
+                .enumerate()
+                .map(|(i, shape)| tensor(shape, (i as u64 + 1) * 0x1000))
+                .collect(),
+            output: tensor(&[0, 5], 0x4000),
+            alias_proof: super::super::ArithmeticAliasProof::OutputDisjointFromEveryInput,
+        };
+        for route in [RequestedRoute::GenericNative, RequestedRoute::Optimized] {
+            let recipe = CudaEinsumRecipe::build(
+                semantic.clone(),
+                signature.clone(),
+                route,
+                DEFAULT_MEMORY_CEILING_BYTES,
+            )
+            .unwrap();
+            assert_eq!(recipe.prefix_requirement().bytes, 0);
+            assert!(recipe.step_specs.is_empty());
+            assert!(!recipe.needs_binding());
+        }
+    }
+
+    #[test]
+    fn semantic_composite_keeps_padding_disjoint_and_zero_demand_empty() {
+        let layout = SemanticWorkspace::new(12, 513).unwrap();
+        assert_eq!(layout.requirement().bytes, 256 + 513);
+        let used = layout
+            .bind(Some(WorkspaceView::new(
+                DevicePtrMut(0x1000usize as *mut _),
+                4096,
+            )))
+            .unwrap();
+        assert_eq!(
+            used.key,
+            BindingKey {
+                base: 0x1000,
+                used_bytes: 769
+            }
+        );
+        assert_eq!((used.arithmetic, used.cublas), (0x1000, 0x1100));
+        assert_eq!(used.used.bytes(), 769);
+        assert_eq!(
+            SemanticWorkspace::new(12, 0).unwrap().requirement().bytes,
+            12
+        );
+        let empty = SemanticWorkspace::new(0, 0).unwrap().bind(None).unwrap();
+        assert_eq!(
+            (empty.key.used_bytes, empty.arithmetic, empty.cublas),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            SemanticWorkspace::new(0, 513).unwrap().requirement().bytes,
+            513
+        );
+        for offered in [
+            None,
+            Some(WorkspaceView::new(DevicePtrMut(0x1000usize as *mut _), 768)),
+            Some(WorkspaceView::new(
+                DevicePtrMut(0x1001usize as *mut _),
+                4096,
+            )),
+        ] {
+            let error = layout.bind(offered).err().unwrap().to_string();
+            assert!(
+                error.contains("769 bytes") && error.contains("prepare and pass"),
+                "{error}"
+            );
+        }
+        assert!(SemanticWorkspace::new(usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn host_program_encodes_only_final_prefix_addresses_after_relocation() {
+        // Pure generic metadata encoding, never a BLAS heuristic with synthetic addresses.
+        let recipe = recipe(RequestedRoute::Optimized, DEFAULT_MEMORY_CEILING_BYTES).unwrap();
+        let offsets = recipe
+            .workspace_layout
+            .values
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        let workspace = SemanticWorkspace::new(recipe.workspace_layout.bytes, 257).unwrap();
+        let program = CudaEinsumProgram {
+            cublas: (0..recipe.step_specs.len()).map(|_| None).collect(),
+            recipe,
+            workspace,
+        };
+        let bind = |base, capacity| {
+            program
+                .workspace
+                .bind(Some(WorkspaceView::new(
+                    DevicePtrMut(base as *mut _),
+                    capacity,
+                )))
+                .unwrap()
+        };
+        let first = bind(0x10000usize, 8192);
+        let final_binding = bind(0x20100usize, 16384);
+        let (_, before) = program.encode_binding(&first).unwrap();
+        let (_, after) = program.encode_binding(&final_binding).unwrap();
+        for offset in offsets {
+            assert!(before.contains(&(first.arithmetic + offset as u64)));
+            assert!(after.contains(&(final_binding.arithmetic + offset as u64)));
+            assert!(!after.contains(&(first.arithmetic + offset as u64)));
+            assert_eq!(
+                (first.arithmetic + offset as u64) % WORKSPACE_ALIGNMENT as u64,
+                0
+            );
+            assert_eq!(
+                (final_binding.arithmetic + offset as u64) % WORKSPACE_ALIGNMENT as u64,
+                0
+            );
+        }
+        assert_eq!(
+            final_binding.key,
+            bind(0x20100usize, 32768).key,
+            "retained capacity is not a snapshot key"
+        );
     }
 
     #[test]
