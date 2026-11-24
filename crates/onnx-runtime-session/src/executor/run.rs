@@ -153,7 +153,8 @@ impl Executor {
             && mode == RunMode::Eager
             && stage2.plan.is_none()
             && activation_memory_planning_enabled();
-        self.prepare_run_buffers(inputs, external, &resolved, stage2.excluded.as_ref())?;
+        self.prepare_run_storage(external, &resolved, stage2.excluded.as_ref())?;
+        self.bind_run_inputs(inputs, stage2.excluded.is_none())?;
         drop(_phase_setup);
 
         // From here on a borrowed input handle may be installed in `buffers`;
@@ -406,9 +407,8 @@ impl Executor {
 
     fn reset_run_state(&mut self) -> Result<()> {
         self.restore_completed_step_workspace();
-        // A previous run must never leave a handle aliasing its caller's
-        // tensors installed (it cannot, but re-establishing the invariant here
-        // makes the guarantee independent of every early-return path above).
+        // Restore any parked handles before reusing storage, including after
+        // unwinding out of execution. Input upload failures publish no loans.
         self.unbind_borrowed_inputs()?;
         // Zero-copy view metadata is run-scoped: a value that aliased another's
         // buffer last run must not leak into this one (buffers may be resized).
@@ -584,9 +584,10 @@ impl Executor {
         }
     }
 
-    fn prepare_run_buffers(
+    /// Materialize backing only: no input payload upload, borrowed input handle,
+    /// runtime-value read or kernel execution occurs in this phase.
+    pub(super) fn prepare_run_storage(
         &mut self,
-        inputs: &[(&str, &Tensor)],
         external: &ExternalBindings,
         resolved: &HashMap<ValueId, Vec<usize>>,
         stage2_excluded: Option<&HashSet<ValueId>>,
@@ -648,6 +649,13 @@ impl Executor {
             }
         }
 
+        Ok(())
+    }
+
+    /// Complete every fallible input upload/clone before publishing any handle
+    /// borrowing the caller's tensor. A later upload error or panic must not
+    /// leave an earlier borrowed input installed past the caller's lifetime.
+    fn bind_run_inputs(&mut self, inputs: &[(&str, &Tensor)], borrow_ok: bool) -> Result<()> {
         // --- Bind input bytes into their (now correctly sized) buffers ------
         // Every graph input reaches its kernel one of two ways. When the EP's
         // device is host-accessible and the value is provably read-only for the
@@ -662,10 +670,10 @@ impl Executor {
         // pointer and asserts that pointer is stable across runs. A borrowed
         // input's address changes whenever the caller hands us a different
         // tensor, so leave those runs on the copy path.
-        let borrow_ok = stage2_excluded.is_none();
         let borrow_align = TensorLayout::contiguous().alignment;
         let mut input_bytes = 0usize;
         let mut borrowed_bytes = 0usize;
+        let mut borrowed_inputs: SmallVec<[(ValueId, &[u8]); 8]> = SmallVec::new();
         for (name, tensor) in inputs {
             let vid = self.input_index[*name];
             if tensor.dtype == DataType::String {
@@ -696,26 +704,37 @@ impl Executor {
                 && !self.shared_buffers.contains_key(&vid)
             {
                 borrowed_bytes += bytes.len();
-                // SAFETY: `bytes` borrows the caller's `&Tensor`, which outlives
-                // this whole run (`inputs` is borrowed by `run_scoped_mode`).
-                // The range is `bytes.len()` long and `borrow_align`-aligned,
-                // and a graph input is producer-less, so no kernel writes it:
-                // every consumer sees it through a read-only `TensorView`.
-                let device = buf.device();
-                let borrowed = unsafe {
-                    DeviceBuffer::from_borrowed_parts(
-                        bytes.as_ptr() as *mut std::ffi::c_void,
-                        device,
-                        bytes.len(),
-                        borrow_align,
-                    )
-                };
-                let owned = std::mem::replace(buf, borrowed);
-                self.parked_input_buffers.push((vid, owned));
+                borrowed_inputs.push((vid, bytes));
                 continue;
             }
             input_bytes += bytes.len();
-            self.ep.copy_from_host(bytes, buf)?;
+            self.ep.copy_from_host(bytes, buf).map_err(|cause| {
+                SessionError::Internal(format!(
+                    "upload host input '{name}' {:?} {:?} ({} bytes) to {:?} failed: {cause}; verify the input storage and provider upload capacity before retrying",
+                    tensor.dtype, tensor.shape, bytes.len(), buf.device()
+                ))
+            })?;
+        }
+        // All fallible operations completed. Installing these read-only loans
+        // neither uploads bytes nor invokes provider callbacks.
+        for (vid, bytes) in borrowed_inputs {
+            let buf = self
+                .buffers
+                .get_mut(&vid)
+                .expect("sized input backing remains installed");
+            // SAFETY: the caller's Tensor outlives this run; classification above
+            // proved alignment, range and read-only use. Normal run cleanup
+            // restores the owned backing before this call releases `inputs`.
+            let borrowed = unsafe {
+                DeviceBuffer::from_borrowed_parts(
+                    bytes.as_ptr() as *mut std::ffi::c_void,
+                    buf.device(),
+                    bytes.len(),
+                    borrow_align,
+                )
+            };
+            let owned = std::mem::replace(buf, borrowed);
+            self.parked_input_buffers.push((vid, owned));
         }
         phase_profile::record("bind_inputs.host_bytes", input_bytes as u128);
         phase_profile::record("bind_inputs.borrowed_bytes", borrowed_bytes as u128);
@@ -1051,7 +1070,7 @@ impl Executor {
                 // pointer. Left alone, a CUDA IO-binding/capture caller reads
                 // back that binding's uninitialized allocation. Seed it here,
                 // every run, from the resident internal buffer — kept alive
-                // for exactly this purpose by `prepare_run_buffers` — which is
+                // for exactly this purpose by `bind_run_inputs` — which is
                 // a cheap, byte-identical copy of already-correct data, not a
                 // recomputation.
                 if self
