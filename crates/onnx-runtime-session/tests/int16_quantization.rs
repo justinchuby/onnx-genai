@@ -147,6 +147,13 @@ impl Case<'_> {
             "{:?}",
             session.execution_provider_fallback_report()
         );
+        if expected_device == DeviceType::Cuda {
+            assert!(
+                session.heterogeneous_placement_report().is_none(),
+                "expected CUDA-only placement, got {:?}",
+                session.heterogeneous_placement_report()
+            );
+        }
         let x = Tensor::from_f32(self.shape, self.input).unwrap();
         let scale = Tensor::from_raw(
             self.scale_type,
@@ -292,6 +299,12 @@ fn int16_quantization_rejects_opset_20() {
 #[ignore = "requires a CUDA device; asserts native CUDA without CPU fallback"]
 fn int16_quantization_cuda_no_fallback() {
     for case in cases() {
-        case.check(DevicePreference::Gpu { index: Some(0) }, DeviceType::Cuda);
+        case.check(
+            DevicePreference::Explicit {
+                device_type: DeviceType::Cuda,
+                index: 0,
+            },
+            DeviceType::Cuda,
+        );
     }
 }
