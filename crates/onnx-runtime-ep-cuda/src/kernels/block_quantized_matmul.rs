@@ -37,7 +37,7 @@ const Q6_K_BLOCK_BYTES: usize = 210;
 const Q8_0_BLOCK_BYTES: usize = 34;
 const BLOCK_THREADS: u32 = 256;
 pub(crate) fn packed_matmul_layout(name: &str) -> Option<(usize, usize)> {
-    let format = BlockFormat::parse(name).ok()?;
+    let format = BlockFormat::parse_projection(name).ok()?;
     Some((format.qk(), format.block_bytes()))
 }
 const GEMM_TILE_M: u32 = 8;
@@ -372,6 +372,10 @@ __device__ __forceinline__ float decode_block_weight(
     return subscale * (iq1_grid_value(iq1s_grid[index], element) + delta);
 }
 
+#ifdef NXRT_ONNX_GGUF_PROJECTION
+__device__ __forceinline__ float decode_onnx_gguf(const unsigned char*, int, int);
+#endif
+
 __device__ __forceinline__ float decode_weight(
     const unsigned char* packed, int format, int qk, int blocks,
     int block_bytes, int column, int depth)
@@ -379,7 +383,11 @@ __device__ __forceinline__ float decode_weight(
     const int block = depth / qk;
     const unsigned char* data =
         packed + ((long long)column * blocks + block) * block_bytes;
-    return decode_block_weight<false>(data, format, depth - block * qk);
+    const int lane = depth - block * qk;
+#ifdef NXRT_ONNX_GGUF_PROJECTION
+    if (format < 0 || format >= 32) return decode_onnx_gguf(data, format, lane);
+#endif
+    return decode_block_weight<false>(data, format, lane);
 }
 
 __device__ __forceinline__ float warp_sum(float value)
@@ -489,14 +497,36 @@ extern "C" __global__ void block_quantized_matmul_gemm_f32(
 }
 "#;
 
-fn gemv_src() -> &'static str {
-    static SOURCE: OnceLock<String> = OnceLock::new();
-    SOURCE.get_or_init(|| module_src(GEMV_KERNEL, None))
+fn gemv_module(onnx: bool) -> (&'static str, &'static str) {
+    static LEGACY: OnceLock<String> = OnceLock::new();
+    static ONNX: OnceLock<String> = OnceLock::new();
+    if onnx {
+        (
+            "block_quantized_matmul_onnx_gemv",
+            ONNX.get_or_init(|| module_src(GEMV_KERNEL, None, true)),
+        )
+    } else {
+        (
+            GEMV_MODULE,
+            LEGACY.get_or_init(|| module_src(GEMV_KERNEL, None, false)),
+        )
+    }
 }
 
-fn gemm_src() -> &'static str {
-    static SOURCE: OnceLock<String> = OnceLock::new();
-    SOURCE.get_or_init(|| module_src(GEMM_KERNEL, Some(GEMM_TILE_M)))
+fn gemm_module(onnx: bool) -> (&'static str, &'static str) {
+    static LEGACY: OnceLock<String> = OnceLock::new();
+    static ONNX: OnceLock<String> = OnceLock::new();
+    if onnx {
+        (
+            "block_quantized_matmul_onnx_gemm",
+            ONNX.get_or_init(|| module_src(GEMM_KERNEL, Some(GEMM_TILE_M), true)),
+        )
+    } else {
+        (
+            GEMM_MODULE,
+            LEGACY.get_or_init(|| module_src(GEMM_KERNEL, Some(GEMM_TILE_M), false)),
+        )
+    }
 }
 
 /// Build the shared NVRTC device prelude: the E2M1/IQ4 codebooks, every IQ grid
@@ -517,8 +547,14 @@ pub(crate) fn decoder_prelude() -> String {
     source
 }
 
-fn module_src(kernel: &str, gemm_tile_m: Option<u32>) -> String {
-    let mut source = decoder_prelude();
+fn module_src(kernel: &str, gemm_tile_m: Option<u32>, onnx: bool) -> String {
+    let mut source = if onnx {
+        let mut source = String::from("#define NXRT_ONNX_GGUF_PROJECTION\n");
+        source.push_str(super::dequantize_packed::decoder_source());
+        source
+    } else {
+        decoder_prelude()
+    };
     if let Some(tile_m) = gemm_tile_m {
         writeln!(source, "#define GEMM_TILE_M {tile_m}")
             .expect("writing CUDA source to String cannot fail");
@@ -578,6 +614,7 @@ fn append_u64_table(source: &mut String, name: &str, values: &[u64]) {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockFormat {
+    Onnx(onnx_runtime_ir::dequantize_packed::Format),
     Mxfp4,
     Iq4Nl,
     Iq4Xs,
@@ -596,6 +633,13 @@ pub(crate) enum BlockFormat {
 }
 
 impl BlockFormat {
+    fn parse_projection(value: &str) -> Result<Self> {
+        if let Some(format) = onnx_runtime_ir::dequantize_packed::Format::parse(value) {
+            return Ok(Self::Onnx(format));
+        }
+        Self::parse(value)
+    }
+
     pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "mxfp4" => Ok(Self::Mxfp4),
@@ -621,6 +665,7 @@ impl BlockFormat {
 
     pub(crate) fn qk(self) -> usize {
         match self {
+            Self::Onnx(format) => format.block().0,
             Self::Mxfp4 | Self::Iq4Nl => SMALL_QK,
             Self::Iq4Xs
             | Self::Iq2Xxs
@@ -640,6 +685,7 @@ impl BlockFormat {
 
     pub(crate) fn block_bytes(self) -> usize {
         match self {
+            Self::Onnx(format) => format.block().1,
             Self::Mxfp4 => MXFP4_BLOCK_BYTES,
             Self::Iq4Nl => IQ4_NL_BLOCK_BYTES,
             Self::Iq4Xs => IQ4_XS_BLOCK_BYTES,
@@ -660,6 +706,7 @@ impl BlockFormat {
 
     pub(crate) fn kernel_id(self) -> i32 {
         match self {
+            Self::Onnx(format) => super::dequantize_packed::decoder_kind(format),
             Self::Mxfp4 => 0,
             Self::Iq4Nl => 1,
             Self::Iq4Xs => 2,
@@ -697,7 +744,7 @@ impl KernelFactory for BlockQuantizedMatMulFactory {
             Some(attribute) => attribute
                 .as_str()
                 .ok_or_else(|| error("attribute 'format' must be a UTF-8 string"))
-                .and_then(BlockFormat::parse)?,
+                .and_then(BlockFormat::parse_projection)?,
             None => return Err(error("missing required string attribute 'format'")),
         };
         Ok(Box::new(BlockQuantizedMatMulKernel {
@@ -783,12 +830,20 @@ impl Kernel for BlockQuantizedMatMulKernel {
             .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
             .unwrap_or(0);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        let format = self.format.kernel_id();
+        let kind = self.format.kernel_id();
+        use onnx_runtime_ir::dequantize_packed::Format;
+        // The shared decoder's strict mode prevents contraction for affine K
+        // blocks. Other shared formats can use the original tuned module.
+        let (format, onnx) = match self.format {
+            BlockFormat::Onnx(Format::Q2K | Format::Q5K) => (kind, true),
+            BlockFormat::Onnx(_) if kind >= 32 => (kind - 32, false),
+            BlockFormat::Onnx(_) => (kind, true),
+            _ => (kind, false),
+        };
 
         if m == 1 {
-            let function = self
-                .runtime
-                .nvrtc_function(GEMV_MODULE, gemv_src(), GEMV_ENTRY)?;
+            let (module, source) = gemv_module(onnx);
+            let function = self.runtime.nvrtc_function(module, source, GEMV_ENTRY)?;
             let mut builder = self.runtime.stream().launch_builder(&function);
             builder
                 .arg(&activation_ptr)
@@ -812,9 +867,8 @@ impl Kernel for BlockQuantizedMatMulKernel {
             }
             .map_err(|err| driver_err("launch BlockQuantizedMatMul GEMV", err))?;
         } else {
-            let function = self
-                .runtime
-                .nvrtc_function(GEMM_MODULE, gemm_src(), GEMM_ENTRY)?;
+            let (module, source) = gemm_module(onnx);
+            let function = self.runtime.nvrtc_function(module, source, GEMM_ENTRY)?;
             let m = as_u64("M", m)?;
             let launch_config = gemm_launch_config(m, grid_x)?;
             let mut builder = self.runtime.stream().launch_builder(&function);
@@ -863,24 +917,7 @@ pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
             ));
         }
     };
-    if !matches!(
-        format,
-        "mxfp4"
-            | "iq4_nl"
-            | "iq4_xs"
-            | "iq2_xxs"
-            | "iq3_xxs"
-            | "iq2_xs"
-            | "iq2_s"
-            | "iq3_s"
-            | "iq1_s"
-            | "iq1_m"
-            | "q2_k"
-            | "q3_k"
-            | "q5_k"
-            | "q6_k"
-            | "q8_0"
-    ) {
+    if BlockFormat::parse_projection(format).is_err() {
         return Some(Cow::Owned(format!(
             "BlockQuantizedMatMul: CUDA does not support format '{format}' — re-export weights as mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, iq1_m, q2_k, q3_k, q5_k, q6_k, or q8_0"
         )));

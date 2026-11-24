@@ -3,6 +3,7 @@
 use crate::{EpError, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{
     DataType, Node, Shape,
+    dequantize_packed::Metadata,
     packed_routed::{OPS, Op, Packing},
 };
 
@@ -206,6 +207,49 @@ pub fn group_layout(op: Op, x: &[TensorView], y: &TensorMut) -> Result<GroupLayo
         .filter(|b| b.dtype != DataType::Undefined && !b.is_absent())
         .map(|b| b.shape);
     group_layout_shapes(op, x[0].shape, x[1].shape, x[2].shape, bias, y.shape)
+}
+
+pub fn packed_group_layout(
+    metadata: &Metadata,
+    x: &[TensorView],
+    y: &[TensorMut],
+) -> Result<GroupLayout> {
+    let fail = |detail: &str| EpError::KernelFailed(format!("PackedGroupedMatMul: {detail}"));
+    let [a, packed, idx] = x else {
+        return Err(fail(
+            "expected activation, packed weights, and group indices",
+        ));
+    };
+    let [out] = y else {
+        return Err(fail("expected one output"));
+    };
+    let [groups, n, k] = metadata.shape() else {
+        return Err(fail("decoded weight shape must be [groups,N,K]"));
+    };
+    if metadata.dtype() != DataType::Float32
+        || a.dtype != DataType::Float32
+        || out.dtype != DataType::Float32
+        || !matches!(idx.dtype, DataType::Int32 | DataType::Int64)
+    {
+        return Err(fail(
+            "activation, decoded weights, and output must be FLOAT, with INT32 or INT64 group indices",
+        ));
+    }
+    metadata
+        .validate_input(packed.dtype, packed.shape)
+        .map_err(|detail| fail(&detail))?;
+    for tensor in x {
+        tensor.validate()?;
+    }
+    out.validate()?;
+    group_layout_shapes(
+        Op::GroupedMatMul { transposed: true },
+        a.shape,
+        &[*groups, *n, *k],
+        idx.shape,
+        None,
+        out.shape,
+    )
 }
 
 fn group_layout_shapes(

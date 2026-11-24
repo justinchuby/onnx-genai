@@ -226,6 +226,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Gather` | `` | ✅ | **NVRTC-custom** | Axis-parametric contiguous indexed copy; Int32/Int64 indices, negative index wrap, arbitrary index rank. |
 | `AffineQuantizedGather` | `pkg.nxrt` | ✅ | **NVRTC-custom** | EP fusion for single-use per-tensor FLOAT `DequantizeLinear` on INT8/UINT8 data feeding `Gather`; decodes only selected elements. |
 | `AffineQuantizedGroupedMatMul` | `pkg.nxrt` | ✅ | **NVRTC-custom** | Eager fusion of row-packed unsigned 4-bit affine weights into `GroupedMatMul`; only selected experts are decoded. Routing and intervening MoE operations stay separate. |
+| `PackedGroupedMatMul` | `pkg.nxrt` | ✅ | **NVRTC-custom** | Eager fusion of row-aligned GGUF weights into unbiased FLOAT `GroupedMatMul`; only selected experts are decoded. |
+| `DequantizePackedGather` | `pkg.nxrt` | ✅ | **NVRTC-custom** | Fusion of GGUF `DequantizePacked` into axis-0 Gather with block-aligned slices; only selected slices are decoded. |
 | `GatherElements` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic contiguous element gather with Int64 indices, negative axes/indices, and CPU-matched rank/dimension validation. |
 | `ScatterElements` (v11 & v16) | `` | ✅ | **NVRTC-custom** | Deterministic f32/Int64 updates in row-major input order. Opset 16 supports `none`, `add`, `mul`, `min`, and `max`; duplicate indices therefore preserve CPU last-write/sequential-reduction semantics. |
 | `TopK` (v10) | `` | ✅ | **NVRTC-custom** | Deterministic f32 per-slice selection with input `K`, arbitrary/negative axis, largest/smallest modes, and CPU tie-breaking by lower source index. |
@@ -283,12 +285,12 @@ codes match. `Unpack` yields `UINT8`; use matching zero-point types or cast
 both operands consistently. An omitted ONNX zero point means zero, not the
 Mobius QMoE default of eight.
 
-The native packed projection fusion covers transposed, unbiased FLOAT
+The native affine projection fusion covers transposed, unbiased FLOAT
 `GroupedMatMul` with last-axis blocked affine weights, accepting either
 `Unpack` or the unsigned nibble expansion used by Mobius. It does not claim
-direct sub-byte initializers, GGUF `DequantizePacked`, or whole-MoE routing,
-activation, and reduction. The original graph remains unchanged when a
-decoded intermediate is shared or the layout cannot be proved.
+direct sub-byte initializers or whole-MoE routing, activation, and reduction.
+The GGUF `DequantizePacked` path is described below. The original graph remains
+unchanged when a decoded intermediate is shared or the layout cannot be proved.
 
 ## Source-derived coverage audit
 
@@ -786,11 +788,9 @@ must specify an immutable scalar count equal to K.
 
 For GGUF, emit a flat UINT8 initializer, opset-29 `DequantizePacked` with
 logical shape `[N,K]`, and a swap transpose. Blocks must fit within each
-row without padding. A redundant FLOAT-to-FLOAT Cast before the transpose
-is allowed. The fused formats are `iq1_s`, `iq1_m`, `iq2_xxs`, `iq2_xs`,
-`iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_nl`, `iq4_xs`, `q2_k`, `q3_k`, `q5_k`,
-`q6_k`, and `q8_0`. The other profiles, including `q4_k` and `mxfp4`,
-retain standalone decoding. Precision-changing casts, shared decoded
+row without padding. A redundant FLOAT-to-FLOAT Cast before or after the
+transpose is allowed. All 27 standard GGUF profiles use the same block
+decoder as standalone `DequantizePacked`. Precision-changing casts, shared decoded
 values, shared inline GGUF bytes, or other layouts also retain the original
 graph.
 
@@ -798,3 +798,9 @@ CUDA uses these fusions only when the activation is statically known to
 contain one row and launch geometry permits it. CPU can stream decoded
 rows for multiple activation rows. Neither fused path materializes the
 full decoded weight matrix.
+
+Packed Gather fuses when axis 0 selects whole block-aligned slices, preserving
+the decoded dtype. Packed `GroupedMatMul` fuses unbiassed FLOAT projections
+with integer routes and `transB=1` when the `[experts, outputs, depth]`
+weight bank is row-aligned. These paths decode only selected slices or expert
+projection blocks. Shared decoded tensors retain the original graph.

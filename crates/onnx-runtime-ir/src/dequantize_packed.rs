@@ -48,11 +48,13 @@ pub fn validate_claim(node: &Node, shapes: &[Shape], dtypes: &[DataType]) -> Res
 macro_rules! formats {
     ($($kind:ident = $tag:literal, $name:literal, $width:literal, $bytes:literal;)*) => {
         /// A fixed ONNX packed layout. The discriminant is the GGML tensor ID.
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
         #[repr(u8)]
         pub enum Format { $($kind = $tag,)* }
 
         impl Format {
+            pub const ALL: &'static [Self] = &[$(Self::$kind,)*];
+
             pub fn parse(name: &str) -> Option<Self> {
                 match name { $($name => Some(Self::$kind),)* _ => None }
             }

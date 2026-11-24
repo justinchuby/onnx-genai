@@ -10,6 +10,7 @@
 //! shape the design sanctions for CPU testing. A real CUDA end-to-end check is
 //! gated separately (GPU-only) and is not part of CI.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +39,7 @@ struct AcceleratorEp {
     allowed: Vec<&'static str>,
     claim_only: Vec<&'static str>,
     device_sized: Vec<&'static str>,
+    unavailable_kernel: bool,
     device: DeviceId,
 }
 
@@ -50,6 +52,7 @@ impl AcceleratorEp {
             allowed,
             claim_only: Vec::new(),
             device_sized: Vec::new(),
+            unavailable_kernel: false,
             // Mlx is host-accessible, so the CPU execution path stays valid while
             // the device id differs from CPU:0 for transfer planning.
             device: DeviceId::new(DeviceType::Mlx, 0),
@@ -116,6 +119,9 @@ impl ExecutionProvider for AcceleratorEp {
         shapes: &[Vec<usize>],
         opset: u64,
     ) -> EpResult<Box<dyn Kernel>> {
+        if self.unavailable_kernel {
+            return Err(onnx_runtime_ep_api::EpError::NotInitialized);
+        }
         if self.device_sized.contains(&op.op_type.as_str()) {
             return Ok(Box::new(DeviceSizedKernel));
         }
@@ -1177,6 +1183,171 @@ fn classify_mixed_graph_is_heterogeneous() {
         }
         other => panic!("expected Heterogeneous, got {other:?}"),
     }
+}
+
+#[test]
+fn ordered_session_prefers_first_whole_graph_provider() {
+    use crate::{ExecutionProviderOrder, InferenceSession};
+
+    let graph = build_chain(&["Relu", "Abs"]);
+    let order = || {
+        let mut whole = AcceleratorEp::new(vec!["Relu", "Abs"]);
+        whole.device.index = 1;
+        ExecutionProviderOrder::new(accel_slot(0, vec!["Relu"]).provider)
+            .then(Arc::new(whole))
+            .then(cpu_slot(2).provider)
+    };
+    let ir_session = InferenceSession::from_graph_with_providers(
+        graph.clone(),
+        weights(),
+        Path::new("."),
+        order(),
+        None,
+    )
+    .unwrap();
+    let bytes =
+        onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph)).unwrap();
+    let bytes_session = InferenceSession::builder()
+        .model_bytes(&bytes)
+        .execution_providers(order())
+        .build()
+        .unwrap();
+    let tensor = Tensor::from_f32(&[4], &[-2.0, 1.0, -3.0, 4.0]).unwrap();
+    let inputs = [("x", &tensor)];
+    let expected = reference(&graph, &inputs);
+    for mut session in [ir_session, bytes_session] {
+        assert_eq!(session.device_id(), DeviceId::new(DeviceType::Mlx, 1));
+        assert!(session.heterogeneous_placement_report().is_none());
+        assert_eq!(
+            session.run(&inputs).unwrap()[0].as_bytes(),
+            expected[0].as_bytes()
+        );
+    }
+}
+
+#[test]
+fn ordered_session_can_select_a_whole_provider_for_symbolic_shapes() {
+    let mut graph = build_chain(&["Relu", "Abs"]);
+    let n = graph.create_symbol(Some("n".into()));
+    let values = graph.values.iter().map(|(id, _)| id).collect::<Vec<_>>();
+    for id in values {
+        graph.value_mut(id).shape = vec![onnx_runtime_ir::Dim::Symbolic(n)];
+    }
+    let order = crate::ExecutionProviderOrder::new(accel_slot(0, vec!["Relu"]).provider)
+        .then(cpu_slot(1).provider);
+    let mut session = crate::InferenceSession::from_graph_with_providers(
+        graph,
+        weights(),
+        Path::new("."),
+        order,
+        None,
+    )
+    .unwrap();
+    assert_eq!(session.device_id(), DeviceId::cpu());
+    assert!(session.heterogeneous_placement_report().is_none());
+    let input = Tensor::from_f32(&[3], &[-1.0, 3.0, 2.0]).unwrap();
+    assert_eq!(
+        session.run(&[("x", &input)]).unwrap()[0].to_vec_f32(),
+        &[0.0, 3.0, 2.0]
+    );
+}
+
+#[test]
+fn ordered_executor_splits_across_explicit_providers_and_cpu_only_when_enabled() {
+    use crate::ExecutionProviderOrder;
+
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let waits = Arc::new(AtomicUsize::new(0));
+    let order = || {
+        ExecutionProviderOrder::new(accel_slot(0, vec!["Relu"]).provider)
+            .then(async_accel_slot(1, vec!["Relu", "Abs"], Arc::clone(&waits)).provider)
+    };
+    let tensor = Tensor::from_f32(&[4], &[-2.0, 1.0, -3.0, 4.0]).unwrap();
+    let inputs = [("x", &tensor)];
+    let expected = reference(&graph, &inputs);
+    let mut mixed =
+        Executor::build_ordered_with_mode(graph.clone(), weights(), order(), false, true, None)
+            .unwrap();
+    let report = mixed.heterogeneous_placement_report().unwrap();
+    assert!(report.contains("1 node(s) on accel_ep"));
+    assert!(report.contains("1 node(s) on async_accel_ep"));
+    assert!(report.contains("1 node(s) on cpu_ep"));
+    assert!(report.contains("2 cross-provider transfer(s)"));
+    assert_eq!(
+        mixed.run(&inputs).unwrap()[0].as_bytes(),
+        expected[0].as_bytes()
+    );
+    assert_eq!(waits.load(Ordering::Relaxed), 1);
+
+    let mut single = Executor::build_ordered_with_mode(
+        graph,
+        weights(),
+        order(),
+        false,
+        false,
+        Some(cpu_slot(2).provider),
+    )
+    .unwrap();
+    assert!(single.heterogeneous_placement_report().is_none());
+    assert_eq!(single.device_id(), DeviceId::cpu());
+    assert_eq!(
+        single.run(&inputs).unwrap()[0].as_bytes(),
+        expected[0].as_bytes()
+    );
+}
+
+#[test]
+fn ordered_executor_uses_single_fallback_for_ineligible_split_and_preserves_strict_cuda() {
+    use crate::ExecutionProviderOrder;
+
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let order = || {
+        ExecutionProviderOrder::new(Arc::new(AcceleratorEp::device_sized(vec!["Relu"])))
+            .then(accel_slot(1, vec![]).provider)
+    };
+    let mut single = Executor::build_ordered_with_mode(
+        graph.clone(),
+        weights(),
+        order(),
+        false,
+        true,
+        Some(cpu_slot(2).provider),
+    )
+    .unwrap();
+    assert!(single.heterogeneous_placement_report().is_none());
+    let tensor = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let inputs = [("x", &tensor)];
+    assert_eq!(
+        single.run(&inputs).unwrap()[0].as_bytes(),
+        reference(&graph, &inputs)[0].as_bytes()
+    );
+    let error = Executor::build_ordered_with_mode(graph, weights(), order(), true, true, None)
+        .err()
+        .expect("strict CUDA must reject this non-CUDA primary");
+    assert!(error.to_string().contains("ONNX_GENAI_REQUIRE_CUDA=1"));
+}
+
+#[test]
+fn ordered_executor_keeps_mixed_kernel_errors_visible() {
+    let mut failing = AcceleratorEp::new(vec!["Relu"]);
+    failing.unavailable_kernel = true;
+    let order = crate::ExecutionProviderOrder::new(Arc::new(failing))
+        .then(accel_slot(1, vec!["Abs"]).provider);
+    let error = Executor::build_ordered_with_mode(
+        build_chain(&["Relu", "Abs", "Neg"]),
+        weights(),
+        order,
+        false,
+        true,
+        None,
+    )
+    .err()
+    .expect("an accepted claim that cannot compile is not mixed ineligibility");
+    let message = error.to_string();
+    assert!(
+        message.contains("Relu") && message.contains("not initialized"),
+        "{message}"
+    );
 }
 
 #[test]
