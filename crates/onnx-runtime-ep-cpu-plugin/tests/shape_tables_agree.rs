@@ -310,6 +310,22 @@ fn opset_28_29_and_affine_rules_resolve_through_the_plugin() {
             ShapeInference::Declined { .. }
         ));
         if n.domain.is_empty() {
+            let mut alias = n.clone();
+            alias.domain = onnx_runtime_ir::AI_ONNX_DOMAIN.into();
+            let alias_rule = ShapeInference::for_node(&alias, &[], 1);
+            assert!(
+                matches!(alias_rule, ShapeInference::NativeRegistry { .. }),
+                "{} alias declined",
+                n.op_type
+            );
+            let alias_shapes =
+                onnx_runtime_ep_plugin::compute::infer_shapes_for_test(&alias_rule, inputs)
+                    .unwrap();
+            assert_eq!(
+                alias_shapes, shapes,
+                "{} domain aliases disagree",
+                n.op_type
+            );
             let mut older = n.clone();
             older.version = n.version.map(|v| v - 1);
             assert!(matches!(
