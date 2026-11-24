@@ -1742,3 +1742,31 @@ one inherited ignore) suites passed on the restack onto main. Remaining local
 surface and feature checks are recorded on the PR before merge. CUDA feature
 compilation is not CUDA execution evidence. Accepted-prefix correction/cache
 alignment and Python launcher/package isolation remain open.
+
+### Native Python wheel startup isolation
+
+The default CLI/server wheel no longer installs ONNX Runtime or imports/preloads
+its Python package. Optional `ort` and `ort-cuda` extras supply explicit reference
+runs; MLX installation is opt-in. Library discovery uses top-level module specs
+without executing package initializers. Explicit paths retain priority, including
+Windows reference-DLL dependency directories whose handles remain owned and are
+reused. The existing abi3-py310 extension now admits standard Python 3.10+;
+publishing builds on CPython 3.12. PyO3 function registration no longer uses the
+deprecated `pyfn` helper. Publishing preserves the complete ABI feature list for
+CUDA reference wheels and runs the installed Native command smoke on every CLI
+wheel platform instead of inheriting reference-runtime platform skips.
+
+On macOS ARM64 / standard CPython 3.15, an actual development-profile abi3 wheel
+passed dependency-metadata inspection, default Native generation without ORT,
+and generation with optional package initializers that fail if imported. Explicit
+missing-ORT selection fails clearly and a real ORT reference generation succeeds.
+A fresh virtual environment installs the default wheel offline with no ORT/MLX
+packages; the actual console command passes version, Native generation and missing
+explicit-reference smoke checks, and `pip check` reports no missing dependencies.
+Seven launcher tests cover discovery, absent/incomplete installs, path priority
+and Windows handle lifetime/reuse. Python lint and CLI Python/CUDA-reference
+feature strict Clippy pass. After restacking onto the workspace-report main,
+the two Native MTP tests and 71 CLI tests pass again, as do the real wheel checks,
+formatting and diff checks. Windows loader cases are mocked, and no CUDA
+execution or performance result is claimed. This closes the Python CPU startup
+isolation gap; the overall compatibility acceptance rows remain open.

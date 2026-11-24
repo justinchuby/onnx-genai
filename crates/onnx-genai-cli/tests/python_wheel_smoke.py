@@ -74,7 +74,7 @@ def main() -> None:
             ],
             success=False,
         )
-        if "onnxruntime" not in rejected.stderr.lower():
+        if "failed to load onnx runtime" not in rejected.stderr.lower():
             raise RuntimeError(
                 f"explicit ORT failed for an unexpected reason: {rejected.stderr}"
             )
