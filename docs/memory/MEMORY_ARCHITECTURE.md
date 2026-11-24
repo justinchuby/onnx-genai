@@ -353,6 +353,28 @@ counts do not change during execution.
 Compiling that regression does not establish CUDA numerical or performance
 correctness; a device is still required to run it.
 
+### Output storage ownership during workspace planning
+
+Native dispatch keeps internal output allocation owners in the executor's buffer
+map while constructing non-owning mutable tensor views. External output owners
+remain with their caller. Bounds are validated against the original backing;
+output views preserve the actual origin and strides. SSA and the existing
+in-place eligibility checks establish the input/output aliasing contract.
+
+Partial output binding, execution-time workspace planning, admission, kernel
+errors and unwinding cannot orphan these owners. There is no output-buffer
+remove/reinsert transaction to complete on success. This preserves real storage
+for later preparation and leaves pending work, validation, retirement and teardown
+with their original authorities. It does not roll back partially written tensor
+contents. No quota operation, device synchronization or success-path heap
+allocation is added by keeping the owners resident.
+
+Host regressions reproduce the original planner-failure loss, preserve both
+output origins through planning/admission/execution failures and unwinding,
+verify error recovery and final allocator balance, and check partial binding and
+external offset/stride behavior. These ownership results do not establish CUDA
+execution or asynchronous failure behavior on a device.
+
 ### CUDA dense MatMul cached-plan preparation boundary
 
 F32 single-row decode and the other single-matrix cuBLASLt paths now share one

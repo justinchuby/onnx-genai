@@ -927,8 +927,9 @@ impl Executor {
         drop(views);
         let views = kernel_input_views(kernel, &in_infos, &mat, node)?;
 
-        // Take output buffers out so they can be borrowed `&mut` disjointly from
-        // the input reads (SSA guarantees outputs are disjoint from inputs).
+        // Build non-owning output views while their backing stays in the
+        // executor. SSA/in-place validation establishes the aliasing contract;
+        // planning failures and unwinding must never orphan a DeviceBuffer.
         let mut out_strides = std::mem::take(&mut self.scratch_output_strides);
         out_strides.resize_with(output_shapes.len(), Vec::new);
         out_strides.truncate(output_shapes.len());
@@ -944,7 +945,8 @@ impl Executor {
                 refill_contiguous_strides(strides, shape);
             }
         }
-        let (out_bufs, mut outs) = ctx.build_output_bindings(
+        let mut outs = build_output_bindings(
+            ctx.buffers,
             outputs,
             &output_shapes,
             &out_strides,
@@ -962,7 +964,6 @@ impl Executor {
             has_lazy_inputs,
             &views,
             &mut outs,
-            out_bufs,
         )?;
         drop(outs);
         drop(views);
@@ -1593,19 +1594,49 @@ impl Executor {
     }
 }
 
-/// Owned backing for one kernel output: either an internal [`DeviceBuffer`]
-/// taken out of the executor's buffer map (to be reinserted after compute) or
-/// an external binding written in place. Holds the raw pointer and length used
-/// to build the mutable [`TensorMut`] the kernel writes through.
-struct OutBacking {
-    vid: ValueId,
-    internal: Option<DeviceBuffer>,
-    ptr: *mut std::ffi::c_void,
-    len: usize,
-    device: onnx_runtime_ir::DeviceId,
+/// Borrow output origins without transferring their allocation ownership.
+/// Internal backing remains in `buffers` through planning, admission and
+/// execution, including errors and unwinding. External backing stays with
+/// the caller. The returned views borrow shape/stride storage; SSA and the
+/// checked in-place capability establish safe input/output aliasing.
+fn build_output_bindings<'o>(
+    buffers: &mut HashMap<ValueId, DeviceBuffer>,
+    outputs: &[ValueId],
+    output_shapes: &'o [Vec<usize>],
+    out_strides: &'o [Vec<i64>],
+    output_dtypes: &[DataType],
+    external: &ExternalBindings,
+) -> Result<SmallVec<[TensorMut<'o>; 8]>> {
+    let mut outs = SmallVec::new();
+    for (index, &vid) in outputs.iter().enumerate() {
+        let (ptr, len, device) = if let Some(value) = external.outputs.get(&vid) {
+            (value.ptr as *mut std::ffi::c_void, value.len, value.device)
+        } else {
+            let buffer = buffers.get_mut(&vid).ok_or_else(|| {
+                SessionError::Internal(format!("missing buffer for output value#{}; allocate its resolved output backing before binding kernel views", vid.0))
+            })?;
+            (buffer.as_mut_ptr(), buffer.len(), buffer.device())
+        };
+        view_bounds(
+            &output_shapes[index],
+            &out_strides[index],
+            0,
+            output_dtypes[index],
+            len,
+        ).map_err(|cause| SessionError::Internal(format!(
+            "output value#{} {:?} {:?} with strides {:?} cannot borrow its {len}-byte backing: {cause}; bind storage covering the resolved output layout",
+            vid.0, output_dtypes[index], output_shapes[index], out_strides[index]
+        )))?;
+        outs.push(TensorMut::new(
+            DevicePtrMut(ptr),
+            output_dtypes[index],
+            &output_shapes[index],
+            &out_strides[index],
+            device,
+        ));
+    }
+    Ok(outs)
 }
-
-type OutputBindings<'a> = (SmallVec<[OutBacking; 8]>, SmallVec<[TensorMut<'a>; 8]>);
 
 /// Auto-materialization gate: a strided (view) input feeding a kernel that does
 /// not accept strided input on that slot is gathered into a private contiguous
@@ -1925,63 +1956,6 @@ impl KernelDispatchContext<'_> {
         Ok(())
     }
 
-    /// Take each output buffer out (internal buffers removed from the map,
-    /// external bindings aliased in place), bounds-check the contiguous output
-    /// window, and build the [`TensorMut`] the kernel writes through. The
-    /// returned views borrow `output_shapes`/`out_strides`; the returned
-    /// backings must outlive them.
-    fn build_output_bindings<'o>(
-        &mut self,
-        outputs: &[ValueId],
-        output_shapes: &'o [Vec<usize>],
-        out_strides: &'o [Vec<i64>],
-        output_dtypes: &[DataType],
-        external: &ExternalBindings,
-    ) -> Result<OutputBindings<'o>> {
-        let mut out_bufs: SmallVec<[OutBacking; 8]> = SmallVec::new();
-        for &vid in outputs {
-            if let Some(value) = external.outputs.get(&vid) {
-                out_bufs.push(OutBacking {
-                    vid,
-                    internal: None,
-                    ptr: value.ptr as *mut std::ffi::c_void,
-                    len: value.len,
-                    device: value.device,
-                });
-            } else {
-                let mut buf = self.buffers.remove(&vid).ok_or_else(|| {
-                    SessionError::Internal(format!("missing buffer for output value#{}", vid.0))
-                })?;
-                let ptr = buf.as_mut_ptr();
-                out_bufs.push(OutBacking {
-                    vid,
-                    ptr,
-                    len: buf.len(),
-                    device: buf.device(),
-                    internal: Some(buf),
-                });
-            }
-        }
-        let mut outs = SmallVec::new();
-        for (i, backing) in out_bufs.iter_mut().enumerate() {
-            view_bounds(
-                &output_shapes[i],
-                &out_strides[i],
-                0,
-                output_dtypes[i],
-                backing.len,
-            )?;
-            outs.push(TensorMut::new(
-                DevicePtrMut(backing.ptr),
-                output_dtypes[i],
-                &output_shapes[i],
-                &out_strides[i],
-                backing.device,
-            ));
-        }
-        Ok((out_bufs, outs))
-    }
-
     /// Resolve and bind scratch once, regardless of whether outputs are sized
     /// before execution or discovered by the kernel. Returned views borrow the
     /// existing lifetime slot; no owner is returned to a pool during the call.
@@ -2150,8 +2124,8 @@ impl KernelDispatchContext<'_> {
 
     /// Run the kernel over the bound input/output views (routing lazy-weight
     /// inputs through [`KernelInput`] when present), map any failure to a
-    /// diagnostic naming the node and its input/output types and shapes, then
-    /// reinsert the internal output buffers back into the buffer map.
+    /// diagnostic naming the node and its input/output types and shapes.
+    /// Internal output allocation owners stay in the buffer map throughout.
     #[allow(clippy::too_many_arguments)]
     fn execute_kernel(
         &mut self,
@@ -2164,7 +2138,6 @@ impl KernelDispatchContext<'_> {
         has_lazy_inputs: bool,
         views: &[TensorView],
         outs: &mut [TensorMut],
-        out_bufs: SmallVec<[OutBacking; 8]>,
     ) -> Result<()> {
         let output_metadata: SmallVec<[OutputMetadata<'_>; 8]> =
             outs.iter().map(OutputMetadata::from_view).collect();
@@ -2278,11 +2251,6 @@ impl KernelDispatchContext<'_> {
 
         drop(kernel_inputs);
         drop(_routed_residency_guard);
-        for backing in out_bufs {
-            if let Some(buf) = backing.internal {
-                self.buffers.insert(backing.vid, buf);
-            }
-        }
         Ok(())
     }
 }
@@ -2329,4 +2297,99 @@ pub(super) fn unresolved_output_metadata(
             },
         })
         .collect()
+}
+
+#[cfg(test)]
+mod output_binding_tests {
+    use super::*;
+    use onnx_runtime_ep_cpu::CpuExecutionProvider;
+
+    #[test]
+    fn output_binding_preserves_external_origin_stride_and_owner() {
+        let mut backing = [9f32; 8];
+        let origin = unsafe { backing.as_mut_ptr().add(1) };
+        let value = ValueId(7);
+        let mut external = ExternalBindings::default();
+        external.outputs.insert(
+            value,
+            ExternalValue {
+                dtype: DataType::Float32,
+                shape: vec![2],
+                accepts_subshape: false,
+                strides: Some(vec![2]),
+                fixed_stride_shape: None,
+                ptr: origin as usize,
+                len: 7 * size_of::<f32>(),
+                alignment: align_of::<f32>(),
+                device: onnx_runtime_ir::DeviceId::cpu(),
+            },
+        );
+        let shapes = [vec![2]];
+        let strides = [vec![2]];
+        let mut buffers = HashMap::new();
+        let mut views = build_output_bindings(
+            &mut buffers,
+            &[value],
+            &shapes,
+            &strides,
+            &[DataType::Float32],
+            &external,
+        )
+        .unwrap();
+        assert!(buffers.is_empty());
+        assert_eq!(views[0].data_ptr_mut::<f32>(), origin);
+        assert_eq!(views[0].strides, &[2]);
+        unsafe {
+            *views[0].data_ptr_mut::<f32>() = 1.;
+            *views[0].data_ptr_mut::<f32>().add(2) = 2.;
+        }
+        drop(views);
+        assert_eq!(external.outputs[&value].ptr, origin as usize);
+        assert_eq!(backing, [9., 1., 9., 2., 9., 9., 9., 9.]);
+    }
+
+    #[test]
+    fn partial_output_binding_failure_keeps_every_internal_owner() {
+        let ep = CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap();
+        for missing_second in [true, false] {
+            let outputs = [ValueId(0), ValueId(1)];
+            let mut buffers = HashMap::new();
+            buffers.insert(outputs[0], ep.allocate(16, 64).unwrap());
+            if !missing_second {
+                buffers.insert(outputs[1], ep.allocate(16, 64).unwrap());
+            }
+            let origins = buffers
+                .iter()
+                .map(|(value, buffer)| (*value, buffer.as_ptr() as usize))
+                .collect::<HashMap<_, _>>();
+            let shapes = [vec![4], vec![8]];
+            let strides = [vec![1], vec![1]];
+            let error = build_output_bindings(
+                &mut buffers,
+                &outputs,
+                &shapes,
+                &strides,
+                &[DataType::Float32; 2],
+                &ExternalBindings::default(),
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(
+                error.contains(if missing_second {
+                    "missing buffer"
+                } else {
+                    "outside backing"
+                }),
+                "{error}"
+            );
+            assert_eq!(buffers.len(), origins.len());
+            for (value, origin) in origins {
+                assert_eq!(buffers[&value].as_ptr() as usize, origin);
+            }
+            for (_, buffer) in buffers.drain() {
+                ep.deallocate(buffer).unwrap();
+            }
+        }
+    }
 }

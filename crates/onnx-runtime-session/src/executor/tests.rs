@@ -17304,11 +17304,13 @@ fn completed_workspace_capture_refuses_eager_growth_and_alignment_changes() {
 
 struct OutputWorkspaceProbeEp {
     deferred: bool,
+    failure: Arc<AtomicU8>,
     cpu: CpuExecutionProvider,
     plans: Arc<std::sync::Mutex<Vec<Vec<OutputMetadata<'static>>>>>,
 }
 struct OutputWorkspaceProbeKernel {
     deferred: bool,
+    failure: Arc<AtomicU8>,
     origin: AtomicUsize,
     slots: Vec<bool>,
     plans: Arc<std::sync::Mutex<Vec<Vec<OutputMetadata<'static>>>>>,
@@ -17371,6 +17373,15 @@ impl Kernel for OutputWorkspaceProbeKernel {
         facts: &[OutputMetadata<'_>],
         cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
     ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        if self
+            .failure
+            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Err(EpError::KernelFailed(
+                "forced output workspace planning failure; retry with valid bindings".into(),
+            ));
+        }
         if !self.deferred {
             return match cached {
                 Some(preparation) => preparation,
@@ -17416,6 +17427,22 @@ impl Kernel for OutputWorkspaceProbeKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> onnx_runtime_ep_api::Result<()> {
+        if self
+            .failure
+            .compare_exchange(2, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Err(EpError::KernelFailed(
+                "forced output kernel execution failure; retry the request".into(),
+            ));
+        }
+        if self
+            .failure
+            .compare_exchange(3, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            panic!("forced output kernel panic");
+        }
         if self.deferred {
             let output = outputs.iter().find(|output| !output.is_absent()).unwrap();
             assert_eq!(
@@ -17481,6 +17508,7 @@ impl ExecutionProvider for OutputWorkspaceProbeEp {
         if matches!(node.op_type.as_str(), "Attention" | "OutputWorkspaceProbe") {
             Ok(Box::new(OutputWorkspaceProbeKernel {
                 deferred: self.deferred,
+                failure: self.failure.clone(),
                 origin: AtomicUsize::new(0),
                 slots: node.outputs.iter().map(Option::is_some).collect(),
                 plans: self.plans.clone(),
@@ -17505,6 +17533,15 @@ impl ExecutionProvider for OutputWorkspaceProbeEp {
         alignment: usize,
         role: MemoryRole,
     ) -> onnx_runtime_ep_api::Result<WorkspaceAllocation> {
+        if self
+            .failure
+            .compare_exchange(4, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Err(EpError::KernelFailed(
+                "forced output workspace admission failure; retry with available capacity".into(),
+            ));
+        }
         self.cpu.allocate_workspace(bytes, alignment, role)
     }
     fn deallocate_workspace(&self, owner: WorkspaceAllocation) -> onnx_runtime_ep_api::Result<()> {
@@ -17534,6 +17571,7 @@ impl ExecutionProvider for OutputWorkspaceProbeEp {
 #[test]
 fn deferred_workspace_strict_prepare_does_not_publish_memo_or_poison_eager_execution() {
     let ep = Arc::new(OutputWorkspaceProbeEp {
+        failure: Default::default(),
         deferred: true,
         cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
         plans: Default::default(),
@@ -17575,6 +17613,7 @@ fn deferred_workspace_strict_prepare_does_not_publish_memo_or_poison_eager_execu
 #[test]
 fn output_workspace_metadata_tracks_physical_bindings_and_memo() {
     let ep = Arc::new(OutputWorkspaceProbeEp {
+        failure: Default::default(),
         deferred: false,
         cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
         plans: Default::default(),
@@ -17649,6 +17688,7 @@ fn output_workspace_metadata_tracks_physical_bindings_and_memo() {
 #[test]
 fn output_workspace_metadata_matches_lowered_trailing_outputs() {
     let ep = Arc::new(OutputWorkspaceProbeEp {
+        failure: Default::default(),
         deferred: false,
         cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
         plans: Default::default(),
@@ -17679,6 +17719,7 @@ fn output_workspace_metadata_matches_lowered_trailing_outputs() {
 #[test]
 fn output_workspace_metadata_reaches_nested_control_flow_preparation() {
     let ep = Arc::new(OutputWorkspaceProbeEp {
+        failure: Default::default(),
         deferred: false,
         cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
         plans: Default::default(),
@@ -17846,4 +17887,101 @@ fn workspace_capture_cannot_silently_skip_unpinned_raw_backing() {
     let error = executor.workspace_capture_resources().err().unwrap();
     assert!(error.to_string().contains("binding-owned workspace"));
     drop(executor.step_workspace.take());
+}
+
+#[test]
+fn output_backings_survive_workspace_planning_admission_execution_errors_and_unwinding() {
+    use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, HostAllocator, MemoryError};
+    use std::ptr::NonNull;
+
+    #[derive(Debug, Default)]
+    struct Allocations {
+        inner: HostAllocator,
+        live: AtomicUsize,
+        allocated: AtomicUsize,
+    }
+    impl DeviceAllocator for Allocations {
+        fn device(&self) -> DeviceKey {
+            self.inner.device()
+        }
+        fn allocate(
+            &self,
+            bytes: usize,
+            align: usize,
+        ) -> std::result::Result<NonNull<u8>, MemoryError> {
+            let pointer = self.inner.allocate(bytes, align)?;
+            self.live.fetch_add(1, Ordering::SeqCst);
+            self.allocated.fetch_add(1, Ordering::SeqCst);
+            Ok(pointer)
+        }
+        unsafe fn deallocate(&self, pointer: NonNull<u8>, bytes: usize, align: usize) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            unsafe { self.inner.deallocate(pointer, bytes, align) };
+        }
+    }
+    for stage in 1..=4 {
+        let allocations = Arc::new(Allocations::default());
+        let mut cpu = CpuExecutionProvider::new().with_memory(allocations.clone());
+        cpu.initialize(&EpConfig::default()).unwrap();
+        let ep = Arc::new(OutputWorkspaceProbeEp {
+            deferred: true,
+            failure: Arc::new(AtomicU8::new(stage)),
+            cpu,
+            plans: Default::default(),
+        });
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let outputs = ["left", "right"].map(|name| {
+            let value = graph.create_named_value(name, DataType::Float32, static_shape([3]));
+            graph.add_output(value);
+            value
+        });
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "OutputWorkspaceProbe",
+            vec![],
+            outputs.to_vec(),
+        ));
+        let mut executor =
+            Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+        executor
+            .size_buffers(&executor.resolve_all(&HashMap::new()).unwrap())
+            .unwrap();
+        let origins = outputs.map(|value| executor.buffers[&value].as_ptr() as usize);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.run(&[])));
+        if stage == 3 {
+            assert!(outcome.is_err(), "the unwind positive control must panic");
+        } else {
+            let error = outcome.unwrap().unwrap_err().to_string();
+            assert!(error.contains("forced output"), "stage {stage}: {error}");
+        }
+        for (value, origin) in outputs.into_iter().zip(origins) {
+            assert_eq!(
+                executor
+                    .buffers
+                    .get(&value)
+                    .map(|buffer| buffer.as_ptr() as usize),
+                Some(origin),
+                "stage {stage} must preserve the real output allocation owner"
+            );
+        }
+        assert!(
+            allocations.allocated.load(Ordering::SeqCst) >= 2,
+            "the leak positive control allocated nothing"
+        );
+        if stage != 3 {
+            let recovered = executor.run(&[]).unwrap();
+            assert_eq!(recovered.len(), 2);
+            for output in recovered {
+                assert_eq!(output.as_bytes(), &[0x5a; 12]);
+            }
+        }
+        drop(executor);
+        drop(ep);
+        assert_eq!(
+            allocations.live.load(Ordering::SeqCst),
+            0,
+            "stage {stage} leaked allocation ownership"
+        );
+    }
 }
