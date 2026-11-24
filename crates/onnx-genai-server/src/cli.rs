@@ -106,7 +106,7 @@ pub struct ServeArgs {
     #[arg(long, env = "NXRT_MCP_SERVERS_JSON")]
     pub mcp_servers_json: Option<String>,
 
-    /// Maximum bytes per MCP stdio message (up to upstream's 8 MiB limit).
+    /// Maximum bytes per incoming MCP stdio message (up to upstream's 8 MiB limit).
     #[arg(long, default_value = "262144")]
     pub mcp_max_message_bytes: std::num::NonZeroUsize,
 

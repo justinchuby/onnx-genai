@@ -83,7 +83,8 @@ child is reaped. The node owns a separate runtime and joins its actors and reape
 at shutdown, including when the caller's Tokio runtime has already ended.
 
 `--mcp-max-message-bytes` defaults to 262144 (256 KiB), and can be raised to the
-upstream 8388608-byte (8 MiB) stdio line limit. Larger messages require additional
+upstream 8388608-byte (8 MiB) incoming stdio line limit. Outgoing arguments retain
+the HTTP request admission and 32 MiB request-body bound. Larger incoming messages require additional
 `--tools-max-host-bytes`. At the default message limit, a connection reserves
 32 MiB for SDK/session staging; each incoming request/notification additionally
 holds at most 8 MiB plus control credit until its SDK handler releases it.
