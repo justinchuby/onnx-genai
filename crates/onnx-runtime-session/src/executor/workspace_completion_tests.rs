@@ -49,8 +49,8 @@ fn exact_completed_binding_reads_reuse_one_pending_lane_without_new_issuer_or_sy
             "poll never consumes or performs device validation"
         );
         assert!(executor.workspace_completion == WorkspaceCompletion::AwaitingValidation);
-        assert!(executor.step_workspace.is_some());
-        assert!(executor.workspace_reuse.take().is_none());
+        assert!(executor.workspaces.active_mut().step.is_some());
+        assert!(executor.workspaces.reuse.take().is_none());
         assert_eq!(
             ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
             0,
@@ -74,9 +74,9 @@ fn exact_completed_binding_reads_reuse_one_pending_lane_without_new_issuer_or_sy
         }
     }
     assert_eq!(ep.workspace_allocations.load(Ordering::Relaxed), 1);
-    executor.release_step_workspace().unwrap();
+    executor.release_workspaces().unwrap();
     assert!(executor.workspace_completion == WorkspaceCompletion::Completed);
-    assert!(executor.step_workspace.is_none());
+    assert!(executor.workspaces.active().is_none());
     assert_eq!(
         ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
         64
@@ -177,9 +177,9 @@ fn completed_failed_receipt_stays_failed_before_a_new_generation() {
             .contains("0x40")
     );
     assert!(executor.workspace_completion == WorkspaceCompletion::Pending);
-    executor.release_step_workspace().unwrap();
+    executor.release_workspaces().unwrap();
     assert_eq!(books.used(Tier::Host), 0);
-    assert!(executor.workspace_reuse.take().is_none());
+    assert!(executor.workspaces.reuse.take().is_none());
 }
 
 #[test]
@@ -201,7 +201,7 @@ fn host_failure_with_zero_device_flags_cannot_publish_reusable_workspace() {
         "unknown/error work must not be upgraded by a clean receipt"
     );
     assert!(executor.workspace_completion == WorkspaceCompletion::Pending);
-    assert!(executor.workspace_reuse.take().is_none());
+    assert!(executor.workspaces.reuse.take().is_none());
     assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
     assert_eq!(books.used(Tier::Host), 0);
 }
@@ -211,7 +211,7 @@ fn capture_pin_and_parent_loan_do_not_enroll_pending_capacity_as_idle() {
     let (mut executor, ep, books, _) = completed_workspace_fixture(true);
     ep.completion_observation_enabled
         .store(true, Ordering::Relaxed);
-    executor.set_pin_step_workspace(true);
+    executor.set_pin_workspace_lane(true);
     let mut bindings = bindings(&mut executor);
     executor
         .run_with_device_bindings(&[], &mut bindings)
@@ -221,9 +221,9 @@ fn capture_pin_and_parent_loan_do_not_enroll_pending_capacity_as_idle() {
         0,
         "pinned release retains active ownership without polling"
     );
-    executor.set_pin_step_workspace(false);
+    executor.set_pin_workspace_lane(false);
     executor.parent_workspace_policy = Some(WorkspaceReplacement::Allowed);
-    executor.release_step_workspace().unwrap();
+    executor.release_workspaces().unwrap();
     assert_eq!(
         ep.completion_observations.load(Ordering::Relaxed),
         0,
@@ -235,7 +235,7 @@ fn capture_pin_and_parent_loan_do_not_enroll_pending_capacity_as_idle() {
     );
     executor.parent_workspace_policy = None;
     bindings[1].read_bytes().unwrap();
-    executor.release_step_workspace().unwrap();
+    executor.release_workspaces().unwrap();
     assert_eq!(
         ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
         64
@@ -268,7 +268,7 @@ fn completion_from_another_executor_cannot_idle_or_reuse_the_pending_owner() {
     // A stale completed output read may synchronize, but carries no receipt for
     // the currently pending first executor's validation generation.
     second_bindings[1].read_bytes().unwrap();
-    second.release_step_workspace().unwrap();
+    second.release_workspaces().unwrap();
     assert_eq!(
         ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
         64
@@ -285,7 +285,7 @@ fn completion_from_another_executor_cannot_idle_or_reuse_the_pending_owner() {
         0
     );
     first_bindings[1].read_bytes().unwrap();
-    first.release_step_workspace().unwrap();
+    first.release_workspaces().unwrap();
     assert_eq!(
         ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
         64
@@ -305,7 +305,7 @@ fn no_step_lane_still_preserves_pending_and_failed_generation_receipts() {
         executor
             .run_with_device_bindings(&[], &mut bindings)
             .unwrap();
-        assert!(executor.step_workspace.is_none());
+        assert!(executor.workspaces.active_mut().step.is_none());
         let token = executor.pending_device_validation;
         let resets = ep.resets.load(Ordering::Relaxed);
         let error = executor

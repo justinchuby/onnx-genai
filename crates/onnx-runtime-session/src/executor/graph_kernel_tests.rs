@@ -893,7 +893,14 @@ fn claimed_dynamic_outputs_use_prepared_scratch_without_lending_it_to_outputs() 
             .unwrap();
         assert_eq!(requirement.step().bytes, 64);
         assert_eq!(requirement.step().lifetime, WorkspaceLifetime::StepScoped);
-        let address = executor.step_workspace.as_ref().unwrap().buffer.as_ptr() as usize;
+        let address = executor
+            .workspaces
+            .active_mut()
+            .step
+            .as_ref()
+            .unwrap()
+            .buffer
+            .as_ptr() as usize;
         if let Some(first) = first_address {
             assert_eq!(
                 address, first,
@@ -938,7 +945,7 @@ fn claimed_dynamic_outputs_reject_short_frozen_or_misaligned_backing_before_exec
         .unwrap()
         .require_complete()
         .unwrap();
-    if let Some(old) = executor.step_workspace.take() {
+    if let Some(old) = executor.workspaces.active_mut().step.take() {
         ep.deallocate_workspace(old.buffer).unwrap();
     }
     executor.parent_workspace_policy = Some(WorkspaceReplacement::CapturePinned);
@@ -952,7 +959,7 @@ fn claimed_dynamic_outputs_reject_short_frozen_or_misaligned_backing_before_exec
             DeviceBuffer::from_borrowed_mut_parts(ptr as *mut _, ep.device_id(), bytes, 1)
         }
         .unwrap();
-        executor.step_workspace = Some(PreparedWorkspace {
+        executor.workspaces.active_mut().step = Some(PreparedWorkspace {
             buffer: WorkspaceAllocation::new(buffer),
             bytes,
             alignment: 16,
@@ -968,6 +975,6 @@ fn claimed_dynamic_outputs_reject_short_frozen_or_misaligned_backing_before_exec
             "rejected backing must fail before executing or publishing dynamic outputs"
         );
     }
-    drop(executor.step_workspace.take());
+    drop(executor.workspaces.active_mut().step.take());
     executor.parent_workspace_policy = None;
 }

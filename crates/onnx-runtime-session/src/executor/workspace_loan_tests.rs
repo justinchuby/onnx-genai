@@ -51,11 +51,11 @@ fn assert_children_returned_owners(executor: &Executor) -> usize {
         .flat_map(|child| &child.compiled)
     {
         count += 1;
-        assert!(child.exec.persistent_workspace.is_none());
-        assert!(child.exec.step_workspace.is_none());
+        assert!(child.exec.workspaces.active().unwrap().persistent.is_none());
+        assert!(child.exec.workspaces.active().unwrap().step.is_none());
         assert!(child.exec.parent_workspace_policy.is_none());
         assert!(matches!(
-            child.exec.workspace_reuse,
+            child.exec.workspaces.reuse,
             WorkspaceReuse::Uninitialized
         ));
         count += assert_children_returned_owners(&child.exec);
@@ -125,8 +125,15 @@ fn nested_workspace_growth_obeys_the_root_secondary_capture_slot() {
     let input = completed_workspace_input(2);
     let inputs = [("condition", &condition), ("input", &input)];
     executor.run(&inputs).unwrap();
-    executor.restore_completed_step_workspace();
-    let origin = executor.step_workspace.as_ref().unwrap().buffer.as_ptr();
+    executor.restore_completed_workspaces();
+    let origin = executor
+        .workspaces
+        .active_mut()
+        .step
+        .as_ref()
+        .unwrap()
+        .buffer
+        .as_ptr();
     let callbacks = books.callbacks();
     executor.slot_capture[1].device_graph_token = Some(DeviceGraphToken::new(
         executor.graph_owner,
@@ -137,7 +144,14 @@ fn nested_workspace_growth_obeys_the_root_secondary_capture_slot() {
     let error = executor.run(&inputs).unwrap_err().to_string();
     assert!(error.contains("reset_device_graph"), "{error}");
     assert_eq!(
-        executor.step_workspace.as_ref().unwrap().buffer.as_ptr(),
+        executor
+            .workspaces
+            .active_mut()
+            .step
+            .as_ref()
+            .unwrap()
+            .buffer
+            .as_ptr(),
         origin
     );
     assert_eq!(books.callbacks(), callbacks);
@@ -168,7 +182,7 @@ fn nested_workspace_replace_refusal_returns_final_slots_without_a_stale_address(
     ep.workspace_bytes.store(4096, Ordering::Relaxed); // Request exceeds the 4096-byte authority.
     assert!(executor.run(&inputs).is_err());
     assert_eq!(ep.executions.load(Ordering::Relaxed), executions);
-    assert!(executor.step_workspace.is_none());
+    assert!(executor.workspaces.active_mut().step.is_none());
     assert_children_returned_owners(&executor);
     ep.workspace_bytes.store(32, Ordering::Relaxed);
     assert_eq!(
@@ -185,12 +199,12 @@ fn workspace_peak_keeps_bytes_when_alignment_grows_in_prepare_and_dispatch() {
         let (mut executor, ep, books, _) = completed_workspace_fixture(true);
         let role = MemoryRole::Workspace { step_scoped: true };
         let owner = ep.allocate_workspace(256, 4, role).unwrap();
-        executor.step_workspace = Some(PreparedWorkspace {
+        executor.workspaces.active_mut().step = Some(PreparedWorkspace {
             bytes: owner.len(),
             alignment: owner.alignment(),
             buffer: owner,
         });
-        executor.pin_step_workspace = true;
+        executor.pin_workspace_lane = true;
         let input = completed_workspace_input(1);
         if prepare_first {
             executor
@@ -201,7 +215,7 @@ fn workspace_peak_keeps_bytes_when_alignment_grows_in_prepare_and_dispatch() {
         } else {
             executor.run(&[("input", &input)]).unwrap();
         }
-        let owner = executor.step_workspace.as_ref().unwrap();
+        let owner = executor.workspaces.active_mut().step.as_ref().unwrap();
         assert!(owner.bytes >= 256);
         assert!(owner.alignment >= 64);
         let origin = owner.buffer.as_ptr();
@@ -210,7 +224,14 @@ fn workspace_peak_keeps_bytes_when_alignment_grows_in_prepare_and_dispatch() {
             .run(&[("input", &completed_workspace_input(8))])
             .unwrap();
         assert_eq!(
-            executor.step_workspace.as_ref().unwrap().buffer.as_ptr(),
+            executor
+                .workspaces
+                .active_mut()
+                .step
+                .as_ref()
+                .unwrap()
+                .buffer
+                .as_ptr(),
             origin
         );
         assert_eq!(books.callbacks(), callbacks);
@@ -235,9 +256,10 @@ fn child_workspace_scope_returns_owners_on_planner_kernel_error_and_unwind() {
         let second = Tensor::from_f32(&[64], &[2.; 64]).unwrap();
         let inputs = [("first", &first), ("second", &second)];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let owners = parent.workspaces.active_mut();
             let workspace = ParentWorkspaces {
-                persistent: &mut parent.persistent_workspace,
-                step: &mut parent.step_workspace,
+                persistent: &mut owners.persistent,
+                step: &mut owners.step,
                 completion: &mut parent.workspace_completion,
                 replacement: WorkspaceReplacement::Allowed,
                 provider: &parent.ep,
@@ -257,11 +279,14 @@ fn child_workspace_scope_returns_owners_on_planner_kernel_error_and_unwind() {
         } else {
             assert!(result.unwrap().is_err());
         }
-        assert!(child.step_workspace.is_none());
-        assert!(child.persistent_workspace.is_none());
+        assert!(child.workspaces.active_mut().step.is_none());
+        assert!(child.workspaces.active_mut().persistent.is_none());
         assert!(child.parent_workspace_policy.is_none());
         assert!(parent.workspace_completion == WorkspaceCompletion::Pending);
-        assert_eq!(parent.step_workspace.is_some(), matches!(stage, 2 | 3));
+        assert_eq!(
+            parent.workspaces.active_mut().step.is_some(),
+            matches!(stage, 2 | 3)
+        );
         assert_eq!(ep.failure.load(Ordering::SeqCst), 0);
     }
 }
@@ -272,7 +297,7 @@ fn child_workspace_scope_refuses_a_private_idle_owner_and_a_different_provider()
     child
         .run(&[("input", &completed_workspace_input(2))])
         .unwrap();
-    assert!(child.step_workspace.is_none());
+    assert!(child.workspaces.active().is_none());
     let mut parent = Executor::build(
         child.graph.clone(),
         child.weights.clone(),
@@ -281,9 +306,10 @@ fn child_workspace_scope_refuses_a_private_idle_owner_and_a_different_provider()
     )
     .unwrap();
     let callbacks = books.callbacks();
+    let owners = parent.workspaces.active_mut();
     let workspace = ParentWorkspaces {
-        persistent: &mut parent.persistent_workspace,
-        step: &mut parent.step_workspace,
+        persistent: &mut owners.persistent,
+        step: &mut owners.step,
         completion: &mut parent.workspace_completion,
         replacement: WorkspaceReplacement::Allowed,
         provider: &parent.ep,
@@ -293,8 +319,8 @@ fn child_workspace_scope_refuses_a_private_idle_owner_and_a_different_provider()
         .unwrap()
         .to_string();
     assert!(error.contains("independent lane"), "{error}");
-    assert!(child.step_workspace.is_some());
-    assert!(parent.step_workspace.is_none());
+    assert!(child.workspaces.active_mut().step.is_some());
+    assert!(parent.workspaces.active_mut().step.is_none());
     assert_eq!(books.callbacks(), callbacks);
     let mut other = Executor::build(
         child.graph.clone(),
@@ -303,9 +329,10 @@ fn child_workspace_scope_refuses_a_private_idle_owner_and_a_different_provider()
         None,
     )
     .unwrap();
+    let owners = other.workspaces.active_mut();
     let workspace = ParentWorkspaces {
-        persistent: &mut other.persistent_workspace,
-        step: &mut other.step_workspace,
+        persistent: &mut owners.persistent,
+        step: &mut owners.step,
         completion: &mut other.workspace_completion,
         replacement: WorkspaceReplacement::Allowed,
         provider: &other.ep,

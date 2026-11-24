@@ -1908,19 +1908,19 @@ impl InferenceSession {
         self.exec.set_graph_slot(slot)
     }
 
-    /// Whether the main executor's StepScoped workspace is pinned across runs.
-    pub fn main_exec_step_workspace_pinned(&self) -> bool {
-        self.exec.step_workspace_pinned()
+    /// Whether the main executor's workspace lane is pinned across runs.
+    pub fn main_exec_workspace_lane_pinned(&self) -> bool {
+        self.exec.workspace_lane_pinned()
     }
 
-    /// Pin (or unpin) the **main** executor's StepScoped workspace across runs.
+    /// Pin (or unpin) both **main** executor workspace lifetime peaks across runs.
     /// Native MTP verify capture pins it so the captured fixed-M verify graph
     /// replays against a stable scratch pointer even though the M=1 decode step
     /// (on the sibling executor) reserves a smaller scratch in between (#1647).
     /// Inert by default; leaving it unpinned keeps every non-verify path
     /// byte-identical.
-    pub fn set_main_exec_pin_step_workspace(&mut self, pin: bool) {
-        self.exec.set_pin_step_workspace(pin);
+    pub fn set_main_exec_pin_workspace_lane(&mut self, pin: bool) {
+        self.exec.set_pin_workspace_lane(pin);
     }
 
     /// Pin the fixed-capacity KV sequence-axis symbols CONSTANT so CUDA-graph

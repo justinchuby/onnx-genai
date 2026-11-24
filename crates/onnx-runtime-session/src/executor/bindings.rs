@@ -847,18 +847,16 @@ impl Executor {
         peak_persistent: WorkspaceRequirement,
         peak_step: WorkspaceRequirement,
     ) -> Result<()> {
-        if peak_step.bytes != 0 {
-            self.restore_completed_step_workspace();
-        }
         let replacement = self.workspace_replacement();
-        replacement.check(self.persistent_workspace.as_ref(), peak_persistent)?;
-        replacement.check(self.step_workspace.as_ref(), peak_step)?;
+        let owners = self.workspaces.active_mut();
+        replacement.check(owners.persistent.as_ref(), peak_persistent)?;
+        replacement.check(owners.step.as_ref(), peak_step)?;
         Self::reserve_prepared_workspace(
             self.ep.as_ref(),
-            &mut self.persistent_workspace,
+            &mut owners.persistent,
             peak_persistent,
         )?;
-        Self::reserve_prepared_workspace(self.ep.as_ref(), &mut self.step_workspace, peak_step)?;
+        Self::reserve_prepared_workspace(self.ep.as_ref(), &mut owners.step, peak_step)?;
 
         Ok(())
     }
@@ -1023,13 +1021,13 @@ impl Executor {
         Ok(())
     }
 
-    pub(super) fn release_step_workspace(&mut self) -> Result<()> {
+    pub(super) fn release_workspaces(&mut self) -> Result<()> {
         // When pinned (an installed fixed-shape verify graph baked this buffer's
-        // address), keep the StepScoped scratch alive so a later replay reads a
+        // address), keep the whole lane alive so a later replay reads a
         // valid pointer. `reserve_prepared_workspace` reuses it whenever the next
         // requirement fits, so the pointer stays stable across replays.
         if self.parent_workspace_policy.is_some()
-            || self.pin_step_workspace
+            || self.pin_workspace_lane
             || matches!(
                 self.workspace_replacement(),
                 WorkspaceReplacement::CapturePinned
@@ -1037,37 +1035,35 @@ impl Executor {
         {
             return Ok(());
         }
-        if self.step_workspace.is_some()
+        if self
+            .workspaces
+            .active()
+            .is_some_and(|pair| !pair.is_empty())
             && self.workspace_completion == WorkspaceCompletion::AwaitingValidation
         {
             self.refresh_awaiting_workspace_completion()?;
             if self.workspace_completion == WorkspaceCompletion::AwaitingValidation {
-                // Still pending: retain the original active owner and charge,
-                // outside the pressure-reclaimable completed idle cell.
                 return Ok(());
             }
         }
-        if let Some(workspace) = self.step_workspace.take() {
-            if self.workspace_completion == WorkspaceCompletion::Completed {
-                self.workspace_reuse.recycle(&self.ep, workspace)?;
-            } else {
-                self.ep.deallocate_workspace(workspace.buffer)?;
-            }
+        if self.workspace_completion == WorkspaceCompletion::Completed {
+            self.workspaces.recycle_completed(&self.ep)
+        } else {
+            self.workspaces.retire_step(self.ep.as_ref())
         }
-        Ok(())
     }
 
-    /// Whether this executor's StepScoped workspace is pinned across runs.
-    pub(crate) fn step_workspace_pinned(&self) -> bool {
-        self.pin_step_workspace
+    /// Whether this executor's workspace lane is pinned across runs.
+    pub(crate) fn workspace_lane_pinned(&self) -> bool {
+        self.pin_workspace_lane
     }
 
-    /// Pin (or unpin) this executor's StepScoped workspace across runs. Pinning
+    /// Pin (or unpin) both workspace lifetime peaks across runs. Pinning
     /// keeps the reserved scratch buffer alive so a captured fixed-shape graph
     /// (the M=K speculative verify) replays against a stable pointer; unpinning
-    /// frees it on the next release. See [`Self::pin_step_workspace`].
-    pub(crate) fn set_pin_step_workspace(&mut self, pin: bool) {
-        self.pin_step_workspace = pin;
+    /// permits idle publication or retirement on the next release. See [`Self::pin_workspace_lane`].
+    pub(crate) fn set_pin_workspace_lane(&mut self, pin: bool) {
+        self.pin_workspace_lane = pin;
     }
 
     /// Bind the graph's symbols to concrete sizes from the actual bound-input
@@ -1182,7 +1178,7 @@ impl Executor {
                 .map(|outputs| outputs.into_iter().map(SessionOutput::Tensor).collect());
         }
         let result = self.run_scoped(inputs, &HashMap::new(), &ExternalBindings::default());
-        self.release_step_workspace()?;
+        self.release_workspaces()?;
         result?
             .into_iter()
             .map(|output| {
@@ -1217,7 +1213,7 @@ impl Executor {
             None,
         );
         self.scratch_external_bindings = external;
-        self.release_step_workspace()?;
+        self.release_workspaces()?;
         let outputs = match result? {
             ScopedRunResult::Executed(outputs) => outputs,
             ScopedRunResult::NotCapturable(_) => unreachable!("eager runs are always executed"),
@@ -1287,7 +1283,7 @@ impl Executor {
             None,
         );
         self.scratch_external_bindings = external;
-        self.release_step_workspace()?;
+        self.release_workspaces()?;
         match result? {
             ScopedRunResult::Executed(outputs) => {
                 let mut tensors = Vec::with_capacity(outputs.len());
@@ -1431,7 +1427,7 @@ impl Executor {
             Some(artifact_requirement),
         );
         self.scratch_external_bindings = external;
-        self.release_step_workspace()?;
+        self.release_workspaces()?;
         match result? {
             // `run_scoped_mode` clears `capture_schedule` when a branch flip
             // retired the graph this step; report that so the caller re-arms.

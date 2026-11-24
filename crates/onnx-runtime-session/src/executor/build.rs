@@ -1417,11 +1417,9 @@ impl Executor {
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
             provider_artifact_readiness: ProviderArtifactReadiness::default(),
-            persistent_workspace: None,
-            step_workspace: None,
-            workspace_reuse: WorkspaceReuse::default(),
+            workspaces: WorkspaceLane::default(),
             workspace_completion: WorkspaceCompletion::Pending,
-            pin_step_workspace: false,
+            pin_workspace_lane: false,
             parent_workspace_policy: None,
             workspace_preparation_memo: None,
             workspace_node_locations,
@@ -1589,13 +1587,13 @@ impl Executor {
         // fixed M=k+1 verify shape, so its workspace is reserved once at that peak
         // and never needs to grow or shrink. Its captured verify graph bakes the
         // workspace device pointer, so it must NOT be freed between replays:
-        // without the pin, `release_step_workspace` returns the workspace to the
+        // without the pin, `release_workspaces` returns the workspace to the
         // shared EP arena after each step, the interleaved M=1 decode on the main
         // executor reserves that same freed slot, and the next verify replay reads
         // reallocated memory (a nondeterministic illegal access, #1647's stale-ptr
         // hazard). Pinning keeps the sibling's scratch pointer stable for every
         // replay.
-        sibling.pin_step_workspace = true;
+        sibling.pin_workspace_lane = true;
         Ok(sibling)
     }
 

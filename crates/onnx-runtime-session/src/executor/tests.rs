@@ -76,6 +76,8 @@ fn count_host_allocations<T>(operation: impl FnOnce() -> T) -> (T, u64) {
 }
 
 struct DeferredValidationKernel {
+    workspace_lifetime: WorkspaceLifetime,
+    workspace_scale: usize,
     workspace_bytes: Arc<AtomicUsize>,
     fail_next: Arc<AtomicBool>,
     panic_next: Arc<AtomicBool>,
@@ -95,10 +97,10 @@ impl Kernel for DeferredValidationKernel {
                 bytes: (self.workspace_bytes.load(Ordering::Relaxed)
                     * inputs
                         .first()
-                        .map_or(0, |input| input.shape.iter().product::<usize>()))
-                    as u64,
+                        .map_or(0, |input| input.shape.iter().product::<usize>())
+                    * self.workspace_scale) as u64,
                 alignment: 64,
-                lifetime: WorkspaceLifetime::StepScoped,
+                lifetime: self.workspace_lifetime,
             },
         ))
     }
@@ -112,7 +114,8 @@ impl Kernel for DeferredValidationKernel {
         let required = self.workspace_bytes.load(Ordering::Relaxed)
             * inputs
                 .first()
-                .map_or(0, |input| input.shape.iter().product::<usize>());
+                .map_or(0, |input| input.shape.iter().product::<usize>())
+            * self.workspace_scale;
         if required != 0 {
             let scratch =
                 workspace.ok_or_else(|| EpError::KernelFailed("test workspace missing".into()))?;
@@ -159,12 +162,16 @@ impl Kernel for DeferredValidationKernel {
     }
 }
 
+type WorkspaceReleaseHook = Arc<dyn Fn(usize) + Send + Sync>;
+
 struct DeferredValidationEp {
     workspace_bytes: Arc<AtomicUsize>,
     workspace_registry: Option<onnx_runtime_memory_governor::PressureRegistry>,
     workspace_allocations: AtomicUsize,
     workspace_releases: AtomicUsize,
     workspace_registry_calls: AtomicUsize,
+    fail_workspace_registry: AtomicBool,
+    workspace_release_hook: std::sync::Mutex<Option<WorkspaceReleaseHook>>,
     completion_observation_enabled: AtomicBool,
     completion_observations: AtomicUsize,
     fail_workspace_release: AtomicBool,
@@ -266,6 +273,8 @@ impl DeferredValidationEp {
             workspace_allocations: AtomicUsize::new(0),
             workspace_releases: AtomicUsize::new(0),
             workspace_registry_calls: AtomicUsize::new(0),
+            fail_workspace_registry: AtomicBool::new(false),
+            workspace_release_hook: std::sync::Mutex::new(None),
             completion_observation_enabled: AtomicBool::new(false),
             completion_observations: AtomicUsize::new(0),
             fail_workspace_release: AtomicBool::new(false),
@@ -389,11 +398,22 @@ impl ExecutionProvider for DeferredValidationEp {
 
     fn get_kernel(
         &self,
-        _op: &Node,
+        op: &Node,
         _shapes: &[Vec<usize>],
         _opset: u64,
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
         Ok(Box::new(DeferredValidationKernel {
+            workspace_lifetime: if op.attr("persistent_workspace").and_then(Attribute::as_int)
+                == Some(1)
+            {
+                WorkspaceLifetime::SessionPersistent
+            } else {
+                WorkspaceLifetime::StepScoped
+            },
+            workspace_scale: op
+                .attr("workspace_scale")
+                .and_then(Attribute::as_int)
+                .map_or(1, |scale| scale as usize),
             workspace_bytes: Arc::clone(&self.workspace_bytes),
             fail_next: Arc::clone(&self.fail_next),
             panic_next: Arc::clone(&self.panic_next),
@@ -408,6 +428,12 @@ impl ExecutionProvider for DeferredValidationEp {
     ) -> onnx_runtime_ep_api::Result<Option<onnx_runtime_memory_governor::PressureRegistry>> {
         self.workspace_registry_calls
             .fetch_add(1, Ordering::Relaxed);
+        if self.fail_workspace_registry.load(Ordering::Relaxed) {
+            return Err(EpError::KernelFailed(
+                "forced pressure registry failure; retry after restoring workspace authority"
+                    .into(),
+            ));
+        }
         Ok(self.workspace_registry.clone())
     }
 
@@ -425,7 +451,11 @@ impl ExecutionProvider for DeferredValidationEp {
         &self,
         workspace: WorkspaceAllocation,
     ) -> onnx_runtime_ep_api::Result<()> {
-        self.workspace_releases.fetch_add(1, Ordering::Relaxed);
+        let release = self.workspace_releases.fetch_add(1, Ordering::Relaxed) + 1;
+        let hook = self.workspace_release_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(release);
+        }
         if self.fail_workspace_release.swap(false, Ordering::Relaxed) {
             return Err(EpError::KernelFailed(
                 "forced workspace release failure; ownership remains quarantined".into(),
@@ -5986,7 +6016,16 @@ fn prepare_reserves_static_nested_qmoe_workspace_and_child_reuses_it() {
         .unwrap();
     assert_eq!(requirement.persistent().bytes, 4096);
     assert_eq!(requirement.step().bytes, 0);
-    assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 4096);
+    assert_eq!(
+        executor
+            .workspaces
+            .active_mut()
+            .persistent
+            .as_ref()
+            .unwrap()
+            .bytes,
+        4096
+    );
 
     let output = executor.run(&[("cond", &cond)]).unwrap();
     assert_eq!(output[0].to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0]);
@@ -6046,7 +6085,16 @@ fn prepare_reserves_static_index_share_workspace() {
         requirement.persistent().role(),
         MemoryRole::Workspace { step_scoped: false }
     );
-    assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 768);
+    assert_eq!(
+        executor
+            .workspaces
+            .active_mut()
+            .persistent
+            .as_ref()
+            .unwrap()
+            .bytes,
+        768
+    );
     assert_eq!(
         deliveries.lock().unwrap().as_slice(),
         ["allocate_workspace"],
@@ -6098,13 +6146,22 @@ fn inference_session_fallback_workspace_grows_retries_and_reuses() {
         vec![1.0, 2.0]
     );
     assert_eq!(
-        session.exec.persistent_workspace.as_ref().unwrap().bytes,
+        session
+            .exec
+            .workspaces
+            .active_mut()
+            .persistent
+            .as_ref()
+            .unwrap()
+            .bytes,
         2048
     );
     assert_eq!(
         session
             .exec
-            .persistent_workspace
+            .workspaces
+            .active_mut()
+            .persistent
             .as_ref()
             .unwrap()
             .alignment,
@@ -6117,7 +6174,7 @@ fn inference_session_fallback_workspace_grows_retries_and_reuses() {
         .run(&[("input", &large)])
         .expect_err("workspace replacement allocation must fail once");
     assert!(
-        session.exec.persistent_workspace.is_none(),
+        session.exec.workspaces.active_mut().persistent.is_none(),
         "failed growth must leave a valid empty slot"
     );
 
@@ -6125,7 +6182,13 @@ fn inference_session_fallback_workspace_grows_retries_and_reuses() {
         session.run(&[("input", &large)]).unwrap()[0].to_vec_f32(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    let grown = session.exec.persistent_workspace.as_ref().unwrap();
+    let grown = session
+        .exec
+        .workspaces
+        .active_mut()
+        .persistent
+        .as_ref()
+        .unwrap();
     assert_eq!(grown.bytes, 4096);
     assert_eq!(grown.alignment, 512);
     let ptr = grown.buffer.as_ptr();
@@ -6134,7 +6197,13 @@ fn inference_session_fallback_workspace_grows_retries_and_reuses() {
         session.run(&[("input", &small)]).unwrap()[0].to_vec_f32(),
         vec![1.0, 2.0]
     );
-    let reused = session.exec.persistent_workspace.as_ref().unwrap();
+    let reused = session
+        .exec
+        .workspaces
+        .active_mut()
+        .persistent
+        .as_ref()
+        .unwrap();
     assert_eq!(reused.bytes, 4096);
     assert_eq!(reused.buffer.as_ptr(), ptr);
 }
@@ -6206,7 +6275,13 @@ fn prepared_session_reprepares_workspace_when_execution_rebuckets() {
         .unwrap()
         .require_complete()
         .unwrap();
-    let reserved = session.exec.persistent_workspace.as_ref().unwrap();
+    let reserved = session
+        .exec
+        .workspaces
+        .active_mut()
+        .persistent
+        .as_ref()
+        .unwrap();
     assert_eq!(reserved.bytes, 2048);
     assert_eq!(reserved.alignment, 256);
     assert!(
@@ -6229,7 +6304,13 @@ fn prepared_session_reprepares_workspace_when_execution_rebuckets() {
         session.run(&[("input", &bucket_b)]).unwrap()[0].to_vec_f32(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    let grown = session.exec.persistent_workspace.as_ref().unwrap();
+    let grown = session
+        .exec
+        .workspaces
+        .active_mut()
+        .persistent
+        .as_ref()
+        .unwrap();
     assert_eq!(grown.bytes, 4096);
     assert_eq!(grown.alignment, 512);
     assert!(
@@ -6243,7 +6324,14 @@ fn prepared_session_reprepares_workspace_when_execution_rebuckets() {
         vec![1.0, 2.0]
     );
     assert_eq!(
-        session.exec.persistent_workspace.as_ref().unwrap().bytes,
+        session
+            .exec
+            .workspaces
+            .active_mut()
+            .persistent
+            .as_ref()
+            .unwrap()
+            .bytes,
         4096
     );
 }
@@ -8754,13 +8842,27 @@ fn lazy_weight_execution_borrows_prepared_workspace_with_logical_geometry() {
                 .unwrap()
                 .require_complete()
                 .unwrap();
-            assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 64);
+            assert_eq!(
+                executor
+                    .workspaces
+                    .active_mut()
+                    .persistent
+                    .as_ref()
+                    .unwrap()
+                    .bytes,
+                64
+            );
         }
         let mut address = None;
         for _ in 0..3 {
             let outputs = executor.run(&[]).unwrap();
             assert_eq!(outputs[0].as_bytes(), &[1, 2, 3, 4]);
-            let workspace = executor.persistent_workspace.as_ref().unwrap();
+            let workspace = executor
+                .workspaces
+                .active_mut()
+                .persistent
+                .as_ref()
+                .unwrap();
             assert_eq!(workspace.bytes, 64);
             let current = workspace.buffer.as_ptr() as usize;
             assert_eq!(*address.get_or_insert(current), current);
@@ -8790,7 +8892,16 @@ fn lazy_weight_workspace_metadata_follows_execution_slots() {
     assert_eq!(executor.plan[0].inputs.len(), 1);
     let output = executor.run(&[]).unwrap();
     assert_eq!(output[0].as_bytes(), &[1, 2, 3, 4]);
-    assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 64);
+    assert_eq!(
+        executor
+            .workspaces
+            .active_mut()
+            .persistent
+            .as_ref()
+            .unwrap()
+            .bytes,
+        64
+    );
     assert_eq!(
         &*deliveries.lock().unwrap(),
         &["allocate_workspace", "lazy"]
@@ -8811,7 +8922,7 @@ fn lazy_weight_workspace_refusal_precedes_materialization_and_can_retry() {
     let error = executor.run(&[]).unwrap_err().to_string();
     assert!(error.contains("64"), "{error}");
     assert!(!deliveries.lock().unwrap().contains(&"lazy"));
-    assert!(executor.persistent_workspace.is_none());
+    assert!(executor.workspaces.active_mut().persistent.is_none());
     let outputs = executor.run(&[]).unwrap();
     assert_eq!(outputs[0].as_bytes(), &[1, 2, 3, 4]);
     assert_eq!(
@@ -14503,12 +14614,12 @@ fn nested_gemm_borrows_and_grows_the_real_parent_peak() {
         let role = MemoryRole::Workspace { step_scoped: true };
         let local = ep.allocate_workspace(local_bytes, 4, role).unwrap();
         let original = local.as_ptr();
-        executor.step_workspace = Some(PreparedWorkspace {
+        executor.workspaces.active_mut().step = Some(PreparedWorkspace {
             bytes: local.len(),
             alignment: local.alignment(),
             buffer: local,
         });
-        executor.pin_step_workspace = true;
+        executor.pin_workspace_lane = true;
         let cond = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
         for _ in 0..3 {
             assert_eq!(
@@ -14517,7 +14628,7 @@ fn nested_gemm_borrows_and_grows_the_real_parent_peak() {
                     .unwrap(),
                 &[3.; 4]
             );
-            let owner = executor.step_workspace.as_ref().unwrap();
+            let owner = executor.workspaces.active_mut().step.as_ref().unwrap();
             assert!(owner.bytes >= local_bytes.max(24));
             if local_bytes == 32 {
                 assert_eq!(owner.buffer.as_ptr(), original);
@@ -14527,8 +14638,8 @@ fn nested_gemm_borrows_and_grows_the_real_parent_peak() {
                 .values()
                 .flat_map(|child| &child.compiled)
             {
-                assert!(child.exec.step_workspace.is_none());
-                assert!(child.exec.persistent_workspace.is_none());
+                assert!(child.exec.workspaces.active().unwrap().step.is_none());
+                assert!(child.exec.workspaces.active().unwrap().persistent.is_none());
                 assert!(child.exec.parent_workspace_policy.is_none());
             }
         }
@@ -14574,7 +14685,7 @@ fn nested_gemm_uses_step_peak_without_clobbering_persistent_workspace() {
         unsafe {
             std::ptr::write_bytes(persistent.as_mut_ptr().cast::<u8>(), 0xA5, persistent.len());
         }
-        executor.persistent_workspace = Some(PreparedWorkspace {
+        executor.workspaces.active_mut().persistent = Some(PreparedWorkspace {
             bytes: persistent.len(),
             alignment: persistent.alignment(),
             buffer: persistent,
@@ -14587,10 +14698,25 @@ fn nested_gemm_uses_step_peak_without_clobbering_persistent_workspace() {
                 .unwrap()
                 .require_complete()
                 .unwrap();
-            assert_eq!(executor.step_workspace.as_ref().unwrap().bytes, 24);
+            assert_eq!(
+                executor
+                    .workspaces
+                    .active_mut()
+                    .step
+                    .as_ref()
+                    .unwrap()
+                    .bytes,
+                24
+            );
             let outputs = executor.run(&inputs).unwrap();
             assert_eq!(outputs[0].try_as_slice_f32().unwrap(), &[3.; 4]);
-            let persistent = &executor.persistent_workspace.as_ref().unwrap().buffer;
+            let persistent = &executor
+                .workspaces
+                .active_mut()
+                .persistent
+                .as_ref()
+                .unwrap()
+                .buffer;
             // SAFETY: the parent's initialized persistent allocation remains live.
             let bytes = unsafe {
                 std::slice::from_raw_parts(persistent.as_ptr().cast::<u8>(), persistent.len())
@@ -16918,7 +17044,7 @@ fn a_false_no_workspace_declaration_is_rejected_before_late_allocation() {
             && error.contains("declare Metadata workspace planning"),
         "{error}"
     );
-    assert!(executor.step_workspace.is_none());
+    assert!(executor.workspaces.active_mut().step.is_none());
 }
 
 #[derive(Debug)]
@@ -17128,10 +17254,10 @@ fn completed_workspace_pressure_releases_idle_but_cannot_take_active_owner() {
     let registry = ep.workspace_registry.as_ref().unwrap();
     assert_eq!(registry.reclaim(0).unwrap(), 0);
     assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 0);
-    executor.restore_completed_step_workspace();
+    executor.restore_completed_workspaces();
     assert_eq!(registry.reclaim(1).unwrap(), 0);
     assert_eq!(books.used(Tier::Host), 64);
-    executor.release_step_workspace().unwrap();
+    executor.release_workspaces().unwrap();
     assert_eq!(registry.reclaim(1).unwrap(), 64);
     assert_eq!(books.used(Tier::Host), 0);
     executor.run(&[("input", &input)]).unwrap();
@@ -17187,7 +17313,7 @@ fn completed_workspace_deferred_binding_run_retires_without_new_sync() {
     assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
     assert_eq!(books.used(Tier::Host), 0);
     assert!(matches!(
-        executor.workspace_reuse,
+        executor.workspaces.reuse,
         WorkspaceReuse::Uninitialized
     ));
 }
@@ -17202,7 +17328,7 @@ fn completed_workspace_failed_validation_cannot_publish_idle_owner() {
     assert!(error.to_string().contains("0x40"), "{error}");
     assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
     assert_eq!(books.used(Tier::Host), 0);
-    assert!(executor.workspace_reuse.take().is_none());
+    assert!(executor.workspaces.reuse.take().is_none());
 }
 
 #[test]
@@ -17211,21 +17337,21 @@ fn completed_workspace_installed_capture_is_never_pressure_idle() {
     executor
         .run(&[("input", &completed_workspace_input(2))])
         .unwrap();
-    executor.restore_completed_step_workspace();
+    executor.restore_completed_workspaces();
     executor.slot_capture[0].device_graph_token = Some(DeviceGraphToken::new(
         executor.graph_owner,
         DeviceGraphSlot::Primary,
         1,
     ));
-    executor.release_step_workspace().unwrap();
-    assert!(executor.step_workspace.is_some());
+    executor.release_workspaces().unwrap();
+    assert!(executor.workspaces.active_mut().step.is_some());
     assert_eq!(
         ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
         0
     );
     assert_eq!(books.used(Tier::Host), 64);
     executor.slot_capture[0].device_graph_token = None;
-    executor.release_step_workspace().unwrap();
+    executor.release_workspaces().unwrap();
     assert_eq!(
         ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
         64
@@ -17239,7 +17365,7 @@ fn completed_workspace_restore_and_pressure_have_one_owner() {
     let input = completed_workspace_input(2);
     for _ in 0..16 {
         executor.run(&[("input", &input)]).unwrap();
-        let reuse = &executor.workspace_reuse;
+        let reuse = &executor.workspaces.reuse;
         let registry = ep.workspace_registry.as_ref().unwrap();
         let (owner, reclaimed) = std::thread::scope(|scope| {
             let take = scope.spawn(|| reuse.take());
@@ -17249,7 +17375,7 @@ fn completed_workspace_restore_and_pressure_have_one_owner() {
         if let Some(owner) = owner {
             assert_eq!(reclaimed, 0);
             assert_eq!(books.used(Tier::Host), 64);
-            ep.deallocate_workspace(owner.buffer).unwrap();
+            ep.deallocate_workspace(owner.step.unwrap().buffer).unwrap();
         } else {
             assert_eq!(reclaimed, 64);
         }
@@ -17267,7 +17393,10 @@ fn completed_workspace_no_pressure_capability_keeps_original_retirement() {
     assert_eq!(ep.workspace_registry_calls.load(Ordering::Relaxed), 1);
     assert_eq!(ep.workspace_allocations.load(Ordering::Relaxed), 3);
     assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 3);
-    assert!(matches!(executor.workspace_reuse, WorkspaceReuse::Disabled));
+    assert!(matches!(
+        executor.workspaces.reuse,
+        WorkspaceReuse::Disabled
+    ));
     // The underlying CPU pool, rather than the executor, still retains charge.
     assert_eq!(books.used(Tier::Host), 64);
 }
@@ -17316,7 +17445,7 @@ fn completed_workspace_preparation_without_execution_stays_active_until_drop() {
         .unwrap()
         .require_complete()
         .unwrap();
-    assert!(executor.step_workspace.is_some());
+    assert!(executor.workspaces.active_mut().step.is_some());
     assert_eq!(
         ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
         0
@@ -17333,8 +17462,15 @@ fn completed_workspace_capture_refuses_prepare_growth_until_all_slots_retire() {
     executor
         .run(&[("input", &completed_workspace_input(2))])
         .unwrap();
-    executor.restore_completed_step_workspace();
-    let original = executor.step_workspace.as_ref().unwrap().buffer.as_ptr();
+    executor.restore_completed_workspaces();
+    let original = executor
+        .workspaces
+        .active_mut()
+        .step
+        .as_ref()
+        .unwrap()
+        .buffer
+        .as_ptr();
     executor.slot_capture[1].device_graph_token = Some(DeviceGraphToken::new(
         executor.graph_owner,
         DeviceGraphSlot::Verify,
@@ -17346,7 +17482,14 @@ fn completed_workspace_capture_refuses_prepare_growth_until_all_slots_retire() {
         .unwrap_err();
     assert!(error.to_string().contains("reset_device_graph"), "{error}");
     assert_eq!(
-        executor.step_workspace.as_ref().unwrap().buffer.as_ptr(),
+        executor
+            .workspaces
+            .active_mut()
+            .step
+            .as_ref()
+            .unwrap()
+            .buffer
+            .as_ptr(),
         original
     );
     assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 0);
@@ -17372,8 +17515,15 @@ fn completed_workspace_capture_refuses_eager_growth_and_alignment_changes() {
     executor
         .run(&[("input", &completed_workspace_input(2))])
         .unwrap();
-    executor.restore_completed_step_workspace();
-    let original = executor.step_workspace.as_ref().unwrap().buffer.as_ptr();
+    executor.restore_completed_workspaces();
+    let original = executor
+        .workspaces
+        .active_mut()
+        .step
+        .as_ref()
+        .unwrap()
+        .buffer
+        .as_ptr();
     executor.slot_capture[0].device_graph_token = Some(DeviceGraphToken::new(
         executor.graph_owner,
         DeviceGraphSlot::Primary,
@@ -17387,13 +17537,27 @@ fn completed_workspace_capture_refuses_eager_growth_and_alignment_changes() {
         "{error}"
     );
     assert_eq!(
-        executor.step_workspace.as_ref().unwrap().buffer.as_ptr(),
+        executor
+            .workspaces
+            .active_mut()
+            .step
+            .as_ref()
+            .unwrap()
+            .buffer
+            .as_ptr(),
         original
     );
-    let alignment = executor.step_workspace.as_ref().unwrap().alignment * 2;
+    let alignment = executor
+        .workspaces
+        .active_mut()
+        .step
+        .as_ref()
+        .unwrap()
+        .alignment
+        * 2;
     let error = WorkspaceReplacement::for_captures(&executor.slot_capture)
         .check(
-            executor.step_workspace.as_ref(),
+            executor.workspaces.active_mut().step.as_ref(),
             WorkspaceRequirement {
                 bytes: 64,
                 alignment,
@@ -17732,8 +17896,8 @@ fn deferred_workspace_strict_prepare_does_not_publish_memo_or_poison_eager_execu
         "{error}"
     );
     assert!(executor.workspace_preparation_memo.is_none());
-    assert!(executor.step_workspace.is_none());
-    assert!(executor.persistent_workspace.is_none());
+    assert!(executor.workspaces.active_mut().step.is_none());
+    assert!(executor.workspaces.active_mut().persistent.is_none());
     for _ in 0..3 {
         assert_eq!(executor.run(&[]).unwrap()[0].as_bytes(), &[0x5A; 12]);
     }
@@ -17930,7 +18094,7 @@ fn workspace_capture_pins_use_existing_lane_without_issuer_callbacks() {
     let callbacks = books.callbacks();
     let first = executor.workspace_capture_resources().unwrap();
     assert_eq!(first.len(), 1);
-    let prepared = executor.step_workspace.as_ref().unwrap();
+    let prepared = executor.workspaces.active_mut().step.as_ref().unwrap();
     assert!(
         first[0]
             .workspace_span()
@@ -17939,6 +18103,7 @@ fn workspace_capture_pins_use_existing_lane_without_issuer_callbacks() {
     );
     let installed = first.clone();
     let provisional = executor.workspace_capture_resources().unwrap();
+    let prepared = executor.workspaces.active_mut().step.as_ref().unwrap();
     assert_eq!(
         prepared.buffer.bound_owner().unwrap().outstanding_views(),
         2
@@ -17986,7 +18151,9 @@ fn workspace_capture_default_cannot_silently_discard_real_pins() {
     );
     assert_eq!(
         executor
-            .step_workspace
+            .workspaces
+            .active_mut()
+            .step
             .as_ref()
             .unwrap()
             .buffer
@@ -18021,14 +18188,14 @@ fn workspace_capture_cannot_silently_skip_unpinned_raw_backing() {
         )
     }
     .unwrap();
-    executor.step_workspace = Some(PreparedWorkspace {
+    executor.workspaces.active_mut().step = Some(PreparedWorkspace {
         buffer: WorkspaceAllocation::new(buffer),
         bytes: 64,
         alignment: 1,
     });
     let error = executor.workspace_capture_resources().err().unwrap();
     assert!(error.to_string().contains("binding-owned workspace"));
-    drop(executor.step_workspace.take());
+    drop(executor.workspaces.active_mut().step.take());
 }
 
 #[test]
@@ -18276,3 +18443,6 @@ mod workspace_report_tests;
 
 #[path = "workspace_completion_tests.rs"]
 mod workspace_completion_tests;
+
+#[path = "workspace_lane_tests.rs"]
+mod workspace_lane_tests;

@@ -233,7 +233,8 @@ impl Executor {
         let route_residency = self
             .provider_artifact_readiness
             .route_residency(self.ep.name(), self.instance_id)?;
-        self.finish_device_validation_boundary_with(route_residency)
+        self.finish_device_validation_boundary_with(route_residency)?;
+        self.release_workspaces()
     }
 
     fn finish_device_validation_boundary_with(
@@ -412,7 +413,7 @@ impl Executor {
     }
 
     fn reset_run_state(&mut self) -> Result<()> {
-        self.restore_completed_step_workspace();
+        self.restore_completed_workspaces();
         // Restore any parked handles before reusing storage, including after
         // unwinding out of execution. Input upload failures publish no loans.
         self.unbind_borrowed_inputs()?;
