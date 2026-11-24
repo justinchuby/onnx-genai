@@ -14409,7 +14409,7 @@ fn nested_gemm_workspace_graph() -> Graph {
 }
 
 #[test]
-fn nested_gemm_forwards_inherited_peak_instead_of_a_stale_local_slot() {
+fn nested_gemm_borrows_and_grows_the_real_parent_peak() {
     for local_bytes in [16, 32] {
         let ep =
             Arc::new(CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap());
@@ -14421,39 +14421,37 @@ fn nested_gemm_forwards_inherited_peak_instead_of_a_stale_local_slot() {
         )
         .unwrap();
         let role = MemoryRole::Workspace { step_scoped: true };
-        let mut local = ep.allocate_workspace(local_bytes, 4, role).unwrap();
-        // SAFETY: the complete exclusive local Host allocation is live.
-        unsafe {
-            std::ptr::write_bytes(local.as_mut_ptr().cast::<u8>(), 0xA5, local.len());
-        }
-        let local_ptr = local.as_ptr();
+        let local = ep.allocate_workspace(local_bytes, 4, role).unwrap();
+        let original = local.as_ptr();
         executor.step_workspace = Some(PreparedWorkspace {
             bytes: local.len(),
             alignment: local.alignment(),
             buffer: local,
         });
-        let mut inherited = ep.allocate_workspace(24, 4, role).unwrap();
-        executor.inherited_workspace.step =
-            Some((inherited.as_mut_ptr() as usize, inherited.len()));
+        executor.pin_step_workspace = true;
         let cond = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
-        let outputs = executor.run(&[("cond", &cond)]).unwrap();
-        assert_eq!(outputs[0].try_as_slice_f32().unwrap(), &[3.; 4]);
-        let returned = ep.allocate_workspace(local_bytes, 4, role).unwrap();
-        assert_eq!(
-            returned.as_ptr(),
-            local_ptr,
-            "the local lane returned to the common domain"
-        );
-        // SAFETY: this is the initialized local backing, exclusively checked out again.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(returned.as_ptr().cast::<u8>(), returned.len()) };
-        assert!(
-            bytes.iter().all(|&byte| byte == 0xA5),
-            "nested execution must use the same inherited source as ordinary dispatch"
-        );
-        ep.deallocate_workspace(returned).unwrap();
-        drop(executor);
-        ep.deallocate_workspace(inherited).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                executor.run(&[("cond", &cond)]).unwrap()[0]
+                    .try_as_slice_f32()
+                    .unwrap(),
+                &[3.; 4]
+            );
+            let owner = executor.step_workspace.as_ref().unwrap();
+            assert!(owner.bytes >= local_bytes.max(24));
+            if local_bytes == 32 {
+                assert_eq!(owner.buffer.as_ptr(), original);
+            }
+            for child in executor
+                .subgraph_execs
+                .values()
+                .flat_map(|child| &child.compiled)
+            {
+                assert!(child.exec.step_workspace.is_none());
+                assert!(child.exec.persistent_workspace.is_none());
+                assert!(child.exec.parent_workspace_policy.is_none());
+            }
+        }
     }
 }
 
@@ -17872,19 +17870,12 @@ fn workspace_capture_default_cannot_silently_discard_real_pins() {
 }
 
 #[test]
-fn workspace_capture_inherited_addresses_cannot_manufacture_ownership() {
+fn workspace_capture_cannot_claim_a_loaned_parent_owner() {
     let (mut executor, _ep, _books, _manager) = completed_workspace_fixture(true);
-    executor.inherited_workspace = InheritedWorkspaces {
-        persistent: Some((0x1000, 64)),
-        step: None,
-    };
+    executor.parent_workspace_policy = Some(WorkspaceReplacement::Allowed);
     let error = executor.workspace_capture_resources().err().unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("parent executor that owns their backing")
-    );
-    executor.inherited_workspace = InheritedWorkspaces::default();
+    assert!(error.to_string().contains("parent executor"));
+    executor.parent_workspace_policy = None;
 }
 
 #[test]
@@ -18148,3 +18139,6 @@ fn run_storage_preparation_excludes_real_external_input_backing() {
     assert_eq!(ep.failure.load(Ordering::SeqCst), 5);
     assert!(executor.parked_input_buffers.is_empty());
 }
+
+#[path = "workspace_loan_tests.rs"]
+mod workspace_loan_tests;

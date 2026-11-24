@@ -839,7 +839,7 @@ impl Executor {
         if peak_step.bytes != 0 {
             self.restore_completed_step_workspace();
         }
-        let replacement = WorkspaceReplacement::for_captures(&self.slot_capture);
+        let replacement = self.workspace_replacement();
         replacement.check(self.persistent_workspace.as_ref(), peak_persistent)?;
         replacement.check(self.step_workspace.as_ref(), peak_step)?;
         Self::reserve_prepared_workspace(
@@ -880,6 +880,13 @@ impl Executor {
         {
             return Ok(());
         };
+        let peak = workspace_high_water(peak, slot.as_ref());
+        let bytes = usize::try_from(peak.bytes).map_err(|_| {
+            SessionError::Internal(format!(
+                "workspace peak {} does not fit usize; reduce the prepared capacity",
+                peak.bytes
+            ))
+        })?;
         let old = slot.take().map(|workspace| workspace.buffer);
         let fresh = ep.replace_workspace(old, bytes, peak.alignment, peak.role())?;
         *slot = Some(PreparedWorkspace {
@@ -1025,9 +1032,10 @@ impl Executor {
         // address), keep the StepScoped scratch alive so a later replay reads a
         // valid pointer. `reserve_prepared_workspace` reuses it whenever the next
         // requirement fits, so the pointer stays stable across replays.
-        if self.pin_step_workspace
+        if self.parent_workspace_policy.is_some()
+            || self.pin_step_workspace
             || matches!(
-                WorkspaceReplacement::for_captures(&self.slot_capture),
+                self.workspace_replacement(),
                 WorkspaceReplacement::CapturePinned
             )
         {

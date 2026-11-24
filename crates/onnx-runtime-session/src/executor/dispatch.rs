@@ -333,9 +333,9 @@ impl Executor {
     pub(super) fn workspace_capture_resources(
         &self,
     ) -> Result<Vec<onnx_runtime_ep_api::DeviceGraphResource>> {
-        if self.inherited_workspace.has_any() {
+        if self.parent_workspace_policy.is_some() {
             return Err(EpError::KernelFailed(
-                "independent capture cannot pin inherited raw workspace views; capture through the parent executor that owns their backing".into()
+                "independent capture cannot pin a loaned enclosing workspace; capture through the parent executor that owns its backing".into()
             ).into());
         }
         [&self.persistent_workspace, &self.step_workspace]
@@ -614,6 +614,7 @@ impl Executor {
         // whole while the kernel (from `cache`) and the buffers/views are held.
         // `cache` and `kernel_bindings` are kept as separate locals because the
         // resolved kernel reference borrows `cache` for the rest of the dispatch.
+        let workspace_replacement = self.workspace_replacement();
         let cache = &mut self.cache;
         let kernel_bindings = &mut self.kernel_bindings;
         let provider_artifact_readiness = &mut self.provider_artifact_readiness;
@@ -636,10 +637,9 @@ impl Executor {
             capturing: matches!(capture, OpCaptureTrace::Captured),
             persistent_workspace: &mut self.persistent_workspace,
             step_workspace: &mut self.step_workspace,
-            inherited_workspace: self.inherited_workspace,
             workspace_preparation_required: self.workspace_preparation_required,
             eager_workspace_growth: matches!(capture, OpCaptureTrace::Eager),
-            workspace_captures: &self.slot_capture,
+            workspace_replacement,
         };
 
         // Build the (possibly strided) input views once; they feed both the
@@ -1759,10 +1759,9 @@ struct KernelDispatchContext<'a> {
     capturing: bool,
     persistent_workspace: &'a mut Option<PreparedWorkspace>,
     step_workspace: &'a mut Option<PreparedWorkspace>,
-    inherited_workspace: InheritedWorkspaces,
     workspace_preparation_required: bool,
     /// True when this node is dispatched on a plain eager run (no device-graph
-    /// capture in progress). Growth also checks `workspace_captures` to
+    /// capture in progress). Growth also checks `workspace_replacement` to
     /// exclude installed graphs from every slot. This is
     /// what lets a prepared session re-prepare (grow) its governed workspace when
     /// execution rebuckets to a larger shape bucket than preparation reserved
@@ -1770,7 +1769,7 @@ struct KernelDispatchContext<'a> {
     /// false while recording a captured segment ([`OpCaptureTrace::Captured`]),
     /// where the workspace pointer must stay fixed for replay.
     eager_workspace_growth: bool,
-    workspace_captures: &'a [SlotCaptureState],
+    workspace_replacement: WorkspaceReplacement,
 }
 
 impl KernelDispatchContext<'_> {
@@ -2021,34 +2020,6 @@ impl KernelDispatchContext<'_> {
         };
         let workspace = if requirement.bytes == 0 {
             None
-        } else if let Some(inherited) = self.inherited_workspace.view(requirement.lifetime) {
-            let required = usize::try_from(requirement.bytes).map_err(|_| {
-                EpError::KernelFailed(format!(
-                    "kernel workspace requirement {} does not fit usize",
-                    requirement.bytes
-                ))
-            })?;
-            let address = inherited.ptr().0 as usize;
-            if address == 0
-                || !address.is_multiple_of(requirement.alignment)
-                || address.checked_add(required).is_none()
-            {
-                return Err(EpError::KernelFailed(format!(
-                "node #{} ('{}::{}') inherited workspace at {address:#x} cannot cover {} bytes aligned to {}; prepare and lend a live, aligned enclosing workspace",
-                node.id.0, node.domain, node.op_type, required, requirement.alignment,
-            )).into());
-            }
-            if required > inherited.bytes() {
-                Err(EpError::KernelFailed(format!(
-                    "node {} (op '{}::{}') workspace invariant mismatch: execute requires {} bytes, enclosing preparation supplied {} bytes",
-                    node.id.0,
-                    node.domain,
-                    node.op_type,
-                    required,
-                    inherited.bytes()
-                )))?;
-            }
-            Some(inherited)
         } else {
             let required = usize::try_from(requirement.bytes).map_err(|_| {
                 EpError::KernelFailed(format!(
@@ -2060,7 +2031,7 @@ impl KernelDispatchContext<'_> {
                 required > workspace.bytes || requirement.alignment > workspace.alignment
             });
             if needs_replacement {
-                WorkspaceReplacement::for_captures(self.workspace_captures)
+                self.workspace_replacement
                     .check(prepared.as_ref(), requirement)?;
             }
             // A prepared session normally refuses to allocate at execution
@@ -2083,13 +2054,17 @@ impl KernelDispatchContext<'_> {
                 // before retiring the old disposable workspace. Release it
                 // before acquiring the replacement to avoid charging both.
                 self.ep.sync()?;
+                let peak = workspace_high_water(requirement, prepared.as_ref());
+                let peak_bytes = usize::try_from(peak.bytes).map_err(|_| {
+                    EpError::KernelFailed(format!(
+                        "workspace peak {} does not fit usize; reduce the execution shape",
+                        peak.bytes
+                    ))
+                })?;
                 let old = prepared.take().map(|workspace| workspace.buffer);
-                let buffer = self.ep.replace_workspace(
-                    old,
-                    required,
-                    requirement.alignment,
-                    requirement.role(),
-                )?;
+                let buffer =
+                    self.ep
+                        .replace_workspace(old, peak_bytes, peak.alignment, peak.role())?;
                 *prepared = Some(PreparedWorkspace {
                     bytes: buffer.len(),
                     alignment: buffer.alignment(),
@@ -2114,9 +2089,21 @@ impl KernelDispatchContext<'_> {
                     prepared.alignment
                 )))?;
             }
+            let pointer = prepared.buffer.as_mut_ptr();
+            let address = pointer as usize;
+            if prepared.buffer.len() < required
+                || address == 0
+                || !address.is_multiple_of(requirement.alignment)
+                || address.checked_add(required).is_none()
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "node #{} ('{}::{}') workspace backing at {address:#x} cannot cover {required} bytes aligned to {}; prepare and lend a live, aligned enclosing workspace",
+                    node.id.0, node.domain, node.op_type, requirement.alignment
+                )).into());
+            }
             Some(WorkspaceView::new(
-                DevicePtrMut(prepared.buffer.as_mut_ptr()),
-                prepared.bytes,
+                DevicePtrMut(pointer),
+                prepared.buffer.len(),
             ))
         };
         Ok((requirement, workspace))

@@ -773,10 +773,9 @@ pub(crate) struct Executor {
     /// replays. Ordinary completed scratch instead enters reclaimable idle
     /// storage when the provider exposes its physical pressure registry.
     pub(super) pin_step_workspace: bool,
-    /// Non-owning view of an enclosing executor's prepared workspace. Nested
-    /// control-flow executors run sequentially, so they may reuse the parent's
-    /// peak allocation without reserving or allocating a second buffer.
-    pub(super) inherited_workspace: InheritedWorkspaces,
+    /// Present only during a scoped loan of the enclosing executor's actual
+    /// workspace owners. This carries growth/capture policy, never raw addresses.
+    pub(super) parent_workspace_policy: Option<WorkspaceReplacement>,
     pub(super) workspace_preparation_required: bool,
     pub(super) workspace_preparation_memo: Option<WorkspacePreparationMemo>,
     pub(super) workspace_node_locations: Vec<String>,
@@ -841,24 +840,21 @@ impl WorkspaceOutputBindings {
     }
 }
 
-/// Parent scratch remains separated by lifetime; a step must never borrow and
-/// overwrite persistent contents merely because that allocation exists first.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct InheritedWorkspaces {
-    pub(super) persistent: Option<(usize, usize)>,
-    pub(super) step: Option<(usize, usize)>,
+/// An exclusive, run-scoped loan of the enclosing executor's actual lanes.
+/// The enclosing execution is paused until both final owners are returned.
+pub(crate) struct ParentWorkspaces<'a> {
+    pub(super) persistent: &'a mut Option<PreparedWorkspace>,
+    pub(super) step: &'a mut Option<PreparedWorkspace>,
+    pub(super) completion: &'a mut WorkspaceCompletion,
+    pub(super) replacement: WorkspaceReplacement,
+    pub(super) provider: &'a Arc<dyn ExecutionProvider>,
 }
-impl InheritedWorkspaces {
-    pub(super) fn view(self, lifetime: WorkspaceLifetime) -> Option<WorkspaceView> {
-        match lifetime {
-            WorkspaceLifetime::SessionPersistent => self.persistent,
-            WorkspaceLifetime::StepScoped => self.step,
-        }
-        .map(|(ptr, bytes)| WorkspaceView::new(DevicePtrMut(ptr as *mut _), bytes))
-    }
-    pub(super) fn has_any(self) -> bool {
-        self.persistent.is_some() || self.step.is_some()
-    }
+
+/// Holds the only executor that may use the borrowed owners until Drop restores
+/// them. No callback, allocation or retirement is performed by Drop.
+pub(super) struct ChildWorkspaceLoan<'a> {
+    pub(super) executor: &'a mut Executor,
+    pub(super) parent: ParentWorkspaces<'a>,
 }
 
 pub(super) struct PreparedWorkspace {

@@ -2265,7 +2265,7 @@ mod device_binding_tests {
             Path::new("."),
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
-            std::sync::Arc::new(ep),
+            ExecutionProviderOrder::new(std::sync::Arc::new(ep)),
             None,
         )
         .unwrap();
@@ -2345,7 +2345,7 @@ mod device_binding_tests {
             Path::new("."),
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
-            std::sync::Arc::new(ep),
+            ExecutionProviderOrder::new(std::sync::Arc::new(ep)),
             None,
         )
         .unwrap();
@@ -2455,7 +2455,7 @@ mod device_binding_tests {
             Path::new("."),
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
-            std::sync::Arc::new(ep),
+            ExecutionProviderOrder::new(std::sync::Arc::new(ep)),
             None,
         )
         .unwrap();
@@ -2614,7 +2614,7 @@ mod device_binding_tests {
             Path::new("."),
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
-            std::sync::Arc::new(ep),
+            ExecutionProviderOrder::new(std::sync::Arc::new(ep)),
             None,
         )
         .unwrap();

@@ -13,6 +13,57 @@ fn required_node_output(node: &Node, index: usize, op: &str) -> Result<ValueId> 
         })
 }
 
+impl<'a> ChildWorkspaceLoan<'a> {
+    pub(super) fn new(executor: &'a mut Executor, parent: ParentWorkspaces<'a>) -> Result<Self> {
+        if !Arc::ptr_eq(&executor.ep, parent.provider) {
+            return Err(SessionError::Internal(
+                "control-flow workspace loan requires the identical provider instance; do not lend workspace across provider contexts".into()
+            ));
+        }
+        // Bring an independent child's idle owner back into its own slot before
+        // rejecting mixed ownership. A parent loan must never steal a child pool.
+        executor.restore_completed_step_workspace();
+        if executor.parent_workspace_policy.is_some()
+            || executor.persistent_workspace.is_some()
+            || executor.step_workspace.is_some()
+        {
+            return Err(SessionError::Internal(
+                "cannot lend parent workspace to a child holding an independent lane; retire the child's private preparation before borrowing the parent lane".into()
+            ));
+        }
+        if matches!(
+            WorkspaceReplacement::for_captures(&executor.slot_capture),
+            WorkspaceReplacement::CapturePinned
+        ) {
+            return Err(SessionError::Internal(
+                "cannot lend parent workspace while the child has installed device graphs; reset every child graph slot before borrowing".into()
+            ));
+        }
+        *parent.completion = WorkspaceCompletion::Pending;
+        executor.parent_workspace_policy = Some(parent.replacement);
+        executor.persistent_workspace = parent.persistent.take();
+        executor.step_workspace = parent.step.take();
+        Ok(Self { executor, parent })
+    }
+
+    pub(super) fn run(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        scope: &HashMap<String, Tensor>,
+    ) -> Result<ScopedOutputs> {
+        self.executor
+            .run_scoped(inputs, scope, &ExternalBindings::default())
+    }
+}
+
+impl Drop for ChildWorkspaceLoan<'_> {
+    fn drop(&mut self) {
+        *self.parent.persistent = self.executor.persistent_workspace.take();
+        *self.parent.step = self.executor.step_workspace.take();
+        self.executor.parent_workspace_policy = None;
+    }
+}
+
 impl ChildExecutor {
     /// Create the reusable wrapper for a loaded subgraph body.
     ///
@@ -175,14 +226,14 @@ impl ChildExecutor {
         formal_inputs: &[&Tensor],
         outer_scope: &HashMap<String, Tensor>,
     ) -> Result<Vec<Tensor>> {
-        self.run_with_workspace(formal_inputs, outer_scope, InheritedWorkspaces::default())
+        self.run_with_workspace(formal_inputs, outer_scope, None)
     }
 
     pub(crate) fn run_with_workspace(
         &mut self,
         formal_inputs: &[&Tensor],
         outer_scope: &HashMap<String, Tensor>,
-        workspace: InheritedWorkspaces,
+        workspace: Option<ParentWorkspaces<'_>>,
     ) -> Result<Vec<Tensor>> {
         if self.formal_names.len() != formal_inputs.len() {
             return Err(SessionError::Internal(format!(
@@ -229,20 +280,22 @@ impl ChildExecutor {
         };
 
         self.runs += 1;
-        self.compiled[cache_index].exec.inherited_workspace = workspace;
-        self.compiled[cache_index]
-            .exec
-            .workspace_preparation_required = workspace.has_any();
         let inputs = self
             .input_names
             .iter()
             .map(String::as_str)
             .zip(externals)
             .collect::<Vec<_>>();
-        self.compiled[cache_index]
-            .exec
-            .run_scoped(&inputs, outer_scope, &ExternalBindings::default())?
-            .into_iter()
+        let outputs = match workspace {
+            Some(parent) => ChildWorkspaceLoan::new(&mut self.compiled[cache_index].exec, parent)?
+                .run(&inputs, outer_scope),
+            None => self.compiled[cache_index].exec.run_scoped(
+                &inputs,
+                outer_scope,
+                &ExternalBindings::default(),
+            ),
+        }?;
+        outputs.into_iter()
             .map(|output| {
                 let output = output.ok_or_else(|| {
                     SessionError::Internal(format!(
@@ -663,24 +716,21 @@ impl Executor {
             self.subgraph_execs.insert(prepared.key.clone(), child);
         }
 
-        let workspace = InheritedWorkspaces {
-            persistent: self.inherited_workspace.persistent.or_else(|| {
-                self.persistent_workspace
-                    .as_mut()
-                    .map(|prepared| (prepared.buffer.as_mut_ptr() as usize, prepared.bytes))
-            }),
-            step: self.inherited_workspace.step.or_else(|| {
-                self.step_workspace
-                    .as_mut()
-                    .map(|prepared| (prepared.buffer.as_mut_ptr() as usize, prepared.bytes))
-            }),
+        self.restore_completed_step_workspace();
+        let replacement = self.workspace_replacement();
+        let workspace = ParentWorkspaces {
+            persistent: &mut self.persistent_workspace,
+            step: &mut self.step_workspace,
+            completion: &mut self.workspace_completion,
+            replacement,
+            provider: &self.ep,
         };
         let child = self
             .subgraph_execs
             .get_mut(&prepared.key)
             .expect("child present");
         let before = child.stats();
-        let result = child.run_with_workspace(formal_inputs, &prepared.captures, workspace);
+        let result = child.run_with_workspace(formal_inputs, &prepared.captures, Some(workspace));
         let after = child.stats();
         self.control_flow_stats.subgraph_builds += after.builds - before.builds;
         self.control_flow_stats.subgraph_runs += after.runs - before.runs;
