@@ -331,14 +331,15 @@ impl Executor {
     /// Capture is cold: pin each actual owned lane once per segment. Inherited
     /// raw views cannot manufacture an independent capture ownership capability.
     pub(super) fn workspace_capture_resources(
-        &self,
+        &mut self,
     ) -> Result<Vec<onnx_runtime_ep_api::DeviceGraphResource>> {
         if self.parent_workspace_policy.is_some() {
             return Err(EpError::KernelFailed(
                 "independent capture cannot pin a loaned enclosing workspace; capture through the parent executor that owns its backing".into()
             ).into());
         }
-        [&self.persistent_workspace, &self.step_workspace]
+        let owners = self.workspaces.active_mut();
+        [&owners.persistent, &owners.step]
             .into_iter()
             .flatten()
             .filter(|prepared| !prepared.buffer.is_empty())
@@ -621,6 +622,7 @@ impl Executor {
         let finalized_expert_banks = &self.finalized_expert_banks;
         let capture_growing = &self.capture_growing_symbols;
         let weights = &self.weights;
+        let workspace_owners = self.workspaces.active_mut();
         let mut ctx = KernelDispatchContext {
             executor: self.instance_id,
             ep: &ep,
@@ -635,8 +637,8 @@ impl Executor {
             pinned: &mut self.pinned,
             capture_deferred_frees: &mut self.capture_deferred_frees,
             capturing: matches!(capture, OpCaptureTrace::Captured),
-            persistent_workspace: &mut self.persistent_workspace,
-            step_workspace: &mut self.step_workspace,
+            persistent_workspace: &mut workspace_owners.persistent,
+            step_workspace: &mut workspace_owners.step,
             workspace_replacement,
         };
 

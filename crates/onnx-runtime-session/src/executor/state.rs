@@ -758,21 +758,18 @@ pub(crate) struct Executor {
     /// Its epoch advances with concrete kernel specializations; every execute,
     /// capture, and replay path must observe `Complete` before enqueuing work.
     pub(super) provider_artifact_readiness: ProviderArtifactReadiness,
-    pub(super) persistent_workspace: Option<PreparedWorkspace>,
-    pub(super) step_workspace: Option<PreparedWorkspace>,
-    pub(super) workspace_reuse: WorkspaceReuse,
+    pub(super) workspaces: WorkspaceLane,
     pub(super) workspace_completion: WorkspaceCompletion,
-    /// When set, [`Executor::release_step_workspace`] is a no-op: the StepScoped
-    /// `step_workspace` buffer is kept alive between runs instead of being freed
-    /// after each one. A captured device graph bakes the physical address of the
-    /// StepScoped scratch it reads; if that buffer is freed and re-reserved
+    /// When set, [`Executor::release_workspaces`] retains both lifetime peaks
+    /// across runs. A captured graph bakes physical scratch addresses; if that
+    /// backing is freed and re-reserved
     /// between the capture and a later replay (as happens once a larger M=K
     /// speculative verify forward reserves a bigger scratch than the M=1 decode),
     /// the replay reads a stale pointer and produces non-finite logits (#1647).
     /// Pinning the workspace at the M=K peak keeps the pointer stable across
     /// replays. Ordinary completed scratch instead enters reclaimable idle
     /// storage when the provider exposes its physical pressure registry.
-    pub(super) pin_step_workspace: bool,
+    pub(super) pin_workspace_lane: bool,
     /// Present only during a scoped loan of the enclosing executor's actual
     /// workspace owners. This carries growth/capture policy, never raw addresses.
     pub(super) parent_workspace_policy: Option<WorkspaceReplacement>,

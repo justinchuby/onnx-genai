@@ -121,23 +121,39 @@ per-kernel budgets, private scratch pools, or a second quota ledger. Context
 retirement guards, asynchronous settlement and capture pins remain separate
 contracts rather than one retention flag.
 A successful request that actually synchronizes and validates its device work
-can return its step workspace to one reclaimable idle cell per executor lane.
+can return both physical lifetime peaks (`SessionPersistent` and `StepScoped`)
+to one reclaimable idle cell per root executor lane. Placement is explicitly
+Active or Idle, separate from completion proof. Active access, including an empty
+lane, never consults the idle mutex. Only an Idle-to-Active transition restores
+the pair, once; completed publication takes one more lock. Ordinary synchronized
+runs therefore use two lane-level locks, rather than a per-node lookup. A
+successful deferred lane stays Active between clean output reads and subsequent
+runs and adds no idle lock, issuer, consume or synchronization callback.
 The next fitting run takes back the same owner and original charge. The provider
 opts in by exposing its existing workspace authority's pressure registry through
 `workspace_pressure_registry`; registration is cold and does not create a holder,
 budget or provider-private pool. Without that capability, the executor preserves
-its normal provider retirement path. Zero requirements do not enroll or allocate.
+Persistent retention and the normal Step provider retirement path. Zero
+requirements do not enroll or allocate.
 
 Pressure removes only idle owners and invokes the original provider release path
-outside the cell lock. It may wait for allocation-specific settlement on that cold
+outside the cell lock. Selection uses actual physical charge where available,
+taking the smallest complete allocation sufficient for the request and leaving
+the other lifetime warm. If neither suffices, it may retire both; regions are
+never split into quota tickets. The unselected owner remains in the cell before
+unlocking, so concurrent restore cannot duplicate or lose it. Consuming release
+failure never reinserts or refunds the failed owner.
+It may wait for allocation-specific settlement on that cold
 path; only verified release reports the retired authority charge. Active and
-capture-referenced owners never enter the idle cell. Pending device-binding runs
+capture-referenced owners never enter the idle cell. Any installed capture,
+lane pin or parent loan retains the whole pair. Capture-resource collection first
+activates the pair before borrowing its address pins. Pending device-binding runs
 continue through provider deferred retirement, so zero warm issuer calls are not
 claimed for that path. No per-token completion synchronization is added.
 
 Successful device-binding execution now distinguishes `AwaitingValidation` from
 unknown/error/prepare-only `Pending`. Only the successful state may retain an
-unpinned active step owner awaiting its exact validation generation. It remains
+unpinned active workspace pair awaiting its exact validation generation. It remains
 charged and outside pressure-reclaimable idle storage. Existing full, partial
 and zero-byte output-binding reads establish their normal host boundary and
 consume validation; reading an unrelated input or another executor's completed

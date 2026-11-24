@@ -1051,22 +1051,7 @@ impl Drop for Executor {
                 drop(buf);
             }
         }
-        self.workspace_reuse
-            .retire(self.ep.as_ref(), safe_to_release);
-        if let Some(workspace) = self.persistent_workspace.take() {
-            if safe_to_release {
-                let _ = self.ep.deallocate_workspace(workspace.buffer);
-            } else {
-                drop(workspace);
-            }
-        }
-        if let Some(workspace) = self.step_workspace.take() {
-            if safe_to_release {
-                let _ = self.ep.deallocate_workspace(workspace.buffer);
-            } else {
-                drop(workspace);
-            }
-        }
+        self.workspaces.retire(self.ep.as_ref(), safe_to_release);
         self.shared_buffers.clear();
         if let Some(registration) = self.validation_registration.as_mut() {
             let owner = registration.owner();
@@ -1104,8 +1089,10 @@ mod geometry;
 use dynamic_shapes::*;
 use geometry::*;
 mod workspace_reuse;
+#[cfg(test)]
+use workspace_reuse::WorkspaceReuse;
 use workspace_reuse::{
-    WorkspaceCompletion, WorkspaceReplacement, WorkspaceReuse, workspace_high_water,
+    WorkspaceCompletion, WorkspaceLane, WorkspacePair, WorkspaceReplacement, workspace_high_water,
 };
 mod bindings;
 #[cfg(test)]

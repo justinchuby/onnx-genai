@@ -2393,8 +2393,10 @@ pub trait ExecutionProvider: Send + Sync {
 
     /// Existing pressure registry for the authority funding workspace backing.
     ///
-    /// Executors may retain completed workspace only when this returns a
-    /// registry, so idle capacity remains reclaimable. This cold capability
+    /// Executors may publish both completed workspace lifetime peaks to a
+    /// reclaimable idle lane when this returns a registry. Without it,
+    /// SessionPersistent stays active and StepScoped uses normal retirement.
+    /// This cold capability
     /// lookup must use the workspace allocator's actual authority/tier, without
     /// creating another budget or holder. The provider's `deallocate_workspace`
     /// must retire backing and settle its charge rather than move the owner to

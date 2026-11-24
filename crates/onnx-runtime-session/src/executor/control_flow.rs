@@ -22,10 +22,9 @@ impl<'a> ChildWorkspaceLoan<'a> {
         }
         // Bring an independent child's idle owner back into its own slot before
         // rejecting mixed ownership. A parent loan must never steal a child pool.
-        executor.restore_completed_step_workspace();
+        executor.restore_completed_workspaces();
         if executor.parent_workspace_policy.is_some()
-            || executor.persistent_workspace.is_some()
-            || executor.step_workspace.is_some()
+            || !executor.workspaces.active_mut().is_empty()
         {
             return Err(SessionError::Internal(
                 "cannot lend parent workspace to a child holding an independent lane; retire the child's private preparation before borrowing the parent lane".into()
@@ -41,8 +40,10 @@ impl<'a> ChildWorkspaceLoan<'a> {
         }
         *parent.completion = WorkspaceCompletion::Pending;
         executor.parent_workspace_policy = Some(parent.replacement);
-        executor.persistent_workspace = parent.persistent.take();
-        executor.step_workspace = parent.step.take();
+        *executor.workspaces.active_mut() = WorkspacePair {
+            persistent: parent.persistent.take(),
+            step: parent.step.take(),
+        };
         Ok(Self { executor, parent })
     }
 
@@ -58,8 +59,10 @@ impl<'a> ChildWorkspaceLoan<'a> {
 
 impl Drop for ChildWorkspaceLoan<'_> {
     fn drop(&mut self) {
-        *self.parent.persistent = self.executor.persistent_workspace.take();
-        *self.parent.step = self.executor.step_workspace.take();
+        if let Some(owners) = self.executor.workspaces.take_active() {
+            *self.parent.persistent = owners.persistent;
+            *self.parent.step = owners.step;
+        }
         self.executor.parent_workspace_policy = None;
     }
 }
@@ -716,11 +719,12 @@ impl Executor {
             self.subgraph_execs.insert(prepared.key.clone(), child);
         }
 
-        self.restore_completed_step_workspace();
+        self.restore_completed_workspaces();
         let replacement = self.workspace_replacement();
+        let owners = self.workspaces.active_mut();
         let workspace = ParentWorkspaces {
-            persistent: &mut self.persistent_workspace,
-            step: &mut self.step_workspace,
+            persistent: &mut owners.persistent,
+            step: &mut owners.step,
             completion: &mut self.workspace_completion,
             replacement,
             provider: &self.ep,

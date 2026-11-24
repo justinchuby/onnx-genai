@@ -695,10 +695,19 @@ impl<'a> OutputMetadata<'a> {
     }
 }
 
-/// How long prepared kernel workspace remains live.
+/// Retention policy for prepared kernel scratch capacity.
+///
+/// Contents are unspecified between dispatches: serial kernels share the same
+/// lifetime peak. Retain reusable artifacts in their own owned storage. Either
+/// lifetime may be reclaimed after proven completion when unpinned; installed
+/// capture addresses and in-flight work keep their physical backing alive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceLifetime {
+    /// Retire at a request boundary unless completed capacity can remain in the
+    /// executor's pressure-reclaimable idle lane.
     StepScoped,
+    /// Retain fitting capacity across requests, including deferred submissions.
+    /// Completed, unpinned capacity may still be reclaimed under pressure.
     SessionPersistent,
 }
 
