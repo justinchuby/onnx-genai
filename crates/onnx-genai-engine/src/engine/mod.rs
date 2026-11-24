@@ -73,6 +73,8 @@ mod memory_strategy;
 mod metadata;
 mod model;
 #[cfg(feature = "native-backend")]
+mod native_session_snapshot;
+#[cfg(feature = "native-backend")]
 mod placement;
 mod runtime;
 pub(crate) use runtime::{EndTokenPolicy, apply_eos_policy};
@@ -96,6 +98,8 @@ pub(crate) use memory_strategy::*;
 pub(crate) use metadata::*;
 pub use model::Engine;
 pub(crate) use model::*;
+#[cfg(feature = "native-backend")]
+pub use native_session_snapshot::NativeSessionSnapshot;
 #[cfg(feature = "native-backend")]
 pub(crate) use placement::plan_static_weight_placement;
 pub use session_fork::{
@@ -617,7 +621,7 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
-    fn native_prefix_snapshot_test_engine() -> anyhow::Result<Engine> {
+    pub(super) fn native_prefix_snapshot_test_engine() -> anyhow::Result<Engine> {
         let mut engine = model_free_rewind_test_engine(PagedKvCache::new(1, 1), HashMap::new())?;
         engine.decode_backend = EngineDecodeBackend::Native;
         engine.native_session = Some(crate::native_decode::NativeDecodeSession::from_session(

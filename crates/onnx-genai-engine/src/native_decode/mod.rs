@@ -182,6 +182,8 @@ pub struct NativeDecodeSession {
     #[cfg(test)]
     fail_next_reset: bool,
     #[cfg(test)]
+    fail_past_restores: usize,
+    #[cfg(test)]
     fail_rewind_after: Option<usize>,
 }
 
@@ -540,6 +542,11 @@ impl NativeDecodeSession {
         self.cuda
             .as_ref()
             .is_some_and(|cuda| cuda.owns_logical_state(identity))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_past_restores_for_test(&mut self, count: usize) {
+        self.fail_past_restores = count;
     }
 
     #[cfg(test)]
@@ -910,6 +917,11 @@ impl NativeDecodeSession {
             "complete native state restore requires host-owned state; this decoder keeps state on the device"
         );
         self.restore_cpu_snapshot(snapshot.cpu_kv.as_ref())?;
+        #[cfg(test)]
+        if self.fail_past_restores > 0 {
+            self.fail_past_restores -= 1;
+            bail!("injected native state restore failure after CPU KV writes");
+        }
         self.past = snapshot.past;
         self.current_len = snapshot.len;
         self.last_hidden = snapshot.last_hidden;

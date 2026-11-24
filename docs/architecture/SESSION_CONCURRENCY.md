@@ -427,6 +427,18 @@ reason.
   snapshots every fallible participant before a child exists; `fork_session`
   consumes that plan on the source worker. Unsupported runner/native state names
   the participant, state/type, and backend before publication.
+- **Native decoder captures are owned engine-local capabilities.**
+  `capture_native_session` copies the active conversation's live KV rows,
+  declared recurrent/compressed state, hidden conditioning, logical history,
+  and physical cursor under a host-memory lease. `restore_native_session`
+  consumes the capture into an existing destination only on its original
+  engine instance/generation. It reserves and captures the previous physical
+  owner before writing, rolls that owner back on failure, and poisons affected
+  sessions if rollback also fails. A selected but unmaterialized final token
+  remains pending after restore. Inactive token histories and device-owned
+  state are refused; neither is silently replayed or transferred as a snapshot.
+  This engine primitive does not yet provide Native fork plans, a persistent
+  file codec, or the llama.cpp `/slots` transport.
 - **Copy-on-write leases are refused at load.** The policy enum admits
   `copy_on_write` (`schema/inference_metadata.schema.json:3248-3254`) and the
   loader rejects it (`crates/onnx-genai-engine/tests/workflow_session_continuation.rs:695-702`).
