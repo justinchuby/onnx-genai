@@ -39,9 +39,12 @@ use super::block_quantized_matmul::{
 };
 use super::decoded_projection::ProjectionScratch;
 use super::moe::{
-    ExpertProjection, MoeAttributes, routing_weights, run_expert_grouped, run_expert_projections,
+    DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace, routing_weights,
 };
 use super::{check_arity, to_dense_f32, write_dense_f32};
+
+#[cfg(test)]
+use super::moe::run_expert_grouped;
 
 const OP: &str = "BlockQuantizedMoE";
 const LAYOUT_VERSION: i64 = 1;
@@ -259,10 +262,10 @@ impl Kernel for BlockQuantizedMoEKernel {
 }
 
 impl BlockQuantizedMoEKernel {
-    fn execution_workspace_layout(&self, dims: Dimensions) -> Result<WorkspaceLayout<3>> {
+    fn execution_workspace_layout(&self, dims: Dimensions) -> Result<WorkspaceLayout<4>> {
         // A validated empty final output cannot consume projections or gathers.
         if dims.rows == 0 || dims.hidden == 0 {
-            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 3]);
+            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 4]);
         }
         // Experts and their projections execute serially. An expert receives a
         // row at most once, so total rows bound every group, independent of k.
@@ -280,16 +283,22 @@ impl BlockQuantizedMoEKernel {
         let projection =
             std::alloc::Layout::from_size_align(projection_bytes, projection_alignment)
                 .map_err(|_| error("decoded projection workspace exceeds addressable capacity"))?;
-        let gathered_elements = dims.rows.checked_mul(dims.hidden).ok_or_else(|| {
-            error("grouped input rows times hidden width overflow; reduce batch dimensions")
+        let [bank_a, bank_b] = MoeWorkspace::bank_layouts(
+            dims.rows,
+            dims.hidden,
+            dims.inter,
+            &self.attributes,
+            self.formats.fc3.is_some(),
+        )?;
+        // The accumulator spans all serial experts and never aliases an FC
+        // bank or decode lane. No region has an expert-count/top-k multiplier.
+        let accumulated = dims.rows.checked_mul(dims.hidden).ok_or_else(|| {
+            error("accumulator rows times hidden width overflow; reduce batch dimensions")
         })?;
-        let gathered = std::alloc::Layout::array::<f32>(gathered_elements).map_err(|_| {
-            error("grouped input workspace exceeds addressable capacity; reduce batch dimensions")
+        let accumulator = std::alloc::Layout::array::<f32>(accumulated).map_err(|_| {
+            error("accumulator workspace exceeds addressable capacity; reduce batch dimensions")
         })?;
-        // The accumulator is live across all experts, so it cannot alias the
-        // projection or gather region. One input-sized region covers the full
-        // output without any expert-count or top-k multiplier.
-        WorkspaceLayout::new([projection, gathered, gathered])
+        WorkspaceLayout::new([projection, bank_a, bank_b, accumulator])
     }
 
     fn execute_prepared_experts(
@@ -324,12 +333,16 @@ impl BlockQuantizedMoEKernel {
         let layout = self.execution_workspace_layout(dimensions)?;
         // SAFETY: one checked layout lends disjoint Host regions for this
         // dispatch. Neither short borrow nor a projection output escapes.
-        let [mut scratch, mut grouped_scratch, mut accumulator] = unsafe {
+        let [mut scratch, bank_a, bank_b, mut accumulator] = unsafe {
             ProjectionScratch::bind_layout(
                 "BlockQuantizedMoE execution workspace binding",
                 layout,
                 workspace,
             )?
+        };
+        let mut expert_workspace = MoeWorkspace {
+            input: bank_a,
+            projection: bank_b,
         };
         let Dimensions {
             rows,
@@ -397,11 +410,6 @@ impl BlockQuantizedMoEKernel {
         #[cfg(test)]
         let mut counted_dense = false;
         for (expert, expert_tasks) in tasks {
-            let grouped_input = grouped_scratch.gather_rows(
-                &input,
-                hidden,
-                expert_tasks.iter().map(|&(row, _)| row),
-            )?;
             let dense = if use_dense {
                 match self.dequantize_expert_group(
                     inputs,
@@ -438,21 +446,23 @@ impl BlockQuantizedMoEKernel {
                 let fc1 = &weights[0];
                 let fc2 = &weights[1];
                 let fc3 = weights.get(2);
-                run_expert_grouped(
-                    grouped_input,
-                    expert_tasks.len(),
-                    fc1.as_slice(),
-                    fc1_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
-                    fc2.as_slice(),
-                    fc2_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
-                    fc3.map(|weight| weight.as_slice()),
-                    fc3_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                expert_workspace.run_dense_expert(
+                    &input,
+                    expert_tasks.iter().map(|&(row, _)| row),
+                    DenseExpertWeights {
+                        fc1: fc1.as_slice(),
+                        fc1_bias: fc1_bias
+                            .as_deref()
+                            .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
+                        fc2: fc2.as_slice(),
+                        fc2_bias: fc2_bias
+                            .as_deref()
+                            .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
+                        fc3: fc3.map(|weight| weight.as_slice()),
+                        fc3_bias: fc3_bias
+                            .as_deref()
+                            .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                    },
                     fc1_size,
                     hidden,
                     inter,
@@ -489,9 +499,9 @@ impl BlockQuantizedMoEKernel {
                         )
                     })
                     .transpose()?;
-                run_expert_projections(
-                    grouped_input,
-                    expert_tasks.len(),
+                expert_workspace.run_expert_projections(
+                    &input,
+                    expert_tasks.iter().map(|&(row, _)| row),
                     &fc1,
                     fc1_bias
                         .as_deref()
@@ -505,13 +515,7 @@ impl BlockQuantizedMoEKernel {
                         .as_deref()
                         .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
                     &self.attributes,
-                    |projection, input, rows, bias| {
-                        let elements = rows.checked_mul(projection.out_features).ok_or_else(|| error("expert projection output element count overflows; reduce batch or expert dimensions"))?;
-                        let mut output = super::decoded_projection::zeroed_f32(
-                            OP,
-                            "expert projection output staging",
-                            elements,
-                        )?;
+                    |projection, input, rows, bias, output| {
                         linear_packed_prepared(
                             projection.format,
                             &projection.bytes,
@@ -522,9 +526,8 @@ impl BlockQuantizedMoEKernel {
                             bias,
                             self.projection_plan,
                             scratch.initialized(),
-                            &mut output,
-                        )?;
-                        Ok(output)
+                            output,
+                        )
                     },
                 )?
             };
@@ -1727,12 +1730,12 @@ mod tests {
                 .execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace))
                 .unwrap();
             assert!(
-                scratch[..scratch.len() - 2 * H]
+                scratch[..scratch.len() - 3 * H]
                     .iter()
                     .all(|&value| value == 29.0),
                 "cold dense expansion and warm resident hits must leave streamed scratch untouched"
             );
-            assert_eq!(&scratch[scratch.len() - 2 * H..], &[0.125; 2 * H]);
+            assert_eq!(&scratch[scratch.len() - 3 * H..], &[0.125; 3 * H]);
             assert_eq!(output.to_f32(), vec![0.125; H]);
         }
         assert_eq!(
@@ -1743,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_workspace_covers_projection_gather_and_accumulator_without_warm_issuer_calls() {
+    fn streamed_workspace_covers_projection_banks_and_accumulator_without_warm_issuer_calls() {
         use crate::kernels::testutil::RecordingGovernor;
         use onnx_runtime_memory_governor::{HolderId, HostWorkspacePool, ProcessMemoryManager};
         use std::num::NonZeroUsize;
@@ -1756,8 +1759,10 @@ mod tests {
         pool_threads.install(|| {
         for (activation, fusion, separate) in [
             ("identity", 0, false),
+            ("swiglu", 1, false),
             ("swiglu", 2, false),
             ("swiglu", 0, true),
+            ("silu", 0, true),
         ] {
             let (rows, hidden, inter, experts) = (3, 32, 64, 4);
             let fc1_size = if fusion == 0 { inter } else { 2 * inter };
@@ -1849,9 +1854,14 @@ mod tests {
                 .bytes()
                 .max(l2.bytes())
                 .max(if separate { l3.bytes() } else { 0 });
+            let (a, b) = if activation == "identity" {
+                (hidden, inter)
+            } else {
+                (hidden.max(inter), (fc1_size + if separate { inter } else { 0 }).max(hidden))
+            };
             assert_eq!(
-                req.bytes, (max + 2 * rows * hidden * std::mem::size_of::<f32>()) as u64,
-                "serial experts/projections share max plus gather and accumulator, not k*E buffers"
+                req.bytes, (max + rows * (a + b + hidden) * std::mem::size_of::<f32>()) as u64,
+                "serial experts/projections share max plus two FC banks and accumulator, not k*E buffers"
             );
             assert!(max < l1.bytes() + l2.bytes());
             let mut output = Owned::zeros_f32(&[rows, hidden]);
@@ -3561,5 +3571,170 @@ mod tests {
             err.to_string().contains("fc3_format is only valid"),
             "{err}"
         );
+    }
+    #[test]
+    fn streamed_fc_banks_match_owned_driver_bits_across_gates_zero_axes_and_dirty_reuse() {
+        use super::super::moe::run_expert_projections;
+        for format in [BlockFormat::Mxfp4, BlockFormat::Q8_0] {
+            for (hidden, inter) in [(32, 64), (64, 32), (32, 0), (0, 32), (0, 0)] {
+                for rows in [0, 1, 3] {
+                    for (activation, fusion, separate) in [
+                        ("identity", 0, false),
+                        ("silu", 0, false),
+                        ("silu", 0, true),
+                        ("swiglu", 0, true),
+                        ("swiglu", 1, false),
+                        ("swiglu", 2, false),
+                    ] {
+                        let mut spec = attrs(activation, 1, true, fusion);
+                        spec.extend([
+                            ("activation_alpha", Attribute::Float(1.7)),
+                            ("activation_beta", Attribute::Float(0.2)),
+                            ("swiglu_limit", Attribute::Float(3.0)),
+                        ]);
+                        let mut node = Node::new(NodeId(0), OP, vec![], vec![]);
+                        node.attributes.extend(
+                            spec.into_iter()
+                                .map(|(name, value)| (name.to_owned(), value)),
+                        );
+                        let attributes = MoeAttributes::from_block_quantized_node(&node).unwrap();
+                        let fc1_size = if fusion == 0 { inter } else { 2 * inter };
+                        let projection = |n, k| PackedExpertProjection {
+                            bytes: Cow::Owned(packed_for_format(format, 1, n, k)),
+                            format,
+                            out_features: n,
+                            in_features: k,
+                        };
+                        let fc1 = projection(fc1_size, hidden);
+                        let fc2 = projection(hidden, inter);
+                        let fc3 = separate.then(|| projection(inter, hidden));
+                        let bias = |n| {
+                            (0..n)
+                                .map(|i| {
+                                    if i == 0 {
+                                        -0.0
+                                    } else {
+                                        (i % 7) as f32 * 0.01 - 0.03
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        let b1 = bias(fc1_size);
+                        let b2 = bias(hidden);
+                        let b3 = bias(inter);
+                        let input = (0..rows * hidden)
+                            .map(|i| (i % 19) as f32 * 0.001 - 0.009)
+                            .collect::<Vec<_>>();
+                        let row_indices: Vec<_> = (0..rows).rev().collect();
+                        let gathered: Vec<_> = row_indices
+                            .iter()
+                            .flat_map(|&row| {
+                                input[row * hidden..(row + 1) * hidden].iter().copied()
+                            })
+                            .collect();
+                        let plan = projection_plan();
+                        let max_decode = [(hidden, fc1_size), (inter, hidden), (hidden, inter)]
+                            .into_iter()
+                            .map(|(k, n)| plan.layout(rows, k, n).unwrap().bytes())
+                            .max()
+                            .unwrap();
+                        let mut old_decode = vec![0.; max_decode / 4];
+                        let expected = run_expert_projections(
+                            &gathered,
+                            rows,
+                            &fc1,
+                            Some(&b1),
+                            &fc2,
+                            Some(&b2),
+                            fc3.as_ref(),
+                            separate.then_some(b3.as_slice()),
+                            &attributes,
+                            |p, x, rows, bias| {
+                                let mut output = vec![0.; rows * p.out_features];
+                                linear_packed_prepared(
+                                    p.format,
+                                    &p.bytes,
+                                    x,
+                                    rows,
+                                    p.in_features,
+                                    p.out_features,
+                                    bias,
+                                    plan,
+                                    &mut old_decode,
+                                    &mut output,
+                                )?;
+                                Ok(output)
+                            },
+                        )
+                        .unwrap();
+                        let [a, b] =
+                            MoeWorkspace::bank_layouts(rows, hidden, inter, &attributes, separate)
+                                .unwrap();
+                        let layout = WorkspaceLayout::new([
+                            std::alloc::Layout::array::<f32>(max_decode / 4).unwrap(),
+                            a,
+                            b,
+                        ])
+                        .unwrap();
+                        let count = layout.bytes() / 4;
+                        let mut backing = vec![91.0f32; count + 7];
+                        for _ in 0..2 {
+                            backing[..count].fill(f32::NAN);
+                            let view = WorkspaceView::new(
+                                DevicePtrMut(backing.as_mut_ptr().cast()),
+                                layout.bytes(),
+                            );
+                            // SAFETY: this checked layout exclusively lends the
+                            // live aligned Host prefix; guards are outside it.
+                            let [mut decode, input_bank, projection_bank] = unsafe {
+                                ProjectionScratch::bind_layout(
+                                    "block MoE bank test",
+                                    layout,
+                                    Some(view),
+                                )
+                            }
+                            .unwrap();
+                            let mut banks = MoeWorkspace {
+                                input: input_bank,
+                                projection: projection_bank,
+                            };
+                            let actual = banks
+                                .run_expert_projections(
+                                    &input,
+                                    row_indices.iter().copied(),
+                                    &fc1,
+                                    Some(&b1),
+                                    &fc2,
+                                    Some(&b2),
+                                    fc3.as_ref(),
+                                    separate.then_some(b3.as_slice()),
+                                    &attributes,
+                                    |p, x, rows, bias, output| {
+                                        linear_packed_prepared(
+                                            p.format,
+                                            &p.bytes,
+                                            x,
+                                            rows,
+                                            p.in_features,
+                                            p.out_features,
+                                            bias,
+                                            plan,
+                                            decode.initialized(),
+                                            output,
+                                        )
+                                    },
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                                expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                                "{format:?}, rows={rows}, H={hidden}, I={inter}, activation={activation:?}, fusion={fusion}, separate={separate}"
+                            );
+                            assert!(backing[count..].iter().all(|&x| x == 91.));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

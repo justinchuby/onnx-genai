@@ -2675,9 +2675,10 @@ fn execute_prepared(
     let requirement = kernel
         .workspace_requirement(&metadata, &out)
         .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)?;
-    let owner = crate::runtime::GraphDeviceAllocation::allocate(
+    let owner = crate::runtime::NativeDeviceAllocation::allocate_shared(
         &kernel.runtime,
         requirement.bytes as usize,
+        onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
     )?;
     let view = WorkspaceView::new(
         onnx_runtime_ep_api::DevicePtrMut(owner.ptr() as *mut c_void),
@@ -2730,10 +2731,8 @@ mod alias_tests {
     use onnx_runtime_ir::{DeviceId, compute_contiguous_strides};
     use std::ffi::c_void;
 
-    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
-        Some(Arc::new(CudaRuntime::new(0).expect(
-            "Attention GPU regression requires a CUDA device/runtime",
-        )))
+    fn maybe_runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -2767,7 +2766,7 @@ mod alias_tests {
         ignore = "requires CUDA device; enable gpu-tests"
     )]
     fn decode_kv_growth_alias_matches_reference_and_is_deterministic() {
-        let Some(rt) = maybe_runtime() else {
+        let Some((_provider, rt)) = maybe_runtime() else {
             eprintln!("skipping: no CUDA device available");
             return;
         };
@@ -2940,7 +2939,7 @@ mod alias_tests {
         ignore = "requires CUDA device; enable gpu-tests"
     )]
     fn decode_kv_capacity_append_matches_reference_and_ignores_padding() {
-        let Some(rt) = maybe_runtime() else {
+        let Some((_provider, rt)) = maybe_runtime() else {
             eprintln!("skipping: no CUDA device available");
             return;
         };
@@ -3129,7 +3128,7 @@ mod alias_tests {
         ignore = "requires CUDA device; enable gpu-tests"
     )]
     fn derive_len_reads_valid_length_from_device_for_prefill_and_decode() {
-        let Some(rt) = maybe_runtime() else {
+        let Some((_provider, rt)) = maybe_runtime() else {
             eprintln!("skipping: no CUDA device available");
             return;
         };
@@ -3232,7 +3231,7 @@ mod alias_tests {
         ignore = "requires CUDA device; enable gpu-tests"
     )]
     fn capture_support_gated_on_warmed_device_valid_length_signature() {
-        let Some(rt) = maybe_runtime() else {
+        let Some((_provider, rt)) = maybe_runtime() else {
             eprintln!("skipping: no CUDA device available");
             return;
         };

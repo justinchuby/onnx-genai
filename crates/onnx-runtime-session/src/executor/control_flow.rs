@@ -1,4 +1,5 @@
 use super::*;
+use crate::tensor::copy_storage_elements;
 
 fn required_node_output(node: &Node, index: usize, op: &str) -> Result<ValueId> {
     node.outputs
@@ -1672,12 +1673,11 @@ fn scan_slice(
             ),
         });
     }
-    let esize = t.dtype.byte_size();
-    if esize == 0 {
+    if t.dtype.bit_size() == 0 {
         return Err(SessionError::ControlFlow {
             op: "Scan".to_string(),
             reason: format!(
-                "sub-byte dtype {:?} for scan input {input_index} is not supported",
+                "scan input {input_index} requires fixed-width tensor storage, got {:?}",
                 t.dtype
             ),
         });
@@ -1686,32 +1686,33 @@ fn scan_slice(
     shape.remove(axis);
     let outer = checked_numel(&t.shape[..axis], || format!("Scan input {input_index}"))?;
     let inner = checked_numel(&t.shape[axis + 1..], || format!("Scan input {input_index}"))?;
-    let inner_bytes = checked_storage_bytes(
+    let slice_numel = outer
+        .checked_mul(inner)
+        .ok_or_else(|| SessionError::ShapeOverflow {
+            value: format!("Scan input {input_index} slice"),
+            dims: shape.clone(),
+        })?;
+    let total_bytes = checked_storage_bytes(
         t.dtype,
-        inner,
-        || format!("Scan input {input_index}"),
-        &t.shape,
+        slice_numel,
+        || format!("Scan input {input_index} slice"),
+        &shape,
     )?;
-    let total_bytes =
-        outer
-            .checked_mul(inner_bytes)
-            .ok_or_else(|| SessionError::ShapeOverflow {
-                value: format!("Scan input {input_index} slice"),
-                dims: shape.clone(),
-            })?;
-    let source = t.as_bytes();
     let mut bytes = vec![0u8; total_bytes];
-    for outer_index in 0..outer {
-        let src = (outer_index * axis_len + index) * inner_bytes;
-        let dst = outer_index * inner_bytes;
-        bytes[dst..dst + inner_bytes].copy_from_slice(&source[src..src + inner_bytes]);
+    if slice_numel != 0 {
+        let source = t.as_bytes();
+        for outer_index in 0..outer {
+            let src = (outer_index * axis_len + index) * inner;
+            let dst = outer_index * inner;
+            copy_storage_elements(t.dtype, source, src, &mut bytes, dst, inner);
+        }
     }
     Ok((shape, bytes))
 }
 
 /// Incremental accumulator for Loop/Scan outputs. Iteration tensors are copied
-/// into one byte buffer and dropped; non-leading Scan axes are rearranged once
-/// when the final tensor is materialized.
+/// into one byte buffer and dropped. Each slice retains its byte padding until
+/// materialization, when stacking removes it and applies the axis/direction.
 struct TensorStackAccumulator {
     dtype: Option<DataType>,
     elem_shape: Vec<usize>,
@@ -1739,9 +1740,9 @@ impl TensorStackAccumulator {
                 )));
             }
         } else {
-            if tensor.dtype.byte_size() == 0 {
+            if tensor.dtype.bit_size() == 0 {
                 return Err(SessionError::Internal(format!(
-                    "Loop/Scan: sub-byte dtype {:?} scan outputs are not supported",
+                    "Loop/Scan: scan outputs require fixed-width tensor storage, got {:?}",
                     tensor.dtype
                 )));
             }
@@ -1753,24 +1754,13 @@ impl TensorStackAccumulator {
         Ok(())
     }
 
-    pub(super) fn finish(self) -> (DataType, Vec<usize>, Vec<u8>) {
-        if self.len == 0 {
-            return (DataType::Float32, vec![0], Vec::new());
-        }
-        let dtype = self.dtype.expect("non-empty accumulator has dtype");
-        let mut shape = Vec::with_capacity(1 + self.elem_shape.len());
-        shape.push(self.len);
-        shape.extend(self.elem_shape);
-        (dtype, shape, self.bytes)
-    }
-
     pub(super) fn finish_with_empty(
         self,
         empty_spec: Option<(DataType, Vec<usize>)>,
         output_index: usize,
     ) -> Result<(DataType, Vec<usize>, Vec<u8>)> {
-        if self.len != 0 {
-            return Ok(self.finish());
+        if let Some(dtype) = self.dtype {
+            return self.materialize(dtype, 0, false);
         }
         let (dtype, elem_shape) = empty_spec.ok_or_else(|| SessionError::ControlFlow {
             op: "Loop".to_string(),
@@ -1792,17 +1782,19 @@ impl TensorStackAccumulator {
         empty_spec: Option<(DataType, Vec<usize>)>,
         output_index: usize,
     ) -> Result<(DataType, Vec<usize>, Vec<u8>)> {
-        let (dtype, elem_shape) = match self.dtype {
-            Some(dtype) => (dtype, self.elem_shape.clone()),
-            None => empty_spec.ok_or_else(|| SessionError::ControlFlow {
-                op: "Scan".to_string(),
-                reason: format!(
-                    "cannot determine the element shape of scan output {output_index} for a \
+        let output_rank = match (&self.dtype, &empty_spec) {
+            (Some(_), _) => self.elem_shape.len() + 1,
+            (None, Some((_, shape))) => shape.len() + 1,
+            (None, None) => {
+                return Err(SessionError::ControlFlow {
+                    op: "Scan".to_string(),
+                    reason: format!(
+                        "cannot determine the element shape of scan output {output_index} for a \
                      zero-iteration result"
-                ),
-            })?,
+                    ),
+                });
+            }
         };
-        let output_rank = elem_shape.len() + 1;
         let axis = normalize_axis(axis, output_rank).ok_or_else(|| SessionError::ControlFlow {
             op: "Scan".to_string(),
             reason: format!(
@@ -1810,36 +1802,34 @@ impl TensorStackAccumulator {
                  {output_rank}"
             ),
         })?;
-        if self.len == 0 {
-            let mut shape = elem_shape;
+        if let Some(dtype) = self.dtype {
+            self.materialize(dtype, axis, direction == 1)
+        } else {
+            let (dtype, mut shape) = empty_spec.expect("empty spec checked above");
             shape.insert(axis, 0);
-            return Ok((dtype, shape, Vec::new()));
+            Ok((dtype, shape, Vec::new()))
         }
-        if axis == 0 && direction == 0 {
-            let mut shape = Vec::with_capacity(output_rank);
-            shape.push(self.len);
-            shape.extend(elem_shape);
+    }
+
+    fn materialize(
+        self,
+        dtype: DataType,
+        axis: usize,
+        reverse: bool,
+    ) -> Result<(DataType, Vec<usize>, Vec<u8>)> {
+        if axis == 0 && !reverse && !dtype.is_sub_byte() {
+            let mut shape = self.elem_shape;
+            shape.insert(0, self.len);
             return Ok((dtype, shape, self.bytes));
         }
-
-        let elem_numel = checked_numel(&elem_shape, || {
-            format!("Scan output {output_index} element")
-        })?;
-        let elem_bytes = checked_storage_bytes(
+        let (shape, bytes) = stack_new_axis(
+            &self.bytes,
+            self.len,
+            &self.elem_shape,
+            axis,
+            reverse,
             dtype,
-            elem_numel,
-            || format!("Scan output {output_index} element"),
-            &elem_shape,
         )?;
-        let mut elements: Vec<&[u8]> = if elem_bytes == 0 {
-            (0..self.len).map(|_| &self.bytes[..]).collect()
-        } else {
-            self.bytes.chunks_exact(elem_bytes).collect()
-        };
-        if direction == 1 {
-            elements.reverse();
-        }
-        let (shape, bytes) = stack_new_axis(&elements, &elem_shape, axis, dtype.byte_size())?;
         Ok((dtype, shape, bytes))
     }
 }

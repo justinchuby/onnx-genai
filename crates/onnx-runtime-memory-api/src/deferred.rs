@@ -169,6 +169,8 @@ pub enum QuarantineReason {
     /// cannot be restored without losing the owner; the conservative answer is
     /// quarantine.
     AllocatorRefused,
+    /// Stream/DMA completion could not be proven, so device ownership must remain.
+    CompletionUnknown,
     /// A mechanism lock was poisoned, so ownership could not be settled safely.
     StatePoisoned,
 }
@@ -184,6 +186,7 @@ impl QuarantineReason {
             Self::PartialRelease => "the allocator released only part of the allocation",
             Self::AllocatorRefused => "the allocator refused after the record was retired",
             Self::StatePoisoned => "mechanism state was poisoned",
+            Self::CompletionUnknown => "stream or DMA completion could not be proven",
         }
     }
 }

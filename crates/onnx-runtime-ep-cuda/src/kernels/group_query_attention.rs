@@ -4731,7 +4731,7 @@ mod raw_allocation_guard {
         let source = include_str!("group_query_attention.rs");
         let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
         for removed in [
-            "GraphDeviceAllocation",
+            "NativeDeviceAllocation",
             "GqaMetadataWorkspace",
             "alloc_raw",
             "fn device_graph_resources",
