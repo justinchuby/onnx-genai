@@ -399,7 +399,7 @@ impl ChatCompletionRequest {
             self.response_format
                 .as_ref()
                 .is_none_or(|format| matches!(format, ResponseFormat::Text)),
-            "grammar conflicts with response_format; supply only a GBNF grammar or a JSON response format"
+            "grammar conflicts with response_format; supply only a grammar or a JSON response format"
         );
         anyhow::ensure!(
             !matches!(
@@ -412,6 +412,15 @@ impl ChatCompletionRequest {
             self.extensions.get("ignore_eos") != Some(&serde_json::Value::Bool(true)),
             "grammar cannot be combined with ignore_eos=true; allow grammar completion to terminate the generation"
         );
+        if grammar.starts_with("%llguidance") {
+            let max_bytes = onnx_genai_engine::GenerateOptions::default().max_constraint_bytes;
+            anyhow::ensure!(
+                grammar.len() <= max_bytes,
+                "raw Lark grammar exceeds its {max_bytes}-byte budget; shorten grammar"
+            );
+            // Vocabulary-aware parsing runs during request preparation, before SSE.
+            return Ok(());
+        }
         onnx_genai_engine::gbnf::validate_gbnf(
             grammar,
             onnx_genai_engine::GenerateOptions::default().max_constraint_bytes,

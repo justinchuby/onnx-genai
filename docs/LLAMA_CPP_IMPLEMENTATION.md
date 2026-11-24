@@ -1367,3 +1367,22 @@ runtime had already passed engine 948 / 1 inherited ignore, server 449 / 2
 inherited ignores, and HTTP 37. The incidental host-string lint repairs passed
 11 CPU text-kernel tests and 6 session text integration tests / 1 inherited
 benchmark ignore. Windows CI remains the platform-specific confirmation.
+
+### Raw llguidance protocol follow-up
+
+The pinned upstream sampling path dispatches a `grammar` beginning with
+`%llguidance` directly to Lark. The server now performs the same prefix dispatch
+on chat, legacy and native completion requests. `GenerateConstraint::RawLark`
+distinguishes this raw newly generated stream from the existing content/prefill
+Lark constraint. It shares the resolved byte vocabulary and completion-only EOS
+contract with GBNF, while preserving authored llguidance options. Source budgets
+are enforced for public Rust callers as well as HTTP; parser failures occur
+during request preparation before SSE.
+
+Validation: engine 948 passed / 1 inherited ignore; server 449 passed / 2
+inherited ignores; HTTP 37 passed; strict engine/server all-target Clippy passed.
+A subsequent targeted run selected and passed the Unicode/byte-budget test
+after its final budget assertion was added. Coverage includes actual Unicode byte fallback and
+compound-token choices, model token IDs, all three buffered/SSE endpoints on
+Native CPU and explicit ORT, invalid Lark syntax and out-of-range IDs. Active
+lazy grammars, preserved tokens and native probability reporting remain open.

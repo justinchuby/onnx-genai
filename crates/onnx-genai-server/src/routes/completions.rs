@@ -2294,8 +2294,14 @@ fn build_generate_options(
         .as_ref()
         .filter(|grammar| !grammar.is_empty())
     {
-        options.constraint = Some(GenerateConstraint::Gbnf {
-            grammar: grammar.clone(),
+        options.constraint = Some(if grammar.starts_with("%llguidance") {
+            GenerateConstraint::RawLark {
+                grammar: grammar.clone(),
+            }
+        } else {
+            GenerateConstraint::Gbnf {
+                grammar: grammar.clone(),
+            }
         });
     }
     options
