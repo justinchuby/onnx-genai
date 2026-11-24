@@ -230,7 +230,7 @@ fn require_context(what: &str) -> Arc<CudaContext> {
 /// physical granules as spans are handed out, and an eager allocator — which
 /// takes physical memory at the moment it is asked for — reports false. The
 /// second half of the test proves that by construction rather than by
-/// assertion: the *same* provider, with an eager allocator injected, flips it.
+/// assertion: a provider constructed with an injected eager allocator reports false.
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
@@ -271,11 +271,16 @@ fn the_default_provider_allocates_through_the_built_in_vmm_arena() {
     assert_eq!(read_back, pattern, "arena memory did not round-trip");
     provider.deallocate(buffer).expect("returned to the arena");
 
-    let eager = require_provider("the eager-contrast half of the default-mechanism check")
-        .with_memory(Arc::new(ExternalEagerAllocator::new(require_context(
-            "the eager-contrast half of the default-mechanism check",
-        ))))
-        .expect("an eager allocator for this device is a legal injection");
+    let eager = onnx_runtime_ep_cuda::CudaExecutionProvider::from_config(
+        0,
+        onnx_runtime_ep_cuda::CudaProviderConfig {
+            memory: Some(Arc::new(ExternalEagerAllocator::new(require_context(
+                "the eager-contrast half of the default-mechanism check",
+            )))),
+            ..Default::default()
+        },
+    )
+    .expect("an eager allocator for this device is a legal injection");
     assert!(
         !eager.commits_on_demand(),
         "premise: `commits_on_demand` must distinguish the arena from an eager allocator, or \
@@ -284,9 +289,8 @@ fn the_default_provider_allocates_through_the_built_in_vmm_arena() {
 }
 
 /// Criterion 4, and the non-goal that says an injected external eager
-/// allocator must not be prohibited: a successful `with_memory` is
-/// authoritative — the built-in arena stops serving and the injected mechanism
-/// serves everything.
+/// allocator must not be prohibited: construction-time selection is authoritative;
+/// only the injected mechanism is created and it serves every provider allocation.
 ///
 /// The counter is read from the injected allocator, so "the provider kept its
 /// own arena and ignored the call" is not a passing outcome. The round-trip
@@ -297,18 +301,22 @@ fn the_default_provider_allocates_through_the_built_in_vmm_arena() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn an_injected_external_eager_allocator_replaces_the_built_in_arena() {
+fn an_injected_external_eager_allocator_is_selected_at_construction() {
     use onnx_runtime_ep_api::ExecutionProvider;
 
-    let provider = require_provider("the authoritative-injection check");
     let injected = Arc::new(ExternalEagerAllocator::new(require_context(
         "the authoritative-injection check",
     )));
     assert_eq!(injected.cumemalloc_calls(), 0);
 
-    let provider = provider
-        .with_memory(Arc::clone(&injected) as Arc<dyn DeviceAllocator>)
-        .expect("an allocator for this EP's own device must be accepted");
+    let provider = onnx_runtime_ep_cuda::CudaExecutionProvider::from_config(
+        0,
+        onnx_runtime_ep_cuda::CudaProviderConfig {
+            memory: Some(Arc::clone(&injected) as Arc<dyn DeviceAllocator>),
+            ..Default::default()
+        },
+    )
+    .expect("an allocator for this EP's own device must be accepted");
     assert!(
         !provider.commits_on_demand(),
         "the injected eager mechanism, not the arena, must now be the live one"
@@ -348,7 +356,7 @@ fn an_injected_external_eager_allocator_replaces_the_built_in_arena() {
 
 /// An allocator that does not serve this EP's device is refused.
 ///
-/// Pointers handed to `with_memory` are given to kernels as this device's
+/// Pointers from construction-selected memory are given to kernels as this device's
 /// addresses. A host allocator's pointer is a perfectly valid host address, so
 /// nothing detects the substitution until a kernel dereferences it on the
 /// device -- far from the call that caused it.
@@ -358,68 +366,18 @@ fn an_injected_external_eager_allocator_replaces_the_built_in_arena() {
 )]
 #[test]
 fn an_allocator_for_the_wrong_device_is_refused() {
-    let provider = require_provider("the device-mismatch check");
-    let error = provider
-        .with_memory(Arc::new(onnx_runtime_memory_api::HostAllocator))
-        .expect_err("host memory is not CUDA device memory");
+    let error = onnx_runtime_ep_cuda::CudaExecutionProvider::from_config(
+        0,
+        onnx_runtime_ep_cuda::CudaProviderConfig {
+            memory: Some(Arc::new(onnx_runtime_memory_api::HostAllocator)),
+            ..Default::default()
+        },
+    )
+    .expect_err("host memory is not CUDA device memory");
     let message = error.to_string();
     assert!(
         message.contains("CUDA device 0"),
         "the error must name the device that was expected: {message}"
-    );
-}
-
-/// Injection is refused once the mechanism it would replace has already served
-/// memory, and refused *before* the new allocator is used.
-///
-/// The replacement is authoritative, so the arena it displaces stops existing.
-/// A pointer already handed out has to be released through the mechanism that
-/// produced it, so swapping underneath one would strand it.
-///
-/// # Why the buffer is released before the refused injection
-///
-/// `with_memory` takes `mut self`, so a *refused* injection still consumes the
-/// provider and drops it — the arena is torn down on the error path just as it
-/// is on the success path. Holding a live `DeviceBuffer` across that call
-/// therefore does not demonstrate "the provider is unchanged by the refusal";
-/// it tears the arena down underneath an outstanding pointer, and the later
-/// drop of that pointer is a teardown assertion or a use-after-free on a real
-/// device. With `mut self` there is no way to hold a provider across a failed
-/// `with_memory`, so this asserts what is actually true and actually safe: the
-/// mechanism that served the pointer is the one that releases it, and the
-/// refusal still fires afterwards because the guard's `served` counter is
-/// monotonic — `ep_allocations` is never decremented, so "has served memory"
-/// stays true after the buffer is returned.
-#[cfg_attr(
-    not(feature = "gpu-tests"),
-    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-)]
-#[test]
-fn injection_is_refused_once_the_live_mechanism_has_served_memory() {
-    use onnx_runtime_ep_api::ExecutionProvider;
-
-    let provider = require_provider("the late-injection refusal check");
-    let buffer = provider.allocate(4096, 256).expect("device memory");
-
-    // The original mechanism owns the pointer and is the one that releases it.
-    provider
-        .deallocate(buffer)
-        .expect("the mechanism that served the pointer can release it");
-
-    let injected = Arc::new(ExternalEagerAllocator::new(require_context(
-        "the late-injection refusal check",
-    )));
-    let error = provider
-        .with_memory(Arc::clone(&injected) as Arc<dyn DeviceAllocator>)
-        .expect_err("a mechanism that has served memory cannot be replaced");
-    assert!(
-        error.to_string().contains("cannot do so underneath"),
-        "the refusal must explain what is outstanding: {error}"
-    );
-    assert_eq!(
-        injected.cumemalloc_calls(),
-        0,
-        "a refused allocator must never have been used"
     );
 }
 
@@ -445,13 +403,17 @@ fn injection_is_refused_once_the_live_mechanism_has_served_memory() {
 fn a_zero_byte_allocation_is_freed_with_the_size_it_was_allocated_with() {
     use onnx_runtime_ep_api::ExecutionProvider;
 
-    let provider = require_provider("the zero-byte size-agreement check");
     let strict = Arc::new(StrictSizes::new(ExternalEagerAllocator::new(
         require_context("the zero-byte size-agreement check"),
     )));
-    let provider = provider
-        .with_memory(Arc::clone(&strict) as Arc<dyn DeviceAllocator>)
-        .expect("an allocator for this EP's own device must be accepted");
+    let provider = onnx_runtime_ep_cuda::CudaExecutionProvider::from_config(
+        0,
+        onnx_runtime_ep_cuda::CudaProviderConfig {
+            memory: Some(Arc::clone(&strict) as Arc<dyn DeviceAllocator>),
+            ..Default::default()
+        },
+    )
+    .expect("an allocator for this EP's own device must be accepted");
 
     let buffer = provider
         .allocate(0, 256)

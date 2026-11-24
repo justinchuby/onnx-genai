@@ -4698,10 +4698,14 @@ fn semantic_einsum_caller_workspace_gpu() {
     let injected = Arc::new(common::ExternalEagerAllocator::new(
         common::require_context("semantic Einsum caller workspace"),
     ));
-    let ep = CudaExecutionProvider::new_default()
-        .unwrap()
-        .with_memory(injected.clone() as Arc<dyn onnx_runtime_memory_api::DeviceAllocator>)
-        .unwrap();
+    let ep = CudaExecutionProvider::from_config(
+        0,
+        onnx_runtime_ep_cuda::CudaProviderConfig {
+            memory: Some(injected.clone() as Arc<dyn onnx_runtime_memory_api::DeviceAllocator>),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let runtime = ep.runtime();
     let (m, k, n, p) = (8, 16, 12, 10);
     let shapes = [vec![m, k], vec![k, n], vec![n, p]];
