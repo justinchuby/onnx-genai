@@ -107,6 +107,13 @@ fn check(
         session.execution_provider_fallback_report().is_none(),
         "{context}"
     );
+    if expected_device == DeviceType::Cuda {
+        assert!(
+            session.heterogeneous_placement_report().is_none(),
+            "{context}: unexpected heterogeneous placement: {:?}",
+            session.heterogeneous_placement_report()
+        );
+    }
     let outputs = session
         .run(&feed)
         .unwrap_or_else(|e| panic!("{context}: {e:#}"));
@@ -342,5 +349,8 @@ fn float8_cast_native_cpu() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn float8_cast_native_cuda() {
-    check_float8_casts(DevicePreference::Gpu { index: Some(0) });
+    check_float8_casts(DevicePreference::Explicit {
+        device_type: DeviceType::Cuda,
+        index: 0,
+    });
 }
