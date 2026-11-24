@@ -857,7 +857,10 @@ fn contiguous(shape: &[usize]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
+    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ir::{Attribute, NodeId, ValueId, static_shape};
     #[test]
     fn clip_tensor_bounds() {
         let x = Owned::f32(&[3], &[-2., 0.5, 3.]);
@@ -1203,6 +1206,55 @@ mod tests {
             vec![5.5, 4.25, 2.25, 7.0, 6.5, 2.0]
         );
         assert_eq!(indices.to_i64(), vec![1, 3, 0, 2, 3, 4]);
+    }
+
+    #[test]
+    fn topk_24_bfloat16_admission_and_execution() {
+        let ep = CpuExecutionProvider::new();
+        let mut node = Node::new(
+            NodeId(0),
+            "TopK",
+            vec![Some(ValueId(0)), Some(ValueId(1))],
+            vec![ValueId(2), ValueId(3)],
+        );
+        let shapes = [static_shape([6_usize]), static_shape([1_usize])];
+        let claim = |node: &Node, opset, dtype| {
+            ep.supports_op(node, opset, &shapes, &[dtype, DataType::Int64], &[])
+        };
+        for opset in [10, 23] {
+            let rejected = claim(&node, opset, DataType::BFloat16);
+            let reason = rejected.reason().expect("pre-24 BF16 must be rejected");
+            assert!(
+                reason.contains("BFloat16") && reason.contains("opset 24"),
+                "{reason}"
+            );
+            assert!(claim(&node, opset, DataType::Float16).is_supported());
+        }
+
+        let input = Owned::bf16(&[6], &[4.5, 4.5, 0.25, -2.5, -2.5, -2.5]);
+        let count = Owned::i64(&[1], &[2]);
+        for (largest, expected_values, expected_indices) in
+            [(1, [4.5, 4.5], [0, 1]), (0, [-2.5, -2.5], [3, 4])]
+        {
+            node.attributes
+                .insert("largest".into(), Attribute::Int(largest));
+            assert!(claim(&node, 24, DataType::BFloat16).is_supported());
+            let kernel = ep.get_kernel(&node, &[vec![6], vec![1]], 24).unwrap();
+            let mut values = Owned::zeros(DataType::BFloat16, &[2]);
+            let mut indices = Owned::zeros(DataType::Int64, &[2]);
+            kernel
+                .execute(
+                    &[input.view(), count.view()],
+                    &mut [values.view_mut(), indices.view_mut()],
+                )
+                .unwrap();
+            assert_eq!(
+                values.to_bf16_as_f32(),
+                expected_values,
+                "largest={largest}"
+            );
+            assert_eq!(indices.to_i64(), expected_indices, "largest={largest}");
+        }
     }
 
     #[test]

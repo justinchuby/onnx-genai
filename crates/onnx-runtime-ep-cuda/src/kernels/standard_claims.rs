@@ -14,6 +14,14 @@ pub(crate) fn unsupported_reason_at_opset(
     input_dtypes: &[DataType],
 ) -> Option<String> {
     let result = match node.op_type.as_str() {
+        "TopK" => {
+            if let Err(reason) =
+                onnx_runtime_ep_api::topk::validate_bfloat16_opset(opset, input_dtypes)
+            {
+                return Some(reason);
+            }
+            topk(node, input_dtypes)
+        }
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
         "AveragePool" => {
@@ -36,7 +44,6 @@ pub(crate) fn unsupported_reason(
     let result = match node.op_type.as_str() {
         "RMSNormalization" => rms_normalization(node, input_dtypes),
         "RotaryEmbedding" => rotary_embedding(node, input_dtypes),
-        "TopK" => topk(node, input_dtypes),
         "CumSum" => cumsum(node, input_dtypes),
         "Trilu" => trilu(node, input_dtypes),
         "Gather" => gather(node, input_dtypes),

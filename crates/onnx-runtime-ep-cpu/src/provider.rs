@@ -472,6 +472,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "TopK"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Err(reason) =
+                onnx_runtime_ep_api::topk::validate_bfloat16_opset(opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) = onnx_runtime_ep_api::gemm::unsupported_reason(
             op,
             opset,
