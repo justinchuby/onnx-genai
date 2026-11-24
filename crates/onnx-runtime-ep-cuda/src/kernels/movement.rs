@@ -436,7 +436,7 @@ struct ReshapeKernel {
 }
 
 impl Kernel for ReshapeKernel {
-    fn may_produce_views(&self) -> bool {
+    fn may_produce_views(&self, _input_dtypes: &[DataType]) -> bool {
         true
     }
 

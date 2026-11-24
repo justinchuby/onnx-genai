@@ -328,8 +328,8 @@ impl Kernel for FinalizationCheckingKernel {
         self.inner.view_outputs(inputs, output_shapes, num_outputs)
     }
 
-    fn may_produce_views(&self) -> bool {
-        self.inner.may_produce_views()
+    fn may_produce_views(&self, input_dtypes: &[DataType]) -> bool {
+        self.inner.may_produce_views(input_dtypes)
     }
 
     fn capture_support(&self) -> CaptureSupport {

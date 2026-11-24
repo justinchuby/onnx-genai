@@ -54,7 +54,7 @@ use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
 };
 use onnx_runtime_ir::transpose::packed_lane_bits;
-use onnx_runtime_ir::{Node, compute_contiguous_strides};
+use onnx_runtime_ir::{DataType, Node, compute_contiguous_strides};
 
 use super::{check_arity, elem_size, to_dense_bytes, write_dense_bytes};
 use crate::strided::{next_index, numel};
@@ -179,8 +179,10 @@ fn collapse(in_shape: &[usize], perm: &[usize]) -> Collapsed {
 }
 
 impl Kernel for TransposeKernel {
-    fn may_produce_views(&self) -> bool {
-        true
+    fn may_produce_views(&self, input_dtypes: &[DataType]) -> bool {
+        input_dtypes
+            .first()
+            .is_none_or(|dtype| dtype.byte_size() != 0)
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -280,7 +282,7 @@ impl Kernel for TransposeKernel {
     ) -> Option<Vec<ViewOutput>> {
         // The session gathers views in whole bytes. Packed outputs use the
         // dense kernel rather than installing a view the session cannot read.
-        if num_outputs != 1 || inputs.len() != 1 || inputs[0].dtype.byte_size() == 0 {
+        if num_outputs != 1 || inputs.len() != 1 || !self.may_produce_views(&[inputs[0].dtype]) {
             return None;
         }
         let input = &inputs[0];
