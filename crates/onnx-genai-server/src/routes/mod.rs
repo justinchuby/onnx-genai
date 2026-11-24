@@ -49,6 +49,7 @@ use crate::{
 
 mod admin;
 mod completions;
+pub(crate) mod decision;
 mod images;
 pub(crate) mod llama;
 pub(crate) mod lora;

@@ -74,6 +74,22 @@ pub struct ServeArgs {
     #[arg(long, default_value = "128")]
     pub max_rerank_documents: std::num::NonZeroUsize,
 
+    /// Maximum tokens per non-generative decision prompt variant.
+    #[arg(long, default_value_t = onnx_genai_engine::decision::DecisionLimits::default().max_input_tokens)]
+    pub max_decision_input_tokens: std::num::NonZeroUsize,
+    /// Maximum rendered bytes per decision prompt variant, before tokenization.
+    #[arg(long, default_value_t = onnx_genai_engine::decision::DecisionLimits::default().template.max_output_bytes)]
+    pub max_decision_prompt_bytes: std::num::NonZeroUsize,
+    /// Maximum Jinja interpreter operations per decision prompt variant.
+    #[arg(long, default_value_t = onnx_genai_engine::decision::DecisionLimits::default().template.max_operations)]
+    pub max_decision_template_operations: std::num::NonZeroU64,
+    /// Maximum questions in one SystemOne decision request.
+    #[arg(long, default_value = "64")]
+    pub max_decision_questions: std::num::NonZeroUsize,
+    /// Maximum options per decision question (also bounded by model metadata).
+    #[arg(long, default_value = "128")]
+    pub max_decision_options: std::num::NonZeroUsize,
+
     /// Maximum active/retained resumable generations (X-Conversation-Id).
     #[arg(long, default_value_t = 16)]
     pub max_replay_streams: usize,
@@ -199,6 +215,11 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         max_completion_prompts: args.max_completion_prompts,
         max_rerank_input_tokens: args.max_rerank_input_tokens,
         max_rerank_documents: args.max_rerank_documents,
+        max_decision_input_tokens: args.max_decision_input_tokens,
+        max_decision_prompt_bytes: args.max_decision_prompt_bytes,
+        max_decision_template_operations: args.max_decision_template_operations,
+        max_decision_questions: args.max_decision_questions,
+        max_decision_options: args.max_decision_options,
         max_replay_streams: args.max_replay_streams,
         replay_buffer_bytes: args.replay_buffer_bytes,
         default_reasoning_effort: args.default_reasoning_effort,
@@ -497,6 +518,36 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("--max-completion-prompts"));
     }
+    #[test]
+    fn decision_resource_limits_are_positive_and_forwarded() {
+        let args = TestCli::parse_from([
+            "test",
+            "model-dir",
+            "--max-decision-input-tokens",
+            "256",
+            "--max-decision-questions",
+            "3",
+            "--max-decision-options",
+            "8",
+        ]);
+        let config = server_config_from_args(&args.serve);
+        assert_eq!(config.max_decision_input_tokens.get(), 256);
+        assert_eq!(config.max_decision_questions.get(), 3);
+        assert_eq!(config.max_decision_options.get(), 8);
+        for flag in [
+            "--max-decision-input-tokens",
+            "--max-decision-questions",
+            "--max-decision-prompt-bytes",
+            "--max-decision-template-operations",
+            "--max-decision-options",
+        ] {
+            assert!(
+                TestCli::try_parse_from(["test", "model-dir", flag, "0"]).is_err(),
+                "{flag}"
+            );
+        }
+    }
+
     #[test]
     fn reranking_resource_limits_are_positive_and_flow_to_server_config() {
         let cli = TestCli::parse_from([
