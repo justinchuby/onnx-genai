@@ -205,6 +205,21 @@ pub fn cast(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+fn bit_cast(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    use onnx_runtime_ir::opset26::{bit_cast_target, validate_bit_cast};
+    let invalid = |detail| ShapeInferError::Invalid {
+        op: "BitCast".into(),
+        detail,
+    };
+    let dtype = bit_cast_target(ctx.node).map_err(invalid)?;
+    if let Some(input) = ctx.input_type(0) {
+        validate_bit_cast(input.dtype, dtype).map_err(invalid)?;
+        ctx.set_output(0, dtype, input.shape.clone());
+    }
+    // Bit reinterpretation is not a numeric cast of ShapeData.
+    Ok(())
+}
+
 /// `Identity`: pass the input's type and shape-data straight through.
 pub fn identity(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     if let Some(t) = ctx.input_type(0).cloned() {
@@ -271,6 +286,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "ConstantOfShape", 1, constant_of_shape);
     reg.register("", "Cast", 1, cast);
     reg.register("", "CastLike", 1, cast_like);
+    reg.register("", "BitCast", 26, bit_cast);
     reg.register("", "Identity", 1, identity);
     reg.register("", "Dropout", 1, dropout);
     reg.register("", "EyeLike", 9, eye_like);

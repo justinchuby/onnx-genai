@@ -235,6 +235,8 @@ mod cuda_impl {
                 supported_dtypes: d.supported_dtypes,
                 input_dtype_constraints: if d.domain.is_empty() && d.op_type == "DequantizePacked" {
                     onnx_runtime_ir::dequantize_packed::INPUT_DTYPES
+                } else if d.domain.is_empty() && d.op_type == "CumProd" {
+                    onnx_runtime_ir::opset26::CUM_PROD_INPUT_TYPES
                 } else {
                     &[]
                 },

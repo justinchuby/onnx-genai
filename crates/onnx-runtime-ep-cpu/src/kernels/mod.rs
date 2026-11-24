@@ -25,6 +25,7 @@ use std::borrow::Cow;
 
 use onnx_runtime_ep_api::{EpError, OpKey, OpRegistry, Result, TensorMut, TensorView};
 use onnx_runtime_ir::DataType;
+use onnx_runtime_ir::opset26::{BIT_CAST_TYPES, CUM_PROD_TYPES};
 
 use crate::strided::{elem_offset, next_index, numel};
 
@@ -302,6 +303,7 @@ pub fn input_dtype_constraints_for_op(
         ("PackedMultiHeadAttention", "com.microsoft") => PACKED_MHA_SLOTS,
         ("QMoE", "com.microsoft") => QMOE_SLOTS,
         ("STFT", "") => STFT_SLOTS,
+        ("CumProd", "") => onnx_runtime_ir::opset26::CUM_PROD_INPUT_TYPES,
         ("NonMaxSuppression", "") => NMS_SLOTS,
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_SLOTS,
         ("RegexFullMatch", "") | ("StringSplit", "") => TEXT_STRING_INPUT,
@@ -518,7 +520,9 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         }
 
         // Sequence/range ops.
-        ("Range", "") | ("CumSum", "") | ("CumProd", "") => ARITH_DTYPES,
+        ("Range", "") | ("CumSum", "") => ARITH_DTYPES,
+        ("CumProd", "") => CUM_PROD_TYPES,
+        ("BitCast", "") => BIT_CAST_TYPES,
 
         // Window functions.
         ("HannWindow", "") | ("HammingWindow", "") | ("BlackmanWindow", "") | ("DFT", "") => {
@@ -600,6 +604,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 pub mod activations;
 pub mod add;
 pub mod attention;
+pub mod bit_cast;
 mod bit_packing;
 pub mod bitshift;
 pub mod bitwise;
@@ -1542,6 +1547,11 @@ pub(crate) fn build_cpu_registry_with_resources(
         OpKey::new("CastLike", "", 15),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(cast::CastLikeFactory),
+    );
+    rec.register(
+        OpKey::new("BitCast", "", 26),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(bit_cast::BitCastFactory),
     );
     // Identity: dtype-agnostic passthrough (raw byte copy).
     rec.register(
@@ -3478,7 +3488,7 @@ mod tests {
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
         // The EP-owned affine and GGUF Gather and grouped-projection fusions each add one.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 115 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 116 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")
@@ -3498,6 +3508,8 @@ mod tests {
         assert!(reg.lookup("ReduceLogSumExp", "", 18).is_some());
         assert!(reg.lookup("CumSum", "", 14).is_some());
         assert!(reg.lookup("CumProd", "", 26).is_some());
+        assert!(reg.lookup("BitCast", "", 25).is_none());
+        assert!(reg.lookup("BitCast", "", 26).is_some());
         assert!(reg.lookup("HannWindow", "", 17).is_some());
         assert!(reg.lookup("HammingWindow", "", 17).is_some());
         assert!(reg.lookup("BlackmanWindow", "", 17).is_some());
