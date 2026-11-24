@@ -3539,11 +3539,17 @@ mod tests {
         drop(read);
         let owner = (resource.identity(), old);
         let before_rearm = runtime.forced_synchronization_count();
+        let before_uploads = runtime.transfer_counts().host_to_device;
         telemetry.arm_route_telemetry(config).unwrap();
         assert_eq!(
             runtime.forced_synchronization_count(),
-            before_rearm + 1,
-            "arming keeps its required H2D completion, without an old-owner retirement drain"
+            before_rearm,
+            "arming must not introduce an explicit old-owner retirement drain"
+        );
+        assert_eq!(
+            runtime.transfer_counts().host_to_device,
+            before_uploads + 1,
+            "arming retains its required synchronous H2D upload; it is tracked separately from explicit drains"
         );
         let replacement = telemetry.capture_resource(4).unwrap().unwrap();
         assert_ne!(

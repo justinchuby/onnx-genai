@@ -1303,10 +1303,12 @@ encodes a new key and payload. Kernels still define their table ABI and scalar
 sentinels; the helper owns allocation/upload, capture-registration checks and
 the existing staged-mutation checkpoint.
 
-A capture miss refuses before encoding, draining or uploading. On an eager
-miss with a previous entry, the common path uses `drain_for_unmap`, including
-`Where` when optional per-op synchronization is deferred. Only successful
-allocation/upload/checkpoint installs the candidate record, and each kernel
+A capture miss refuses before encoding or uploading. Eager misses prepare a
+new immutable native owner; they do not explicitly drain old readers before
+encoding or replacing metadata. Encoding refusal performs no admission, copy
+or drain. Synchronous H2D upload still waits for stream completion; this change
+does not make uploads asynchronous. Only successful allocation/upload/checkpoint
+installs the candidate record, and each kernel
 still publishes that candidate and its capture signature after successful
 launch. Installed graphs independently pin old allocation owners across rewarm
 and kernel drop. No new lock, pool, budget, quota callback or device owner is
@@ -1317,7 +1319,7 @@ key construction on `Where` hits, and both caches' candidate key deep copies.
 Capture-signature and broadcast-output shape handling still allocate Host
 vectors, so this is not an allocation-free whole-call claim. Cold preparation
 materializes a byte payload for the shared upload interface. Device fixtures
-cover lazy hits, mandatory replacement drains under eager deferral, staged
+cover lazy hits, no explicit drain on replacement under eager deferral, staged
 failure retention, capture miss rejection and replay after owner replacement
 and kernel drop. Host/type checks and GPU-feature compilation can verify the
 interfaces here; device execution and performance need CUDA hardware.
@@ -1333,15 +1335,14 @@ extent and graph resource derive from that record through a borrowed allocation
 accessor. Empty metadata retains the initialized u64 sentinel, including exact
 signed-stride bit patterns in nonempty payloads.
 
-For this adapter, a content miss now adds the common explicit
-`drain_for_unmap` before replacement, independent of deferred per-op eager sync;
-its fitting warm path adds no drain or upload. Cold preparation materializes
-an owned byte payload. Existing kernel-specific signature checks, dynamic
+For this adapter, content misses use native retirement for the prior owner;
+fitting warm reuse adds no drain or upload. Cold preparation materializes an
+owned byte payload and retains its synchronous H2D completion. Existing kernel-specific signature checks, dynamic
 control readbacks, identity/empty paths and launch-success publication remain
 in their callers. The artifact labels passed to staging are borrowed, avoiding
 new warm formatting. Host regressions pin table ABI and sentinel/signed-bit
 encoding; the Transpose device fixture additionally checks warm allocation/
-transfer/drain stability and mandatory drains for failed and successful rewarm,
+transfer/drain stability and no explicit drain for failed or successful rewarm,
 while retaining its old-graph replay after rewarm and kernel drop.
 
 ### Slice metadata shares one physical lifetime
@@ -1362,8 +1363,10 @@ Eager calls still read dynamic starts/ends/axes/steps; capture reuses the warmed
 fixed plan. Empty-output and scalar-copy paths remain unchanged. Warm eager
 calls therefore still incur control D2H and Host shape/plan construction; the
 metadata hit introduces no additional upload or retirement drain. A content
-miss uses one mandatory retirement drain rather than independently replacing
-two tables. This adds no quota protocol or new allocator.
+miss prepares one complete immutable replacement and retires prior ownership
+through the existing native queue. Its four dynamic control D2H completion
+barriers remain; there is no added metadata retirement drain, quota protocol or
+new allocator.
 
 Host regressions cover table order, signed encoding, aligned origins,
 initialized sentinels, complete-span refusal, rank mismatch and layout overflow.
@@ -1379,12 +1382,27 @@ actual driver memory use and latency/throughput remain unmeasured here.
 
 `SkipSimplifiedLayerNormalization` now delegates its two-table broadcast cache
 to `DeviceMetadataCache`, with input/skip shapes in one non-Clone typed key and
-the owner in the same immutable record. The outer warm rollback snapshot shares
-the Arc instead of copying shape vectors. Table encoding, allocation/upload
-checkpoint and BF16 caller-workspace pins remain separate kernel contracts.
-Preparation failures restore the old owner and revoke capture readiness; a
-successful launch keeps the replacement. Cold content replacement uses the
-common mandatory drain in place of the old trailing optional synchronization.
+the owner in the same immutable record. Each invocation briefly locks shared
+state to clone a candidate, sharing the Arc rather than copying shape vectors.
+Direct, native BF16 and BF16-through-F32 paths all consume that local candidate
+through the final output conversion. No shared metadata lock is held over
+encoding, upload, NVRTC resolution or kernel launches. Only successful complete
+consumption publishes the candidate with a short replace; the old value retires
+after unlocking. Failed calls never mutate published metadata and retain the
+old graph's owner, with readiness false from entry. The Drop rollback object,
+ignored failure drain and restore-under-lock path are removed.
+
+Branches return their capture eligibility as an ordinary result. The outer call
+publishes that eligibility only after metadata commit succeeds, so failed casts
+and poisoned publication cannot advertise ready state. Table encoding,
+allocation/upload checkpoint and actual BF16 workspace pins remain enforced.
+Host tests exercise reentrant candidate retirement outside the publication lock,
+including refusal with poisoned state. Device fixtures distinguish required
+H2D upload counters from explicit force/drain counters, and check no work on
+invalid input, failed replacement preservation, successful rewarm and old graph
+replay after kernel destruction. These fixtures are compiled/listed, not run on
+this CPU-only host. Synchronous H2D behavior is unchanged, and no latency or
+throughput improvement is claimed.
 
 The shared metadata hit path already queries the driver's capture status. It
 now uses a strict captured-owner check: an actual capture must have a registered
@@ -1601,7 +1619,9 @@ extra resource allocation or owner clone compared with the prior path.
 Host tests exercise exact owner matching and reentrant retirement outside the
 state lock, including candidate refusal and cleanup after poison. CUDA fixtures
 compile/list assertions for submission serialization, no retirement drain,
-retained old ownership and exact native settlement. Existing QMoE graph/window
+retained old ownership and exact native settlement. Their counter assertions
+track required synchronous H2D through `host_to_device` separately from
+`forced_synchronization_count`, which records explicit force/drain calls. Existing QMoE graph/window
 integration tests retain reset, accumulation and request-isolation coverage.
 These source/Host checks do not prove device ordering or throughput; the longer
 route-submission mutex interval still needs device validation.
