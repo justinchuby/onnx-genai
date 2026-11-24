@@ -1068,7 +1068,12 @@ impl Engine {
             .is_none()
             .then(|| native_speculation_plan(&options, &chain))
             .flatten();
-        let scheduler_session_id = self.next_native_session_id();
+        let retained = if options.cold_start {
+            None
+        } else {
+            Some(self.default_native_session()?)
+        };
+        let scheduler_session_id = retained.unwrap_or_else(|| self.next_native_session_id());
         let scheduled = self.admit_generate_request_with_scheduler(
             scheduler_session_id,
             prompt_tokens.len(),
@@ -1240,7 +1245,21 @@ impl Engine {
         );
         let result = match result {
             Ok(result) => {
+                if let Some(id) = retained {
+                    let stamp = self.touch_native_session();
+                    let state = self
+                        .native_sessions
+                        .get_mut(&id)
+                        .expect("admitted default cache remains until commit");
+                    state.tokens.clone_from(&prompt_tokens);
+                    state.tokens.extend_from_slice(&result.token_ids);
+                    state.last_access = stamp;
+                }
                 let _outcome = turn.commit()?;
+                if let Some(id) = retained {
+                    self.native_active_session = Some(id);
+                    self.evict_native_sessions(id);
+                }
                 if let Some(control) = control {
                     control.finish_commit();
                 }
@@ -1291,13 +1310,13 @@ impl Engine {
     }
 
     #[cfg(feature = "native-backend")]
-    fn next_native_session_id(&mut self) -> SessionId {
+    pub(super) fn next_native_session_id(&mut self) -> SessionId {
         self.native_session_ids.mint()
     }
 
     /// Stamp a session as most-recently-used and return the new stamp.
     #[cfg(feature = "native-backend")]
-    fn touch_native_session(&mut self) -> u64 {
+    pub(super) fn touch_native_session(&mut self) -> u64 {
         self.native_access_counter = self.native_access_counter.saturating_add(1);
         self.native_access_counter
     }
@@ -1369,7 +1388,7 @@ impl Engine {
     /// budget here would bound nothing. That belongs to the resource governor
     /// once native sessions hold leases on the central KV manager.
     #[cfg(feature = "native-backend")]
-    fn evict_native_sessions(&mut self, keep: SessionId) {
+    pub(super) fn evict_native_sessions(&mut self, keep: SessionId) {
         while self.native_max_sessions != 0 && self.native_sessions.len() > self.native_max_sessions
         {
             let Some(victim) = self
@@ -1392,7 +1411,7 @@ impl Engine {
     }
 
     #[cfg(feature = "native-backend")]
-    fn default_native_session(&mut self) -> anyhow::Result<SessionId> {
+    pub(super) fn default_native_session(&mut self) -> anyhow::Result<SessionId> {
         if let Some(id) = self.native_default_session
             && self.native_sessions.contains_key(&id)
         {
@@ -2168,6 +2187,7 @@ impl Engine {
                 || request.options.num_speculative_tokens.is_some()
                 || self.mtp.is_some();
             if request.options.cold_start || native_spec_requested {
+                let retain_cache = !request.options.cold_start;
                 let result = self.generate_native_cold_with_callback(
                     request,
                     tool_call_policy,
@@ -2175,7 +2195,9 @@ impl Engine {
                     admission_callback,
                     token_callback,
                 );
-                self.native_active_session = None;
+                if !retain_cache || result.is_err() {
+                    self.native_active_session = None;
+                }
                 return result;
             }
             let session_id = self.default_native_session()?;

@@ -12,7 +12,7 @@ fn load(path: &Path) -> anyhow::Result<Engine> {
         EngineConfig {
             decode_backend: EngineDecodeBackend::Native,
             native_device: Some(crate::NativeDecodeDevice::Cpu),
-            native_state_files: true,
+            native_state_files: crate::NativeStateFilePolicy::Required,
             ..EngineConfig::default()
         },
     )
@@ -317,14 +317,14 @@ fn state_file_enforces_limits_memory_admission_and_opt_in() -> anyhow::Result<()
             .write_native_session_state(session, &mut Vec::new(), Default::default())
             .unwrap_err()
             .to_string()
-            .contains("native_state_files=true")
+            .contains("native_state_files=Required")
     );
     assert!(
         disabled
             .restore_native_session_state(session, &mut file.as_slice(), Default::default())
             .unwrap_err()
             .to_string()
-            .contains("native_state_files=true")
+            .contains("native_state_files=Required")
     );
     Ok(())
 }
@@ -526,7 +526,7 @@ fn state_file_configuration_rejects_unsupported_execution_paths_at_load() -> any
         &path("tiny-native-engine"),
         EngineConfig {
             decode_backend: EngineDecodeBackend::Ort,
-            native_state_files: true,
+            native_state_files: crate::NativeStateFilePolicy::Required,
             ..Default::default()
         },
     )
@@ -539,7 +539,7 @@ fn state_file_configuration_rejects_unsupported_execution_paths_at_load() -> any
     let error = Engine::from_dir(
         &path("onnx_genai_workflows/reranking"),
         EngineConfig {
-            native_state_files: true,
+            native_state_files: crate::NativeStateFilePolicy::Required,
             ..Default::default()
         },
     )

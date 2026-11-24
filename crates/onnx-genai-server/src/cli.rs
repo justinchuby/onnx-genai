@@ -144,6 +144,24 @@ pub struct ServeArgs {
     #[arg(long, env = "ONNX_GENAI_ADMIN_ENDPOINTS")]
     pub enable_admin_endpoints: bool,
 
+    /// Directory for llama.cpp slot save/restore/erase actions.
+    #[arg(long, env = "NXRT_SLOT_SAVE_PATH")]
+    pub slot_save_path: Option<std::path::PathBuf>,
+    #[arg(
+        long,
+        env = "NXRT_SLOT_SAVE_MAX_FILE_BYTES",
+        default_value = "4294967296"
+    )]
+    pub slot_save_max_file_bytes: std::num::NonZeroU64,
+    #[arg(
+        long,
+        env = "NXRT_SLOT_SAVE_MAX_TOTAL_BYTES",
+        default_value = "17179869184"
+    )]
+    pub slot_save_max_total_bytes: std::num::NonZeroU64,
+    #[arg(long, env = "NXRT_SLOT_SAVE_MAX_FILES", default_value = "128")]
+    pub slot_save_max_files: std::num::NonZeroUsize,
+
     /// Maximum number of models kept loaded in memory at once. When exceeded, loading
     /// another model evicts the least-recently-used one (never below one model).
     /// Omit for unlimited. Falls back to ONNX_GENAI_MAX_LOADED_MODELS.
@@ -208,6 +226,10 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         max_batch: args.max_batch,
         enable_debug_endpoints: args.enable_debug_endpoints,
         enable_admin_endpoints: args.enable_admin_endpoints,
+        slot_save_path: args.slot_save_path.clone(),
+        slot_save_max_file_bytes: args.slot_save_max_file_bytes,
+        slot_save_max_total_bytes: args.slot_save_max_total_bytes,
+        slot_save_max_files: args.slot_save_max_files,
         max_loaded_models: args.max_loaded_models,
         eviction_policy: Default::default(),
         engine_config,
@@ -269,6 +291,38 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn slot_storage_flags_parse_positive_bounds_and_path() {
+        let args = TestCli::try_parse_from([
+            "test",
+            "model-dir",
+            "--slot-save-path",
+            "states",
+            "--slot-save-max-file-bytes",
+            "1024",
+            "--slot-save-max-total-bytes",
+            "4096",
+            "--slot-save-max-files",
+            "3",
+        ])
+        .unwrap();
+        let config = server_config_from_args(&args.serve);
+        assert_eq!(
+            config.slot_save_path.as_deref(),
+            Some(std::path::Path::new("states"))
+        );
+        assert_eq!(config.slot_save_max_file_bytes.get(), 1024);
+        assert_eq!(config.slot_save_max_total_bytes.get(), 4096);
+        assert_eq!(config.slot_save_max_files.get(), 3);
+        for flag in [
+            "--slot-save-max-file-bytes",
+            "--slot-save-max-total-bytes",
+            "--slot-save-max-files",
+        ] {
+            assert!(TestCli::try_parse_from(["test", "model-dir", flag, "0"]).is_err());
+        }
     }
 
     #[test]

@@ -40,6 +40,8 @@ mod replay;
 mod routes;
 pub mod runtime_args;
 mod session;
+mod slot_storage;
+mod slots;
 mod speech;
 mod sse;
 mod state;
@@ -142,6 +144,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/reranking", post(routes::ranking::rerank))
         .route("/embedding", post(routes::native::embeddings))
         .route("/embeddings", post(routes::native::embeddings))
+        .route("/slots", get(routes::slots::list))
+        .route("/slots/{id_slot}", post(routes::slots::action))
         .route("/tokenize", post(routes::llama::tokenize))
         .route("/detokenize", post(routes::llama::detokenize))
         .route("/apply-template", post(routes::llama::apply_template))

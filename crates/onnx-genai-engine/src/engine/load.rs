@@ -521,7 +521,7 @@ impl Engine {
         provider: Option<Arc<dyn MemoryAuthorityProvider>>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            !config.native_state_files,
+            config.native_state_files != crate::NativeStateFilePolicy::Required,
             "native_state_files requires a runtime-owned Native decoder; this package executes through interpreted workflow state, whose portable snapshot participant is not implemented"
         );
 
@@ -582,8 +582,9 @@ impl Engine {
             resolve_decode_backend(&model_directory.model_path, config.decode_backend)?
         };
         anyhow::ensure!(
-            !config.native_state_files || decode_backend == EngineDecodeBackend::Native,
-            "native_state_files=true requires backend=native; disable state files for the ORT reference/testing backend"
+            config.native_state_files != crate::NativeStateFilePolicy::Required
+                || decode_backend == EngineDecodeBackend::Native,
+            "native_state_files=Required requires backend=native; disable state files for the ORT reference/testing backend"
         );
         if decode_backend == EngineDecodeBackend::Native {
             #[cfg(feature = "native-backend")]
@@ -1218,21 +1219,24 @@ impl Engine {
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
         };
         let mut native_session = native_session;
-        if config.native_state_files {
+        if config.native_state_files != crate::NativeStateFilePolicy::Disabled {
             anyhow::ensure!(
-                native_session.supports_past_snapshots(),
+                config.native_state_files != crate::NativeStateFilePolicy::Required
+                    || native_session.supports_past_snapshots(),
                 "native_state_files requires host-owned decoder state; select a host-state executor or disable Native state files"
             );
-            native_session.state_identity = Some(
-                super::native_state_identity::identity(
-                    &model_directory,
-                    &metadata,
-                    &tokenizer,
-                    config.decode_precision,
-                    native_session.inference_session().graph(),
-                )
-                .context("resolve Native state file identity at model load")?,
-            );
+            if native_session.supports_past_snapshots() {
+                native_session.state_identity = Some(
+                    super::native_state_identity::identity(
+                        &model_directory,
+                        &metadata,
+                        &tokenizer,
+                        config.decode_precision,
+                        native_session.inference_session().graph(),
+                    )
+                    .context("resolve Native state file identity at model load")?,
+                );
+            }
         }
         // #1362: a prefill forward's activations scale with the tokens in it, so
         // an unchunked prompt makes peak device memory a function of prompt

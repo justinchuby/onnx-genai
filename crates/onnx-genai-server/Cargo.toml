@@ -63,6 +63,7 @@ native-backend = ["onnx-genai-engine/native-backend"]
 mlas = ["native-backend", "onnx-genai-engine/mlas"]
 
 [dependencies]
+cap-std = "4.0.3"
 onnx-runtime-memory-api = { workspace = true }
 onnx-genai = { path = "../onnx-genai", version = "=0.1.0-dev.6", default-features = false }
 onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.6", default-features = false }
@@ -84,6 +85,7 @@ regex = "1.12"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 tokio-stream = { workspace = true }
 getrandom = "0.3"
@@ -91,6 +93,9 @@ base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 image = { workspace = true, features = ["png"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.6", default-features = false, features = ["test-output-staging"] }

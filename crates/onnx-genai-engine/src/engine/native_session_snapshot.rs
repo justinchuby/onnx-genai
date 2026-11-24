@@ -14,11 +14,11 @@ use onnx_runtime_memory_governor::{MemoryGovernor, MemoryLease};
 /// consumes it and rejects a different engine instance or generation before
 /// touching the destination. Capture and rollback copies are memory-admitted.
 pub struct NativeSessionSnapshot {
-    origin: SessionForkOrigin,
-    source: SessionId,
-    tokens: Vec<TokenId>,
-    state: crate::native_decode::NativePastSnapshot,
-    _leases: Vec<MemoryLease>,
+    pub(super) origin: SessionForkOrigin,
+    pub(super) source: SessionId,
+    pub(super) tokens: Vec<TokenId>,
+    pub(super) state: crate::native_decode::NativePastSnapshot,
+    pub(super) _leases: Vec<MemoryLease>,
 }
 
 /// Logical history and executable cursor are independent in a saved file.
@@ -28,6 +28,12 @@ pub struct NativeStateFileSummary {
     pub materialized_tokens: usize,
     pub bytes: u64,
 }
+
+/// A file was rejected before live decoder state publication. Resource errors
+/// remain in the source chain so transports can distinguish overload from bad input.
+#[derive(Debug, thiserror::Error)]
+#[error("Native state file was rejected before publication: {0}")]
+pub struct NativeStateFileReadError(String);
 
 impl std::fmt::Debug for NativeSessionSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -135,6 +141,27 @@ impl Engine {
         require_healthy(target, logical)?;
         let next_generation = logical.generation.checked_add(1)
             .with_context(|| format!("cannot restore native session {target}: logical generation exhausted; close it and create a new session"))?;
+        self.install_native_physical_state(target, snapshot.state)?;
+        let stamp = self.native_access_counter.saturating_add(1);
+        let logical = self
+            .native_sessions
+            .get_mut(&target)
+            .expect("exclusive restore admission retains destination");
+        logical.tokens = snapshot.tokens;
+        logical.generation = next_generation;
+        logical.last_access = stamp;
+        self.native_access_counter = stamp;
+        self.native_active_session = Some(target);
+        // Host-only admission makes bind infallible: there is no device owner
+        // registry to update. The public owner is committed only after writes.
+        Ok(())
+    }
+
+    pub(super) fn install_native_physical_state(
+        &mut self,
+        target: SessionId,
+        state: crate::native_decode::NativePastSnapshot,
+    ) -> anyhow::Result<()> {
         let native = self.native_session.as_mut().context(
             "cannot restore native session: native decoder is unavailable; reload the model",
         )?;
@@ -159,7 +186,7 @@ impl Engine {
                 lease,
             ))
         };
-        if let Err(error) = native.restore_owned_past_snapshot(snapshot.state) {
+        if let Err(error) = native.restore_owned_past_snapshot(state) {
             let rollback = match undo {
                 Some((state, _lease)) => native.restore_owned_past_snapshot(state),
                 None => native.reset(),
@@ -181,24 +208,12 @@ impl Engine {
             }
             return Err(error.context(format!("restore native session {target}; previous state was restored; retry with a fresh capture")));
         }
-        let stamp = self.native_access_counter.saturating_add(1);
-        let logical = self
-            .native_sessions
-            .get_mut(&target)
-            .expect("exclusive restore admission retains destination");
-        logical.tokens = snapshot.tokens;
-        logical.generation = next_generation;
-        logical.last_access = stamp;
-        self.native_access_counter = stamp;
-        self.native_active_session = Some(target);
-        // Host-only admission makes bind infallible: there is no device owner
-        // registry to update. The public owner is committed only after writes.
         Ok(())
     }
 
     /// Write a bounded, checksummed Native state file. The writer must be
     /// staged/atomically published by the transport; an I/O error can leave a
-    /// partial output. Load with `native_state_files=true` to enable identity.
+    /// partial output. Load with `native_state_files=Required` to enable identity.
     pub fn write_native_session_state(
         &mut self,
         session: SessionId,
@@ -211,7 +226,7 @@ impl Engine {
             .as_ref()
             .and_then(|s| s.state_identity)
             .context(
-                "Native state files are disabled; reload with EngineConfig.native_state_files=true",
+                "Native state files are disabled; reload with EngineConfig.native_state_files=Required",
             )?;
         if let Some(context) = self.effective_max_context(&GenerateOptions::default()) {
             limits.max_tokens = limits.max_tokens.min(context);
@@ -238,27 +253,13 @@ impl Engine {
         &mut self,
         target: SessionId,
         reader: &mut impl std::io::Read,
-        mut limits: crate::native_decode::NativeStateFileLimits,
+        limits: crate::native_decode::NativeStateFileLimits,
     ) -> anyhow::Result<NativeStateFileSummary> {
         self.require_native_snapshot_backend()?;
         let logical = self.native_sessions.get(&target)
             .with_context(|| format!("cannot read state for native session {target}: destination not found; create it first"))?;
         require_healthy(target, logical)?;
-        if let Some(context) = self.effective_max_context(&GenerateOptions::default()) {
-            limits.max_tokens = limits.max_tokens.min(context);
-        }
-        let native = self
-            .native_session
-            .as_ref()
-            .context("Native decoder is unavailable; reload the model")?;
-        let decoded = native.read_state_file(reader, limits, self.governor.memory())?;
-        let tokenizer = self.require_tokenizer()?;
-        for (index, token) in decoded.tokens.iter().enumerate() {
-            anyhow::ensure!(
-                tokenizer.inner().id_to_token(*token).is_some(),
-                "Native state token[{index}]={token} is absent from the package vocabulary; restore a file from the original tokenizer"
-            );
-        }
+        let decoded = self.read_native_file(reader, limits)?;
         let report = NativeStateFileSummary {
             logical_tokens: decoded.tokens.len(),
             materialized_tokens: decoded.state.len(),
@@ -277,7 +278,32 @@ impl Engine {
         Ok(report)
     }
 
-    fn require_native_snapshot_backend(&self) -> anyhow::Result<()> {
+    pub(super) fn read_native_file(
+        &self,
+        reader: &mut impl std::io::Read,
+        mut limits: crate::native_decode::NativeStateFileLimits,
+    ) -> anyhow::Result<crate::native_decode::DecodedState> {
+        (|| -> anyhow::Result<_> {
+        if let Some(context) = self.effective_max_context(&GenerateOptions::default()) {
+            limits.max_tokens = limits.max_tokens.min(context);
+        }
+        let native = self
+            .native_session
+            .as_ref()
+            .context("Native decoder is unavailable; reload the model")?;
+        let decoded = native.read_state_file(reader, limits, self.governor.memory())?;
+        let tokenizer = self.require_tokenizer()?;
+        for (index, token) in decoded.tokens.iter().enumerate() {
+            anyhow::ensure!(
+                tokenizer.inner().id_to_token(*token).is_some(),
+                "Native state token[{index}]={token} is absent from the package vocabulary; restore a file from the original tokenizer"
+            );
+        }
+        Ok(decoded)
+        })().map_err(|error| { let reason = error.to_string(); error.context(NativeStateFileReadError(reason)) })
+    }
+
+    pub(super) fn require_native_snapshot_backend(&self) -> anyhow::Result<()> {
         self.require_workflow_execution_admitted()?;
         anyhow::ensure!(
             self.holds_decode_core() && self.decode_backend == EngineDecodeBackend::Native,
@@ -297,7 +323,7 @@ fn require_healthy(session: SessionId, state: &NativeSessionState) -> anyhow::Re
     Ok(())
 }
 
-fn reserve(governor: &dyn MemoryGovernor, bytes: u64) -> anyhow::Result<MemoryLease> {
+pub(super) fn reserve(governor: &dyn MemoryGovernor, bytes: u64) -> anyhow::Result<MemoryLease> {
     MemoryGovernor::reserve(
         governor,
         Tier::Host,

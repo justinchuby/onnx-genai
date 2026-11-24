@@ -38,6 +38,7 @@ pub(crate) struct EngineDriver {
     /// The worker threads that own the engine. Exactly one today; every command
     /// names the worker it must reach rather than assuming there is only one.
     pub(crate) workers: WorkerPool,
+    pub(crate) native_slot: Option<Arc<crate::slots::NativeSlot>>,
     /// Which model this engine was loaded as, bound once by
     /// [`ModelHandle::new`](crate::registry::ModelHandle::new).
     ///
@@ -124,6 +125,11 @@ impl BatchingReport {
 }
 
 pub(crate) enum DriverCommand {
+    Slot {
+        operation: crate::slots::SlotOperation,
+        response: oneshot::Sender<anyhow::Result<serde_json::Value>>,
+        _permit: OwnedSemaphorePermit,
+    },
     CreateSession {
         reservation: SessionPlacementReservation,
         acknowledgement: std::sync::mpsc::Receiver<()>,
@@ -411,6 +417,7 @@ struct MicrobatchAdmission<'a> {
 /// `DropProbe` is `()` in production. Tests use the final field to observe that
 /// the preceding `Engine` has already been dropped on the worker thread.
 struct EngineWorkerState<DropProbe> {
+    native_slot: Option<Arc<crate::slots::NativeSlot>>,
     engine: Engine,
     commands: Option<mpsc::Receiver<DriverCommand>>,
     continuous_batch_supported: bool,
@@ -424,6 +431,7 @@ struct EngineWorkerState<DropProbe> {
 }
 
 struct EngineWorkerReady {
+    native_slot: Option<Arc<crate::slots::NativeSlot>>,
     batching: Arc<BatchingReport>,
     kv_telemetry: Arc<KvTelemetry>,
     resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
@@ -466,7 +474,14 @@ fn prepare_engine_worker<DropProbe>(
     };
     let resource_snapshot = Arc::new(Mutex::new(Some(engine.resource_snapshot())));
     let runtime_sampling = engine.supports_runtime_sampling();
+    #[cfg(feature = "native-backend")]
+    let native_slot = (worker_count == 1)
+        .then(|| crate::slots::NativeSlot::from_engine(&engine))
+        .flatten();
+    #[cfg(not(feature = "native-backend"))]
+    let native_slot = None;
     let ready = EngineWorkerReady {
+        native_slot: native_slot.clone(),
         batching,
         kv_telemetry,
         resource_snapshot: Arc::clone(&resource_snapshot),
@@ -478,6 +493,7 @@ fn prepare_engine_worker<DropProbe>(
     };
     Ok((
         EngineWorkerState {
+            native_slot,
             engine,
             commands: Some(rx),
             continuous_batch_supported,
@@ -703,6 +719,7 @@ impl EngineDriver {
                 // knows the id this engine was loaded as.
                 model: ModelKey::new(""),
                 workers,
+                native_slot: first_ready.native_slot,
                 generation_capacity,
                 generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
                 kv_telemetry: Arc::clone(&first_ready.kv_telemetry),
@@ -1401,7 +1418,12 @@ fn run_engine_driver<DropProbe>(mut worker: EngineWorkerState<DropProbe>) {
             effective_max_batch = 1,
             "continuous batch driver disabled; using per-request engine path (single-sequence decode)"
         );
-        run_fallback_engine_driver(&mut worker.engine, commands, &worker.resource_snapshot);
+        run_fallback_engine_driver(
+            &mut worker.engine,
+            commands,
+            &worker.resource_snapshot,
+            worker.native_slot.as_ref(),
+        );
     }
 }
 
@@ -1409,9 +1431,14 @@ fn run_fallback_engine_driver(
     engine: &mut Engine,
     mut rx: mpsc::Receiver<DriverCommand>,
     resource_snapshot: &Mutex<Option<GovernorSnapshot>>,
+    slot: Option<&Arc<crate::slots::NativeSlot>>,
 ) {
     while let Some(command) = rx.blocking_recv() {
+        let _slot_execution = slot.map(crate::slots::NativeSlot::begin);
         handle_driver_command(engine, command);
+        if let Some(slot) = slot {
+            slot.finish(engine);
+        }
         refresh_resource_snapshot(resource_snapshot, engine);
     }
 }
@@ -2106,6 +2133,15 @@ fn route_continuous_events(
 
 fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
     match command {
+        DriverCommand::Slot {
+            operation,
+            response,
+            _permit,
+        } => {
+            if !response.is_closed() {
+                let _ = response.send(operation.run(engine));
+            }
+        }
         DriverCommand::CreateSession {
             reservation,
             acknowledgement,
@@ -3239,6 +3275,7 @@ mod admission_tests {
             .try_send(DriverCommand::ResourceSnapshot(reply))
             .expect("fill command queue");
         let driver = EngineDriver {
+            native_slot: None,
             reranking: None,
             runtime_sampling: false,
             workflow_facts: crate::driver::WorkflowFacts {
@@ -3597,6 +3634,7 @@ mod admission_tests {
     async fn a_session_on_an_unknown_worker_is_refused() {
         let (commands, _rx) = mpsc::channel(1);
         let driver = EngineDriver {
+            native_slot: None,
             reranking: None,
             runtime_sampling: false,
             workflow_facts: WorkflowFacts {
@@ -3651,6 +3689,7 @@ mod admission_tests {
     async fn a_turn_that_never_reaches_a_worker_releases_its_lease() {
         let (commands, rx) = mpsc::channel(1);
         let driver = EngineDriver {
+            native_slot: None,
             reranking: None,
             runtime_sampling: false,
             workflow_facts: WorkflowFacts {

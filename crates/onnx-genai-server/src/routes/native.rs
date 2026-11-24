@@ -320,6 +320,7 @@ fn prepare(
     request: NativeRequest,
     handle: Arc<ModelHandle>,
 ) -> Result<PreparedNative, ApiError> {
+    super::llama::validate_slot_selection(&request.sampling, &handle)?;
     let tokens = match &request.prompt {
         MixedPrompt::Text(text) if request.suffix.is_some() => {
             let fim = handle.fim_config.as_ref().ok_or_else(|| {
