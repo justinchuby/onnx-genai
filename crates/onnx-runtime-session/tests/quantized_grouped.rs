@@ -274,7 +274,7 @@ fn verify(build: impl Fn(Graph) -> InferenceSession) {
                 .graph()
                 .nodes
                 .values()
-                .any(|n| n.op_type == quantized_grouped::OP)
+                .any(|n| n.op_type == "AffineQuantizedGroupedMatMul")
         );
         assert!(!fused.graph().nodes.values().any(|n| {
             matches!(

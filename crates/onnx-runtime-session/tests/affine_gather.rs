@@ -37,7 +37,7 @@ fn verify(mut fused: InferenceSession, mut reference: InferenceSession) {
             .filter(|n| n.op_type == name)
             .count()
     };
-    assert_eq!(ops(&fused, affine_gather::OP), 1);
+    assert_eq!(ops(&fused, "AffineQuantizedGather"), 1);
     assert_eq!(ops(&fused, "DequantizeLinear"), 0);
     assert_eq!(ops(&reference, affine_gather::OP), 0);
     assert_eq!(ops(&reference, "DequantizeLinear"), 1);

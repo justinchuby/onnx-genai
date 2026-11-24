@@ -83,8 +83,8 @@ impl Kernel for PackedKernel {
     }
 }
 
-fn decoder(format: Format) -> fn(&[u8], &mut [f32]) {
-    match format {
+pub(super) fn legacy_block_format(format: Format) -> Option<BlockFormat> {
+    Some(match format {
         Format::Iq4Nl => BlockFormat::Iq4Nl,
         Format::Iq4Xs => BlockFormat::Iq4Xs,
         Format::Iq2Xxs => BlockFormat::Iq2Xxs,
@@ -99,21 +99,30 @@ fn decoder(format: Format) -> fn(&[u8], &mut [f32]) {
         Format::Q5K => BlockFormat::Q5K,
         Format::Q6K => BlockFormat::Q6K,
         Format::Q8_0 => BlockFormat::Q8_0,
-        Format::Q1_0 => return decode_lanes::<41>,
-        Format::Q2_0 => return decode_lanes::<42>,
-        Format::Q4_0 => return decode_lanes::<2>,
-        Format::Q4_1 => return decode_lanes::<3>,
-        Format::Q5_0 => return decode_lanes::<6>,
-        Format::Q5_1 => return decode_lanes::<7>,
-        Format::Q8_1 => return decode_lanes::<9>,
-        Format::Q4K => return decode_lanes::<12>,
-        Format::Q8K => return decode_lanes::<15>,
-        Format::Tq1_0 => return decode_lanes::<34>,
-        Format::Tq2_0 => return decode_lanes::<35>,
-        Format::Mxfp4 => return decode_lanes::<39>,
-        Format::Nvfp4 => return decode_lanes::<40>,
+        _ => return None,
+    })
+}
+
+pub(super) fn decoder(format: Format) -> fn(&[u8], &mut [f32]) {
+    if let Some(legacy) = legacy_block_format(format) {
+        return legacy.scalar_decoder();
     }
-    .scalar_decoder()
+    match format {
+        Format::Q1_0 => decode_lanes::<41>,
+        Format::Q2_0 => decode_lanes::<42>,
+        Format::Q4_0 => decode_lanes::<2>,
+        Format::Q4_1 => decode_lanes::<3>,
+        Format::Q5_0 => decode_lanes::<6>,
+        Format::Q5_1 => decode_lanes::<7>,
+        Format::Q8_1 => decode_lanes::<9>,
+        Format::Q4K => decode_lanes::<12>,
+        Format::Q8K => decode_lanes::<15>,
+        Format::Tq1_0 => decode_lanes::<34>,
+        Format::Tq2_0 => decode_lanes::<35>,
+        Format::Mxfp4 => decode_lanes::<39>,
+        Format::Nvfp4 => decode_lanes::<40>,
+        _ => unreachable!("legacy block format was resolved above"),
+    }
 }
 
 fn fp16(data: &[u8], offset: usize) -> f32 {
