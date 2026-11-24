@@ -967,25 +967,43 @@ its temporary column-major buffer and transposes only after successful work.
 Later decoder/dispatch errors may modify staging, so staging is not permission
 to publish a partial tensor.
 
-QMoE's owned expert driver and the block-format test oracle allocate their
-existing result staging at the ownership edge. MatMulNBits deliberately retains
-independent staging and copies into its possibly direct Float32 tensor output
-only after success; this change does not weaken its failure protection. Decoder
-state, bounded tile allocation, scheduling, K reduction and bias order remain.
+QMoE streams projections directly into its expert banks; the block-format
+owned test oracle allocates its reference staging at the ownership edge.
+MatMulNBits deliberately retains independent staging and copies into its
+possibly direct Float32 tensor output only after success. Decoder state,
+bounded tile allocation, scheduling, K reduction and bias order remain.
 No old returned-Vec alias or public EP interface is retained/added.
 
-This is the output-storage prerequisite for moving QMoE FC results into the
-shared expert banks. Its current governed workspace still covers grouped input
-only; FC/output and dynamic decoded-column/row storage remain separate until
-their actual callers migrate. No memory saving, quota change or inference
-performance result follows from this interface change alone.
+### CPU integer QMoE projection banks
 
-The QMoE bank follow-up must derive inter from FC2's packed input axis times
-8/bits, as execution does, and share that checked geometry between metadata
-preparation and dispatch. Single-row inference needs FC banks despite needing
-no gather. A zero hidden width must retain its existing validation/lifecycle
-until an independently justified empty-output rule replaces it. Prefetch keeps
-owned weights; only the main compute thread may borrow the FC lane.
+Integer QMoE reuses the same private two-bank driver as float MoE and
+BlockQuantizedMoE. One StepScoped lane covers grouped input, FC1/optional FC3,
+activation and expert output, reused serially across expert groups. Nongated
+banks are R*H and R*I f32 values; gated banks are R*max(H,I) and
+R*max(FC1+separate_FC3,H), for total input rows R. There is no expert-count or
+top-k multiplier. A singleton still borrows its contiguous original input row,
+but now declares the capacity for its FC intermediates.
+
+Preparation and execution share checked geometry: inter is FC2's packed input
+axis times 8/bits, never inferred backward from FC1. FC2 metadata is therefore
+required during preparation. Zero rows have zero banks; zero hidden retains
+input/weight/routing validation and can still need nonempty FC1 storage.
+The prefetch worker owns weights independently; only the main compute thread
+borrows the lane. Weight request/read/join order and final contribution
+accumulation/publication order remain unchanged.
+
+This accounts retained FC capacity previously allocated as per-expert Vecs;
+it does not establish RSS savings or a process-memory cap. Contributions,
+final output accumulator, tensor widening, decoded-row and column-major decode
+staging remain outside this lane. Transient/retained weight grants retain
+their existing authority. Warm workspace checkout/return does not call its
+issuer; this is distinct from unchanged positive transient weight admissions.
+
+The [public-session study](../benchmarks/qmoe-fc-projection-banks/README.md)
+retains144 terminal-process CPU receipts, complete outputs and actual path
+traces, plus setup/doubled-work/A/A controls. All six aggregate cells qualify;
+small single-row CPU costs are not excluded. This is not CUDA, mmap-prefetch
+performance or full-model throughput evidence.
 
 ### CPU float MoE projection banks
 
