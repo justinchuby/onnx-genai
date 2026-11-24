@@ -107,6 +107,7 @@ fn check_projection<const K: usize, const N: usize>(device: DevicePreference, cu
             ..Default::default()
         };
         let bench = std::env::var_os("NXRT_TEST_FLOAT6_TIMING").is_some();
+        let mut timing_sessions = Vec::new();
         for arm in 0..if bench { 3 } else { 2 } {
             let mut model = model.clone();
             match arm {
@@ -271,28 +272,39 @@ fn check_projection<const K: usize, const N: usize>(device: DevicePreference, cu
                 assert!(session.reset_device_graph().unwrap());
             }
             if bench && arm != 1 {
-                let activation_peak = session.activation_memory_plan_stats().map(|s| s.peak_bytes);
-                let warmup = std::time::Instant::now();
-                while warmup.elapsed() < std::time::Duration::from_secs(if cuda { 1 } else { 8 }) {
-                    std::hint::black_box(session.run(&[("X", &x)]).unwrap());
-                }
-                let mut wall_us = [0.0; 5];
-                for time in &mut wall_us {
-                    // This includes submission and completed transfers, not just kernel time.
-                    let start = std::time::Instant::now();
-                    for _ in 0..100 {
-                        std::hint::black_box(session.run(&[("X", &x)]).unwrap());
-                    }
-                    *time = start.elapsed().as_secs_f64() * 1e4;
-                }
-                wall_us.sort_by(f64::total_cmp);
-                let storage = if arm == 0 { len } else { K * N * 4 };
-                eprintln!(
-                    "{kind} {device:?} K={K} N={N} weight_bytes={storage} activation_plan_peak={activation_peak:?} arm={arm} synchronized_session_us={wall_us:.1?}"
-                );
+                timing_sessions.push((session, x));
             }
-            drop(session);
         }
+        if bench {
+            assert_eq!(timing_sessions.len(), 2);
+            let mut measure = |arm: usize| {
+                let (session, x) = &mut timing_sessions[arm];
+                // This includes submission and completed transfers, not just kernel time.
+                let start = std::time::Instant::now();
+                for _ in 0..100 {
+                    std::hint::black_box(session.run(&[("X", x)]).unwrap());
+                }
+                start.elapsed().as_secs_f64() * 1e4
+            };
+            let warmup = std::time::Instant::now();
+            while warmup.elapsed() < std::time::Duration::from_secs(if cuda { 1 } else { 8 }) {
+                measure(0);
+                measure(1);
+            }
+            let samples: [_; 6] = std::array::from_fn(|pair| {
+                if pair.is_multiple_of(2) {
+                    (measure(0), measure(1))
+                } else {
+                    let expanded = measure(1);
+                    (measure(0), expanded)
+                }
+            });
+            eprintln!(
+                "{kind} {device:?} K={K} N={N} (packed,expanded) weight_bytes=({len},{}) synchronized_session_us={samples:.1?}",
+                K * N * 4
+            );
+        }
+        drop(timing_sessions);
         std::fs::remove_file(path).unwrap();
     }
 }
