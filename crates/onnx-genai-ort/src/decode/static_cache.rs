@@ -341,7 +341,7 @@ impl<'a> StaticCacheDecodeSession<'a> {
                         })?
                     }
                 };
-                borrowed_outputs.push(output_value.raw_ptr_addr());
+                borrowed_outputs.push(output_value.raw_ptr_addr()?);
                 self.binding.bind_output(output, output_value)?;
             } else {
                 self.binding
@@ -372,7 +372,7 @@ impl<'a> StaticCacheDecodeSession<'a> {
                 std::iter::once(buffer.current.raw_ptr_addr())
                     .chain(buffer.alternate.as_ref().map(|value| value.raw_ptr_addr()))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let outputs = self.binding.output_values_or_borrowed(&borrowed_outputs)?;
         for (name, value) in self.session.output_names().iter().zip(outputs) {
             if name == &self.logits_output {
@@ -984,7 +984,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
                 .find(|binding| binding.output_name == *output)
             {
                 let output_value = binding.output.as_ref().unwrap_or(&binding.input);
-                borrowed_outputs.push(output_value.raw_ptr_addr());
+                borrowed_outputs.push(output_value.raw_ptr_addr()?);
                 self.binding.bind_output(output, output_value)?;
             } else {
                 self.binding
@@ -1141,7 +1141,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
                         })?
                     }
                 };
-                borrowed_outputs.push(output_value.raw_ptr_addr());
+                borrowed_outputs.push(output_value.raw_ptr_addr()?);
                 self.binding.bind_output(output, output_value)?;
             } else {
                 self.binding
@@ -1172,7 +1172,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
                 std::iter::once(buffer.current.raw_ptr_addr())
                     .chain(buffer.alternate.as_ref().map(|value| value.raw_ptr_addr()))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let outputs = self.binding.output_values_or_borrowed(&borrowed_outputs)?;
         for (name, value) in self.session.output_names().iter().zip(outputs) {
             if name == &self.logits_output {

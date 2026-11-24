@@ -781,8 +781,10 @@ impl Session {
             .collect::<Result<_>>()?;
         let input_name_ptrs: Vec<*const std::ffi::c_char> =
             input_names.iter().map(|name| name.as_ptr()).collect();
-        let input_value_ptrs: Vec<*const onnx_genai_ort_sys::OrtValue> =
-            inputs.iter().map(|(_, value)| value.as_ptr()).collect();
+        let input_value_ptrs: Vec<*const onnx_genai_ort_sys::OrtValue> = inputs
+            .iter()
+            .map(|(_, value)| value.as_ptr())
+            .collect::<Result<_>>()?;
 
         let output_names: Vec<CString> = self
             .output_names

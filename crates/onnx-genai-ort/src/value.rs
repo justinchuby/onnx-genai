@@ -1,8 +1,8 @@
-//! ORT Values (tensors).
+//! Owned workflow tensors and explicit ORT reference views.
 
 use std::borrow::Cow;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::{MemoryInfo, OrtError, Result};
 
@@ -103,10 +103,37 @@ impl DataType {
     }
 }
 
+/// Own a fixed-size allocation and retain the mutable pointer obtained at
+/// construction. Deref exposes slices, so no caller can reallocate the buffer.
+struct OwnedBuffer<T> {
+    data: Vec<T>,
+    pointer: *mut T,
+}
+impl<T> OwnedBuffer<T> {
+    fn new(mut data: Vec<T>) -> Self {
+        let pointer = data.as_mut_ptr();
+        Self { data, pointer }
+    }
+    fn raw_ptr(&self) -> *mut T {
+        self.pointer
+    }
+}
+impl<T> std::ops::Deref for OwnedBuffer<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.data
+    }
+}
+impl<T> std::ops::DerefMut for OwnedBuffer<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.data
+    }
+}
+
 enum TensorBacking {
-    F32(Vec<f32>),
-    F16(Vec<u16>),
-    I64(Vec<i64>),
+    F32(OwnedBuffer<f32>),
+    F16(OwnedBuffer<u16>),
+    I64(OwnedBuffer<i64>),
     /// Raw little-endian element bytes for a tensor of arbitrary dtype (used by
     /// the backend-neutral component-session seam, which carries host tensors as
     /// opaque bytes).
@@ -135,6 +162,8 @@ enum TensorBacking {
     /// address on the CPU is a wild access, not an error, so the accessors
     /// consult this rather than trying and faulting.
     External {
+        data: NonNull<std::ffi::c_void>,
+        placement: crate::allocator::MemoryDescriptor,
         host_accessible: bool,
         /// Optional shared owner kept alive for as long as this `Value` **or any
         /// alias derived from it**: dropping the last sharer drops this after the
@@ -146,7 +175,7 @@ enum TensorBacking {
         /// the caller owns the memory elsewhere (a pure borrow).
         owner: Option<Arc<dyn core::any::Any + Send + Sync>>,
     },
-    None,
+    Ort(OrtValueHandle),
 }
 
 /// Owned tensor bytes whose data pointer is aligned for **every** [`DataType`].
@@ -167,15 +196,15 @@ enum TensorBacking {
 /// for any dtype the tensor can carry.
 enum ElementBytes {
     /// The caller's `Vec<u8>`, kept because it is already suitably aligned.
-    Borrowed(Vec<u8>),
+    Borrowed(OwnedBuffer<u8>),
     /// Re-homed bytes: `words` holds `len` meaningful bytes plus tail padding.
-    Realigned { words: Vec<u64>, len: usize },
+    Realigned { words: OwnedBuffer<u64>, len: usize },
 }
 
 impl ElementBytes {
     fn new(data: Vec<u8>) -> Self {
         if !data.is_empty() && (data.as_ptr() as usize).is_multiple_of(MAX_ELEMENT_ALIGN) {
-            return Self::Borrowed(data);
+            return Self::Borrowed(OwnedBuffer::new(data));
         }
         let len = data.len();
         // `max(1)` keeps this a real allocation even for an empty tensor, so the
@@ -188,7 +217,10 @@ impl ElementBytes {
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), words.as_mut_ptr().cast::<u8>(), len);
         }
-        Self::Realigned { words, len }
+        Self::Realigned {
+            words: OwnedBuffer::new(words),
+            len,
+        }
     }
 
     fn len(&self) -> usize {
@@ -199,10 +231,10 @@ impl ElementBytes {
     }
 
     /// Pointer to the first byte, aligned to [`MAX_ELEMENT_ALIGN`].
-    fn as_mut_ptr(&mut self) -> *mut u8 {
+    fn as_ptr(&self) -> *mut u8 {
         let ptr = match self {
-            Self::Borrowed(data) => data.as_mut_ptr(),
-            Self::Realigned { words, .. } => words.as_mut_ptr().cast::<u8>(),
+            Self::Borrowed(data) => data.raw_ptr(),
+            Self::Realigned { words, .. } => words.raw_ptr().cast::<u8>(),
         };
         debug_assert!(
             (ptr as usize).is_multiple_of(MAX_ELEMENT_ALIGN),
@@ -212,21 +244,56 @@ impl ElementBytes {
     }
 }
 
-/// An ORT tensor value.
+/// Tensor storage with an explicitly materialized ORT reference view.
+/// The view drops before backing storage, preserving all external/alias owners.
 pub struct Value {
-    ptr: NonNull<onnx_genai_ort_sys::OrtValue>,
+    ort_view: Mutex<Option<OrtValueHandle>>,
     shape: Vec<i64>,
     dtype: DataType,
     backing: TensorBacking,
 }
 
+struct OrtValueHandle {
+    ptr: NonNull<onnx_genai_ort_sys::OrtValue>,
+    api: &'static onnx_genai_ort_sys::OrtApi,
+}
+impl OrtValueHandle {
+    fn new(ptr: NonNull<onnx_genai_ort_sys::OrtValue>) -> Result<Self> {
+        let api = crate::error::api()?;
+        api.ReleaseValue
+            .ok_or(OrtError::ApiUnavailable("ReleaseValue"))?;
+        Ok(Self { ptr, api })
+    }
+}
+impl Drop for OrtValueHandle {
+    fn drop(&mut self) {
+        // SAFETY: this owner holds one successful ORT allocation and its matching
+        // release callback. Native-only values never construct this owner.
+        if let Some(release) = self.api.ReleaseValue {
+            unsafe { release(self.ptr.as_ptr()) };
+        }
+    }
+}
+
 impl Value {
     /// Create a tensor value with given shape and type.
     ///
-    /// Memory is allocated with the default CPU allocator. Use
+    /// Owns zero-initialized CPU storage without opening a runtime. Use
     /// [`Value::empty_in`] to allocate on a specific (device) allocator.
     pub fn empty(shape: &[i64], dtype: DataType) -> Result<Self> {
-        Self::empty_in(shape, dtype, &crate::Allocator::default_cpu()?)
+        let numel = validate_shape(shape, None)?;
+        let bytes = numel.checked_mul(dtype.size_of()).ok_or_else(|| OrtError::InvalidArgument(format!("tensor byte size overflows for shape {shape:?} at {dtype:?}; use a smaller allocation")))?;
+        match dtype {
+            DataType::Float32 => Self::from_vec_f32(host_zeros(numel, 0., shape, dtype)?, shape),
+            DataType::Float16 => {
+                Self::from_vec_f16_bits(host_zeros(numel, 0, shape, dtype)?, shape)
+            }
+            DataType::BFloat16 => {
+                Self::from_vec_bf16_bits(host_zeros(numel, 0, shape, dtype)?, shape)
+            }
+            DataType::Int64 => Self::from_vec_i64(host_zeros(numel, 0, shape, dtype)?, shape),
+            _ => Self::from_raw_bytes(host_zeros(bytes, 0, shape, dtype)?, shape, dtype),
+        }
     }
 
     /// Create an uninitialized tensor value on the memory owned by `allocator`.
@@ -262,10 +329,12 @@ impl Value {
             )
         })?;
         Ok(Self {
-            ptr: NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
+            ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype,
-            backing: TensorBacking::None,
+            backing: TensorBacking::Ort(OrtValueHandle::new(
+                NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
+            )?),
         })
     }
 
@@ -386,12 +455,14 @@ impl Value {
             )));
         }
         let host_accessible = memory_info.is_host_accessible();
-        let ptr = create_tensor_with_data_in(data, bytes, shape, dtype, memory_info)?;
+
         Ok(Self {
-            ptr,
+            ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype,
             backing: TensorBacking::External {
+                data: NonNull::new(data).ok_or(OrtError::NullPointer)?,
+                placement: memory_info.descriptor(),
                 host_accessible,
                 owner: None,
             },
@@ -468,70 +539,46 @@ impl Value {
     }
 
     /// Create a CPU tensor from owned f32 data.
-    pub fn from_vec_f32(mut data: Vec<f32>, shape: &[i64]) -> Result<Self> {
+    pub fn from_vec_f32(data: Vec<f32>, shape: &[i64]) -> Result<Self> {
         validate_shape(shape, Some(data.len()))?;
-        let ptr = create_tensor_with_data(
-            data.as_mut_ptr().cast(),
-            data.len() * std::mem::size_of::<f32>(),
-            shape,
-            DataType::Float32,
-        )?;
         Ok(Self {
-            ptr,
+            ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype: DataType::Float32,
-            backing: TensorBacking::F32(data),
+            backing: TensorBacking::F32(OwnedBuffer::new(data)),
         })
     }
 
     /// Create a CPU Float16 tensor from owned IEEE-754 half-precision bit patterns.
-    pub fn from_vec_f16_bits(mut data: Vec<u16>, shape: &[i64]) -> Result<Self> {
+    pub fn from_vec_f16_bits(data: Vec<u16>, shape: &[i64]) -> Result<Self> {
         validate_shape(shape, Some(data.len()))?;
-        let ptr = create_tensor_with_data(
-            data.as_mut_ptr().cast(),
-            data.len() * std::mem::size_of::<u16>(),
-            shape,
-            DataType::Float16,
-        )?;
         Ok(Self {
-            ptr,
+            ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype: DataType::Float16,
-            backing: TensorBacking::F16(data),
+            backing: TensorBacking::F16(OwnedBuffer::new(data)),
         })
     }
 
     /// Create a CPU BFloat16 tensor from owned bfloat16 bit patterns.
-    pub fn from_vec_bf16_bits(mut data: Vec<u16>, shape: &[i64]) -> Result<Self> {
+    pub fn from_vec_bf16_bits(data: Vec<u16>, shape: &[i64]) -> Result<Self> {
         validate_shape(shape, Some(data.len()))?;
-        let ptr = create_tensor_with_data(
-            data.as_mut_ptr().cast(),
-            data.len() * std::mem::size_of::<u16>(),
-            shape,
-            DataType::BFloat16,
-        )?;
         Ok(Self {
-            ptr,
+            ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype: DataType::BFloat16,
-            backing: TensorBacking::F16(data),
+            backing: TensorBacking::F16(OwnedBuffer::new(data)),
         })
     }
 
     /// Create a CPU tensor from owned i64 data.
-    pub fn from_vec_i64(mut data: Vec<i64>, shape: &[i64]) -> Result<Self> {
+    pub fn from_vec_i64(data: Vec<i64>, shape: &[i64]) -> Result<Self> {
         validate_shape(shape, Some(data.len()))?;
-        let ptr = create_tensor_with_data(
-            data.as_mut_ptr().cast(),
-            data.len() * std::mem::size_of::<i64>(),
-            shape,
-            DataType::Int64,
-        )?;
         Ok(Self {
-            ptr,
+            ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype: DataType::Int64,
-            backing: TensorBacking::I64(data),
+            backing: TensorBacking::I64(OwnedBuffer::new(data)),
         })
     }
 
@@ -542,9 +589,8 @@ impl Value {
     /// dtype round-trips without a per-dtype host representation. `shape` must be
     /// fully static and `data.len()` must equal `numel * dtype.size_of()`.
     pub fn from_raw_bytes(data: Vec<u8>, shape: &[i64], dtype: DataType) -> Result<Self> {
-        validate_shape(shape, None)?;
-        let numel = shape.iter().fold(1usize, |acc, &dim| acc * dim as usize);
-        let expected = numel * dtype.size_of();
+        let numel = validate_shape(shape, None)?;
+        let expected = numel.checked_mul(dtype.size_of()).ok_or_else(|| OrtError::InvalidArgument(format!("tensor byte size overflows for shape {shape:?} at {dtype:?}; use a smaller allocation")))?;
         if data.len() != expected {
             return Err(OrtError::InvalidArgument(format!(
                 "raw tensor byte length {} does not match a {:?} tensor of shape {:?} \
@@ -559,10 +605,9 @@ impl Value {
         // address `0x1`), but ORT hands this exact pointer back to every reader,
         // which casts it to the element type. Re-home it when necessary so the
         // tensor's data pointer is aligned for `dtype`.
-        let mut data = ElementBytes::new(data);
-        let ptr = create_tensor_with_data(data.as_mut_ptr().cast(), data.len(), shape, dtype)?;
+        let data = ElementBytes::new(data);
         Ok(Self {
-            ptr,
+            ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype,
             backing: TensorBacking::Bytes(data),
@@ -597,6 +642,15 @@ impl Value {
     /// it as host memory is undefined behavior, so anything that dereferences the
     /// data pointer must check this first.
     pub fn is_host_resident(&self) -> Result<bool> {
+        match &self.backing {
+            TensorBacking::External {
+                host_accessible, ..
+            } => return Ok(*host_accessible),
+            TensorBacking::Alias { owner, .. } => return owner.is_host_resident(),
+            TensorBacking::Ort(_) => {}
+            _ => return Ok(true),
+        }
+
         let api = crate::error::api()?;
         let get_memory_info = api
             .GetTensorMemoryInfo
@@ -610,9 +664,7 @@ impl Value {
         let mut memory_info = std::ptr::null();
         // SAFETY: `self.ptr` is a valid tensor OrtValue. ORT owns the returned
         // OrtMemoryInfo for the lifetime of the value, so it must not be freed.
-        crate::error::check_status(unsafe {
-            get_memory_info(self.ptr.as_ptr(), &mut memory_info)
-        })?;
+        crate::error::check_status(unsafe { get_memory_info(self.as_ptr()?, &mut memory_info) })?;
         if memory_info.is_null() {
             return Err(OrtError::NullPointer);
         }
@@ -638,6 +690,13 @@ impl Value {
 
     /// Return the allocator device ID recorded on this tensor.
     pub fn device_id(&self) -> Result<i32> {
+        match &self.backing {
+            TensorBacking::External { placement, .. } => return Ok(placement.device_id()),
+            TensorBacking::Alias { owner, .. } => return owner.device_id(),
+            TensorBacking::Ort(_) => {}
+            _ => return Ok(0),
+        }
+
         let api = crate::error::api()?;
         let get_memory_info = api
             .GetTensorMemoryInfo
@@ -648,9 +707,7 @@ impl Value {
         let mut memory_info = std::ptr::null();
         // SAFETY: `self.ptr` is a valid tensor OrtValue. ORT owns the returned
         // OrtMemoryInfo for the lifetime of the value.
-        crate::error::check_status(unsafe {
-            get_memory_info(self.ptr.as_ptr(), &mut memory_info)
-        })?;
+        crate::error::check_status(unsafe { get_memory_info(self.as_ptr()?, &mut memory_info) })?;
         if memory_info.is_null() {
             return Err(OrtError::NullPointer);
         }
@@ -681,7 +738,7 @@ impl Value {
         if bytes == 0 {
             return Ok(&[]);
         }
-        let ptr = tensor_data_ptr(self.ptr.as_ptr())?;
+        let ptr = self.data_ptr()?;
         // SAFETY: `ptr` points to at least `bytes` contiguous bytes of this
         // tensor's row-major allocation, checked host-resident above and kept
         // alive by `self`, which also bounds the returned slice's lifetime.
@@ -696,7 +753,7 @@ impl Value {
         if bytes == 0 {
             return Ok(Vec::new());
         }
-        let ptr = tensor_data_ptr(self.ptr.as_ptr())?;
+        let ptr = self.data_ptr()?;
         // SAFETY: `ptr` points to at least `bytes` contiguous bytes of this
         // host-resident tensor's row-major allocation, kept alive by `self`;
         // `u8` has alignment 1, so any non-null `ptr` is suitably aligned.
@@ -713,7 +770,7 @@ impl Value {
                 self.dtype
             )));
         }
-        tensor_data_to_vec(self.ptr.as_ptr(), self.numel())
+        self.elements_to_vec(self.numel())
     }
 
     /// Copy tensor data out as f32 values, widening Float16 losslessly.
@@ -731,7 +788,7 @@ impl Value {
                 if numel == 0 {
                     return Ok(Vec::new());
                 }
-                let data = tensor_data_ptr(self.ptr.as_ptr())?;
+                let data = self.data_ptr()?;
                 // SAFETY: an fp16 tensor holds `numel` contiguous u16 elements at
                 // `data`, valid until this Value is released; we only read here,
                 // and `tensor_elements` upholds the alignment precondition.
@@ -788,7 +845,7 @@ impl Value {
                 "argmax_last_row row size {vocab} exceeds tensor length {numel}"
             ))
         })?;
-        let data = tensor_data_ptr(self.ptr.as_ptr())?;
+        let data = self.data_ptr()?;
         // SAFETY: the tensor owns `numel` contiguous elements of `dtype` at
         // `data`, valid until the value is released; we only read the final row
         // `[offset, offset + vocab)`, which is in bounds by construction. The
@@ -827,7 +884,7 @@ impl Value {
                 self.dtype
             )));
         }
-        tensor_data_to_vec(self.ptr.as_ptr(), self.numel())
+        self.elements_to_vec(self.numel())
     }
 
     /// Copy BFloat16 tensor data out as bfloat16 bit patterns.
@@ -839,7 +896,7 @@ impl Value {
                 self.dtype
             )));
         }
-        tensor_data_to_vec(self.ptr.as_ptr(), self.numel())
+        self.elements_to_vec(self.numel())
     }
 
     /// Copy tensor data out as i64 values.
@@ -851,7 +908,7 @@ impl Value {
                 self.dtype
             )));
         }
-        tensor_data_to_vec(self.ptr.as_ptr(), self.numel())
+        self.elements_to_vec(self.numel())
     }
 
     /// Copy a Bool tensor out as canonical Rust booleans.
@@ -863,24 +920,115 @@ impl Value {
                 self.dtype
             )));
         }
-        Ok(tensor_data_to_vec::<u8>(self.ptr.as_ptr(), self.numel())?
+        Ok(self
+            .elements_to_vec::<u8>(self.numel())?
             .into_iter()
             .map(|value| value != 0)
             .collect())
     }
 
-    pub(crate) fn as_ptr(&self) -> *const onnx_genai_ort_sys::OrtValue {
-        self.ptr.as_ptr()
+    pub(crate) fn as_ptr(&self) -> Result<*const onnx_genai_ort_sys::OrtValue> {
+        if let TensorBacking::Ort(handle) = &self.backing {
+            return Ok(handle.ptr.as_ptr());
+        }
+        let mut cached = self.ort_view.lock().map_err(|_| {
+            OrtError::InvalidArgument(
+                "ORT tensor-view cache was poisoned; rebuild the tensor before reference execution"
+                    .into(),
+            )
+        })?;
+        if cached.is_none() {
+            let data = self.data_ptr()?;
+            let bytes = self.numel() * self.dtype.size_of();
+            let ptr = match &self.backing {
+                TensorBacking::External {placement, ..} => create_tensor_with_data_in(data, bytes, &self.shape, self.dtype, &MemoryInfo::new(placement.clone())),
+                TensorBacking::Alias {owner, ..} => create_tensor_with_data_at(owner.reference_memory_info()?, data, bytes, &self.shape, self.dtype),
+                _ => create_tensor_with_data(data, bytes, &self.shape, self.dtype),
+            }.map_err(|source| OrtError::Context {operation: format!("materialize ORT reference tensor {:?} {:?}; install a matching ORT library for the explicitly selected reference backend", self.dtype, self.shape), source: Box::new(source)})?;
+            *cached = Some(OrtValueHandle::new(ptr)?);
+        }
+        cached
+            .as_ref()
+            .map(|handle| handle.ptr.as_ptr().cast_const())
+            .ok_or_else(|| {
+                OrtError::InvalidArgument(
+                    "ORT tensor view was not initialized; rebuild the reference input".into(),
+                )
+            })
     }
-
-    pub(crate) fn raw_ptr_addr(&self) -> usize {
-        self.ptr.as_ptr() as usize
+    fn reference_memory_info(&self) -> Result<*const onnx_genai_ort_sys::OrtMemoryInfo> {
+        let mut root = self;
+        while let TensorBacking::Alias { owner, .. } = &root.backing {
+            root = owner;
+        }
+        tensor_memory_info(root.as_ptr()?)
+    }
+    pub(crate) fn raw_ptr_addr(&self) -> Result<usize> {
+        Ok(self.as_ptr()? as usize)
+    }
+    fn data_ptr(&self) -> Result<*mut std::ffi::c_void> {
+        Ok(match &self.backing {
+            TensorBacking::F32(data) => data.raw_ptr().cast(),
+            TensorBacking::F16(data) => data.raw_ptr().cast(),
+            TensorBacking::I64(data) => data.raw_ptr().cast(),
+            TensorBacking::Bytes(data) => {
+                debug_assert_eq!(data.len(), self.numel() * self.dtype.size_of());
+                data.as_ptr().cast()
+            }
+            TensorBacking::External { data, .. } => data.as_ptr(),
+            TensorBacking::Alias {
+                owner,
+                element_offset,
+            } => {
+                if self.numel() == 0 {
+                    return Ok(dangling_aligned(self.dtype));
+                }
+                let mut root = owner.as_ref();
+                let mut offset = *element_offset;
+                while let TensorBacking::Alias {
+                    owner,
+                    element_offset,
+                } = &root.backing
+                {
+                    offset = offset.checked_add(*element_offset).ok_or_else(|| {
+                        OrtError::InvalidArgument(
+                            "tensor alias element offset overflows; use a smaller window".into(),
+                        )
+                    })?;
+                    root = owner;
+                }
+                // SAFETY: admission checked every nested element window, and
+                // all owners remain retained. Only compute a device address.
+                unsafe { root.data_ptr()?.byte_add(offset * self.dtype.size_of()) }
+            }
+            TensorBacking::Ort(handle) => {
+                if self.numel() == 0 {
+                    return Ok(dangling_aligned(self.dtype));
+                }
+                return tensor_data_ptr(handle.ptr.as_ptr());
+            }
+        })
+    }
+    fn elements_to_vec<T: Copy>(&self, len: usize) -> Result<Vec<T>> {
+        // SAFETY: typed public callers validate dtype, residency and numel.
+        Ok(unsafe { tensor_elements::<T>(self.data_ptr()?.cast(), len) }.into_owned())
+    }
+    fn elements_mut_ptr<T>(&self) -> Result<*mut T> {
+        let ptr = self.data_ptr()?.cast::<T>();
+        if !ptr.is_aligned() {
+            return Err(OrtError::InvalidArgument(format!(
+                "tensor data pointer {ptr:p} is not aligned to {} bytes as {:?}; use an element-aligned allocation",
+                std::mem::align_of::<T>(),
+                self.dtype
+            )));
+        }
+        Ok(ptr)
     }
 
     /// Return the address of the tensor data buffer. Intended for tests and
     /// decode-session diagnostics that need to verify buffer reuse.
     pub fn data_ptr_addr(&self) -> Result<usize> {
-        Ok(tensor_data_ptr(self.ptr.as_ptr())? as usize)
+        Ok(self.data_ptr()? as usize)
     }
 
     /// Copy a host tensor into this existing host tensor without changing its
@@ -901,8 +1049,8 @@ impl Value {
             .ok_or_else(|| {
                 OrtError::InvalidArgument("copy_from_host tensor byte size overflows".into())
             })?;
-        let destination = tensor_data_ptr(self.ptr.as_ptr())?;
-        let source = tensor_data_ptr(source.ptr.as_ptr())?;
+        let destination = self.data_ptr()?;
+        let source = source.data_ptr()?;
         // SAFETY: shape/dtype equality guarantees both tensor buffers contain
         // at least `bytes` bytes and do not overlap (distinct OrtValues).
         unsafe { std::ptr::copy_nonoverlapping(source, destination, bytes) };
@@ -1160,7 +1308,7 @@ impl Value {
         if bytes.is_empty() {
             return Ok(());
         }
-        let base = tensor_data_ptr(self.ptr.as_ptr())?;
+        let base = self.data_ptr()?;
         // SAFETY: `base` points at this host-resident tensor's row-major
         // allocation of `numel() * element` bytes, and the destination window
         // was bounds-checked above; `u8` has alignment 1, so any non-null
@@ -1204,7 +1352,7 @@ impl Value {
         if data.is_empty() {
             return Ok(());
         }
-        let dst = tensor_elements_mut_ptr::<i64>(self.ptr.as_ptr(), self.dtype)?;
+        let dst = self.elements_mut_ptr::<i64>()?;
         // SAFETY: `dst` points to at least `numel()` contiguous i64 elements
         // owned by this tensor and is element-aligned (checked above); we write
         // only the first `data.len()` of them.
@@ -1241,7 +1389,7 @@ impl Value {
         if count == 0 {
             return Ok(());
         }
-        let base = tensor_elements_mut_ptr::<i64>(self.ptr.as_ptr(), self.dtype)?;
+        let base = self.elements_mut_ptr::<i64>()?;
         // SAFETY: `[start, start+count)` lies within the `numel()` contiguous
         // i64 elements owned by this tensor (checked above) and `base` is
         // element-aligned, so each written element is in bounds and aligned.
@@ -1392,16 +1540,16 @@ impl Value {
         match &mut self.backing {
             TensorBacking::F32(data) => data[start..start + row_len].fill(0.0),
             TensorBacking::F16(data) => data[start..start + row_len].fill(0),
-            TensorBacking::None => match self.dtype {
+            TensorBacking::Ort(_) => match self.dtype {
                 DataType::Float32 => {
-                    let ptr = tensor_elements_mut_ptr::<f32>(self.ptr.as_ptr(), self.dtype)?;
+                    let ptr = self.elements_mut_ptr::<f32>()?;
                     // SAFETY: `start..start + row_len` lies within this tensor's
                     // row-major allocation, ORT returned a mutable data pointer,
                     // and the pointer is element-aligned (checked above).
                     unsafe { std::slice::from_raw_parts_mut(ptr.add(start), row_len) }.fill(0.0);
                 }
                 DataType::Float16 | DataType::BFloat16 => {
-                    let ptr = tensor_elements_mut_ptr::<u16>(self.ptr.as_ptr(), self.dtype)?;
+                    let ptr = self.elements_mut_ptr::<u16>()?;
                     // SAFETY: same bounds/invariants as the Float32 branch.
                     unsafe { std::slice::from_raw_parts_mut(ptr.add(start), row_len) }.fill(0);
                 }
@@ -1470,9 +1618,9 @@ impl Value {
                 }
                 data[..prefix.len()].copy_from_slice(&prefix);
             }
-            TensorBacking::None => match self.dtype {
+            TensorBacking::Ort(_) => match self.dtype {
                 DataType::Float32 => {
-                    let ptr = tensor_elements_mut_ptr::<f32>(self.ptr.as_ptr(), self.dtype)?;
+                    let ptr = self.elements_mut_ptr::<f32>()?;
                     let mut prefix = Vec::with_capacity(sources.len() * row_len);
                     for &src in sources {
                         // SAFETY: `src` was range-checked above and `ptr` is
@@ -1488,7 +1636,7 @@ impl Value {
                     }
                 }
                 DataType::Float16 | DataType::BFloat16 => {
-                    let ptr = tensor_elements_mut_ptr::<u16>(self.ptr.as_ptr(), self.dtype)?;
+                    let ptr = self.elements_mut_ptr::<u16>()?;
                     let mut prefix = Vec::with_capacity(sources.len() * row_len);
                     for &src in sources {
                         // SAFETY: same bounds/alignment invariants as the
@@ -1583,30 +1731,8 @@ impl Value {
                 owner.numel()
             )));
         }
-        let memory_info = tensor_memory_info(owner.ptr.as_ptr())?;
-        // A zero-element alias borrows no bytes, and ORT is entitled to report a
-        // null data pointer for a tensor that owns none. Such an alias is still
-        // a real tensor -- a workflow's growing state starts empty and an
-        // island's outputs are aliased before anything has been appended -- so
-        // give ORT an aligned address it will never dereference instead of
-        // asking the owner for one.
-        let data = if alias_numel == 0 {
-            dangling_aligned(owner.dtype)
-        } else {
-            let base = tensor_data_ptr(owner.ptr.as_ptr())?;
-            // Pointer arithmetic only; the bytes are never read here, so this is
-            // valid for a device address the host cannot dereference.
-            unsafe { base.byte_add(element_offset * owner.dtype.size_of()) }
-        };
-        let ptr = create_tensor_with_data_at(
-            memory_info,
-            data,
-            alias_numel * owner.dtype.size_of(),
-            shape,
-            owner.dtype,
-        )?;
         Ok(Self {
-            ptr,
+            ort_view: Mutex::new(None),
             shape: shape.to_vec(),
             dtype: owner.dtype,
             backing: TensorBacking::Alias {
@@ -1707,6 +1833,7 @@ impl Value {
             TensorBacking::External {
                 host_accessible,
                 owner: Some(owner),
+                ..
             } => Some(self.alias_external_with_owner(*host_accessible, Arc::clone(owner))),
             _ => None,
         }
@@ -1719,27 +1846,19 @@ impl Value {
         host_accessible: bool,
         owner: Arc<dyn core::any::Any + Send + Sync>,
     ) -> Result<Value> {
-        let memory_info = tensor_memory_info(self.ptr.as_ptr())?;
-        let numel = self.numel();
-        // A zero-element alias dereferences no data pointer; hand ORT an aligned
-        // address it will never read rather than the owner's (possibly null) one.
-        let data = if numel == 0 {
-            dangling_aligned(self.dtype)
-        } else {
-            tensor_data_ptr(self.ptr.as_ptr())?
+        let TensorBacking::External {
+            data, placement, ..
+        } = &self.backing
+        else {
+            return Err(OrtError::InvalidArgument("external alias requires externally owned tensor storage; retain the original external owner".into()));
         };
-        let ptr = create_tensor_with_data_at(
-            memory_info,
-            data,
-            numel * self.dtype.size_of(),
-            &self.shape,
-            self.dtype,
-        )?;
         Ok(Self {
-            ptr,
+            ort_view: Mutex::new(None),
             shape: self.shape.clone(),
             dtype: self.dtype,
             backing: TensorBacking::External {
+                data: *data,
+                placement: placement.clone(),
                 host_accessible,
                 owner: Some(owner),
             },
@@ -1747,41 +1866,28 @@ impl Value {
     }
 
     pub(crate) unsafe fn from_raw(ptr: *mut onnx_genai_ort_sys::OrtValue) -> Result<Self> {
-        let ptr = NonNull::new(ptr).ok_or(OrtError::NullPointer)?;
-        let (shape, dtype) = tensor_shape_and_type(ptr.as_ptr())?;
+        let handle = OrtValueHandle::new(NonNull::new(ptr).ok_or(OrtError::NullPointer)?)?;
+        let (shape, dtype) = tensor_shape_and_type(handle.ptr.as_ptr())?;
+        validate_shape(&shape, None)?;
         Ok(Self {
-            ptr,
+            ort_view: Mutex::new(None),
             shape,
             dtype,
-            backing: TensorBacking::None,
+            backing: TensorBacking::Ort(handle),
         })
     }
 }
 
-impl Drop for Value {
-    fn drop(&mut self) {
-        let _keep_data_alive = match &self.backing {
-            TensorBacking::F32(data) => data.len(),
-            TensorBacking::F16(data) => data.len(),
-            TensorBacking::I64(data) => data.len(),
-            TensorBacking::Bytes(data) => data.len(),
-            TensorBacking::Alias { owner, .. } => owner.numel(),
-            // Borrowed memory. Any `_owner` here is a struct field, so drop glue
-            // frees it *after* this body releases the `OrtValue` below — ORT is
-            // always done with the allocation before the owner frees it.
-            TensorBacking::External { .. } => 0,
-            TensorBacking::None => 0,
-        };
-        if let Ok(api) = crate::error::api()
-            && let Some(release) = api.ReleaseValue
-        {
-            // SAFETY: `ptr` is owned by this wrapper and released exactly once here.
-            unsafe { release(self.ptr.as_ptr()) };
-        }
-    }
+fn host_zeros<T: Clone>(len: usize, zero: T, shape: &[i64], dtype: DataType) -> Result<Vec<T>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|error| OrtError::InvalidArgument(format!(
+        "cannot allocate {len} host elements for {dtype:?} tensor with shape {shape:?}: {error}; reduce tensor dimensions or the requested memory footprint"
+    )))?;
+    data.resize(len, zero);
+    Ok(data)
 }
 
-fn validate_shape(shape: &[i64], actual_len: Option<usize>) -> Result<()> {
+fn validate_shape(shape: &[i64], actual_len: Option<usize>) -> Result<usize> {
     let mut expected_len = 1usize;
     for &dim in shape {
         if dim < 0 {
@@ -1789,7 +1895,8 @@ fn validate_shape(shape: &[i64], actual_len: Option<usize>) -> Result<()> {
                 "tensor shape contains negative dimension: {shape:?}"
             )));
         }
-        expected_len = expected_len.checked_mul(dim as usize).ok_or_else(|| {
+        let dim = usize::try_from(dim).map_err(|_| OrtError::InvalidArgument(format!("tensor dimension {dim} does not fit this platform's address width for shape {shape:?}; use smaller dimensions")))?;
+        expected_len = expected_len.checked_mul(dim).ok_or_else(|| {
             OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}"))
         })?;
     }
@@ -1800,7 +1907,7 @@ fn validate_shape(shape: &[i64], actual_len: Option<usize>) -> Result<()> {
             "data length {actual_len} doesn't match shape {shape:?} (expected {expected_len})"
         )));
     }
-    Ok(())
+    Ok(expected_len)
 }
 
 fn create_tensor_with_data(
@@ -1923,34 +2030,6 @@ fn tensor_shape_and_type(
     result
 }
 
-fn tensor_data_to_vec<T: Copy>(
-    value: *mut onnx_genai_ort_sys::OrtValue,
-    len: usize,
-) -> Result<Vec<T>> {
-    // A zero-element tensor has nothing to copy, and ORT is entitled to hand
-    // back any pointer for it (including a caller's dangling `Vec` sentinel).
-    // Answer without asking for the data pointer at all.
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    let api = crate::error::api()?;
-    let get_data = api
-        .GetTensorMutableData
-        .ok_or(OrtError::ApiUnavailable("GetTensorMutableData"))?;
-    let mut data = std::ptr::null_mut();
-    // SAFETY: `value` is a valid tensor OrtValue; ORT returns a pointer valid
-    // until the value is released. We immediately copy `len` elements out.
-    crate::error::check_status(unsafe { get_data(value, &mut data) })?;
-    if data.is_null() {
-        return Err(OrtError::NullPointer);
-    }
-
-    // SAFETY: caller ensures `T` matches the tensor dtype and `len` is numel, so
-    // `data` covers `len` contiguous `T`s that stay valid until the value is
-    // released. `tensor_elements` handles the alignment precondition itself.
-    Ok(unsafe { tensor_elements::<T>(data.cast::<T>(), len) }.into_owned())
-}
-
 /// Read-only view of `len` elements of `T` at a raw ORT tensor data pointer.
 ///
 /// `slice::from_raw_parts` requires the pointer to be aligned for `T` **even
@@ -1998,21 +2077,6 @@ unsafe fn tensor_elements<'a, T: Copy>(ptr: *const T, len: usize) -> Cow<'a, [T]
 /// the tensor — so misalignment is reported instead of being ignored. Our own
 /// constructors guarantee alignment, so this can only fire for a buffer handed
 /// in through [`Value::from_external_memory`].
-fn tensor_elements_mut_ptr<T>(
-    value: *mut onnx_genai_ort_sys::OrtValue,
-    dtype: DataType,
-) -> Result<*mut T> {
-    let ptr = tensor_data_ptr(value)?.cast::<T>();
-    if !ptr.is_aligned() {
-        return Err(OrtError::InvalidArgument(format!(
-            "tensor data pointer {ptr:p} is not aligned to {} bytes as {dtype:?} elements \
-             require, so it cannot be written in place",
-            std::mem::align_of::<T>()
-        )));
-    }
-    Ok(ptr)
-}
-
 /// Index of the maximum value in `row`, ignoring NaNs.
 ///
 /// Matches the engine greedy sampler exactly: a vectorizable horizontal max
@@ -2177,8 +2241,8 @@ mod clone_owned_tests {
         );
         // The clone owns a distinct buffer, not an alias over the original's.
         assert_ne!(
-            original.as_ptr() as usize,
-            cloned.as_ptr() as usize,
+            original.as_ptr().unwrap() as usize,
+            cloned.as_ptr().unwrap() as usize,
             "{dtype:?}: clone must be an independent OrtValue"
         );
     }
@@ -3184,5 +3248,148 @@ mod alias_offset_tests {
         value.fill_i64_range(0, 3, 9).unwrap();
         assert_eq!(snapshot, [0, 2, 5]);
         assert_eq!(value.to_vec_i64().unwrap(), [9, 9, 9]);
+    }
+}
+
+#[cfg(test)]
+mod neutral_storage_tests {
+    use super::*;
+    #[test]
+    // The production alias API shares allocation owners through Arc; these
+    // handles stay on this process's test thread, including cached ORT views.
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn host_values_and_aliases_work_without_ort() -> Result<()> {
+        const CHILD: &str = "NXRT_NEUTRAL_VALUE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "value::neutral_storage_tests::host_values_and_aliases_work_without_ort",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(
+                    "ONNX_GENAI_ORT_LIB",
+                    "/missing/nxrt-native-value-test/onnxruntime",
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return Ok(());
+        }
+        let oversized = Value::empty(&[i64::MAX, 2], DataType::Uint8)
+            .err()
+            .expect("capacity must be rejected without panicking");
+        assert!(!oversized.to_string().is_empty());
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            oversized.to_string().contains("cannot allocate"),
+            "{oversized}"
+        );
+        assert!(Value::empty(&[i64::MAX, 2], DataType::Float32).is_err());
+        let value = Arc::new(Value::from_vec_i64(vec![10, 20, 30, 40], &[4])?);
+        let alias = Value::alias_with_offset(Arc::clone(&value), 1, &[2])?;
+        let cloned = alias.try_alias_clone().unwrap()?;
+        assert_eq!(alias.to_vec_i64()?, [20, 30]);
+        assert_eq!(cloned.data_ptr_addr()?, alias.data_ptr_addr()?);
+        alias.write_i64_prefix(&[7, 8])?;
+        assert_eq!(value.to_vec_i64()?, [10, 7, 8, 40]);
+        let nested =
+            Value::alias_with_offset(Arc::new(cloned.try_alias_clone().unwrap()?), 1, &[1])?;
+        assert_eq!(nested.to_vec_i64()?, [8]);
+        assert!(nested.as_ptr().is_err());
+        assert_eq!(nested.to_vec_i64()?, [8]);
+        let deep = alias.clone_owned()?;
+        alias.fill_i64_range(0, 2, 9)?;
+        assert_eq!(deep.to_vec_i64()?, [7, 8]);
+        assert_eq!(cloned.to_vec_i64()?, [9, 9]);
+        drop(value);
+        assert_eq!(cloned.to_vec_i64()?, [9, 9]);
+        for dtype in [
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float8E4M3,
+            DataType::Float8E5M2,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Uint8,
+            DataType::Uint16,
+            DataType::Uint32,
+            DataType::Uint64,
+            DataType::Bool,
+        ] {
+            let raw = vec![1; dtype.size_of() * 2];
+            let tensor = Value::from_raw_bytes(raw.clone(), &[2], dtype)?;
+            assert_eq!(tensor.as_raw_bytes()?, raw);
+            assert!(tensor.is_host_resident()?);
+            assert_eq!(tensor.device_id()?, 0);
+            assert_eq!(tensor.clone_owned()?.as_raw_bytes()?, raw);
+            assert!(Value::empty(&[0, 2], dtype)?.as_raw_bytes()?.is_empty());
+        }
+        let floats = Value::from_vec_f32(vec![0., 2., 1.], &[1, 3])?;
+        assert_eq!(floats.argmax_last_row()?, 1);
+        assert_eq!(floats.as_slice_f32()?, [0., 2., 1.]);
+        assert_eq!(
+            Value::from_vec_f16_bits(vec![0x3c00], &[1])?.to_vec_f32_lossy()?,
+            [1.]
+        );
+        assert_eq!(
+            Value::from_vec_bf16_bits(vec![0x3f80], &[1])?.to_vec_f32_lossy()?,
+            [1.]
+        );
+        struct ExternalOwner {
+            values: Vec<f32>,
+            drops: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Drop for ExternalOwner {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut owner = Box::new(ExternalOwner {
+            values: vec![1., 2., 3., 4.],
+            drops: Arc::clone(&drops),
+        });
+        let pointer = owner.values.as_mut_ptr();
+        // SAFETY: owner owns this complete CPU allocation; no-copy views keep
+        // that owner alive. Only the tensor accessors reach it after admission.
+        let external = unsafe {
+            Value::from_external_memory_with_owner(
+                pointer.cast(),
+                16,
+                &[2, 2],
+                DataType::Float32,
+                &MemoryInfo::cpu()?,
+                owner,
+            )?
+        };
+        let shared = external.try_alias_clone().unwrap()?;
+        let window = Value::axis0_view(Arc::new(external), 1, 1)?;
+        assert_eq!(window.to_vec_f32()?, [3., 4.]);
+        drop(shared);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(window.as_ptr().is_err());
+        assert_eq!(window.to_vec_f32()?, [3., 4.]);
+        drop(window);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let error = alias.as_ptr().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("materialize ORT reference tensor"),
+            "{error}"
+        );
+        assert_eq!(alias.to_vec_i64()?, [9, 9]);
+        Ok(())
     }
 }

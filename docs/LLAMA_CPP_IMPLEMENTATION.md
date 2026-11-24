@@ -1674,3 +1674,50 @@ the owner explicitly requested bypassing blocked remote CI. Lazy JSON, C++
 collating/equivalence classes, remaining model/slot/adapter protocols and complete
 Native Value/MTP isolation remain broader goal work. These CPU functional and
 compile checks do not establish GPU execution or performance results.
+
+
+### Neutral workflow tensor storage
+
+Workflow `Value` owns typed fixed-size CPU allocations, aligned raw bytes,
+external storage with immutable placement and retained owners, or checked alias
+windows. Only an explicitly selected ORT session/binding resolves a reference
+view, with fallible admission propagated through all pointer/borrowed-output
+callers. The cached view releases before its backing owner. ORT-created outputs
+retain an owned ready handle, and native-only destruction never opens ORT.
+Mutable pointers are retained from allocation construction instead of deriving
+write pointers from shared slice borrows. Alias metadata traversal is iterative
+and retains every owner rather than dropping intermediate resource guards.
+
+CPU empty tensors retain zero-initialized host storage; aligned zero-byte raw
+allocations keep their existing real-allocation contract. An initial regression
+caught an overly broad dangling-pointer shortcut and passed after restricting
+it to zero-byte aliases/reference outputs. Metadata shape and byte arithmetic
+is checked before allocation. CPU arena/device and external provider placement
+remain preserved when a view is explicitly materialized.
+
+Ordinary Native startup no longer creates the optional MTP environment.
+The enabled metadata-declared legacy MTP proposer still owns its actual ORT
+session/environment together; it is not bypassed or reported as Native-only.
+The Python launcher/preload and package dependencies are unchanged in this
+increment and remain open isolation work.
+
+Initial verification passed 191 ORT/value tests, including a subprocess that
+constructs, mutates, aliases, deep-copies and drops every host dtype with a
+missing ORT library. External-owner lifetime, exact nested windows and recovery
+after an explicit reference-view failure are covered. Real CLI subprocesses
+passed both default Native generation with an unavailable ORT path and explicit
+ORT reference generation. The broader engine/server/HTTP regression and strict
+CUDA-feature checks are being completed before landing.
+
+Neutral storage validation completed: the full storage-change graph passed
+191 ORT/value, 979 engine / one inherited ignore, 451 server / two inherited
+ignores and 71 CLI tests. The subsequent capacity/portable-shape checks passed
+the 191-value suite again, including the isolated missing-library capacity
+regression. Both CLI profile subprocesses and all 38 HTTP tests then passed,
+including the independent missing-ORT buffered completion and successful SSE
+finish/error assertions. Strict ORT/engine/server/CLI all-target Clippy with the
+ORT CUDA feature, formatting and diff checks passed. The two implementation
+commits restacked unchanged onto current main; both CLI subprocesses, HTTP 38
+and strict checks passed again on that restack. PR #2529 proceeds after local
+self-review without waiting for blocked CI, as explicitly requested. GPU
+execution/performance and the Python/MTP isolation work remain unproven here.

@@ -501,7 +501,7 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
                         pair.past
                     ))
                 })?;
-                borrowed_outputs.push(value.raw_ptr_addr());
+                borrowed_outputs.push(value.raw_ptr_addr()?);
                 self.binding.bind_output(output, value).map_err(|e| {
                     OrtError::InvalidArgument(format!("bind present '{output}': {e}"))
                 })?;

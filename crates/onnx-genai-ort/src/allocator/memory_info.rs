@@ -4,8 +4,8 @@ use std::{cell::OnceCell, ffi::CString, ptr::NonNull, rc::Rc};
 use super::{AllocatorType, MemoryType};
 use crate::{OrtError, Result};
 
-#[derive(Debug)]
-enum MemoryDescriptor {
+#[derive(Clone, Debug)]
+pub(crate) enum MemoryDescriptor {
     Cpu {
         allocator: AllocatorType,
     },
@@ -18,20 +18,20 @@ enum MemoryDescriptor {
 }
 
 impl MemoryDescriptor {
-    fn device_name(&self) -> &str {
+    pub(crate) fn device_name(&self) -> &str {
         match self {
             Self::Cpu { .. } => "Cpu",
             Self::Device { name, .. } => name,
             Self::WebGpu => "WebGPU_Buffer",
         }
     }
-    fn device_id(&self) -> i32 {
+    pub(crate) fn device_id(&self) -> i32 {
         match self {
             Self::Device { id, .. } => *id,
             _ => 0,
         }
     }
-    fn memory_type(&self) -> MemoryType {
+    pub(crate) fn memory_type(&self) -> MemoryType {
         match self {
             Self::Device { memory_type, .. } => *memory_type,
             _ => MemoryType::Default,
@@ -165,13 +165,16 @@ pub struct MemoryInfo {
     state: Rc<MemoryInfoState>,
 }
 impl MemoryInfo {
-    fn new(descriptor: MemoryDescriptor) -> Self {
+    pub(crate) fn new(descriptor: MemoryDescriptor) -> Self {
         Self {
             state: Rc::new(MemoryInfoState {
                 descriptor: Rc::new(descriptor),
                 resolved: OnceCell::new(),
             }),
         }
+    }
+    pub(crate) fn descriptor(&self) -> MemoryDescriptor {
+        (*self.state.descriptor).clone()
     }
     /// Describe CPU memory managed by an arena allocator.
     pub fn cpu() -> Result<Self> {
