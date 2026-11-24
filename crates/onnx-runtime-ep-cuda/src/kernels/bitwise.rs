@@ -732,11 +732,11 @@ mod tests {
     #[test]
     fn bitwise_not_claim_is_unary() {
         assert_eq!(
-            unsupported_reason("BitwiseNot", &[DataType::Int8]),
+            unsupported_reason("BitwiseNot", 18, &[DataType::Int8]),
             None,
             "unary op must not require a second operand"
         );
-        assert!(unsupported_reason("BitwiseNot", &[DataType::Float64]).is_some());
+        assert!(unsupported_reason("BitwiseNot", 18, &[DataType::Float64]).is_some());
     }
 
     #[test]
