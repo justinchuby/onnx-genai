@@ -603,7 +603,7 @@ impl ExecutionProvider for CpuExecutionProvider {
             && let Some(&dtype) = input_dtypes.first()
             && let Err(reason) = onnx_runtime_ir::lp_pool::validate_dtype(opset, dtype)
         {
-            return KernelMatch::unsupported(reason);
+            return KernelMatch::unsupported(format!("LpPool: {reason}"));
         }
         // Structural kernel limits belong to the versioned factory selected
         // above, alongside the parser that creation uses. No operator-name

@@ -766,9 +766,16 @@ fn window_dtype(op: &str, dtype: DataType) -> Result<i32> {
         DataType::Float16 => Ok(1),
         DataType::BFloat16 => Ok(2),
         DataType::Float64 if op == "LpPool" => Ok(3),
-        other => Err(not_implemented(format!(
-            "{op} dtype {other:?} (supported: Float32, Float16, BFloat16)"
-        ))),
+        other => {
+            let supported = if op == "LpPool" {
+                "Float32, Float16, Float64, BFloat16"
+            } else {
+                "Float32, Float16, BFloat16"
+            };
+            Err(not_implemented(format!(
+                "{op} dtype {other:?} (supported: {supported})"
+            )))
+        }
     }
 }
 
@@ -805,7 +812,7 @@ impl WindowPoolKernel {
         let dtype = window_dtype(op, input.dtype)?;
         checked_tensor_bytes(op, "input", input.dtype, input.shape)?;
         checked_tensor_bytes(op, "output", output.dtype, output.shape)?;
-        if matches!(input.dtype, DataType::Float16 | DataType::BFloat16) {
+        if dtype != 0 {
             self.runtime.require_nvrtc_half_headers(op)?;
         }
         let spatial = &input.shape[2..];

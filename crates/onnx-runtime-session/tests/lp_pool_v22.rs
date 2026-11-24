@@ -1,4 +1,7 @@
-//! Native LpPool conformance, with expected values from ONNX ReferenceEvaluator.
+//! Native LpPool conformance. Schema audited at ONNX commit
+//! `622adf94d4e720142950aa8178f7357d52e63db0`; fixture values use ONNX 1.24.0
+//! `ReferenceEvaluator`. To reproduce, feed each input and attribute list to a
+//! single-node LpPool-22 model, applying the per-case adjustments below.
 
 use half::bf16;
 use onnx_runtime_ir::{Attribute, DataType, DeviceId, Graph, Node, NodeId, static_shape};
