@@ -4994,8 +4994,8 @@ mod claim_probes {
     use super::SkipLayerNormKernel;
     use crate::runtime::CudaRuntime;
 
-    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn maybe_runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn reference(input: &[f32], skip: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
@@ -5009,7 +5009,7 @@ mod claim_probes {
 
     #[test]
     fn typed_skip_layernorm_f16_bf16_match_reference_on_gpu() {
-        let Some(runtime) = maybe_runtime() else {
+        let Some((_provider, runtime)) = maybe_runtime() else {
             eprintln!("skipping typed SkipLayerNorm GPU probe: CUDA runtime unavailable");
             return;
         };

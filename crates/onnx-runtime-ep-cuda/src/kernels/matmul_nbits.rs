@@ -7315,8 +7315,7 @@ impl Bf16ConstCache {
             } else {
                 Some(GraphDeviceAllocation::allocate(
                     &self.runtime,
-                    layout.bytes(),
-                ).map_err(|source| contextual(
+                    layout.bytes(), onnx_runtime_memory_api::MemoryRole::Weights).map_err(|source| contextual(
                     "allocate immutable MatMulNBits BF16 constant composite; free device capacity or reduce constant shapes", source,
                 ))?)
             };
@@ -11961,12 +11960,27 @@ mod tests {
     #[test]
     fn bf16_constant_replacements_preserve_old_graph_contents_and_reject_unpinned_capture() {
         use half::bf16;
-        let runtime =
-            Arc::new(CudaRuntime::new(0).expect("BF16 immutable cache test requires CUDA"));
+        let (_provider, runtime) = crate::test_support::maybe_native_runtime()
+            .expect("retained artifact test requires native CUDA provider backing");
         runtime.set_defer_eager_sync(true);
-        let source_a = GraphDeviceAllocation::allocate(&runtime, 4).unwrap();
-        let source_b = GraphDeviceAllocation::allocate(&runtime, 4).unwrap();
-        let output = GraphDeviceAllocation::allocate(&runtime, 8).unwrap();
+        let source_a = GraphDeviceAllocation::allocate(
+            &runtime,
+            4,
+            onnx_runtime_memory_api::MemoryRole::Weights,
+        )
+        .unwrap();
+        let source_b = GraphDeviceAllocation::allocate(
+            &runtime,
+            4,
+            onnx_runtime_memory_api::MemoryRole::Weights,
+        )
+        .unwrap();
+        let output = GraphDeviceAllocation::allocate(
+            &runtime,
+            8,
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+        )
+        .unwrap();
         unsafe {
             runtime
                 .htod(
@@ -12173,6 +12187,7 @@ mod tests {
                 &kernel.runtime,
                 usize::try_from(requirement.bytes)
                     .map_err(|_| error("test workspace size exceeds usize"))?,
+                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
             )?)
         };
         let view = owner.as_ref().map(|owner| {
@@ -12907,7 +12922,7 @@ mod tests {
     )]
     #[test]
     fn prefill_workspace_empty_half_routes_preserve_output_canary() {
-        let runtime = runtime().expect("empty prefill regression requires CUDA");
+        let (_provider, runtime) = runtime().expect("empty prefill regression requires CUDA");
         runtime
             .require_nvrtc_half_headers("empty prefill regression")
             .unwrap();
@@ -13285,8 +13300,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
 }
 "#;
 
-    fn runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -13315,7 +13330,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[ignore = "perf microbench; requires a dedicated idle SM80+ CUDA device"]
     fn marlin_m_gt_1_op_wall_vs_tiled() {
         let _route = TiledMarlinRoute::select();
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping Marlin M>1 wall bench: CUDA runtime unavailable");
             return;
         };
@@ -13455,7 +13470,12 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 .collect::<Vec<_>>();
             let requirement = kernel.workspace_requirement_for(&metadata).unwrap();
             let owner = (requirement.bytes != 0).then(|| {
-                GraphDeviceAllocation::allocate(&runtime, requirement.bytes as usize).unwrap()
+                GraphDeviceAllocation::allocate(
+                    &runtime,
+                    requirement.bytes as usize,
+                    onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+                )
+                .unwrap()
             });
             let workspace = owner.as_ref().map(|owner| {
                 WorkspaceView::new(device_ptr_mut(owner.ptr()), requirement.bytes as usize)
@@ -13532,7 +13552,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[test]
     #[ignore = "requires an SM80+ CUDA device"]
     fn marlin_m_gt_1_rmsnorm_op_parity() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping Marlin M>1 rmsnorm parity: CUDA runtime unavailable");
             return;
         };
@@ -14200,7 +14220,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         with_bias: bool,
         explicit_zp: bool,
     ) -> (f32, f32, f32, bool) {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping MatMulNBits fp16 GEMV parity test: CUDA runtime unavailable");
             return (0.0, 0.0, 0.0, true);
         };
@@ -14517,7 +14537,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         pipeline: Option<bool>,
         prefetch: Option<bool>,
     ) -> Option<Vec<f16>> {
-        let runtime = runtime()?;
+        let (_provider, runtime) = runtime()?;
         if runtime
             .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
             .is_err()
@@ -14843,11 +14863,11 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[test]
     fn interleaved_weights_are_not_shared_between_runtimes() {
         const BYTES: usize = 4096;
-        let Some(first) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_first, first)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping interleave runtime-scoping test: no CUDA device");
             return;
         };
-        let Some(second) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_second, second)) = crate::test_support::maybe_native_runtime() else {
             return;
         };
 
@@ -14893,7 +14913,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[test]
     fn tearing_down_a_runtime_releases_its_interleaved_weights() {
         const BYTES: usize = 2048;
-        let Some(runtime) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_runtime, runtime)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping interleave teardown test: no CUDA device");
             return;
         };
@@ -14998,7 +15018,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     /// symmetric split-K entry is provably selected (asserted below).
     #[test]
     fn scales_f16_zp_splitk_prefetch_is_bit_identical_to_splitk() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping split-K prefetch byte-identity test: CUDA runtime unavailable");
             return;
         };
@@ -15057,7 +15077,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[ignore = "requires an SM80+ CUDA device"]
     fn marlin_m_gt_1_op_parity_and_capture_safety() {
         let _route = TiledMarlinRoute::select();
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping Marlin M>1 op parity: CUDA runtime unavailable");
             return;
         };
@@ -15333,7 +15353,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[test]
     #[ignore = "requires an SM80+ CUDA device"]
     fn dequant_f16_cublas_m_gt_1_op_parity() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping dequant-f16 cuBLASLt parity: CUDA runtime unavailable");
             return;
         };
@@ -15710,7 +15730,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         use cudarc::driver::result::event;
         use cudarc::driver::sys;
 
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping zero-copy kernel probe: CUDA runtime unavailable");
             return;
         };
@@ -15974,7 +15994,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     fn zerocopy_kernel_capture_with_host_mapped_pointer() {
         use cudarc::driver::sys;
 
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping capture probe: CUDA runtime unavailable");
             return;
         };
@@ -16173,7 +16193,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         with_bias: bool,
         explicit_zp: bool,
     ) -> (f32, f32, f32, bool) {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping MatMulNBits int8 fp16 GEMV parity test: CUDA runtime unavailable");
             return (0.0, 0.0, 0.0, true);
         };
@@ -16446,7 +16466,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
 
     #[test]
     fn fp16_down_projection_is_bit_exact_to_staged_kernel() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping down-projection GEMV parity test: CUDA runtime unavailable");
             return;
         };
@@ -17038,7 +17058,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     /// mis-strided the per-row sub-views — would diverge here.
     #[test]
     fn decode_gemv_loop_is_byte_identical_to_per_row_singlestream() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping looped decode GEMV byte-identity test: CUDA runtime unavailable");
             return;
         };
@@ -17272,7 +17292,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     /// mis-strided the per-row sub-views, would diverge here.
     #[test]
     fn gate_up_swiglu_rmsnorm_loop_is_byte_identical_to_per_row_singlestream() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!(
                 "skipping rmsnorm gate/up SwiGLU byte-identity test: CUDA runtime unavailable"
             );
@@ -17915,7 +17935,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         with_bias: bool,
         explicit_zp: bool,
     ) -> (f32, f32, f32, bool) {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping MatMulNBits int8 f32 GEMV parity test: CUDA runtime unavailable");
             return (0.0, 0.0, 0.0, true);
         };
@@ -18204,7 +18224,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         with_bias: bool,
         explicit_zp: bool,
     ) -> (usize, bool) {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!(
                 "skipping MatMulNBits int{bits} f32 block-128 byte-identity test: CUDA runtime unavailable"
             );
@@ -18501,7 +18521,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     /// bit across every output column.
     #[test]
     fn fp16_folded_bias_is_bit_exact_to_two_op_path() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping folded-bias bit-exactness test: CUDA runtime unavailable");
             return;
         };
@@ -18752,7 +18772,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// five-token Qwen case plus M/N tails on a small unrelated shape.
     #[test]
     fn fp16_gate_up_swiglu_is_bit_exact_to_two_op_path() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping gate/up SwiGLU bit-exactness test: CUDA runtime unavailable");
             return;
         };
@@ -19479,7 +19499,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// default-on and only passes under `ONNX_GENAI_MARLIN_M_GT_1=0` (tiled).
     #[test]
     fn fp16_gate_up_swiglu_two_op_ulp_bound_sweep() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping gate/up SwiGLU ULP sweep: CUDA runtime unavailable");
             return;
         };
@@ -19978,7 +19998,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// reassociates the K reduction and is bounded separately below.
     #[test]
     fn fp16_gate_up_swiglu_rmsnorm_two_op_ulp_bound_sweep() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping gate/up SwiGLU rmsnorm ULP sweep: CUDA runtime unavailable");
             return;
         };
@@ -20141,7 +20161,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     }
 
     fn run_fused_gate_up_swiglu_rmsnorm_parity(gamma_dtype: DataType, explicit_zp: bool) {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping gate/up SwiGLU RMS-norm parity test: CUDA runtime unavailable");
             return;
         };
@@ -20575,7 +20595,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// allocation, so the math is unchanged.
     #[test]
     fn gate_up_swiglu_vec_is_bit_identical_to_scalar() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping gate/up SwiGLU _vec bit-identity test: CUDA runtime unavailable");
             return;
         };
@@ -20913,7 +20933,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     }
 
     fn run_fused_skip_rmsnorm_parity(gamma_dtype: DataType, bits: usize, explicit_zp: bool) {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping fused skip-rmsnorm parity test: CUDA runtime unavailable");
             return;
         };
@@ -21494,7 +21514,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     fn bf16_direct_store_matches_staged_cast_bit_for_bit() {
         use half::bf16;
 
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping MatMulNBits bf16 direct-store test: CUDA runtime unavailable");
             return;
         };
@@ -21739,7 +21759,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     fn bf16_direct_store_declines_the_small_batch_row_loop() {
         use half::bf16;
 
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!(
                 "skipping MatMulNBits bf16 small-batch direct-store test: CUDA runtime unavailable"
             );
@@ -21989,7 +22009,8 @@ extern "C" __global__ void ref_silu_mul_f16(
     fn bf16_scale_cache_is_bit_exact_to_inline_staging() {
         use half::bf16;
 
-        let runtime = runtime().expect("BF16 scale-cache parity requires a CUDA runtime");
+        let (_provider, runtime) =
+            runtime().expect("BF16 scale-cache parity requires a CUDA runtime");
 
         let k = 256usize;
         let n = 64usize;
@@ -22557,7 +22578,7 @@ extern "C" __global__ void ref_silu_mul_f16(
         ];
         const BLOCK: usize = 32;
 
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping GEMV bandwidth probe: CUDA runtime unavailable");
             return;
         };

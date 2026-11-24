@@ -619,14 +619,13 @@ pub(super) fn run(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use half::f16;
 
     use super::*;
 
-    fn runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -698,7 +697,7 @@ mod tests {
 
     #[test]
     fn fp16_decode_kernel_matches_reference_softmax_at_short_and_long_context() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping CUDA GQA fp16 decode parity test: CUDA runtime unavailable");
             return;
         };
@@ -960,7 +959,7 @@ mod tests {
         let _serial = super::super::gqa_decode::TEST_SINGLE_SPLIT_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping GQA fp16 single-split parity test: CUDA runtime unavailable");
             return;
         };
@@ -1082,7 +1081,7 @@ mod tests {
     /// 320/384/448/512 (new H2PL 5/6/7/8 tiers) against the fp32/f64 oracle.
     #[test]
     fn fp16_decode_kernel_matches_reference_softmax_general_head_dims() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!(
                 "skipping CUDA GQA fp16 general head-dim parity test: CUDA runtime unavailable"
             );
