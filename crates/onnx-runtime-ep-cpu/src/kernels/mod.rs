@@ -1094,7 +1094,12 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
                 domain: key.domain.clone(),
                 since_version: key.since_version,
                 end_version: reg.explicit_end_version(key),
-                supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
+                supported_dtypes: if key.op_type == "BitShift" && key.domain.is_empty() {
+                    onnx_runtime_ep_api::bitshift::BitShiftTypes::for_opset(key.since_version)
+                        .dtypes()
+                } else {
+                    supported_dtypes_for_op(&key.op_type, &key.domain)
+                },
                 supports_raw_tensor_abi,
             }
         })
@@ -2058,10 +2063,20 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(onehot::OneHotFactory),
     );
-    rec.register(
+    rec.register_through(
         OpKey::new("BitShift", "", 11),
+        onnx_runtime_ep_api::bitshift::SIGNED_SINCE - 1,
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(bitshift::BitShiftFactory),
+        Box::new(bitshift::BitShiftFactory(
+            onnx_runtime_ep_api::bitshift::BitShiftTypes::UnsignedOnly,
+        )),
+    );
+    rec.register(
+        OpKey::new("BitShift", "", onnx_runtime_ep_api::bitshift::SIGNED_SINCE),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(bitshift::BitShiftFactory(
+            onnx_runtime_ep_api::bitshift::BitShiftTypes::SignedAndUnsigned,
+        )),
     );
     rec.register(
         OpKey::new("Compress", "", 11),
@@ -3529,7 +3544,7 @@ mod tests {
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
         // Opset-28 Cast adds one registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 124 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 125 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")

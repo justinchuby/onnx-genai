@@ -1633,6 +1633,49 @@ fn bitshift_cases() -> Vec<Case> {
     ]
 }
 
+fn signed_bitshift_cases() -> Vec<(Case, Vec<u8>)> {
+    let mut cases = Vec::new();
+    macro_rules! cases_for_type {
+        ($dtype:ident, $ty:ty, $($extra_count:expr),*) => {{
+            let dtype = DataType::$dtype;
+            let width = <$ty>::BITS as $ty;
+            let counts = [0, 1, width - 1, width, width + 1, -1, $($extra_count),*];
+            let extra = counts.len() - 6;
+            // Pinned ONNX vectors distinguish arithmetic RIGHT and wrapping LEFT;
+            // two-sided broadcasting combines positive/negative X with all counts.
+            for (direction, positive, negative, negative_fill) in [
+                ("LEFT", [1, 2, <$ty>::MIN], [-8, -16, 0], 0),
+                ("RIGHT", [1, 0, 0], [-8, -4, -1], -1),
+            ] {
+                let expected: Vec<_> = positive.into_iter()
+                    .chain(std::iter::repeat_n(0, 3 + extra))
+                    .chain(negative)
+                    .chain(std::iter::repeat_n(negative_fill, 3 + extra))
+                    .flat_map(<$ty>::to_le_bytes)
+                    .collect();
+                cases.push((Case {
+                    label: format!("BitShift-28[{dtype:?},{direction}]"),
+                    op: "BitShift",
+                    domain: "",
+                    opset: 28,
+                    inputs: vec![
+                        input(dtype, &[2, 1], &[1 as $ty, -8]),
+                        input(dtype, &[1, counts.len()], &counts),
+                    ],
+                    outputs: vec![(dtype, vec![2, counts.len()])],
+                    attrs: vec![("direction", Attribute::String(direction.as_bytes().to_vec()))],
+                    compare: Compare::ExactBytes,
+                }, expected));
+            }
+        }};
+    }
+    cases_for_type!(Int8, i8,);
+    cases_for_type!(Int16, i16,);
+    cases_for_type!(Int32, i32,);
+    cases_for_type!(Int64, i64, 1 << 32, -0xffff_ffff);
+    cases
+}
+
 /// `LogSoftmax` parity, f32/f16/bf16, opset-13 last-axis and legacy opset-11
 /// coerce-to-2D, including a large-magnitude row to exercise the stable
 /// shifted-logsumexp path (the #266 overflow lesson).
@@ -2579,7 +2622,9 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("BitwiseOr", bitwise_binary_cases("BitwiseOr")));
     p.push(sweep("BitwiseXor", bitwise_binary_cases("BitwiseXor")));
     p.push(sweep("BitwiseNot", bitwise_not_cases()));
-    p.push(sweep("BitShift", bitshift_cases()));
+    let mut shifts = bitshift_cases();
+    shifts.extend(signed_bitshift_cases().into_iter().map(|(case, _)| case));
+    p.push(sweep("BitShift", shifts));
     p.push(sweep("LogSoftmax", log_softmax_cases()));
     p.push(sweep("Hardmax", hardmax_cases()));
 
@@ -3238,6 +3283,19 @@ fn run_case(ep: &CudaExecutionProvider, case: &Case) -> Vec<Vec<u8>> {
         }
     }
     cuda
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn bitshift_native_cuda_conformance() {
+    let ep = require_cuda();
+    for (case, expected) in signed_bitshift_cases() {
+        let output = run_case(&ep, &case);
+        assert_eq!(output, [expected], "{}", case.label);
+    }
+    for case in bitshift_cases() {
+        run_case(&ep, &case);
+    }
 }
 
 #[cfg_attr(

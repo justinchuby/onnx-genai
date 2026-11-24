@@ -1,5 +1,6 @@
-//! Unsigned integer `BitShift` with NumPy-style broadcasting.
+//! Integer `BitShift` with NumPy-style broadcasting (signed since opset 28).
 
+use onnx_runtime_ep_api::bitshift::BitShiftTypes;
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
@@ -16,9 +17,10 @@ enum Direction {
 
 pub struct BitShiftKernel {
     direction: Direction,
+    types: BitShiftTypes,
 }
 
-pub struct BitShiftFactory;
+pub struct BitShiftFactory(pub BitShiftTypes);
 
 impl KernelFactory for BitShiftFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -36,7 +38,10 @@ impl KernelFactory for BitShiftFactory {
                 ));
             }
         };
-        Ok(Box::new(BitShiftKernel { direction }))
+        Ok(Box::new(BitShiftKernel {
+            direction,
+            types: self.0,
+        }))
     }
 }
 
@@ -63,19 +68,48 @@ macro_rules! impl_shiftable {
 
 impl_shiftable!(u8, u16, u32, u64);
 
+macro_rules! impl_signed_shiftable {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl Shiftable for $t {
+                fn shift_left(self, amount: Self) -> Self {
+                    u32::try_from(amount).ok()
+                        .and_then(|amount| self.checked_shl(amount))
+                        .unwrap_or(0)
+                }
+
+                fn shift_right(self, amount: Self) -> Self {
+                    u32::try_from(amount).ok()
+                        .and_then(|amount| self.checked_shr(amount))
+                        .unwrap_or(self >> (<$t>::BITS - 1))
+                }
+            }
+        )+
+    };
+}
+
+impl_signed_shiftable!(i8, i16, i32, i64);
+
 impl Kernel for BitShiftKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("BitShift", inputs, outputs, 2, 2, 1)?;
-        macro_rules! dispatch_unsigned {
+        self.types
+            .validate_dtype(inputs[0].dtype)
+            .map_err(EpError::KernelFailed)?;
+        macro_rules! dispatch {
             ($t:ty) => {
                 bitshift_typed::<$t>(self.direction, inputs, outputs)
             };
         }
         match inputs[0].dtype {
-            DataType::Uint8 => dispatch_unsigned!(u8),
-            DataType::Uint16 => dispatch_unsigned!(u16),
-            DataType::Uint32 => dispatch_unsigned!(u32),
-            DataType::Uint64 => dispatch_unsigned!(u64),
+            DataType::Uint8 => dispatch!(u8),
+            DataType::Uint16 => dispatch!(u16),
+            DataType::Uint32 => dispatch!(u32),
+            DataType::Uint64 => dispatch!(u64),
+            DataType::Int8 => dispatch!(i8),
+            DataType::Int16 => dispatch!(i16),
+            DataType::Int32 => dispatch!(i32),
+            DataType::Int64 => dispatch!(i64),
             other => Err(unsupported_dtype("BitShift", other)),
         }
     }
@@ -117,9 +151,10 @@ fn bitshift_typed<T: Shiftable + Default>(
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+    use onnx_runtime_ep_api::ExecutionProvider;
     use onnx_runtime_ir::{NodeId, compute_contiguous_strides};
 
-    fn unsigned(shape: &[usize], dtype: DataType, values: &[u64]) -> Owned {
+    fn from_bits(shape: &[usize], dtype: DataType, values: &[u64]) -> Owned {
         let mut bytes = Vec::with_capacity(values.len() * dtype.byte_size());
         for &value in values {
             bytes.extend_from_slice(&value.to_le_bytes()[..dtype.byte_size()]);
@@ -152,11 +187,12 @@ mod tests {
             DataType::Uint32,
             DataType::Uint64,
         ] {
-            let input = unsigned(&[2, 1], dtype, &[3, 8]);
-            let shifts = unsigned(&[1, 3], dtype, &[0, 1, 2]);
+            let input = from_bits(&[2, 1], dtype, &[3, 8]);
+            let shifts = from_bits(&[1, 3], dtype, &[0, 1, 2]);
             let mut left = Owned::zeros(dtype, &[2, 3]);
             BitShiftKernel {
                 direction: Direction::Left,
+                types: BitShiftTypes::UnsignedOnly,
             }
             .execute(&[input.view(), shifts.view()], &mut [left.view_mut()])
             .unwrap();
@@ -165,6 +201,7 @@ mod tests {
             let mut right = Owned::zeros(dtype, &[2, 3]);
             BitShiftKernel {
                 direction: Direction::Right,
+                types: BitShiftTypes::UnsignedOnly,
             }
             .execute(&[left.view(), shifts.view()], &mut [right.view_mut()])
             .unwrap();
@@ -179,6 +216,7 @@ mod tests {
         let mut out = Owned::zeros(DataType::Uint8, &[1]);
         BitShiftKernel {
             direction: Direction::Right,
+            types: BitShiftTypes::UnsignedOnly,
         }
         .execute(&[input.view(), shifts.view()], &mut [out.view_mut()])
         .unwrap();
@@ -188,6 +226,82 @@ mod tests {
     #[test]
     fn missing_direction_attribute_errors() {
         let node = Node::new(NodeId(0), "BitShift", vec![], vec![]);
-        assert!(BitShiftFactory.create(&node, &[]).is_err());
+        assert!(
+            BitShiftFactory(BitShiftTypes::UnsignedOnly)
+                .create(&node, &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn signed_bitshift_opset_28_directions_broadcast_and_counts() {
+        let cpu = crate::CpuExecutionProvider::new();
+        for dtype in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ] {
+            let width = (dtype.byte_size() * 8) as u64;
+            let sign_bit = 1u64 << (width - 1);
+            let mut counts = vec![0, 1, width - 1, width, width + 1, u64::MAX];
+            if dtype == DataType::Int64 {
+                // These counts alias 0 and 1 if truncated to a u32 before checking.
+                counts.extend([1 << 32, -0xffff_ffffi64 as u64]);
+            }
+            let shapes = [vec![2, 1], vec![1, counts.len()]];
+            let out_shape = [2, counts.len()];
+            let x = from_bits(&shapes[0], dtype, &[1, -8i64 as u64]);
+            let y = from_bits(&shapes[1], dtype, &counts);
+            for (direction, positive, negative, fill) in [
+                (
+                    "LEFT",
+                    [1, 2, sign_bit],
+                    [-8i64 as u64, -16i64 as u64, 0],
+                    0,
+                ),
+                (
+                    "RIGHT",
+                    [1, 0, 0],
+                    [-8i64 as u64, -4i64 as u64, u64::MAX],
+                    u64::MAX,
+                ),
+            ] {
+                let expected: Vec<_> = positive
+                    .into_iter()
+                    .chain(std::iter::repeat_n(0, counts.len() - 3))
+                    .chain(negative)
+                    .chain(std::iter::repeat_n(fill, counts.len() - 3))
+                    .collect();
+                let mut node = Node::new(NodeId(0), "BitShift", vec![], vec![]);
+                node.attributes.insert(
+                    "direction".into(),
+                    Attribute::String(direction.as_bytes().to_vec()),
+                );
+                let dtypes = [dtype; 2];
+                let declined = cpu.supports_op(&node, 27, &[], &dtypes, &[]);
+                assert!(declined.reason().unwrap().contains("opset 28"), "{dtype:?}");
+                assert!(
+                    cpu.supports_op(&node, 28, &[], &dtypes, &[]).is_supported(),
+                    "{dtype:?}"
+                );
+
+                let mut out = Owned::zeros(dtype, &out_shape);
+                let previous = cpu.get_kernel(&node, &shapes, 27).unwrap();
+                let error = previous
+                    .execute(&[x.view(), y.view()], &mut [out.view_mut()])
+                    .unwrap_err();
+                assert!(error.to_string().contains("opset 28"), "{error}");
+                let current = cpu.get_kernel(&node, &shapes, 28).unwrap();
+                current
+                    .execute(&[x.view(), y.view()], &mut [out.view_mut()])
+                    .unwrap();
+                assert_eq!(
+                    out.bytes,
+                    from_bits(&out_shape, dtype, &expected).bytes,
+                    "{dtype:?} {direction}"
+                );
+            }
+        }
     }
 }

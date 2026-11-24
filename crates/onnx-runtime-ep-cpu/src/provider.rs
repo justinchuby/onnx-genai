@@ -636,6 +636,23 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "BitShift"
+            && op.is_default_domain()
+            && let Some(&dtype) = input_dtypes.first()
+        {
+            if let Err(reason) =
+                onnx_runtime_ep_api::bitshift::BitShiftTypes::for_opset(opset).validate_dtype(dtype)
+            {
+                return KernelMatch::unsupported(reason);
+            }
+            if let Some(&rhs) = input_dtypes.get(1)
+                && dtype != rhs
+            {
+                return KernelMatch::unsupported(format!(
+                    "BitShift: operands must have the same dtype (got {dtype:?} and {rhs:?})"
+                ));
+            }
+        }
         // The reference kernels produce contiguous row-major outputs and accept
         // strided inputs, so no input layout is required.
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
