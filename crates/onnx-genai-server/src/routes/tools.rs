@@ -1,6 +1,7 @@
 //! llama.cpp host-tool discovery, invocation and bounded SSE transport.
 use super::*;
-use crate::tools::{BuiltinTool, Job, ResponseBytes, ToolValue, Tools};
+use crate::tools::mcp::Target;
+use crate::tools::{Job, ResponseBytes, ToolValue, Tools};
 use axum::{
     body::{Body, Bytes, to_bytes},
     extract::FromRequest,
@@ -24,8 +25,7 @@ struct Call {
 }
 pub(crate) struct AdmittedCall {
     call: Call,
-    tool: BuiltinTool,
-    tools: Arc<Tools>,
+    tool: Target,
     job: Arc<Job>,
     cwd: std::path::PathBuf,
     base64: bool,
@@ -84,6 +84,12 @@ impl FromRequest<AppState> for AdmittedCall {
                 "x-tool-runtime is not supported by the host executor; omit this header rather than silently falling back from an isolated runtime",
             ));
         }
+        let mcp_cwd = header_text(headers, "x-tool-cwd")?
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned);
+        let mcp_response = header_text(headers, "x-resp-type")?
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned);
         let cwd = tools.cwd(header_text(headers, "x-tool-cwd")?);
         let base64 = header_text(headers, "x-resp-type")? == Some("base64");
         let bound = header_text(headers, "content-length")?
@@ -124,8 +130,11 @@ impl FromRequest<AppState> for AdmittedCall {
         })?;
         job.retain_body_credit(bytes.len())
             .map_err(admission_error)?;
-        let tool = BuiltinTool::parse(&call.tool)
-            .filter(|tool| tools.enabled(*tool))
+        let job = Arc::new(job);
+        let mut tool = tools
+            .target(&call.tool, job.clone())
+            .await
+            .map_err(admission_error)?
             .ok_or_else(|| {
                 let mut error = ApiError::invalid_request(
                     "unknown or disabled tool; GET /tools lists enabled tool names",
@@ -133,6 +142,9 @@ impl FromRequest<AppState> for AdmittedCall {
                 error.status = StatusCode::NOT_FOUND;
                 error
             })?;
+        tool.frontend_controls(mcp_cwd, mcp_response);
+        job.begin_operation(tool.timeout())
+            .map_err(admission_error)?;
         if call.stream && !tool.streaming() {
             let mut error = ApiError::invalid_request(format!(
                 "tool '{}' does not support stream=true",
@@ -141,18 +153,10 @@ impl FromRequest<AppState> for AdmittedCall {
             error.status = StatusCode::NOT_FOUND;
             return Err(error);
         }
-        job.limit_time(
-            if matches!(tool, BuiltinTool::FileGlobSearch | BuiltinTool::GrepSearch) {
-                Duration::from_secs(15)
-            } else {
-                Duration::from_secs(60)
-            },
-        );
         Ok(Self {
             call,
             tool,
-            tools,
-            job: Arc::new(job),
+            job,
             cwd,
             base64,
         })
@@ -217,9 +221,26 @@ pub(crate) async fn list(
 ) -> Result<Response, ApiError> {
     let tools = owner(&state, &headers)?;
     let job = Arc::new(tools.admit(0).map_err(admission_error)?);
+    let catalog = tools.catalog(job.clone()).await.map_err(admission_error)?;
+    let leases = if catalog.wire_bytes == 0 {
+        Vec::new()
+    } else {
+        vec![
+            tools
+                .reserve(
+                    catalog
+                        .wire_bytes
+                        .saturating_mul(32)
+                        .saturating_add(16 * 1024),
+                )
+                .map_err(admission_error)?,
+        ]
+    };
+    let mut definitions = tools.definitions().as_array().cloned().unwrap_or_default();
+    definitions.extend(catalog.tools.values().map(|tool| tool.definition.clone()));
     encode(ToolValue {
-        value: tools.definitions(),
-        leases: Vec::new(),
+        value: Value::Array(definitions),
+        leases,
         job,
     })
 }
@@ -227,7 +248,6 @@ pub(crate) async fn invoke(admitted: AdmittedCall) -> Result<Response, ApiError>
     let AdmittedCall {
         call,
         tool,
-        tools,
         job,
         cwd,
         base64,
@@ -238,15 +258,8 @@ pub(crate) async fn invoke(admitted: AdmittedCall) -> Result<Response, ApiError>
         let producer_job = job.clone();
         tokio::spawn(async move {
             let params = call.params.as_ref().map_or("{}", |p| p.get());
-            let result = tools
-                .invoke(
-                    tool,
-                    params,
-                    cwd,
-                    base64,
-                    producer_job,
-                    Some(sender.clone()),
-                )
+            let result = tool
+                .invoke(params, cwd, base64, producer_job, Some(sender.clone()))
                 .await;
             let final_event = match result {
                 Ok(_) => json!({"done":true}),
@@ -263,9 +276,7 @@ pub(crate) async fn invoke(admitted: AdmittedCall) -> Result<Response, ApiError>
         .into_response());
     }
     let params = call.params.as_ref().map_or("{}", |p| p.get());
-    let result = tools
-        .invoke(tool, params, cwd, base64, job.clone(), None)
-        .await;
+    let result = tool.invoke(params, cwd, base64, job.clone(), None).await;
     let value = match result {
         Ok(result) => result,
         Err(error) if error.is::<onnx_runtime_memory_api::MemoryError>() => {

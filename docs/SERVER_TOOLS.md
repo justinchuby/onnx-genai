@@ -92,7 +92,8 @@ Filesystem/process failures are ordinary tool result objects containing `error`.
 `/props` reports `nxrt_capabilities.server_tools` independently of the model's
 ability to generate tool calls. Discovery and execution do not load a model.
 
-This increment supplies the seven host built-ins. MCP stdio discovery/invocation
-and container/SSH tool runtimes remain separate compatibility work.
+The seven host built-ins can be combined with [stdio MCP tools](SERVER_MCP.md)
+configured through `--mcp-servers-config` or `--mcp-servers-json`. MCP configuration
+does not enable host built-ins. Container/SSH tool runtimes remain separate work.
 `x-tool-runtime` is refused explicitly; a request for an isolate never falls back
 to host execution. The HTTP MCP proxy is a separate opt-in transport.

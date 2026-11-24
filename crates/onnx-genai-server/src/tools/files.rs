@@ -83,7 +83,7 @@ struct GrepArgs {
     context_lines: usize,
 }
 
-fn regular(path: &Path) -> anyhow::Result<File> {
+pub(super) fn regular(path: &Path) -> anyhow::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -109,7 +109,7 @@ fn regular(path: &Path) -> anyhow::Result<File> {
     );
     Ok(file)
 }
-fn read_bounded(path: &Path, limit: usize) -> anyhow::Result<Vec<u8>> {
+pub(super) fn read_bounded(path: &Path, limit: usize) -> anyhow::Result<Vec<u8>> {
     let file = regular(path)?;
     let length = usize::try_from(
         file.metadata()

@@ -148,7 +148,7 @@ pub(super) async fn run(
         .stderr
         .take()
         .context("tool stderr pipe is unavailable")?;
-    let deadline = (Instant::now() + timeout).min(job.deadline);
+    let deadline = (Instant::now() + timeout).min(job.deadline());
     let mut out = Vec::new();
     let mut stdout_bytes = Vec::new();
     stdout_bytes
@@ -197,7 +197,7 @@ pub(super) async fn run(
     // The process is terminal; keep no completed child handle in a drop reaper.
     guard.child.take();
     if !truncated {
-        emit(events, decoder.push(&[], true), job.deadline, job).await?;
+        emit(events, decoder.push(&[], true), job.deadline(), job).await?;
     }
     Ok(Output {
         output: out,
@@ -257,7 +257,7 @@ pub(super) async fn shell(
         tail.push_str(" [exit due to timed out]");
     }
     let value = if events.is_some() {
-        emit(events.as_ref(), tail, job.deadline, &job).await?;
+        emit(events.as_ref(), tail, job.deadline(), &job).await?;
         Value::Null
     } else {
         let mut decoder = Utf8Chunks::default();
