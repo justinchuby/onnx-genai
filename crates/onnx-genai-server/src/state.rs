@@ -391,6 +391,7 @@ pub struct AppState {
     pub(crate) completion_controls: crate::completion_control::CompletionControls,
     pub(crate) proxy_connections: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) slot_storage: Option<Arc<crate::slot_storage::SlotStorage>>,
+    pub(crate) tools: Option<Arc<crate::tools::Tools>>,
     pub(crate) config: ServerConfig,
 }
 
@@ -459,6 +460,8 @@ pub struct ServerConfig {
     pub replay_buffer_bytes: usize,
     /// Optional frontend proxy; independent from model-management privileges.
     pub mcp_proxy_policy: McpProxyPolicy,
+    /// Explicit host tools available to trusted clients. Disabled by default.
+    pub tools: crate::ToolsConfig,
     /// Maximum bytes in each proxy request or streamed response.
     pub mcp_proxy_max_bytes: std::num::NonZeroUsize,
     /// Maximum simultaneous outbound proxy transfers.
@@ -524,6 +527,7 @@ impl Default for ServerConfig {
             max_replay_streams: 16,
             replay_buffer_bytes: 4 * 1024 * 1024,
             mcp_proxy_policy: McpProxyPolicy::Disabled,
+            tools: crate::ToolsConfig::default(),
             mcp_proxy_max_connections: std::num::NonZeroUsize::new(16)
                 .expect("positive proxy connection budget"),
             mcp_proxy_max_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024)
@@ -553,6 +557,7 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     fn validate(mut self) -> anyhow::Result<Self> {
+        self.tools.validate()?;
         if self.slot_save_path.is_some()
             && self.engine_config.native_state_files
                 == onnx_genai_engine::NativeStateFilePolicy::Disabled
@@ -648,6 +653,7 @@ impl AppState {
         let registry = ModelRegistry::from_specs(std::slice::from_ref(&spec), config.clone())?;
         Ok(Self {
             registry,
+            tools: crate::tools::Tools::new(&config.tools)?,
             slot_storage,
             replays: crate::replay::ReplayRegistry::new(
                 config.max_replay_streams,
@@ -694,6 +700,7 @@ impl AppState {
         let registry = ModelRegistry::from_specs(&specs, config.clone())?;
         Ok(Self {
             registry,
+            tools: crate::tools::Tools::new(&config.tools)?,
             slot_storage,
             replays: crate::replay::ReplayRegistry::new(
                 config.max_replay_streams,

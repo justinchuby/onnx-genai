@@ -7864,10 +7864,13 @@ mod llama_compat {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        for path in ["/tools", "/cors-proxy"] {
+        for (path, kind) in [
+            ("/tools", "permission_error"),
+            ("/cors-proxy", "feature_disabled"),
+        ] {
             let (status, error) = call(router.clone(), "GET", path, Value::Null).await;
             assert_eq!(status, StatusCode::FORBIDDEN);
-            assert_eq!(error["error"]["type"], "feature_disabled");
+            assert_eq!(error["error"]["type"], kind);
         }
     }
 }
