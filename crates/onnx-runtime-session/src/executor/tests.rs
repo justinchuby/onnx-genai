@@ -8651,8 +8651,16 @@ fn coverage_collector_surfaces_ep_decline_reason() {
     )
     .unwrap();
     let mut issues = Vec::new();
-    collect_cuda_coverage_issues(&graph, &graph, &ep, artifact_config, "graph", &mut issues)
-        .unwrap();
+    collect_cuda_coverage_issues(
+        &graph,
+        &graph,
+        &ep,
+        artifact_config,
+        "graph",
+        &mut issues,
+        false,
+    )
+    .unwrap();
 
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0].op_type, "NotRegistered");
@@ -8719,7 +8727,7 @@ fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() 
     )
     .unwrap();
     let report = || {
-        cuda_fallback_report(&graph, &ep, artifact_config)
+        cuda_fallback_report(&graph, &ep, artifact_config, false)
             .unwrap()
             .expect("CUDA declines must produce a fallback report")
             .to_string()
