@@ -108,6 +108,7 @@ fn push(state: &mut State, op: Op, budget: &mut Budget) -> Result<()> {
     Ok(())
 }
 fn branch(state: &State, queued: &mut Vec<State>, budget: &mut Budget) -> Result<()> {
+    budget.spend(state.units())?;
     budget.reserve(state.units())?;
     queued.push(state.clone());
     Ok(())
@@ -177,12 +178,14 @@ fn run(
                                 }
                             }
                             Kind::Seq(items) => {
+                                budget.spend(items.len())?;
                                 budget.reserve(items.len())?;
                                 state.ops.extend(items.iter().rev().copied().map(Op::Node));
                             }
                             Kind::Alt(items) => {
                                 if let Some((&first, rest)) = items.split_first() {
                                     for &id in rest.iter().rev() {
+                                        budget.spend(state.units() + 1)?;
                                         budget.reserve(state.units() + 1)?;
                                         let mut alternative = state.clone();
                                         alternative.ops.push(Op::Node(id));
@@ -277,6 +280,7 @@ fn run(
                                 branch(&state, &mut queued, budget)?;
                                 take(&mut state, repetition, budget)?;
                             } else {
+                                budget.spend(state.units() + 2)?;
                                 budget.reserve(state.units() + 2)?;
                                 let mut alternative = state.clone();
                                 // Those two queued operations were already admitted above.
