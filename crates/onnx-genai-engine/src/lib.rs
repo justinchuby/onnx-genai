@@ -12,6 +12,7 @@ pub mod byte_grammar;
 mod byte_stream;
 pub mod config;
 pub(crate) mod connector_bridge;
+pub mod decision;
 pub(crate) mod decode;
 pub(crate) mod decode_loop;
 pub mod embedding;

@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "base": "22cfd90ee5f7fcf668bc41edb64ee98bf27ddc03",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "bd30a3f3163bd8c0d42128864ef2598cfb152a54299fe8ed969c923ced1d186c",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "52403951fcba5f33e37932a01e863d797cd33f317ad2bd8730a78536e68ab204"
+  },
+  "probe_sha256": "43f29035f48374b3fa0a20ee1636089b7a25da668f7b352b80c963f679bff707",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "hardware": {
+    "machdep.cpu.brand_string": "Apple M1 Max",
+    "hw.memsize": "34359738368",
+    "hw.logicalcpu": "10",
+    "hardware_read_command": "/usr/sbin/sysctl -n machdep.cpu.brand_string hw.memsize hw.logicalcpu",
+    "hardware_read_exit": 0,
+    "hardware_read_authority": "separate escalated read-only command; sandbox sysctl was denied before any build or timing",
+    "hardware_read_time_utc": "2026-11-24T19:43:28.315736+00:00"
+  },
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "lock_inode": 339651569,
+  "lock_busy_control": true,
+  "parent_pid": 75379,
+  "binaries": {
+    "baseline": {
+      "sha256": "6ce2bccb5a6d014d0640ac984cb480ee2168f0fec2095d41cf277dd7524ab5ea",
+      "native": true,
+      "symbol_count": 28413
+    },
+    "candidate": {
+      "sha256": "afcfd128f91ab89a6b21686498d47772d57e7c9a8578ad02bd6691204fc3eea9",
+      "native": true,
+      "symbol_count": 28242
+    }
+  },
+  "foreign_core_monitor": "Unavailable on Darwin; no claim of an idle host",
+  "metric": "terminal child user+system CPU seconds, includes setup/work/validation/output IO/retirement; not pure inference latency",
+  "receipts_sha256": "9a6c83715adbd155a6956808bf4b2e3a51528bc19c8c06a5df89186e6dab46c5",
+  "runner_sha256": "debb6ee53360ed32878478d9b8b5bd8e3451e1c3b1cb9ca466b24eab8dfe43ac",
+  "processes": 144
+}

@@ -726,6 +726,31 @@ semantics to make items compatible, and unsupported grouped execution falls back
 to isolated execution. Placement, host/device transfers, allocation, group size,
 and scheduling remain runtime policy.
 
+### 10.5 Multimodal relevance profiles and reusable image preprocessing (v1.12)
+
+A required `kind: reranking`, `version: '2'` profile declares `reranking` with
+ordered `query_images` and `document_images` workflow-input names. At least one
+list is nonempty; names are unique across both lists. Each input is opaque,
+application-sourced and a uint8 encoded-byte vector. Its required/default and
+`present_as` declarations retain their ordinary workflow meaning. The task ABI
+supplies tokenizer pair rows and binds supplied images to the ordered endpoints;
+it never guesses model names, vision geometry, placeholders or calibration.
+The workflow owns decoding and feature fusion.
+
+`outputs.score` names a final floating scalar relevance probability in [0,1].
+`outputs.prompt_tokens` is required and names a single int64 token-usage count,
+including media-token expansion authored inside the workflow. Negative or
+unrepresentable counts fail. Version 1 text-pair profiles retain tokenizer-owned
+non-padding counts and do not admit images.
+
+The `onnx-genai.image-preprocess@2` component adapter requires schema v1.12.
+`preprocessing.image.outputs[].name` names an adapter output port, scoped to that
+component; each invocation maps it to a distinct workflow SSA value. The adapter
+may be invoked repeatedly, including inside branches, while every invocation
+binds every declared program output and preserves its exact typed contract.
+Version 1 retains workflow-scoped names and its exactly-one-invocation rule.
+These are explicit adapter ABIs, not alternative inference of output names.
+
 ## 11. Cache correctness dependencies
 
 ### 11.1 Derived, not declared

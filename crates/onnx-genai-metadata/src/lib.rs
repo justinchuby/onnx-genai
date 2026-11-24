@@ -40,10 +40,11 @@ pub use graph_cardinality::{
 pub use identity::{IDENTITY_SCHEME, semantic_identity, semantic_identity_of_str};
 pub use lowering::{CompiledWorkflow, compile_workflow};
 pub use parser::{
-    MtpProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor, SpeculatorProposerKind,
-    SpeculatorProposerStatus, find_metadata_path, inspect_legacy_speculator_for_migration,
-    load_metadata, load_metadata_from_dir, load_metadata_package, load_metadata_with_identity,
-    load_pipeline_spec, parse_metadata, parse_metadata_json, resolve_package_artifact,
+    METADATA_FILE_NAMES, MtpProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor,
+    SpeculatorProposerKind, SpeculatorProposerStatus, find_metadata_path,
+    inspect_legacy_speculator_for_migration, load_metadata, load_metadata_from_dir,
+    load_metadata_package, load_metadata_with_identity, load_pipeline_spec, parse_metadata,
+    parse_metadata_json, resolve_package_artifact,
 };
 pub use schema::*;
 pub use session_state::{
@@ -65,7 +66,8 @@ pub use validation::{
 };
 pub use version::{
     BATCHING_SCHEMA_VERSION, CANONICAL_SPECULATION_SCHEMA_VERSION, COMPRESSED_STATE_SCHEMA_VERSION,
-    DFLASH_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION, OUTPUT_PROTOCOL_SCHEMA_VERSION,
+    DECISION_INPUT_SCHEMA_VERSION, DECISION_SCHEMA_VERSION, DFLASH_SCHEMA_VERSION,
+    INITIAL_SCHEMA_VERSION, MULTIMODAL_RERANKING_SCHEMA_VERSION, OUTPUT_PROTOCOL_SCHEMA_VERSION,
     PUBLICATION_MODE_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS,
     SchemaDocumentContext, SchemaFamily, SchemaVersion, SchemaVersionError,
     SupportedSchemaVersions, TOKEN_AUTHORITY_SCHEMA_VERSION, TOOL_PROTOCOL_SCHEMA_VERSION,
@@ -120,3 +122,6 @@ impl MetadataError {
         }
     }
 }
+
+pub mod decision;
+mod decision_policy;

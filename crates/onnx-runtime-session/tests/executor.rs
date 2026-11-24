@@ -289,8 +289,8 @@ impl Kernel for FinalizationCheckingKernel {
         self.inner.set_constant_inputs(constant_inputs);
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.inner.set_capture_seq_independent(seq_independent);
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        self.inner.configure_shape_facts(facts);
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> EpResult<()> {

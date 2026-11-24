@@ -68,6 +68,7 @@ pub(crate) struct EngineDriver {
     pub(crate) workflow_facts: WorkflowFacts,
     pub(crate) runtime_sampling: bool,
     pub(crate) reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
+    pub(crate) decision: Option<Arc<onnx_genai_metadata::decision::DecisionContract>>,
     /// One lock-free KV mirror per worker. The legacy aggregate fields continue
     /// to report worker 0; debug/status expose this full list.
     pub(crate) worker_kv_telemetry: Arc<Vec<Arc<KvTelemetry>>>,
@@ -207,8 +208,13 @@ pub(crate) enum DriverCommand {
         reply: oneshot::Sender<Result<onnx_genai_engine::PrefillResult, DriverFailure>>,
         permit: WorkerPermit,
     },
+    Decide {
+        request: Box<onnx_genai_engine::decision::PreparedDecision>,
+        reply: oneshot::Sender<anyhow::Result<onnx_genai_engine::decision::DecisionResult>>,
+        permit: WorkerPermit,
+    },
     ScorePair {
-        pair: Box<onnx_genai_engine::ranking::PreparedTokenPair>,
+        pair: Box<onnx_genai_engine::ranking::PreparedRerankingPair>,
         reply: oneshot::Sender<anyhow::Result<onnx_genai_engine::ranking::RerankingScore>>,
         permit: WorkerPermit,
     },
@@ -442,6 +448,7 @@ struct EngineWorkerReady {
     workflow_facts: WorkflowFacts,
     runtime_sampling: bool,
     reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
+    decision: Option<Arc<onnx_genai_metadata::decision::DecisionContract>>,
 }
 
 fn prepare_engine_worker<DropProbe>(
@@ -469,6 +476,8 @@ fn prepare_engine_worker<DropProbe>(
             )
         })
         .transpose()?;
+    let decision =
+        onnx_genai_metadata::decision::decision_contract(engine.metadata())?.map(Arc::new);
     let reranking =
         onnx_genai_metadata::task_profiles::reranking_contract(engine.metadata())?.map(Arc::new);
     let batching = Arc::new(BatchingReport::from_capability(
@@ -509,6 +518,7 @@ fn prepare_engine_worker<DropProbe>(
         workflow_facts,
         runtime_sampling,
         reranking,
+        decision,
     };
     Ok((
         EngineWorkerState {
@@ -701,6 +711,7 @@ impl EngineDriver {
         for (index, ready) in worker_readies.iter().enumerate().skip(1) {
             if ready.batching.supported != first_ready.batching.supported
                 || ready.batching.effective_max_batch != first_ready.batching.effective_max_batch
+                || ready.decision != first_ready.decision
                 || ready.reranking != first_ready.reranking
                 || ready.workflow_facts.components != first_ready.workflow_facts.components
                 || ready.workflow_facts.graph_components
@@ -750,6 +761,7 @@ impl EngineDriver {
                 workflow_facts: first_ready.workflow_facts,
                 runtime_sampling: first_ready.runtime_sampling,
                 reranking: first_ready.reranking,
+                decision: first_ready.decision,
                 worker_kv_telemetry,
             },
             ready_payload,
@@ -1182,9 +1194,29 @@ impl EngineDriver {
         anyhow::bail!("generation stream ended before result")
     }
 
+    pub(crate) async fn decide(
+        &self,
+        request: onnx_genai_engine::decision::PreparedDecision,
+    ) -> Result<onnx_genai_engine::decision::DecisionResult, GenerateSubmitError> {
+        let (commands, permit) = self.reserve_stateless_command()?;
+        let (reply, response) = oneshot::channel();
+        commands
+            .send(DriverCommand::Decide {
+                request: Box::new(request),
+                reply,
+                permit,
+            })
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+        response
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?
+            .map_err(|error| GenerateSubmitError::Failed(DriverFailure::from_engine_error(&error)))
+    }
+
     pub(crate) async fn score_pair(
         &self,
-        pair: onnx_genai_engine::ranking::PreparedTokenPair,
+        pair: onnx_genai_engine::ranking::PreparedRerankingPair,
     ) -> Result<onnx_genai_engine::ranking::RerankingScore, GenerateSubmitError> {
         let (commands, permit) = self.reserve_stateless_command()?;
         let (reply, response) = oneshot::channel();
@@ -1955,6 +1987,7 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
                     | DriverCommand::SynthesizeSpeech { .. }
                     | DriverCommand::Embed { .. }
                     | DriverCommand::ScorePair { .. }
+                    | DriverCommand::Decide { .. }
                     | DriverCommand::Prefill { .. }
             )
         })
@@ -2362,13 +2395,26 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             }
             let _ = reply.send(result);
         }
+        DriverCommand::Decide {
+            request,
+            reply,
+            permit: _permit,
+        } => {
+            if !reply.is_closed() {
+                let result = engine.decide(*request);
+                if let Ok(result) = &result {
+                    crate::metrics::add_prompt_tokens(result.prompt_tokens());
+                }
+                let _ = reply.send(result);
+            }
+        }
         DriverCommand::ScorePair {
             pair,
             reply,
             permit: _permit,
         } => {
             if !reply.is_closed() {
-                let result = engine.score_token_pair(*pair);
+                let result = engine.score_reranking_pair(*pair);
                 if let Ok(score) = &result {
                     crate::metrics::add_prompt_tokens(score.prompt_tokens);
                 }
@@ -3311,6 +3357,7 @@ mod admission_tests {
             adapters: None,
             native_slot: None,
             reranking: None,
+            decision: None,
             runtime_sampling: false,
             workflow_facts: crate::driver::WorkflowFacts {
                 components: 0,
@@ -3671,6 +3718,7 @@ mod admission_tests {
             adapters: None,
             native_slot: None,
             reranking: None,
+            decision: None,
             runtime_sampling: false,
             workflow_facts: WorkflowFacts {
                 components: 0,
@@ -3727,6 +3775,7 @@ mod admission_tests {
             adapters: None,
             native_slot: None,
             reranking: None,
+            decision: None,
             runtime_sampling: false,
             workflow_facts: WorkflowFacts {
                 components: 0,
