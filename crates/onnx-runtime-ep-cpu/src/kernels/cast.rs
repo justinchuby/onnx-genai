@@ -100,10 +100,13 @@ num_to_int!(to_u64, u64);
 /// resolved; execution errors if it was absent).
 pub struct CastKernel {
     to: Option<DataType>,
+    float6: bool,
 }
 
 /// Factory reading the ONNX `to` attribute (a `TensorProto.DataType` integer).
-pub struct CastFactory;
+pub struct CastFactory {
+    pub float6: bool,
+}
 
 impl KernelFactory for CastFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -111,7 +114,10 @@ impl KernelFactory for CastFactory {
             .attr("to")
             .and_then(|a| a.as_int())
             .and_then(|raw| DataType::from_onnx(raw as i32));
-        Ok(Box::new(CastKernel { to }))
+        Ok(Box::new(CastKernel {
+            to,
+            float6: self.float6,
+        }))
     }
 }
 
@@ -134,7 +140,7 @@ impl Kernel for CastKernel {
         let to = self.to.ok_or_else(|| {
             EpError::KernelFailed("Cast: missing or unsupported `to` attribute".into())
         })?;
-        cast_to("Cast", &inputs[0], &mut outputs[0], to)
+        cast_to("Cast", &inputs[0], &mut outputs[0], to, self.float6)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -146,7 +152,13 @@ impl Kernel for CastLikeKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("CastLike", inputs, outputs, 2, 2, 1)?;
         inputs[1].validate()?;
-        cast_to("CastLike", &inputs[0], &mut outputs[0], inputs[1].dtype)
+        cast_to(
+            "CastLike",
+            &inputs[0],
+            &mut outputs[0],
+            inputs[1].dtype,
+            false,
+        )
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -154,7 +166,13 @@ impl Kernel for CastLikeKernel {
     }
 }
 
-fn cast_to(op: &str, input: &TensorView, output: &mut TensorMut, to: DataType) -> Result<()> {
+fn cast_to(
+    op: &str,
+    input: &TensorView,
+    output: &mut TensorMut,
+    to: DataType,
+    float6: bool,
+) -> Result<()> {
     // Cast to/from STRING is a real ONNX feature, but the ep-cpu stores
     // string tensors out-of-band (String has no fixed-width raw byte
     // layout), so the byte-oriented conversion table below cannot produce or
@@ -176,6 +194,14 @@ fn cast_to(op: &str, input: &TensorView, output: &mut TensorMut, to: DataType) -
             output.dtype
         )));
     }
+    if input.dtype.is_float6() {
+        if !float6 {
+            return Err(EpError::KernelFailed(format!(
+                "{op}: FLOAT6 widening requires standard Cast at opset 28 or newer"
+            )));
+        }
+        return widen_float6(input, output);
+    }
 
     // Fast path first: both views row-major contiguous and non-overlapping.
     // The generic path below costs an `elem_offset` dot product, a `next_index`
@@ -194,6 +220,137 @@ fn cast_to(op: &str, input: &TensorView, output: &mut TensorMut, to: DataType) -
         write_num(&mut bytes, n, to)?;
     }
     super::write_dense_bytes(output, &bytes)
+}
+
+fn widen_float6(input: &TensorView, output: &mut TensorMut) -> Result<()> {
+    input.validate()?;
+    output.validate()?;
+    if input.shape != output.shape {
+        return Err(EpError::KernelFailed(
+            "Cast from FLOAT6 requires matching input and output shapes".into(),
+        ));
+    }
+    if !matches!(
+        output.dtype,
+        DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
+    ) {
+        return Err(EpError::KernelFailed(format!(
+            "CPU Cast from {:?} to {:?} is unsupported; cast FLOAT6 to f16, bf16, f32, or f64 first",
+            input.dtype, output.dtype
+        )));
+    }
+    let values = float6_table(input.dtype);
+    let n = input.numel();
+    if n == 0 {
+        return Ok(());
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        let mut bytes = Vec::with_capacity(output.byte_size());
+        let mut index = vec![0; input.shape.len()];
+        let origin = input.data_ptr::<u8>();
+        loop {
+            let element = crate::strided::elem_offset(input.strides, &index);
+            let lane_bit = element.rem_euclid(4) * 6;
+            let offset = element.div_euclid(4) * 3 + lane_bit / 8;
+            let shift = lane_bit % 8;
+            // The executor owns the strided extent. Read a second byte only
+            // for codes that straddle a boundary, including the final group.
+            let word = unsafe {
+                u16::from(*origin.offset(offset))
+                    | if shift > 2 {
+                        u16::from(*origin.offset(offset + 1)) << 8
+                    } else {
+                        0
+                    }
+            };
+            let code = usize::from((word >> shift) & 63);
+            write_num(&mut bytes, Num::F(f64::from(values[code])), output.dtype)?;
+            if !crate::strided::next_index(input.shape, &mut index) {
+                break;
+            }
+        }
+        return super::write_dense_bytes(output, &bytes);
+    }
+    // SAFETY: the CPU kernel contract supplies live buffers for both validated
+    // dense views; use byte slices so mapped origins need not be aligned.
+    let len = output.byte_size();
+    let src_ptr = input.data_ptr::<u8>();
+    let dst_ptr = output.data_ptr_mut::<u8>();
+    let src_len = input.byte_size();
+    let src = unsafe { std::slice::from_raw_parts(src_ptr, src_len) };
+    let snapshot;
+    let src = if byte_ranges_overlap(src_ptr, src_len, dst_ptr, len) {
+        snapshot = src.to_vec();
+        snapshot.as_slice()
+    } else {
+        src
+    };
+    // The borrowed source is disjoint from the destination, or was copied.
+    let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, len) };
+    match output.dtype {
+        DataType::Float32 => write_float6(src, dst, n, values.map(f32::to_le_bytes)),
+        DataType::Float64 => write_float6(src, dst, n, values.map(|x| (x as f64).to_le_bytes())),
+        DataType::Float16 => write_float6(
+            src,
+            dst,
+            n,
+            values.map(|x| half::f16::from_f32(x).to_le_bytes()),
+        ),
+        DataType::BFloat16 => write_float6(
+            src,
+            dst,
+            n,
+            values.map(|x| half::bf16::from_f32(x).to_le_bytes()),
+        ),
+        _ => unreachable!("FLOAT6 destination was validated"),
+    }
+    Ok(())
+}
+
+fn byte_ranges_overlap(src: *const u8, src_len: usize, dst: *const u8, dst_len: usize) -> bool {
+    let (src, dst) = (src.addr(), dst.addr());
+    src < dst.saturating_add(dst_len) && dst < src.saturating_add(src_len)
+}
+
+fn float6_table(dtype: DataType) -> [f32; 64] {
+    let (mantissa, bias) = if dtype == DataType::Float6E2M3 {
+        (3, 1)
+    } else {
+        (2, 3)
+    };
+    std::array::from_fn(|code| {
+        let exponent = (code as i32 & 31) >> mantissa;
+        let fraction = code as i32 & ((1 << mantissa) - 1);
+        let significand = if exponent == 0 {
+            fraction
+        } else {
+            (1 << mantissa) | fraction
+        };
+        let magnitude = significand as f32 * 2f32.powi(exponent.max(1) - bias - mantissa);
+        if code & 32 != 0 {
+            -magnitude
+        } else {
+            magnitude
+        }
+    })
+}
+
+fn write_float6<const WIDTH: usize>(
+    src: &[u8],
+    dst: &mut [u8],
+    count: usize,
+    table: [[u8; WIDTH]; 64],
+) {
+    for (group, out) in src.chunks(3).zip(dst.chunks_mut(4 * WIDTH)) {
+        let mut bytes = [0; 4];
+        bytes[..group.len()].copy_from_slice(group);
+        let packed = u32::from_le_bytes(bytes);
+        for (lane, element) in out.chunks_exact_mut(WIDTH).enumerate() {
+            let code = (packed >> (6 * lane)) as usize & 63;
+            element.copy_from_slice(&table[code]);
+        }
+    }
+    debug_assert_eq!(dst.len(), count * WIDTH);
 }
 
 /// Number of elements converted per staging batch. Sized so the `Num` staging
@@ -678,9 +835,40 @@ mod tests {
     }
 
     fn cast(to: DataType, input: &Owned, out: &mut Owned) {
-        CastKernel { to: Some(to) }
-            .execute(&[input.view()], &mut [out.view_mut()])
-            .unwrap();
+        CastKernel {
+            to: Some(to),
+            float6: true,
+        }
+        .execute(&[input.view()], &mut [out.view_mut()])
+        .unwrap();
+    }
+
+    #[test]
+    fn float6_cast_reads_partial_groups_and_strided_codes() {
+        let packed = Owned {
+            bytes: vec![0x01, 0x0b, 0x02], // E2M3 codes [1, 44, 32].
+            shape: vec![3],
+            strides: vec![1],
+            dtype: DataType::Float6E2M3,
+        };
+        let mut out = Owned::zeros(DataType::Float32, &[3]);
+        let legacy = CastKernel {
+            to: Some(DataType::Float32),
+            float6: false,
+        };
+        let error = legacy
+            .execute(&[packed.view()], &mut [out.view_mut()])
+            .unwrap_err();
+        assert!(error.to_string().contains("opset 28"));
+        cast(DataType::Float32, &packed, &mut out);
+        assert_eq!(
+            out.to_f32().iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            [0.125_f32, -1.5, -0.0].map(f32::to_bits)
+        );
+        let mut out = Owned::zeros(DataType::Float32, &[2]);
+        cast(DataType::Float32, &packed.with_view(&[2], &[2]), &mut out);
+        assert_eq!(out.to_f32()[1].to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(out.to_f32()[0], 0.125);
     }
 
     #[test]
@@ -856,7 +1044,11 @@ mod tests {
     fn missing_to_attribute_errors() {
         let a = Owned::f32(&[1], &[1.0]);
         let mut out = Owned::zeros(DataType::Int64, &[1]);
-        let err = CastKernel { to: None }.execute(&[a.view()], &mut [out.view_mut()]);
+        let err = CastKernel {
+            to: None,
+            float6: false,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()]);
         assert!(err.is_err());
     }
 
@@ -868,6 +1060,7 @@ mod tests {
         let mut out = Owned::zeros(DataType::String, &[1]);
         let err = CastKernel {
             to: Some(DataType::String),
+            float6: false,
         }
         .execute(&[a.view()], &mut [out.view_mut()]);
         let msg = format!("{}", err.unwrap_err());
@@ -882,6 +1075,7 @@ mod tests {
         let mut out = Owned::zeros(DataType::Float32, &[1]);
         let err = CastKernel {
             to: Some(DataType::Float32),
+            float6: false,
         }
         .execute(&[a.view()], &mut [out.view_mut()]);
         let msg = format!("{}", err.unwrap_err());
@@ -919,9 +1113,12 @@ mod contiguous_fast_path_tests {
         let mut input = Owned::zeros(from, &[n]);
         input.bytes.copy_from_slice(src);
         let mut output = Owned::zeros(to, &[n]);
-        CastKernel { to: Some(to) }
-            .execute(&[input.view()], &mut [output.view_mut()])
-            .unwrap();
+        CastKernel {
+            to: Some(to),
+            float6: false,
+        }
+        .execute(&[input.view()], &mut [output.view_mut()])
+        .unwrap();
         output.bytes
     }
 
@@ -1147,6 +1344,7 @@ mod contiguous_fast_path_tests {
         let mut output = Owned::zeros(DataType::Float32, &[3, 2]);
         CastKernel {
             to: Some(DataType::Float32),
+            float6: false,
         }
         .execute(&[input.view()], &mut [output.view_mut()])
         .unwrap();

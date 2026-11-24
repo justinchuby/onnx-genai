@@ -1677,9 +1677,26 @@ and use supported encodings.
   packing and must have a whole-byte payload: unlike ONNX, SafeTensors
   cannot store an odd number of `F4` values by padding the final nibble.
   Use the logical shape in the SafeTensors header, not the byte shape
-  exposed by PyTorch's `float4_e2m1fn_x2`. ONNX defines FLOAT6 types, but
-  nxrt does not yet represent them internally, so `F6_E2M3` and `F6_E3M2`
-  are rejected rather than being reinterpreted as bytes or another dtype.
+  exposed by PyTorch's `float4_e2m1fn_x2`. `F6_E2M3` and `F6_E3M2` map to
+  ONNX `FLOAT6E2M3` (27) and `FLOAT6E3M2` (28). For ONNX binding, the
+  exporter must store the codes in ONNX order: four consecutive six-bit
+  codes in three bytes, least-significant bits first. [SafeTensors' FLOAT6
+  support](https://github.com/safetensors/safetensors/pull/611) validates
+  the byte length but does not transform or describe producer-specific
+  blocking or swizzling; nxrt cannot infer a different order from the header.
+  The total logical element count, not each row, must be divisible by four.
+  For example, [compressed-tensors' E2M3 packer](https://docs.vllm.ai/projects/compressed-tensors/en/latest/api/compressed_tensors/compressors/mxfp6/helpers/)
+  emits least-significant bits first, while [pt2-bfp's E3M2 packer](https://github.com/d-matrix-ai/pt2-bfp/blob/main/src/pt2bfp/torchao/dtypes/float6_e3m2.py)
+  puts the first code in the high six bits of the first byte. The latter
+  payload must be repacked before using it as an nxrt FLOAT6 initializer.
+  ONNX inline and ordinary external data can use a
+  zero-padded final byte; ONNX `int32_data` uses one unsigned code per
+  element. On native CPU and CUDA, opset 28 `Cast` widens contiguous
+  FLOAT6 to FP16, BF16, FP32 or FP64; CPU also supports strided views.
+  The loader keeps the initializer packed. A graph can feed the widened
+  result to `MatMul`, but this materializes the widened weight at execution
+  rather than projecting directly from packed bytes. Quantizing to FLOAT6,
+  `DequantizeLinear` on FLOAT6, and direct FLOAT6 arithmetic are not supported.
 * **GGUF:** accepts little-endian v2 and v3. Dense `F32`, `F16`, `BF16`,
   `F64`, and `I8`/`I16`/`I32`/`I64` map to their exact ONNX scalar dtype.
   GGML's first dimension is contiguous; the ONNX shape is the reversed

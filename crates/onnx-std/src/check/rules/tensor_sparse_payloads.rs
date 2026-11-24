@@ -277,6 +277,20 @@ pub(super) fn check_tensor_payload(
     if populated == 0 {
         return;
     }
+    if matches!(
+        dtype,
+        tensor_proto::DataType::Float6e2m3 | tensor_proto::DataType::Float6e3m2
+    ) && tensor.int32_data.iter().any(|code| !(0..64).contains(code))
+    {
+        report("FLOAT6 TensorProto.int32_data requires unsigned six-bit codes (0..63)".into());
+    }
+    if onnx_runtime_ir::DataType::from_onnx(dtype as i32)
+        .is_some_and(|dtype| dtype.has_invalid_float6_padding(count, &tensor.raw_data))
+    {
+        report(
+            "FLOAT6 TensorProto.raw_data requires zero unused high bits in the final byte".into(),
+        );
+    }
     let actual_expected = match dtype {
         _ if !tensor.raw_data.is_empty() => storage_bytes(dtype, count)
             .map(|expected| (tensor.raw_data.len(), expected, "raw_data")),
@@ -337,37 +351,11 @@ fn checked_numel(dims: &[i64]) -> Option<usize> {
 }
 
 fn storage_bytes(dtype: tensor_proto::DataType, count: usize) -> Option<usize> {
-    let bits = match dtype {
-        tensor_proto::DataType::Uint2 | tensor_proto::DataType::Int2 => 2,
-        tensor_proto::DataType::Uint4
-        | tensor_proto::DataType::Int4
-        | tensor_proto::DataType::Float4e2m1 => 4,
-        tensor_proto::DataType::Uint8
-        | tensor_proto::DataType::Int8
-        | tensor_proto::DataType::Bool
-        | tensor_proto::DataType::Float8e4m3fn
-        | tensor_proto::DataType::Float8e4m3fnuz
-        | tensor_proto::DataType::Float8e5m2
-        | tensor_proto::DataType::Float8e5m2fnuz
-        | tensor_proto::DataType::Float8e8m0 => 8,
-        tensor_proto::DataType::Uint16
-        | tensor_proto::DataType::Int16
-        | tensor_proto::DataType::Float16
-        | tensor_proto::DataType::Bfloat16 => 16,
-        tensor_proto::DataType::Float
-        | tensor_proto::DataType::Int32
-        | tensor_proto::DataType::Uint32 => 32,
-        tensor_proto::DataType::Double
-        | tensor_proto::DataType::Int64
-        | tensor_proto::DataType::Uint64
-        | tensor_proto::DataType::Complex64 => 64,
-        tensor_proto::DataType::Complex128 => 128,
-        tensor_proto::DataType::String | tensor_proto::DataType::Undefined => return None,
-    };
-    count
-        .checked_mul(bits)
-        .and_then(|bits| bits.checked_add(7))
-        .map(|bits| bits / 8)
+    let dtype = onnx_runtime_ir::DataType::from_onnx(dtype as i32)?;
+    if dtype == onnx_runtime_ir::DataType::String {
+        return None;
+    }
+    dtype.checked_storage_bytes(count)
 }
 
 fn visit_graph_sparse_tensors(graph: &GraphProto, rule_id: &str, violations: &mut Vec<Violation>) {

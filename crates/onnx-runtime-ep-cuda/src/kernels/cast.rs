@@ -54,6 +54,25 @@ const BLOCK: u32 = 256;
 /// are the raw ONNX `DataType` discriminants (`Float32 = 1`, `Int64 = 7`, …), so
 /// the Rust side passes `dtype as i32` directly.
 const CAST_HELPERS: &str = r#"
+__device__ __forceinline__ float decode_float6(unsigned int code, int tag) {
+    const int mantissa = tag == 27 ? 3 : 2;
+    const int bias = tag == 27 ? 1 : 3;
+    const int exp = (code & 31) >> mantissa;
+    const int fraction = code & ((1 << mantissa) - 1);
+    const int significand = exp == 0 ? fraction : (1 << mantissa) | fraction;
+    const unsigned int scale = 127 + (exp == 0 ? 1 : exp) - bias - mantissa;
+    const float magnitude = (float)significand * __uint_as_float(scale << 23);
+    return (code & 32) ? -magnitude : magnitude;
+}
+__device__ float load_float6(const unsigned char* x, int i, int tag) {
+    const unsigned int lane = i & 3;
+    const unsigned int bit = lane * 6;
+    const unsigned char* p = x + (i / 4) * 3 + bit / 8;
+    const unsigned int shift = bit & 7;
+    unsigned int word = p[0];
+    if (shift > 2) word |= (unsigned int)p[1] << 8;
+    return decode_float6((word >> shift) & 63, tag);
+}
 __device__ long long f_to_ll_sat(double f, double lo, double hi) {
     if (isnan(f)) return 0;
     if (f < lo) return (long long)lo;
@@ -81,6 +100,8 @@ __device__ void load_core(const unsigned char* x, int i, int tag,
         case 7:  *iv = ((const long long*)x)[i];                  *is_float = 0; break; // i64
         case 13: *iv = (long long)((const unsigned long long*)x)[i]; *is_float = 0; break; // u64
         case 9:  *iv = (((const unsigned char*)x)[i] != 0) ? 1 : 0;  *is_float = 0; break; // bool
+        case 27:
+        case 28: *fv = load_float6(x, i, tag); *is_float = 1; break;
         default: *fv = 0.0; *iv = 0; *is_float = 1; break;
     }
 }
@@ -182,6 +203,17 @@ fn is_half(dt: DataType) -> bool {
     matches!(dt, DataType::Float16 | DataType::BFloat16)
 }
 
+fn cast_pair_supported(src: DataType, dst: DataType) -> bool {
+    if src.is_float6() {
+        matches!(
+            dst,
+            DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
+        )
+    } else {
+        is_supported(src) && is_supported(dst)
+    }
+}
+
 /// Grid dimension for `n` elements at [`BLOCK`] threads (grid-stride, capped).
 fn grid_for(n: usize) -> u32 {
     const MAX_BLOCKS: usize = 65_535;
@@ -194,12 +226,14 @@ fn grid_for(n: usize) -> u32 {
 /// kernel.
 pub struct CastFactory {
     pub runtime: Arc<CudaRuntime>,
+    pub float6: bool,
 }
 
 impl KernelFactory for CastFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(CastKernel {
             runtime: self.runtime.clone(),
+            float6: self.float6,
         }))
     }
 }
@@ -208,6 +242,7 @@ impl KernelFactory for CastFactory {
 #[derive(Debug)]
 pub struct CastKernel {
     runtime: Arc<CudaRuntime>,
+    float6: bool,
 }
 
 impl CastKernel {
@@ -224,16 +259,14 @@ impl CastKernel {
         let x = &inputs[0];
         let src = x.dtype;
         let dst = outputs[0].dtype;
-        if !is_supported(src) {
-            return Err(not_implemented(format!(
-                "Cast from dtype {src:?} (unsupported source type; supported: f32/f64/f16/bf16/\
-                 int8-64/uint8-64/bool)"
-            )));
+        if src.is_float6() && !self.float6 {
+            return Err(not_implemented(
+                "FLOAT6 widening requires standard Cast at opset 28 or newer",
+            ));
         }
-        if !is_supported(dst) {
+        if !cast_pair_supported(src, dst) {
             return Err(not_implemented(format!(
-                "Cast to dtype {dst:?} (unsupported target type; supported: f32/f64/f16/bf16/\
-                 int8-64/uint8-64/bool)"
+                "Cast {src:?} to {dst:?}; use f32/f64/f16/bf16/int8-64/uint8-64/bool, or widen a FLOAT6 source to f16, bf16, f32, or f64"
             )));
         }
         if !x.is_contiguous() || !outputs[0].is_contiguous() {
@@ -253,49 +286,9 @@ impl CastKernel {
         if n == 0 {
             return Ok(());
         }
-        let n_i = i32::try_from(n)
-            .map_err(|_| EpError::KernelFailed(format!("cuda_ep Cast: {n} elements exceed i32")))?;
-        let src_tag = src as i32;
-        let dst_tag = dst as i32;
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-
-        // Route to the header-free core unless a half type is involved.
-        let use_half = is_half(src) || is_half(dst);
-        let (module, entry, source) = if use_half {
-            (
-                CAST_HALF_MODULE,
-                "cast_half",
-                format!(
-                    "#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n{CAST_HELPERS}{CAST_HALF_ENTRY}"
-                ),
-            )
-        } else {
-            (
-                CAST_CORE_MODULE,
-                "cast_core",
-                format!("{CAST_HELPERS}{CAST_CORE_ENTRY}"),
-            )
-        };
-
-        let func = self.runtime.nvrtc_function(module, &source, entry)?;
-        let cfg = LaunchConfig {
-            grid_dim: (grid_for(n), 1, 1),
-            block_dim: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let stream = self.runtime.stream();
-        let mut builder = stream.launch_builder(&func);
-        builder
-            .arg(&x_ptr)
-            .arg(&y_ptr)
-            .arg(&n_i)
-            .arg(&src_tag)
-            .arg(&dst_tag);
-        // SAFETY: `func` is the compiled cast entry; the (const uchar*, uchar*,
-        // int, int, int) argument list matches its signature; `x_ptr`/`y_ptr` are
-        // live device allocations of `n` elements of the src/dst dtype.
-        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        launch_cast_raw(&self.runtime, x_ptr, src, y_ptr, dst, n)?;
         if self.runtime.is_capturing()? {
             Ok(())
         } else {
@@ -315,7 +308,7 @@ impl CastKernel {
 /// # Safety
 /// `src_ptr`/`dst_ptr` must be live device allocations holding at least `n`
 /// elements of `src_dtype`/`dst_dtype` respectively, and both dtypes must be
-/// supported by the cast kernel (see [`is_supported`]).
+/// supported by the cast kernel (see [`cast_pair_supported`]).
 pub(crate) fn launch_cast_raw(
     runtime: &CudaRuntime,
     src_ptr: CUdeviceptr,
@@ -327,7 +320,7 @@ pub(crate) fn launch_cast_raw(
     if n == 0 {
         return Ok(());
     }
-    if !is_supported(src_dtype) || !is_supported(dst_dtype) {
+    if !cast_pair_supported(src_dtype, dst_dtype) {
         return Err(not_implemented(format!(
             "cuda_ep Cast: unsupported dtype pair {src_dtype:?} -> {dst_dtype:?}"
         )));

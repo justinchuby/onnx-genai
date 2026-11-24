@@ -345,6 +345,8 @@ fn parses_supported_upstream_tensor_type_spellings() {
         ("uint32", DataType::Uint32),
         ("uint64", DataType::Uint64),
         ("float4e2m1", DataType::Float4E2M1),
+        ("float6e2m3", DataType::Float6E2M3),
+        ("float6e3m2", DataType::Float6E3M2),
     ];
 
     for (spelling, expected) in cases {
