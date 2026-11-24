@@ -483,6 +483,8 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/eye_like_v22.yaml"),
     include_str!("../../schemas/standard/group_normalization.yaml"),
     include_str!("../../schemas/standard/group_normalization_v21.yaml"),
+    include_str!("../../schemas/standard/instance_normalization.yaml"),
+    include_str!("../../schemas/standard/instance_normalization_v22.yaml"),
     include_str!("../../schemas/standard/hardmax.yaml"),
     include_str!("../../schemas/standard/is_inf.yaml"),
     include_str!("../../schemas/standard/is_nan.yaml"),
@@ -793,8 +795,8 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 121);
-        assert_eq!(registry.iter().count(), 151);
+        assert_eq!(registry.schemas.len(), 122);
+        assert_eq!(registry.iter().count(), 153);
         for (op, prior, prior_indices) in [
             ("GatherND", 13, "tensor(int64)"),
             ("ScatterND", 18, "tensor(int64)"),
@@ -900,6 +902,41 @@ type_constraints:
                 .unwrap()
                 .since_version,
             21
+        );
+        assert_eq!(
+            registry
+                .lookup("InstanceNormalization", "", 21)
+                .unwrap()
+                .since_version,
+            6
+        );
+        assert_eq!(
+            registry
+                .lookup("InstanceNormalization", "", 22)
+                .unwrap()
+                .since_version,
+            22
+        );
+        assert_eq!(
+            registry
+                .lookup("InstanceNormalization", "", 21)
+                .unwrap()
+                .type_constraints[0]
+                .allowed,
+            [DataType::Float16, DataType::Float32, DataType::Float64]
+        );
+        assert_eq!(
+            registry
+                .lookup("InstanceNormalization", "", 22)
+                .unwrap()
+                .type_constraints[0]
+                .allowed,
+            [
+                DataType::BFloat16,
+                DataType::Float16,
+                DataType::Float32,
+                DataType::Float64
+            ]
         );
     }
 

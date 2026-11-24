@@ -189,6 +189,23 @@ fn glm_standard_claim_gates_reject_runtime_unsupported_input_dtypes() {
         1,
     );
     assert_rejected(&ep, "Expand", 24, &[DataType::Float32, DataType::Int32], 1);
+    for dtype in [DataType::Float16, DataType::Float32] {
+        assert_supported(&ep, "InstanceNormalization", 21, &[dtype; 3], 1);
+    }
+    assert_rejected(
+        &ep,
+        "InstanceNormalization",
+        21,
+        &[DataType::BFloat16; 3],
+        1,
+    );
+    assert_supported(
+        &ep,
+        "InstanceNormalization",
+        22,
+        &[DataType::BFloat16; 3],
+        1,
+    );
 }
 
 #[cfg_attr(
