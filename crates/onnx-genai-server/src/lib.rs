@@ -10,8 +10,7 @@
 
 #![forbid(unsafe_code)]
 
-use anyhow::Context as _;
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{net::SocketAddr, time::Instant};
 
 use axum::{
     Router,
@@ -48,8 +47,6 @@ mod speech;
 mod sse;
 mod state;
 mod tool_protocol;
-mod tools;
-pub use tools::{BuiltinTool, McpSources, ToolsConfig};
 mod types;
 mod webui;
 mod worker;
@@ -66,8 +63,7 @@ pub use runtime_args::{
 #[cfg(feature = "native-backend")]
 pub use state::parse_native_device;
 pub use state::{
-    AppState, McpProxyPolicy, OrtSessionWorkerCount, ServerConfig, default_node_id,
-    parse_kv_cache_dtype,
+    AppState, OrtSessionWorkerCount, ServerConfig, default_node_id, parse_kv_cache_dtype,
 };
 pub use tool_protocol::{ToolProtocol, ToolProtocolError};
 pub use types::{
@@ -82,26 +78,6 @@ pub use types::{
 };
 
 pub fn app(state: AppState) -> Router {
-    let tools_origin = state.tools.clone();
-    let tools_cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(tower_http::cors::AllowOrigin::predicate(
-            move |origin, _| {
-                origin.to_str().is_ok_and(|origin| {
-                    tools_origin
-                        .as_ref()
-                        .is_some_and(|tools| tools.origin_allowed(origin))
-                })
-            },
-        ))
-        .allow_credentials(true)
-        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-            axum::http::HeaderName::from_static("x-tool-cwd"),
-            axum::http::HeaderName::from_static("x-tool-runtime"),
-            axum::http::HeaderName::from_static("x-resp-type"),
-        ]);
     let mut router = Router::new()
         .route("/health", get(routes::health))
         .route("/v1/health", get(routes::health))
@@ -177,16 +153,6 @@ pub fn app(state: AppState) -> Router {
         .route("/tokenize", post(routes::llama::tokenize))
         .route("/detokenize", post(routes::llama::detokenize))
         .route("/apply-template", post(routes::llama::apply_template))
-        .route(
-            "/tools",
-            get(routes::tools::list)
-                .post(routes::tools::invoke)
-                .layer(tools_cors),
-        )
-        .route(
-            "/cors-proxy",
-            get(routes::proxy::forward).post(routes::proxy::forward),
-        )
         .route("/chat/completions", post(routes::chat_completions))
         .route("/v1/models", get(routes::models))
         .route("/v1/status", get(routes::status))
@@ -285,13 +251,6 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
     // Security posture: the server has no built-in authentication. The CLI defaults
     // to 127.0.0.1, enforces max_tokens/max_sessions caps, and issues CSPRNG session
     // ids; binding a non-loopback --addr should be done only behind an auth proxy.
-    if let Some(tools) = &state.tools {
-        let job = Arc::new(tools.admit(0).context("admit MCP startup discovery")?);
-        tools
-            .catalog(job)
-            .await
-            .context("discover configured MCP tools before accepting HTTP requests")?;
-    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app(state)).await?;
     Ok(())

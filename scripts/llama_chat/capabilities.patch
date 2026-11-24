@@ -37,17 +37,112 @@ index 38c7eba..84d0408 100644
  		};
  
  		// Include model in request if provided (required in ROUTER mode)
+diff --git a/ui/apps/chat/src/lib/stores/tools.svelte.ts b/ui/apps/chat/src/lib/stores/tools.svelte.ts
+index 99b65a1..9e40d99 100644
+--- a/ui/apps/chat/src/lib/stores/tools.svelte.ts
++++ b/ui/apps/chat/src/lib/stores/tools.svelte.ts
+@@ -28,6 +28,7 @@ import {
+ } from '#lib/enums/index.ts';
+ import { ToolsService } from '#lib/services/tools.service.ts';
+ // direct imports between stores, not via the barrel, to avoid circular deps
++import { serverStore } from '#lib/stores/llama-server.svelte.ts';
+ import { mcpStore } from '#lib/stores/mcp/index.svelte.ts';
+ import { modelsStore } from '#lib/stores/models/index.svelte.ts';
+ import { settingsStore } from '#lib/stores/settings/index.svelte.ts';
+@@ -240,6 +241,13 @@ class ToolsStore {
+ 		this._toolsEndpointUnreachable = false;
+ 
+ 		try {
++			if (!serverStore.props) await serverStore.fetch();
++			if (serverStore.props?.nxrt_capabilities?.server_tools === false) {
++				this._serverTools = [];
++				this.cwdAwareTools = new SvelteSet();
++				this._toolsEndpointUnreachable = true;
++				return;
++			}
+ 			const toolInfos = await ToolsService.list();
+ 
+ 			this._serverTools = toolInfos.map((info) => info.definition);
 diff --git a/ui/apps/chat/src/lib/types/api.d.ts b/ui/apps/chat/src/lib/types/api.d.ts
-index abdd1b3..6b066fa 100644
+index abdd1b3..578ff5a 100644
 --- a/ui/apps/chat/src/lib/types/api.d.ts
 +++ b/ui/apps/chat/src/lib/types/api.d.ts
-@@ -219,6 +219,9 @@ export interface ApiModelDetails {
+@@ -219,6 +219,14 @@ export interface ApiModelDetails {
  }
  
  export interface ApiLlamaCppServerProps {
 +	/** Optional backend capabilities; absent on an ordinary llama-server. */
-+	nxrt_capabilities?: { tools?: boolean; reasoning_control?: boolean; resumable_streams?: boolean };
++	nxrt_capabilities?: {
++		server_tools?: boolean;
++		tools?: boolean;
++		reasoning_control?: boolean;
++		resumable_streams?: boolean;
++	};
 +
  	default_generation_settings: {
  		id: number;
  		id_task: number;
+diff --git a/ui/apps/chat/tests/client/settings-tools-policy.svelte.test.ts b/ui/apps/chat/tests/client/settings-tools-policy.svelte.test.ts
+index 0962010..fc50f37 100644
+--- a/ui/apps/chat/tests/client/settings-tools-policy.svelte.test.ts
++++ b/ui/apps/chat/tests/client/settings-tools-policy.svelte.test.ts
+@@ -1,6 +1,9 @@
+ // Settings > Tools must edit the active conversation policy, not the defaults for future chats.
+ 
+ import SettingsChatToolsTab from '#lib/components/app/settings/SettingsChat/SettingsChatToolsTab.svelte';
++import { PropsService } from '#lib/services/props.service.ts';
++import { ToolsService } from '#lib/services/tools.service.ts';
++import { serverStore } from '#lib/stores/llama-server.svelte.ts';
+ import { DatabaseService } from '#lib/services/database.service.ts';
+ import { conversationsStore } from '#lib/stores/conversations/index.svelte.ts';
+ import { toolsStore } from '#lib/stores/tools.svelte.ts';
+@@ -59,3 +62,49 @@ describe('SettingsChatToolsTab', () => {
+ 		expect(toolsStore.isToolEnabled(TOOL_KEY)).toBe(true);
+ 	});
+ });
++
++describe('server tool capability', () => {
++	it('skips execution discovery and clears stale server tools when delegated to a harness', async () => {
++		const previous = serverStore.props;
++		try {
++			serverStore.props = { nxrt_capabilities: { server_tools: false } } as ApiLlamaCppServerProps;
++			setServerTools([TOOL]);
++			const list = vi.spyOn(ToolsService, 'list');
++			await toolsStore.fetchServerTools();
++			expect(list).not.toHaveBeenCalled();
++			expect(toolsStore.allToolDefinitions.some((tool) => tool.function.name === 'test_tool')).toBe(
++				false
++			);
++		} finally {
++			serverStore.props = previous;
++		}
++	});
++
++	it('still discovers server tools on upstream servers without the capability extension', async () => {
++		const previous = serverStore.props;
++		try {
++			serverStore.props = {} as ApiLlamaCppServerProps;
++			const list = vi.spyOn(ToolsService, 'list').mockResolvedValue([]);
++			await toolsStore.fetchServerTools();
++			expect(list).toHaveBeenCalledOnce();
++		} finally {
++			serverStore.props = previous;
++		}
++	});
++
++	it('loads properties before choosing whether to contact the tools endpoint', async () => {
++		const previous = serverStore.props;
++		try {
++			serverStore.props = null;
++			vi.spyOn(PropsService, 'fetch').mockResolvedValue({
++				nxrt_capabilities: { server_tools: false }
++			} as ApiLlamaCppServerProps);
++			const list = vi.spyOn(ToolsService, 'list');
++			await toolsStore.fetchServerTools();
++			expect(PropsService.fetch).toHaveBeenCalledOnce();
++			expect(list).not.toHaveBeenCalled();
++		} finally {
++			serverStore.props = previous;
++		}
++	});
++});

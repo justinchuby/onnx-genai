@@ -7864,14 +7864,6 @@ mod llama_compat {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        for (path, kind) in [
-            ("/tools", "permission_error"),
-            ("/cors-proxy", "feature_disabled"),
-        ] {
-            let (status, error) = call(router.clone(), "GET", path, Value::Null).await;
-            assert_eq!(status, StatusCode::FORBIDDEN);
-            assert_eq!(error["error"]["type"], kind);
-        }
     }
 }
 
@@ -7880,14 +7872,48 @@ mod llama_router_compat {
     use tokio_stream::StreamExt;
 
     #[tokio::test]
+    async fn tools_are_owned_by_external_harnesses_not_server_routes() {
+        let state = lazy_state(ServerConfig::default());
+        let router = app(state.clone());
+        for path in ["/tools", "/cors-proxy"] {
+            for method in ["GET", "POST"] {
+                let response = router.clone().oneshot(Request::builder()
+                    .method(method).uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tool":"exec_shell_command","params":{"command":"echo should-not-run"}}"#))
+                    .unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+                assert!(
+                    response
+                        .headers()
+                        .get("access-control-allow-origin")
+                        .is_none()
+                );
+                assert_eq!(
+                    json_body(response).await["error"]["type"],
+                    "not_found_error"
+                );
+            }
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/props?autoload=false")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let props = json_body(response).await;
+        assert_eq!(props["nxrt_capabilities"]["server_tools"], false);
+        assert_eq!(props["cors_proxy_enabled"], false);
+    }
+
+    #[tokio::test]
     async fn props_acknowledgement_matches_upstream_without_loading_or_mutation() {
         for enabled in [false, true] {
             let state = lazy_state(ServerConfig {
                 endpoint_props: enabled,
-                tools: crate::ToolsConfig {
-                    enabled: vec![crate::BuiltinTool::GetInfo],
-                    ..Default::default()
-                },
                 ..Default::default()
             });
             let router = app(state.clone());
@@ -7903,7 +7929,7 @@ mod llama_router_compat {
                 .unwrap();
             let before = json_body(response).await;
             assert_eq!(before["endpoint_props"], enabled);
-            assert_eq!(before["nxrt_capabilities"]["server_tools"], true);
+            assert_eq!(before["nxrt_capabilities"]["server_tools"], false);
             for payload in ["", "not-json", r#"{"temperature":0.9,"n_predict":1}"#] {
                 let response = router
                     .clone()
@@ -7961,6 +7987,8 @@ mod llama_router_compat {
                 .unwrap();
             let before = json_body(response).await;
             assert_eq!(before["endpoint_props"], enabled);
+            assert_eq!(before["nxrt_capabilities"]["server_tools"], false);
+            assert_eq!(before["cors_proxy_enabled"], false);
             let response = router
                 .clone()
                 .oneshot(

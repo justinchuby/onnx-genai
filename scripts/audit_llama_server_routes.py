@@ -13,6 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM_COMMIT = "8d60873dfb8619f2b5ed31adfbab07cccb40db5c"
 FIXTURE = ROOT / "tests/fixtures/llama-server-routes.json"
 REPORT = ROOT / "docs/LLAMA_CPP_ENDPOINT_MATRIX.md"
+# Tool execution and MCP transport belong to the external harness. Keep their
+# upstream contracts visible without counting this deliberate boundary as a gap.
+EXTERNAL_HARNESS = {
+    (method, path)
+    for method in ("GET", "POST")
+    for path in ("/tools", "/cors-proxy")
+}
 
 
 def without_comments(source: str) -> str:
@@ -132,8 +139,12 @@ def contracts(fixture: dict, source: str) -> list[dict]:
             continue  # Enabled/disabled registrations still describe one contract.
         seen.add(key)
         handler = ours.get(key)
+        if key in EXTERNAL_HARNESS and handler is not None:
+            raise ValueError(f"external-harness contract {key} must not execute in the inference server")
         status = (
-            "missing"
+            "external harness"
+            if key in EXTERNAL_HARNESS
+            else "missing"
             if handler is None
             else "disabled"
             if "disabled_feature" in handler
@@ -153,7 +164,7 @@ def render(fixture: dict, rows: list[dict]) -> str:
         "",
         f"Reference: llama.cpp `{fixture['commit']}`, `{fixture['source']}`;",
         f"{len(fixture['registrations'])} registrations / {len(rows)} distinct method-path contracts.",
-        f"Local registrations: {counts['present']} present, {counts['disabled']} disabled placeholders, {counts['missing']} missing.",
+        f"Local registrations: {counts['present']} present, {counts['disabled']} disabled placeholders, {counts['missing']} missing, {counts['external harness']} delegated to the external harness.",
         "",
         "**Registration presence is not behavioral conformance.** This source audit does not",
         "execute handlers, enable feature gates, compare schemas/results, or prove frontend",
@@ -176,17 +187,22 @@ def render(fixture: dict, rows: list[dict]) -> str:
         )
     lines += [
         "",
+        "Tool execution and MCP transport (`/tools`, `/cors-proxy`, stdio MCP and",
+        "container/SSH runtimes) are outside the inference server's scope by design.",
+        "Chat tool definitions, calls, streamed deltas and tool-result messages remain",
+        "in scope; the external harness owns execution and network/process access.",
+        "",
         "## Acceptance work still required",
         "",
-        "For each contract, validate enabled and disabled gates, malformed and valid input,",
-        "schema/defaults, actual model or tool execution, status/error bodies, aliases, and",
+        "For each in-scope contract, validate enabled and disabled gates, malformed and valid input,",
+        "schema/defaults, actual model execution, status/error bodies, aliases, and",
         "stream framing/cancellation where applicable. Test source presence alone does not",
         "satisfy these cases. Cross-model and backend-specific behavior must use declared",
         "capabilities; a passing narrow fixture does not establish general parity.",
         "",
         "The missing realtime/SystemOne protocols and disabled model download/deletion",
         "remain implementation work. Existing handlers also retain the explicit source,",
-        "device-state, multimodal and MCP/runtime gaps documented in the compatibility ledger.",
+        "device-state and multimodal gaps documented in the compatibility ledger.",
         "",
     ]
     return "\n".join(lines)
