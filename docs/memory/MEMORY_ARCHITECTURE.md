@@ -865,6 +865,40 @@ without claiming its borrowed kernel view can own a graph. Local Host checks
 cover layout, zero demand and typed metadata rejection. Device tests and the
 Python CUDA/ORT script require hardware and are not executed here.
 
+### Integer-affine QMoE shares one prepared composite
+
+`com.microsoft::QMoE` now uses the same root caller lane as other prepared
+kernels. A pure metadata geometry proves quantized expert layouts, routing,
+separate/fused gating, grouping and independent conversion of floating operands.
+Its 19 disjoint byte regions form one SessionPersistent requirement; there are
+no region grants, private allocation owners, grow-only slot capacities, used-slot
+flags or scratch rollback. Empty work requires zero capacity after validation.
+The first migration keeps all existing simultaneously live regions disjoint;
+no launch reordering or live-range compression is assumed.
+
+The shared factory wrapper forwards planning, execution refinement and borrowed
+workspace execution. Both preparation and execution use the same geometry;
+known output facts must agree while unresolved output extent follows input
+semantics. Runtime binds the entire layout before any widening or routing work.
+Capture requires a real caller pin for the complete used span and the exact
+warmed signature. Failed calls revoke readiness. Successful recording can
+publish readiness again, while installed graphs retain their own caller pins
+independently of later kernel warm state.
+
+Route telemetry remains independently owned, cumulative across calls, and reset
+only at its explicit coarse boundary. Its producer identities, artifact pins and
+arming rules remain intact; it is never treated as disposable scratch. The
+existing eager-sync debug policy is preserved: default deferred execution adds
+no trailing device synchronization.
+
+Host tests cover decode/grouped/fused geometry, mixed parameter dtypes, optional
+regions, empty work, overflow and whole-layout refusal. Device fixtures use
+actual caller owners outside timing/recording, including independent pending
+lanes, missing pins, failed rewarm, graph retention and stable warm charge.
+These device fixtures are compiled locally without CUDA execution or throughput
+claims. Historical raw-pool and timing descriptions below are superseded for
+this kernel's ownership only; the device algorithm sources are unchanged.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
@@ -928,7 +962,7 @@ call; it owns the governed workspace preparation path
 | `kernels/pad.rs:292` | Pad metadata | `metadata.len()` | rank/pads config | step-scoped | raw bypass |
 | `kernels/pooling.rs:538` | pooling metadata | `bytes.len()` | rank/kernel config | step-scoped | raw bypass |
 | `kernels/qlinear_matmul.rs:299` | QLinearMatMul metadata | `bytes.len()` | rank/quantization params | step-scoped | raw bypass |
-| `kernels/qmoe.rs:1956` | legacy QMoE pooled scratch | slot-specific `bytes` | prompt/expert dependent | session-persistent growable scratch | raw bypass; separate from governed `BlockQuantizedMoE` path |
+| `kernels/qmoe.rs`, `qmoe/workspace.rs` | integer-affine QMoE routing, expert intermediates, grouping and float widening | one checked composite of the 19 reachable regions | rows/experts/hidden/intermediate, activation/gate route and each operand dtype | shared SessionPersistent caller peak | metadata planning and actual used-span capture pin; no private pool or slot owner |
 | `kernels/reduce.rs:711` | reduce base shape metadata | `base_bytes.len().max(1)` | rank/config | step-scoped | raw bypass |
 | `kernels/reduce.rs:712` | reduce delta shape metadata | `delta_bytes.len().max(1)` | rank/config | step-scoped | raw bypass |
 | `kernels/reduce.rs:720` | reduce axes metadata | `axes_bytes.len().max(1)` | rank/axes config | step-scoped | raw bypass |

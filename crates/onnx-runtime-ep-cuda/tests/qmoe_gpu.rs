@@ -16,7 +16,8 @@ mod common;
 
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
+    DeviceBuffer, DeviceGraphResource, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut,
+    TensorView, WorkspaceAllocation, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
@@ -423,6 +424,18 @@ fn require_cuda() -> GpuGuard {
     }
 }
 
+fn workspace_resources(owner: &Option<WorkspaceAllocation>) -> Vec<DeviceGraphResource> {
+    owner
+        .iter()
+        .filter_map(|owner| owner.device_graph_resource().expect("real caller pin"))
+        .collect()
+}
+fn workspace_view(owner: &Option<WorkspaceAllocation>) -> Option<WorkspaceView> {
+    owner
+        .as_ref()
+        .map(|owner| WorkspaceView::new(DevicePtrMut(owner.as_ptr() as *mut _), owner.len()))
+}
+
 fn run_gpu(
     ep: &CudaExecutionProvider,
     case: Case,
@@ -506,7 +519,10 @@ fn run_gpu_impl(
     let output_bytes = case.rows * case.hidden * dtype.byte_size();
     let mut output_buffer = ep.allocate(output_bytes, 256)?;
     let output_strides = compute_contiguous_strides(&output_shape);
-    kernel.execute(
+    let mut workspace = None;
+    common::execute_kernel(
+        ep,
+        kernel.as_ref(),
         &views,
         &mut [TensorMut::new(
             DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -515,14 +531,19 @@ fn run_gpu_impl(
             &output_strides,
             ep.device_id(),
         )],
+        &mut workspace,
     )?;
+    let caller_view = workspace_view(&workspace);
     if capture {
         assert!(
             kernel.capture_support().is_supported(),
             "successful eager QMoE execution must warm its capture workspace"
         );
-        runtime.begin_graph_capture(&[kernel.as_ref()])?;
-        if let Err(error) = kernel.execute(
+        runtime.begin_graph_capture_with_resources(
+            &[kernel.as_ref()],
+            workspace_resources(&workspace),
+        )?;
+        if let Err(error) = kernel.execute_with_workspace(
             &views,
             &mut [TensorMut::new(
                 DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -531,6 +552,7 @@ fn run_gpu_impl(
                 &output_strides,
                 ep.device_id(),
             )],
+            caller_view,
         ) {
             let _ = runtime.abort_graph_capture();
             return Err(error);
@@ -557,6 +579,9 @@ fn run_gpu_impl(
         ep.deallocate(buffer)?;
     }
     ep.deallocate(output_buffer)?;
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace)?;
+    }
     Ok(match dtype {
         DataType::Float32 => bytes
             .chunks_exact(4)
@@ -1578,7 +1603,7 @@ fn qmoe_prefill_handles_empty_experts_and_all_routes_to_one_expert() {
 // bandwidth. It is left as-is (still a valid "cost of calling this op from
 // scratch every time" measurement) but is NOT a kernel bandwidth probe. See
 // `qmoe_expert_gemv_bandwidth_probe` below for one that allocates/uploads
-// once and times only repeated `kernel.execute()` calls.
+// once and times only repeated `kernel.execute_with_workspace()` calls.
 // ---------------------------------------------------------------------------
 
 /// `hidden_size=2048`, `moe_intermediate_size=1408`, `n_routed_experts=64`,
@@ -1644,7 +1669,7 @@ fn qmoe_deepseek_decode_bench() {
 // Unlike `qmoe_deepseek_decode_bench` above, every device allocation and H2D
 // upload happens exactly once per (model shape, M) configuration, before any
 // timing loop starts (measurement-discipline: "allocate outside the timed
-// region"). Only repeated `kernel.execute()` calls are timed, so the number
+// region"). Only repeated `kernel.execute_with_workspace()` calls are timed, so the number
 // this reports is the expert-GEMV/GEMM kernel's own achieved bandwidth, not
 // the cost of rebuilding the graph/model or re-uploading expert weights.
 //
@@ -1659,7 +1684,7 @@ fn qmoe_deepseek_decode_bench() {
 // `BlockQuantizedMoEKernel::capture_support` is unconditionally `Unsupported`
 // -- relying on capture here would make the very thing this probe reports on
 // (fast-path/capture eligibility) also decide whether the timing methodology
-// itself is valid. Every sample below is instead `BATCH` raw `execute()`
+// itself is valid. Every sample below is instead `BATCH` raw `execute_with_workspace()`
 // launches between two events (the "repeat-launch + CUDA-event/single-sync"
 // pattern, not graph replay), which is also the honest cost of the *current*
 // uncaptured decode step in production.
@@ -1979,13 +2004,15 @@ fn is_fused_decode_eligible(case: Case) -> bool {
 }
 
 /// Persistent GPU state for one (shape, M) point: built and uploaded exactly
-/// once by [`setup_gemv_bench`], then reused for every timed `execute()`
+/// once by [`setup_gemv_bench`], then reused for every timed `execute_with_workspace()`
 /// call. No *device* allocation, H2D copy, or `Graph`/`Kernel` construction
 /// happens after `setup_gemv_bench` returns -- `execute_once` still builds a
 /// small host-side `Vec<TensorView>` per call (via `views`), which is
 /// intentional: that bookkeeping cost is part of what `median_us`'s
 /// `host_us` leg is measuring, not something this harness hides.
 struct GemvBenchSetup {
+    workspace: Option<WorkspaceAllocation>,
+    caller_view: Option<WorkspaceView>,
     kernel: Box<dyn onnx_runtime_ep_api::Kernel>,
     buffers: Vec<Option<DeviceBuffer>>,
     input_shapes: Vec<Vec<usize>>,
@@ -2002,6 +2029,9 @@ struct GemvBenchSetup {
 }
 
 impl GemvBenchSetup {
+    fn capture_resources(&self) -> Vec<DeviceGraphResource> {
+        workspace_resources(&self.workspace)
+    }
     fn views(&self) -> Vec<TensorView<'_>> {
         self.input_shapes
             .iter()
@@ -2032,8 +2062,11 @@ impl GemvBenchSetup {
     }
 
     fn execute_once(&self) -> onnx_runtime_ep_api::Result<()> {
-        self.kernel
-            .execute(&self.views(), &mut [self.output_view()])
+        self.kernel.execute_with_workspace(
+            &self.views(),
+            &mut [self.output_view()],
+            self.caller_view,
+        )
     }
 
     /// Reads the output back and frees every buffer. Consumes `self` so a
@@ -2048,6 +2081,9 @@ impl GemvBenchSetup {
             ep.deallocate(buffer)?;
         }
         ep.deallocate(self.output_buffer)?;
+        if let Some(workspace) = self.workspace {
+            ep.deallocate_workspace(workspace)?;
+        }
         Ok(bytes)
     }
 
@@ -2063,6 +2099,9 @@ impl GemvBenchSetup {
             ep.deallocate(buffer)?;
         }
         ep.deallocate(self.output_buffer)?;
+        if let Some(workspace) = self.workspace {
+            ep.deallocate_workspace(workspace)?;
+        }
         Ok(())
     }
 }
@@ -2149,7 +2188,9 @@ fn setup_gemv_bench(
     let output_ptr = DevicePtrMut(output_buffer.as_mut_ptr());
     let output_strides = compute_contiguous_strides(&output_shape);
 
-    let setup = GemvBenchSetup {
+    let mut setup = GemvBenchSetup {
+        workspace: None,
+        caller_view: None,
         kernel,
         buffers,
         input_shapes,
@@ -2168,17 +2209,24 @@ fn setup_gemv_bench(
     // path) sets QMoE's `warmed` flag; never time it. Use the unconditional
     // drain (not `synchronize`, a no-op by default per #1383) so the first
     // *timed* call in `median_us` never inherits overlap from this call.
+    let requirement = {
+        let views = setup.views();
+        let outputs = [setup.output_view()];
+        let metadata = [onnx_runtime_ep_api::OutputMetadata::from_view(&outputs[0])];
+        common::runtime_workspace_requirement(setup.kernel.as_ref(), &views, &metadata, &outputs)?
+    };
+    setup.caller_view = common::prepare_workspace(ep, requirement, &mut setup.workspace)?;
     setup.execute_once()?;
     runtime.drain_for_unmap()?;
     Ok(setup)
 }
 
-/// Times one sample: `batch` raw `execute()` calls bracketed by two CUDA
+/// Times one sample: `batch` raw `execute_with_workspace()` calls bracketed by two CUDA
 /// events (single `event::synchronize` + `elapsed()`, divided by `batch`),
 /// and a separate wall-clock enqueue loop (drained for real only between
 /// reps, via `drain_for_unmap` -- see the module doc's correction above for
 /// why not `synchronize`). No graph capture is attempted (see the module doc
-/// above). `execute()` is fully async on its non-capturing path (as of
+/// above). `execute_with_workspace()` is fully async on its non-capturing path (as of
 /// cycle-5; see `src/kernels/qmoe.rs`), so `median_host_us` reflects real
 /// per-batch host dispatch cost, not a per-call blocking round trip; at
 /// large M it can still approach `median_gpu_us` once the host enqueues
@@ -2221,7 +2269,7 @@ fn median_us(
         let start = event::create(CUevent_flags::CU_EVENT_DEFAULT).unwrap();
         let end = event::create(CUevent_flags::CU_EVENT_DEFAULT).unwrap();
         // SAFETY: both events belong to this context and bracket `batch`
-        // back-to-back `execute()` launches on the runtime's own stream.
+        // back-to-back `execute_with_workspace()` launches on the runtime's own stream.
         unsafe {
             event::record(start, runtime.stream_ptr()).unwrap();
             for _ in 0..batch {
@@ -2470,7 +2518,7 @@ fn qmoe_expert_gemv_bandwidth_probe() {
 /// times. Identical event/drain discipline to `median_us` above, with
 /// `replay_graph()` in place of `setup.execute_once()` -- this is the only
 /// way to isolate the launch-dispatch saving a graph replay buys over
-/// `median_us`'s per-node `execute()` path from any change in the kernel's
+/// `median_us`'s per-node `execute_with_workspace()` path from any change in the kernel's
 /// own device-side cost (there is none: it is the same launches, replayed
 /// instead of re-recorded). Returns `(median_gpu_us_per_replay,
 /// median_host_us_per_replay, sorted_gpu_samples_us)`.
@@ -2527,7 +2575,9 @@ fn median_capture_us(setup: &GemvBenchSetup, runtime: &CudaRuntime, reps: usize)
     let mut samples = Vec::with_capacity(reps);
     for sample in 0..reps {
         let begin = std::time::Instant::now();
-        let guard = CaptureGuard::begin(runtime, &[setup.kernel.as_ref()]).unwrap();
+        let guard =
+            CaptureGuard::begin(runtime, &[setup.kernel.as_ref()], setup.capture_resources())
+                .unwrap();
         setup.execute_once().unwrap_or_else(|error| {
             panic!("sample {sample}: capture-time execute failed: {error}")
         });
@@ -2577,7 +2627,12 @@ fn qmoe_grouped_capture_replay_bandwidth_probe() {
         "ramp configuration must itself be capture-eligible once warmed, or the whole \
          capture/replay probe below is measuring a fallback path"
     );
-    let guard = CaptureGuard::begin(&runtime, &[ramp_setup.kernel.as_ref()]).unwrap();
+    let guard = CaptureGuard::begin(
+        &runtime,
+        &[ramp_setup.kernel.as_ref()],
+        ramp_setup.capture_resources(),
+    )
+    .unwrap();
     ramp_setup.execute_once().unwrap();
     guard.end().unwrap();
     let ramp_start = std::time::Instant::now();
@@ -2648,7 +2703,12 @@ fn qmoe_grouped_capture_replay_bandwidth_probe() {
             let eager_actual = decode_output_bytes(&eager_bytes, dtype);
             assert_conforms(&eager_actual, &expected, proxy_case, dtype);
 
-            let guard = CaptureGuard::begin(&runtime, &[proxy_setup.kernel.as_ref()]).unwrap();
+            let guard = CaptureGuard::begin(
+                &runtime,
+                &[proxy_setup.kernel.as_ref()],
+                proxy_setup.capture_resources(),
+            )
+            .unwrap();
             proxy_setup.execute_once().unwrap();
             guard.end().unwrap();
             runtime.replay_graph().unwrap();
@@ -2710,7 +2770,12 @@ fn qmoe_grouped_capture_replay_bandwidth_probe() {
             // 3) Steady-state replay cost: install one graph, then replay it
             // `reps * batch` times under the same event/drain discipline as
             // the eager measurement.
-            let guard = CaptureGuard::begin(&runtime, &[setup.kernel.as_ref()]).unwrap();
+            let guard = CaptureGuard::begin(
+                &runtime,
+                &[setup.kernel.as_ref()],
+                setup.capture_resources(),
+            )
+            .unwrap();
             setup.execute_once().unwrap();
             guard.end().unwrap();
             let (replay_gpu_us, replay_host_us, replay_samples) =
@@ -2845,7 +2910,7 @@ fn qmoe_occ_is_bit_identical() {
 // Cycle-5 regression coverage: `QMoEKernel::execute` no longer ends with an
 // unconditional `runtime.synchronize()` (see `src/kernels/qmoe.rs`). These
 // tests guard the two invariants that call used to (accidentally) protect --
-// scratch-growth-free safety and `Drop` teardown safety -- now that each is
+// caller-owner retirement and kernel-drop safety -- now that each is
 // its own explicit, narrowly-scoped drain, plus a direct check that `execute`
 // itself no longer blocks the host for device completion.
 // ---------------------------------------------------------------------------
@@ -2854,9 +2919,8 @@ fn qmoe_occ_is_bit_identical() {
 /// `bits`/`top_k`/activation/etc. matter here; `template.rows` is ignored --
 /// shapes are never baked into kernel construction: `QMoEFactory::create`
 /// takes `_input_shapes` by name only, see `src/kernels/qmoe.rs`). The
-/// returned kernel is reused across many `execute()` calls with independently
-/// varying row counts, which is exactly what exercises `ScratchPool`'s
-/// growth path.
+/// returned kernel is reused across independently owned caller lanes with
+/// varying row counts and complete prepared workspace bounds.
 fn build_qmoe_kernel(
     ep: &CudaExecutionProvider,
     template: Case,
@@ -2874,17 +2938,17 @@ fn build_qmoe_kernel(
         .expect("QMoE kernel construction must succeed for a well-formed case")
 }
 
-/// Everything an in-flight `execute()` call owns until its output is read
+/// Everything an in-flight `execute_with_workspace()` call owns until its output is read
 /// back. Splitting "enqueue" from "read back" (unlike a single helper that
-/// does both) lets a caller issue several `execute()` calls on one kernel
+/// does both) lets a caller issue several `execute_with_workspace()` calls on one kernel
 /// back-to-back with **no** intervening drain -- which is the only way to
-/// create a genuine overlap window where a growth-triggered free in
-/// `ScratchPool::ensure` could race a still-in-flight previous launch. A
+/// create a genuine overlap window between independently owned caller lanes. A
 /// helper that always reads back immediately (via `dtoh`, which
 /// unconditionally force-synchronizes -- see `CudaRuntime::dtoh`) would drain
 /// the stream after every single call, making such a race structurally
-/// impossible to observe regardless of whether `ensure`'s drain is present.
+/// impossible to observe regardless of caller-owner retirement behavior.
 struct PendingExecution {
+    workspace: Option<WorkspaceAllocation>,
     buffers: Vec<Option<DeviceBuffer>>,
     output_buffer: DeviceBuffer,
     output_shape: [usize; 2],
@@ -2909,6 +2973,9 @@ impl PendingExecution {
             ep.deallocate(buffer)?;
         }
         ep.deallocate(self.output_buffer)?;
+        if let Some(workspace) = self.workspace {
+            ep.deallocate_workspace(workspace)?;
+        }
         Ok(decode_output_bytes(&bytes, self.dtype))
     }
 
@@ -2927,11 +2994,14 @@ impl PendingExecution {
             ep.deallocate(buffer)?;
         }
         ep.deallocate(self.output_buffer)?;
+        if let Some(workspace) = self.workspace {
+            ep.deallocate_workspace(workspace)?;
+        }
         Ok(())
     }
 }
 
-/// Uploads this call's inputs and issues one `execute()` call against an
+/// Uploads this call's inputs and issues one `execute_with_workspace()` call against an
 /// already-built kernel (unlike `run_gpu_impl`, which builds a fresh kernel
 /// every call), **without** reading the output back -- the returned
 /// [`PendingExecution`] must be read back (via `read_back_and_free`) for the
@@ -2985,7 +3055,10 @@ fn enqueue_with_existing_kernel(
     let output_bytes = case.rows * case.hidden * dtype.byte_size();
     let mut output_buffer = ep.allocate(output_bytes, 256)?;
     let output_strides = compute_contiguous_strides(&output_shape);
-    kernel.execute(
+    let mut workspace = None;
+    common::execute_kernel(
+        ep,
+        kernel,
         &views,
         &mut [TensorMut::new(
             DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -2994,9 +3067,11 @@ fn enqueue_with_existing_kernel(
             &output_strides,
             ep.device_id(),
         )],
+        &mut workspace,
     )?;
     drop(views);
     Ok(PendingExecution {
+        workspace,
         buffers,
         output_buffer,
         output_shape,
@@ -3009,29 +3084,10 @@ fn enqueue_with_existing_kernel(
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn qmoe_scratch_pool_regrows_and_shrinks_across_calls_matches_cpu() {
-    // One long-lived kernel instance, exercised with a row-count sequence
-    // that deliberately mixes: growth (1->8), a repeat at the same size
-    // (8->8, no realloc), shrink-without-realloc (8->2), and repeated
-    // re-growth (2->8, 8->16, 16->1, 1->16, 16->2) -- forcing
-    // `ScratchPool::ensure` to free-and-grow its slots (fc1/fc3/activation/
-    // route-output/grouping scratch) many times over the same kernel's
-    // lifetime. Consecutive calls are deliberately enqueued back-to-back with
-    // NO intervening drain/readback (via `enqueue_with_existing_kernel`,
-    // reading back one call behind): a helper that reads back immediately
-    // after every call would force a full stream drain each time (`dtoh`
-    // unconditionally calls `force_synchronize` -- see `CudaRuntime::dtoh`),
-    // which would make it structurally impossible to ever observe a missing
-    // drain in `ScratchPool::ensure`'s growth path, since the previous call's
-    // launches would always have already retired before the next call's
-    // `ensure()` could free anything. With no intervening drain, a call that
-    // triggers growth runs its free-then-realloc while the *previous* call's
-    // launches may genuinely still be in flight -- exactly the precondition a
-    // missing `drain_for_unmap` there would need to actually corrupt data
-    // (via this pool's shared, size-classed, cross-kernel free list handing
-    // the just-freed pointer to a concurrent allocation before the old
-    // launch finishes reading it). Every call's result is still checked
-    // against the CPU oracle: a fast wrong kernel must not pass.
+fn qmoe_independent_pending_caller_lanes_across_shapes_match_cpu() {
+    // Alternate row counts on one kernel with separately owned in-flight
+    // caller lanes. Read one call behind so launch dependencies overlap without
+    // aliasing scratch; every result must still match the independent CPU oracle.
     let ep = require_cuda();
     let dtype = DataType::Float16;
     // Same shape as `qmoe_decode_fused_silu_fc3_matches_cpu`: satisfies the
@@ -3086,16 +3142,97 @@ fn qmoe_scratch_pool_regrows_and_shrinks_across_calls_matches_cpu() {
 
 #[cfg_attr(
     not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests on a CUDA runner"
+)]
+#[test]
+fn qmoe_factory_serves_one_caller_peak_and_warm_dispatch_adds_no_device_work_boundaries() {
+    let ep = require_cuda();
+    let dtype = DataType::Float16;
+    let case = qmoe_64expert_case(3);
+    let inputs = case_inputs(case, dtype);
+    let (graph, node) = model_node(&inputs, dtype, &[case.rows, case.hidden], case);
+    let shapes = inputs
+        .iter()
+        .map(|input| {
+            input
+                .as_ref()
+                .map_or_else(Vec::new, |input| static_shape(input.shape.iter().copied()))
+        })
+        .collect::<Vec<_>>();
+    let dtypes = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            input
+                .as_ref()
+                .map_or_else(|| absent_dtype(i, dtype), |input| input.dtype)
+        })
+        .collect::<Vec<_>>();
+    let claim = ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]);
+    assert!(
+        matches!(
+            claim,
+            onnx_runtime_ep_api::KernelMatch::Supported {
+                workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+                ..
+            }
+        ),
+        "{claim:?}"
+    );
+    let setup = setup_gemv_bench(&ep, case, dtype, &inputs).unwrap();
+    let owner = setup
+        .workspace
+        .as_ref()
+        .expect("shared factory must report real caller demand");
+    let identity = owner.managed_owner().unwrap().identity();
+    let settlement = owner.managed_settlement_wait().unwrap();
+    let charged = settlement.charged_bytes();
+    assert!(charged > 0);
+    assert!(
+        setup.kernel.device_graph_resources().is_empty(),
+        "unarmed scratch ownership belongs to caller"
+    );
+    let runtime = ep.runtime();
+    runtime.set_defer_eager_sync(true);
+    let allocations = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let syncs = runtime.forced_synchronization_count();
+    for _ in 0..8 {
+        setup.execute_once().unwrap();
+    }
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(runtime.transfer_counts(), transfers);
+    assert_eq!(runtime.forced_synchronization_count(), syncs);
+    assert_eq!(
+        setup
+            .workspace
+            .as_ref()
+            .unwrap()
+            .managed_owner()
+            .unwrap()
+            .identity(),
+        identity
+    );
+    assert_eq!(settlement.charged_bytes(), charged);
+    setup.teardown(&ep).unwrap();
+    assert_eq!(
+        settlement.wait(std::time::Duration::from_secs(30)),
+        onnx_runtime_memory_governor::AllocationSettlementStatus::Released
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
 fn qmoe_execute_does_not_block_host_for_device_completion() {
     // Direct regression test for the change under test: a single, uncaptured
-    // `execute()` call on a genuinely slow (memory-bandwidth-bound) grouped
+    // `execute_with_workspace()` call on a genuinely slow (memory-bandwidth-bound) grouped
     // shape must return to the host in a small fraction of the time its own
     // kernels take to actually finish on the device. This would fail if an
     // unconditional device sync (`runtime.synchronize`/`force_synchronize`)
-    // were reintroduced at the end of `execute()`, independent of any queue-
+    // were reintroduced at the end of `execute_with_workspace()`, independent of any queue-
     // depth effects from batching (this test uses `batch=1`, one call per
     // sample, each rep separated by a real drain).
     let ep = require_cuda();
@@ -3131,9 +3268,9 @@ fn qmoe_execute_does_not_block_host_for_device_completion() {
 )]
 #[test]
 fn qmoe_drop_after_inflight_launch_leaves_runtime_usable() {
-    // `Drop for QMoEKernel` now performs its own best-effort drain before
-    // freeing scratch (since `execute()` no longer syncs on every call, a
-    // just-issued launch may still be in flight when the kernel is dropped).
+    // The caller retires its workspace through the event-ordered release queue.
+    // A just-issued launch can remain in flight after both that retirement and
+    // kernel destruction; neither operation should force a host drain.
     // Build a kernel, issue a heavy async call, drop the kernel immediately
     // without waiting on it, then prove the runtime/stream is still correct
     // for a completely independent subsequent operation -- both a fresh
@@ -3191,7 +3328,7 @@ fn qmoe_drop_after_inflight_launch_leaves_runtime_usable() {
 // follow-up to #1777/#1788).
 //
 // `QMoEKernel::capture_support()` returns `Supported` purely from a
-// row-count-agnostic `warmed` flag set by any prior non-capturing `execute()`
+// row-count-agnostic `warmed` flag set by any prior non-capturing `execute_with_workspace()`
 // call. This is safe for the grouped/gather-scatter path (M>1) specifically
 // because:
 //   1. Every grouped-path launch grid (`launch_grouping`/`launch_gather`/
@@ -3201,14 +3338,8 @@ fn qmoe_drop_after_inflight_launch_leaves_runtime_usable() {
 //      back to the host -- the actual sparse/empty-expert distribution is
 //      handled by in-kernel bounds checks, not a smaller/dynamic launch grid.
 //      No launch-shape instability, no host dependency on device state.
-//   2. `ScratchPool::ensure(.., capturing)` rejects (loud `Err`, not a silent
-//      grow) any capacity increase while `capturing == true` (see `qmoe.rs`);
-//      the framework's own per-shape `KernelKey` cache (`kernel_cache.rs`,
-//      "Chew's guarantee") additionally never reuses a kernel instance for a
-//      DIFFERENT shape than it was compiled/warmed for in production, so this
-//      reject path is a defense-in-depth backstop, not the primary safety
-//      argument -- both are exercised directly below.
-//   3. The only host readback in `execute()` (`dump_route_selection`) is
+//   2. Complete caller bounds and real capture pins reject missing capacity.
+//   3. The only host readback in `execute_with_workspace()` (`dump_route_selection`) is
 //      gated `if !capturing`, and the trailing `synchronize()` is gated the
 //      same way -- no hidden sync/drain in the captured region.
 //   4. No new global/second synchronization or allocation authority is used
@@ -3225,7 +3356,7 @@ fn qmoe_drop_after_inflight_launch_leaves_runtime_usable() {
 // capture (`..eager_execute_after_capture_replay..`), and drop/teardown
 // (`..drop_kernel_after_capture_replay..`). No M/model allowlist appears
 // anywhere below or in `qmoe.rs`: every check is driven by the kernel's own
-// `capture_support()`/`ScratchPool` state, independent of which `Case` shape
+// `capture_support()`, signatures and caller-owner pins, independent of which `Case` shape
 // is in play.
 // ---------------------------------------------------------------------------
 
@@ -3249,8 +3380,9 @@ impl<'a> CaptureGuard<'a> {
     fn begin(
         runtime: &'a CudaRuntime,
         kernels: &[&dyn onnx_runtime_ep_api::Kernel],
+        resources: Vec<DeviceGraphResource>,
     ) -> onnx_runtime_ep_api::Result<Self> {
-        runtime.begin_graph_capture(kernels)?;
+        runtime.begin_graph_capture_with_resources(kernels, resources)?;
         Ok(Self {
             runtime,
             armed: true,
@@ -3279,7 +3411,7 @@ impl Drop for CaptureGuard<'_> {
 )]
 #[test]
 fn qmoe_grouped_capture_support_denied_before_warmup_with_reason() {
-    // A freshly built kernel (never `execute()`d) must not claim capture
+    // A freshly built kernel (never `execute_with_workspace()`d) must not claim capture
     // support, and the SAME reason must independently block the runtime-level
     // `begin_graph_capture` audit -- proving the rejection is enforced
     // structurally (via `capture.rs::require_subgraph_graph_capturable`), not
@@ -3316,249 +3448,90 @@ fn qmoe_grouped_capture_support_denied_before_warmup_with_reason() {
 #[test]
 fn qmoe_grouped_capture_rejects_shape_growth_without_corrupting_kernel() {
     #[cfg(feature = "gpu-tests")]
-    qmoe_grouped_capture_rejects_shape_growth_without_corrupting_kernel_gpu();
+    qmoe_grouped_capture_rejects_unfunded_rewarm_and_keeps_installed_caller_owner_gpu();
 }
 
 #[cfg(feature = "gpu-tests")]
-fn qmoe_grouped_capture_rejects_shape_growth_without_corrupting_kernel_gpu() {
-    // Production never hands one kernel instance two different shapes mid-
-    // capture (the executor's per-shape `KernelKey` cache guarantees a
-    // captured instance only ever sees the exact shape it was warmed at --
-    // see `kernel_cache.rs`), but `ScratchPool::ensure`'s reject-on-grow-
-    // during-capture path is the load-bearing defense if that invariant were
-    // ever violated, so it must be exercised directly rather than only
-    // trusted from the framework side. Warm one instance at a SMALL grouped
-    // shape, begin capture, then request a LARGER shape on the very same
-    // instance: `execute()` must return `Err` (never silently reallocate
-    // mid-capture, which would misalign the replayed graph's baked-in
-    // pointers), and the kernel must remain fully usable afterward.
+fn qmoe_grouped_capture_rejects_unfunded_rewarm_and_keeps_installed_caller_owner_gpu() {
     let ep = require_cuda();
     let dtype = DataType::Float16;
-    let template = qmoe_64expert_case(2);
-    let kernel = build_qmoe_kernel(&ep, template, dtype);
-
-    let warm_inputs = case_inputs(template, dtype);
-    let warm_expected = run_cpu(template, &rounded_cpu_inputs(&warm_inputs, dtype));
-    let warm_actual =
-        enqueue_with_existing_kernel(&ep, kernel.as_ref(), template, &warm_inputs, dtype)
-            .unwrap()
-            .read_back_and_free(&ep)
-            .unwrap();
-    assert_conforms(&warm_actual, &warm_expected, template, dtype);
-    assert!(
-        kernel.capture_support().is_supported(),
-        "kernel must claim capture support once warmed"
-    );
-    let warmed_resources = kernel
-        .device_graph_resources()
-        .iter()
-        .map(|resource| resource.identity())
-        .collect::<Vec<_>>();
-    assert!(
-        !warmed_resources.is_empty(),
-        "warmed QMoE must publish its exact private scratch owners"
-    );
-    let failed_replacement = kernel.execute(&[], &mut []).unwrap_err().to_string();
-    assert!(
-        failed_replacement.contains("expected 7 to 21 inputs"),
-        "{failed_replacement}"
-    );
-    assert!(
-        kernel.capture_support().is_supported(),
-        "a failed replacement call must preserve the successful QMoE warm"
-    );
-    assert_eq!(
-        kernel
-            .device_graph_resources()
-            .iter()
-            .map(|resource| resource.identity())
-            .collect::<Vec<_>>(),
-        warmed_resources,
-        "QMoE capture eligibility and resources must remain one successful snapshot"
-    );
-
+    let small = qmoe_64expert_case(2);
+    let mut large = small;
+    large.rows = 8;
+    let small_inputs = case_inputs(small, dtype);
+    let large_inputs = case_inputs(large, dtype);
+    let expected = run_cpu(small, &rounded_cpu_inputs(&small_inputs, dtype));
+    let a = setup_gemv_bench(&ep, small, dtype, &small_inputs).unwrap();
+    let b = setup_gemv_bench(&ep, large, dtype, &large_inputs).unwrap();
     let runtime = ep.runtime();
-
-    // Prepare the LARGER shape's device buffers and upload them BEFORE
-    // touching capture at all: `ep.allocate`/`htod` are not capture-safe
-    // operations (real device allocation, and a host<->device transfer) and
-    // must never run inside a begin/end capture window -- only
-    // `kernel.execute()` itself runs inside capture below, matching every
-    // other capture test in this file (`run_gpu_impl`'s `capture` branch and
-    // `GemvBenchSetup`/`setup_gemv_bench`, which allocate once, outside any
-    // timed/captured region, precisely so the capture window only ever
-    // contains the kernel launch itself).
-    let mut larger = template;
-    larger.rows = 8;
-    let larger_inputs = case_inputs(larger, dtype);
-    let mut larger_buffers = Vec::<Option<DeviceBuffer>>::new();
-    for input in &larger_inputs {
-        if let Some(input) = input {
-            let buffer = ep.allocate(input.bytes.len(), 256).unwrap();
-            // SAFETY: allocation size equals the source tensor byte length.
-            unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr())).unwrap() };
-            larger_buffers.push(Some(buffer));
-        } else {
-            larger_buffers.push(None);
-        }
-    }
-    let larger_strides: Vec<_> = larger_inputs
-        .iter()
-        .map(|input| {
-            input
-                .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
-        })
-        .collect();
-    let larger_views: Vec<_> = larger_inputs
-        .iter()
-        .zip(&larger_buffers)
-        .zip(&larger_strides)
-        .enumerate()
-        .map(
-            |(index, ((input, buffer), strides))| match (input, buffer, strides) {
-                (Some(input), Some(buffer), Some(strides)) => TensorView::new(
-                    DevicePtr(buffer.as_ptr()),
-                    input.dtype,
-                    &input.shape,
-                    strides,
-                    ep.device_id(),
-                ),
-                _ => TensorView::absent(absent_dtype(index, dtype)),
-            },
-        )
-        .collect();
-    let larger_output_shape = [larger.rows, larger.hidden];
-    let larger_output_bytes = larger.rows * larger.hidden * dtype.byte_size();
-    let mut larger_output_buffer = ep.allocate(larger_output_bytes, 256).unwrap();
-    let larger_output_strides = compute_contiguous_strides(&larger_output_shape);
-
-    let counts_before_failure = runtime.allocation_counts();
-    let pooled_before_failure = runtime.raw_pool_retained_bytes();
-    runtime.fail_warm_transaction_at_for_test(3);
-    let error = kernel
-        .execute(
-            &larger_views,
-            &mut [TensorMut::new(
-                DevicePtrMut(larger_output_buffer.as_mut_ptr()),
-                dtype,
-                &larger_output_shape,
-                &larger_output_strides,
-                ep.device_id(),
-            )],
-        )
-        .expect_err("valid larger QMoE must fail after staging several replacement slots");
     assert!(
-        error
-            .to_string()
-            .contains("injected staged warm-cache failure after QMoE scratch slot 2"),
-        "unexpected rejection message: {error}"
+        a.kernel.device_graph_resources().is_empty(),
+        "unarmed QMoE owns no private scratch resources"
     );
-    assert_eq!(
-        kernel
-            .device_graph_resources()
-            .iter()
-            .map(|resource| resource.identity())
-            .collect::<Vec<_>>(),
-        warmed_resources,
-        "failed multi-slot QMoE rewarm must preserve A's scratch snapshot"
-    );
-    let counts_after_failure = runtime.allocation_counts();
-    assert!(
-        counts_after_failure.frees > counts_before_failure.frees
-            || runtime.raw_pool_retained_bytes() > pooled_before_failure,
-        "every rejected QMoE candidate allocation must be returned exactly once"
-    );
-
-    let warm_strides: Vec<_> = warm_inputs
-        .iter()
-        .map(|input| {
-            input
-                .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
-        })
-        .collect();
-    let warm_views: Vec<_> = warm_inputs
-        .iter()
-        .zip(&larger_buffers)
-        .zip(&warm_strides)
-        .enumerate()
-        .map(
-            |(index, ((input, buffer), strides))| match (input, buffer, strides) {
-                (Some(input), Some(buffer), Some(strides)) => TensorView::new(
-                    DevicePtr(buffer.as_ptr()),
-                    input.dtype,
-                    &input.shape,
-                    strides,
-                    ep.device_id(),
-                ),
-                _ => TensorView::absent(absent_dtype(index, dtype)),
-            },
+    let required = {
+        let views = b.views();
+        let outputs = [b.output_view()];
+        common::runtime_workspace_requirement(
+            a.kernel.as_ref(),
+            &views,
+            &[onnx_runtime_ep_api::OutputMetadata::from_view(&outputs[0])],
+            &outputs,
         )
-        .collect();
-    let warm_output_shape = [template.rows, template.hidden];
-    let warm_output_strides = compute_contiguous_strides(&warm_output_shape);
-    let mut execute_warm = || {
-        kernel.execute(
-            &warm_views,
-            &mut [TensorMut::new(
-                DevicePtrMut(larger_output_buffer.as_mut_ptr()),
-                dtype,
-                &warm_output_shape,
-                &warm_output_strides,
-                ep.device_id(),
-            )],
-        )
+        .unwrap()
     };
-
-    let guard = CaptureGuard::begin(runtime, &[kernel.as_ref()]).unwrap();
-    execute_warm().unwrap();
-    guard.end().unwrap();
-    drop(execute_warm);
-
-    kernel
-        .execute(
-            &larger_views,
-            &mut [TensorMut::new(
-                DevicePtrMut(larger_output_buffer.as_mut_ptr()),
-                dtype,
-                &larger_output_shape,
-                &larger_output_strides,
-                ep.device_id(),
-            )],
-        )
-        .unwrap();
-    assert_ne!(
-        kernel
-            .device_graph_resources()
-            .iter()
-            .map(|resource| resource.identity())
-            .collect::<Vec<_>>(),
-        warmed_resources,
-        "successful eager B must publish its new multi-slot scratch snapshot"
+    let full = b.caller_view.unwrap();
+    let short = WorkspaceView::new(full.ptr(), required.bytes as usize - 1);
+    let error = a
+        .kernel
+        .execute_with_workspace(&b.views(), &mut [b.output_view()], Some(short))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("bind complete caller QMoE"),
+        "{error}"
     );
+    assert!(!a.kernel.capture_support().is_supported());
+    a.execute_once().unwrap();
+    let guard = CaptureGuard::begin(runtime, &[a.kernel.as_ref()], a.capture_resources()).unwrap();
+    let rejected =
+        a.kernel
+            .execute_with_workspace(&b.views(), &mut [b.output_view()], b.caller_view);
+    assert!(
+        rejected
+            .unwrap_err()
+            .to_string()
+            .contains("signature changed")
+    );
+    drop(guard);
+    assert!(!a.kernel.capture_support().is_supported());
+    a.execute_once().unwrap();
+    let guard = CaptureGuard::begin(runtime, &[a.kernel.as_ref()], Vec::new()).unwrap();
+    assert!(
+        a.execute_once()
+            .unwrap_err()
+            .to_string()
+            .contains("real workspace owner")
+    );
+    drop(guard);
+    a.execute_once().unwrap();
+    let guard = CaptureGuard::begin(runtime, &[a.kernel.as_ref()], a.capture_resources()).unwrap();
+    a.execute_once().unwrap();
+    guard.end().unwrap();
+    // A second complete caller lane can rewarm the same kernel without moving
+    // the owner already pinned by A's installed graph.
+    a.kernel
+        .execute_with_workspace(&b.views(), &mut [b.output_view()], b.caller_view)
+        .unwrap();
     runtime.replay_graph().unwrap();
-    let warm_output_bytes = template.rows * template.hidden * dtype.byte_size();
-    let mut replay_bytes = vec![0u8; warm_output_bytes];
+    let mut bytes = vec![0; small.rows * small.hidden * dtype.byte_size()];
     unsafe {
         runtime
-            .dtoh(&mut replay_bytes, cuptr(larger_output_buffer.as_ptr()))
+            .dtoh(&mut bytes, cuptr(a.output_buffer.as_ptr()))
             .unwrap();
     }
-    assert_conforms(
-        &decode_output_bytes(&replay_bytes, dtype),
-        &warm_expected,
-        template,
-        dtype,
-    );
-    assert!(runtime.reset_graph().unwrap());
-
-    drop(warm_views);
-    drop(larger_views);
-    for buffer in larger_buffers.into_iter().flatten() {
-        ep.deallocate(buffer).unwrap();
-    }
-    ep.deallocate(larger_output_buffer).unwrap();
+    assert_conforms(&decode_output_bytes(&bytes, dtype), &expected, small, dtype);
+    runtime.reset_graph().unwrap();
+    a.teardown(&ep).unwrap();
+    b.teardown(&ep).unwrap();
 }
 
 #[cfg_attr(
@@ -3568,7 +3541,7 @@ fn qmoe_grouped_capture_rejects_shape_growth_without_corrupting_kernel_gpu() {
 #[test]
 fn qmoe_grouped_capture_never_syncs_even_with_deferral_disabled() {
     // Regression test for the "no host sync/drain in captured region"
-    // taxonomy category: `execute()`'s trailing `synchronize()` call is
+    // taxonomy category: `execute_with_workspace()`'s trailing `synchronize()` call is
     // gated `if !capturing` (`src/kernels/qmoe.rs`), but under the DEFAULT
     // `ONNX_GENAI_DEFER_EAGER_SYNC=1` config, `CudaRuntime::synchronize` is
     // ALSO already a no-op regardless of `capturing` (#1383) -- so exercising
@@ -3586,9 +3559,9 @@ fn qmoe_grouped_capture_never_syncs_even_with_deferral_disabled() {
     let case = qmoe_64expert_case(4);
     let inputs = case_inputs(case, dtype);
     // `setup_gemv_bench` allocates every buffer and does its warm-up
-    // `execute()` call ONCE, up front -- so the only thing that runs between
+    // `execute_with_workspace()` call ONCE, up front -- so the only thing that runs between
     // `begin_graph_capture`/`end_graph_capture` below is `execute_once()`
-    // itself (a bare `kernel.execute()` against already-resident buffers),
+    // itself (a bare `kernel.execute_with_workspace()` against already-resident buffers),
     // never a device allocation or host->device copy, matching the
     // capture-safety contract every other capture path in this crate relies
     // on.
@@ -3597,7 +3570,10 @@ fn qmoe_grouped_capture_never_syncs_even_with_deferral_disabled() {
 
     runtime.set_defer_eager_sync(false);
     let outcome = (|| -> onnx_runtime_ep_api::Result<()> {
-        runtime.begin_graph_capture(&[setup.kernel.as_ref()])?;
+        runtime.begin_graph_capture_with_resources(
+            &[setup.kernel.as_ref()],
+            setup.capture_resources(),
+        )?;
         if let Err(error) = setup.execute_once() {
             let _ = runtime.abort_graph_capture();
             return Err(error);
@@ -3642,7 +3618,9 @@ fn qmoe_grouped_capture_repeated_replays_and_consecutive_capture_cycles_stay_cor
     let (free_before, _) = cudarc::driver::result::mem_get_info().unwrap();
 
     for cycle in 0..3 {
-        let guard = CaptureGuard::begin(runtime, &[setup.kernel.as_ref()]).unwrap();
+        let guard =
+            CaptureGuard::begin(runtime, &[setup.kernel.as_ref()], setup.capture_resources())
+                .unwrap();
         setup
             .execute_once()
             .unwrap_or_else(|error| panic!("cycle {cycle}: capture-time execute failed: {error}"));
@@ -3704,7 +3682,8 @@ fn qmoe_grouped_eager_execute_after_capture_replay_still_correct() {
     let inputs = case_inputs(case, dtype);
     let setup = setup_gemv_bench(&ep, case, dtype, &inputs).unwrap();
 
-    let guard = CaptureGuard::begin(runtime, &[setup.kernel.as_ref()]).unwrap();
+    let guard =
+        CaptureGuard::begin(runtime, &[setup.kernel.as_ref()], setup.capture_resources()).unwrap();
     setup.execute_once().unwrap();
     guard.end().unwrap();
     runtime.replay_graph().unwrap();
@@ -3763,7 +3742,9 @@ fn qmoe_grouped_drop_kernel_after_capture_replay_leaves_runtime_usable() {
         let inputs = case_inputs(case, dtype);
         let setup = setup_gemv_bench(&ep, case, dtype, &inputs).unwrap();
 
-        let guard = CaptureGuard::begin(runtime, &[setup.kernel.as_ref()]).unwrap();
+        let guard =
+            CaptureGuard::begin(runtime, &[setup.kernel.as_ref()], setup.capture_resources())
+                .unwrap();
         setup.execute_once().unwrap();
         guard.end().unwrap();
         runtime.replay_graph().unwrap();
@@ -3976,7 +3957,10 @@ mod route_telemetry {
         let output_bytes = case.rows * case.hidden * 4;
         let mut output_buffer = ep.allocate(output_bytes, 256)?;
         let output_strides = compute_contiguous_strides(&output_shape);
-        kernel.execute(
+        let mut workspace = None;
+        common::execute_kernel(
+            ep,
+            kernel,
             &views,
             &mut [TensorMut::new(
                 DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -3985,6 +3969,7 @@ mod route_telemetry {
                 &output_strides,
                 ep.device_id(),
             )],
+            &mut workspace,
         )?;
         runtime.synchronize()?;
         let mut bytes = vec![0u8; output_bytes];
@@ -3995,6 +3980,9 @@ mod route_telemetry {
             ep.deallocate(buffer)?;
         }
         ep.deallocate(output_buffer)?;
+        if let Some(workspace) = workspace {
+            ep.deallocate_workspace(workspace)?;
+        }
         Ok(bytes)
     }
 
@@ -4192,10 +4180,23 @@ mod route_telemetry {
         let mut output_buffer = ep.allocate(output_bytes, 256).unwrap();
         let output_strides = compute_contiguous_strides(&output_shape);
 
+        let mut workspace = None;
+        let caller_view = {
+            let setup_views = views(&inputs, &buffers, &strides, ep.device_id());
+            let output = TensorMut::new(
+                DevicePtrMut(output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            );
+            common::prepare_kernel_workspace(&ep, &kernel, &setup_views, &[output], &mut workspace)
+                .unwrap()
+        };
         let run_once = |output_buffer: &mut DeviceBuffer| {
             let views = views(&inputs, &buffers, &strides, ep.device_id());
             kernel
-                .execute(
+                .execute_with_workspace(
                     &views,
                     &mut [TensorMut::new(
                         DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -4204,6 +4205,7 @@ mod route_telemetry {
                         &output_strides,
                         ep.device_id(),
                     )],
+                    caller_view,
                 )
                 .expect("execute");
             drop(views);
@@ -4232,7 +4234,10 @@ mod route_telemetry {
         // Capture the route-only kernel into the graph (no reset kernel baked in;
         // the fused marks are the only telemetry work recorded).
         runtime
-            .begin_graph_capture(&[&kernel as &dyn Kernel])
+            .begin_graph_capture_with_resources(
+                &[&kernel as &dyn Kernel],
+                workspace_resources(&workspace),
+            )
             .unwrap();
         run_once(&mut output_buffer);
         runtime.end_graph_capture().unwrap();
@@ -4298,6 +4303,9 @@ mod route_telemetry {
             ep.deallocate(buffer).unwrap();
         }
         ep.deallocate(output_buffer).unwrap();
+        if let Some(workspace) = workspace {
+            ep.deallocate_workspace(workspace).unwrap();
+        }
     }
 
     #[cfg_attr(
@@ -4335,10 +4343,23 @@ mod route_telemetry {
         let mut output_buffer = ep.allocate(output_bytes, 256).unwrap();
         let output_strides = compute_contiguous_strides(&output_shape);
 
+        let mut workspace = None;
+        let caller_view = {
+            let setup_views = views(&inputs, &buffers, &strides, ep.device_id());
+            let output = TensorMut::new(
+                DevicePtrMut(output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            );
+            common::prepare_kernel_workspace(&ep, &kernel, &setup_views, &[output], &mut workspace)
+                .unwrap()
+        };
         let run_once = |output_buffer: &mut DeviceBuffer| {
             let views = views(&inputs, &buffers, &strides, ep.device_id());
             kernel
-                .execute(
+                .execute_with_workspace(
                     &views,
                     &mut [TensorMut::new(
                         DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -4347,6 +4368,7 @@ mod route_telemetry {
                         &output_strides,
                         ep.device_id(),
                     )],
+                    caller_view,
                 )
                 .expect("execute");
             drop(views);
@@ -4361,7 +4383,10 @@ mod route_telemetry {
         // a capture is in flight must be rejected, and must not advance the epoch
         // or otherwise disturb the armed record.
         runtime
-            .begin_graph_capture(&[&kernel as &dyn Kernel])
+            .begin_graph_capture_with_resources(
+                &[&kernel as &dyn Kernel],
+                workspace_resources(&workspace),
+            )
             .unwrap();
         let rejected = kernel.reset_route_telemetry_boundary();
         assert!(
@@ -4384,6 +4409,9 @@ mod route_telemetry {
             ep.deallocate(buffer).unwrap();
         }
         ep.deallocate(output_buffer).unwrap();
+        if let Some(workspace) = workspace {
+            ep.deallocate_workspace(workspace).unwrap();
+        }
     }
 
     #[cfg_attr(
@@ -4694,10 +4722,29 @@ mod route_telemetry {
             let mut output_buffer = ep.allocate(output_bytes, 256).unwrap();
             let output_strides = compute_contiguous_strides(&output_shape);
 
+            let mut workspace = None;
+            let caller_view = {
+                let setup_views = views(inputs, &buffers, &strides, ep.device_id());
+                let output = TensorMut::new(
+                    DevicePtrMut(output_buffer.as_mut_ptr()),
+                    out_dtype,
+                    &output_shape,
+                    &output_strides,
+                    ep.device_id(),
+                );
+                common::prepare_kernel_workspace(
+                    ep,
+                    &kernel,
+                    &setup_views,
+                    &[output],
+                    &mut workspace,
+                )
+                .unwrap()
+            };
             let run_once = |output_buffer: &mut DeviceBuffer| {
                 let views = views(inputs, &buffers, &strides, ep.device_id());
                 kernel
-                    .execute(
+                    .execute_with_workspace(
                         &views,
                         &mut [TensorMut::new(
                             DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -4706,6 +4753,7 @@ mod route_telemetry {
                             &output_strides,
                             ep.device_id(),
                         )],
+                        caller_view,
                     )
                     .expect("execute");
                 drop(views);
@@ -4729,7 +4777,10 @@ mod route_telemetry {
                 "{label} decode QMoE must warm its capture workspace before the perf gate"
             );
             runtime
-                .begin_graph_capture(&[&kernel as &dyn Kernel])
+                .begin_graph_capture_with_resources(
+                    &[&kernel as &dyn Kernel],
+                    workspace_resources(&workspace),
+                )
                 .unwrap();
             run_once(&mut output_buffer);
             runtime.end_graph_capture().unwrap();
@@ -4767,7 +4818,10 @@ mod route_telemetry {
                 .route_telemetry_bitmap_addr()
                 .expect("telemetry armed");
             runtime
-                .begin_graph_capture(&[&kernel as &dyn Kernel])
+                .begin_graph_capture_with_resources(
+                    &[&kernel as &dyn Kernel],
+                    workspace_resources(&workspace),
+                )
                 .unwrap();
             run_once(&mut output_buffer);
             runtime.end_graph_capture().unwrap();
@@ -4787,7 +4841,10 @@ mod route_telemetry {
             run_once(&mut output_buffer);
             runtime.synchronize().unwrap();
             runtime
-                .begin_graph_capture(&[&kernel as &dyn Kernel])
+                .begin_graph_capture_with_resources(
+                    &[&kernel as &dyn Kernel],
+                    workspace_resources(&workspace),
+                )
                 .unwrap();
             run_once(&mut output_buffer);
             runtime.end_graph_capture().unwrap();
@@ -4818,6 +4875,9 @@ mod route_telemetry {
                 ep.deallocate(buffer).unwrap();
             }
             ep.deallocate(output_buffer).unwrap();
+            if let Some(workspace) = workspace {
+                ep.deallocate_workspace(workspace).unwrap();
+            }
 
             G1 {
                 off_gpu,
