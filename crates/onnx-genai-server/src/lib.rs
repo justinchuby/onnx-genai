@@ -47,6 +47,8 @@ mod speech;
 mod sse;
 mod state;
 mod tool_protocol;
+mod tools;
+pub use tools::{BuiltinTool, ToolsConfig};
 mod types;
 mod webui;
 mod worker;
@@ -79,6 +81,26 @@ pub use types::{
 };
 
 pub fn app(state: AppState) -> Router {
+    let tools_origin = state.tools.clone();
+    let tools_cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::AllowOrigin::predicate(
+            move |origin, _| {
+                origin.to_str().is_ok_and(|origin| {
+                    tools_origin
+                        .as_ref()
+                        .is_some_and(|tools| tools.origin_allowed(origin))
+                })
+            },
+        ))
+        .allow_credentials(true)
+        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderName::from_static("x-tool-cwd"),
+            axum::http::HeaderName::from_static("x-tool-runtime"),
+            axum::http::HeaderName::from_static("x-resp-type"),
+        ]);
     let mut router = Router::new()
         .route("/health", get(routes::health))
         .route("/v1/health", get(routes::health))
@@ -121,7 +143,7 @@ pub fn app(state: AppState) -> Router {
         .route("/audio/speech", post(routes::audio_speech))
         .route(
             "/props",
-            get(routes::llama::props).post(routes::llama::disabled_feature),
+            get(routes::llama::props).post(routes::llama::post_props),
         )
         .route(
             "/v1/chat/completions/input_tokens",
@@ -156,7 +178,9 @@ pub fn app(state: AppState) -> Router {
         .route("/apply-template", post(routes::llama::apply_template))
         .route(
             "/tools",
-            get(routes::llama::disabled_feature).post(routes::llama::disabled_feature),
+            get(routes::tools::list)
+                .post(routes::tools::invoke)
+                .layer(tools_cors),
         )
         .route(
             "/cors-proxy",
