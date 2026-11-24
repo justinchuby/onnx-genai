@@ -778,6 +778,7 @@ impl CudaEinsumPlan {
         equation: &str,
         signature: &ArithmeticExecutionSignature,
         offered: Option<WorkspaceView>,
+        capturing: bool,
     ) -> Result<bool> {
         if let Some(reason) = self.program.recipe.signature.mismatch_reason(signature) {
             return Err(EpError::KernelFailed(format!(
@@ -791,7 +792,7 @@ impl CudaEinsumPlan {
             .binding
             .as_ref()
             .is_some_and(|binding| binding.key == workspace.key);
-        if runtime.capture_active() && !hit {
+        if capturing && !hit {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Einsum `{equation}`: semantic caller workspace binding changed during capture; abort capture and eagerly warm this exact workspace address/layout before recording"
             )));
@@ -805,7 +806,7 @@ impl CudaEinsumPlan {
             .as_ref()
             .or(self.binding.as_ref())
             .expect("a warmed or new binding exists");
-        if runtime.capture_active() {
+        if capturing {
             if workspace.used.bytes() != 0 {
                 runtime.require_registered_workspace_capture(
                     workspace.used,
@@ -813,7 +814,7 @@ impl CudaEinsumPlan {
                 )?;
             }
             if let Some(metadata) = &binding.metadata {
-                runtime.require_registered_address_capture(
+                runtime.require_captured_address_owner(
                     GraphDeviceAllocation::device_graph_resource(metadata).identity(),
                     "immutable CUDA Einsum metadata",
                 )?;

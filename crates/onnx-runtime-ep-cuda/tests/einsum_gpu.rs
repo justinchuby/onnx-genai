@@ -1174,6 +1174,19 @@ fn forced_f16_cublaslt_narrows_once_and_rejects_unregistered_workspace_capture()
         );
         runtime.test_end_unregistered_graph_capture().unwrap();
         execute(EinsumRouteOverride::CudaCublas, &mut cublas_output).unwrap();
+        runtime
+            .stream()
+            .begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .unwrap();
+        let error = execute(EinsumRouteOverride::CudaCublas, &mut cublas_output)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("real workspace owner"), "{error}");
+        runtime.test_end_unregistered_graph_capture().unwrap();
+        assert!(!kernel.capture_support().is_supported());
+        execute(EinsumRouteOverride::CudaCublas, &mut cublas_output).unwrap();
 
         runtime
             .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
@@ -4745,7 +4758,7 @@ fn semantic_einsum_caller_workspace_gpu() {
         };
     }
     macro_rules! refine {
-        () => {
+        (result) => {
             onnx_runtime_ep_cuda::einsum_workspace_requirement_for_route(
                 kernel.as_ref(),
                 &views,
@@ -4753,7 +4766,9 @@ fn semantic_einsum_caller_workspace_gpu() {
                 EinsumRouteOverride::Optimized,
                 None,
             )
-            .unwrap()
+        };
+        () => {
+            refine!(result).unwrap()
         };
     }
     macro_rules! execute {
@@ -4780,6 +4795,22 @@ fn semantic_einsum_caller_workspace_gpu() {
     let raw_before = runtime.allocation_counts();
     let transfer_before = runtime.transfer_counts();
     let external_before = injected.cumemalloc_calls();
+    runtime
+        .stream()
+        .begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .unwrap();
+    let error = refine!(result).unwrap_err().to_string();
+    assert!(
+        error.contains("cannot reuse the warmed arithmetic snapshot"),
+        "{error}"
+    );
+    assert_eq!(runtime.allocation_counts(), raw_before);
+    assert_eq!(runtime.transfer_counts(), transfer_before);
+    assert_eq!(injected.cumemalloc_calls(), external_before);
+    runtime.test_end_unregistered_graph_capture().unwrap();
+    assert!(!kernel.capture_support().is_supported());
     let preparation = refine!();
     let WorkspaceExecutionPreparation::Bind(prefix) = preparation else {
         panic!("a cold multilinear BLAS program needs a real arithmetic prefix")
@@ -4792,6 +4823,25 @@ fn semantic_einsum_caller_workspace_gpu() {
     assert_eq!(runtime.allocation_counts(), raw_before);
     assert_eq!(runtime.transfer_counts(), transfer_before);
     assert_eq!(injected.cumemalloc_calls(), external_before);
+    // A staged Bind is still cold even though its recipe exists. The capture
+    // refusal must precede taking it, so the same preparation can be retried.
+    runtime
+        .stream()
+        .begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .unwrap();
+    let error = kernel
+        .workspace_requirement_for_bound_execution(None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("cannot select a cold bound algorithm while recording"),
+        "{error}"
+    );
+    assert_eq!(runtime.allocation_counts(), raw_before);
+    assert_eq!(runtime.transfer_counts(), transfer_before);
+    runtime.test_end_unregistered_graph_capture().unwrap();
     let mut owner = None;
     injected.fail_next_allocation();
     let failure = preparation
@@ -4853,6 +4903,35 @@ fn semantic_einsum_caller_workspace_gpu() {
     assert_eq!(runtime.allocation_counts(), raw_warm);
     assert_eq!(runtime.transfer_counts(), transfers_warm);
     assert_eq!(injected.cumemalloc_calls(), external_warm);
+    // Published plans do not imply another caller still has backing. During
+    // untracked capture a cold caller is refused at the provider boundary,
+    // while a fitting caller still needs its real span pinned before launch.
+    runtime
+        .stream()
+        .begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .unwrap();
+    assert!(matches!(refine!(), WorkspaceExecutionPreparation::Ready(_)));
+    let mut cold_owner = None;
+    let syncs_before = runtime.forced_synchronization_count();
+    let error = refine!()
+        .resolve(kernel.as_ref(), |requirement| {
+            common::prepare_workspace(&ep, requirement, &mut cold_owner)
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("during CUDA graph capture"), "{error}");
+    assert!(cold_owner.is_none());
+    let error = execute!(Some(view)).unwrap_err().to_string();
+    assert!(error.contains("real workspace owner"), "{error}");
+    assert_eq!(runtime.allocation_counts(), raw_warm);
+    assert_eq!(runtime.transfer_counts(), transfers_warm);
+    assert_eq!(injected.cumemalloc_calls(), external_warm);
+    assert_eq!(runtime.forced_synchronization_count(), syncs_before);
+    runtime.test_end_unregistered_graph_capture().unwrap();
+    assert!(!kernel.capture_support().is_supported());
+    execute!(Some(view)).unwrap();
     runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
     let missing_pin = execute!(Some(view)).unwrap_err().to_string();
     runtime.abort_graph_capture().unwrap();
@@ -4910,6 +4989,39 @@ fn semantic_einsum_caller_workspace_gpu() {
         .iter()
         .map(|resource| resource.identity())
         .collect::<Vec<_>>();
+    let raw_before_capture_miss = runtime.allocation_counts();
+    let transfers_before_capture_miss = runtime.transfer_counts();
+    let external_before_capture_miss = injected.cumemalloc_calls();
+    let rewarms_before_capture_miss = einsum_execution_stats().plan_rewarms;
+    runtime
+        .stream()
+        .begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .unwrap();
+    let error = execute!(Some(view)).unwrap_err().to_string();
+    assert!(error.contains("binding changed during capture"), "{error}");
+    assert_eq!(runtime.allocation_counts(), raw_before_capture_miss);
+    assert_eq!(runtime.transfer_counts(), transfers_before_capture_miss);
+    assert_eq!(injected.cumemalloc_calls(), external_before_capture_miss);
+    assert_eq!(
+        kernel
+            .device_graph_resources()
+            .iter()
+            .map(|resource| resource.identity())
+            .collect::<Vec<_>>(),
+        metadata
+    );
+    runtime.test_end_unregistered_graph_capture().unwrap();
+    assert!(!kernel.capture_support().is_supported());
+    execute!(Some(other_view)).unwrap();
+    assert_eq!(
+        einsum_execution_stats().plan_rewarms,
+        rewarms_before_capture_miss,
+        "refusing raw-capture rebinding must preserve the already committed final-address snapshot"
+    );
+    assert_eq!(runtime.allocation_counts(), raw_before_capture_miss);
+    assert_eq!(runtime.transfer_counts(), transfers_before_capture_miss);
     runtime.fail_warm_transaction_at_for_test(1);
     let error = execute!(Some(view)).unwrap_err().to_string();
     assert!(

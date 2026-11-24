@@ -1333,6 +1333,40 @@ post-upload failure/ready revocation, and replay of A after B rewarm/kernel drop
 Host checks pin broadcast-table ABI and owner-registration classification.
 These device fixtures require CUDA hardware to execute.
 
+### Einsum observes capture at execution boundaries
+
+Arithmetic Einsum now queries the real stream capture state once per execution
+and passes that invocation-local observation through direct GEMM and semantic
+launch validation. Semantic snapshot/binding misses refuse before constructing
+a new final-address candidate; nonzero caller scratch requires its complete real
+span pin, and immutable metadata uses the strict registered-owner validator.
+These checks therefore also apply when capture started directly on the stream,
+without runtime bookkeeping flags. The observation is not retained in a plan or
+reused across caller admission. Query failures follow the existing ready-revocation
+boundaries, while the safely published snapshot remains available for eager retry.
+
+Actual-view preparation keeps its pure Host fast return on an exact published
+plan match. Every miss, including a matching staged-but-unpublished Bind recipe,
+observes real capture before cold planning or prefix admission can proceed. The
+bound hook independently checks before taking staged state. A published match
+does not imply the caller still owns capacity: the provider's cold workspace
+admission guard above independently refuses capture before grants, synchronization
+or owner consumption. This covers a reclaimed lane or a fresh caller without
+adding queries to fitting/zero resource admission.
+
+The arithmetic execution entry gains one capture-status query and its existing
+graph-lifecycle mutex acquisition compared with its old tracked-flag lookup.
+Private launch steps reuse that observation; published preparation hits do not
+query again. Cold preparation/binding has its own observation at each boundary.
+No new mode cache, Context, allocator, quota callback or owner is introduced.
+This is a correctness change with an unmeasured Host cost, not a throughput claim.
+Device regressions cover cold raw-capture preparation, preserving staged Bind
+for retry, published-plan hits with an unfunded caller, raw-capture missing pins,
+and rebinding refusal with stable allocation/transfer/rewarm state. Existing
+registered capture/replay, workspace dirtying and transactional failure fixtures
+remain in place. CUDA source, layout and numerical routes are unchanged; device
+execution and performance still require hardware validation.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current

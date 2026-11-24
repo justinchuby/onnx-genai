@@ -845,12 +845,11 @@ impl CachedGemm {
         &self,
         layout: &ContractionLayout,
         runtime: &CudaRuntime,
-        a: CUdeviceptr,
-        b: CUdeviceptr,
-        c: CUdeviceptr,
+        pointers: ContractionPointers,
         workspace: Option<WorkspaceView>,
+        capturing: bool,
     ) -> Result<CUdeviceptr> {
-        let params = self.params(layout, a, b, c)?;
+        let params = self.params(layout, pointers.a, pointers.b, pointers.c)?;
         let bytes = self.plan.workspace_bytes();
         let used = direct_workspace(bytes, workspace)?;
         let pointer = if bytes == 0 {
@@ -858,7 +857,7 @@ impl CachedGemm {
         } else {
             cuptr(used.ptr().0.cast_const())
         };
-        if runtime.capture_active() && bytes != 0 {
+        if capturing && bytes != 0 {
             runtime
                 .require_registered_workspace_capture(used, "Einsum direct cuBLASLt workspace")?;
         }
@@ -1456,6 +1455,7 @@ impl EinsumKernel {
         pointers: ContractionPointers,
         signature: &ArithmeticExecutionSignature,
         direct_eligibility: &DirectRouteEligibility,
+        observe_capture: impl FnOnce() -> Result<bool>,
     ) -> Result<bool> {
         let mismatch = match state.published.as_ref() {
             Some(snapshot) => {
@@ -1464,10 +1464,15 @@ impl EinsumKernel {
             None => Some("no arithmetic execution snapshot has been warmed".into()),
         };
         if mismatch.is_none() {
+            // This only reports the immutable plan's requirement. If caller
+            // backing was retired, provider cold admission independently
+            // rejects real capture before any quota/owner mutation.
             state.prepared = None;
             return Ok(true);
         }
-        if self.runtime.capture_active() {
+        // Includes a staged-but-unpublished Bind: never defer this check until
+        // after the caller could attempt cold prefix admission.
+        if observe_capture()? {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Einsum `{}`: cannot reuse the warmed arithmetic snapshot during CUDA graph capture because {}. HOW: abort capture and eagerly warm this exact route/layout first",
                 self.plan.equation(),
@@ -1571,6 +1576,7 @@ impl EinsumKernel {
                 signature.pointers(),
                 &signature,
                 &eligibility,
+                || self.runtime.is_capturing(),
             )?;
             Ok(if hit {
                 WorkspaceExecutionPreparation::Ready(
@@ -1591,7 +1597,7 @@ impl EinsumKernel {
         prefix: Option<WorkspaceView>,
     ) -> Result<WorkspaceRequirement> {
         let result = (|| {
-            if self.runtime.capture_active() {
+            if self.runtime.is_capturing()? {
                 return Err(EpError::KernelFailed(format!(
                     "cuda_ep Einsum `{}`: cannot select a cold bound algorithm while recording; abort capture and eagerly prepare the exact workspace first",
                     self.plan.equation()
@@ -1651,7 +1657,9 @@ impl EinsumKernel {
             route: requested,
             memory_ceiling_bytes,
         };
-        let capturing = self.runtime.capture_active();
+        // Observe once for this execution; launch helpers reuse the result,
+        // never a flag saved across preparation or caller admission.
+        let capturing = self.runtime.is_capturing()?;
         let mut state = self.arithmetic_execution.lock().map_err(|_| {
             EpError::KernelFailed(format!(
                 "cuda_ep Einsum `{}`: arithmetic execution-snapshot lock was poisoned",
@@ -1664,6 +1672,7 @@ impl EinsumKernel {
             pointers,
             &signature,
             &direct_eligibility,
+            || Ok(capturing),
         )?;
         let start = Instant::now();
         let mut candidate = if cache_hit {
@@ -1726,14 +1735,8 @@ impl EinsumKernel {
                             (0, 0, None)
                         }
                         ExecutionKind::Gemm(gemm) => {
-                            let used_pointer = gemm.launch(
-                                layout,
-                                &self.runtime,
-                                pointers.a,
-                                pointers.b,
-                                pointers.c,
-                                workspace,
-                            )?;
+                            let used_pointer =
+                                gemm.launch(layout, &self.runtime, pointers, workspace, capturing)?;
                             GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
                             if layout.left_order == StorageOrder::Transposed
                                 || layout.right_order == StorageOrder::Transposed
@@ -1767,6 +1770,7 @@ impl EinsumKernel {
                         self.plan.equation(),
                         &signature,
                         workspace,
+                        capturing,
                     )?;
                     let summary = plan.summary();
                     match summary.route {
