@@ -92,13 +92,15 @@ fn decode_value(node: &Node) -> Result<(DataType, [u8; 16], usize)> {
     let mut pattern = [0_u8; 16];
     if tensor.dtype.is_sub_byte() {
         let bit_size = tensor.dtype.bit_size();
-        let mask = (1_u8 << bit_size) - 1;
-        let scalar = tensor.data[0] & mask;
-        pattern[0] = match bit_size {
-            4 => scalar | (scalar << 4),
-            2 => scalar * 0x55,
-            _ => unreachable!("ONNX sub-byte dtypes are two or four bits"),
-        };
+        if !8_usize.is_multiple_of(bit_size) {
+            return Err(not_implemented(format!(
+                "ConstantOfShape cannot fill {:?}: packed elements cross byte boundaries; \
+                 use a byte-aligned dtype or a packed dtype whose width divides eight",
+                tensor.dtype
+            )));
+        }
+        let mask = u8::MAX >> (8 - bit_size);
+        pattern[0] = (tensor.data[0] & mask) * (u8::MAX / mask);
         Ok((tensor.dtype, pattern, 1))
     } else {
         let bytes = tensor.dtype.byte_size();

@@ -37,6 +37,13 @@ fn decode_value(node: &Node) -> Result<(DataType, Vec<u8>)> {
     match node.attr("value") {
         Some(Attribute::Tensor(t)) => {
             let esize = if t.dtype.is_sub_byte() {
+                if !8_usize.is_multiple_of(t.dtype.bit_size()) {
+                    return Err(EpError::KernelFailed(format!(
+                        "ConstantOfShape: cannot fill {:?}: packed elements cross byte boundaries; \
+                         use a byte-aligned dtype or a packed dtype whose width divides eight",
+                        t.dtype
+                    )));
+                }
                 t.dtype.storage_bytes(1)
             } else {
                 elem_size(t.dtype)?
@@ -190,6 +197,17 @@ mod tests {
         let mut out = Owned::zeros(DataType::Int64, &[4]);
         k.execute(&[shape.view()], &mut [out.view_mut()]).unwrap();
         assert_eq!(out.to_i64(), vec![7, 7, 7, 7]);
+    }
+
+    #[test]
+    fn constant_of_shape_rejects_packed_width_crossing_byte_boundaries() {
+        let mut node = Node::new(NodeId(0), "ConstantOfShape", vec![], vec![]);
+        node.attributes
+            .insert("value".into(), tensor_value(DataType::Float6E2M3, vec![1]));
+        let Err(error) = ConstantOfShapeFactory.create(&node, &[]) else {
+            panic!("ConstantOfShape accepted a cross-byte packed fill");
+        };
+        assert!(error.to_string().contains("cross byte boundaries"));
     }
 
     #[test]

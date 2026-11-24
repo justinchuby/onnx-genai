@@ -50,19 +50,33 @@ fn assert_placement(session: &InferenceSession, device_type: DeviceType) {
 }
 
 fn check_fill(device: DevicePreference, device_type: DeviceType) {
-    for (dtype, scalar, full_byte) in [
-        (DataType::Int2, 0x02, 0xaa), // signed -2
-        (DataType::Uint2, 0x03, 0xff),
-        (DataType::Float8E8M0, 0x81, 0x81),
+    for (dtype, scalar, expected) in [
+        (
+            DataType::Int2,
+            0x02,
+            [&[][..], &[2], &[0x0a], &[0x2a], &[0xaa], &[0xaa, 2]],
+        ),
+        (
+            DataType::Uint2,
+            0x03,
+            [&[][..], &[3], &[0x0f], &[0x3f], &[0xff], &[0xff, 3]],
+        ),
+        (
+            DataType::Float8E8M0,
+            0x81,
+            [
+                &[][..],
+                &[0x81; 1],
+                &[0x81; 2],
+                &[0x81; 3],
+                &[0x81; 4],
+                &[0x81; 5],
+            ],
+        ),
     ] {
         let mut session = session(&filled_graph(dtype, scalar), device.clone());
         assert_placement(&session, device_type);
-        let odd = if dtype.is_sub_byte() {
-            vec![full_byte, scalar]
-        } else {
-            vec![full_byte; 5]
-        };
-        for (n, expected) in [(5, odd.as_slice()), (0, &[][..]), (1, &[scalar][..])] {
+        for (n, expected) in expected.into_iter().enumerate() {
             let shape = Tensor::from_raw(DataType::Int64, vec![1], &(n as i64).to_le_bytes())
                 .expect("shape feed");
             let outputs = session
