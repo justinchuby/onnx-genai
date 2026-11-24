@@ -132,7 +132,7 @@ fn run_model_with(
         &output_strides,
         device,
     );
-    let opset = graph.opset_imports[""] as u64;
+    let opset = graph.opset_imports[""];
     assert!(
         ep.supports_op(
             node,
@@ -448,10 +448,14 @@ fn cpu_dilated_averagepool_matches_expected_vectors() {
             &output_strides,
             ep.device_id(),
         );
-        ep.get_kernel(node, &[input_shape.clone()], graph.opset_imports[""] as u64)
-            .unwrap()
-            .execute(&[input], &mut [output])
-            .unwrap();
+        ep.get_kernel(
+            node,
+            std::slice::from_ref(&input_shape),
+            graph.opset_imports[""],
+        )
+        .unwrap()
+        .execute(&[input], &mut [output])
+        .unwrap();
         if dtype != DataType::Float32 {
             for (value, bits) in got.iter_mut().zip(narrow) {
                 *value = if dtype == DataType::Float16 {

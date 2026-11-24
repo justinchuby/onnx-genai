@@ -798,7 +798,7 @@ impl WindowPoolKernel {
         let metadata = spatial
             .iter()
             .map(|&dim| dim as u64)
-            .chain(output_strides.into_iter())
+            .chain(output_strides)
             .chain(kernel)
             .chain(strides)
             .chain(dilations)
