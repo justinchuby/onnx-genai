@@ -52,6 +52,7 @@ pub mod deform_conv;
 pub mod dequantize_packed;
 pub mod dequantize_packed_gather;
 mod device;
+pub mod dft;
 mod domain;
 mod dtype;
 mod einsum;

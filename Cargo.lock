@@ -2423,6 +2423,7 @@ dependencies = [
  "onnx-runtime-quantization",
  "onnx-runtime-tracer",
  "rayon",
+ "rustfft",
  "smallvec",
  "thiserror 2.0.19",
  "tracing",

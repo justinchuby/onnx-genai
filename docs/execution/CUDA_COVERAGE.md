@@ -258,7 +258,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Range` | `` | ✅ | **NVRTC-custom** | FP32/FP64, FP16/BF16, and Int16/32/64; opset 27 supports FLOAT and DOUBLE stash precision. CUDA graph capture cannot resolve a scalar-dependent output length. The ORT CUDA plugin declines runtime-valued shape reads rather than claiming them. |
 | `ScatterND` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16/Int64 slice updates with negative index wrapping and ordered assignment/legacy reductions. Opset 29 adds Int32 indices and parallel `mean` including the original data, with exact integer sums and truncation toward zero (`indexing.rs`). |
 | `HannWindow`, `HammingWindow`, `BlackmanWindow` (v17) | `` | ✅ | **NVRTC-custom** | Periodic or symmetric signal windows generated directly on device in f16/bf16/f32/f64, with the scalar size and `output_datatype` contract matched to the CPU EP (`window.rs`). |
-| `DFT` (v17/v20) | `` | ✅ | **cuFFT + NVRTC pack/unpack** | f32 real/complex input, forward/inverse, full/onesided output, arbitrary signal axis, and truncating/zero-padding `dft_length`. A bounded 16-entry plan cache reuses stream-bound C2C plans; execution scratch and packed data use governed EP workspace. Plan selection and scalar staging deliberately decline CUDA-graph capture (`dft.rs`, `cufft.rs`). |
+| `DFT` (v17/v20) | `` | ✅ | **cuFFT + NVRTC pack/unpack** | Contiguous data, arbitrary signal axis, and truncating/zero-padding `dft_length`. v17 retains the f32 path and axis attribute; v20 adds inverse real transforms (complex half-spectrum to real output), f64/f16/bf16, Int32 or Int64 length, and optional Int64 axis. f16/bf16 compute in f32. Governed workspace and a bounded 16-entry plan cache back the C2C/Z2Z paths. CUDA-graph capture is unsupported (`dft.rs`, `cufft.rs`). |
 | `NonMaxSuppression` (v10) | `` | ✅ | **NVRTC bounded sort/suppress + DeviceWorkspace** | Static contiguous f32 boxes `[B,N,4]` and scores `[B,C,N]`, with `N <= 256` and `B*C <= 256`. One block per batch/class filters and bitonic-sorts scores deterministically, then performs bounded sequential suppression; a second metadata launch reduces per-group counts. Only the 8-byte selected count crosses D2H before one device materialization launch writes exact Int64 rows. Optional scalar inputs remain device-resident. |
 | `STFT` (v17) | `` | ✅ | **cuFFT + fused NVRTC frame/window pack + unpack** | Contiguous f32 `[batch, signal, 1|2]`, dynamic Int32/Int64 `frame_step` and optional `frame_length`, optional matching f32 window, complete unpadded frames, full spectrum or real-input onesided output. All frames across the signal batch execute in one PlanMany call through DFT's shared 16-entry plan cache and governed workspace. Runtime scalar reads/plan selection deliberately decline CUDA-graph capture (`stft.rs`, `cufft.rs`). |
 | `CenterCropPad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width centered crop/zero-pad over all or selected axes, including negative axes and CPU-matched odd-difference placement (`index_transform.rs`). |
@@ -454,9 +454,11 @@ worth stating precisely:
   prevent future re-investigation.
 
 `ai.onnx::DFT` and `ai.onnx::STFT` are implemented for CUDA in `kernels/dft.rs`
-and `kernels/stft.rs`. The DFT path
-packs arbitrary ONNX signal axes into contiguous complex f32 batches, executes
-cuFFT C2C, and unpacks to the requested full or half spectrum. This common
+and `kernels/stft.rs`. The DFT path packs arbitrary ONNX signal axes into
+contiguous complex batches, executes cuFFT C2C or Z2Z, and unpacks to the
+requested spectrum or real signal. DFT-20 inverse real uses an even length of
+`2 * (bins - 1)` by default; an explicit positive length also supports odd signals.
+This common
 packed-batch/plan-cache seam is reused by STFT, whose fused pack kernel extracts
 complete frames and applies the optional window before one batched cuFFT call.
 

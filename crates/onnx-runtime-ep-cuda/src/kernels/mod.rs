@@ -437,8 +437,15 @@ pub struct CudaOpDescriptor {
 /// Float compute types the CUDA kernels handle (cuBLASLt + custom kernels).
 static CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
 
-/// DFT data/output are f32; its optional length and axis inputs are i64.
-static CUDA_DFT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
+/// Union of versioned DFT data and scalar input dtypes; placement checks each slot.
+static CUDA_DFT_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float64,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Int32,
+    DataType::Int64,
+];
 
 /// STFT data/output/window are f32; frame scalars may be i32 or i64.
 static CUDA_STFT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int32, DataType::Int64];
@@ -2431,7 +2438,7 @@ mod tests {
         assert_eq!(
             cuda_supported_dtypes_for_op("DFT", ""),
             CUDA_DFT_DTYPES,
-            "DFT must advertise f32 data plus its Int64 scalar inputs"
+            "DFT must advertise the union of supported data and scalar dtypes"
         );
     }
 

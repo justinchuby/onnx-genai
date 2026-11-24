@@ -10,9 +10,11 @@ use std::f32::consts::PI;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::dft::{self as dft_rules, Spectrum};
+use onnx_runtime_ir::{DataType, Node};
+use rustfft::{FftPlanner, num_complex::Complex};
 
-use super::check_arity;
+use super::{check_arity, to_dense_bytes, write_dense_bytes};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
@@ -88,27 +90,20 @@ impl KernelFactory for DftFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let inverse = node.attr("inverse").and_then(|a| a.as_int()).unwrap_or(0) != 0;
         let onesided = node.attr("onesided").and_then(|a| a.as_int()).unwrap_or(0) != 0;
-        // Opset < 20: axis is an attribute (default 1).
-        // Opset >= 20: axis is an input, handled at execute time.
-        let axis_attr = node.attr("axis").and_then(|a| a.as_int());
-        let default_axis = if node.local_opset().unwrap_or(17) >= 20 {
-            -2
-        } else {
-            1
-        };
+        let opset = node.local_opset().unwrap_or(17);
         Ok(Box::new(DftKernel {
             inverse,
-            onesided,
-            axis_attr,
-            default_axis,
+            spectrum: Spectrum::from_flags(opset, inverse, onesided),
+            opset,
+            default_axis: dft_rules::default_axis(node, opset),
         }))
     }
 }
 
 struct DftKernel {
     inverse: bool,
-    onesided: bool,
-    axis_attr: Option<i64>,
+    spectrum: Spectrum,
+    opset: u64,
     default_axis: i64,
 }
 
@@ -117,7 +112,7 @@ impl Kernel for DftKernel {
         // DFT opset 17: inputs = [input, dft_length?]
         // DFT opset 20: inputs = [input, dft_length?, axis?]
         let min_in = 1;
-        let max_in = 3;
+        let max_in = if self.opset >= 20 { 3 } else { 2 };
         check_arity("DFT", inputs, outputs, min_in, max_in, 1)?;
 
         let input = &inputs[0];
@@ -129,149 +124,185 @@ impl Kernel for DftKernel {
         }
 
         // Determine the signal axis.
-        let axis_raw = if inputs.len() >= 3 && !inputs[2].is_absent() {
-            // Opset 20: axis as input
-            let axis_data = super::to_dense_i64(&inputs[2])?;
-            axis_data[0]
-        } else {
-            self.axis_attr.unwrap_or(self.default_axis)
-        };
-
-        let axis = normalize_axis(axis_raw, rank)?;
+        let axis_raw = scalar(inputs, 2, "axis", |dtype| dtype == DataType::Int64)?
+            .unwrap_or(self.default_axis);
+        let axis = dft_rules::normalize_axis(axis_raw, rank).map_err(dft_error)?;
         let last = rank - 1;
-
-        // The last dimension is the complex component dimension (1 for real, 2 for complex).
-        let complex_dim = input.shape[last];
-        let is_real_input = complex_dim == 1;
-        if complex_dim != 1 && complex_dim != 2 {
-            return Err(EpError::KernelFailed(format!(
-                "DFT: last dimension must be 1 (real) or 2 (complex), got {complex_dim}"
-            )));
-        }
-        if self.onesided && !is_real_input {
-            return Err(EpError::KernelFailed(
-                "DFT: onesided=1 is valid only for real input (last dimension 1)".into(),
-            ));
-        }
-
-        // Determine DFT length.
-        let signal_len = input.shape[axis];
-        let dft_length = if inputs.len() >= 2 && !inputs[1].is_absent() {
-            let len_data = super::to_dense_i64(&inputs[1])?;
-            usize::try_from(len_data[0])
-                .ok()
-                .filter(|length| *length > 0)
-                .ok_or_else(|| {
-                    EpError::KernelFailed(format!(
-                        "DFT: dft_length must be positive, got {}",
-                        len_data[0]
-                    ))
-                })?
-        } else {
-            signal_len
-        };
-
-        // Validate output shape.
-        let out_signal_len = if self.onesided {
-            dft_length / 2 + 1
-        } else {
-            dft_length
-        };
-
+        self.spectrum
+            .validate_components(input.shape[last])
+            .map_err(dft_error)?;
+        let explicit = scalar(inputs, 1, "dft_length", dft_rules::is_length_dtype)?
+            .map(dft_rules::explicit_length)
+            .transpose()
+            .map_err(dft_error)?;
+        let dft_length = self
+            .spectrum
+            .transform_length(explicit, input.shape[axis])
+            .map_err(dft_error)?;
+        let mut expected = input.shape.to_vec();
+        expected[axis] = self.spectrum.output_extent(dft_length);
+        expected[last] = self.spectrum.output_components();
         let output = &mut outputs[0];
-        if output.shape[last] != 2 {
-            return Err(EpError::KernelFailed(format!(
-                "DFT: output last dim must be 2, got {}",
-                output.shape[last]
-            )));
-        }
-        if output.shape[axis] != out_signal_len {
-            return Err(EpError::KernelFailed(format!(
-                "DFT: output signal axis size mismatch: expected {out_signal_len}, got {}",
-                output.shape[axis]
+        if output.shape != expected || output.dtype != input.dtype {
+            return Err(dft_error(format!(
+                "expected output {:?} {expected:?}, got {:?} {:?}",
+                input.dtype, output.dtype, output.shape
             )));
         }
 
-        // Materialize input as f32. `to_dense_f32_widen` accepts the full ONNX
-        // DFT type constraint (float32/float16/bfloat16/float64 and strided
-        // float32) and folds every case into a dense f32 buffer, so DFT is
-        // computed in f32 and narrowed back to the output dtype on write — the
-        // same compute-in-f32 contract every other float kernel uses.
-        let input_data = to_dense_f32_widen("DFT", input)?;
-
-        // Compute batch dimensions: all dims except axis and last.
-        let mut batch_shape: Vec<usize> = Vec::with_capacity(rank - 2);
-        for (i, &d) in input.shape.iter().enumerate() {
-            if i != axis && i != last {
-                batch_shape.push(d);
-            }
+        let geometry = DftGeometry {
+            input_shape: input.shape,
+            output_shape: output.shape,
+            axis,
+            dft_length,
+            spectrum: self.spectrum,
+        };
+        if input.dtype == DataType::Float64 && self.opset >= 20 {
+            let bytes = to_dense_bytes(input)?;
+            let data: Vec<f64> = bytes
+                .chunks_exact(8)
+                .map(|chunk| f64::from_ne_bytes(chunk.try_into().expect("8-byte chunk")))
+                .collect();
+            let mut planner = FftPlanner::<f64>::new();
+            let plan = if self.inverse {
+                planner.plan_fft_inverse(dft_length)
+            } else {
+                planner.plan_fft_forward(dft_length)
+            };
+            let mut scratch = vec![Complex::default(); plan.get_inplace_scratch_len()];
+            let mut work = vec![Complex::default(); dft_length];
+            let scale = if self.inverse {
+                1.0 / dft_length as f64
+            } else {
+                1.0
+            };
+            let data = geometry.transform(&data, |real, imag, real_out, imag_out| {
+                for (i, value) in work.iter_mut().enumerate() {
+                    *value = Complex::new(real[i], imag[i]);
+                }
+                plan.process_with_scratch(&mut work, &mut scratch);
+                for (i, value) in work.iter().enumerate() {
+                    real_out[i] = value.re * scale;
+                    imag_out[i] = value.im * scale;
+                }
+            });
+            let bytes: Vec<u8> = data.into_iter().flat_map(f64::to_ne_bytes).collect();
+            write_dense_bytes(output, &bytes)
+        } else {
+            let data = to_dense_f32_widen("DFT", input)?;
+            let plan = DftPlan::new(dft_length, self.inverse);
+            let data = geometry.transform(&data, |r, i, ro, io| plan.transform(r, i, ro, io));
+            write_dense_f32_narrow("DFT", output, &data)
         }
+    }
+}
+
+fn dft_error(reason: String) -> EpError {
+    EpError::KernelFailed(format!("DFT: {reason}"))
+}
+
+fn scalar(
+    inputs: &[TensorView],
+    index: usize,
+    name: &str,
+    valid_type: impl Fn(DataType) -> bool,
+) -> Result<Option<i64>> {
+    let Some(input) = inputs.get(index).filter(|input| !input.is_absent()) else {
+        return Ok(None);
+    };
+    if !input.shape.is_empty() || !valid_type(input.dtype) {
+        return Err(dft_error(format!(
+            "{name} must be a scalar of type {}, got {:?} {:?}",
+            if index == 1 {
+                "Int32 or Int64"
+            } else {
+                "Int64"
+            },
+            input.dtype,
+            input.shape
+        )));
+    }
+    Ok(Some(super::to_dense_i64(input)?[0]))
+}
+
+struct DftGeometry<'a> {
+    input_shape: &'a [usize],
+    output_shape: &'a [usize],
+    axis: usize,
+    dft_length: usize,
+    spectrum: Spectrum,
+}
+
+impl DftGeometry<'_> {
+    fn transform<T: Copy + Default + std::ops::Neg<Output = T>>(
+        &self,
+        input: &[T],
+        mut transform: impl FnMut(&[T], &[T], &mut [T], &mut [T]),
+    ) -> Vec<T> {
+        let axis = self.axis;
+        let last = self.input_shape.len() - 1;
+        let n = self.dft_length;
+        let bins = self.spectrum.input_extent(n);
+        let keep = bins.min(self.input_shape[axis]);
+        let real_output = self.spectrum == Spectrum::OneSidedInput;
+        let batch_shape: Vec<_> = self.input_shape[..last]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &d)| (i != axis).then_some(d))
+            .collect();
         let batch_count: usize = batch_shape.iter().product();
-
-        // Compute strides for the input layout (row-major).
-        let input_strides = row_major_strides(input.shape);
-        let output_strides = row_major_strides(output.shape);
-
-        let total_output = numel(output.shape);
-        let mut output_data = vec![0.0f32; total_output];
-
-        // Iterate over batches.
+        let input_strides = row_major_strides(self.input_shape);
+        let output_strides = row_major_strides(self.output_shape);
+        let mut output = vec![T::default(); numel(self.output_shape)];
+        if batch_count == 0 {
+            return output;
+        }
+        let mut real = vec![T::default(); n];
+        let mut imag = vec![T::default(); n];
+        let mut real_out = vec![T::default(); n];
+        let mut imag_out = vec![T::default(); n];
         let mut batch_indices = vec![0usize; batch_shape.len()];
         for _ in 0..batch_count {
-            // Map batch indices to input/output coordinates.
             let (in_base, out_base) = compute_bases(
                 &batch_indices,
-                input.shape,
-                output.shape,
+                self.input_shape,
+                self.output_shape,
                 axis,
                 last,
                 &input_strides,
                 &output_strides,
             );
 
-            // Extract signal from input.
-            let mut real_in = vec![0.0f32; signal_len];
-            let mut imag_in = vec![0.0f32; signal_len];
-            for i in 0..signal_len {
+            for i in 0..keep {
                 let idx = in_base + i * input_strides[axis];
-                real_in[i] = input_data[idx];
-                if !is_real_input {
-                    imag_in[i] = input_data[idx + 1];
+                real[i] = input[idx];
+                if self.input_shape[last] == 2 {
+                    imag[i] = input[idx + 1];
                 }
             }
-
-            // Zero-pad or truncate to dft_length.
-            real_in.resize(dft_length, 0.0);
-            imag_in.resize(dft_length, 0.0);
-
-            // Compute DFT.
-            let (real_out, imag_out) =
-                compute_dft(&real_in, &imag_in, dft_length, self.inverse, self.onesided);
-
-            // Write to output.
-            for i in 0..out_signal_len {
-                let idx = out_base + i * output_strides[axis];
-                output_data[idx] = real_out[i];
-                output_data[idx + 1] = imag_out[i];
+            if real_output {
+                // DC and the even-length Nyquist bin are their own conjugates.
+                imag[0] = T::default();
+                if n % 2 == 0 {
+                    imag[n / 2] = T::default();
+                }
+                for i in bins..n {
+                    real[i] = real[n - i];
+                    imag[i] = -imag[n - i];
+                }
             }
-
-            // Advance batch indices.
+            transform(&real, &imag, &mut real_out, &mut imag_out);
+            for i in 0..self.output_shape[axis] {
+                let idx = out_base + i * output_strides[axis];
+                output[idx] = real_out[i];
+                if !real_output {
+                    output[idx + 1] = imag_out[i];
+                }
+            }
             advance_indices(&mut batch_indices, &batch_shape);
         }
-
-        write_dense_f32_narrow("DFT", output, &output_data)
+        output
     }
-}
-
-fn normalize_axis(axis: i64, rank: usize) -> Result<usize> {
-    let r = rank as i64;
-    let normalized = if axis >= 0 { axis } else { axis + r };
-    if normalized < 0 || normalized >= r - 1 {
-        return Err(EpError::KernelFailed(format!(
-            "DFT: axis {axis} invalid for rank {rank} (last dim is complex component)"
-        )));
-    }
-    Ok(normalized as usize)
 }
 
 fn row_major_strides(shape: &[usize]) -> Vec<usize> {
@@ -318,6 +349,7 @@ fn advance_indices(indices: &mut [usize], shape: &[usize]) {
 }
 
 /// Compute the DFT using the best available method.
+#[cfg(test)]
 fn compute_dft(
     real_in: &[f32],
     imag_in: &[f32],
@@ -327,24 +359,13 @@ fn compute_dft(
 ) -> (Vec<f32>, Vec<f32>) {
     let mut real_out = vec![0.0; n];
     let mut imag_out = vec![0.0; n];
-    compute_dft_into(real_in, imag_in, &mut real_out, &mut imag_out, inverse);
+    DftPlan::new(n, inverse).transform(real_in, imag_in, &mut real_out, &mut imag_out);
     if onesided {
         let half = n / 2 + 1;
         real_out.truncate(half);
         imag_out.truncate(half);
     }
     (real_out, imag_out)
-}
-
-/// Compute one DFT into caller-owned full-length buffers.
-pub(super) fn compute_dft_into(
-    real_in: &[f32],
-    imag_in: &[f32],
-    real_out: &mut [f32],
-    imag_out: &mut [f32],
-    inverse: bool,
-) {
-    DftPlan::new(real_in.len(), inverse).transform(real_in, imag_in, real_out, imag_out);
 }
 
 /// A transform plan reusable across STFT frames of one fixed length.
@@ -909,5 +930,76 @@ mod tests {
              -- a per-thread counter that sees another thread's work turns every exact \
              dispatch equality in this crate back into a lower bound, silently"
         );
+    }
+    fn irfft20() -> Box<dyn Kernel> {
+        let mut node = versioned_dft_node(20, None);
+        node.attributes.insert("inverse".into(), Attribute::Int(1));
+        DftFactory.create(&node, &[]).unwrap()
+    }
+
+    #[test]
+    fn dft_v20_irfft_odd_int32_pads_missing_bins_on_a_non_last_axis() {
+        let signal = Owned::f32(&[2, 2, 2], &[1., 9., 2., -8., 3., 4., -2., 1.]);
+        let length = Owned::i32(&[], &[5]);
+        let axis = Owned::i64(&[], &[-3]);
+        let mut output = Owned::zeros_f32(&[5, 2, 1]);
+        irfft20()
+            .execute(
+                &[signal.view(), length.view(), axis.view()],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+        // np.fft.irfft([[1+9j, 2-8j], [3+4j, -2+1j]], n=5, axis=0)
+        let expected = [
+            1.4,
+            -0.4,
+            -0.95087004,
+            -0.2276362,
+            -1.7112768,
+            0.8120995,
+            0.16963601,
+            1.2823277,
+            2.0925107,
+            0.533209,
+        ];
+        let actual = to_dense_f32_widen("DFT test", &output.view()).unwrap();
+        for (i, (&a, e)) in actual.iter().zip(expected).enumerate() {
+            assert!((a - e).abs() < 2e-6, "index {i}: expected {e}, got {a}");
+        }
+    }
+
+    #[test]
+    fn dft_v20_irfft_default_length_preserves_float64_precision() {
+        let delta = 2f64.powi(-40);
+        let signal = Owned::f64(&[2, 2], &[1.0 + delta, 9.0, 1.0, 11.0]);
+        let mut output = Owned::f64(&[2, 1], &[0.; 2]);
+        irfft20()
+            .execute(&[signal.view()], &mut [output.view_mut()])
+            .unwrap();
+        // np.fft.irfft([1+2**-40+9j, 1+11j]); both imaginary parts are ignored.
+        assert_eq!(
+            output.bytes,
+            Owned::f64(&[2, 1], &[1.0 + delta / 2.0, delta / 2.0]).bytes
+        );
+    }
+
+    #[test]
+    fn dft_v20_irfft_accepts_lower_precision_and_int64_length() {
+        let f16 = Owned::f16(&[3, 2], &[1., 9., 3., 4., 5., -6.]);
+        let bf16 = Owned::bf16(&[3, 2], &[1., 9., 3., 4., 5., -6.]);
+        let length = Owned::i64(&[], &[4]);
+        for (signal, mut output) in [
+            (f16, Owned::f16(&[4, 1], &[0.; 4])),
+            (bf16, Owned::bf16(&[4, 1], &[0.; 4])),
+        ] {
+            irfft20()
+                .execute(&[signal.view(), length.view()], &mut [output.view_mut()])
+                .unwrap();
+            // np.fft.irfft([1+9j, 3+4j, 5-6j])
+            assert_eq!(
+                to_dense_f32_widen("DFT test", &output.view()).unwrap(),
+                [3., -3., 0., 1.]
+            );
+        }
     }
 }
