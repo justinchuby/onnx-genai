@@ -91,6 +91,19 @@ __device__ __forceinline__ __nv_bfloat16 from_f_val(float x, __nv_bfloat16*) {
   return __float2bfloat16_rn(x);
 }
 
+__device__ __forceinline__ float read_state(const void* ptr, unsigned long long i, int dtype) {
+  if (!ptr) return 0.0f;
+  if (dtype == 1) return ((const float*)ptr)[i];
+  if (dtype == 10) return to_f(((const __half*)ptr)[i]);
+  return to_f(((const __nv_bfloat16*)ptr)[i]);
+}
+
+__device__ __forceinline__ void write_state(void* ptr, unsigned long long i, float x, int dtype) {
+  if (dtype == 1) ((float*)ptr)[i] = x;
+  else if (dtype == 10) ((__half*)ptr)[i] = __float2half_rn(x);
+  else ((__nv_bfloat16*)ptr)[i] = __float2bfloat16_rn(x);
+}
+
 // Round `x` through the storage dtype `T` and widen back to f32. Reproduces the
 // per-op narrow rounding a standalone `Sigmoid`/`Softplus`/`Add`/`Mul` kernel
 // applies at each fused gate's boundary, so a folded gate stays byte-identical
@@ -147,9 +160,9 @@ __device__ __forceinline__ float la_warp_reduce_sum(float v) {
 template <typename T>
 __device__ void linear_attention_core(
     const T* q, const T* k, const T* v,
-    const T* past_state, const T* decay, const T* beta,
+    const void* past_state, const T* decay, const T* beta,
     const T* dt_bias, const T* neg_exp_A,
-    T* output, T* present_state,
+    T* output, void* present_state,
     unsigned long long batch, unsigned long long seq,
     unsigned long long d_k, unsigned long long d_v,
     unsigned long long q_num_heads, unsigned long long kv_num_heads,
@@ -158,7 +171,7 @@ __device__ void linear_attention_core(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp) {
+    int fuse_neg_exp, int state_dtype, float* scratch) {
   const unsigned long long total = batch * kv_num_heads * d_v;
   const unsigned long long stride =
       (unsigned long long)gridDim.x * blockDim.x;
@@ -172,9 +185,10 @@ __device__ void linear_attention_core(
   const unsigned long long h_k = h_kv / kv_per_k_head;
   const unsigned long long sbase = hk_flat * d_k * d_v;  // + i*d_v + j
 
-  float sc[MAX_D_K];
+  float local[MAX_D_K];
+  float* sc = scratch ? scratch + tid * d_k : local;
   for (unsigned long long i = 0; i < d_k; ++i) {
-    sc[i] = past_state ? to_f(past_state[sbase + i * d_v + j]) : 0.0f;
+    sc[i] = read_state(past_state, sbase + i * d_v + j, state_dtype);
   }
 
   for (unsigned long long t = 0; t < seq; ++t) {
@@ -248,7 +262,7 @@ __device__ void linear_attention_core(
   }
 
   for (unsigned long long i = 0; i < d_k; ++i) {
-    present_state[sbase + i * d_v + j] = from_f_val(sc[i], present_state);
+    write_state(present_state, sbase + i * d_v + j, sc[i], state_dtype);
   }
   }
 }
@@ -266,13 +280,13 @@ extern "C" __global__ void linear_attention_f32(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp) {
+    int fuse_neg_exp, int state_dtype, float* scratch) {
   linear_attention_core<float>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus, fuse_neg_exp);
+      fuse_decay_softplus, fuse_neg_exp, state_dtype, scratch);
 }
 
 extern "C" __global__ void linear_attention_f16(
@@ -288,13 +302,13 @@ extern "C" __global__ void linear_attention_f16(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp) {
+    int fuse_neg_exp, int state_dtype, float* scratch) {
   linear_attention_core<__half>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus, fuse_neg_exp);
+      fuse_decay_softplus, fuse_neg_exp, state_dtype, scratch);
 }
 
 extern "C" __global__ void linear_attention_bf16(
@@ -312,13 +326,13 @@ extern "C" __global__ void linear_attention_bf16(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp) {
+    int fuse_neg_exp, int state_dtype, float* scratch) {
   linear_attention_core<__nv_bfloat16>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus, fuse_neg_exp);
+      fuse_decay_softplus, fuse_neg_exp, state_dtype, scratch);
 }
 
 // ── Warp-cooperative variant ────────────────────────────────────────────────
@@ -336,9 +350,9 @@ extern "C" __global__ void linear_attention_bf16(
 template <typename T>
 __device__ void linear_attention_core_coop(
     const T* q, const T* k, const T* v,
-    const T* past_state, const T* decay, const T* beta,
+    const void* past_state, const T* decay, const T* beta,
     const T* dt_bias, const T* neg_exp_A,
-    T* output, T* present_state,
+    T* output, void* present_state,
     unsigned long long batch, unsigned long long seq,
     unsigned long long d_k, unsigned long long d_v,
     unsigned long long q_num_heads, unsigned long long kv_num_heads,
@@ -347,7 +361,7 @@ __device__ void linear_attention_core_coop(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp) {
+    int fuse_neg_exp, int state_dtype) {
   const unsigned lane = threadIdx.x & (LA_WARP - 1);
   const unsigned warps_per_block = blockDim.x / LA_WARP;
   const unsigned long long total_warps = batch * kv_num_heads * d_v;
@@ -370,7 +384,7 @@ __device__ void linear_attention_core_coop(
 #pragma unroll
     for (int s = 0; s < LA_MAX_SLOTS; ++s) {
       const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
-      sc[s] = (i < d_k && past_state) ? to_f(past_state[sbase + i * d_v + j]) : 0.0f;
+      sc[s] = i < d_k ? read_state(past_state, sbase + i * d_v + j, state_dtype) : 0.0f;
     }
 
     for (unsigned long long t = 0; t < seq; ++t) {
@@ -485,7 +499,7 @@ __device__ void linear_attention_core_coop(
 #pragma unroll
     for (int s = 0; s < LA_MAX_SLOTS; ++s) {
       const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
-      if (i < d_k) present_state[sbase + i * d_v + j] = from_f_val(sc[s], present_state);
+      if (i < d_k) write_state(present_state, sbase + i * d_v + j, sc[s], state_dtype);
     }
   }
 }
@@ -503,13 +517,13 @@ extern "C" __global__ void linear_attention_f32_coop(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp) {
+    int fuse_neg_exp, int state_dtype, float*) {
   linear_attention_core_coop<float>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus, fuse_neg_exp);
+      fuse_decay_softplus, fuse_neg_exp, state_dtype);
 }
 
 extern "C" __global__ void linear_attention_f16_coop(
@@ -525,13 +539,13 @@ extern "C" __global__ void linear_attention_f16_coop(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp) {
+    int fuse_neg_exp, int state_dtype, float*) {
   linear_attention_core_coop<__half>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus, fuse_neg_exp);
+      fuse_decay_softplus, fuse_neg_exp, state_dtype);
 }
 
 extern "C" __global__ void linear_attention_bf16_coop(
@@ -549,13 +563,13 @@ extern "C" __global__ void linear_attention_bf16_coop(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp) {
+    int fuse_neg_exp, int state_dtype, float*) {
   linear_attention_core_coop<__nv_bfloat16>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus, fuse_neg_exp);
+      fuse_decay_softplus, fuse_neg_exp, state_dtype);
 }
 "#;
 
@@ -568,6 +582,15 @@ enum UpdateRule {
 }
 
 impl UpdateRule {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::Gated => "gated",
+            Self::Delta => "delta",
+            Self::GatedDelta => "gated_delta",
+        }
+    }
+
     fn parse(node: &Node) -> Result<Self> {
         match node.attr("update_rule").and_then(|a| a.as_str()) {
             Some("linear") => Ok(UpdateRule::Linear),
@@ -598,8 +621,15 @@ fn read_heads(node: &Node, name: &str) -> Option<usize> {
 /// Claim gate. Returns `Some(reason)` when the CUDA EP cannot run this node, so
 /// placement declines cleanly instead of claiming then failing at execute time.
 pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Option<String> {
-    let q_num_heads = read_heads(node, "q_num_heads")?;
-    let kv_num_heads = read_heads(node, "kv_num_heads")?;
+    let standard = matches!(node.domain.as_str(), "" | "ai.onnx");
+    let (Some(q_num_heads), Some(kv_num_heads)) = (
+        read_heads(node, "q_num_heads"),
+        read_heads(node, "kv_num_heads"),
+    ) else {
+        return Some(
+            "LinearAttention: q_num_heads and kv_num_heads must be positive integers".into(),
+        );
+    };
     if UpdateRule::parse(node).is_err() {
         return Some("LinearAttention: unrecognized update_rule".into());
     }
@@ -622,7 +652,7 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
     {
         return Some("LinearAttention: query/key/value must share one dtype".into());
     }
-    if q_num_heads >= kv_num_heads {
+    if standard || q_num_heads >= kv_num_heads {
         if !q_num_heads.is_multiple_of(kv_num_heads) {
             return Some(format!(
                 "LinearAttention: q_num_heads {q_num_heads} not a multiple of kv_num_heads \
@@ -677,6 +707,7 @@ impl KernelFactory for LinearAttentionFactory {
             .is_some_and(|v| v != 0);
         Ok(Box::new(LinearAttentionKernel {
             runtime: self.runtime.clone(),
+            standard: matches!(node.domain.as_str(), "" | "ai.onnx"),
             q_num_heads,
             kv_num_heads,
             update_rule,
@@ -692,6 +723,7 @@ impl KernelFactory for LinearAttentionFactory {
 #[derive(Debug)]
 struct LinearAttentionKernel {
     runtime: Arc<CudaRuntime>,
+    standard: bool,
     q_num_heads: usize,
     kv_num_heads: usize,
     update_rule: UpdateRule,
@@ -704,25 +736,20 @@ struct LinearAttentionKernel {
 
 impl std::fmt::Debug for UpdateRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            UpdateRule::Linear => "linear",
-            UpdateRule::Gated => "gated",
-            UpdateRule::Delta => "delta",
-            UpdateRule::GatedDelta => "gated_delta",
-        };
-        f.write_str(name)
+        f.write_str(self.name())
     }
 }
 
 impl Kernel for LinearAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        if inputs.len() < 3 || inputs.len() > 8 {
+        let max_inputs = if self.standard { 6 } else { 8 };
+        if inputs.len() < 3 || inputs.len() > max_inputs {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep LinearAttention: expected 3..=8 inputs, got {}",
+                "cuda_ep LinearAttention: expected 3..={max_inputs} inputs, got {}",
                 inputs.len()
             )));
         }
-        if outputs.len() != 2 {
+        if outputs.len() != 2 || outputs[1].is_absent() {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep LinearAttention: expected 2 outputs (output, present_state), got {}",
                 outputs.len()
@@ -766,9 +793,9 @@ impl Kernel for LinearAttentionKernel {
             )));
         }
         let d_k = q_hidden / q_num_heads;
-        if d_k == 0 || d_k > MAX_D_K || !k.shape[2].is_multiple_of(d_k) {
+        if d_k == 0 || !k.shape[2].is_multiple_of(d_k) {
             return Err(not_implemented(format!(
-                "cuda_ep LinearAttention: d_k {d_k} unsupported (must be 1..={MAX_D_K} and divide \
+                "cuda_ep LinearAttention: d_k {d_k} invalid (must be positive and divide \
                  key hidden {})",
                 k.shape[2]
             )));
@@ -782,6 +809,12 @@ impl Kernel for LinearAttentionKernel {
             )));
         }
         let d_v = v.shape[2] / kv_num_heads;
+        if self.standard && (n_k_heads != kv_num_heads || !q_num_heads.is_multiple_of(kv_num_heads))
+        {
+            return Err(EpError::KernelFailed(format!(
+                "LinearAttention-27: key heads {n_k_heads} must equal kv_num_heads={kv_num_heads}, and q_num_heads={q_num_heads} must be a multiple of it"
+            )));
+        }
 
         let heads_per_group = if q_num_heads >= kv_num_heads {
             if !q_num_heads.is_multiple_of(kv_num_heads) {
@@ -812,21 +845,32 @@ impl Kernel for LinearAttentionKernel {
         let needs_decay = self.update_rule.needs_decay();
         let needs_delta = self.update_rule.needs_delta();
 
-        let past_state = inputs.get(3);
-        let decay = inputs.get(4);
-        let beta = inputs.get(5);
+        let optional = |index| inputs.get(index).filter(|v: &&TensorView| !v.is_absent());
+        let past_state = optional(3);
+        let decay = optional(4);
+        let beta = optional(5);
         // Trailing gate-fusion operands, present only when the CUDA gating
         // fusion folded the decay `Softplus` chain into this kernel.
         let dt_bias = inputs.get(6);
         let neg_exp_a = inputs.get(7);
 
-        if needs_decay && decay.is_none() {
+        if self.standard {
+            if let Some(detail) = onnx_runtime_ir::linear_attention::gate_error(
+                self.update_rule.name(),
+                decay.is_some(),
+                beta.is_some(),
+            ) {
+                return Err(EpError::KernelFailed(format!(
+                    "LinearAttention-27: {detail}"
+                )));
+            }
+        } else if needs_decay && decay.is_none() {
             return Err(EpError::KernelFailed(
                 "cuda_ep LinearAttention: decay input required for update_rule=gated/gated_delta"
                     .into(),
             ));
         }
-        if needs_delta && beta.is_none() {
+        if !self.standard && needs_delta && beta.is_none() {
             return Err(EpError::KernelFailed(
                 "cuda_ep LinearAttention: beta input required for update_rule=delta/gated_delta"
                     .into(),
@@ -941,28 +985,66 @@ impl Kernel for LinearAttentionKernel {
             )));
         }
 
-        // Uniform dtype + contiguity across every present tensor.
-        let all_inputs_ok = inputs
-            .iter()
-            .all(|input| input.dtype == dtype && input.is_contiguous());
+        let state_dtype = if self.standard {
+            past_state.map_or(dtype, |state| state.dtype)
+        } else {
+            dtype
+        };
+        let state_dtype_code: i32 = match state_dtype {
+            DataType::Float32 => 1,
+            DataType::Float16 => 10,
+            DataType::BFloat16 => 16,
+            _ => {
+                return Err(not_implemented(format!(
+                    "LinearAttention state dtype {state_dtype:?}"
+                )));
+            }
+        };
+        let all_inputs_ok = inputs.iter().enumerate().all(|(index, input)| {
+            (index >= 3 && input.is_absent())
+                || (input.dtype == if index == 3 { state_dtype } else { dtype }
+                    && input.is_contiguous())
+        });
         if !all_inputs_ok
             || outputs[0].dtype != dtype
-            || outputs[1].dtype != dtype
+            || outputs[1].dtype != state_dtype
             || !outputs[0].is_contiguous()
             || !outputs[1].is_contiguous()
         {
             return Err(not_implemented(
-                "LinearAttention requires contiguous, uniform-dtype tensors",
+                "LinearAttention requires contiguous tensors, one activation dtype and matching past/present state dtypes",
             ));
         }
 
         let total = (batch * kv_num_heads * d_v) as u64;
-        if total == 0 || seq == 0 {
-            // Nothing to compute; present_state is a byte-copy of past (or zeros).
+        if total == 0 {
             return Ok(());
         }
 
-        let stem = match (dtype, self.warp_coop) {
+        let warp_coop = self.warp_coop && d_k <= MAX_D_K;
+        if d_k > MAX_D_K && self.runtime.is_capturing()? {
+            return Err(not_implemented(
+                "LinearAttention with temporary state during CUDA graph capture",
+            ));
+        }
+        let scratch = if d_k > MAX_D_K {
+            let bytes = outputs[1]
+                .numel()
+                .checked_mul(size_of::<f32>())
+                .ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "LinearAttention: FP32 state scratch size overflows".into(),
+                    )
+                })?;
+            Some(crate::runtime::GraphDeviceAllocation::allocate(
+                &self.runtime,
+                bytes,
+            )?)
+        } else {
+            None
+        };
+        let scratch_ptr = scratch.as_ref().map_or(0, |allocation| allocation.ptr());
+        let stem = match (dtype, warp_coop) {
             (DataType::Float32, false) => "linear_attention_f32",
             (DataType::Float16, false) => "linear_attention_f16",
             (DataType::BFloat16, false) => "linear_attention_bf16",
@@ -971,12 +1053,12 @@ impl Kernel for LinearAttentionKernel {
             (DataType::BFloat16, true) => "linear_attention_bf16_coop",
             _ => unreachable!(),
         };
-        if dtype != DataType::Float32 {
+        if dtype != DataType::Float32 || state_dtype != DataType::Float32 {
             self.runtime.require_nvrtc_half_headers("LinearAttention")?;
         }
         let function = self
             .runtime
-            .nvrtc_function("linear_attention_v3", SOURCE, stem)?;
+            .nvrtc_function("linear_attention_v4", SOURCE, stem)?;
 
         let q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
         let k_ptr = cuptr(k.data_ptr::<u8>() as *const c_void);
@@ -1027,7 +1109,7 @@ impl Kernel for LinearAttentionKernel {
 
         // The serial kernel launches one thread per state column; the
         // warp-cooperative kernel launches one WARP (32 threads) per column.
-        let threads_needed = if self.warp_coop {
+        let threads_needed = if warp_coop {
             total.saturating_mul(u64::from(LA_WARP))
         } else {
             total
@@ -1065,7 +1147,9 @@ impl Kernel for LinearAttentionKernel {
             .arg(&beta_per_head_i)
             .arg(&fuse_beta_sigmoid_i)
             .arg(&fuse_decay_softplus_i)
-            .arg(&fuse_neg_exp_i);
+            .arg(&fuse_neg_exp_i)
+            .arg(&state_dtype_code)
+            .arg(&scratch_ptr);
         // SAFETY: argument types/order match `linear_attention_*`; every pointer
         // is a live contiguous device allocation validated above (nulls for
         // absent optionals), and each thread owns one disjoint state column so

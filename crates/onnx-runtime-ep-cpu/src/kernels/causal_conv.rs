@@ -38,7 +38,7 @@
 //! stays dtype-parameterized (RULES.md §2) without changing the arithmetic.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
 use crate::dtype::{
@@ -56,6 +56,7 @@ enum ConvActivation {
 
 pub struct CausalConvWithStateKernel {
     activation: ConvActivation,
+    standard: bool,
 }
 
 pub struct CausalConvWithStateFactory;
@@ -78,7 +79,10 @@ impl KernelFactory for CausalConvWithStateFactory {
                 )));
             }
         };
-        Ok(Box::new(CausalConvWithStateKernel { activation }))
+        Ok(Box::new(CausalConvWithStateKernel {
+            activation,
+            standard: node.is_default_domain(),
+        }))
     }
 }
 
@@ -269,6 +273,17 @@ impl Kernel for CausalConvWithStateKernel {
         }
 
         if self.activation == ConvActivation::Silu {
+            if self.standard {
+                match inputs[0].dtype {
+                    DataType::Float16 => out
+                        .iter_mut()
+                        .for_each(|v| *v = half::f16::from_f32(*v).to_f32()),
+                    DataType::BFloat16 => out
+                        .iter_mut()
+                        .for_each(|v| *v = half::bf16::from_f32(*v).to_f32()),
+                    _ => {}
+                }
+            }
             // SiLU over the dense output (MLAS fused SiLU where available,
             // matching ORT's activation numerics).
             let mut activated = vec![0.0f32; out.len()];

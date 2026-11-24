@@ -38,6 +38,7 @@ pub struct CpuOpDescriptor {
     pub op_type: String,
     pub domain: String,
     pub since_version: u64,
+    pub end_version: u64,
     /// Supported element types for the "T" type-constraint. Derived from the
     /// kernel's actual dtype dispatch — fail closed (f32-only) when unknown.
     pub supported_dtypes: &'static [DataType],
@@ -520,7 +521,16 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         }
 
         // Sequence/range ops.
-        ("Range", "") | ("CumSum", "") => ARITH_DTYPES,
+        ("Range", "") => &[
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ],
+        ("CumSum", "") => ARITH_DTYPES,
         ("CumProd", "") => CUM_PROD_TYPES,
         ("BitCast", "") => BIT_CAST_TYPES,
 
@@ -551,9 +561,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("LinearAttention", "com.microsoft")
         | ("GatherBlockQuantized", "com.microsoft") => FLOAT_DTYPES,
 
-        ("SimplifiedLayerNormalization", "")
-        | ("LinearAttention", "")
-        | ("CausalConvWithState", "") => FLOAT_DTYPES,
+        ("SimplifiedLayerNormalization", "") => FLOAT_DTYPES,
+        ("LinearAttention", "") | ("CausalConvWithState", "") => FLOAT_COMPUTE_DTYPES,
 
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_DTYPES,
         // `moe.rs` widens f16/bf16 to f32, computes, and narrows on the way
@@ -1075,6 +1084,7 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
                 op_type: key.op_type.clone(),
                 domain: key.domain.clone(),
                 since_version: key.since_version,
+                end_version: reg.explicit_end_version(key),
                 supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
                 supports_raw_tensor_abi,
             }
@@ -1320,12 +1330,10 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
-    // Standard ONNX-domain spelling, opset 27. Same contract as the contrib op
-    // (rank-3 `[B, C, L]`, depthwise `[C, 1, k]` weight, `k-1` carry state,
-    // `none`/`silu`/`swish` activation), so it reuses the same kernel rather
-    // than growing a second implementation to keep in step.
-    rec.register(
+    // Reuse the depthwise kernel; the standard schema changes at opset 29.
+    rec.register_through(
         OpKey::new("CausalConvWithState", "", 27),
+        28,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
@@ -1334,10 +1342,9 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(linear_attention::LinearAttentionFactory),
     );
-    // Standard ONNX-domain spelling (onnx/onnx#7689), semantically identical to
-    // the com.microsoft op — served by the same fused kernel.
-    rec.register(
-        OpKey::new("LinearAttention", "", 1),
+    rec.register_through(
+        OpKey::new("LinearAttention", "", 27),
+        28,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(linear_attention::LinearAttentionFactory),
     );
@@ -2064,10 +2071,16 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sequence::TileFactory),
     );
-    rec.register(
+    rec.register_through(
         OpKey::new("Range", "", 11),
+        26,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sequence::RangeFactory),
+    );
+    rec.register(
+        OpKey::new("Range", "", 27),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(sequence::Range27Factory),
     );
     rec.register(
         OpKey::new("CumSum", "", 14),
@@ -3499,7 +3512,7 @@ mod tests {
         // The EP-owned affine and GGUF Gather and grouped-projection fusions each add one.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
         // Opset-28 Cast and the packed FLOAT6 projection add two registrations.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 118 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 119 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")
@@ -3571,6 +3584,12 @@ mod tests {
                 .is_some()
         );
         assert!(reg.lookup("LinearAttention", "com.microsoft", 1).is_some());
+        for op in ["LinearAttention", "CausalConvWithState"] {
+            assert!(!reg.supports(op, "", 26));
+            assert!(reg.supports(op, "ai.onnx", 28));
+            assert!(!reg.supports(op, "", 29));
+            assert!(reg.lookup(op, "", 29).is_none());
+        }
         assert!(
             reg.lookup("GatherBlockQuantized", "com.microsoft", 1)
                 .is_some()

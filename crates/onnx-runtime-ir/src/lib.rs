@@ -59,6 +59,7 @@ pub mod float6_projection;
 mod graph;
 mod graph_view;
 mod layout;
+pub mod linear_attention;
 mod node;
 pub mod onnx;
 pub mod opset26;

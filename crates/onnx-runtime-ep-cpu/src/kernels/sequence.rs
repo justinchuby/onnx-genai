@@ -71,6 +71,33 @@ impl Kernel for TileKernel {
 
 pub struct RangeKernel;
 pub struct RangeFactory;
+pub struct Range27Factory;
+
+struct Range27Kernel {
+    stash_type: i64,
+}
+
+impl KernelFactory for Range27Factory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(Range27Kernel {
+            stash_type: node
+                .attr("stash_type")
+                .and_then(|a| a.as_int())
+                .unwrap_or(1),
+        }))
+    }
+}
+
+impl Kernel for Range27Kernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        execute_range(inputs, outputs, Some(self.stash_type))
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        true
+    }
+}
+
 impl KernelFactory for RangeFactory {
     fn create(&self, _: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(RangeKernel))
@@ -78,97 +105,158 @@ impl KernelFactory for RangeFactory {
 }
 impl Kernel for RangeKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        check_arity("Range", inputs, outputs, 3, 3, 1)?;
-        if inputs.iter().any(|v| !v.shape.is_empty()) {
-            return Err(EpError::KernelFailed(
-                "Range: inputs must be scalars".into(),
-            ));
-        }
-        if inputs.iter().any(|v| v.dtype != inputs[0].dtype) || outputs[0].dtype != inputs[0].dtype
-        {
-            return Err(EpError::KernelFailed(
-                "Range: input and output dtypes must match".into(),
-            ));
-        }
-        match inputs[0].dtype {
-            DataType::Float32 => {
-                let (start, limit, delta) = (
-                    to_dense_f32(&inputs[0])?[0],
-                    to_dense_f32(&inputs[1])?[0],
-                    to_dense_f32(&inputs[2])?[0],
-                );
-                if delta == 0. {
-                    return Err(EpError::KernelFailed(
-                        "Range: delta must not be zero".into(),
-                    ));
-                }
-                let count = float_range_count(start, limit, delta)?;
-                let mut out = alloc_range_output::<f32>(count)?;
-                out.extend((0..count).map(|i| start + i as f32 * delta));
-                write_dense_f32(&mut outputs[0], &out)
-            }
-            DataType::Float16 | DataType::BFloat16 => {
-                let start = crate::dtype::to_dense_f32_widen("Range", &inputs[0])?[0];
-                let limit = crate::dtype::to_dense_f32_widen("Range", &inputs[1])?[0];
-                let delta = crate::dtype::to_dense_f32_widen("Range", &inputs[2])?[0];
-                if delta == 0. {
-                    return Err(EpError::KernelFailed(
-                        "Range: delta must not be zero".into(),
-                    ));
-                }
-                let count = float_range_count(start, limit, delta)?;
-                let out: Vec<f32> = (0..count).map(|i| start + i as f32 * delta).collect();
-                crate::dtype::write_dense_f32_narrow("Range", &mut outputs[0], &out)
-            }
-            DataType::Int64 => {
-                let (start, limit, delta) = (
-                    to_dense_i64(&inputs[0])?[0],
-                    to_dense_i64(&inputs[1])?[0],
-                    to_dense_i64(&inputs[2])?[0],
-                );
-                if delta == 0 {
-                    return Err(EpError::KernelFailed(
-                        "Range: delta must not be zero".into(),
-                    ));
-                }
-                let count = int_range_count(start, limit, delta)?;
-                let mut out = alloc_range_output::<i64>(count)?;
-                for i in 0..count {
-                    let v = i64::try_from(start as i128 + i as i128 * delta as i128)
-                        .map_err(|_| EpError::KernelFailed("Range: value overflow".into()))?;
-                    out.push(v);
-                }
-                let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
-                write_dense_bytes(&mut outputs[0], &bytes)
-            }
-            DataType::Int32 => {
-                let (start, limit, delta) = (
-                    to_dense_i64(&inputs[0])?[0],
-                    to_dense_i64(&inputs[1])?[0],
-                    to_dense_i64(&inputs[2])?[0],
-                );
-                if delta == 0 {
-                    return Err(EpError::KernelFailed(
-                        "Range: delta must not be zero".into(),
-                    ));
-                }
-                let count = int_range_count(start, limit, delta)?;
-                let mut out = alloc_range_output::<i32>(count)?;
-                for i in 0..count {
-                    let value = i32::try_from(start as i128 + i as i128 * delta as i128)
-                        .map_err(|_| EpError::KernelFailed("Range: value overflow".into()))?;
-                    out.push(value);
-                }
-                let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
-                write_dense_bytes(&mut outputs[0], &bytes)
-            }
-            dtype => Err(EpError::KernelFailed(format!(
-                "Range: unsupported dtype {dtype:?}"
-            ))),
-        }
+        execute_range(inputs, outputs, None)
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         true
+    }
+}
+
+fn execute_range(
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+    stash_type: Option<i64>,
+) -> Result<()> {
+    check_arity("Range", inputs, outputs, 3, 3, 1)?;
+    if inputs.iter().any(|v| !v.shape.is_empty()) {
+        return Err(EpError::KernelFailed(
+            "Range: inputs must be scalars".into(),
+        ));
+    }
+    if inputs.iter().any(|v| v.dtype != inputs[0].dtype) || outputs[0].dtype != inputs[0].dtype {
+        return Err(EpError::KernelFailed(
+            "Range: input and output dtypes must match".into(),
+        ));
+    }
+    if stash_type.is_some() && outputs[0].shape.len() != 1 {
+        return Err(EpError::KernelFailed(
+            "Range-27: output must be a rank-1 tensor".into(),
+        ));
+    }
+    match inputs[0].dtype {
+        DataType::Float32 => {
+            let (start, limit, delta) = (
+                to_dense_f32(&inputs[0])?[0],
+                to_dense_f32(&inputs[1])?[0],
+                to_dense_f32(&inputs[2])?[0],
+            );
+            if delta == 0. {
+                return Err(EpError::KernelFailed(
+                    "Range: delta must not be zero".into(),
+                ));
+            }
+            let count = float_range_count(start, limit, delta)?;
+            let mut out = alloc_range_output::<f32>(count)?;
+            out.extend((0..count).map(|i| start + i as f32 * delta));
+            write_dense_f32(&mut outputs[0], &out)
+        }
+        DataType::Float16 | DataType::BFloat16 => {
+            let start = crate::dtype::to_dense_f32_widen("Range", &inputs[0])?[0];
+            let limit = crate::dtype::to_dense_f32_widen("Range", &inputs[1])?[0];
+            let delta = crate::dtype::to_dense_f32_widen("Range", &inputs[2])?[0];
+            if delta == 0. {
+                return Err(EpError::KernelFailed(
+                    "Range: delta must not be zero".into(),
+                ));
+            }
+            match stash_type.unwrap_or(1) {
+                1 => {
+                    let count = float_range_count(start, limit, delta)?;
+                    let mut out = alloc_range_output::<f32>(count)?;
+                    out.extend((0..count).map(|i| start + i as f32 * delta));
+                    crate::dtype::write_dense_f32_narrow("Range", &mut outputs[0], &out)
+                }
+                11 => {
+                    let (start, limit, delta) =
+                        (f64::from(start), f64::from(limit), f64::from(delta));
+                    let count = double_range_count(start, limit, delta)?;
+                    if inputs[0].dtype == DataType::Float16 {
+                        let mut out = alloc_range_output::<half::f16>(count)?;
+                        out.extend(
+                            (0..count).map(|i| half::f16::from_f64(start + i as f64 * delta)),
+                        );
+                        write_dense(&mut outputs[0], &out)
+                    } else {
+                        let mut out = alloc_range_output::<half::bf16>(count)?;
+                        out.extend(
+                            (0..count).map(|i| half::bf16::from_f64(start + i as f64 * delta)),
+                        );
+                        write_dense(&mut outputs[0], &out)
+                    }
+                }
+                invalid => Err(EpError::KernelFailed(format!(
+                    "Range-27: stash_type={invalid} is invalid for FP16/BF16; use FLOAT (1) or DOUBLE (11)"
+                ))),
+            }
+        }
+        DataType::Float64 => {
+            let start = to_dense::<f64>(&inputs[0])?[0];
+            let limit = to_dense::<f64>(&inputs[1])?[0];
+            let delta = to_dense::<f64>(&inputs[2])?[0];
+            let count = double_range_count(start, limit, delta)?;
+            let mut out = alloc_range_output::<f64>(count)?;
+            out.extend((0..count).map(|i| start + i as f64 * delta));
+            write_dense(&mut outputs[0], &out)
+        }
+        DataType::Int16 => {
+            let start = i64::from(to_dense::<i16>(&inputs[0])?[0]);
+            let limit = i64::from(to_dense::<i16>(&inputs[1])?[0]);
+            let delta = i64::from(to_dense::<i16>(&inputs[2])?[0]);
+            if delta == 0 {
+                return Err(EpError::KernelFailed(
+                    "Range: delta must not be zero".into(),
+                ));
+            }
+            let count = int_range_count(start, limit, delta)?;
+            let mut out = alloc_range_output::<i16>(count)?;
+            out.extend((0..count).map(|i| (start + i as i64 * delta) as i16));
+            write_dense(&mut outputs[0], &out)
+        }
+        DataType::Int64 => {
+            let (start, limit, delta) = (
+                to_dense_i64(&inputs[0])?[0],
+                to_dense_i64(&inputs[1])?[0],
+                to_dense_i64(&inputs[2])?[0],
+            );
+            if delta == 0 {
+                return Err(EpError::KernelFailed(
+                    "Range: delta must not be zero".into(),
+                ));
+            }
+            let count = int_range_count(start, limit, delta)?;
+            let mut out = alloc_range_output::<i64>(count)?;
+            for i in 0..count {
+                let v = i64::try_from(start as i128 + i as i128 * delta as i128)
+                    .map_err(|_| EpError::KernelFailed("Range: value overflow".into()))?;
+                out.push(v);
+            }
+            let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
+            write_dense_bytes(&mut outputs[0], &bytes)
+        }
+        DataType::Int32 => {
+            let (start, limit, delta) = (
+                to_dense_i64(&inputs[0])?[0],
+                to_dense_i64(&inputs[1])?[0],
+                to_dense_i64(&inputs[2])?[0],
+            );
+            if delta == 0 {
+                return Err(EpError::KernelFailed(
+                    "Range: delta must not be zero".into(),
+                ));
+            }
+            let count = int_range_count(start, limit, delta)?;
+            let mut out = alloc_range_output::<i32>(count)?;
+            for i in 0..count {
+                let value = i32::try_from(start as i128 + i as i128 * delta as i128)
+                    .map_err(|_| EpError::KernelFailed("Range: value overflow".into()))?;
+                out.push(value);
+            }
+            let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
+            write_dense_bytes(&mut outputs[0], &bytes)
+        }
+        dtype => Err(EpError::KernelFailed(format!(
+            "Range: unsupported dtype {dtype:?}"
+        ))),
     }
 }
 
@@ -421,6 +509,20 @@ fn float_range_count(start: f32, limit: f32, delta: f32) -> Result<usize> {
     Ok(count as usize)
 }
 
+fn double_range_count(start: f64, limit: f64, delta: f64) -> Result<usize> {
+    if delta == 0.0 {
+        return Err(EpError::KernelFailed(
+            "Range: delta must not be zero".into(),
+        ));
+    }
+    let count = ((limit - start) / delta).ceil();
+    if !count.is_finite() || count >= usize::MAX as f64 {
+        return Err(EpError::KernelFailed(
+            "Range: output length is non-finite or exceeds addressable memory".into(),
+        ));
+    }
+    Ok(count.max(0.0) as usize)
+}
 fn int_range_count(start: i64, limit: i64, delta: i64) -> Result<usize> {
     let count = if delta > 0 && start < limit {
         let distance = limit as i128 - start as i128;
@@ -818,6 +920,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.to_bf16_as_f32(), vec![-1., -0.5, 0., 0.5]);
+    }
+
+    #[test]
+    fn range_v27_stash_precision_controls_low_precision_length() {
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            let make_scalar = |value: f32| {
+                let bits = if dtype == DataType::Float16 {
+                    half::f16::from_f32(value).to_bits()
+                } else {
+                    half::bf16::from_f32(value).to_bits()
+                };
+                (bits, dtype)
+            };
+            let (start, _) = make_scalar(-2.0_f32.powi(-24));
+            let (limit, _) = make_scalar(16.0);
+            let (delta, _) = make_scalar(4.0);
+            let input = |word: &u16| {
+                TensorView::new(
+                    onnx_runtime_ep_api::DevicePtr(std::ptr::from_ref(word).cast()),
+                    dtype,
+                    &[],
+                    &[],
+                    onnx_runtime_ir::DeviceId::cpu(),
+                )
+            };
+            let inputs = [input(&start), input(&limit), input(&delta)];
+            for (stash_type, len) in [(1, 4), (11, 5)] {
+                let mut actual = vec![0u16; len];
+                let shape = [len];
+                let output = TensorMut::new(
+                    onnx_runtime_ep_api::DevicePtrMut(actual.as_mut_ptr().cast()),
+                    dtype,
+                    &shape,
+                    &[1],
+                    onnx_runtime_ir::DeviceId::cpu(),
+                );
+                Range27Kernel { stash_type }
+                    .execute(&inputs, &mut [output])
+                    .unwrap();
+                let mut expected = vec![start];
+                expected.extend(
+                    [4.0, 8.0, 12.0, 16.0][..len - 1]
+                        .iter()
+                        .map(|&v| make_scalar(v).0),
+                );
+                assert_eq!(actual, expected);
+            }
+        }
     }
     #[test]
     fn tile_bf16_preserves_element_bits() {
