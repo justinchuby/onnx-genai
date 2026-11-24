@@ -1631,6 +1631,76 @@ unregistered caller capture refusal, numerical parity and replay after kernel
 drop. CUDA execution and throughput remain unmeasured. The new Host layout/bind
 and capture-owner checks are not claimed to have zero cost.
 
+### Native CUDA retirement has one consuming core
+
+Provider buffers and sealed allocations now use the same private
+`enqueue_native_release` function after their caller-specific validation. The
+provider still rejects foreign devices, missing ownership and foreign
+context/mechanism identities; sealed owners still verify their exact generation.
+Each caller invalidates its derived interleave entries before transferring
+ownership. These provenance checks are not weakened by sharing retirement.
+
+The core consumes binding or managed ownership, prepares one release and pairs
+its exact settlement token with the existing queue observer. Acceptance reports
+ordering, not physical unmapping: `deallocate_with_unmapped` still returns zero.
+A refused enqueue quarantines the same returned request and settles that
+outcome once. Preparation failures keep typed BindingError or
+AllocationTransactionError sources; their consumed owners follow existing
+quarantine semantics. In particular, dropping the last outstanding view cannot
+retry that owner or refund retained bytes.
+
+No runtime, new registry, quota authority, pool or per-region lease is stored in
+this core. It introduces no hot execution path. This is the shared retirement
+boundary for the next native allocation-domain extraction; runtime-private raw
+artifacts have not yet migrated.
+
+Host regressions drive this production function with real binding/managed Host
+owners and independently controlled compute/copy fences. They verify pending
+charges, complete settlement and exactly-once observers, closed/failed-fence
+refusal with retained charges, typed outstanding-view failure without enqueue,
+and the binding-only branch. Existing workspace-barrier tests now also use this
+core instead of a test-specific settlement observer. GPU fixtures compile
+against both callers; no CUDA execution or performance measurement was available.
+
+### Sealed weights and workspace share cold native admission
+
+The CUDA provider's private `allocate_governed` function is the common cold
+entry for native workspace and sealed immutable weights. It checks provider
+liveness and real capture state before injected allocation failure, mapped-size
+planning, mapped-growth admission and the existing allocation transaction.
+Sealed uploads use the `Weights` content role; they no longer inherit the
+legacy generic allocator's Workspace classification. Both trait-based constant
+uploads and direct planar-bank uploads reach this guard before any grant,
+allocation or H2D copy. Capture rejection does not consume a pending allocation
+fault injection. Generic and native allocation paths share one failure point;
+the native path includes workspace requests as well as sealed requests.
+
+The workspace release barrier stays outside that common function. Workspace
+admission checks capture before waiting, then rechecks after the possible wait;
+sealed weights do not wait on unrelated workspace settlement. Content role and
+mapped arena zone are separate: the same authority still owns physical handles,
+and the same shared mapped allowance funds mappings without another process
+reservation or per-region lease. Existing governed VMM allocations already used
+AuthorityManaged accounting; this change does not claim they previously bypassed
+quota. Construction without an external governor retains its explicitly reported
+Compatibility semantics.
+
+A failed upload or post-upload publication checkpoint retires its unpublished
+unique owner through the same structured queue. Combined upload/retirement
+failures preserve both typed errors rather than flattening them into a string.
+The GPU fault seam tests successful upload followed by publication failure; it
+does not simulate a real asynchronous CUDA DMA fault. Normal sealed-owner Drop,
+graph lifetime and settlement remain unchanged, and retained physical pool
+capacity is not confused with the returned allocation charge.
+
+Host tests verify typed error preservation. Compiled GPU fixtures check both
+raw-capture entry points, role/charge-mode/process-reservation records, copied
+bytes, allocation failure, post-upload rejection and deferred release. CUDA
+execution and performance were unavailable. No new warm inference allocation or
+quota callback was added; this does not establish a universal zero-callback
+contract for arbitrary existing StepScoped callers. Runtime-private raw artifacts
+still require the subsequent native-domain migration.
+
 ### Physical release pins are independent of the runtime graph registry
 
 CUDA provider-context registrations now pin the release queue, whose fence
