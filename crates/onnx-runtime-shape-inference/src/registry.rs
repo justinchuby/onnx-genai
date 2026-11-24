@@ -18,11 +18,13 @@ use crate::error::ShapeInferError;
 /// sets its outputs' types (and, where applicable, shape-data).
 pub type InferenceFn = fn(&mut InferenceContext) -> Result<(), ShapeInferError>;
 
+type VersionedHandler = (u64, u64, InferenceFn);
+
 /// A registry mapping `(domain, op_type, opset)` to an [`InferenceFn`].
 #[derive(Default)]
 pub struct InferenceRegistry {
     /// `(domain, op)` → ascending list of `(min_opset, max_opset, rule)`.
-    handlers: HashMap<(String, String), Vec<(u64, u64, InferenceFn)>>,
+    handlers: HashMap<(String, String), Vec<VersionedHandler>>,
 }
 
 impl InferenceRegistry {
