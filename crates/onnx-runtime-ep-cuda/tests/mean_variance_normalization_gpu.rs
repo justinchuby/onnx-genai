@@ -18,11 +18,11 @@ fn goldens(cuda: Option<&CudaExecutionProvider>) {
             let inputs = [float_input(dtype, shape, x)];
             let outputs = [(dtype, shape.to_vec())];
             let cpu = run_cpu(OP, "", 29, &inputs, &outputs, attrs);
-            let cpu = decode_floats(dtype, &cpu[0]);
+            let cpu = decode_floats(&cpu[0], dtype);
             assert_close("CPU vs golden", dtype, &cpu, expected, 1e-6);
             if let Some(ep) = cuda {
                 let gpu = run_cuda(ep, OP, "", 29, &inputs, &outputs, attrs);
-                let gpu = decode_floats(dtype, &gpu[0]);
+                let gpu = decode_floats(&gpu[0], dtype);
                 assert_close("CUDA vs golden", dtype, &gpu, expected, 1e-6);
                 assert_close("CUDA vs CPU", dtype, &gpu, &cpu, 1e-6);
             }
