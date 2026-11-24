@@ -1549,3 +1549,41 @@ or HTTP conformance.
 The final engine regression passed 965 tests / one inherited ignore. Strict
 engine all-target Clippy, formatting and diff checks passed on this replay
 implementation. No active server lazy behavior is claimed by those checks.
+
+### Byte-oriented trigger pattern matching in progress
+
+The trigger matcher now explicitly translates the admitted C-locale
+`std::regex<char>` ECMAScript syntax into the bounded `fancy-regex` backend
+already present in the dependency graph. Each original input byte is represented
+by one Latin-1 scalar; captures are converted back to original byte offsets.
+ASCII word boundaries and character classes do not inherit Unicode semantics.
+Dot excludes both CR and LF. C-locale named character classes, empty/negated
+empty classes, control escapes and byte-narrowed Unicode escapes have explicit
+translations. Backend-only group extensions and references preceding their
+captures are rejected. Unmatched/open capture references retain the upstream
+nonmatching behavior.
+
+The matcher selects the first nonempty captured group, falling back to the
+whole match. Captures inside lookahead can therefore move the replay start
+beyond the whole match. A pattern with leading `^` and trailing `$` uses actual
+complete matching with alternative backtracking, rather than post-filtering
+one shorter search result. A standalone harness running the pinned upstream
+`llama_grammar_trigger_pattern::find` supplied the capture and invalid-syntax
+expectations used by the Rust tests. The harness also exposed JavaScript
+backreference/extension differences in a separate candidate library; that
+library was not added to the repository.
+
+Compilation limits include 128 group nesting levels, 1024 captures, repetition
+bounds of 2000 and a one-MiB translated-program budget. Matching has a one-million
+backtrack limit and the explicit input byte budget. Exhaustion is an actionable
+error, not a fabricated nonmatch. Seven selected matcher tests passed, including
+resource rejection and a catastrophically backtracking expression. The full
+engine regression passed 972 tests / one inherited ignore.
+Final strict engine all-target Clippy, formatting and diff checks passed.
+Character classes separately cap their collected ranges at 65536 items.
+
+This matcher is not yet connected to active lazy server admission. Production
+trigger resolution, token-aware constraint ownership, reasoning suppression and
+HTTP conformance remain open. C++ collating/equivalence bracket forms also still
+need explicit conformance and implementation; the current matcher does not
+establish complete coverage of every platform-specific std::regex extension.

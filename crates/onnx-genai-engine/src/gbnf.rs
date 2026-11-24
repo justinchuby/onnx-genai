@@ -4,6 +4,7 @@
 //! channel projection. Token references are resolved against the actual model.
 
 pub mod replay;
+pub mod trigger;
 
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, HashSet};
