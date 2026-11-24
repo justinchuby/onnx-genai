@@ -437,7 +437,9 @@ returns upstream-compatible `501 not_supported_error`. This is not an API
 for changing generation defaults.
 `GET/POST /tools` now supports the seven explicitly enabled host built-ins,
 including command SSE, file selection and editing. See [host tools](SERVER_TOOLS.md)
-for limits, trusted-origin policy and remaining MCP/container/SSH integrations. The MCP
+for limits and trusted-origin policy. [Stdio MCP tools](SERVER_MCP.md) support
+configured commands, discovery and invocation; container/SSH tool runtimes remain
+open. The MCP
 HTTP proxy is separately opt-in with `--ui-mcp-proxy`; `/props` reports
 `cors_proxy_enabled` from that setting. `GET` and `POST /cors-proxy?url=...`
 forward only headers explicitly prefixed with `x-llama-server-proxy-header-`.
