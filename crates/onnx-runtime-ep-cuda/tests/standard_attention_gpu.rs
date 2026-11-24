@@ -2112,6 +2112,12 @@ fn assert_attention25_window_cases(
     assert_close(&f32s(&result[0]), &[8., 12., 0., 32.]);
 }
 
+// This CPU oracle belongs to the cross-EP CUDA conformance target. Run it
+// explicitly with gpu-tests even on Host; ordinary Host runs skip this target.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "cross-EP conformance oracle; enable gpu-tests to run the CPU reference"
+)]
 #[test]
 fn standard_attention_opset25_windows_cpu() {
     assert_attention25_window_cases(run_cpu_opt);

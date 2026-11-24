@@ -87,6 +87,7 @@ impl Kernel for DeferredValidationKernel {
     fn workspace_requirement(
         &self,
         inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
         Ok(WorkspaceRequirement {
             bytes: (self.workspace_bytes.load(Ordering::Relaxed)
@@ -5314,6 +5315,7 @@ impl Kernel for WeightDeliveryKernel {
     fn workspace_requirement(
         &self,
         inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
         let rows = inputs
             .first()
@@ -5405,6 +5407,7 @@ impl Kernel for WorkspaceOnlyKernel {
     fn workspace_requirement(
         &self,
         _inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
         Ok(WorkspaceRequirement {
             bytes: self.bytes,
@@ -5571,7 +5574,23 @@ impl ExecutionProvider for WeightDeliveryEp {
         _layouts: &[TensorLayout],
     ) -> KernelMatch {
         if self.optional_input_contract && op.op_type == "OptionalContract" {
-            if input_dtypes == [DataType::Float32, DataType::Undefined, DataType::Bool] {
+            let expected: Vec<_> = op
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    if input.is_none() {
+                        DataType::Undefined
+                    } else if index == 0 {
+                        DataType::Float32
+                    } else {
+                        assert_eq!(index, 2);
+                        DataType::Bool
+                    }
+                })
+                .collect();
+            if input_dtypes == expected && _shapes.len() == op.inputs.len() {
+                self.deliveries.lock().unwrap().push("optional.claim");
                 return KernelMatch::Supported {
                     workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
                     cost: Cost::ZERO,
@@ -5580,7 +5599,7 @@ impl ExecutionProvider for WeightDeliveryEp {
                 };
             }
             return KernelMatch::unsupported(format!(
-                "OptionalContract requires [Float32, Undefined, Bool] input dtypes, got {input_dtypes:?}"
+                "OptionalContract requires {expected:?} positional dtypes and matching shapes, got {input_dtypes:?} and {_shapes:?}"
             ));
         }
         if self.support_index_share_workspace
@@ -5620,6 +5639,20 @@ impl ExecutionProvider for WeightDeliveryEp {
         _shapes: &[Vec<usize>],
         _opset: u64,
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        if self.optional_input_contract && op.op_type == "OptionalContract" {
+            assert_eq!(
+                _shapes.len(),
+                op.inputs.len(),
+                "compilation must preserve every optional slot"
+            );
+            assert_eq!(_shapes[0], [1]);
+            assert!(_shapes[1..].iter().all(Vec::is_empty));
+            self.deliveries.lock().unwrap().push("optional.compile");
+            return Ok(Box::new(OptionalSlotContractKernel {
+                arity: op.inputs.len(),
+                deliveries: Arc::clone(&self.deliveries),
+            }));
+        }
         if self.support_index_share_workspace
             && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && op.op_type == "IndexShare"
@@ -6460,6 +6493,219 @@ fn claim_time_optional_input_dtype_is_undefined_not_silently_float32() {
         executor.is_ok(),
         "an omitted optional input must reach supports_op as DataType::Undefined"
     );
+}
+
+struct OptionalSlotContractKernel {
+    arity: usize,
+    deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl Kernel for OptionalSlotContractKernel {
+    fn execute(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        assert_eq!(
+            inputs.len(),
+            self.arity,
+            "execution must preserve every optional slot"
+        );
+        assert_eq!(inputs[0].dtype, DataType::Float32);
+        assert!(!inputs[0].is_absent());
+        assert!(inputs[1].is_absent());
+        assert_eq!(inputs[1].dtype, DataType::Undefined);
+        assert_eq!(inputs[2].dtype, DataType::Bool);
+        assert!(
+            !inputs[2].is_absent(),
+            "a present scalar with an empty shape is not an omitted input"
+        );
+        for input in &inputs[3..] {
+            assert!(input.is_absent());
+            assert_eq!(input.dtype, DataType::Undefined);
+        }
+        self.deliveries.lock().unwrap().push("optional.execute");
+        // SAFETY: live input/output tensor views are bounded by the executor;
+        // the fixture declares a single f32 result with the same byte extent.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(inputs[0].data_ptr::<u8>(), inputs[0].byte_size())
+        };
+        WeightDeliveryKernel::copy_bytes(bytes, &mut outputs[0])
+    }
+}
+
+#[test]
+fn optional_input_slots_agree_through_claim_compile_and_public_execution() {
+    for encoded in [false, true] {
+        for prepared in [false, true] {
+            for trailing in [false, true] {
+                let mut graph = Graph::new();
+                graph.opset_imports.insert("test.optional".into(), 1);
+                let data = graph.create_named_value("data", DataType::Float32, static_shape([1]));
+                let training =
+                    graph.create_named_value("training", DataType::Bool, static_shape([]));
+                let output =
+                    graph.create_named_value("output", DataType::Float32, static_shape([1]));
+                graph.add_input(data);
+                graph.add_input(training);
+                graph.add_output(output);
+                let mut inputs = vec![Some(data), None, Some(training)];
+                if trailing {
+                    inputs.extend([None, None]);
+                }
+                let mut node = Node::new(NodeId(0), "OptionalContract", inputs, vec![output]);
+                node.domain = "test.optional".into();
+                graph.insert_node(node);
+                let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let mut provider = WeightDeliveryEp::new(false, Arc::clone(&deliveries));
+                provider.optional_input_contract = true;
+                let provider: Arc<dyn ExecutionProvider> = Arc::new(provider);
+                let mut session = if encoded {
+                    let bytes =
+                        onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph))
+                            .unwrap();
+                    crate::InferenceSession::builder()
+                        .model_bytes(&bytes)
+                        .option("optimization", "none")
+                        .execution_provider(provider)
+                        .build()
+                        .unwrap()
+                } else {
+                    crate::InferenceSession::from_graph_with_provider(
+                        graph,
+                        Arc::new(WeightStore::new()),
+                        std::path::Path::new("."),
+                        provider,
+                        None,
+                    )
+                    .unwrap()
+                };
+                let data = Tensor::from_f32(&[1], &[7.25]).unwrap();
+                let training = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
+                let bindings = [("data", &data), ("training", &training)];
+                if prepared {
+                    session
+                        .prepare_with_device_bindings(&bindings, &mut [])
+                        .unwrap();
+                }
+                let output = session.run(&bindings).unwrap();
+                assert_eq!(output[0].to_vec_f32(), [7.25]);
+                let seen = deliveries.lock().unwrap();
+                for phase in ["optional.claim", "optional.compile", "optional.execute"] {
+                    assert!(
+                        seen.contains(&phase),
+                        "missing {phase}; encoded={encoded}, prepared={prepared}, trailing={trailing}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn public_block_moe_accepts_preserved_trailing_optional_inputs() {
+    const H: usize = 32;
+    let mut expected = None;
+    for prepared in [false, true] {
+        for trailing in [0, 2, 4, 5] {
+            let mut graph = Graph::new();
+            graph
+                .opset_imports
+                .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+            let data = graph.create_named_value("data", DataType::Float32, static_shape([1, H]));
+            let router =
+                graph.create_named_value("router", DataType::Float32, static_shape([1, 2]));
+            let output =
+                graph.create_named_value("output", DataType::Float32, static_shape([1, H]));
+            let mut weight = |name: &str| {
+                let shape = vec![2, H, 1, 17];
+                let value = graph.create_named_value(
+                    name,
+                    DataType::Uint8,
+                    static_shape(shape.iter().copied()),
+                );
+                let mut packed = vec![0x22; 2 * H * 17];
+                for block in packed.chunks_exact_mut(17) {
+                    block[0] = 121;
+                }
+                graph.set_initializer(
+                    value,
+                    WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                        DataType::Uint8,
+                        shape,
+                        packed,
+                    )),
+                );
+                value
+            };
+            let fc1 = weight("fc1");
+            let fc2 = weight("fc2");
+            let mut inputs = vec![Some(data), Some(router), Some(fc1), None, Some(fc2)];
+            inputs.extend(std::iter::repeat_n(None, trailing));
+            let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", inputs, vec![output]);
+            node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+            for (name, attr) in [
+                (
+                    "fc1_format",
+                    onnx_runtime_ir::Attribute::String(b"mxfp4".to_vec()),
+                ),
+                (
+                    "fc2_format",
+                    onnx_runtime_ir::Attribute::String(b"mxfp4".to_vec()),
+                ),
+                ("block_layout_version", onnx_runtime_ir::Attribute::Int(1)),
+                (
+                    "activation_type",
+                    onnx_runtime_ir::Attribute::String(b"identity".to_vec()),
+                ),
+                ("k", onnx_runtime_ir::Attribute::Int(1)),
+                (
+                    "normalize_routing_weights",
+                    onnx_runtime_ir::Attribute::Int(1),
+                ),
+            ] {
+                node.attributes.insert(name.into(), attr);
+            }
+            graph.add_input(data);
+            graph.add_input(router);
+            graph.add_output(output);
+            graph.insert_node(node);
+            let bytes = onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph))
+                .unwrap();
+            let built = crate::InferenceSession::builder()
+                .model_bytes(&bytes)
+                .option("optimization", "none")
+                .execution_provider(Arc::new(CpuExecutionProvider::new()))
+                .build();
+            if trailing == 5 {
+                let Err(error) = built else {
+                    panic!("ten positional slots must not be accepted by a nine-input operator");
+                };
+                let message = error.to_string();
+                assert!(
+                    message.contains("expected 5 to 9 positional inputs, got 10"),
+                    "{message}"
+                );
+                continue;
+            }
+            let mut session = built.unwrap();
+            let data = Tensor::from_f32(&[1, H], &[0.125; H]).unwrap();
+            let router = Tensor::from_f32(&[1, 2], &[4., -4.]).unwrap();
+            let bindings = [("data", &data), ("router", &router)];
+            if prepared {
+                session
+                    .prepare_with_device_bindings(&bindings, &mut [])
+                    .unwrap();
+            }
+            let output = session.run(&bindings).unwrap();
+            let values = output[0].to_vec_f32();
+            assert!(values.iter().all(|x| x.is_finite() && *x != 0.));
+            assert_eq!(
+                *expected.get_or_insert_with(|| output[0].as_bytes().to_vec()),
+                output[0].as_bytes()
+            );
+        }
+    }
 }
 
 #[test]
@@ -17048,4 +17294,447 @@ fn completed_workspace_capture_refuses_eager_growth_and_alignment_changes() {
         .run(&[("input", &completed_workspace_input(4))])
         .unwrap();
     assert_eq!(books.used(Tier::Host), 128);
+}
+
+struct OutputWorkspaceProbeEp {
+    cpu: CpuExecutionProvider,
+    plans: Arc<std::sync::Mutex<Vec<Vec<OutputMetadata<'static>>>>>,
+}
+struct OutputWorkspaceProbeKernel {
+    slots: Vec<bool>,
+    plans: Arc<std::sync::Mutex<Vec<Vec<OutputMetadata<'static>>>>>,
+}
+impl OutputWorkspaceProbeKernel {
+    fn bytes(&self, outputs: &[OutputMetadata<'_>]) -> onnx_runtime_ep_api::Result<u64> {
+        if outputs.len() != self.slots.len() {
+            return Err(EpError::KernelFailed(
+                "workspace output positions were compressed".into(),
+            ));
+        }
+        let mut bytes = 0;
+        for (index, (present, output)) in self.slots.iter().zip(outputs).enumerate() {
+            match (present, output) {
+                (false, OutputMetadata::Absent) => {}
+                (true, OutputMetadata::Tensor { shape, .. }) => {
+                    bytes += shape.iter().product::<usize>() as u64 * 8
+                }
+                _ => {
+                    return Err(EpError::KernelFailed(format!(
+                        "workspace output #{index}: expected presence {present}, received {output:?}; slots={:?}; bind an exact output extent before preparation",
+                        self.slots
+                    )));
+                }
+            }
+        }
+        Ok(bytes)
+    }
+}
+impl Kernel for OutputWorkspaceProbeKernel {
+    fn workspace_requirement(
+        &self,
+        _: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        let bytes = self.bytes(outputs)?;
+        self.plans.lock().unwrap().push(
+            outputs
+                .iter()
+                .cloned()
+                .map(OutputMetadata::into_owned)
+                .collect(),
+        );
+        Ok(WorkspaceRequirement {
+            bytes,
+            alignment: 8,
+            ..WorkspaceRequirement::NONE
+        })
+    }
+    fn execute(&self, _: &[TensorView], _: &mut [TensorMut]) -> onnx_runtime_ep_api::Result<()> {
+        Err(EpError::KernelFailed(
+            "output-bound probe requires prepared workspace".into(),
+        ))
+    }
+    fn execute_with_workspace(
+        &self,
+        _: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let facts = outputs
+            .iter()
+            .map(OutputMetadata::from_view)
+            .collect::<Vec<_>>();
+        let bytes = self.bytes(&facts)?;
+        assert!(workspace.is_some_and(|workspace| workspace.bytes() as u64 >= bytes));
+        for output in outputs.iter_mut().filter(|output| !output.is_absent()) {
+            let bytes = output.byte_size();
+            // SAFETY: this fixture receives exclusive, contiguous Host outputs.
+            unsafe { std::ptr::write_bytes(output.data_ptr_mut::<u8>(), 0x5A, bytes) };
+        }
+        Ok(())
+    }
+}
+impl ExecutionProvider for OutputWorkspaceProbeEp {
+    fn name(&self) -> &str {
+        "output_workspace_probe"
+    }
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Cpu
+    }
+    fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+        onnx_runtime_ir::DeviceId::cpu()
+    }
+    fn initialize(&mut self, config: &EpConfig) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.initialize(config)
+    }
+    fn shutdown(&mut self) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.shutdown()
+    }
+    fn supports_op(
+        &self,
+        node: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        dtypes: &[DataType],
+        layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        if matches!(node.op_type.as_str(), "Attention" | "OutputWorkspaceProbe") {
+            KernelMatch::Supported {
+                workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+                cost: Cost::ZERO,
+                required_input_layouts: None,
+                output_layouts: vec![TensorLayout::contiguous(); node.output_values().count()],
+            }
+        } else {
+            self.cpu.supports_op(node, opset, shapes, dtypes, layouts)
+        }
+    }
+    fn get_kernel(
+        &self,
+        node: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        if matches!(node.op_type.as_str(), "Attention" | "OutputWorkspaceProbe") {
+            Ok(Box::new(OutputWorkspaceProbeKernel {
+                slots: node.outputs.iter().map(Option::is_some).collect(),
+                plans: self.plans.clone(),
+            }))
+        } else {
+            self.cpu.get_kernel(node, shapes, opset)
+        }
+    }
+    fn allocate(
+        &self,
+        bytes: usize,
+        alignment: usize,
+    ) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+        self.cpu.allocate(bytes, alignment)
+    }
+    fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.deallocate(buffer)
+    }
+    fn allocate_workspace(
+        &self,
+        bytes: usize,
+        alignment: usize,
+        role: MemoryRole,
+    ) -> onnx_runtime_ep_api::Result<WorkspaceAllocation> {
+        self.cpu.allocate_workspace(bytes, alignment, role)
+    }
+    fn deallocate_workspace(&self, owner: WorkspaceAllocation) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.deallocate_workspace(owner)
+    }
+    fn copy(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        bytes: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.copy(src, dst, bytes)
+    }
+    fn copy_async(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        bytes: usize,
+    ) -> onnx_runtime_ep_api::Result<Fence> {
+        self.cpu.copy_async(src, dst, bytes)
+    }
+    fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.sync()
+    }
+}
+
+#[test]
+fn output_workspace_metadata_tracks_physical_bindings_and_memo() {
+    let ep = Arc::new(OutputWorkspaceProbeEp {
+        cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
+        plans: Default::default(),
+    });
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 24);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
+    let cache = graph.create_named_value("cache", DataType::Float32, static_shape([1, 1, 2, 4]));
+    graph.add_input(input);
+    graph.add_output(y);
+    graph.add_output(cache);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Attention",
+        vec![Some(input)],
+        vec![y, cache],
+    ));
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    assert_eq!(
+        executor.graph.node(NodeId(0)).outputs,
+        vec![Some(y), Some(cache)]
+    );
+    let input = Tensor::from_f32(&[2], &[1., 2.]).unwrap();
+    for capacity in [4, 8, 4] {
+        let mut bindings = vec![
+            executor
+                .allocate_device_output_binding(
+                    "cache".into(),
+                    DataType::Float32,
+                    vec![1, 1, capacity, 4],
+                    vec![1, 1, 2, 4],
+                )
+                .unwrap(),
+        ];
+        let requirement = executor
+            .prepare_with_device_bindings(&[("input", &input)], &mut bindings)
+            .unwrap();
+        assert_eq!(requirement.bytes, 8 + capacity as u64 * 32);
+        let plans = ep.plans.lock().unwrap().len();
+        assert_eq!(
+            executor
+                .prepare_with_device_bindings(&[("input", &input)], &mut bindings)
+                .unwrap()
+                .bytes,
+            requirement.bytes
+        );
+        assert_eq!(
+            ep.plans.lock().unwrap().len(),
+            plans,
+            "unchanged output facts must hit the preparation memo"
+        );
+        executor
+            .run_with_device_bindings(&[("input", &input)], &mut bindings)
+            .unwrap();
+        assert!(
+            bindings[0]
+                .read_bytes()
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0x5A)
+        );
+        let expected = vec![
+            OutputMetadata::tensor(DataType::Float32, &[1]).into_owned(),
+            OutputMetadata::tensor(DataType::Float32, &[1, 1, capacity, 4]).into_owned(),
+        ];
+        assert_eq!(ep.plans.lock().unwrap().last(), Some(&expected));
+    }
+}
+
+#[test]
+fn output_workspace_metadata_matches_lowered_trailing_outputs() {
+    let ep = Arc::new(OutputWorkspaceProbeEp {
+        cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
+        plans: Default::default(),
+    });
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([3]));
+    graph.add_output(y);
+    let mut node = Node::new(NodeId(0), "OutputWorkspaceProbe", vec![], vec![y]);
+    node.outputs = vec![Some(y), None, None];
+    graph.insert_node(node);
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    assert_eq!(
+        executor
+            .prepare_with_device_bindings(&[], &mut [])
+            .unwrap()
+            .bytes,
+        24
+    );
+    assert_eq!(executor.run(&[]).unwrap()[0].as_bytes(), &[0x5A; 12]);
+    assert_eq!(
+        ep.plans.lock().unwrap().last().unwrap().as_slice(),
+        &[OutputMetadata::tensor(DataType::Float32, &[3])]
+    );
+}
+
+#[test]
+fn output_workspace_metadata_reaches_nested_control_flow_preparation() {
+    let ep = Arc::new(OutputWorkspaceProbeEp {
+        cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
+        plans: Default::default(),
+    });
+    let mut child = Graph::new();
+    let value = child.create_named_value("child_output", DataType::Float32, static_shape([3]));
+    child.add_output(value);
+    let mut node = Node::new(NodeId(0), "OutputWorkspaceProbe", vec![], vec![value]);
+    node.outputs = vec![Some(value), None];
+    child.insert_node(node);
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let condition = graph.create_named_value("condition", DataType::Bool, static_shape([]));
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([3]));
+    graph.add_input(condition);
+    graph.add_output(output);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "If",
+        vec![Some(condition)],
+        vec![output],
+    ));
+    graph
+        .subgraphs
+        .insert((NodeId(0), "then_branch".into()), child.clone());
+    graph
+        .subgraphs
+        .insert((NodeId(0), "else_branch".into()), child);
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    for condition in [0, 1] {
+        let condition = Tensor::from_raw(DataType::Bool, vec![], &[condition]).unwrap();
+        assert_eq!(
+            executor
+                .prepare_with_device_bindings(&[("condition", &condition)], &mut [])
+                .unwrap()
+                .bytes,
+            24
+        );
+        assert_eq!(
+            executor.run(&[("condition", &condition)]).unwrap()[0].as_bytes(),
+            &[0x5A; 12]
+        );
+    }
+    assert!(
+        ep.plans
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|facts| facts == &[OutputMetadata::tensor(DataType::Float32, &[3])])
+    );
+}
+
+#[test]
+fn workspace_capture_pins_use_existing_lane_without_issuer_callbacks() {
+    let (mut executor, _ep, books, _manager) = completed_workspace_fixture(true);
+    let input = completed_workspace_input(2);
+    executor
+        .prepare_with_device_bindings(&[("input", &input)], &mut [])
+        .unwrap();
+    let callbacks = books.callbacks();
+    let first = executor.workspace_capture_resources().unwrap();
+    assert_eq!(first.len(), 1);
+    let prepared = executor.step_workspace.as_ref().unwrap();
+    assert!(
+        first[0]
+            .workspace_span()
+            .unwrap()
+            .covers(prepared.buffer.as_ptr() as usize, prepared.bytes)
+    );
+    let installed = first.clone();
+    let provisional = executor.workspace_capture_resources().unwrap();
+    assert_eq!(
+        prepared.buffer.bound_owner().unwrap().outstanding_views(),
+        2
+    );
+    drop(first);
+    drop(provisional);
+    assert_eq!(
+        prepared.buffer.bound_owner().unwrap().outstanding_views(),
+        1
+    );
+    drop(installed);
+    assert_eq!(
+        prepared.buffer.bound_owner().unwrap().outstanding_views(),
+        0
+    );
+    assert_eq!(books.callbacks(), callbacks);
+    assert_eq!(books.used(Tier::Host), 64);
+    drop(executor);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn workspace_capture_default_cannot_silently_discard_real_pins() {
+    let (mut executor, ep, _books, _manager) = completed_workspace_fixture(true);
+    executor
+        .prepare_with_device_bindings(&[("input", &completed_workspace_input(2))], &mut [])
+        .unwrap();
+    let resources = executor.workspace_capture_resources().unwrap();
+    let error = ep
+        .begin_owned_device_graph_capture(
+            executor.graph_owner,
+            DeviceGraphSlot::Primary,
+            None,
+            &[],
+            resources,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("implement begin_owned_device_graph_capture"),
+        "{error}"
+    );
+    assert_eq!(
+        executor
+            .step_workspace
+            .as_ref()
+            .unwrap()
+            .buffer
+            .bound_owner()
+            .unwrap()
+            .outstanding_views(),
+        0
+    );
+}
+
+#[test]
+fn workspace_capture_inherited_addresses_cannot_manufacture_ownership() {
+    let (mut executor, _ep, _books, _manager) = completed_workspace_fixture(true);
+    executor.inherited_workspace = InheritedWorkspaces {
+        persistent: Some((0x1000, 64)),
+        step: None,
+    };
+    let error = executor.workspace_capture_resources().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("parent executor that owns their backing")
+    );
+    executor.inherited_workspace = InheritedWorkspaces::default();
+}
+
+#[test]
+fn workspace_capture_cannot_silently_skip_unpinned_raw_backing() {
+    let (mut executor, _ep, _books, _manager) = completed_workspace_fixture(true);
+    let mut backing = [0u8; 64];
+    // SAFETY: this scoped backing remains live and exclusive until the test
+    // removes the borrowed lane; it is never handed to provider deallocation.
+    let buffer = unsafe {
+        DeviceBuffer::from_borrowed_mut_parts(
+            backing.as_mut_ptr().cast(),
+            onnx_runtime_ir::DeviceId::cpu(),
+            backing.len(),
+            1,
+        )
+    }
+    .unwrap();
+    executor.step_workspace = Some(PreparedWorkspace {
+        buffer: WorkspaceAllocation::new(buffer),
+        bytes: 64,
+        alignment: 1,
+    });
+    let error = executor.workspace_capture_resources().err().unwrap();
+    assert!(error.to_string().contains("binding-owned workspace"));
+    drop(executor.step_workspace.take());
 }

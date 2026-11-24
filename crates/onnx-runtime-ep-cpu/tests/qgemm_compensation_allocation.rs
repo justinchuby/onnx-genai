@@ -125,7 +125,15 @@ fn native_qgemm_compensation_allocations_do_not_scale_with_batches() {
                 .iter()
                 .map(|input| TensorMetadata::new(input.dtype, input.shape, true))
                 .collect::<Vec<_>>();
-            let requirement = kernel.workspace_requirement(&metadata).unwrap();
+            let requirement = kernel
+                .workspace_requirement(
+                    &metadata,
+                    &[onnx_runtime_ep_api::OutputMetadata::tensor(
+                        DataType::Uint8,
+                        &y_shape,
+                    )],
+                )
+                .unwrap();
             assert_eq!(
                 requirement.bytes,
                 3 * 9 * 4,

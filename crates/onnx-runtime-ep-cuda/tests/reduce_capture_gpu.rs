@@ -685,8 +685,12 @@ fn cudnn_rewarm_failure_preserves_a(mode: CudnnRewarmFailure) {
     match mode {
         CudnnRewarmFailure::WorkspaceQuery => {
             runtime.fail_warm_transaction_at_for_test(1);
-            let error = common::runtime_workspace_requirement(kernel.as_ref(), &b_inputs)
-                .expect_err("signature-B cuDNN workspace query must hit the injected failure");
+            let error = common::runtime_workspace_requirement(
+                kernel.as_ref(),
+                &b_inputs,
+                &[onnx_runtime_ep_api::OutputMetadata::tensor(dtype, &b_out)],
+            )
+            .expect_err("signature-B cuDNN workspace query must hit the injected failure");
             assert!(
                 error.to_string().contains(
                     "injected staged warm-cache failure after Reduce cuDNN workspace query"
@@ -695,8 +699,12 @@ fn cudnn_rewarm_failure_preserves_a(mode: CudnnRewarmFailure) {
             );
         }
         CudnnRewarmFailure::WorkspaceAllocation => {
-            let requirement = common::runtime_workspace_requirement(kernel.as_ref(), &b_inputs)
-                .expect("query signature-B cuDNN workspace");
+            let requirement = common::runtime_workspace_requirement(
+                kernel.as_ref(),
+                &b_inputs,
+                &[onnx_runtime_ep_api::OutputMetadata::tensor(dtype, &b_out)],
+            )
+            .expect("query signature-B cuDNN workspace");
             assert!(
                 requirement.bytes > 0,
                 "the allocation-failure arm must select an actual non-zero cuDNN workspace"

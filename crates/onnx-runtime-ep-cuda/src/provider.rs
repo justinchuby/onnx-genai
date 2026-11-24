@@ -5271,9 +5271,16 @@ impl ExecutionProvider for CudaExecutionProvider {
         slot: DeviceGraphSlot,
         continuation: Option<DeviceGraphToken>,
         kernels: &[&dyn Kernel],
+        resources: Vec<onnx_runtime_ep_api::DeviceGraphResource>,
     ) -> Result<DeviceGraphToken> {
-        self.runtime
-            .begin_owned_graph_capture_in(owner, slot, continuation, kernels)
+        self.runtime.begin_owned_graph_capture_in(
+            owner,
+            slot,
+            continuation,
+            kernels,
+            resources,
+            self.provider_context_identity(),
+        )
     }
 
     fn end_owned_device_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {

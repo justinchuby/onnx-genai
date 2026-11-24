@@ -82,17 +82,12 @@ impl Default for ProjectionFusion {
 
 /// The ordered CPU EP optimization registry.
 pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
-    let mut passes: Vec<Box<dyn OptimizationPass>> = Vec::new();
-    passes.push(Box::new(
-        onnx_runtime_optimizer::quantized_grouped::QuantizedGroupedFusion,
-    ));
-    passes.push(Box::new(
-        onnx_runtime_optimizer::affine_gather::AffineGatherFusion,
-    ));
-    passes.push(Box::new(
-        onnx_runtime_optimizer::dequantize_packed_gather::DequantizePackedGatherFusion,
-    ));
-    passes.push(Box::new(CpuSiluFusion));
+    let mut passes: Vec<Box<dyn OptimizationPass>> = vec![
+        Box::new(onnx_runtime_optimizer::quantized_grouped::QuantizedGroupedFusion),
+        Box::new(onnx_runtime_optimizer::affine_gather::AffineGatherFusion),
+        Box::new(onnx_runtime_optimizer::dequantize_packed_gather::DequantizePackedGatherFusion),
+        Box::new(CpuSiluFusion),
+    ];
     let projection_fusion = ProjectionFusion::new();
     if projection_fusion.enabled() {
         passes.push(Box::new(projection_fusion));

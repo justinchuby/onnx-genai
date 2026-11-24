@@ -232,7 +232,13 @@ impl PreparedKernel {
             .map(|shape| TensorMetadata::new(dtype, shape, true))
             .collect::<Vec<_>>();
         let request = kernel
-            .workspace_requirement(&metadata)
+            .workspace_requirement(
+                &metadata,
+                &[onnx_runtime_ep_api::OutputMetadata::tensor(
+                    dtype,
+                    &case.output_shape,
+                )],
+            )
             .expect("benchmark workspace planning must succeed");
         assert!(request.alignment <= std::mem::align_of::<u64>());
         let bytes = usize::try_from(request.bytes).expect("benchmark workspace is addressable");

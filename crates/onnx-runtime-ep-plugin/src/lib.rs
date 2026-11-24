@@ -40,6 +40,7 @@ pub mod pin;
 mod shared_shapes;
 pub mod status;
 pub mod transfer;
+mod workspace;
 
 pub use ep::ExportedEp;
 pub use factory::ExportedFactory;

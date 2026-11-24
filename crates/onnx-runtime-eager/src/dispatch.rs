@@ -111,7 +111,8 @@ impl EagerContext {
 
         // 2. Target device (mixed-device inputs are rejected, §1.6).
         let device = self.resolve_device(inputs)?;
-        let ep = self.ep_for_device(device)?;
+        let provider = self.synchronous_provider(device)?;
+        let ep = provider.ep();
 
         // Concrete input shapes, reused for the kernel, cache key, and views.
         let input_shapes: Vec<Vec<usize>> = inputs.iter().map(|t| t.shape().to_vec()).collect();
@@ -136,7 +137,7 @@ impl EagerContext {
             output_count,
             device,
         };
-        let kernel = self
+        let lookup = self
             .cache
             .lock()
             .expect("kernel cache lock poisoned")
@@ -154,6 +155,11 @@ impl EagerContext {
                         })
                 },
             )?;
+
+        // Resource retirement may call the provider. Never do it while holding
+        // the process-wide cache lock; in-flight Arc owners retire later.
+        drop(lookup.retired);
+        let kernel = lookup.kernel;
 
         // 5. Infer output shapes/dtypes for every requested output slot.
         let output_meta = self.infer_output_meta(&node, op_type, domain, opset, inputs)?;
@@ -203,8 +209,15 @@ impl EagerContext {
             .collect();
 
         {
-            let guard = kernel.lock().expect("cached kernel mutex poisoned");
-            guard.execute(&input_views, &mut output_views)?;
+            let mut guard = kernel.lock().expect("cached kernel mutex poisoned");
+            guard
+                .execute(provider, op_type, &input_views, &mut output_views)
+                .map_err(|source| EagerError::Execution {
+                    op_type: op_type.into(),
+                    domain: domain.into(),
+                    device,
+                    source: Box::new(source),
+                })?;
         }
         // Drop the views (they borrow the ptr/stride holders) before the owned
         // output tensors leave the function.

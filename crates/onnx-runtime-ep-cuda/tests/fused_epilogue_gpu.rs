@@ -157,7 +157,7 @@ fn run_model(
         .iter()
         .map(|input| TensorMetadata::new(input.dtype, input.shape, true))
         .collect::<Vec<_>>();
-    let requirement = kernel.workspace_requirement(&metadata).unwrap();
+    let requirement = kernel.workspace_requirement(&metadata, &[]).unwrap();
     let mut workspace = (requirement.bytes != 0).then(|| {
         ep.allocate(requirement.bytes as usize, requirement.alignment)
             .unwrap()
