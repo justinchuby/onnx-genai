@@ -424,8 +424,110 @@ impl MatMulPrefillGeometry {
     }
 }
 
+/// One route classification shared by planning and f32 execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum F32MatMulRoute {
+    Empty,
+    Gemv,
+    Accuracy4,
+    Dequant,
+}
+
+fn f32_matmul_route(
+    m: usize,
+    bits: usize,
+    accuracy: i64,
+    block: usize,
+    group_indices: bool,
+) -> F32MatMulRoute {
+    if m == 0 {
+        F32MatMulRoute::Empty
+    } else if m == 1 && !group_indices {
+        F32MatMulRoute::Gemv
+    } else if bits == 4 && accuracy == 4 && block == 32 && !group_indices {
+        F32MatMulRoute::Accuracy4
+    } else {
+        F32MatMulRoute::Dequant
+    }
+}
+
+/// Checked f32 matrix geometry; its weight prefix and BLAS suffix coexist.
+struct F32DequantGeometry {
+    weight: std::alloc::Layout,
+    activation_elements: usize,
+}
+impl F32DequantGeometry {
+    fn new(m: usize, k: usize, n: usize) -> Result<Self> {
+        if m == 0 || k == 0 || n == 0 {
+            return Err(error(format!(
+                "f32 dequantization requires nonzero M, K and N, received M={m}, K={k}, N={n}"
+            )));
+        }
+        let matrix = |rows: usize, columns: usize, name: &str| {
+            let elements = rows.checked_mul(columns).ok_or_else(|| {
+                error(format!(
+                    "{name} element count overflows for {rows} by {columns}; reduce the MatMulNBits shape"
+                ))
+            })?;
+            let bytes = elements.checked_mul(4).ok_or_else(|| {
+                error(format!(
+                    "{name} byte count overflows; reduce the MatMulNBits shape"
+                ))
+            })?;
+            let layout = std::alloc::Layout::from_size_align(bytes, blas::WORKSPACE_ALIGNMENT)
+                .map_err(|_| {
+                    error(format!(
+                        "{name} exceeds addressable capacity; reduce the MatMulNBits shape"
+                    ))
+                })?;
+            Ok::<_, EpError>((elements, layout))
+        };
+        let (activation_elements, _) = matrix(m, k, "f32 activation")?;
+        matrix(m, n, "f32 output")?;
+        let (_, weight) = matrix(k, n, "f32 dequantized weight")?;
+        Ok(Self {
+            weight,
+            activation_elements,
+        })
+    }
+
+    /// The weight prefix is metadata-independent. Borrow the remaining capacity
+    /// without another heuristic query; governed_gemm validates its own plan.
+    fn bind(
+        &self,
+        workspace: Option<WorkspaceView>,
+    ) -> Result<(WorkspaceView, Option<WorkspaceView>)> {
+        let boundary = std::alloc::Layout::from_size_align(0, blas::WORKSPACE_ALIGNMENT)
+            .map_err(|_| error("invalid f32 BLAS alignment"))?;
+        let prefix = WorkspaceLayout::new([self.weight, boundary])?;
+        let [weight, tail] = prefix.bind(workspace).map_err(|cause| {
+            error(format!(
+                "cannot bind f32 dequantized weight/BLAS workspace: {cause}; prepare the complete MatMulNBits requirement"
+            ))
+        })?;
+        let backing = workspace.ok_or_else(|| {
+            error("f32 dequantization requires caller-owned weight workspace; prepare MatMulNBits before execution")
+        })?;
+        if (backing.ptr().0 as usize)
+            .checked_add(backing.bytes())
+            .is_none()
+        {
+            return Err(error(
+                "f32 dequantization backing address span overflows; supply a valid caller workspace",
+            ));
+        }
+        let remaining = backing.bytes() - prefix.bytes();
+        Ok((
+            weight,
+            (remaining != 0).then_some(WorkspaceView::new(tail.ptr(), remaining)),
+        ))
+    }
+}
+
 const MATMUL_MAX_INPUTS: usize = 8;
-const MATMUL_WORKSPACE_REGIONS: usize = 3 + MATMUL_MAX_INPUTS + 1;
+const MATMUL_PREFILL_START: usize = 1;
+const MATMUL_STAGING_START: usize = MATMUL_PREFILL_START + 3;
+const MATMUL_WORKSPACE_REGIONS: usize = MATMUL_STAGING_START + MATMUL_MAX_INPUTS + 1;
 const BF16_MAX_CACHED_SCALES: usize = bf16_scale_slots(true).len();
 
 #[derive(Clone, Copy)]
@@ -475,6 +577,7 @@ impl MatMulNBitsWorkspaceLayout {
         constants: &[bool],
         gate_up: bool,
         output_elements: usize,
+        dequantized_weight: std::alloc::Layout,
     ) -> Result<Self> {
         if inputs.len() > MATMUL_MAX_INPUTS {
             return Err(error(
@@ -484,7 +587,8 @@ impl MatMulNBitsWorkspaceLayout {
         let empty = std::alloc::Layout::from_size_align(0, blas::WORKSPACE_ALIGNMENT)
             .map_err(|_| error("invalid BF16 workspace alignment"))?;
         let mut regions = [empty; MATMUL_WORKSPACE_REGIONS];
-        regions[..3].copy_from_slice(&prefill);
+        regions[0] = dequantized_weight;
+        regions[MATMUL_PREFILL_START..MATMUL_STAGING_START].copy_from_slice(&prefill);
         let mut staged = [false; MATMUL_MAX_INPUTS];
         let mut input_elements = [0; MATMUL_MAX_INPUTS];
         let bf16 = inputs
@@ -507,7 +611,7 @@ impl MatMulNBitsWorkspaceLayout {
                 let converted = region(input_elements[index])?;
                 if !bf16_scale_input_is_cacheable(constants, gate_up, index, input.dtype) {
                     staged[index] = true;
-                    regions[3 + index] = converted;
+                    regions[MATMUL_STAGING_START + index] = converted;
                 }
             }
             regions[MATMUL_WORKSPACE_REGIONS - 1] = region(output_elements)?;
@@ -528,11 +632,14 @@ impl MatMulNBitsWorkspaceLayout {
         let views = self.layout.bind(workspace)?;
         Ok(MatMulNBitsWorkspaceBinding {
             prefill: MatMulNBitsWorkspaceParts {
-                normalized: views[0],
-                gate: views[1],
-                blas: (views[2].bytes() != 0).then_some(views[2]),
+                normalized: views[MATMUL_PREFILL_START],
+                gate: views[MATMUL_PREFILL_START + 1],
+                blas: (views[MATMUL_PREFILL_START + 2].bytes() != 0)
+                    .then_some(views[MATMUL_PREFILL_START + 2]),
             },
-            inputs: std::array::from_fn(|index| self.staged[index].then_some(views[3 + index])),
+            inputs: std::array::from_fn(|index| {
+                self.staged[index].then_some(views[MATMUL_STAGING_START + index])
+            }),
             input_elements: self.input_elements,
             result: self.bf16.then_some(views[MATMUL_WORKSPACE_REGIONS - 1]),
             used: if self.bytes() == 0 {
@@ -7323,7 +7430,17 @@ impl MatMulNBitsKernel {
             }
         }
 
-        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        let m = checked_matmul_rows(a_shape)?;
+        let route = f32_matmul_route(
+            m,
+            self.bits,
+            self.accuracy_level,
+            self.block_size,
+            group_indices.is_some(),
+        );
+        if route == F32MatMulRoute::Empty {
+            return Ok(());
+        }
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let mut flops = (m as u64)
                 .saturating_mul(self.n as u64)
@@ -7336,7 +7453,7 @@ impl MatMulNBitsKernel {
         });
         self.last_call_capture_safe
             .store(m == 1 && group_indices.is_none(), Ordering::Relaxed);
-        if m == 1 && group_indices.is_none() {
+        if route == F32MatMulRoute::Gemv {
             self.release_marlin_repack_for_decode();
             if self.round_affine_weights {
                 return self.launch_f32_gemv(
@@ -7526,11 +7643,7 @@ impl MatMulNBitsKernel {
                 );
             }
         }
-        if self.bits == 4
-            && self.accuracy_level == 4
-            && self.block_size == 32
-            && group_indices.is_none()
-        {
+        if route == F32MatMulRoute::Accuracy4 {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "gemm_tiled_accuracy4",
                 "M={} (GEMV requires M==1), accuracy_level==4, block_size=32, no g_idx → \
@@ -7560,54 +7673,48 @@ impl MatMulNBitsKernel {
             group_indices.is_some()
         );
 
-        let weight = self.runtime.alloc_raw(self.k * self.n * 4)?;
-        let result = self
-            .launch_dequant(
-                &inputs[1],
-                &inputs[2],
-                zero_points,
-                group_indices,
-                weight,
-                k_blocks,
-                blob_size,
-                zp_row_bytes,
+        let geometry = F32DequantGeometry::new(m, self.k, self.n)?;
+        let (weight, blas_workspace) = geometry.bind(workspace)?;
+        let weight = cuptr(weight.ptr().0.cast_const());
+        self.launch_dequant(
+            &inputs[1],
+            &inputs[2],
+            zero_points,
+            group_indices,
+            weight,
+            k_blocks,
+            blob_size,
+            zp_row_bytes,
+        )?;
+        let params = GemmParams {
+            dtype: GemmDtype::F32,
+            a: cuptr(inputs[0].data_ptr::<u8>() as *const c_void),
+            b: weight,
+            c: cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void),
+            m,
+            k: self.k,
+            n: self.n,
+            batch: 1,
+            a_batch_stride: geometry.activation_elements,
+            b_batch_stride: 0,
+            epilogue: bias.map(|bias| GemmEpilogue {
+                kind: GemmEpilogueKind::Bias,
+                bias: cuptr(bias.data_ptr::<u8>() as *const c_void),
+            }),
+        };
+        // SAFETY: checked input/output spans and a separately bound weight
+        // matrix cover the GEMM. BLAS receives only its disjoint suffix. All
+        // backing remains caller/provider owned through asynchronous settlement.
+        unsafe {
+            blas::governed_gemm(
+                self.runtime.blas(),
+                self.runtime.stream_ptr(),
+                &params,
+                blas_workspace,
+                "MatMulNBits",
             )
-            .and_then(|()| {
-                let params = GemmParams {
-                    dtype: GemmDtype::F32,
-                    a: cuptr(inputs[0].data_ptr::<u8>() as *const c_void),
-                    b: weight,
-                    c: cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void),
-                    m,
-                    k: self.k,
-                    n: self.n,
-                    batch: 1,
-                    a_batch_stride: m * self.k,
-                    b_batch_stride: 0,
-                    epilogue: bias.map(|bias| GemmEpilogue {
-                        kind: GemmEpilogueKind::Bias,
-                        bias: cuptr(bias.data_ptr::<u8>() as *const c_void),
-                    }),
-                };
-                // SAFETY: validated dense f32 A/Y and the dequantized [K,N]
-                // allocation cover the complete GEMM; workspace and stream live
-                // through the call and Y aliases neither input.
-                unsafe {
-                    blas::governed_gemm(
-                        self.runtime.blas(),
-                        self.runtime.stream_ptr(),
-                        &params,
-                        workspace,
-                        "MatMulNBits",
-                    )
-                }
-            })
-            .and_then(|()| self.runtime.synchronize());
-
-        // SAFETY: `weight` came from `alloc_raw` and is released once, after all
-        // submitted work has synchronized (or the submission failed).
-        let free_weight = unsafe { self.runtime.free_raw(weight) };
-        result.and(free_weight)
+        }?;
+        self.runtime.synchronize()
     }
 
     fn uses_dequant_cublas_workspace(
@@ -7623,13 +7730,13 @@ impl MatMulNBitsKernel {
         let Ok(m) = checked_matmul_rows(a_shape) else {
             return false;
         };
-        if m == 1 && !group_indices_present {
-            return false;
-        }
-        !(self.bits == 4
-            && self.accuracy_level == 4
-            && self.block_size == 32
-            && !group_indices_present)
+        f32_matmul_route(
+            m,
+            self.bits,
+            self.accuracy_level,
+            self.block_size,
+            group_indices_present,
+        ) == F32MatMulRoute::Dequant
     }
 
     /// Whether a half-precision activation at M>1 would take the dequantize +
@@ -7677,7 +7784,7 @@ impl MatMulNBitsKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
     ) -> Result<MatMulNBitsWorkspaceLayout> {
-        let a = inputs.first();
+        let a = inputs.first().filter(|a| a.present);
         let m = match a {
             Some(a) if a.shape.last() == Some(&self.k) => checked_matmul_rows(a.shape)?,
             _ => 0,
@@ -7704,12 +7811,25 @@ impl MatMulNBitsKernel {
         } else {
             0
         };
+        let dequantized = if a.is_some_and(|a| {
+            a.present
+                && self.uses_dequant_cublas_workspace(
+                    a.dtype,
+                    a.shape,
+                    inputs.get(4).is_some_and(|input| input.present),
+                )
+        }) {
+            F32DequantGeometry::new(m, self.k, self.n)?.weight
+        } else {
+            std::alloc::Layout::new::<()>()
+        };
         MatMulNBitsWorkspaceLayout::new(
             prefill,
             inputs,
             &self.constant_inputs,
             self.gate_up_swiglu,
             output_elements,
+            dequantized,
         )
     }
 
@@ -7777,7 +7897,7 @@ impl MatMulNBitsKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
-        let Some(a) = inputs.first() else {
+        let Some(a) = inputs.first().filter(|a| a.present) else {
             return Ok(WorkspaceRequirement::NONE);
         };
         let group_indices_present = inputs.get(4).is_some_and(|input| input.present);
@@ -7811,6 +7931,7 @@ impl MatMulNBitsKernel {
             }
             return Ok(blas::governed_workspace_requirement(bytes));
         }
+        let geometry = F32DequantGeometry::new(m, self.k, self.n)?;
         let params = GemmParams {
             dtype,
             a: 1,
@@ -7820,7 +7941,7 @@ impl MatMulNBitsKernel {
             k: self.k,
             n: self.n,
             batch: 1,
-            a_batch_stride: m * self.k,
+            a_batch_stride: geometry.activation_elements,
             b_batch_stride: 0,
             epilogue: inputs
                 .get(5)
@@ -11695,6 +11816,124 @@ mod tests {
     }
 
     #[test]
+    fn f32_dequant_route_keeps_grouped_decode_and_empty_work_explicit() {
+        for bits in [4, 8] {
+            for accuracy in [0, 4] {
+                for block in [16, 32, 128] {
+                    for grouped in [false, true] {
+                        assert_eq!(
+                            f32_matmul_route(0, bits, accuracy, block, grouped),
+                            F32MatMulRoute::Empty
+                        );
+                        assert_eq!(
+                            f32_matmul_route(1, bits, accuracy, block, grouped),
+                            if grouped {
+                                F32MatMulRoute::Dequant
+                            } else {
+                                F32MatMulRoute::Gemv
+                            }
+                        );
+                        assert_eq!(
+                            f32_matmul_route(2, bits, accuracy, block, grouped),
+                            if bits == 4 && accuracy == 4 && block == 32 && !grouped {
+                                F32MatMulRoute::Accuracy4
+                            } else {
+                                F32MatMulRoute::Dequant
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn f32_dequant_weight_and_blas_share_one_nonoverlapping_requirement() {
+        let geometry = F32DequantGeometry::new(2, 3, 5).unwrap();
+        assert_eq!(geometry.weight.size(), 60);
+        let empty = std::alloc::Layout::from_size_align(0, blas::WORKSPACE_ALIGNMENT).unwrap();
+        let inputs = [TensorMetadata::new(DataType::Float32, &[2, 3], true)];
+        #[repr(align(256))]
+        struct Backing([u8; 1024]);
+        let mut backing = Backing([0; 1024]);
+        for blas_bytes in [0, 96] {
+            let layout = MatMulNBitsWorkspaceLayout::new(
+                [
+                    empty,
+                    empty,
+                    std::alloc::Layout::from_size_align(blas_bytes, blas::WORKSPACE_ALIGNMENT)
+                        .unwrap(),
+                ],
+                &inputs,
+                &[],
+                false,
+                0,
+                geometry.weight,
+            )
+            .unwrap();
+            assert!(layout.bytes() >= geometry.weight.size() + blas_bytes);
+            assert_eq!(
+                blas::governed_workspace_requirement(layout.bytes()).lifetime,
+                onnx_runtime_ep_api::WorkspaceLifetime::SessionPersistent
+            );
+            let view =
+                WorkspaceView::new(DevicePtrMut(backing.0.as_mut_ptr().cast()), layout.bytes());
+            let (weight, tail) = geometry.bind(Some(view)).unwrap();
+            assert_eq!(weight.bytes(), 60);
+            assert_eq!(weight.ptr().0, view.ptr().0);
+            let exact_blas = layout.bind(Some(view)).unwrap().prefill.blas;
+            if blas_bytes == 0 {
+                assert!(tail.is_none());
+                assert!(exact_blas.is_none());
+            } else {
+                let tail = tail.unwrap();
+                assert_eq!(tail.ptr().0, exact_blas.unwrap().ptr().0);
+                assert!(tail.bytes() >= blas_bytes);
+                assert!(weight.ptr().0 as usize + weight.bytes() <= tail.ptr().0 as usize);
+                assert_eq!(
+                    tail.ptr().0 as usize + tail.bytes(),
+                    view.ptr().0 as usize + view.bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f32_dequant_checks_each_matrix_and_rejects_invalid_backing() {
+        for (m, k, n, context) in [
+            (0, 1, 1, "nonzero"),
+            (1, 0, 1, "nonzero"),
+            (1, 1, 0, "nonzero"),
+            (usize::MAX, 2, 1, "activation"),
+            (2, 1, usize::MAX / 2 + 1, "output"),
+            (1, usize::MAX / 16, 5, "dequantized weight"),
+        ] {
+            let message = F32DequantGeometry::new(m, k, n).err().unwrap().to_string();
+            assert!(message.contains(context), "{message}");
+        }
+        let geometry = F32DequantGeometry::new(2, 3, 5).unwrap();
+        for view in [
+            None,
+            Some(WorkspaceView::new(DevicePtrMut(256usize as *mut _), 255)),
+            Some(WorkspaceView::new(DevicePtrMut(257usize as *mut _), 512)),
+            Some(WorkspaceView::new(
+                DevicePtrMut((usize::MAX - 255) as *mut _),
+                512,
+            )),
+            Some(WorkspaceView::new(
+                DevicePtrMut(256usize as *mut _),
+                usize::MAX,
+            )),
+        ] {
+            let message = geometry.bind(view).err().unwrap().to_string();
+            assert!(
+                message.contains("workspace") || message.contains("backing"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn bf16_workspace_staging_preserves_optional_slots_and_excludes_constant_scales() {
         let inputs = [
             TensorMetadata::new(DataType::BFloat16, &[1, 16], true),
@@ -11718,7 +11957,15 @@ mod tests {
         .unwrap();
         let mut facts = [false; MATMUL_MAX_INPUTS];
         facts[2] = true;
-        let layout = MatMulNBitsWorkspaceLayout::new(prefill, &inputs, &facts, true, 8).unwrap();
+        let layout = MatMulNBitsWorkspaceLayout::new(
+            prefill,
+            &inputs,
+            &facts,
+            true,
+            8,
+            std::alloc::Layout::new::<()>(),
+        )
+        .unwrap();
         assert_eq!(layout.bytes(), 784);
         #[repr(align(256))]
         struct Backing([u8; 1280]);
@@ -11759,7 +12006,15 @@ mod tests {
         );
         facts[2] = false;
         facts[4] = true;
-        let mixed = MatMulNBitsWorkspaceLayout::new(prefill, &inputs, &facts, true, 8).unwrap();
+        let mixed = MatMulNBitsWorkspaceLayout::new(
+            prefill,
+            &inputs,
+            &facts,
+            true,
+            8,
+            std::alloc::Layout::new::<()>(),
+        )
+        .unwrap();
         let parts = mixed.bind(Some(view)).unwrap();
         assert!(parts.inputs[2].is_some());
         assert!(parts.inputs[4].is_none());
@@ -11787,6 +12042,7 @@ mod tests {
             &[false; 8],
             true,
             9 * 24,
+            std::alloc::Layout::new::<()>(),
         )
         .unwrap();
         #[repr(align(256))]
@@ -11822,7 +12078,8 @@ mod tests {
                 &[TensorMetadata::new(DataType::Float16, &[1, 16], true)],
                 &[],
                 false,
-                24
+                24,
+                std::alloc::Layout::new::<()>(),
             )
             .unwrap()
             .bytes(),
@@ -11838,7 +12095,8 @@ mod tests {
                 )],
                 &[],
                 false,
-                24
+                24,
+                std::alloc::Layout::new::<()>(),
             )
             .is_err()
         );
@@ -11848,7 +12106,8 @@ mod tests {
                 &[TensorMetadata::new(DataType::BFloat16, &[1], true)],
                 &[],
                 false,
-                usize::MAX
+                usize::MAX,
+                std::alloc::Layout::new::<()>(),
             )
             .is_err()
         );

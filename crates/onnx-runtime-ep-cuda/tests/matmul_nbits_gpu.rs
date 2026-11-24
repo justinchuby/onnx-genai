@@ -12,6 +12,8 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
+mod common;
+
 use half::f16;
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
@@ -331,7 +333,14 @@ fn run_case_with_bits(
         &output_strides,
         device,
     );
-    kernel.execute(&input_views, &mut [output_view])?;
+    let mut workspace = None;
+    common::execute_kernel(
+        ep,
+        kernel.as_ref(),
+        &input_views,
+        &mut [output_view],
+        &mut workspace,
+    )?;
     assert_eq!(
         kernel.cuda_graph_compatible(),
         a_shape[..a_shape.len() - 1].iter().product::<usize>() == 1
@@ -340,6 +349,10 @@ fn run_case_with_bits(
     let mut bytes = vec![0u8; output_len * 4];
     // SAFETY: output allocation contains `output_len` f32 values.
     unsafe { runtime.dtoh(&mut bytes, cuptr(output_buffer.as_ptr()))? };
+    // The blocking D2H above completes the workspace use before release.
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace)?;
+    }
     drop(input_views);
     for buffer in input_buffers {
         ep.deallocate(buffer)?;
