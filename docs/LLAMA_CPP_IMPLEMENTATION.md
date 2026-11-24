@@ -1874,3 +1874,16 @@ upstream acknowledgement-only response. Request fields do not mutate settings;
 this matches the pinned server-context.cpp handler, which has no mutation schema.
 Both router and model properties report the configured endpoint flag. Router
 properties also expose the actual host-tool capability independently of loading.
+
+
+### Stdio MCP server tools
+
+Cursor-compatible file/inline configuration supplies independent stdio MCP server
+lanes. The official client SDK handles initialization, IDs and peer messages;
+canonical leases cover configuration, SDK message tasks, catalogs and cloned HTTP
+response bytes. Discovery is bounded and independent of model loading. Calls use
+upstream names/result normalization, preserve trusted frontend controls, reuse
+healthy sessions after application errors, and cancel/reap process groups on
+disconnect or timeout. A node-owned runtime joins actors and the child reaper.
+See [stdio MCP serving](SERVER_MCP.md) for configuration and explicit I/O limits.
+Container/SSH runtimes and the rest of the compatibility ledger remain open.

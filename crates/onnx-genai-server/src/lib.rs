@@ -10,7 +10,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::{net::SocketAddr, time::Instant};
+use anyhow::Context as _;
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use axum::{
     Router,
@@ -48,7 +49,7 @@ mod sse;
 mod state;
 mod tool_protocol;
 mod tools;
-pub use tools::{BuiltinTool, ToolsConfig};
+pub use tools::{BuiltinTool, McpSources, ToolsConfig};
 mod types;
 mod webui;
 mod worker;
@@ -284,6 +285,13 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
     // Security posture: the server has no built-in authentication. The CLI defaults
     // to 127.0.0.1, enforces max_tokens/max_sessions caps, and issues CSPRNG session
     // ids; binding a non-loopback --addr should be done only behind an auth proxy.
+    if let Some(tools) = &state.tools {
+        let job = Arc::new(tools.admit(0).context("admit MCP startup discovery")?);
+        tools
+            .catalog(job)
+            .await
+            .context("discover configured MCP tools before accepting HTTP requests")?;
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app(state)).await?;
     Ok(())

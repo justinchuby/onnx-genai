@@ -158,8 +158,12 @@ impl NativeDeviceAllocation {
         self.bytes
     }
 
+    pub(crate) fn identity(owner: &Arc<Self>) -> usize {
+        Arc::as_ptr(owner) as usize
+    }
+
     pub(crate) fn device_graph_resource(owner: &Arc<Self>) -> DeviceGraphResource {
-        DeviceGraphResource::new(Arc::as_ptr(owner) as usize, Arc::clone(owner))
+        DeviceGraphResource::new(Self::identity(owner), Arc::clone(owner))
     }
 
     pub(crate) fn release(&mut self) -> Result<()> {
@@ -3158,15 +3162,12 @@ impl CudaRuntime {
         self.runtime_id
     }
 
-    /// The interleaved copy of the `bytes`-byte int4 packed weight at `packed`,
-    /// built once per weight and released when this runtime drops. Returns
-    /// `(pointer, warm)`; see [`crate::interleave_cache::InterleaveCache::ensure`].
-    pub(crate) fn ensure_interleaved_int4(
-        &self,
-        packed: CUdeviceptr,
-        bytes: usize,
-    ) -> Result<(CUdeviceptr, bool)> {
-        self.interleave.ensure(self, packed, bytes)
+    /// Prepare a shared owning conversion for an explicitly immutable source.
+    pub(crate) fn prepare_interleaved_int4(
+        self: &Arc<Self>,
+        source: crate::interleave_cache::ImmutablePackedWeight,
+    ) -> Result<(Arc<crate::interleave_cache::InterleaveEntry>, bool)> {
+        self.interleave.prepare(self, source)
     }
 
     /// Release every interleaved weight copy this runtime holds.
@@ -3176,7 +3177,7 @@ impl CudaRuntime {
     /// which runs per buffer as the provider frees it.
     #[cfg(test)]
     pub(crate) fn release_interleaved_weights(&self) {
-        self.interleave.release_all(self);
+        self.interleave.release_all();
     }
 
     /// Drop any interleaved copy derived from the buffer at `base`.
@@ -3191,7 +3192,7 @@ impl CudaRuntime {
     /// and frees their initializers back into the same arena — so runtime
     /// scoping alone leaves that window open and this is what closes it.
     pub(crate) fn invalidate_interleaved_for(&self, base: CUdeviceptr, len: usize) {
-        self.interleave.invalidate(self, base, len);
+        self.interleave.invalidate(base, len);
     }
 
     /// Record that device weight offload is on, so weight buffers may be paged.
@@ -3929,11 +3930,10 @@ impl Drop for CudaRuntime {
         // released when this body returns, which is *before* the fields drop.
         // See `teardown_section`.
         self.teardown_section = capture_gate::synchronizing_section();
-        // Before the context goes: an interleaved weight copy is keyed by the
-        // source weight's device address, and that address stops meaning
-        // anything once this runtime's allocator is gone. Freeing here is what
-        // bounds an entry's life by the life of the address that names it.
-        self.interleave.release_all(&*self);
+        // Revoke source names and release the cache's native owners before
+        // field teardown. Graph pins may retain independent domain ownership;
+        // native retirement does not need to upgrade this dying runtime.
+        self.interleave.release_all();
         if self.capture_error != 0 {
             // SAFETY: `capture_error` was allocated by this runtime's `alloc_raw`
             // in `with_capture_error_word` and is freed exactly once here.
