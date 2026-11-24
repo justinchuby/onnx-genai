@@ -65,6 +65,7 @@ pub const CPU_OPERATOR_CATALOG: &[OperatorCatalogEntry] = &[
     entry("", "Col2Im", 18, OPS_CNN),
     entry("", "Conv", 1, OPS_CNN),
     entry("", "ConvTranspose", 1, OPS_CNN),
+    entry("", "DeformConv", 19, OPS_CNN),
     entry("", "GlobalAveragePool", 1, OPS_CNN),
     entry("", "GlobalMaxPool", 1, OPS_CNN),
     entry("", "GlobalLpPool", 2, OPS_CNN),

@@ -108,6 +108,7 @@ rounding. The CUDA plugin declines runtime-valued shape reads for `Range`.
 | DepthToSpace | 1 | Super-resolution, diffusion. |
 | SpaceToDepth | 1 | |
 | GridSample | 20 | |
+| DeformConv | 19, 22 | Native CPU and CUDA. Opset 22 adds bfloat16; CUDA supports up to 32 spatial axes. |
 | Compress | 9 | |
 | Scatter | 9 | |
 | Unique | 11 | |

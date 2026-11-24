@@ -534,7 +534,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        239,
+        240,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -543,7 +543,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        285,
+        291,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -5179,6 +5179,41 @@ fn ints(values: &[i64]) -> Attribute {
 }
 
 #[test]
+fn deform_conv_shapes_follow_geometry_and_versioned_types() {
+    let n = with_attr(node("DeformConv", 3, 1), "strides", ints(&[2]));
+    let inputs = |dtype, offset_channels| {
+        [
+            vec![c(2), c(3), c(9)],
+            vec![c(4), c(3), c(3)],
+            vec![c(2), c(offset_channels), c(4)],
+        ]
+        .into_iter()
+        .map(|s| tin(dtype, s))
+        .collect()
+    };
+    assert_eq!(
+        out_shape(&run(&n, inputs(DataType::Float64, 3), 19)),
+        vec![c(2), c(4), c(4)]
+    );
+    assert!(
+        try_run(&n, inputs(DataType::BFloat16, 3), 21)
+            .unwrap_err()
+            .to_string()
+            .contains("requires opset 22")
+    );
+    assert_eq!(
+        out_shape(&run(&n, inputs(DataType::BFloat16, 3), 22)),
+        vec![c(2), c(4), c(4)]
+    );
+    assert!(
+        try_run(&n, inputs(DataType::Float32, 4), 22)
+            .unwrap_err()
+            .to_string()
+            .contains("offset shape")
+    );
+}
+
+#[test]
 fn conv_transpose_deconvolution_formula_and_channels() {
     // stride*(input-1) + output_padding + effective_kernel - pads.
     let mut n = with_attr(node("ConvTranspose", 2, 1), "strides", ints(&[2, 2]));
@@ -7229,6 +7264,8 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "CumSum", 14),
     ("", "DFT", 17),
     ("", "DFT", 20),
+    ("", "DeformConv", 19),
+    ("", "DeformConv", 22),
     ("", "DepthToSpace", 1),
     ("", "DepthToSpace", 11),
     ("", "DepthToSpace", 13),

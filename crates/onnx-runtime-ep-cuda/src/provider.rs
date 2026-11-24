@@ -4276,6 +4276,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "DeformConv"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) =
+                crate::kernels::deform_conv::unsupported_reason(op, opset, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) = crate::kernels::standard_claims::unsupported_reason_at_opset(
                 op,
