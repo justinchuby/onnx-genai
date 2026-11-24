@@ -208,11 +208,30 @@ macro_rules! scatter_half {
             #[inline]
             fn sum_value(self) -> f64 { self.to_f64() }
             #[inline]
-            fn mean(sum: f64, count: usize) -> Self { Self::from_f64(sum / count as f64) }
+            fn mean(sum: f64, count: usize) -> Self {
+                Self::from_f32(round_to_odd_f32(sum / count as f64))
+            }
         }
     )+};
 }
 scatter_half!(half::f16, half::bf16);
+
+// Preserve the sticky bit in the f32 intermediate so narrowing again cannot
+// turn an inexact value into an apparent FP16/BF16 midpoint.
+fn round_to_odd_f32(value: f64) -> f32 {
+    let narrowed = value as f32;
+    let bits = narrowed.to_bits();
+    if narrowed.is_finite() && f64::from(narrowed) != value && bits & 1 == 0 {
+        let adjusted = if f64::from(narrowed.abs()) < value.abs() {
+            bits + 1
+        } else {
+            bits - 1
+        };
+        f32::from_bits(adjusted)
+    } else {
+        narrowed
+    }
+}
 
 // Keep a separate wide sum until the last contribution; in particular, an
 // integer sum can overflow its element type even when the mean is in range.
