@@ -6702,6 +6702,30 @@ fn seq_in(dtype: DataType, shape: Option<Vec<DimExpr>>) -> NodeIo {
 }
 
 #[test]
+fn optional_operand_forms_follow_opset() {
+    for op in ["OptionalHasElement", "OptionalGetElement"] {
+        let n = node(op, 1, 1);
+        assert!(try_run(&n, vec![f32in(vec![c(2)])], 15).is_err());
+        let direct = run(&n, vec![f32in(vec![c(2)])], 18);
+        let wrapped = run(
+            &n,
+            vec![NodeIo::container(ValueType::Optional(Box::new(
+                ValueType::tensor(DataType::Float32, vec![c(2)]),
+            )))],
+            15,
+        );
+        assert_eq!(direct[0].type_info, wrapped[0].type_info);
+    }
+    let omitted = node("OptionalHasElement", 0, 1);
+    assert!(try_run(&omitted, vec![], 15).is_err());
+    let result = run(&omitted, vec![], 28);
+    assert_eq!(
+        result[0].type_info,
+        Some(TypeInfo::new(DataType::Bool, vec![]))
+    );
+}
+
+#[test]
 fn sequence_empty_element_dtype_follows_attr_and_defaults_to_float32() {
     // Default (no `dtype` attr) is Float32, per the ONNX spec.
     let default = run(&node("SequenceEmpty", 0, 1), vec![], 13);

@@ -283,11 +283,13 @@ fn optional(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 }
 
 fn optional_has_element(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    validate_optional_operand(ctx, true)?;
     ctx.set_output(0, DataType::Bool, vec![]);
     Ok(())
 }
 
 fn optional_get_element(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    validate_optional_operand(ctx, false)?;
     match ctx.input_value_type(0).cloned() {
         Some(ValueType::Optional(element)) => match *element {
             ValueType::Tensor(tensor) => {
@@ -307,6 +309,30 @@ fn optional_get_element(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
         _ => {}
     }
     Ok(())
+}
+
+fn validate_optional_operand(
+    ctx: &InferenceContext,
+    allows_omission: bool,
+) -> Result<(), ShapeInferError> {
+    let before_18 = ctx.opset("") < 18;
+    let known_non_optional = match ctx.input_value_type(0) {
+        Some(ty) => !matches!(ty, ValueType::Optional(_)),
+        None => ctx.input_type(0).is_some(),
+    };
+    let detail = if ctx.num_inputs() > 1 {
+        "expected at most one input slot"
+    } else if before_18 && (!ctx.has_input(0) || known_non_optional) {
+        "requires an Optional input before opset 18"
+    } else if !allows_omission && !ctx.has_input(0) {
+        "requires an input; supply an Optional, tensor, or tensor sequence"
+    } else {
+        return Ok(());
+    };
+    Err(ShapeInferError::Invalid {
+        op: ctx.node.op_type.clone(),
+        detail: detail.into(),
+    })
 }
 
 /// Register the container-type rules.
