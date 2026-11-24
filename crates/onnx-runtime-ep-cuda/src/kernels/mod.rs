@@ -1040,7 +1040,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("Pad", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(pad::PadFactory {
             runtime: runtime.clone(),
         }),
@@ -1110,7 +1110,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("Resize", "", 10),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(resize::ResizeFactory {
             runtime: runtime.clone(),
             since_version: 10,
@@ -1118,7 +1118,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("Resize", "", 11),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(resize::ResizeFactory {
             runtime: runtime.clone(),
             since_version: 11,

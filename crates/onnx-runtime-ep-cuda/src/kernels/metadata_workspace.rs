@@ -17,6 +17,16 @@ pub(super) struct MetadataWorkspace {
     layout: WorkspaceLayout<1>,
 }
 
+fn output_is_empty(op: &str, output: &OutputMetadata<'_>) -> Result<bool> {
+    match output {
+        OutputMetadata::Absent => Err(EpError::KernelFailed(format!(
+            "cuda_ep {op}: required output 0 is absent; provide the output metadata"
+        ))),
+        OutputMetadata::Tensor { shape, .. } => Ok(shape.contains(&0)),
+        OutputMetadata::Unresolved { .. } => Ok(false),
+    }
+}
+
 impl MetadataWorkspace {
     pub(super) fn for_records(
         op: &'static str,
@@ -24,15 +34,7 @@ impl MetadataWorkspace {
         words_per_record: usize,
         output: &OutputMetadata<'_>,
     ) -> Result<Self> {
-        let empty = match output {
-            OutputMetadata::Absent => {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep {op}: required output 0 is absent; provide the output metadata"
-                )));
-            }
-            OutputMetadata::Tensor { shape, .. } => shape.contains(&0),
-            OutputMetadata::Unresolved { .. } => false,
-        };
+        let empty = output_is_empty(op, output)?;
         let bytes = if empty {
             0
         } else {
@@ -40,6 +42,25 @@ impl MetadataWorkspace {
                 .ok_or_else(|| EpError::KernelFailed(format!(
                     "cuda_ep {op}: {records} metadata records with {words_per_record} words per record overflow; reduce the tensor shape")))?
         };
+        Self::from_bytes(op, bytes)
+    }
+
+    pub(super) fn for_bytes(
+        op: &'static str,
+        bytes: usize,
+        output: &OutputMetadata<'_>,
+    ) -> Result<Self> {
+        Self::from_bytes(
+            op,
+            if output_is_empty(op, output)? {
+                0
+            } else {
+                bytes
+            },
+        )
+    }
+
+    fn from_bytes(op: &'static str, bytes: usize) -> Result<Self> {
         let region = Layout::from_size_align(bytes, std::mem::align_of::<u64>())
             .map_err(|_| EpError::KernelFailed(format!(
                 "cuda_ep {op}: {bytes} metadata bytes exceed addressable capacity; reduce the tensor rank")))?;
@@ -85,10 +106,10 @@ pub(super) struct BoundMetadataUpload {
 }
 
 impl BoundMetadataUpload {
-    fn validate_payload(&self, words: usize) -> Result<()> {
-        if words.checked_mul(8) != Some(self.region.bytes()) {
+    fn validate_bytes(&self, bytes: usize) -> Result<()> {
+        if bytes != self.region.bytes() {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep {}: payload has {words} metadata words but the prepared layout contains {} bytes; prepare the complete current-layout workspace",
+                "cuda_ep {}: payload has {bytes} metadata bytes but the prepared layout contains {}; prepare the complete current-layout workspace",
                 self.op,
                 self.region.bytes()
             )));
@@ -96,15 +117,21 @@ impl BoundMetadataUpload {
         Ok(())
     }
     pub(super) fn upload(self, runtime: &CudaRuntime, values: &[u64]) -> Result<CUdeviceptr> {
-        self.validate_payload(values.len())?;
-        if values.is_empty() {
+        let bytes = values.len().checked_mul(8).ok_or_else(|| EpError::KernelFailed(format!(
+            "cuda_ep {}: metadata word payload exceeds addressable byte count; reduce the descriptor", self.op)))?;
+        // SAFETY: u64 has no padding and the slice remains live through the
+        // synchronous byte upload. upload_bytes validates the complete span.
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), bytes) };
+        self.upload_bytes(runtime, bytes)
+    }
+    pub(super) fn upload_bytes(self, runtime: &CudaRuntime, bytes: &[u8]) -> Result<CUdeviceptr> {
+        self.validate_bytes(bytes.len())?;
+        if bytes.is_empty() {
             return Ok(0);
         }
-        // SAFETY: u64 has no padding, payload length equals the bound region,
-        // and the host slice stays live until synchronous htod completes.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), self.region.bytes()) };
         let pointer = cuptr(self.region.ptr().0.cast_const());
+        // SAFETY: the proof covers exactly bytes.len(); synchronous htod keeps
+        // the borrowed host payload live through completion.
         unsafe { runtime.htod(bytes, pointer) }?;
         Ok(pointer)
     }
@@ -143,6 +170,41 @@ mod tests {
     use super::*;
     use onnx_runtime_ep_api::DevicePtrMut;
     use onnx_runtime_ir::DataType;
+    #[test]
+    fn mixed_byte_payloads_keep_exact_tail_size_and_empty_output_skips_backing() {
+        for bytes in [1, 65, 96] {
+            let plan = MetadataWorkspace::for_bytes(
+                "Pad",
+                bytes,
+                &OutputMetadata::tensor(DataType::Uint8, &[]),
+            )
+            .unwrap();
+            assert_eq!(plan.requirement().bytes, bytes as u64);
+            let bound = plan
+                .bind(Some(WorkspaceView::new(
+                    DevicePtrMut(0x10000usize as *mut _),
+                    bytes,
+                )))
+                .unwrap();
+            bound.validate_bytes(bytes).unwrap();
+            assert!(
+                bound
+                    .validate_bytes(bytes - 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("payload")
+            );
+        }
+        let empty = MetadataWorkspace::for_bytes(
+            "Resize",
+            usize::MAX,
+            &OutputMetadata::tensor(DataType::Float32, &[0]),
+        )
+        .unwrap();
+        assert_eq!(empty.requirement(), WorkspaceRequirement::NONE);
+        empty.bind(None).unwrap().validate_bytes(0).unwrap();
+    }
+
     #[test]
     fn checked_dense_spans_reject_overflow_and_empty_strides_need_no_address_math() {
         assert_eq!(
@@ -197,7 +259,7 @@ mod tests {
         let scalar = OutputMetadata::tensor(DataType::Float32, &[]);
         let plan = MetadataWorkspace::for_records("Mod", 0, 3, &scalar).unwrap();
         assert_eq!(plan.requirement(), WorkspaceRequirement::NONE);
-        plan.bind(None).unwrap().validate_payload(0).unwrap();
+        plan.bind(None).unwrap().validate_bytes(0).unwrap();
         let empty = MetadataWorkspace::for_records(
             "LpPool",
             usize::MAX,
@@ -244,10 +306,10 @@ mod tests {
         assert!(
             plan.bind(Some(view(0x10000usize, 64)))
                 .unwrap()
-                .validate_payload(5)
+                .validate_bytes(40)
                 .unwrap_err()
                 .to_string()
-                .contains("payload has 5")
+                .contains("payload has 40")
         );
     }
 }
