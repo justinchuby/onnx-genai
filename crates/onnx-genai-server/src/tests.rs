@@ -7880,6 +7880,118 @@ mod llama_router_compat {
     use tokio_stream::StreamExt;
 
     #[tokio::test]
+    async fn props_acknowledgement_matches_upstream_without_loading_or_mutation() {
+        for enabled in [false, true] {
+            let state = lazy_state(ServerConfig {
+                endpoint_props: enabled,
+                tools: crate::ToolsConfig {
+                    enabled: vec![crate::BuiltinTool::GetInfo],
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let router = app(state.clone());
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/props?autoload=false")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let before = json_body(response).await;
+            assert_eq!(before["endpoint_props"], enabled);
+            assert_eq!(before["nxrt_capabilities"]["server_tools"], true);
+            for payload in ["", "not-json", r#"{"temperature":0.9,"n_predict":1}"#] {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/props?model=not-a-model")
+                            .body(Body::from(payload))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let value = json_body(response).await;
+                if enabled {
+                    assert_eq!(status, StatusCode::OK);
+                    assert_eq!(value, json!({"success":true}));
+                } else {
+                    assert_eq!(status, StatusCode::FORBIDDEN);
+                    assert!(
+                        value["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("--props")
+                    );
+                }
+            }
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/props?autoload=false")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(json_body(response).await, before);
+            assert!(state.registry.resolve("model-b").unwrap().is_none());
+        }
+        for enabled in [false, true] {
+            let mut state = tiny_state();
+            state.config.endpoint_props = enabled;
+            let router = app(state);
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/props")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let before = json_body(response).await;
+            assert_eq!(before["endpoint_props"], enabled);
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/props")
+                        .body(Body::from(r#"{"temperature":0.9,"n_predict":1}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if enabled {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            );
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/props")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(json_body(response).await, before);
+        }
+    }
+
+    #[tokio::test]
     async fn router_discovery_lifecycle_and_events_follow_registry_state() {
         let state = lazy_state(ServerConfig {
             enable_admin_endpoints: true,

@@ -1865,3 +1865,12 @@ replacements against the original file. Read-only Git listing disables repositor
 fsmonitor execution. Searches and regex matching have explicit resource bounds.
 See [host tools](SERVER_TOOLS.md). MCP stdio and remote/container tool runtimes
 remain open; this increment does not close the overall compatibility goal.
+
+
+### Upstream properties acknowledgement
+
+`--props` enables `POST /props` without loading a model, with the current
+upstream acknowledgement-only response. Request fields do not mutate settings;
+this matches the pinned server-context.cpp handler, which has no mutation schema.
+Both router and model properties report the configured endpoint flag. Router
+properties also expose the actual host-tool capability independently of loading.

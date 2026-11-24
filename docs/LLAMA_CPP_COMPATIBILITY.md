@@ -425,7 +425,11 @@ parity. These upstream protocols are still unimplemented:
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
 - GGUF/Hugging Face model downloads and deletion.
 
-Model download/delete and mutable `/props` remain disabled.
+Model download/delete remain disabled. `--props` enables `POST /props`, matching
+upstream's current acknowledgement-only contract: it returns `{"success":true}`
+and does not read or change generation settings. `GET /props` advertises the
+configured `endpoint_props` value in router and model modes. This is not an API
+for changing generation defaults.
 `GET/POST /tools` now supports the seven explicitly enabled host built-ins,
 including command SSE, file selection and editing. See [host tools](SERVER_TOOLS.md)
 for limits, trusted-origin policy and remaining MCP/container/SSH integrations. The MCP
