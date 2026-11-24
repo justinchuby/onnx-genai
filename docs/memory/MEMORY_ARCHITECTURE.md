@@ -1651,8 +1651,8 @@ retry that owner or refund retained bytes.
 
 No runtime, new registry, quota authority, pool or per-region lease is stored in
 this core. It introduces no hot execution path. This is the shared retirement
-boundary for the next native allocation-domain extraction; runtime-private raw
-artifacts have not yet migrated.
+boundary used by the native allocation domain; runtime-private raw artifacts
+have not yet migrated.
 
 Host regressions drive this production function with real binding/managed Host
 owners and independently controlled compute/copy fences. They verify pending
@@ -1661,6 +1661,34 @@ refusal with retained charges, typed outstanding-view failure without enqueue,
 and the binding-only branch. Existing workspace-barrier tests now also use this
 core instead of a test-specific settlement observer. GPU fixtures compile
 against both callers; no CUDA execution or performance measurement was available.
+
+### The provider owns one native allocation domain
+
+The private `CudaAllocationDomain` owns the selected allocator, process-manager
+binding, governor, mapped attribution, allocation/free counters, admission-closed
+state and deferred-release queue. These are moved out of the provider into one
+inline value; the provider does not retain a parallel copy. Native admission,
+mapped-growth transactions and release accounting read that same state. The
+runtime is borrowed only to query capture during cold admission; the domain does
+not retain it. No additional Arc, lock, quota ticket or allocation tier is added.
+
+Provider configuration still builds a replacement binding before retiring the
+old mechanism and replacing its allocator. Governor adoption still checks the
+same authority and physical pool. The construction queue guard remains armed
+through fallible residency installation. Field teardown releases mapped reclaim
+registration before the domain, then the selected allocator before its binding,
+with the domain queue last. No second cleanup owner or Domain Drop is introduced.
+
+The EP continues to coordinate workspace release barriers, executor/graph state,
+shutdown and the terminal runtime keepalive. Existing provider trait methods
+forward allocation work to the domain; retained warm workspace paths do not gain
+quota calls. This extraction does not install the domain into the runtime or
+migrate runtime-private raw artifacts. Those callers still require an explicit
+ownership migration with capture and retirement guarantees.
+
+Host allocator/retirement regressions pass; GPU admission and deferred-release
+fixtures compile and are listed, and default/GPU-feature all-target Clippy covers
+the EP, plugin and session callers. No CUDA execution or performance was measured.
 
 ### Sealed weights and workspace share cold native admission
 
