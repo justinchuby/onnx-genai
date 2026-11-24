@@ -18,6 +18,7 @@ dispatch_probe = []
 testutil = []
 
 [dependencies]
+smallvec = { workspace = true }
 onnx-runtime-memory-api = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }

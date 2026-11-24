@@ -191,7 +191,7 @@ impl Kernel for PackedGatherKernel {
         let packed = cuptr(packed.data_ptr::<u8>().cast::<c_void>());
         let indices = cuptr(indices.data_ptr::<u8>().cast::<c_void>());
         let output = cuptr(output.data_ptr_mut::<u8>().cast::<c_void>());
-        let grid = lanes.div_ceil(u64::from(THREADS)).min(65_535).max(1) as u32;
+        let grid = lanes.div_ceil(u64::from(THREADS)).clamp(1, 65_535) as u32;
         let stream = self.runtime.stream();
         let mut args = stream.launch_builder(&function);
         args.arg(&packed)

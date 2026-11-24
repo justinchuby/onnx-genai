@@ -49,15 +49,15 @@
     clippy::manual_is_multiple_of
 )]
 
+mod common;
+
 use std::ffi::c_void;
 
 use half::f16;
 use onnx_runtime_cuda_memory::vmm_allocator::{
     CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV, CudaVmmAllocator,
 };
-use onnx_runtime_ep_api::{
-    DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, TensorMut, TensorView,
-};
+use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
 use onnx_runtime_ep_cuda::{CudaExecutionProvider, GroupQueryAttentionKernel};
 use onnx_runtime_ir::{DataType, compute_contiguous_strides};
 use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, MemoryRole, SharedDevicePrefix, Tier};
@@ -411,7 +411,19 @@ fn run_decode(
             device,
         ),
     ];
-    kernel.execute(&inputs_arr, &mut outputs_arr).unwrap();
+    let mut workspace = None;
+    let execution =
+        common::execute_kernel(ep, &kernel, &inputs_arr, &mut outputs_arr, &mut workspace);
+    let retirement = workspace.map_or(Ok(()), |owner| ep.deallocate_workspace(owner));
+    match (execution, retirement) {
+        (Err(error), Err(retirement)) => panic!(
+            "GQA shared-prefix dispatch failed: {error}; workspace retirement also failed: {retirement}"
+        ),
+        (Err(error), _) | (_, Err(error)) => {
+            panic!("GQA shared-prefix workspace dispatch/retirement failed: {error}")
+        }
+        (Ok(()), Ok(())) => {}
+    }
 
     let out = read_from(
         ep,

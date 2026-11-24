@@ -55,9 +55,9 @@ use onnx_runtime_ep_api::{
     ExecutorArtifactReadinessEpoch, ExecutorArtifactState, ExecutorInstanceId,
     ExecutorRouteResidencyConfig, ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight,
     Kernel, KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
-    expert_weight_groups, lazy_weight_candidates,
+    OutputMetadata, ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata,
+    TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
+    WorkspaceRequirement, WorkspaceView, expert_weight_groups, lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 
@@ -773,8 +773,9 @@ pub(crate) struct NodePlan {
     /// Positional input value ids in ONNX signature order. An omitted optional
     /// input (ONNX empty-string input name → `None` slot) is preserved as
     /// `None` so a later present input is never misread as the omitted one
-    /// (e.g. `Slice(data, starts, ends, "", steps)`). Trailing `None`s are
-    /// trimmed — a truly absent trailing optional simply lowers the arity.
+    /// (e.g. `Slice(data, starts, ends, "", steps)`). Trailing `None`s also
+    /// remain: the source node, claim metadata and execution share one arity.
+    /// Whole-graph kernels append lexical captures after this source prefix.
     pub inputs: Vec<Option<ValueId>>,
     /// Output value ids, in positional order.
     pub outputs: Vec<ValueId>,

@@ -1979,22 +1979,15 @@ impl Executor {
                 }
                 continue;
             }
-            // Preserve positional input arity: keep interior `None` (omitted
-            // optional) slots so a later present input is not misread as the
-            // omitted one, but trim trailing `None`s (a trailing omitted
-            // optional just lowers the arity, matching ONNX semantics).
-            let mut slots: Vec<Option<ValueId>> = node.inputs.clone();
+            // Claim, compilation and execution must describe the same source
+            // positions, including omitted trailing optional inputs. Only graph
+            // kernels append captures to that unchanged positional prefix.
             let graph_kernel = graph_claims.contains(nid);
-            if graph_kernel {
-                slots = node.inputs_with_captures(
-                    captures_by_node.get(&nid).into_iter().flatten().copied(),
-                );
+            let inputs = if graph_kernel {
+                node.inputs_with_captures(captures_by_node.get(&nid).into_iter().flatten().copied())
             } else {
-                while matches!(slots.last(), Some(None)) {
-                    slots.pop();
-                }
-            }
-            let inputs = slots;
+                node.inputs.clone()
+            };
             let outputs: Vec<ValueId> = node.output_values().collect();
             let dtype = |vid: ValueId| -> Result<DataType> {
                 let dtype = value_dtypes.get(&vid).copied().ok_or_else(|| SessionError::Ep(EpError::KernelFailed(format!("graph node #{} ('{}') references value #{} without dtype metadata; declare its tensor type before claiming the graph", nid.0, node.op_type, vid.0))))?;

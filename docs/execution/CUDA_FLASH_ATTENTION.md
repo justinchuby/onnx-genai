@@ -165,10 +165,53 @@ scratch. Phase-2a rejects a missing workspace rather than allocating outside
 preparation. Eager registration currently exposes only CPU execution; future
 asynchronous registration needs an explicit completion/retirement contract.
 
-The shared Phase-2a engine still retains temporary scratch ownership for its
-MHA/GQA callers pending migration of their complete composite layouts. The
-remaining MHA/GQA resource migration is not complete.
+GroupQueryAttention's general half/bf16 fallback also borrows the complete
+Phase-2a score/32 MiB BLAS region from its existing composite workspace. One
+route classifier drives KV-read support, execution and scratch planning. The
+input-derived `past_capacity + current_key_length` bound covers every legal
+valid length without inspecting device length values during preparation. Auto
+planning can reserve fallback scratch even when a shorter individual invocation
+selects fused; guaranteed-fused and dedicated decode shapes reserve neither
+matrix nor BLAS scratch. Missing or invalid fallback backing is an error.
 
-The fallback still synchronizes its CUDA stream and remains unavailable during
-capture. The parity tests use the public provider workspace preparation path,
-and the benchmark reuses its admitted backing across warm iterations.
+GQA now requires its composite for all large temporary buffers: packed staging,
+Q/output transposes, scores/BLAS, and hidden KV outputs. There is no private
+allocation fallback for these regions. A single visible K or V output fixes the
+physical capacity of its hidden sibling; when both are omitted, both temporary
+caches use the input-derived logical bound. Planning receives actual output facts
+and rejects unresolved visible cache geometry when a hidden sibling needs that
+capacity before admission. Complete backing is checked before metadata
+preparation or attention launches.
+
+The three sequence metadata arrays are now a checked final region of that same
+composite. GQA preparation owns no allocation or pool and returns no private
+graph resource.
+During capture, the complete used view must be covered by one registered, real
+workspace pin. Unregistered capture, arbitrary tokens, and insufficient spans
+are refused before metadata preparation. Manual callers pass the workspace
+resource to capture and retire the graph before returning its backing.
+
+Capacity remains SessionPersistent: a deferred device-binding decode can return
+before completion, so step retirement could reintroduce admission on every token.
+Metadata contents remain temporary. This retention policy adds no per-token sync
+or issuer operation. Even an empty metadata group funds one backing byte for its
+legal empty windows rather than relying on every downstream launch being skipped.
+Dedicated f32/f16/bf16 split-K decode now borrows partial states from the same
+composite. Its checked bound is `min(rows, row_cap) * max_splits * (head_dim + 2)`
+f32s. Only rows after the cap execute direct; earlier rows still use partials.
+All split columns remain funded even for a short/direct invocation, so changing
+the direct-output test/configuration or a device-resident valid length cannot
+invalidate preparation. Host and NVRTC row/split limits come from one definition.
+The three fixed module-global arrays are removed. Partial and merge launchers
+receive the same borrowed pointer; their reduction order and launch geometry are
+unchanged. Actual CUDA parity, NVRTC compilation and throughput require a device
+runner and are not established by Rust compilation.
+
+The separate MHA prepared-composite migration is tracked in
+[PR #2481](https://github.com/justinchuby/onnx-genai/pull/2481).
+
+The fallback retains the existing runtime synchronization policy and capture
+exclusion. The parity tests use the public provider workspace preparation path.
+The benchmark prepares and reuses its admitted backing outside timing, then
+explicitly waits for device completion before recording each wall-clock sample;
+its samples include dispatch through completion, rather than enqueue latency.

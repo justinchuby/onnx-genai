@@ -15,6 +15,7 @@ onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-shape-inference = { workspace = true }
 thiserror = { workspace = true }
+smallvec = { workspace = true }
 
 [lints]
 workspace = true

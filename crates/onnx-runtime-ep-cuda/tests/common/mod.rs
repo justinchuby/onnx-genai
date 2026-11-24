@@ -42,12 +42,13 @@ use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, MemoryError, Tier};
 pub fn runtime_workspace_requirement(
     kernel: &dyn Kernel,
     inputs: &[TensorView],
+    outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
 ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
     let metadata = inputs
         .iter()
         .map(|input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()))
         .collect::<Vec<_>>();
-    kernel.workspace_requirement_for_execution(inputs, &metadata)
+    kernel.workspace_requirement_for_execution(inputs, &metadata, outputs)
 }
 
 /// Ensure `workspace` satisfies `requirement`, reusing or replacing it through
@@ -92,7 +93,11 @@ pub fn execute_kernel(
     outputs: &mut [TensorMut],
     workspace: &mut Option<WorkspaceAllocation>,
 ) -> onnx_runtime_ep_api::Result<()> {
-    let requirement = runtime_workspace_requirement(kernel, inputs)?;
+    let output_metadata = outputs
+        .iter()
+        .map(onnx_runtime_ep_api::OutputMetadata::from_view)
+        .collect::<Vec<_>>();
+    let requirement = runtime_workspace_requirement(kernel, inputs, &output_metadata)?;
     let workspace_view = prepare_workspace(ep, requirement, workspace)?;
     kernel.execute_with_workspace(inputs, outputs, workspace_view)
 }
@@ -448,7 +453,11 @@ pub fn execute_cpu_kernel(
     inputs: &[TensorView],
     outputs: &mut [TensorMut],
 ) -> onnx_runtime_ep_api::Result<()> {
-    let requirement = runtime_workspace_requirement(kernel, inputs)?;
+    let output_metadata = outputs
+        .iter()
+        .map(onnx_runtime_ep_api::OutputMetadata::from_view)
+        .collect::<Vec<_>>();
+    let requirement = runtime_workspace_requirement(kernel, inputs, &output_metadata)?;
     let mut owner = if requirement.bytes == 0 {
         None
     } else {

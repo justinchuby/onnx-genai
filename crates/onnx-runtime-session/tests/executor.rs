@@ -310,8 +310,9 @@ impl Kernel for FinalizationCheckingKernel {
     fn workspace_requirement(
         &self,
         inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> EpResult<WorkspaceRequirement> {
-        self.inner.workspace_requirement(inputs)
+        self.inner.workspace_requirement(inputs, &[])
     }
 
     fn supports_strided_input(&self, input_idx: usize) -> bool {
