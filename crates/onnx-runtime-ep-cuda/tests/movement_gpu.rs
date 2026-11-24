@@ -517,6 +517,36 @@ fn constant_gpu_fp32_and_i64_tensor_exact() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn constant_gpu_fp8_tensor_exact() {
+    let ep = require_cuda();
+    let payload = [0x01, 0x7f, 0xff];
+    for (opset, dtype) in [
+        (19, DataType::Float8E4M3FN),
+        (19, DataType::Float8E4M3FNUZ),
+        (19, DataType::Float8E5M2),
+        (19, DataType::Float8E5M2FNUZ),
+        (24, DataType::Float8E8M0),
+    ] {
+        let shape = vec![payload.len()];
+        let value = Attribute::Tensor(TensorData::from_raw(dtype, shape.clone(), payload.to_vec()));
+        let got = common::run_cuda(
+            &ep,
+            "Constant",
+            "",
+            opset,
+            &[],
+            &[(dtype, shape)],
+            &[("value", value)],
+        );
+        assert_eq!(got, vec![payload.to_vec()], "{dtype:?}");
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn constant_gpu_packed_tensor_exact() {
     let ep = require_cuda();
     for (opset, dtype, count, payload) in [

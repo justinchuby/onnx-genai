@@ -60,6 +60,61 @@ fn f32_initializer(name: &str) -> onnx::TensorProto {
 }
 
 #[test]
+fn constant_fp8_tensor_requires_its_schema_opset() {
+    use onnx_runtime_ir::DataType;
+    use onnx_runtime_loader::load_model_bytes;
+
+    for (dtype, minimum) in [
+        (DataType::Float8E4M3FN, 19),
+        (DataType::Float8E4M3FNUZ, 19),
+        (DataType::Float8E5M2, 19),
+        (DataType::Float8E5M2FNUZ, 19),
+        (DataType::Float8E8M0, 24),
+    ] {
+        let payload = vec![0x01, 0x7f, 0xff];
+        let mut constant = node("Constant", &[], &["Y"]);
+        constant.name = "fp8_value".into();
+        constant.attribute = vec![onnx::AttributeProto {
+            name: "value".into(),
+            r#type: onnx::attribute_proto::AttributeType::Tensor as i32,
+            t: Some(onnx::TensorProto {
+                data_type: dtype.to_onnx(),
+                dims: vec![3],
+                raw_data: payload.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let mut model = model(onnx::GraphProto {
+            output: vec![value_info("Y")],
+            node: vec![constant],
+            ..Default::default()
+        });
+        model.ir_version = 12;
+        model.opset_import[0].version = minimum - 1;
+        let err = load_model_bytes(&model.encode_to_vec()).unwrap_err();
+        assert!(
+            matches!(&err, LoaderError::ConstantValueOpset {
+                node, dtype: rejected, opset, minimum: required
+            } if node.contains("fp8_value")
+                && *rejected == dtype
+                && *opset == (minimum - 1) as u64
+                && *required == minimum as u64),
+            "{dtype:?}: {err}"
+        );
+
+        model.opset_import[0].version = minimum;
+        let graph = load_model_bytes(&model.encode_to_vec()).unwrap();
+        let (_, node) = graph.nodes.iter().next().unwrap();
+        let Some(onnx_runtime_ir::Attribute::Tensor(value)) = node.attr("value") else {
+            panic!("loader must preserve the Constant node's tensor-valued attribute");
+        };
+        assert_eq!(value.dtype, dtype);
+        assert_eq!(value.data, payload);
+    }
+}
+
+#[test]
 fn duplicate_value_producer_is_rejected_and_unique_values_load() {
     let duplicate = onnx::GraphProto {
         input: vec![value_info("X")],

@@ -609,7 +609,8 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 /// [`validate_model_proto`], before graph construction coalesces names or drops
 /// protobuf-only fields. This IR-level phase then runs:
 ///
-/// 1. [`validate_opset_imports`] — every node's domain must declare an opset.
+/// 1. [`validate_opset_imports`] — every node's domain must declare an opset;
+///    FP8 tensor-valued `Constant` attributes must meet their schema version.
 /// 2. [`validate_einsum_nodes`] — resolve `Einsum-12`/`Einsum-28` from the
 ///    imported opset and validate every statically known equation/type/shape.
 /// 3. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
@@ -1083,19 +1084,15 @@ pub fn validate_no_initializer_producer(graph: &Graph) -> Result<(), LoaderError
 /// ONNX treats `""` and `"ai.onnx"` as equivalent spellings of the default
 /// domain. Model-level imports also govern nodes nested in subgraphs.
 pub fn validate_opset_imports(graph: &Graph) -> Result<(), LoaderError> {
-    // Loaded IR is canonical: the default domain is `""` for both node domains
-    // and opset-import keys, so a direct lookup suffices (no dual-spelling
-    // fallback needed — see `onnx_runtime_ir::normalize_domain`).
-    fn has_import(imports: &std::collections::HashMap<String, u64>, domain: &str) -> bool {
-        imports.contains_key(domain)
-    }
+    use onnx_runtime_ir::{Attribute, DataType};
 
     fn validate_graph(
         graph: &Graph,
         imports: &std::collections::HashMap<String, u64>,
     ) -> Result<(), LoaderError> {
         for (_, node) in graph.nodes.iter() {
-            if !has_import(imports, &node.domain) {
+            // Loaded IR uses canonical domains for both nodes and imports.
+            let Some(&imported_opset) = imports.get(&node.domain) else {
                 let domain = if node.domain.is_empty() {
                     "ai.onnx".to_string()
                 } else {
@@ -1111,6 +1108,29 @@ pub fn validate_opset_imports(graph: &Graph) -> Result<(), LoaderError> {
                     node: node_name,
                     domain,
                 });
+            };
+            if node.is_default_domain()
+                && node.op_type == "Constant"
+                && let Some(Attribute::Tensor(value)) = node.attr("value")
+            {
+                // Pinned ONNX Constant-19 uses IR9 types; Constant-24 uses IR12.
+                let minimum = match value.dtype {
+                    DataType::Float8E4M3FN
+                    | DataType::Float8E4M3FNUZ
+                    | DataType::Float8E5M2
+                    | DataType::Float8E5M2FNUZ => 19,
+                    DataType::Float8E8M0 => 24,
+                    _ => continue,
+                };
+                let opset = node.local_opset().unwrap_or(imported_opset);
+                if opset < minimum {
+                    return Err(LoaderError::ConstantValueOpset {
+                        node: node_label(node),
+                        dtype: value.dtype,
+                        opset,
+                        minimum,
+                    });
+                }
             }
         }
         for subgraph in graph.subgraphs.values() {

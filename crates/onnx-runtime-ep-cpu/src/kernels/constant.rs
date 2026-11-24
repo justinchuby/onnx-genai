@@ -199,6 +199,35 @@ mod tests {
     }
 
     #[test]
+    fn constant_fp8_tensor_opsets_preserve_exact_storage() {
+        let ep = CpuExecutionProvider::new();
+        let payload = [0x01, 0x7f, 0xff];
+        for (opset, dtype) in [
+            (19, DataType::Float8E4M3FN),
+            (19, DataType::Float8E4M3FNUZ),
+            (19, DataType::Float8E5M2),
+            (19, DataType::Float8E5M2FNUZ),
+            (24, DataType::Float8E8M0),
+        ] {
+            let shape = [payload.len()];
+            let node = node_with(
+                "value",
+                Attribute::Tensor(TensorData::from_raw(
+                    dtype,
+                    shape.to_vec(),
+                    payload.to_vec(),
+                )),
+            );
+            let claim = ep.supports_op(&node, opset, &[], &[], &[]);
+            assert!(claim.is_supported(), "{dtype:?}: {:?}", claim.reason());
+            let kernel = ep.get_kernel(&node, &[], opset).unwrap();
+            let mut out = Owned::zeros(dtype, &shape);
+            kernel.execute(&[], &mut [out.view_mut()]).unwrap();
+            assert_eq!(out.bytes, payload, "{dtype:?}");
+        }
+    }
+
+    #[test]
     fn constant_packed_tensor_opsets_preserve_exact_storage() {
         let ep = CpuExecutionProvider::new();
         // First Constant schema admitting each dtype at the pinned ONNX commit.
