@@ -33,13 +33,23 @@ pub(crate) async fn models(
             }
             serde_json::json!({"input_modalities": inputs})
         });
+        let owned = status.cached || status.transfer.is_some();
+        let model_status = if let Some(transfer) = &status.transfer {
+            serde_json::json!({"value":if transfer.running {"downloading"} else {"incomplete"},"error":transfer.error})
+        } else {
+            serde_json::json!({"value":if handle.is_some() {"loaded"} else {"unloaded"}})
+        };
         data.push(ModelObject {
             id: status.id,
-            object: "model", created: now_unix(), owned_by: "onnx-genai",
-            status: serde_json::json!({"value": if handle.is_some() { "loaded" } else { "unloaded" }}),
+            object: "model",
+            created: now_unix(),
+            owned_by: "onnx-genai",
+            status: model_status,
             architecture,
             context_length: handle.as_ref().and_then(|h| h.model_max_context),
-            in_cache: false, can_remove: false,
+            in_cache: status.cached,
+            can_remove: owned,
+            source: if owned { "cache" } else { "models_dir" },
         });
     }
     Ok(Json(ModelsResponse {
@@ -418,7 +428,7 @@ pub(crate) async fn admin_load_model(
         .registry
         .load(&id)
         .await
-        .map_err(|err| ApiError::internal(format!("failed to load model '{id}': {err}")))?;
+        .map_err(|error| map_model_load_error(&id, error))?;
     Ok(Json(AdminLoadResponse { id, loaded: true }))
 }
 

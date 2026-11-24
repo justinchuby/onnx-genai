@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "base": "22cfd90ee5f7fcf668bc41edb64ee98bf27ddc03",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "e84667fe70ffb3d86d2989bd10da8647b0e66b886bb488c44cb50ef84fac63a7",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "52403951fcba5f33e37932a01e863d797cd33f317ad2bd8730a78536e68ab204"
+  },
+  "probe_sha256": "43f29035f48374b3fa0a20ee1636089b7a25da668f7b352b80c963f679bff707",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "hardware": {
+    "machdep.cpu.brand_string": "Apple M1 Max",
+    "hw.memsize": "34359738368",
+    "hw.logicalcpu": "10",
+    "hardware_read_command": "/usr/sbin/sysctl -n machdep.cpu.brand_string hw.memsize hw.logicalcpu",
+    "hardware_read_exit": 0,
+    "hardware_read_authority": "separate escalated read-only command; sandbox sysctl was denied before any build or timing",
+    "hardware_read_time_utc": "2026-11-24T19:43:28.315736+00:00"
+  },
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "lock_inode": 339651569,
+  "lock_busy_control": true,
+  "parent_pid": 76261,
+  "binaries": {
+    "baseline": {
+      "sha256": "6ce2bccb5a6d014d0640ac984cb480ee2168f0fec2095d41cf277dd7524ab5ea",
+      "native": true,
+      "symbol_count": 28413
+    },
+    "candidate": {
+      "sha256": "8c15c38a6ccf6589e76a9ff03a804262cdabf7e510047eaf01bf1b44961ec865",
+      "native": true,
+      "symbol_count": 28242
+    }
+  },
+  "foreign_core_monitor": "Unavailable on Darwin; no claim of an idle host",
+  "metric": "terminal child user+system CPU seconds, includes setup/work/validation/output IO/retirement; not pure inference latency",
+  "baseline_inherited_from": {
+    "metadata": "/tmp/nxrt-block-banks-study/metadata.json",
+    "metadata_sha256": "7e14939cb7fe23259352845fffff39a410311aba4a013d8d293b38e852c7ab19"
+  },
+  "receipts_sha256": "1e6ffd8ac3fe18b3567278fdf73f005bbd195263f791e623ca75a6ee1e0c4278",
+  "runner_sha256": "ecba03668ba8a36d734374db25b61519161da88ae8e8ff5d5702c500b21ba0bd",
+  "processes": 144
+}

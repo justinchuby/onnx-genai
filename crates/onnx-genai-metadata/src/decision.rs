@@ -13,6 +13,7 @@ pub enum DecisionFeature {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecisionContract {
     profile: String,
+    input_policy: std::sync::Arc<crate::DecisionInputPolicy>,
     output: String,
     spec: DecisionSpec,
     bindings: Vec<(String, DecisionFeature)>,
@@ -20,6 +21,9 @@ pub struct DecisionContract {
     option_count: Option<usize>,
 }
 impl DecisionContract {
+    pub fn input_policy(&self) -> &std::sync::Arc<crate::DecisionInputPolicy> {
+        &self.input_policy
+    }
     pub fn profile(&self) -> &str {
         &self.profile
     }
@@ -60,6 +64,16 @@ pub fn decision_contract(
                 &format!("profiles.{name}.decision"),
             )
             .map_err(invalid)?;
+            crate::version::gate_feature_field(
+                version,
+                crate::version::SchemaFeature::DecisionInputPolicies,
+                &format!("profiles.{name}.decision.input_policy"),
+                profile
+                    .decision
+                    .as_ref()
+                    .is_some_and(|spec| spec.input_policy.is_some()),
+            )
+            .map_err(invalid)?;
         }
         if crate::task_profiles::skip_unsupported_version(profile) {
             continue;
@@ -84,6 +98,16 @@ pub fn decision_contract(
             ));
         }
         let spec=profile.decision.as_ref().ok_or_else(||invalid(format!("profiles.{name}.decision must declare prompt_template, max_options, variants, confidence and score policies")))?;
+        if let Some(policy) = &spec.input_policy {
+            policy
+                .validate_definition(spec.max_options.get())
+                .map_err(|e| invalid(format!("profiles.{name}.decision.{e}")))?;
+        }
+        let input_policy = std::sync::Arc::new(
+            spec.input_policy
+                .clone()
+                .unwrap_or_else(crate::DecisionInputPolicy::schema_v1_10),
+        );
         if spec.prompt_template.trim().is_empty()
             || profile.pooling.is_some()
             || profile.decoding.is_some()
@@ -206,6 +230,7 @@ pub fn decision_contract(
         }
         result = Some(DecisionContract {
             profile: name.clone(),
+            input_policy,
             output: output.clone(),
             spec: spec.clone(),
             bindings,

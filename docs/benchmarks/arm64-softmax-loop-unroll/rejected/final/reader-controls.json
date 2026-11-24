@@ -1,0 +1,40 @@
+{
+  "scope": "synthetic parser controls, not measurements",
+  "accepted_complete_fixture": true,
+  "complete_samples": 10800,
+  "controls": [
+    {
+      "name": "vacuity_no_timed_work",
+      "rejected": true
+    },
+    {
+      "name": "missing_one_sample",
+      "rejected": true
+    },
+    {
+      "name": "duplicate_sample_identity",
+      "rejected": true
+    },
+    {
+      "name": "zero_process_cpu",
+      "rejected": true
+    },
+    {
+      "name": "unstable_full_call_token",
+      "rejected": true
+    },
+    {
+      "name": "missing_validation",
+      "rejected": true
+    },
+    {
+      "name": "unexpected_worker_participation",
+      "rejected": true
+    },
+    {
+      "name": "arm_label_drift",
+      "rejected": true
+    }
+  ],
+  "analyzer_sha256": "311ff965ae4e0f43c1aa9b56e8165375601a95e788f033250cc0c39e3143e515"
+}

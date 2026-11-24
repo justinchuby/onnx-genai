@@ -1,0 +1,13 @@
+{
+  "scope": "Codegen observation, not proof of CPU causality. Inline build still has an out-of-line helper copy.",
+  "full_symbol_file_sha256": {
+    "baseline-symbols.txt": "afbe329f60833fcafc2bdf157ef73ac78c94b95c6d81ad8af893d94a47763496",
+    "candidate-symbols.txt": "ebc5769d465253e62d498ac4ca65c21dd2a2cae25f13c68fce725b0bbeb58bdd"
+  },
+  "selected": [
+    {
+      "source": "candidate-symbols.txt",
+      "line": "0000000100218a18 0000000000000000 t onnx_runtime_ep_cpu::kernels::moe::gated_activation_row::<onnx_runtime_ep_cpu::kernels::moe::AppliedActivationBias>"
+    }
+  ]
+}

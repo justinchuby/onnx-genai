@@ -21,8 +21,13 @@ use crate::{
 #[derive(Debug, Args)]
 #[command(group(
     ArgGroup::new("model_source")
-        .required(true)
         .args(["model", "models_dir", "models_config"])
+))]
+#[command(group(
+    ArgGroup::new("startup_source")
+        .required(true)
+        .multiple(true)
+        .args(["model", "models_dir", "models_config", "model_cache_dir"])
 ))]
 pub struct ServeArgs {
     /// Single-model mode: path to a model directory containing the ONNX model
@@ -50,6 +55,23 @@ pub struct ServeArgs {
     /// Falls back to ONNX_GENAI_MODELS_CONFIG.
     #[arg(long, env = "ONNX_GENAI_MODELS_CONFIG", group = "model_source")]
     pub models_config: Option<PathBuf>,
+
+    /// Operator-owned directory enabling background Hub package downloads and deletion.
+    /// May be used alone to start an empty model catalog, or alongside configured models.
+    #[arg(long, env = "NXRT_MODEL_CACHE_DIR")]
+    pub model_cache_dir: Option<PathBuf>,
+    /// Total managed-cache byte bound, including incomplete downloads and manifests.
+    #[arg(long, default_value = "68719476736")]
+    pub model_cache_max_bytes: std::num::NonZeroU64,
+    /// Total managed-cache regular file bound, including manifests.
+    #[arg(long, default_value = "4096")]
+    pub model_cache_max_files: std::num::NonZeroUsize,
+    /// Maximum published and incomplete models in the managed cache.
+    #[arg(long, default_value = "128")]
+    pub model_cache_max_models: std::num::NonZeroUsize,
+    /// Maximum concurrent model metadata resolutions and file downloads.
+    #[arg(long, default_value = "2")]
+    pub model_downloads: std::num::NonZeroUsize,
 
     /// Node-level identifier reported by GET /v1/status for the cluster router (§34.8).
     /// Model-agnostic: it names this server process, not any model.
@@ -212,6 +234,11 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
         endpoint_props: args.props,
+        model_cache_dir: args.model_cache_dir.clone(),
+        model_cache_max_bytes: args.model_cache_max_bytes,
+        model_cache_max_files: args.model_cache_max_files,
+        model_cache_max_models: args.model_cache_max_models,
+        model_downloads: args.model_downloads,
         max_completion_prompts: args.max_completion_prompts,
         max_rerank_input_tokens: args.max_rerank_input_tokens,
         max_rerank_documents: args.max_rerank_documents,
@@ -276,7 +303,7 @@ pub async fn run_serve(mut args: ServeArgs) -> anyhow::Result<()> {
         } else if let Some(config_path) = args.models_config {
             ModelsConfig::from_file(&config_path)?.models
         } else {
-            unreachable!("ArgGroup enforces that exactly one model_source arg is provided")
+            Vec::new() // Explicit cache-only startup; the required startup_source group admits it.
         }
     };
 
@@ -295,6 +322,62 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn managed_cache_startup_combines_with_one_source_and_keeps_positive_bounds() {
+        let args = TestCli::try_parse_from([
+            "test",
+            "--model-cache-dir",
+            "cache",
+            "--model-cache-max-bytes",
+            "8192",
+            "--model-cache-max-files",
+            "16",
+            "--model-cache-max-models",
+            "3",
+            "--model-downloads",
+            "2",
+        ])
+        .unwrap();
+        let config = server_config_from_args(&args.serve);
+        assert_eq!(
+            config.model_cache_dir.as_deref(),
+            Some(std::path::Path::new("cache"))
+        );
+        assert_eq!(
+            (
+                config.model_cache_max_bytes.get(),
+                config.model_cache_max_files.get(),
+                config.model_cache_max_models.get(),
+                config.model_downloads.get()
+            ),
+            (8192, 16, 3, 2)
+        );
+        assert!(TestCli::try_parse_from(["test", "model", "--model-cache-dir", "cache"]).is_ok());
+        assert!(TestCli::try_parse_from(["test"]).is_err());
+        assert!(
+            TestCli::try_parse_from([
+                "test",
+                "model",
+                "--models-dir",
+                "models",
+                "--model-cache-dir",
+                "cache"
+            ])
+            .is_err()
+        );
+        for flag in [
+            "--model-cache-max-bytes",
+            "--model-cache-max-files",
+            "--model-cache-max-models",
+            "--model-downloads",
+        ] {
+            assert!(
+                TestCli::try_parse_from(["test", "--model-cache-dir", "cache", flag, "0"]).is_err(),
+                "{flag}"
+            );
+        }
     }
 
     #[test]

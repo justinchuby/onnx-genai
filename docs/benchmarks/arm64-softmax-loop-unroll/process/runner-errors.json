@@ -1,0 +1,4 @@
+{
+  "excluded_stage": "before any benchmark child",
+  "reason": "whole-process parent omitted itertools import; both builds and named correctness/selector checks passed before the parent exited; no timing matrix existed"
+}

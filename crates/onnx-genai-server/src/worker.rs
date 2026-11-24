@@ -187,6 +187,8 @@ struct WorkerLifecycle {
     live_sessions: usize,
     pending_sessions: usize,
     active_turns: usize,
+    /// Held by the actual owner thread, including when its handle is detached.
+    package: Option<Arc<crate::model_cache::PublishedPackage>>,
 }
 
 impl WorkerState {
@@ -197,6 +199,7 @@ impl WorkerState {
                 live_sessions: 0,
                 pending_sessions: 0,
                 active_turns: 0,
+                package: None,
             }),
         }
     }
@@ -217,6 +220,7 @@ impl WorkerState {
         lifecycle.live_sessions = 0;
         lifecycle.pending_sessions = 0;
         lifecycle.active_turns = 0;
+        lifecycle.package = None;
     }
 
     fn mark_failed(&self) {
@@ -224,6 +228,7 @@ impl WorkerState {
         lifecycle.health = WorkerHealth::Failed;
         lifecycle.live_sessions = 0;
         lifecycle.active_turns = 0;
+        lifecycle.package = None;
     }
 
     fn placement_load(&self) -> Option<usize> {
@@ -548,6 +553,7 @@ impl WorkerHandle {
                     live_sessions: 0,
                     pending_sessions: 0,
                     active_turns: 0,
+                    package: None,
                 }),
             }),
         })
@@ -677,6 +683,35 @@ pub(crate) struct WorkerPool {
 }
 
 impl WorkerPool {
+    pub(crate) fn bind_cached_package(
+        &self,
+        package: &Arc<crate::model_cache::PublishedPackage>,
+    ) -> anyhow::Result<()> {
+        let mut failure = None;
+        // Bind every unbound owner before returning an error. Dropping a
+        // partially initialized pool detaches its threads; they still need
+        // their file capability until engine destruction finishes.
+        for worker in self.workers.iter() {
+            let mut state = lock(&worker.state.lifecycle);
+            let health = state.health;
+            if state.package.is_some() {
+                failure.get_or_insert((worker.id, health));
+                continue;
+            }
+            state.package = Some(Arc::clone(package));
+            if health != WorkerHealth::Healthy {
+                failure.get_or_insert((worker.id, health));
+            }
+        }
+        if let Some((worker, health)) = failure {
+            anyhow::bail!(
+                "cannot bind cached model '{}' to worker {worker} in state {health:?}; reload the model with healthy unbound workers",
+                package.id()
+            );
+        }
+        Ok(())
+    }
+
     /// A pool of exactly one worker, which owns the whole engine.
     #[cfg(test)]
     pub(crate) fn single(worker: Arc<WorkerHandle>) -> Self {

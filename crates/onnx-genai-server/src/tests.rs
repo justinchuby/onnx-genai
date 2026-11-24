@@ -8076,7 +8076,7 @@ mod llama_router_compat {
         assert!(
             std::str::from_utf8(&first)
                 .unwrap()
-                .contains("status_update")
+                .contains("model_status")
         );
         drop(stream);
         for (path, loaded) in [("/models/load", true), ("/models/unload", false)] {
@@ -10898,6 +10898,78 @@ mod systemone_decisions {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/decision");
         AppState::load(&root, Some("decision-fixture".into())).unwrap()
+    }
+    fn policy_fixture() -> (tempfile::TempDir, AppState) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/decision");
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["tokenizer.json", "model.onnx.textproto"] {
+            std::fs::copy(root.join(file), dir.path().join(file)).unwrap();
+        }
+        let mut metadata: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("inference_metadata.yaml")).unwrap(),
+        )
+        .unwrap();
+        metadata["schema_version"] = serde_yaml::Value::String("v1.11".into());
+        metadata["profiles"]["decision_head"]["decision"]["input_policy"] = serde_yaml::to_value(json!({
+            "state":"payload",
+            "instructions":{"kind":"optional","default":"the","payload":"text"},
+            "default_type":"choice", "max_questions":1,
+            "choice":{"kind":"dynamic","minimum":2,"order":"request","descriptions":"payload","nonempty_keys":true},
+            "score":{"minimum":2,"maximum":2,"descriptions":"payload","legend":"canonical_json_text"},
+            "noul":{"order":"true_first","criteria":{"kind":"permissive","no_yes_aliases":true}}
+        })).unwrap();
+        std::fs::write(
+            dir.path().join("inference_metadata.yaml"),
+            serde_yaml::to_string(&metadata).unwrap(),
+        )
+        .unwrap();
+        let state = AppState::load(dir.path(), Some("policy-fixture".into())).unwrap();
+        (dir, state)
+    }
+    #[tokio::test]
+    async fn systemone_authored_policy_controls_defaults_order_and_boolean_mapping() {
+        let (_dir, state) = policy_fixture();
+        let router = app(state);
+        let (status, result) = call(
+            router.clone(),
+            "POST",
+            "/v1/systemone",
+            json!({
+                "state":"hello", "ignored":true,
+                "questions":{"x":{"criteria":{"z":"hello","a":"world"},"ignored":true}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["answers"]["x"]["choice"], "z");
+        assert_eq!(result["usage"], json!({"input_tokens":6,"output_tokens":0}));
+        let (status, result) = call(router.clone(), "POST", "/v1/systemone", json!({
+            "state":"hello", "questions":{"x":{"type":"noul","criteria":{"yes":"hello","no":"world"}}}
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert!(
+            result["answers"]["x"]["noul"].as_f64().unwrap() > 0.7,
+            "{result}"
+        );
+        for body in [
+            json!({"state":null,"questions":{"x":{"criteria":{"a":"hello","b":"world"}}}}),
+            json!({"state":"hello","questions":{"x":{"instructions":null,"criteria":{"a":"hello","b":"world"}}}}),
+            json!({"state":"hello","questions":{"x":{"type":"score","criteria":["a","b","c"]}}}),
+            json!({"state":"hello","questions":{"a":{"criteria":{"a":"hello","b":"world"}},"b":{"criteria":{"a":"hello","b":"world"}}}}),
+        ] {
+            let (status, error) = call(router.clone(), "POST", "/v1/systemone", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(error["error"]["message"].as_str().unwrap().len() > 20);
+        }
+        let (status, result) = call(router, "POST", "/v1/systemone", json!({
+            "state":"hello", "questions":{"x":{"type":"score","criteria":["hello",{"z":2,"a":1}]}}
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(
+            result["answers"]["x"]["legend"],
+            json!({"0":"hello","1":"{\"a\":1,\"z\":2}"})
+        );
     }
     fn request(state: &str) -> Value {
         json!({"state":state,"questions":{
