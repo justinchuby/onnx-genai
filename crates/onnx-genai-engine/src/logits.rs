@@ -4715,6 +4715,7 @@ mod tests {
             prefix,
             4096,
             vec![eos],
+            &Default::default(),
         )
         .unwrap();
         ConstraintProcessor::new(Box::new(constraint), texts, vec![eos])

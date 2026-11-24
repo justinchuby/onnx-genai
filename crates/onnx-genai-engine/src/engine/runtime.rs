@@ -218,7 +218,11 @@ impl DecoderTurnParticipant {
         let Some(callback) = callback else {
             return Ok(());
         };
-        let pieces = crate::tokenization::token_texts(Some(tokenizer), &result.token_ids)?;
+        let pieces = crate::tokenization::token_texts(
+            Some(tokenizer),
+            &result.token_ids,
+            &result.preserved_tokens,
+        )?;
         for (index, (token_id, text)) in result.token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
                 logprob: result
@@ -983,7 +987,7 @@ impl Engine {
     pub(crate) fn tool_call_observer(
         &self,
         policy: &ToolCallPolicy,
-        projection: Option<&crate::response_template::ResponseProjection>,
+        options: &GenerateOptions,
     ) -> anyhow::Result<Option<crate::pipeline::ToolCallStagedOutputObserver>> {
         if !policy.observes_output() {
             return Ok(None);
@@ -1005,8 +1009,12 @@ impl Engine {
             )?;
         let protocol = onnx_genai_metadata::ToolProtocol::from_declaration(declaration)
             .map_err(anyhow::Error::new)?;
-        let observer = crate::pipeline::ToolCallStagedOutputObserver::new(protocol, policy.clone());
-        Ok(Some(match projection {
+        let observer = crate::pipeline::ToolCallStagedOutputObserver::new(
+            protocol,
+            policy.clone(),
+            options.effective_preserved_tokens(),
+        );
+        Ok(Some(match options.response_projection.as_ref() {
             Some(projection) => {
                 observer.with_projection(projection.clone(), self.tokenizer.as_deref()).map_err(|source| crate::logits::ConstraintPrefixError {
                     source: anyhow::Error::new(source).context("validate declared assistant tool prefix before generation; repair continue_final_message content or the model chat_template"),
@@ -1052,8 +1060,7 @@ impl Engine {
         }
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
-        let mut tool_observer =
-            self.tool_call_observer(&tool_call_policy, options.response_projection.as_ref())?;
+        let mut tool_observer = self.tool_call_observer(&tool_call_policy, &options)?;
         // Speculation is an optimization. Until its accepted-token callback can
         // carry a normal host stop, tool-aware requests use the ordinary
         // declared loop rather than losing transactional observation.
@@ -2149,10 +2156,7 @@ impl Engine {
         self.require_workflow_execution_admitted()?;
         // Resolve the exact protocol and request policy before a cold path can
         // allocate its short-lived session or admit scheduler state.
-        let _ = self.tool_call_observer(
-            &tool_call_policy,
-            request.options.response_projection.as_ref(),
-        )?;
+        let _ = self.tool_call_observer(&tool_call_policy, &request.options)?;
         // One entry point, one interpreter, one declared loop. What varies is
         // whether this runtime holds the fused decode session that implements
         // the package's declared `autoregressive-decode` step. Without one, the
@@ -2432,10 +2436,7 @@ impl Engine {
                 callback,
             );
         }
-        let mut tool_observer = self.tool_call_observer(
-            &tool_call_policy,
-            request.options.response_projection.as_ref(),
-        )?;
+        let mut tool_observer = self.tool_call_observer(&tool_call_policy, &request.options)?;
         request.options.validate()?;
         let mut options = request.options.clone();
         self.apply_eos_defaults(&mut options)?;
@@ -3691,6 +3692,7 @@ impl Engine {
                 finish_reason,
                 loop_state.prefix_cache_hit_len,
                 loop_state.logprobs.as_deref(),
+                &active.options.effective_preserved_tokens(),
             )?)
         } else {
             // Borrowed before the disjoint mutable borrows the backend takes.
@@ -3753,6 +3755,7 @@ impl Engine {
                     finish_reason,
                     loop_state.prefix_cache_hit_len,
                     loop_state.logprobs.as_deref(),
+                    &active.options.effective_preserved_tokens(),
                 )?),
                 None => None,
             }
@@ -3774,6 +3777,7 @@ impl Engine {
                     FinishReason::MaxTokens,
                     active.prefix_cache_hit_len,
                     active.logprobs.as_deref(),
+                    &active.options.effective_preserved_tokens(),
                 )
                 .map(|mut result| {
                     result.budget_cap = active.budget_cap;
@@ -4029,12 +4033,15 @@ impl Engine {
         finish_reason: FinishReason,
         prefix_cache_hit_len: usize,
         logprobs: Option<&[crate::config::TokenLogprob]>,
+        preserved_tokens: &std::collections::BTreeSet<TokenId>,
     ) -> anyhow::Result<GenerateResult> {
         Ok(GenerateResult {
-            text: self
-                .require_tokenizer()?
-                .decode(generated_tokens)
-                .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
+            text: crate::tokenization::decode_output(
+                self.require_tokenizer()?,
+                generated_tokens,
+                preserved_tokens,
+            )?,
+            preserved_tokens: preserved_tokens.clone(),
             token_ids: generated_tokens.to_vec(),
             finish_reason,
             tool_calls: Vec::new(),
@@ -4153,8 +4160,7 @@ impl Engine {
         }
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
-        let mut tool_observer =
-            self.tool_call_observer(&tool_call_policy, options.response_projection.as_ref())?;
+        let mut tool_observer = self.tool_call_observer(&tool_call_policy, &options)?;
         if native_speculation_plan(&options, &chain).is_some() {
             anyhow::bail!(
                 "native session generation does not support speculative decoding; use stateless generate() for native prompt-lookup/shared-KV speculation"

@@ -537,6 +537,7 @@ fn native_session_generate(
         };
     }
     Ok(GenerateResult {
+        preserved_tokens: Default::default(),
         text: String::new(),
         token_ids,
         finish_reason: FinishReason::MaxTokens,

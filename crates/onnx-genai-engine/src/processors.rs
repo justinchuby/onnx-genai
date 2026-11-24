@@ -30,6 +30,9 @@ pub(crate) fn build_processor_chain(
     // A temperature-zero stage still runs at its requested position. Only an
     // explicit greedy policy bypasses stochastic warpers before terminal selection.
     let samples = !options.greedy || has_custom_sampler;
+    if !options.effective_preserved_tokens().is_empty() || options.response_projection.is_some() {
+        options.validate_preserved_tokens(tokenizer.context("preserved_tokens requires the model tokenizer; provide a tokenizer before requesting special-token output")?)?;
+    }
     if !options.logit_bias.is_empty() {
         if let Some(tokenizer) = tokenizer {
             options.validate_logit_bias(tokenizer)?;
@@ -126,6 +129,7 @@ pub(crate) fn build_processor_chain(
                     &prefix(plain),
                     max_bytes,
                     endings(),
+                    &options.effective_preserved_tokens(),
                 )?)
             }
             GenerateConstraint::JsonSchema {
@@ -141,6 +145,7 @@ pub(crate) fn build_processor_chain(
                     &prefix(plain),
                     max_bytes,
                     endings(),
+                    &options.effective_preserved_tokens(),
                 )?)
             }
             GenerateConstraint::Regex {
@@ -155,6 +160,7 @@ pub(crate) fn build_processor_chain(
                         projection.prefix(),
                         max_bytes,
                         endings(),
+                        &options.effective_preserved_tokens(),
                     )?)
                 } else {
                     build_llguidance_constraint(
@@ -180,6 +186,7 @@ pub(crate) fn build_processor_chain(
                         projection.prefix(),
                         max_bytes,
                         endings(),
+                        &options.effective_preserved_tokens(),
                     )?)
                 } else {
                     build_llguidance_constraint(

@@ -715,13 +715,16 @@ impl ProbabilityOutput {
         }
         let values = result.logprobs.as_ref().filter(|values| values.len() == result.token_ids.len())
             .ok_or_else(|| ApiError::internal("native completion did not return one probability per generated token; select a decoder with probability reporting"))?;
-        let texts =
-            onnx_genai_engine::tokenization::token_texts(Some(tokenizer), &result.token_ids)
-                .map_err(|error| {
-                    ApiError::internal(format!(
-                        "native probability text decoding failed: {error:#}"
-                    ))
-                })?;
+        let texts = onnx_genai_engine::tokenization::token_texts(
+            Some(tokenizer),
+            &result.token_ids,
+            &result.preserved_tokens,
+        )
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "native probability text decoding failed: {error:#}"
+            ))
+        })?;
         let stop_tokens = match result.finish_reason {
             FinishReason::StopSequence { index } => match stops.get(index) {
                 Some(stop) => MixedPrompt::Text(stop.clone())

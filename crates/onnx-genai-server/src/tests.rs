@@ -84,7 +84,11 @@ mod gbnf_wire {
         let mut tokenizer: Value =
             serde_json::from_slice(&std::fs::read(&tokenizer_path).unwrap()).unwrap();
         tokenizer["decoder"] = json!({"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false});
-        tokenizer["added_tokens"] = json!([{"id":3,"content":"<eos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}]);
+        tokenizer["added_tokens"] = json!([
+            {"id":3,"content":"<eos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+            {"id":24,"content":"tok24","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+            {"id":23,"content":"tok23","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}
+        ]);
         std::fs::write(tokenizer_path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
         // Assistant prefill is already inside reasoning. GBNF must begin with
         // the generated closer, rather than consume prefill or see content-only bytes.
@@ -243,6 +247,90 @@ mod gbnf_wire {
                 );
             }
         }
+        for path in ["/v1/chat/completions", "/v1/completions", "/completion"] {
+            for preserved in [false, true] {
+                for stream in [false, true] {
+                    for logprobs in [false, true] {
+                        let chat = path == "/v1/chat/completions";
+                        let mut body = if chat {
+                            json!({"messages":[{"role":"user","content":"hello"}],"grammar":"root ::= <[23]> <[24]>"})
+                        } else {
+                            json!({"prompt":"hello","grammar":"root ::= <[24]>"})
+                        };
+                        body["preserved_tokens"] = if preserved {
+                            json!(["tok24", "tok24"])
+                        } else {
+                            json!([])
+                        };
+                        body["stream"] = json!(stream);
+                        body["max_tokens"] = json!(4);
+                        body["temperature"] = json!(0);
+                        if logprobs {
+                            if chat {
+                                body["logprobs"] = json!(true);
+                            } else if path == "/completion" {
+                                body["n_probs"] = json!(2);
+                            } else {
+                                body["logprobs"] = json!(1);
+                            }
+                        }
+                        let response = router
+                            .clone()
+                            .oneshot(
+                                Request::post(path)
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(body.to_string()))
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        let status = response.status();
+                        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                        assert_eq!(
+                            status,
+                            StatusCode::OK,
+                            "{backend:?} {path}: {}",
+                            String::from_utf8_lossy(&bytes)
+                        );
+                        let content = if stream {
+                            let events = sse_json_events(&bytes);
+                            assert!(
+                                !events.iter().any(|event| event.get("error").is_some()),
+                                "{events:?}"
+                            );
+                            events
+                                .iter()
+                                .filter_map(|event| {
+                                    if path == "/completion" {
+                                        event["content"].as_str()
+                                    } else if chat {
+                                        event["choices"][0]["delta"]["content"].as_str()
+                                    } else {
+                                        event["choices"][0]["text"].as_str()
+                                    }
+                                })
+                                .collect::<String>()
+                        } else {
+                            let result: Value = serde_json::from_slice(&bytes).unwrap();
+                            if path == "/completion" {
+                                result["content"].as_str()
+                            } else if chat {
+                                result["choices"][0]["message"]["content"].as_str()
+                            } else {
+                                result["choices"][0]["text"].as_str()
+                            }
+                            .unwrap_or_default()
+                            .to_owned()
+                        };
+                        assert_eq!(
+                            content,
+                            if preserved { "tok24" } else { "" },
+                            "{backend:?} {path} stream={stream} logprobs={logprobs}"
+                        );
+                    }
+                }
+            }
+        }
         for post in [false, true] {
             for stream in [false, true] {
                 let body = json!({"prompt":"hello", "n_predict":1, "temperature":0,
@@ -346,7 +434,6 @@ mod gbnf_wire {
         for fields in [
             json!({"grammar":"root ::= \"hello\"", "grammar_lazy":true}),
             json!({"grammar":"root ::= \"hello\"", "grammar_triggers":[{"type":0,"value":"hello"}]}),
-            json!({"grammar":"root ::= \"hello\"", "preserved_tokens":["hello"]}),
             json!({"grammar":"root ::= \"hello\"", "ignore_eos":true}),
             json!({"grammar":"%llguidance {}\nstart: missing"}),
             json!({"grammar":"%llguidance {}\nstart: <[9999]>"}),

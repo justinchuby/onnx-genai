@@ -268,6 +268,11 @@ pub(crate) fn commit_selected_token(
     tokenizer: &Tokenizer,
     callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<Option<FinishReason>> {
+    if state.step == 0 {
+        state.text_decoder = crate::tokenization::TokenTextDecoder::with_preserved_tokens(
+            &options.effective_preserved_tokens(),
+        );
+    }
     state.generated_tokens.push(token_id);
     // Which token this step produced. Without it a timeline shows that a step
     // happened but not what came out of it, so a stall cannot be tied to the
@@ -276,7 +281,7 @@ pub(crate) fn commit_selected_token(
     // decodes exactly as often as an untraced one.
     let mut commit_span = onnx_genai_ort::prof_span!("loop.commit_selected_token");
     commit_span.set_arg("token_id", token_id);
-    let decode_text = callback.is_some() || !chain.is_empty();
+    let decode_text = callback.is_some() || !chain.is_empty() || state.custom_sampler.is_some();
     let mut token_text = if decode_text {
         let _span = onnx_genai_ort::prof_span!("loop.detokenize");
         state.text_decoder.step(tokenizer, token_id)?
@@ -329,11 +334,11 @@ pub(crate) fn finish_result(
     finish_reason: FinishReason,
     prefix_cache_hit_len: usize,
     logprobs: Option<&[TokenLogprob]>,
+    preserved_tokens: &std::collections::BTreeSet<TokenId>,
 ) -> anyhow::Result<GenerateResult> {
     Ok(GenerateResult {
-        text: tokenizer
-            .decode(generated_tokens)
-            .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
+        text: crate::tokenization::decode_output(tokenizer, generated_tokens, preserved_tokens)?,
+        preserved_tokens: preserved_tokens.clone(),
         token_ids: generated_tokens.to_vec(),
         finish_reason,
         tool_calls: Vec::new(),
@@ -667,8 +672,14 @@ mod tests {
                 );
                 assert_eq!(projected, "<eos>");
                 if let Some(finish) = finish {
-                    let result =
-                        finish_result(&tokenizer, &state.generated_tokens, finish, 0, None)?;
+                    let result = finish_result(
+                        &tokenizer,
+                        &state.generated_tokens,
+                        finish,
+                        0,
+                        None,
+                        &options.effective_preserved_tokens(),
+                    )?;
                     assert_eq!(result.token_ids, [3]);
                     assert_eq!(result.text, text);
                 }
@@ -1029,6 +1040,7 @@ mod tests {
             )
             .expect("supported protocol"),
             policy,
+            Default::default(),
         )
     }
 

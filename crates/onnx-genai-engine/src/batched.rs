@@ -460,7 +460,14 @@ impl<'a> ContinuousBatchManager<'a> {
 
             self.events.push_back(ContinuousBatchEvent::Finished {
                 handle,
-                result: finish_result(self.tokenizer, &[], FinishReason::Length, 0, None)?,
+                result: finish_result(
+                    self.tokenizer,
+                    &[],
+                    FinishReason::Length,
+                    0,
+                    None,
+                    &options.effective_preserved_tokens(),
+                )?,
             });
             return Ok(handle);
         }
@@ -1134,6 +1141,7 @@ impl<'a> ContinuousBatchManager<'a> {
                 reason,
                 row.state.prefix_cache_hit_len,
                 row.state.logprobs.as_deref(),
+                &row.options.effective_preserved_tokens(),
             )?;
             row.turn.stage_finished(row.handle, result);
             Ok((token_id, true))
@@ -2830,6 +2838,7 @@ mod tests {
             let mut request = greedy_req(1);
             request.options.max_new_tokens = 1;
             request.options.top_logprobs = Some(1);
+            request.options.preserved_tokens.insert(4);
             request.options.logprob_source = source;
             request
                 .options
@@ -2858,6 +2867,10 @@ mod tests {
                     _ => None,
                 })
                 .expect("completed single-token request");
+            assert_eq!(
+                result.preserved_tokens,
+                std::collections::BTreeSet::from([4])
+            );
             let probability = token
                 .logprob
                 .as_ref()

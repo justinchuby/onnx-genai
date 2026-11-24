@@ -76,6 +76,23 @@ fn byte_level_alphabet() -> anyhow::Result<HashMap<char, u8>> {
 }
 
 impl ByteStreamContract {
+    /// Filter special IDs before any stream-context transforms run.
+    pub(crate) fn resolve_output(
+        tokenizer: &Tokenizer,
+        preserved: &std::collections::BTreeSet<u32>,
+    ) -> anyhow::Result<Option<Self>> {
+        let Some(mut contract) = Self::resolve(tokenizer, SpecialTokenHandling::Preserve)? else {
+            return Ok(None);
+        };
+        let added = tokenizer.inner().get_added_vocabulary();
+        for (&id, token) in added.get_added_tokens_decoder() {
+            if added.is_special_token(&token.content) && !preserved.contains(&id) {
+                contract.pieces.get_mut(id as usize).with_context(||format!("special token {id} is absent from the byte vocabulary; repair tokenizer.json"))?.clear();
+            }
+        }
+        Ok(Some(contract))
+    }
+
     /// Token-local stages preserve input-token boundaries. Once byte chunks are
     /// fused, only finite initial character stripping is admitted here. Other
     /// stages need a separate contextual-stream proof rather than a guessed map.

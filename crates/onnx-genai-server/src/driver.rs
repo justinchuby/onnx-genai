@@ -3839,6 +3839,7 @@ mod driver_delivery_tests {
 
     fn result(tokens: usize) -> GenerateResult {
         GenerateResult {
+            preserved_tokens: Default::default(),
             text: "done".to_string(),
             token_ids: (0..tokens as u32).collect(),
             finish_reason: FinishReason::EosToken,

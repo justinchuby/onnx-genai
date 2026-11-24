@@ -2,7 +2,6 @@
 use crate::response_template::{
     IncompleteResponseUtf8, PrefixOutput, ResponseBufferExceeded, ResponseParser, ResponseTemplate,
 };
-use crate::tokenization::SpecialTokenHandling;
 use anyhow::Context;
 use std::{num::NonZeroUsize, sync::Arc};
 
@@ -12,13 +11,6 @@ pub(crate) enum ProjectionKind {
 }
 
 impl ProjectionKind {
-    pub(crate) fn special_tokens(&self) -> SpecialTokenHandling {
-        match self {
-            Self::Plain => SpecialTokenHandling::Skip,
-            Self::Declared(_) => SpecialTokenHandling::Preserve,
-        }
-    }
-
     pub(crate) fn create(&self, prefix: &str, max_bytes: usize) -> anyhow::Result<TextProjection> {
         match self {
             Self::Plain => {

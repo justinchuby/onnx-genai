@@ -1810,6 +1810,7 @@ impl Engine {
                     FinishReason::MaxTokens,
                     prefix_cache_hit_len,
                     logprobs.as_deref(),
+                    &options.effective_preserved_tokens(),
                 )
             }
         }
@@ -2058,6 +2059,7 @@ impl Engine {
                 FinishReason::MaxTokens,
                 prefix_cache_hit_len,
                 generated_logprobs.as_deref(),
+                &options.effective_preserved_tokens(),
             )?));
         }
         if reached_context_limit(token_count, max_context) {
@@ -2066,6 +2068,7 @@ impl Engine {
                 FinishReason::Length,
                 prefix_cache_hit_len,
                 generated_logprobs.as_deref(),
+                &options.effective_preserved_tokens(),
             )?));
         }
         Ok(None)
@@ -2357,18 +2360,16 @@ impl Engine {
                     .copied()
                     .chain(draft_tokens[..idx].iter().copied())
                     .collect(),
-                generated_text: self
-                    .require_tokenizer()?
-                    .decode(
-                        &generated_tokens
-                            .iter()
-                            .copied()
-                            .chain(draft_tokens[..idx].iter().copied())
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to detokenize speculative context: {e}")
-                    })?,
+                generated_text: crate::tokenization::decode_output(
+                    self.require_tokenizer()?,
+                    &generated_tokens
+                        .iter()
+                        .copied()
+                        .chain(draft_tokens[..idx].iter().copied())
+                        .collect::<Vec<_>>(),
+                    &options.effective_preserved_tokens(),
+                )
+                .context("decode speculative output history with preserved_tokens")?,
                 step: step + idx,
             };
             let probabilities = ProbabilitySnapshot::capture(options, &target_logits[idx]);
@@ -2455,18 +2456,16 @@ impl Engine {
                     .copied()
                     .chain(draft_tokens.iter().copied())
                     .collect(),
-                generated_text: self
-                    .require_tokenizer()?
-                    .decode(
-                        &generated_tokens
-                            .iter()
-                            .copied()
-                            .chain(draft_tokens.iter().copied())
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to detokenize speculative context: {e}")
-                    })?,
+                generated_text: crate::tokenization::decode_output(
+                    self.require_tokenizer()?,
+                    &generated_tokens
+                        .iter()
+                        .copied()
+                        .chain(draft_tokens.iter().copied())
+                        .collect::<Vec<_>>(),
+                    &options.effective_preserved_tokens(),
+                )
+                .context("decode speculative output history with preserved_tokens")?,
                 step: step + draft_tokens.len(),
             };
             let probabilities = ProbabilitySnapshot::capture(
@@ -2588,6 +2587,7 @@ impl Engine {
                     finish_reason,
                     prefix_cache_hit_len,
                     generated_logprobs.as_deref(),
+                    &options.effective_preserved_tokens(),
                 )?));
             }
         }
