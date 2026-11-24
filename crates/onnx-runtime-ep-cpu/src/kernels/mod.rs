@@ -1357,6 +1357,11 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(linear_attention::LinearAttentionFactory),
     );
+    rec.register(
+        OpKey::new("LinearAttention", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(linear_attention::LinearAttentionFactory),
+    );
     // `com.microsoft::GatherBlockQuantized`: block-quantized embedding gather
     // (the Qwen3.5 `embed_tokens` table is uint8 with `bits = 8`). Shape-driven,
     // dequantizes on the fly to the graph's activation dtype.
@@ -3604,8 +3609,7 @@ mod tests {
         for op in ["LinearAttention", "CausalConvWithState"] {
             assert!(!reg.supports(op, "", 26));
             assert!(reg.supports(op, "ai.onnx", 28));
-            assert!(!reg.supports(op, "", 29));
-            assert!(reg.lookup(op, "", 29).is_none());
+            assert_eq!(reg.supports(op, "", 29), op == "LinearAttention");
         }
         assert!(
             reg.lookup("GatherBlockQuantized", "com.microsoft", 1)

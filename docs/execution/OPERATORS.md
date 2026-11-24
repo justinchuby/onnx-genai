@@ -82,6 +82,7 @@ plugin EPs (via C ABI bridge) handle them.
 | Range | 11, 27 | Arithmetic progression; opset 27 adds FP16/BF16 with FLOAT or DOUBLE intermediates. |
 | CausalConvWithState | 27 | Depthwise causal convolution with optional bias and input carry; emits the last `K−1` samples. |
 | LinearAttention | 27 | Packed recurrent attention, all four update rules, forward GQA, and a separately typed state. Contrib behavior is unchanged. |
+| LinearAttention | 29 | Adds compact Q/K with independent value and state heads, plus optional post-update state snapshots for every token on native CPU and CUDA. |
 | CumSum | 11 | Position computation. |
 | NonZero | 9 | Sparse operations. |
 | ScatterElements | 11 | Native CPU/CUDA; opset 29 adds mean reduction. |

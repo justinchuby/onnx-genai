@@ -4312,7 +4312,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         if op.op_type == "LinearAttention"
             && matches!(op.domain.as_str(), "" | "ai.onnx" | "com.microsoft")
             && let Some(reason) =
-                crate::kernels::linear_attention::unsupported_reason(op, input_dtypes)
+                crate::kernels::linear_attention::unsupported_reason(op, opset, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }

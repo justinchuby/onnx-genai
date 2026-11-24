@@ -102,7 +102,8 @@ pub(crate) fn native_shape_operands(node: &Node) -> Option<&'static [usize]> {
         }
         if opset >= 27 {
             match op {
-                "CausalConvWithState" | "LinearAttention" if opset <= 28 => return Some(&[]),
+                "CausalConvWithState" if opset <= 28 => return Some(&[]),
+                "LinearAttention" => return Some(&[]),
                 "Range" => return Some(&[0, 1, 2]),
                 _ => {}
             }

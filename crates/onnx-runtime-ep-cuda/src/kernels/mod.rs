@@ -1375,6 +1375,13 @@ pub fn build_cuda_registry_with_metrics(
         }),
     );
     reg.register(
+        OpKey::new("LinearAttention", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(linear_attention::LinearAttentionFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
         OpKey::new("QMoE", "com.microsoft", 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(qmoe::QMoEFactory {

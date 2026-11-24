@@ -171,7 +171,7 @@ __device__ void linear_attention_core(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp, int state_dtype, float* scratch) {
+    int fuse_neg_exp, int state_dtype, float* scratch, void* states) {
   const unsigned long long total = batch * kv_num_heads * d_v;
   const unsigned long long stride =
       (unsigned long long)gridDim.x * blockDim.x;
@@ -253,11 +253,17 @@ __device__ void linear_attention_core(
       }
     } else {
       // Inverse GQA: output slot is h_kv, query head h_kv·H_q/H_kv.
-      const unsigned long long h_q = h_kv * q_num_heads / kv_num_heads;
+      const unsigned long long h_q = h_kv / (kv_num_heads / q_num_heads);
       const T* qt = q + row * (q_num_heads * d_k) + h_q * d_k;
       float o = 0.0f;
       for (unsigned long long i = 0; i < d_k; ++i) o += to_f(qt[i]) * sc[i];
       output[row * output_hidden + h_kv * d_v + j] = from_f_val(o * scale, output);
+    }
+    if (states) {
+      const unsigned long long base = (row * kv_num_heads + h_kv) * d_k * d_v;
+      for (unsigned long long i = 0; i < d_k; ++i) {
+        write_state(states, base + i * d_v + j, sc[i], state_dtype);
+      }
     }
   }
 
@@ -280,13 +286,13 @@ extern "C" __global__ void linear_attention_f32(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp, int state_dtype, float* scratch) {
+    int fuse_neg_exp, int state_dtype, float* scratch, void* states) {
   linear_attention_core<float>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus, fuse_neg_exp, state_dtype, scratch);
+      fuse_decay_softplus, fuse_neg_exp, state_dtype, scratch, states);
 }
 
 extern "C" __global__ void linear_attention_f16(
@@ -302,13 +308,13 @@ extern "C" __global__ void linear_attention_f16(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp, int state_dtype, float* scratch) {
+    int fuse_neg_exp, int state_dtype, float* scratch, void* states) {
   linear_attention_core<__half>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus, fuse_neg_exp, state_dtype, scratch);
+      fuse_decay_softplus, fuse_neg_exp, state_dtype, scratch, states);
 }
 
 extern "C" __global__ void linear_attention_bf16(
@@ -326,13 +332,13 @@ extern "C" __global__ void linear_attention_bf16(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp, int state_dtype, float* scratch) {
+    int fuse_neg_exp, int state_dtype, float* scratch, void* states) {
   linear_attention_core<__nv_bfloat16>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus, fuse_neg_exp, state_dtype, scratch);
+      fuse_decay_softplus, fuse_neg_exp, state_dtype, scratch, states);
 }
 
 // ── Warp-cooperative variant ────────────────────────────────────────────────
@@ -361,7 +367,7 @@ __device__ void linear_attention_core_coop(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp, int state_dtype) {
+    int fuse_neg_exp, int state_dtype, void* states) {
   const unsigned lane = threadIdx.x & (LA_WARP - 1);
   const unsigned warps_per_block = blockDim.x / LA_WARP;
   const unsigned long long total_warps = batch * kv_num_heads * d_v;
@@ -481,7 +487,7 @@ __device__ void linear_attention_core_coop(
         }
       } else {
         // Inverse GQA: output slot is h_kv, query head h_kv·H_q/H_kv.
-        const unsigned long long h_q = h_kv * q_num_heads / kv_num_heads;
+        const unsigned long long h_q = h_kv / (kv_num_heads / q_num_heads);
         const T* qt = q + row * (q_num_heads * d_k) + h_q * d_k;
         float opart = 0.0f;
 #pragma unroll
@@ -492,6 +498,14 @@ __device__ void linear_attention_core_coop(
         const float o = la_warp_reduce_sum(opart);
         if (lane == 0) {
           output[row * output_hidden + h_kv * d_v + j] = from_f_val(o * scale, output);
+        }
+      }
+      if (states) {
+        const unsigned long long base = (row * kv_num_heads + h_kv) * d_k * d_v;
+#pragma unroll
+        for (int s = 0; s < LA_MAX_SLOTS; ++s) {
+          const unsigned long long i = lane + (unsigned long long)s * LA_WARP;
+          if (i < d_k) write_state(states, base + i * d_v + j, sc[s], state_dtype);
         }
       }
     }
@@ -517,13 +531,13 @@ extern "C" __global__ void linear_attention_f32_coop(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp, int state_dtype, float*) {
+    int fuse_neg_exp, int state_dtype, float*, void* states) {
   linear_attention_core_coop<float>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus, fuse_neg_exp, state_dtype);
+      fuse_decay_softplus, fuse_neg_exp, state_dtype, states);
 }
 
 extern "C" __global__ void linear_attention_f16_coop(
@@ -539,13 +553,13 @@ extern "C" __global__ void linear_attention_f16_coop(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp, int state_dtype, float*) {
+    int fuse_neg_exp, int state_dtype, float*, void* states) {
   linear_attention_core_coop<__half>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus, fuse_neg_exp, state_dtype);
+      fuse_decay_softplus, fuse_neg_exp, state_dtype, states);
 }
 
 extern "C" __global__ void linear_attention_bf16_coop(
@@ -563,13 +577,13 @@ extern "C" __global__ void linear_attention_bf16_coop(
     float scale, int needs_decay, int decay_per_key_dim,
     int needs_delta, int beta_per_head,
     int fuse_beta_sigmoid, int fuse_decay_softplus,
-    int fuse_neg_exp, int state_dtype, float*) {
+    int fuse_neg_exp, int state_dtype, float*, void* states) {
   linear_attention_core_coop<__nv_bfloat16>(
       q, k, v, past_state, decay, beta, dt_bias, neg_exp_A, output,
       present_state, batch, seq, d_k, d_v, q_num_heads, kv_num_heads, n_k_heads,
       heads_per_group, kv_per_k_head, output_hidden, scale, needs_decay,
       decay_per_key_dim, needs_delta, beta_per_head, fuse_beta_sigmoid,
-      fuse_decay_softplus, fuse_neg_exp, state_dtype);
+      fuse_decay_softplus, fuse_neg_exp, state_dtype, states);
 }
 "#;
 
@@ -611,25 +625,19 @@ impl UpdateRule {
     }
 }
 
-fn read_heads(node: &Node, name: &str) -> Option<usize> {
-    node.attr(name)
-        .and_then(|a| a.as_int())
-        .and_then(|v| usize::try_from(v).ok())
-        .filter(|&v| v > 0)
-}
+use onnx_runtime_ir::linear_attention::{Heads, has_trajectory};
 
 /// Claim gate. Returns `Some(reason)` when the CUDA EP cannot run this node, so
 /// placement declines cleanly instead of claiming then failing at execute time.
-pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Option<String> {
+pub(crate) fn unsupported_reason(
+    node: &Node,
+    opset: u64,
+    input_dtypes: &[DataType],
+) -> Option<String> {
     let standard = matches!(node.domain.as_str(), "" | "ai.onnx");
-    let (Some(q_num_heads), Some(kv_num_heads)) = (
-        read_heads(node, "q_num_heads"),
-        read_heads(node, "kv_num_heads"),
-    ) else {
-        return Some(
-            "LinearAttention: q_num_heads and kv_num_heads must be positive integers".into(),
-        );
-    };
+    if let Err(detail) = Heads::from_node(node, standard.then_some(opset)) {
+        return Some(format!("LinearAttention: {detail}"));
+    }
     if UpdateRule::parse(node).is_err() {
         return Some("LinearAttention: unrecognized update_rule".into());
     }
@@ -652,19 +660,6 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
     {
         return Some("LinearAttention: query/key/value must share one dtype".into());
     }
-    if standard || q_num_heads >= kv_num_heads {
-        if !q_num_heads.is_multiple_of(kv_num_heads) {
-            return Some(format!(
-                "LinearAttention: q_num_heads {q_num_heads} not a multiple of kv_num_heads \
-                 {kv_num_heads}"
-            ));
-        }
-    } else if !kv_num_heads.is_multiple_of(q_num_heads) {
-        return Some(format!(
-            "LinearAttention: kv_num_heads {kv_num_heads} not a multiple of q_num_heads \
-             {q_num_heads} (inverse GQA)"
-        ));
-    }
     None
 }
 
@@ -674,16 +669,10 @@ pub struct LinearAttentionFactory {
 
 impl KernelFactory for LinearAttentionFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let q_num_heads = read_heads(node, "q_num_heads").ok_or_else(|| {
-            EpError::KernelFailed(
-                "LinearAttention: `q_num_heads` must be a positive integer".into(),
-            )
-        })?;
-        let kv_num_heads = read_heads(node, "kv_num_heads").ok_or_else(|| {
-            EpError::KernelFailed(
-                "LinearAttention: `kv_num_heads` must be a positive integer".into(),
-            )
-        })?;
+        let opset = matches!(node.domain.as_str(), "" | "ai.onnx")
+            .then(|| node.local_opset().unwrap_or(27));
+        let heads = Heads::from_node(node, opset)
+            .map_err(|detail| EpError::KernelFailed(format!("LinearAttention: {detail}")))?;
         let update_rule = UpdateRule::parse(node)?;
         // ORT resolves a `0` (or missing) scale attribute to `1 / sqrt(d_k)`.
         let scale = match node.attr("scale").and_then(|a| a.as_float()) {
@@ -707,9 +696,9 @@ impl KernelFactory for LinearAttentionFactory {
             .is_some_and(|v| v != 0);
         Ok(Box::new(LinearAttentionKernel {
             runtime: self.runtime.clone(),
-            standard: matches!(node.domain.as_str(), "" | "ai.onnx"),
-            q_num_heads,
-            kv_num_heads,
+            standard: opset.is_some(),
+            trajectory: opset.is_some_and(has_trajectory),
+            heads,
             update_rule,
             scale,
             fuse_beta_sigmoid,
@@ -724,8 +713,8 @@ impl KernelFactory for LinearAttentionFactory {
 struct LinearAttentionKernel {
     runtime: Arc<CudaRuntime>,
     standard: bool,
-    q_num_heads: usize,
-    kv_num_heads: usize,
+    trajectory: bool,
+    heads: Heads,
     update_rule: UpdateRule,
     scale: Option<f32>,
     fuse_beta_sigmoid: bool,
@@ -749,9 +738,12 @@ impl Kernel for LinearAttentionKernel {
                 inputs.len()
             )));
         }
-        if outputs.len() != 2 || outputs[1].is_absent() {
+        if !(2..=if self.trajectory { 3 } else { 2 }).contains(&outputs.len())
+            || outputs[0].is_absent()
+            || outputs[1].is_absent()
+        {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep LinearAttention: expected 2 outputs (output, present_state), got {}",
+                "cuda_ep LinearAttention: expected output and present_state, plus optional states in opset 29+; got {} slots",
                 outputs.len()
             )));
         }
@@ -784,61 +776,31 @@ impl Kernel for LinearAttentionKernel {
             ));
         }
 
-        let q_num_heads = self.q_num_heads;
-        let kv_num_heads = self.kv_num_heads;
-        if q_num_heads == 0 || kv_num_heads == 0 || !q_hidden.is_multiple_of(q_num_heads) {
+        let q_num_heads = self.heads.query;
+        // The CUDA recurrence historically calls its state-head count kv_num_heads.
+        let kv_num_heads = self.heads.state;
+        if !q_hidden.is_multiple_of(q_num_heads) {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep LinearAttention: query hidden {q_hidden} not divisible by q_num_heads \
                  {q_num_heads}"
             )));
         }
         let d_k = q_hidden / q_num_heads;
-        if d_k == 0 || !k.shape[2].is_multiple_of(d_k) {
-            return Err(not_implemented(format!(
-                "cuda_ep LinearAttention: d_k {d_k} invalid (must be positive and divide \
-                 key hidden {})",
-                k.shape[2]
-            )));
-        }
-        let n_k_heads = k.shape[2] / d_k;
-        if n_k_heads == 0 || !v.shape[2].is_multiple_of(kv_num_heads) {
+        let n_k_heads = self
+            .heads
+            .packed_key_heads(k.shape[2], d_k, self.standard)
+            .map_err(|detail| {
+                EpError::KernelFailed(format!("cuda_ep LinearAttention: {detail}"))
+            })?;
+        if !v.shape[2].is_multiple_of(kv_num_heads) || (self.trajectory && v.shape[2] == 0) {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep LinearAttention: value hidden {} not divisible by kv_num_heads \
-                 {kv_num_heads}",
+                "cuda_ep LinearAttention: value hidden {} must be divisible by the state head count \
+                 {kv_num_heads} (and positive in opset 29+)",
                 v.shape[2]
             )));
         }
         let d_v = v.shape[2] / kv_num_heads;
-        if self.standard && (n_k_heads != kv_num_heads || !q_num_heads.is_multiple_of(kv_num_heads))
-        {
-            return Err(EpError::KernelFailed(format!(
-                "LinearAttention-27: key heads {n_k_heads} must equal kv_num_heads={kv_num_heads}, and q_num_heads={q_num_heads} must be a multiple of it"
-            )));
-        }
-
-        let heads_per_group = if q_num_heads >= kv_num_heads {
-            if !q_num_heads.is_multiple_of(kv_num_heads) {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep LinearAttention: q_num_heads {q_num_heads} must be a multiple of \
-                     kv_num_heads {kv_num_heads}"
-                )));
-            }
-            q_num_heads / kv_num_heads
-        } else {
-            if !kv_num_heads.is_multiple_of(q_num_heads) {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep LinearAttention: kv_num_heads {kv_num_heads} must be a multiple of \
-                     q_num_heads {q_num_heads} (inverse GQA)"
-                )));
-            }
-            0
-        };
-        if !kv_num_heads.is_multiple_of(n_k_heads) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep LinearAttention: kv_num_heads {kv_num_heads} must be a multiple of \
-                 n_k_heads {n_k_heads}"
-            )));
-        }
+        let heads_per_group = self.heads.queries_per_state;
         let kv_per_k_head = kv_num_heads / n_k_heads;
         let scale = self.scale.unwrap_or_else(|| 1.0 / (d_k as f32).sqrt());
 
@@ -860,9 +822,7 @@ impl Kernel for LinearAttentionKernel {
                 decay.is_some(),
                 beta.is_some(),
             ) {
-                return Err(EpError::KernelFailed(format!(
-                    "LinearAttention-27: {detail}"
-                )));
+                return Err(EpError::KernelFailed(format!("LinearAttention: {detail}")));
             }
         } else if needs_decay && decay.is_none() {
             return Err(EpError::KernelFailed(
@@ -897,15 +857,14 @@ impl Kernel for LinearAttentionKernel {
                     "cuda_ep LinearAttention: decay must be [B={batch}, T={seq}, ...], got {s:?}"
                 )));
             }
-            if s[2] == kv_num_heads * d_k {
+            if kv_num_heads.checked_mul(d_k) == Some(s[2]) {
                 true
             } else if s[2] == kv_num_heads {
                 false
             } else {
                 return Err(EpError::KernelFailed(format!(
                     "cuda_ep LinearAttention: decay last dim must be H_kv={kv_num_heads} or \
-                     H_kv·d_k={}, got {}",
-                    kv_num_heads * d_k,
+                     that count times d_k={d_k}, got {}",
                     s[2]
                 )));
             }
@@ -969,7 +928,7 @@ impl Kernel for LinearAttentionKernel {
             }
         }
 
-        let output_hidden = q_num_heads.max(kv_num_heads) * d_v;
+        let output_hidden = self.heads.output * d_v;
         if outputs[0].shape != [batch, seq, output_hidden] {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep LinearAttention: output must be [B={batch}, T={seq}, {output_hidden}], \
@@ -990,6 +949,15 @@ impl Kernel for LinearAttentionKernel {
         } else {
             dtype
         };
+        if let Some(states) = outputs.get(2).filter(|s| !s.is_absent()) {
+            let expected = [batch, seq, kv_num_heads, d_k, d_v];
+            if states.shape != expected || states.dtype != state_dtype || !states.is_contiguous() {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep LinearAttention: states requires contiguous {state_dtype:?} with shape {expected:?}; got {:?} {:?}",
+                    states.dtype, states.shape
+                )));
+            }
+        }
         let state_dtype_code: i32 = match state_dtype {
             DataType::Float32 => 1,
             DataType::Float16 => 10,
@@ -1058,7 +1026,7 @@ impl Kernel for LinearAttentionKernel {
         }
         let function = self
             .runtime
-            .nvrtc_function("linear_attention_v4", SOURCE, stem)?;
+            .nvrtc_function("linear_attention_v5", SOURCE, stem)?;
 
         let q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
         let k_ptr = cuptr(k.data_ptr::<u8>() as *const c_void);
@@ -1088,6 +1056,10 @@ impl Kernel for LinearAttentionKernel {
         };
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let present_ptr = cuptr(outputs[1].data_ptr_mut::<u8>() as *const c_void);
+        let states_ptr = outputs
+            .get_mut(2)
+            .filter(|s| !s.is_absent())
+            .map_or(0, |s| cuptr(s.data_ptr_mut::<u8>() as *const c_void));
 
         let batch = batch as u64;
         let seq = seq as u64;
@@ -1149,7 +1121,8 @@ impl Kernel for LinearAttentionKernel {
             .arg(&fuse_decay_softplus_i)
             .arg(&fuse_neg_exp_i)
             .arg(&state_dtype_code)
-            .arg(&scratch_ptr);
+            .arg(&scratch_ptr)
+            .arg(&states_ptr);
         // SAFETY: argument types/order match `linear_attention_*`; every pointer
         // is a live contiguous device allocation validated above (nulls for
         // absent optionals), and each thread owns one disjoint state column so
