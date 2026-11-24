@@ -10872,3 +10872,140 @@ mod lora_http {
         );
     }
 }
+
+mod systemone_decisions {
+    use super::*;
+    async fn call(
+        router: axum::Router,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        (response.status(), json_body(response).await)
+    }
+    fn fixture() -> AppState {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/decision");
+        AppState::load(&root, Some("decision-fixture".into())).unwrap()
+    }
+    fn request(state: &str) -> Value {
+        json!({"state":state,"questions":{
+            "select":{"type":"choice","instructions":"the","criteria":{"a":"hello","b":"world"}},
+            "level":{"type":"score","instructions":"the","criteria":["hello","world"]},
+            "yes":{"type":"noul","instructions":"the","criteria":{"false":"hello","true":"world"}}
+        }})
+    }
+    #[tokio::test]
+    async fn systemone_evaluates_choice_score_and_noul_without_generated_tokens() {
+        let router = app(fixture());
+        for (state, best) in [("hello", "a"), ("world", "b")] {
+            let (status, result) =
+                call(router.clone(), "POST", "/v1/systemone", request(state)).await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["model"], "decision-fixture");
+            assert_eq!(result["answers"]["select"]["choice"], best);
+            let p = result["answers"]["select"]["probabilities"]["b"]
+                .as_f64()
+                .unwrap();
+            assert!((result["answers"]["level"]["score"].as_f64().unwrap() - p).abs() < 1e-6);
+            assert!((result["answers"]["yes"]["noul"].as_f64().unwrap() - p).abs() < 1e-6);
+            assert_eq!(
+                result["answers"]["level"]["legend"],
+                json!({"0":"hello","1":"world"})
+            );
+            assert_eq!(
+                result["usage"],
+                json!({"input_tokens":18,"output_tokens":0})
+            );
+        }
+        let (_, props) = call(router, "GET", "/props", Value::Null).await;
+        assert_eq!(props["nxrt_capabilities"]["decision"], true);
+        assert_eq!(props["nxrt_capabilities"]["server_tools"], false);
+    }
+    #[tokio::test]
+    async fn systemone_refuses_unsupported_models_media_and_malformed_questions() {
+        let (status, result) =
+            call(app(tiny_state()), "POST", "/v1/systemone", request("hello")).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{result}");
+        assert_eq!(result["error"]["type"], "not_supported_error");
+        let router = app(fixture());
+        for value in [
+            json!({"state":"hello","questions":{}}),
+            json!({"questions":{"x":{"type":"noul","instructions":"the"}}}),
+            json!({"state":"hello","questions":{"x":{"type":"noul"}}}),
+            json!({"state":"hello","questions":{"x":{"type":"choice","instructions":"the","criteria":[]}}}),
+            json!({"state":"hello","questions":{"x":{"type":"score","instructions":"the","criteria":["one"]}}}),
+            json!({"state":"hello","questions":{"x":{"type":"noul","instructions":"the","criteria":{"unread":true}}}}),
+            json!({"state":"hello","questions":{"x":{"type":"noul","instructions":{"type":"input_audio","data":"abc"}}}}),
+            json!({"state":"hello","questions":{"x":{"type":"invalid","instructions":"the"}}}),
+            json!({"state":"hello","questions":{"x":{"type":"choice","instructions":"the","criteria":{"a":"hello"}}}}),
+            json!({"state":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}],"questions":{"x":{"type":"noul","instructions":"the"}}}),
+        ] {
+            let (status, result) = call(router.clone(), "POST", "/v1/systemone", value).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+            assert!(
+                result["error"]["message"].as_str().unwrap().len() > 30,
+                "{result}"
+            );
+        }
+        let mut media = request("hello");
+        media["images"] = json!(["data:image/png;base64,AA=="]);
+        let (status, result) = call(router, "POST", "/v1/systemone", media).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+    }
+    #[tokio::test]
+    async fn systemone_checks_all_preparation_and_capacity_before_execution() {
+        let mut state = fixture();
+        state.config.max_decision_questions = std::num::NonZeroUsize::new(1).unwrap();
+        let (status, _) = call(app(state), "POST", "/v1/systemone", request("hello")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let mut state = fixture();
+        state.config.max_decision_options = std::num::NonZeroUsize::new(1).unwrap();
+        let (status, _) = call(app(state), "POST", "/v1/systemone", request("hello")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let mut state = fixture();
+        state.config.max_decision_input_tokens = std::num::NonZeroUsize::new(2).unwrap();
+        let (status, result) = call(app(state), "POST", "/v1/systemone", request("hello")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("budget")
+        );
+        for (bytes, operations) in [(3, 1_000_000), (4 * 1024 * 1024, 1)] {
+            let mut state = fixture();
+            state.config.max_decision_prompt_bytes = std::num::NonZeroUsize::new(bytes).unwrap();
+            state.config.max_decision_template_operations =
+                std::num::NonZeroU64::new(operations).unwrap();
+            let (status, result) =
+                call(app(state), "POST", "/v1/systemone", request("hello")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+            assert!(
+                result["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("max_output_bytes"),
+                "{result}"
+            );
+        }
+        let router = app(fixture());
+        let mut invalid = request("hello");
+        invalid["questions"]["select"]["criteria"] = json!({"a":"hello"});
+        let (status, _) = call(router.clone(), "POST", "/v1/systemone", invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(router, "POST", "/v1/systemone", request("world")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}

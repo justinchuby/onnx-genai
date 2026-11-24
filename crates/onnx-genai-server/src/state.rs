@@ -439,6 +439,16 @@ pub struct ServerConfig {
     pub max_rerank_input_tokens: std::num::NonZeroUsize,
     /// Maximum document count in one scoring request.
     pub max_rerank_documents: std::num::NonZeroUsize,
+    /// Maximum tokens per decision prompt variant.
+    pub max_decision_input_tokens: std::num::NonZeroUsize,
+    /// Maximum rendered prompt bytes before decision tokenization.
+    pub max_decision_prompt_bytes: std::num::NonZeroUsize,
+    /// Maximum Jinja interpreter operations per decision variant.
+    pub max_decision_template_operations: std::num::NonZeroU64,
+    /// Maximum questions per SystemOne request.
+    pub max_decision_questions: std::num::NonZeroUsize,
+    /// Maximum options per question, independent of the model's own bound.
+    pub max_decision_options: std::num::NonZeroUsize,
     /// Maximum retained/live resumable generations; payload storage is allocated lazily.
     pub max_replay_streams: usize,
     /// Maximum retained SSE bytes per conversation (older prefixes are evicted).
@@ -490,6 +500,7 @@ pub struct ServerConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
+        let decision = onnx_genai_engine::decision::DecisionLimits::default();
         Self {
             node_id: default_node_id(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
@@ -500,6 +511,13 @@ impl Default for ServerConfig {
                 .expect("positive default reranking token budget"),
             max_rerank_documents: std::num::NonZeroUsize::new(128)
                 .expect("positive default reranking document budget"),
+            max_decision_input_tokens: decision.max_input_tokens,
+            max_decision_prompt_bytes: decision.template.max_output_bytes,
+            max_decision_template_operations: decision.template.max_operations,
+            max_decision_questions: std::num::NonZeroUsize::new(64)
+                .expect("positive decision question bound"),
+            max_decision_options: std::num::NonZeroUsize::new(128)
+                .expect("positive decision option bound"),
             max_replay_streams: 16,
             replay_buffer_bytes: 4 * 1024 * 1024,
             default_reasoning_effort: None,

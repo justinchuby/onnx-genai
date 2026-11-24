@@ -1,0 +1,15 @@
+ir_version: 11
+opset_import { domain: "" version: 24 }
+graph { name: "nearest_option_decision"
+node { input: "input_ids" output: "ids.float" op_type: "Cast" attribute { name: "to" i: 1 type: INT } }
+node { input: "ids.float" input: "state_index" output: "state" op_type: "Gather" attribute { name: "axis" i: 1 type: INT } }
+node { input: "ids.float" input: "option_indices" output: "options" op_type: "Gather" attribute { name: "axis" i: 1 type: INT } }
+node { input: "options" input: "state" output: "difference" op_type: "Sub" }
+node { input: "difference" output: "distance" op_type: "Abs" }
+node { input: "distance" output: "logits" op_type: "Neg" }
+node { input: "logits" output: "probabilities" op_type: "Softmax" attribute { name: "axis" i: 1 type: INT } }
+input { name: "input_ids" type { tensor_type { elem_type: 7 shape { dim { dim_param: "batch" } dim { dim_param: "sequence" } } } } }
+output { name: "probabilities" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 2 } } } } }
+initializer { name: "state_index" data_type: 7 dims: 1 int64_data: 1 }
+initializer { name: "option_indices" data_type: 7 dims: 2 int64_data: 3 int64_data: 4 }
+}

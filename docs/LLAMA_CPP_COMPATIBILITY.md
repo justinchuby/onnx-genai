@@ -43,6 +43,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/detokenize` | `tokens`, optional `model`; preserves special tokens, rejects absent vocabulary IDs |
 | POST | `/apply-template` | Chat request fields; same prompt renderer as chat inference |
 | POST | `/v1/chat/completions`, `/chat/completions` | Buffered/streaming text, tools, reasoning, declared image/audio inputs |
+| POST | `/v1/systemone` | Declared non-generative decision workflows: choice, score and noul; see [contract and limits](SYSTEMONE.md) |
 | POST | `/v1/chat/completions/control` | End the current reasoning block of an armed live chat/legacy completion |
 | POST | `/v1/completions` | OpenAI text/token/mixed prompt batches, shared controls, declared text FIM and optional stream usage |
 | POST | `/v1/embeddings` | Existing OpenAI embedding contract |
@@ -425,9 +426,15 @@ for package contracts, memory admission and remaining source/device limitations.
 This is a functional Llama Chat integration, not a claim of complete llama-server
 parity. These upstream protocols are still unimplemented:
 
-- Multimodal reranking, realtime audio/WebSocket inference and `/v1/systemone`.
+- Multimodal reranking, realtime audio/WebSocket inference, and multimodal/joint decision heads.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
 - GGUF/Hugging Face model downloads and deletion.
+
+`/v1/systemone` executes text/structured-state decision profiles, with explicit
+model-authored prompting, calibration outputs, variants and answer policies.
+Model-specific defaults, multimodal/joint heads and shared generation/decision
+entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
+claim every upstream decision-model format is admitted.
 
 Model download/delete remain disabled. `--props` enables `POST /props`, matching
 upstream's current acknowledgement-only contract: it returns `{"success":true}`

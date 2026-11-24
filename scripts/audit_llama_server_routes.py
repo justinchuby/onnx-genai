@@ -200,7 +200,7 @@ def render(fixture: dict, rows: list[dict]) -> str:
         "satisfy these cases. Cross-model and backend-specific behavior must use declared",
         "capabilities; a passing narrow fixture does not establish general parity.",
         "",
-        "The missing realtime/SystemOne protocols and disabled model download/deletion",
+        "The missing realtime protocol and disabled model download/deletion",
         "remain implementation work. Existing handlers also retain the explicit source,",
         "device-state and multimodal gaps documented in the compatibility ledger.",
         "",
