@@ -508,6 +508,9 @@ trigonometric/hyperbolic unary family (`Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`,
 the dtypes/attributes it claims (trig ops in f32/f16/bf16; `Trilu` upper/lower
 with positive/negative `k` in f32/Int64), raising CPU standard-domain op-type
 coverage to **88 / 141**.
+The trig parity fixture uses opset 22 for BF16 and retains opset 17 for
+f32/f16. It also checks that the CUDA EP rejects BF16 at opset 21. Float64 is
+legal in both ONNX revisions but is not implemented by these CUDA kernels.
 
 The issue #67 operator-coverage batch 2 adds eleven more advertised op names —
 the extended f32 reductions (`ReduceProd`, `ReduceSumSquare`, `ReduceL1`,

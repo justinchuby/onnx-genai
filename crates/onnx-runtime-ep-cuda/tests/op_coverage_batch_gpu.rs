@@ -388,7 +388,17 @@ fn trig_hyperbolic_unary_matches_cpu() {
         ("Atanh", &[-0.9, -0.4, 0.0, 0.5, 0.85]),
     ];
     for &(op, values) in cases {
+        let node = Node::new(NodeId(0), op, vec![], vec![]);
+        let shapes = [static_shape([values.len()])];
+        let rejected = ep.supports_op(&node, 21, &shapes, &[DataType::BFloat16], &[]);
+        let reason = format!("{op} does not accept BF16 (BFloat16) at opset 21");
+        assert!(
+            rejected.reason().is_some_and(|s| s.contains(&reason)),
+            "{op}: expected an opset-specific CUDA rejection, got {:?}",
+            rejected.reason()
+        );
         for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let opset = if dtype == DataType::BFloat16 { 22 } else { 17 };
             let shape = vec![values.len()];
             let inputs = [Tensor {
                 dtype,
@@ -396,8 +406,8 @@ fn trig_hyperbolic_unary_matches_cpu() {
                 bytes: encode_floats(values, dtype),
             }];
             let outputs = [(dtype, shape.clone())];
-            let cuda = run_cuda(&ep, op, 17, &inputs, &outputs, &[]);
-            let cpu = run_cpu(op, 17, &inputs, &outputs, &[]);
+            let cuda = run_cuda(&ep, op, opset, &inputs, &outputs, &[]);
+            let cpu = run_cpu(op, opset, &inputs, &outputs, &[]);
             let cuda_f = decode_floats(&cuda[0], dtype);
             let cpu_f = decode_floats(&cpu[0], dtype);
             // f32 device intrinsics vs host libm agree to a few ulp; the half
