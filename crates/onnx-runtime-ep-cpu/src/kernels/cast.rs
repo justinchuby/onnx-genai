@@ -365,18 +365,46 @@ impl Kernel for Float6Projection {
         let y = unsafe { std::slice::from_raw_parts_mut(dst, n * 4) };
         const TILE: usize = 128;
         let row_bytes = n / 4 * 3;
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        #[cfg(target_arch = "x86_64")]
+        let e2m3 = inputs[1].dtype == DataType::Float6E2M3;
         let tile = |(i, out): (usize, &mut [u8])| {
             let mut accum = [0f32; TILE];
             let offset = i * (TILE / 4 * 3);
             let cols = out.len() / 4;
-            for (row, a) in x.chunks_exact(4).enumerate() {
-                let a = f32::from_le_bytes(a.try_into().unwrap());
-                let start = row * row_bytes + offset;
-                let groups = w[start..start + cols / 4 * 3].chunks_exact(3);
-                for (g, sum) in groups.zip(accum.chunks_exact_mut(4)) {
-                    let word = u32::from_le_bytes([g[0], g[1], g[2], 0]);
-                    for (lane, dst) in sum.iter_mut().enumerate() {
-                        *dst += a * table[(word >> (lane * 6)) as usize & 63];
+            #[cfg(target_arch = "x86_64")]
+            let vector_cols = if avx2 { cols / 8 * 8 } else { 0 };
+            #[cfg(not(target_arch = "x86_64"))]
+            let vector_cols = 0;
+            #[cfg(target_arch = "x86_64")]
+            if vector_cols != 0 {
+                let vectors = &mut accum[..vector_cols];
+                // SAFETY: AVX2 was detected; each row contains all tile bytes.
+                unsafe {
+                    if e2m3 {
+                        accumulate_float6_avx2::<3, 126>(w, row_bytes, offset, vectors, x);
+                    } else {
+                        accumulate_float6_avx2::<2, 124>(w, row_bytes, offset, vectors, x);
+                    }
+                }
+            }
+            if vector_cols != cols {
+                for (row, a) in x.as_chunks::<4>().0.iter().enumerate() {
+                    let a = f32::from_le_bytes(*a);
+                    let start = row * row_bytes + offset;
+                    let packed = &w[start + vector_cols / 4 * 3..start + cols / 4 * 3];
+                    let sum = &mut accum[vector_cols..cols];
+                    for (g, sum) in packed
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .zip(sum.as_chunks_mut::<4>().0)
+                    {
+                        let word = u32::from_le_bytes([g[0], g[1], g[2], 0]);
+                        for (lane, dst) in sum.iter_mut().enumerate() {
+                            *dst += a * table[(word >> (lane * 6)) as usize & 63];
+                        }
                     }
                 }
             }
@@ -392,6 +420,59 @@ impl Kernel for Float6Projection {
         Ok(())
     }
 }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn accumulate_float6_avx2<const M: i32, const BIAS_DELTA: i32>(
+    weights: &[u8],
+    row_bytes: usize,
+    offset: usize,
+    sums: &mut [f32],
+    x: &[u8],
+) {
+    use std::arch::x86_64::*;
+    let shift = _mm256_setr_epi32(0, 6, 12, 18, 0, 6, 12, 18);
+    let magnitude = _mm256_set1_epi32(31);
+    let exponent = _mm256_set1_epi32(31 ^ ((1 << M) - 1));
+    let bias = _mm256_set1_epi32(BIAS_DELTA << 23);
+    let min_normal = _mm256_set1_epi32((BIAS_DELTA + 1) << 23);
+    let exp_step = _mm256_set1_epi32(1 << 23);
+    let magnitude_shift = _mm256_set1_epi32(23 - M);
+    let bytes = sums.len() / 8 * 6;
+    for (row, a) in weights.chunks_exact(row_bytes).zip(x.as_chunks::<4>().0) {
+        let a = _mm256_set1_ps(f32::from_le_bytes(*a));
+        for (p, acc) in row[offset..offset + bytes]
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .zip(sums.as_chunks_mut::<8>().0)
+        {
+            let lo = i32::from_le_bytes([p[0], p[1], p[2], 0]);
+            let hi = i32::from_le_bytes([p[3], p[4], p[5], 0]);
+            let words = _mm256_setr_epi32(lo, lo, lo, lo, hi, hi, hi, hi);
+            let lanes = _mm256_srlv_epi32(words, shift);
+            let mag = _mm256_and_si256(lanes, magnitude);
+            let subnormal =
+                _mm256_cmpeq_epi32(_mm256_and_si256(mag, exponent), _mm256_setzero_si256());
+            let bits = _mm256_add_epi32(
+                _mm256_add_epi32(_mm256_sllv_epi32(mag, magnitude_shift), bias),
+                _mm256_and_si256(subnormal, exp_step),
+            );
+            // Decode subnormals with exact subtraction of the FP6 minimum normal.
+            let value = _mm256_sub_ps(
+                _mm256_castsi256_ps(bits),
+                _mm256_castsi256_ps(_mm256_and_si256(subnormal, min_normal)),
+            );
+            let sign = _mm256_slli_epi32::<26>(_mm256_and_si256(lanes, _mm256_set1_epi32(32)));
+            let w = _mm256_xor_ps(value, _mm256_castsi256_ps(sign));
+            // SAFETY: acc is eight writable f32 lanes and unaligned loads/stores are permitted.
+            unsafe {
+                let s = _mm256_loadu_ps(acc.as_ptr());
+                _mm256_storeu_ps(acc.as_mut_ptr(), _mm256_add_ps(s, _mm256_mul_ps(a, w)));
+            }
+        }
+    }
+}
+
 fn write_float6<const WIDTH: usize>(
     src: &[u8],
     dst: &mut [u8],

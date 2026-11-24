@@ -138,16 +138,17 @@ __device__ void store_core(unsigned char* y, int i, int tag,
 }
 "#;
 
-// Each lane owns four columns, while eight warps split K. One block reduces
+// Each lane owns four columns, while eight row lanes split K. One block reduces
 // its own partial rows without an intermediate buffer or a second launch.
 const PROJECT_FLOAT6_ENTRY: &str = r#"
 extern "C" __global__ void project_float6(const float* x, const unsigned char* w, float* y,
-                                          const int k, const int groups, const int tag) {
-    __shared__ float partial[8][32][4];
+                                          const int k, const int groups) {
+    const int width = blockDim.x;
+    __shared__ float partial[4][8][16];
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
-    for (long long tile = blockIdx.x; tile * 32 < groups; tile += gridDim.x) {
-        const long long group = tile * 32 + lane;
+    for (long long tile = blockIdx.x; tile * width < groups; tile += gridDim.x) {
+        const long long group = tile * width + lane;
         float accum[4] = {0, 0, 0, 0};
         if (group < groups) {
             for (long long row = warp; row < k; row += 8) {
@@ -156,18 +157,18 @@ extern "C" __global__ void project_float6(const float* x, const unsigned char* w
                 const float a = x[row];
                 #pragma unroll
                 for (int j = 0; j < 4; ++j)
-                    accum[j] = fmaf(a, decode_float6((bits >> (j * 6)) & 63, tag), accum[j]);
+                    accum[j] = fmaf(a, decode_float6((bits >> (j * 6)) & 63, FLOAT6_TAG), accum[j]);
             }
         }
         #pragma unroll
-        for (int j = 0; j < 4; ++j) partial[warp][lane][j] = accum[j];
+        for (int j = 0; j < 4; ++j) partial[j][warp][lane] = accum[j];
         __syncthreads();
         if (warp == 0 && group < groups) {
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 float sum = 0;
                 #pragma unroll
-                for (int r = 0; r < 8; ++r) sum += partial[r][lane][j];
+                for (int r = 0; r < 8; ++r) sum += partial[j][r][lane];
                 y[group * 4 + j] = sum;
             }
         }
@@ -199,22 +200,26 @@ impl Kernel for Float6Projection {
             cuptr(inputs[1].data_ptr::<u8>() as *const c_void),
             cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void),
         );
-        let tag = inputs[1].dtype.to_onnx();
-        let source = format!("{CAST_HELPERS}{PROJECT_FLOAT6_ENTRY}");
+        use std::sync::LazyLock;
+        static E2M3: LazyLock<String> = LazyLock::new(|| {
+            format!("#define FLOAT6_TAG 27\n{CAST_HELPERS}{PROJECT_FLOAT6_ENTRY}")
+        });
+        static E3M2: LazyLock<String> = LazyLock::new(|| {
+            format!("#define FLOAT6_TAG 28\n{CAST_HELPERS}{PROJECT_FLOAT6_ENTRY}")
+        });
+        let (module, source) = if inputs[1].dtype == DataType::Float6E2M3 {
+            ("float6_projection_e2m3", &*E2M3)
+        } else {
+            ("float6_projection_e3m2", &*E3M2)
+        };
         let func = self
             .runtime
-            .nvrtc_function("float6_projection", &source, "project_float6")?;
+            .nvrtc_function(module, source, "project_float6")?;
         let mut launch = self.runtime.stream().launch_builder(&func);
-        launch
-            .arg(&x)
-            .arg(&w)
-            .arg(&y)
-            .arg(&k)
-            .arg(&groups)
-            .arg(&tag);
+        launch.arg(&x).arg(&w).arg(&y).arg(&k).arg(&groups);
         let cfg = LaunchConfig {
-            grid_dim: ((groups as u32).div_ceil(32).min(65_535), 1, 1),
-            block_dim: (32, 8, 1),
+            grid_dim: ((groups as u32).div_ceil(16).min(65_535), 1, 1),
+            block_dim: (16, 8, 1),
             shared_mem_bytes: 0,
         };
         // SAFETY: dense device buffers were validated and the launch matches the NVRTC ABI.

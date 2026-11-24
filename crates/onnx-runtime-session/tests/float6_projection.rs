@@ -27,9 +27,7 @@ fn value(name: &str, dims: [i64; 2]) -> onnx::ValueInfoProto {
     }
 }
 
-fn check_projection(device: DevicePreference, cuda: bool) {
-    const K: usize = 1024;
-    const N: usize = 2048;
+fn check_projection<const K: usize, const N: usize>(device: DevicePreference, cuda: bool) {
     for (tag, kind, expected) in [
         (
             27,
@@ -63,7 +61,7 @@ fn check_projection(device: DevicePreference, cuda: bool) {
         }
         let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
         let path = dir.join(format!(
-            "float6-projection-{kind}-{cuda}-{}.safetensors",
+            "float6-projection-{kind}-{cuda}-{K}x{N}-{}.safetensors",
             std::process::id()
         ));
         std::fs::write(&path, bytes).unwrap();
@@ -138,6 +136,19 @@ fn check_projection(device: DevicePreference, cuda: bool) {
             let builder = InferenceSession::builder()
                 .model_bytes(&model.encode_to_vec())
                 .device(device.clone());
+            #[cfg(feature = "cuda")]
+            let timing_ep = (bench && cuda && arm != 1).then(|| {
+                use onnx_runtime_ep_api::{EpConfig, ExecutionProvider};
+                let mut ep = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0).unwrap();
+                ep.initialize(&EpConfig::default()).unwrap();
+                std::sync::Arc::new(ep)
+            });
+            #[cfg(feature = "cuda")]
+            let builder = if let Some(ep) = &timing_ep {
+                builder.execution_provider(ep.clone())
+            } else {
+                builder
+            };
             let mut session = if arm != 2 {
                 builder.keyed_weight_file(KeyedWeightFile::safetensors(&path))
             } else {
@@ -186,7 +197,7 @@ fn check_projection(device: DevicePreference, cuda: bool) {
                     "{kind} col {col}, arm {arm}: got {actual}, expected {reference} ± {tolerance}"
                 );
             }
-            if cuda && arm == 0 {
+            if cuda && (arm == 0 || (bench && arm == 2)) {
                 use onnx_runtime_ir::DataType;
                 let mut input = session
                     .allocate_device_binding(
@@ -210,7 +221,8 @@ fn check_projection(device: DevicePreference, cuda: bool) {
                     onnx_runtime_session::DeviceGraphCaptureResult::Captured(_)
                 ));
                 assert_eq!(session.captured_graph_segment_count(), 1);
-                let before = session.device_allocation_counts().unwrap();
+                let allocations_after_capture =
+                    session.device_allocation_counts().unwrap().allocations;
                 assert!(session.replay_device_graph(&mut bindings).unwrap());
                 let readback = bindings[1].read_bytes().unwrap();
                 assert_eq!(readback.len(), out.len() * 4);
@@ -218,13 +230,49 @@ fn check_projection(device: DevicePreference, cuda: bool) {
                     let captured = f32::from_le_bytes(bytes.try_into().unwrap());
                     assert_eq!(captured, expected, "{kind}: captured projection");
                 }
-                assert_eq!(session.device_allocation_counts().unwrap(), before);
+                // The first synchronized read can retire buffers from before capture.
+                // It must not allocate, and subsequent replays must keep both counters stable.
+                let warmed = session.device_allocation_counts().unwrap();
+                assert_eq!(warmed.allocations, allocations_after_capture);
+                assert!(session.replay_device_graph(&mut bindings).unwrap());
+                assert_eq!(bindings[1].read_bytes().unwrap(), readback);
+                assert_eq!(session.device_allocation_counts().unwrap(), warmed);
+                #[cfg(feature = "cuda")]
+                if let Some(ep) = &timing_ep {
+                    use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+                    let runtime = ep.runtime();
+                    let stream = runtime.stream();
+                    let context = runtime.cuda_context();
+                    let start = context.new_event(Some(CU_EVENT_DEFAULT)).unwrap();
+                    let end = context.new_event(Some(CU_EVENT_DEFAULT)).unwrap();
+                    const REPLAYS: usize = 256;
+                    let mut batch = || {
+                        start.record(stream).unwrap();
+                        let host = std::time::Instant::now();
+                        for _ in 0..REPLAYS {
+                            assert!(session.replay_device_graph(&mut bindings).unwrap());
+                        }
+                        let dispatch_us = host.elapsed().as_secs_f64() * 1e6 / REPLAYS as f64;
+                        end.record(stream).unwrap();
+                        let stream_us =
+                            f64::from(start.elapsed_ms(&end).unwrap()) * 1e3 / REPLAYS as f64;
+                        (stream_us, dispatch_us)
+                    };
+                    let warmup = std::time::Instant::now();
+                    while warmup.elapsed() < std::time::Duration::from_secs(8) {
+                        std::hint::black_box(batch());
+                    }
+                    let samples: [_; 5] = std::array::from_fn(|_| batch());
+                    eprintln!(
+                        "{kind} CUDA K={K} N={N} arm={arm} (stream_us, host_dispatch_us)={samples:.2?}"
+                    );
+                }
                 assert!(session.reset_device_graph().unwrap());
             }
             if bench && arm != 1 {
                 let activation_peak = session.activation_memory_plan_stats().map(|s| s.peak_bytes);
                 let warmup = std::time::Instant::now();
-                while warmup.elapsed() < std::time::Duration::from_secs(8) {
+                while warmup.elapsed() < std::time::Duration::from_secs(if cuda { 1 } else { 8 }) {
                     std::hint::black_box(session.run(&[("X", &x)]).unwrap());
                 }
                 let mut wall_us = [0.0; 5];
@@ -250,12 +298,19 @@ fn check_projection(device: DevicePreference, cuda: bool) {
 
 #[test]
 fn float6_safetensors_projection_cpu() {
-    check_projection(DevicePreference::Cpu, false);
+    check_projection::<1024, 2048>(DevicePreference::Cpu, false);
+    if std::env::var_os("NXRT_TEST_FLOAT6_TIMING").is_some() {
+        check_projection::<4096, 4096>(DevicePreference::Cpu, false);
+    }
 }
 
 #[cfg(feature = "cuda")]
 #[test]
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA GPU and NVRTC")]
 fn float6_safetensors_projection_cuda() {
-    check_projection(DevicePreference::Gpu { index: Some(0) }, true);
+    let device = DevicePreference::Gpu { index: Some(0) };
+    check_projection::<1024, 2048>(device.clone(), true);
+    if std::env::var_os("NXRT_TEST_FLOAT6_TIMING").is_some() {
+        check_projection::<4096, 4096>(device, true);
+    }
 }
