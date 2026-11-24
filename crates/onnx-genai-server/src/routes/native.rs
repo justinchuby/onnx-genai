@@ -366,13 +366,24 @@ fn prepare(
         output_budget,
     )
     .map_err(|err| ApiError::invalid_request(format!("{err:#}")))?;
-    options.max_json_bytes = state.config.replay_buffer_bytes;
+    options.max_constraint_bytes = state.config.replay_buffer_bytes;
     options.resolve_sampling_defaults(
         handle.generation_defaults.as_ref(),
         &super::completions::chat_sampling_overrides(&request.sampling),
     );
     options.max_context = handle.model_max_context;
-    if options.constraint.is_some() {
+    crate::reasoning_request::ReasoningRequest::extract(&request.sampling)
+        .and_then(|controls| {
+            controls.apply(
+                &mut options,
+                &handle.tokenizer,
+                crate::reasoning_request::BudgetContext::Raw,
+            )
+        })
+        .map_err(|error| {
+            ApiError::invalid_request(format!("invalid native reasoning controls: {error:#}"))
+        })?;
+    if options.constraint.is_some() || options.reasoning_budget.is_some() {
         options
             .validate_processors(&handle.tokenizer)
             .map_err(|error| {

@@ -208,7 +208,7 @@ pub(crate) fn extract_last_row(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
     Ok(values[values.len() - width..].to_vec())
 }
 
-fn tensor_to_f32(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
+pub(super) fn tensor_to_f32(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
     match tensor.dtype {
         DataType::Float32 => Ok(tensor.to_vec_f32()),
         DataType::Float16 => Ok(tensor

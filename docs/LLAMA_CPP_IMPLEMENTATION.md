@@ -963,7 +963,7 @@ can leave literal. NUL/newline/control/DEL values and an escaped newline propert
 name now have actual schema next-token checks. All 3 selected schema-prefill
 cases and strict native-engine all-target Clippy passed after this refinement.
 
-Reusable JSON byte recognition: `JsonByteCursor` compiles a schema once against
+Reusable JSON byte recognition: `GrammarByteCursor` compiles a schema once against
 a byte vocabulary independent of model token IDs. Candidate preview rolls back
 accepted bytes after both viable and rejected trials; atomic commit rejects an
 invalid suffix without retaining its accepted prefix. Status distinguishes viable
@@ -1009,7 +1009,7 @@ open, including partial-byte/framing viability and decoder context agreement.
 
 ### Channel-aware JSON sampling through the production processor chain
 
-`ResponseJson` composes the model tokenizer, declared response projection and a
+`GenerateOptions.response_projection` composes the model tokenizer, declared response framing and a
 compiled JSON Schema cursor in the mandatory generation processor chain. The
 actual rendered assistant prefix primes all three; JSON validates only the
 selected content field, so reasoning can continue before the content boundary.
@@ -1148,7 +1148,7 @@ stops and output/context limits retain their existing partial-value behavior.
 A transactional plain projection retains split UTF-8 and restores rejected,
 failed or panicking inspections. The old character-only generation constraint
 was removed, with no alias. Its pure syntax preflight is now the
-`validate_json_prefix` function. One positive `GenerateOptions.max_json_bytes`
+`validate_json_prefix` function. One positive `GenerateOptions.max_constraint_bytes`
 budget replaces the response-only duplicate; HTTP admission supplies the actual
 configured response buffer limit. All constrained chat/native/legacy generation requests
 validate capability and prefix before execution or SSE headers. Prefix errors
@@ -1194,3 +1194,176 @@ ordered Unicode prefix stripping, rewind, special-marker preservation and actual
 tokenizer panic containment. The full suite on main 332396bcf plus these changes
 passed 734 engine tests (1 inherited ignore) and 405 server tests (2 inherited
 ignores). These are functional checks, with no performance claim.
+
+
+## Optional MCP HTTP transport
+
+The official frontend's GET/POST `/cors-proxy` transport is implemented behind
+an independent opt-in network policy. Target admission checks every resolved
+address and pins those addresses into a client that disables environment proxies
+and automatic redirects. Only explicitly prefixed browser headers are eligible
+for forwarding. Redirects return through admission and strip forwarding headers
+when target origins differ, while preserving representation negotiation.
+Remote headers cannot set inference-origin cookies, CORS grants, storage or
+transport policy; remote documents receive a sandbox CSP.
+
+Request and response bytes and idle wait durations have positive operator
+limits. A bounded response queue propagates backpressure, the response body owns
+the transfer task, and dropping the reader cancels it. Timeout after a stalled
+reader remains an error rather than a successful truncated response. Native
+server tools, local tool execution and the other unchecked compatibility work
+remain separate delivery items. Fourteen new proxy/CLI tests passed, including
+real local SSE delivery before EOF, request/response byte limits, disconnect,
+stalled-reader timeout, cross-origin credential isolation and connection quota
+release and active SSE continuing beyond the idle interval. The full server
+library suite passed 419 tests with 2 inherited ignores. Strict server all-target
+Clippy passed. This increment does not complete the remaining delivery items.
+
+
+## Declared reasoning budgets and grammar prefill
+
+Reasoning budgets lower into a mandatory engine processor shared by host sampling
+paths. A resolved token protocol validates open/end/forced IDs, supports finite
+or unlimited windows, tracks natural closes, re-arms on repeated blocks and
+finishes split Unicode before forcing. Generated-history checkpoints preserve
+manual-control revisions and forced-token position through rewind and independent
+sampler branches. Existing prefill is charged but never consumes an ungenerated
+forced close. Forced IDs cannot resurrect a banned or grammar-rejected logit.
+
+The server resolves chat protocols from declared response boundaries and the
+final assistant anchor, with authored closer order retained separately from
+longest-match scanning. Native/legacy callers can supply an explicit protocol.
+Ordinary models retain compatibility with the upstream UI's unconditional
+optional arming hint, while explicit finite protocols fail actionably when they
+cannot be represented. JSON/Schema/Regex/Lark share generation_prompt prefill;
+the Regex Rust API now carries pattern and prefix with all callers updated.
+Anthropic enabled thinking budgets lower to the same request controls.
+
+Real ONNX buffered/logprob-SSE requests prove forced close followed by answer
+publication for zero/one-token budgets; native and legacy wire routes preserve
+raw protocol text. Actual Native-backend inference also passes the forced-close
+contract. The full engine suite passed 932 tests (1 inherited ignore), and the
+full server suite passed 432 tests (2 inherited ignores). Strict engine/server
+all-target Clippy passed. These are functional checks without performance claims.
+Live chat and legacy completions own bounded registrations until their consumer
+ends, with replay producers retaining control independently of reader reconnects.
+128-bit operating-system-random completion IDs prevent timestamp collisions.
+POST /control validates the action and signals the same resolved engine budget;
+unknown/finished and unarmed IDs return success:false. Native budget requests do
+not yet publish IDs for manual control. The final server suite passed 436 tests (2 inherited ignores), including HTTP
+control reaching real ONNX inference, capacity/completed-ID coverage and failure/
+disconnect cleanup. Strict server all-target Clippy passed. The manual-signal
+inference test signals before submission to avoid racing the tiny fixture; it
+does not claim an end-to-end midstream timing test.
+Other unchecked delivery items remain required.
+
+
+## Projected literal grammars and tool observation
+
+One resolved ResponseProjection now owns the template, actual assistant prefill
+and response buffer bound for both grammar constraints and transactional tool
+observation. Json/JsonSchema/Regex/Lark retain their respective languages;
+response-only constraint variants are removed from the pre-release Rust API.
+Constraint prefixes must be empty when the projection owns prefill. Plain
+constraints retain their own prefix. The shared byte cursor is GrammarByteCursor,
+and max_constraint_bytes applies to raw/logical constrained text.
+
+Literal text grammars use the same transactional response projection as JSON
+without canonicalizing their escape spellings. Compiled grammar inspection
+rejects model-token references, token-based limits, rule temperatures and hidden
+stops rather than silently interpreting model token IDs as byte IDs. Unprojected
+model-token Lark remains token-aware. The subsequent raw GBNF increment is described below.
+
+Tool observation consumes only the declared content channel, including tool
+prefill. Actual ONNX regression first demonstrated HTTP 500 from a reasoning
+closer being interpreted as text before a tool envelope; it now passes for
+forced Specific tool requests and Auto requests without a grammar. Tool examples
+inside reasoning are retained as reasoning and never become committed calls.
+Buffered tool turns retain reasoning_content, matching live SSE behavior.
+Malformed assistant tool prefill is a typed client error before generation and
+SSE admission, with continuation/chat-template repair context.
+
+Resolved byte codecs retain split UTF-8 and special channel markers. Contextual
+byte decoders without that streaming contract defer observation until terminal
+canonical decoding, with the reason retained in Debug state. Checkpoints and
+aborts restore raw bytes, input representation and projected parser history.
+Backend decoder panics preserve model-token and tokenizer.decoder context.
+
+On main 01632f548 plus the compatibility increments, the complete engine suite
+passed 940 tests (1 inherited ignore), server passed 437 (2 inherited ignores),
+and HTTP integration passed all 37 tests. Explicitly enabling the server's
+native-backend feature passed 446 server tests (2 inherited ignores), including
+the actual Native reasoning-budget and projected-tool cases. Strict engine/server
+all-target Clippy passed for the default feature combination and server Clippy
+also passed with native-backend enabled. The final tool regression explicitly
+selects ORT or Native, covering forced/Auto tools, buffered/SSE/logprob delivery
+and reasoning exclusion. These are functional checks without performance claims.
+The broader unchecked delivery items remain required.
+
+
+## Raw GBNF generation constraints
+
+Add an explicit `GenerateConstraint::Gbnf` without a prefix field: user grammars
+operate on new raw model output, while internal forced-tool Lark remains scoped
+to projected content. This distinction follows the pinned upstream
+[grammar parser](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-grammar.cpp)
+and [sampling initialization](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/sampling.cpp).
+A bounded AST lowers Unicode classes, literals, recursion, groups, repetitions
+and model-token references into model-aware Lark. Numeric IDs must exist in the
+loaded vocabulary; named references use actual model tokenization. A resolved
+ByteStreamContract proves actual decoder bytes and dense IDs. Raw special-token
+pieces remain available to character literals, matching the pinned upstream
+[vocabulary cache](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-vocab.cpp).
+Only explicit ending roles get EOS frames; adapter name-based role guesses and
+decoded-token fallback are excluded. Contextual initial stripping remains an
+explicit unsupported capability on this raw model-token path.
+
+Adversarial mask tests exposed two real semantic differences: negated token
+ranges could allow EOS before the root completed, and llguidance canonical
+forcing could exclude a legal compound token. The GBNF path now proves root
+completion for all ending roles and disables canonical forcing. Literal `{0}`
+is lowered to epsilon because the target Lark parser rejects a zero upper bound.
+History rewind/recovery, nullable recursion, expanded repetition, Unicode scalar
+limits and incomplete UTF-8 pieces have executable coverage.
+
+HTTP preparation rejects conflicting JSON/forced-tool/ignore-EOS controls and
+validates syntax, model token references and decoder capability before SSE.
+Shared public request builders apply the same grammar validation. Neutral lazy,
+trigger and preserved-token fields are accepted; active forms are rejected.
+Native `n_probs` was confirmed as a separate missing protocol feature and remains
+required by the overall compatibility goal. Raw `%llguidance` syntax and active
+lazy grammars are also still required follow-ups.
+
+Final validation: engine libraries 948 passed / 1 inherited ignore; server
+libraries 449 passed / 2 inherited ignores; HTTP integration 37 passed. Strict
+engine/server all-target Clippy passed. Explicit Native CPU and ORT tests cover
+all three completion endpoints, buffered/logprob SSE, reasoning-budget interaction,
+neutral grammar controls, conflicting fields and malformed input before SSE.
+This increment does not close the goal.
+
+
+### Native-default CLI portability
+
+The profiling subprocess test now selects ORT explicitly for its CPU reference
+run and independently checks that an ordinary command records Native as its
+actual backend. CI previously exposed a Windows process-main stack overflow
+once Native became the default. The shared CLI entry point now executes on a
+named standard Rust worker, including calls from Python. It honors Rust's
+standard worker-stack configuration, preserves panic payloads, and reports
+thread startup failures with recovery advice.
+
+Native is the default computation backend. The workflow tensor bridge and the
+optional hybrid MTP head still use ORT APIs; eliminating those runtime library
+dependencies is separate unfinished work, tracked by a local missing-ORT
+subprocess regression. The Python package must retain its runtime dependency
+until that regression passes. This change does not claim ORT-free deployment.
+
+Final portability validation: 71 CLI unit tests and both real profiling
+subprocesses passed. A separate command with a 1 MiB process-main stack completed
+Native generation and recorded `decode_backend=native` and
+`execution_provider=native`. Strict all-target engine/server/CLI Clippy passed
+with `-D warnings`; formatting and diff checks passed. The integrated parent
+runtime had already passed engine 948 / 1 inherited ignore, server 449 / 2
+inherited ignores, and HTTP 37. The incidental host-string lint repairs passed
+11 CPU text-kernel tests and 6 session text integration tests / 1 inherited
+benchmark ignore. Windows CI remains the platform-specific confirmation.

@@ -1,4 +1,4 @@
-//! Transactional JSON text before and after declared response-channel projection.
+//! Transactional response text before and after declared response-channel projection.
 use crate::response_template::{
     IncompleteResponseUtf8, PrefixOutput, ResponseBufferExceeded, ResponseParser, ResponseTemplate,
 };
@@ -19,22 +19,23 @@ impl ProjectionKind {
         }
     }
 
-    pub(crate) fn create(&self, prefix: &str, max_bytes: usize) -> anyhow::Result<JsonProjection> {
+    pub(crate) fn create(&self, prefix: &str, max_bytes: usize) -> anyhow::Result<TextProjection> {
         match self {
             Self::Plain => {
-                let limit = NonZeroUsize::new(max_bytes)
-                    .context("JSON text byte budget must be positive; configure max_json_bytes")?;
+                let limit = NonZeroUsize::new(max_bytes).context(
+                    "constraint text byte budget must be positive; configure max_constraint_bytes",
+                )?;
                 if prefix.len() > limit.get() {
                     return Err(ResponseBufferExceeded { limit: limit.get() }.into());
                 }
-                Ok(JsonProjection::Plain(PlainText {
+                Ok(TextProjection::Plain(PlainText {
                     bytes: prefix.as_bytes().into(),
                     limit,
                 }))
             }
             Self::Declared(template) => {
-                template.require_json_boundaries()?;
-                Ok(JsonProjection::Declared(Box::new(ResponseParser::new(
+                template.require_constraint_boundaries()?;
+                Ok(TextProjection::Declared(Box::new(ResponseParser::new(
                     template.clone(),
                     prefix,
                     PrefixOutput::Include,
@@ -45,35 +46,35 @@ impl ProjectionKind {
     }
 }
 
-pub(crate) enum JsonProjection {
+pub(crate) enum TextProjection {
     Plain(PlainText),
     Declared(Box<ResponseParser>),
 }
 
-pub(crate) enum JsonView<'a> {
+pub(crate) enum TextView<'a> {
     Plain { text: &'a str, pending: &'a [u8] },
     Declared(&'a ResponseParser),
 }
 
-impl JsonView<'_> {
+impl TextView<'_> {
     pub(crate) fn content(&self, terminal: bool) -> String {
         match self {
             Self::Plain { text, .. } => (*text).into(),
-            Self::Declared(parser) => parser.json_content(terminal),
+            Self::Declared(parser) => parser.content_text(terminal),
         }
     }
 
     pub(crate) fn grammar_content(&self) -> String {
         match self {
             Self::Plain { text, .. } => (*text).into(),
-            Self::Declared(parser) => parser.grammar_json_content(),
+            Self::Declared(parser) => parser.grammar_content_text(),
         }
     }
 
     pub(crate) fn pending_bytes(&self) -> anyhow::Result<&[u8]> {
         match self {
             Self::Plain { pending, .. } => Ok(pending),
-            Self::Declared(parser) => Ok(parser.pending_json_bytes()?.unwrap_or_default()),
+            Self::Declared(parser) => Ok(parser.pending_content_bytes()?.unwrap_or_default()),
         }
     }
 
@@ -85,12 +86,12 @@ impl JsonView<'_> {
     }
 }
 
-impl JsonProjection {
+impl TextProjection {
     pub(crate) fn plain_pending(&self) -> anyhow::Result<Option<&[u8]>> {
         match self {
             Self::Declared(_) => Ok(None),
             Self::Plain(text) => {
-                let (_, pending) = split_json_utf8(&text.bytes)?;
+                let (_, pending) = split_text_utf8(&text.bytes)?;
                 Ok(Some(pending))
             }
         }
@@ -114,11 +115,11 @@ impl JsonProjection {
         &mut self,
         bytes: &[u8],
         terminal: bool,
-        inspect: impl FnOnce(JsonView<'_>) -> anyhow::Result<T>,
+        inspect: impl FnOnce(TextView<'_>) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         match self {
             Self::Declared(parser) => parser.with_preview(bytes, terminal, |parser| {
-                inspect(JsonView::Declared(parser))
+                inspect(TextView::Declared(parser))
             }),
             Self::Plain(text) => {
                 let trial = text.append(bytes)?;
@@ -172,23 +173,23 @@ struct PlainTrial<'a> {
     original: usize,
 }
 
-fn split_json_utf8(bytes: &[u8]) -> anyhow::Result<(&str, &[u8])> {
+fn split_text_utf8(bytes: &[u8]) -> anyhow::Result<(&str, &[u8])> {
     match std::str::from_utf8(bytes) {
         Ok(text) => Ok((text, &[])),
         Err(error) if error.error_len().is_none() => {
             let at = error.valid_up_to();
             let text = std::str::from_utf8(&bytes[..at])
-                .context("read validated JSON UTF-8 text before pending scalar")?;
+                .context("read validated response UTF-8 text before pending scalar")?;
             Ok((text, &bytes[at..]))
         }
         Err(error) => Err(anyhow::Error::new(error)
-            .context("JSON model token produces invalid UTF-8; use valid byte pieces or repair the tokenizer decoder")),
+            .context("model token produces invalid UTF-8; use valid byte pieces or repair the tokenizer decoder")),
     }
 }
 
 impl PlainTrial<'_> {
-    fn view(&self, terminal: bool) -> anyhow::Result<JsonView<'_>> {
-        let (text, pending) = split_json_utf8(self.bytes)?;
+    fn view(&self, terminal: bool) -> anyhow::Result<TextView<'_>> {
+        let (text, pending) = split_text_utf8(self.bytes)?;
         if terminal && !pending.is_empty() {
             return Err(IncompleteResponseUtf8 {
                 bytes: pending.len(),
@@ -196,7 +197,7 @@ impl PlainTrial<'_> {
             }
             .into());
         }
-        Ok(JsonView::Plain { text, pending })
+        Ok(TextView::Plain { text, pending })
     }
 }
 
@@ -211,7 +212,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plain_json_projection_trials_preserve_partial_utf8_and_restore_errors() {
+    fn plain_text_projection_trials_preserve_partial_utf8_and_restore_errors() {
         let mut projection = ProjectionKind::Plain.create("\"", 16).unwrap();
         projection.commit(&[0xe7]).unwrap();
         assert!(
@@ -242,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_json_projection_rolls_back_budget_inspection_errors_and_panics() {
+    fn plain_text_projection_rolls_back_budget_inspection_errors_and_panics() {
         let mut projection = ProjectionKind::Plain.create("{", 2).unwrap();
         let error = projection
             .with_preview(b"}", true, |_| -> anyhow::Result<()> {

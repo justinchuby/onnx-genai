@@ -1008,7 +1008,7 @@ mod tests {
     #[tokio::test]
     async fn production_load_path_shares_device_authority_and_metrics_ledger() {
         let model_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let specs = vec![
             ModelSpec {
                 id: "first".to_string(),
@@ -1072,7 +1072,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_limit_update_applies_to_future_lazy_loads() {
         let model_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let specs = vec![
             ModelSpec {
                 id: "eager".to_string(),
@@ -1108,7 +1108,7 @@ mod tests {
     #[tokio::test]
     async fn failed_runtime_shrink_preserves_policy_and_ledger_limit() {
         let model_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let specs = vec![ModelSpec {
             id: "model".to_string(),
             path: model_dir,
@@ -1143,7 +1143,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_limit_update_with_no_loaded_models_applies_to_future_load() {
         let model_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let specs = vec![
             ModelSpec {
                 id: "eager".to_string(),

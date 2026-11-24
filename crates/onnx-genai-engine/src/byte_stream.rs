@@ -104,7 +104,7 @@ impl ByteStreamContract {
         for (path, stage) in &stages[..byte_index] {
             ensure!(
                 matches!(stage, DecoderWrapper::Replace(_) | DecoderWrapper::Strip(_)),
-                "{path} changes token context before the byte decoder; JSON output requires token-local transforms before one byte stage, or a separately resolved contextual decoder contract"
+                "{path} changes token context before the byte decoder; streaming protocol output requires token-local transforms before one byte stage, or a separately resolved contextual decoder contract"
             );
         }
         let byte_level = matches!(stages[byte_index].1, DecoderWrapper::ByteLevel(_));
@@ -123,7 +123,7 @@ impl ByteStreamContract {
                     }
                 }
                 _ => anyhow::bail!(
-                    "{path} needs a contextual byte-stream contract: after a byte decoder, JSON output currently supports Fuse and initial Strip on a fused stream; trailing stripping and other context-changing stages need explicit streaming support"
+                    "{path} needs a contextual byte-stream contract: after a byte decoder, streaming protocol output currently supports Fuse and initial Strip on a fused stream; trailing stripping and other context-changing stages need explicit streaming support"
                 ),
             }
         }
@@ -134,12 +134,12 @@ impl ByteStreamContract {
             vocab
                 .values()
                 .all(|id| usize::try_from(*id).is_ok_and(|id| id < size)),
-            "JSON byte decoding requires dense tokenizer.model.vocab IDs; repair tokenizer.json before enabling this byte-stream contract"
+            "streaming byte decoding requires dense tokenizer.model.vocab IDs; repair tokenizer.json before enabling this byte-stream contract"
         );
         let specials = tokenizer.inner().get_added_tokens_decoder();
         let mut pieces = Vec::with_capacity(size);
         for index in 0..size {
-            let id = u32::try_from(index).context("JSON byte vocabulary exceeds token IDs")?;
+            let id = u32::try_from(index).context("byte-stream vocabulary exceeds token IDs")?;
             if policy == SpecialTokenHandling::Skip
                 && specials.get(&id).is_some_and(|token| token.special)
             {
@@ -205,6 +205,12 @@ impl ByteStreamContract {
 }
 
 impl ByteStreamState {
+    pub(crate) fn has_pending_prefix(&self) -> bool {
+        self.strips
+            .iter()
+            .any(|strip| matches!(strip,StripState::Matching {matched,..} if !matched.is_empty()))
+    }
+
     pub(crate) fn is_identity(&self) -> bool {
         self.strips
             .iter()

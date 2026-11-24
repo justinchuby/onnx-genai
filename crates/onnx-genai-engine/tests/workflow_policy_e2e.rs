@@ -1299,7 +1299,13 @@ pipeline:
             ("eos.onnx.textproto", termination.as_str()),
         ],
     )?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(
+        &root,
+        EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..Default::default()
+        },
+    )?;
     let run = |engine: &mut onnx_genai_engine::Engine, min_p: f32| {
         let mut generate = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
         generate.options.min_p = min_p;
@@ -1514,7 +1520,13 @@ pipeline:
             ("sampler.onnx.textproto", sampler.as_str()),
         ],
     )?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(
+        &root,
+        EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..Default::default()
+        },
+    )?;
     let output = engine.run_pipeline(
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
             .with_input(
@@ -2371,6 +2383,18 @@ pipeline:
 
 #[test]
 fn workflow_combines_speculation_grammar_and_adaptive_budget() -> anyhow::Result<()> {
+    for backend in [
+        EngineConfig::default().decode_backend,
+        onnx_genai_engine::EngineDecodeBackend::Ort,
+    ] {
+        combined_speculation_grammar_case(backend)?;
+    }
+    Ok(())
+}
+
+fn combined_speculation_grammar_case(
+    backend: onnx_genai_engine::EngineDecodeBackend,
+) -> anyhow::Result<()> {
     let metadata = r#"
 pipeline:
   workflow:
@@ -2704,7 +2728,13 @@ pipeline:
             ("guided.onnx.textproto", GUIDED_SAMPLER),
         ],
     )?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(
+        &root,
+        EngineConfig {
+            decode_backend: backend,
+            ..Default::default()
+        },
+    )?;
     let target = [
         0.0, 1.0, 0.0, 0.0, 0.0, // token 1
         0.0, 0.0, 1.0, 0.0, 0.0, // token 2
@@ -2772,6 +2802,11 @@ pipeline:
             changed["final_grammar_state"].to_vec_i64()?,
             output["final_grammar_state"].to_vec_i64()?
         );
+    }
+    // Semantic outputs above apply to both backends. These counters describe
+    // the ORT component-session island optimization specifically.
+    if backend != onnx_genai_engine::EngineDecodeBackend::Ort {
+        return Ok(());
     }
     let islands = engine.execution_island_diagnostics();
     assert!(

@@ -1,12 +1,13 @@
-"""onnx_genai — ONNX Runtime-backed text generation.
+"""onnx_genai — Native text generation.
 
-Same API as ``nxrt.genai`` (``Engine`` / ``GenerateResult``), implemented on
-ONNX Runtime so it stays ONNX Runtime compatible.
+Same API as ``nxrt.genai`` (``Engine`` / ``GenerateResult``), with Native
+execution selected by default. ORT remains linked for runtime infrastructure
+and explicit reference tests.
 
 The ONNX Runtime shared library is intentionally **not** bundled in this wheel.
 It is loaded at import time from the installed ``onnxruntime`` (CPU) or
-``onnxruntime-gpu`` (CUDA) wheel, so ``onnx_genai`` automatically uses whichever
-execution providers the user installed. Install the CUDA runtime with
+``onnxruntime-gpu`` (CUDA) wheel, for runtime infrastructure and reference
+execution. Install the CUDA runtime with
 ``pip install onnx-genai[cuda]`` on Windows/Linux; on macOS the
 ``onnxruntime-ep-mlx`` plugin is pulled in by default for Apple Silicon.
 """
