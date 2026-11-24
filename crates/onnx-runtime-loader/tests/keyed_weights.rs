@@ -282,27 +282,48 @@ fn binds_safetensors_float4_in_onnx_nibble_order() {
 }
 
 #[test]
-fn diagnoses_float6_runtime_dtype_limitation() {
+fn maps_both_float6_formats_and_rejects_partial_or_wrong_sized_tensors() {
     let dir = directory("keyed_safetensors_f6");
-    for (kind, bytes) in [
-        ("F6_E2M3", [0x24, 0xc2, 0x40]),
-        ("F6_E3M2", [0x28, 0xe3, 0x40]),
+    for (kind, dtype, bytes) in [
+        ("F6_E2M3", 27, [0x24, 0xc2, 0x40]),
+        ("F6_E3M2", 28, [0x28, 0xe3, 0x40]),
     ] {
         let header =
             format!(r#"{{"packed":{{"dtype":"{kind}","shape":[4],"data_offsets":[0,3]}}}}"#);
         let file = safetensors(&dir, &format!("{kind}.safetensors"), &header, &bytes);
-        let error = load_model_bytes_with_keyed_weights(
-            &model(vec![initializer("packed", 2, &[3], &[])]),
+        let (graph, store) = load_model_bytes_with_keyed_weights(
+            &model(vec![initializer("packed", dtype, &[4], &[])]),
             &dir,
             &[file],
         )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            error.contains(kind)
-                && error.contains("cannot represent the corresponding ONNX FLOAT6 dtype"),
-            "{error}"
+        .unwrap();
+        assert_eq!(
+            mapped_bytes(&store, graph.initializers.values().next().unwrap()),
+            bytes
         );
+        for (numel, size, diagnostic) in [(3, 3, "does not fill whole bytes"), (4, 2, "requires 3")]
+        {
+            let header = format!(
+                r#"{{"packed":{{"dtype":"{kind}","shape":[{numel}],"data_offsets":[0,{size}]}}}}"#
+            );
+            let file = safetensors(
+                &dir,
+                &format!("{kind}-{numel}-{size}.safetensors"),
+                &header,
+                &bytes[..size],
+            );
+            let error = load_model_bytes_with_keyed_weights(
+                &model(vec![initializer("packed", dtype, &[numel], &[])]),
+                &dir,
+                &[file],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(kind) && error.contains(diagnostic),
+                "{error}"
+            );
+        }
     }
 }
 
