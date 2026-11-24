@@ -12,7 +12,9 @@
 //! This module replaces the wait with an ordering fact. Enqueue records a
 //! completion event at the current tail of **both** streams and returns
 //! immediately; a worker polls those events without blocking and performs the
-//! physical release only once every recorded event has completed. Nothing here
+//! physical release only once every recorded event has completed. A failed
+//! legacy-default-stream upload latches an additional default-stream fence into
+//! subsequent releases; the ordinary path still records just two events. Nothing here
 //! ever calls `cuCtxSynchronize`, `cuStreamSynchronize`, or `cuEventSynchronize`.
 //!
 //! # What the queue owns
@@ -90,9 +92,9 @@ pub trait ReleaseFence: Send + Sync + Debug {
 /// Where a release request's ordering fences come from.
 ///
 /// The production implementation records one event on the compute stream and
-/// one on the dedicated copy stream, which is the whole ordering claim this
-/// queue makes: a release runs after every kernel and every transfer that could
-/// still touch the memory.
+/// one on the dedicated copy stream. An unsettled legacy upload adds that
+/// stream's tail too: release waits for every recorded point that could still
+/// touch the memory.
 pub trait ReleaseFenceSource: Send + Sync + Debug {
     /// Record completion fences at the current tail of every relevant stream.
     ///
@@ -1195,7 +1197,9 @@ impl Drop for PreparedReleaseAction {
 /// One event is recorded at the tail of the compute stream and one at the tail
 /// of the dedicated copy stream, so a release is ordered after *both* the
 /// kernels and the transfers that could still be reading the memory. Recording
-/// an event is asynchronous: this never waits for either stream.
+/// an event is asynchronous: this never waits for either stream. If a legacy
+/// synchronous upload failed without a completion proof, subsequent releases
+/// additionally fence the legacy default stream. Ordinary releases keep two fences.
 #[derive(Debug)]
 pub struct CudaStreamFences {
     runtime: Arc<crate::runtime::CudaRuntime>,
@@ -1207,17 +1211,33 @@ impl CudaStreamFences {
     }
 }
 
+fn release_streams<'a, S>(
+    compute: &'a S,
+    copy: &'a S,
+    legacy: Option<&'a S>,
+) -> impl Iterator<Item = (&'a S, &'static str)> {
+    [(compute, "compute"), (copy, "copy")]
+        .into_iter()
+        .chain(legacy.map(|stream| (stream, "legacy default")))
+}
+
 impl ReleaseFenceSource for CudaStreamFences {
     fn record(&self) -> Result<Vec<Box<dyn ReleaseFence>>, String> {
         self.runtime
             .bind()
             .map_err(|error| format!("could not bind the CUDA context: {error}"))?;
         let context = self.runtime.cuda_context();
-        let mut fences: Vec<Box<dyn ReleaseFence>> = Vec::with_capacity(2);
-        for (stream, name) in [
-            (self.runtime.stream(), "compute"),
-            (self.runtime.copy_stream(), "copy"),
-        ] {
+        let legacy_default = self
+            .runtime
+            .legacy_upload_needs_release_fence()
+            .then(|| context.default_stream());
+        let mut fences: Vec<Box<dyn ReleaseFence>> =
+            Vec::with_capacity(if legacy_default.is_some() { 3 } else { 2 });
+        for (stream, name) in release_streams(
+            self.runtime.stream(),
+            self.runtime.copy_stream(),
+            legacy_default.as_ref(),
+        ) {
             let event = context
                 .new_event(None)
                 .map_err(|error| format!("cuEventCreate for the {name} stream failed: {error}"))?;
@@ -1440,6 +1460,56 @@ mod tests {
         assert_eq!(calls.load(Ordering::Acquire), 2);
         queue.poll();
         assert_eq!(calls.load(Ordering::Acquire), 2, "callback settles once");
+    }
+
+    #[test]
+    fn failed_legacy_upload_adds_a_third_required_release_fence() {
+        #[derive(Debug)]
+        struct Source {
+            compute: Arc<AtomicBool>,
+            copy: Arc<AtomicBool>,
+            legacy: Option<Arc<AtomicBool>>,
+        }
+        impl ReleaseFenceSource for Source {
+            fn record(&self) -> Result<Vec<Box<dyn ReleaseFence>>, String> {
+                Ok(
+                    release_streams(&self.compute, &self.copy, self.legacy.as_ref())
+                        .map(|(complete, _)| {
+                            Box::new(FakeFence {
+                                complete: complete.clone(),
+                                destroyed: None,
+                            }) as Box<dyn ReleaseFence>
+                        })
+                        .collect(),
+                )
+            }
+        }
+        let done = Arc::new(AtomicBool::new(true));
+        let legacy = Arc::new(AtomicBool::new(false));
+        assert_eq!(release_streams(&done, &done, None).count(), 2);
+        let queue = CudaDeferredReleaseQueue::manual(
+            Box::new(Source {
+                compute: done.clone(),
+                copy: done,
+                legacy: Some(legacy.clone()),
+            }),
+            1,
+        );
+        let executed = Arc::new(AtomicUsize::new(0));
+        queue
+            .enqueue(CountingAction {
+                executed: executed.clone(),
+            })
+            .expect("accepted");
+        assert_eq!(
+            queue.poll(),
+            0,
+            "compute/copy completion cannot release a pending legacy upload"
+        );
+        assert_eq!(executed.load(Ordering::Acquire), 0);
+        legacy.store(true, Ordering::Release);
+        assert_eq!(queue.poll(), 1);
+        assert_eq!(executed.load(Ordering::Acquire), 1);
     }
 
     #[test]

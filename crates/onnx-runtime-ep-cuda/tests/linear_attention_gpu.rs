@@ -495,6 +495,8 @@ fn opset27_range_half_stash_matches_expected() {
 
 #[test]
 #[ignore = "release microbenchmark; run on an idle GPU under the host benchmark lock"]
+// Keep this ignored probe debug-compilable; reject debug only when it runs.
+#[allow(clippy::assertions_on_constants)]
 fn opset27_recurrent_and_range_release_ab() {
     assert!(!cfg!(debug_assertions), "run this probe with --release");
     let cuda = require_cuda();

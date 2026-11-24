@@ -113,7 +113,8 @@ fn decode_axis(dtype: DataType, shape: &[usize], bytes: &[u8]) -> Result<i64> {
     }
 }
 
-#[cfg(all(test, feature = "gpu-tests"))]
+#[cfg(feature = "gpu-tests")]
+#[cfg(test)]
 mod tests {
     use super::*;
     use cudarc::driver::sys::CUevent_flags;

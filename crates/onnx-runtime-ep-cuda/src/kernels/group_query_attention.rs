@@ -3345,7 +3345,7 @@ impl GroupQueryAttentionKernel {
                 query_starts_gpu,
                 local_window_i,
                 self.softcap,
-                phase2a_scratch,
+                phase2a_scratch.ok_or_else(|| EpError::KernelFailed("cuda_ep GroupQueryAttention: Phase-2a route has no checked caller scratch; reprepare the composite workspace for the selected attention geometry".into()))?,
             )?;
         }
 
