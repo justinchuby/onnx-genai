@@ -694,9 +694,10 @@ impl Executor {
             // Preparation uses the same specialization binding as dispatch.
             // Reuse it before resolving constants or constructing a cache key:
             // both are cold-path work when concrete metadata has not changed.
-            let prebound = self.kernel_bindings[pi]
-                .as_ref()
-                .is_some_and(|binding| self.cache.has_prebound(binding, &input_shapes));
+            let shape_facts = self.kernel_shape_facts[pi];
+            let prebound = self.kernel_bindings[pi].as_ref().is_some_and(|binding| {
+                self.cache.has_prebound(binding, &input_shapes, shape_facts)
+            });
             if !prebound {
                 let constant_inputs = self.plan[pi]
                     .inputs
@@ -714,8 +715,6 @@ impl Executor {
                 let opset = effective_opset(&self.graph, node);
                 // Must match what dispatch computes for this node, or prepare-only
                 // planning would key a different kernel than execution uses.
-                let seq_independent =
-                    node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
                 let graph_tokens = std::array::from_fn(|index| {
                     let capture = &self.slot_capture[index];
                     capture
@@ -737,7 +736,7 @@ impl Executor {
                     &constant_inputs,
                     &constant_values,
                     opset,
-                    seq_independent,
+                    shape_facts,
                     self.artifact_config,
                     &mut self.provider_artifact_readiness,
                     self.ep.as_ref(),
@@ -765,6 +764,7 @@ impl Executor {
                         .as_ref()
                         .expect("workspace kernel binding installed"),
                     &input_shapes,
+                    shape_facts,
                 )
                 .expect("workspace kernel resolved immediately before lookup");
             let metadata = input_shapes

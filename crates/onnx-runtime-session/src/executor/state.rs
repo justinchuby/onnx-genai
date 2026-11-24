@@ -575,6 +575,8 @@ pub(crate) struct Executor {
     /// non-growing, not unified with a growing one) is absent from this set, so
     /// ops carrying it stay capturable — preserving the 154→34 collapse.
     pub(super) capture_growing_symbols: HashSet<SymbolId>,
+    /// Independent positive growth evidence, refreshed with capacity pinning.
+    pub(super) kernel_shape_facts: Vec<KernelShapeFacts>,
     /// KV sequence-axis symbols pinned CONSTANT to their bound physical capacity
     /// by [`Self::pin_fixed_capacity_kv_capture_symbols`] once the engine has
     /// bound fixed-capacity, device-valid-length KV (see
