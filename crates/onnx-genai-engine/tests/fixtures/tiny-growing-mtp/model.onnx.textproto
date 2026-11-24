@@ -1,0 +1,17 @@
+ir_version: 11
+opset_import { version: 21 }
+graph {
+name: "growing_mtp"
+node { op_type: "Add" input: "inputs_embeds" input: "hidden_states" output: "mtp_hidden" }
+node { op_type: "Unsqueeze" input: "inputs_embeds" input: "axes" output: "new_kv" }
+initializer { name: "axes" data_type: 7 dims: 1 int64_data: 1 }
+node { op_type: "Concat" input: "past_key_values.0.key" input: "new_kv" output: "present.0.key" attribute {name: "axis" type: INT i: 2} }
+node { op_type: "Concat" input: "past_key_values.0.value" input: "new_kv" output: "present.0.value" attribute {name: "axis" type: INT i: 2} }
+input { name: "inputs_embeds" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 1 } dim { dim_value: 2 } } } } }
+input { name: "hidden_states" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 1 } dim { dim_value: 2 } } } } }
+output { name: "mtp_hidden" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 1 } dim { dim_value: 2 } } } } }
+input { name: "past_key_values.0.key" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 1 } dim { dim_param: "past" } dim { dim_value: 2 } } } } }
+output { name: "present.0.key" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 1 } dim { dim_param: "total" } dim { dim_value: 2 } } } } }
+input { name: "past_key_values.0.value" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 1 } dim { dim_param: "past" } dim { dim_value: 2 } } } } }
+output { name: "present.0.value" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 1 } dim { dim_param: "total" } dim { dim_value: 2 } } } } }
+}

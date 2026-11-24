@@ -796,12 +796,26 @@ fn load_native_component(
                  the CPU native device / the ORT backend."
             );
         }
-        NativeDecodeDevice::Plugin { .. } => {
-            anyhow::bail!(
-                "native workflow component '{component}' requested a plugin execution provider, \
-                 which the native workflow backend does not support yet; use the CPU or CUDA \
-                 native device, or the ORT backend."
-            );
+        NativeDecodeDevice::Plugin {
+            library,
+            registration_name,
+            provider_name,
+        } => {
+            let ep = onnx_runtime_session::PluginExecutionProvider::new(
+                library.clone(),
+                registration_name.clone(),
+                provider_name.clone(),
+                provider_name,
+                Arc::clone(&cpu),
+            )
+            .with_context(|| {
+                format!(
+                    "initialize the selected native plugin provider for component '{component}'"
+                )
+            })?;
+            builder = builder
+                .device(DevicePreference::Cpu)
+                .execution_provider(Arc::new(ep));
         }
     }
     builder.build().with_context(|| {
@@ -812,4 +826,312 @@ fn load_native_component(
             path.display()
         )
     })
+}
+
+/// One admitted native MTP graph. Decode/KV state belongs to each proposer;
+/// the shared executor serializes access to the session's workspace caches.
+pub(crate) struct NativeMtpHead {
+    components: std::sync::Mutex<NativeComponentSet>,
+    io: onnx_genai_ort::GraphIoMetadata,
+    cuda_ordinal: Option<u32>,
+}
+impl NativeMtpHead {
+    pub(crate) fn load(
+        path: &Path,
+        device: &NativeDecodeDevice,
+        resources: onnx_runtime_ep_cpu::CpuMemoryResources,
+    ) -> anyhow::Result<Arc<Self>> {
+        let components = NativeComponentSet::load(
+            &BTreeMap::from([("mtp_head".into(), path.to_owned())]),
+            device,
+            resources,
+        )?;
+        let compiled = &components
+            .components
+            .get("mtp_head")
+            .context("native MTP head session was not admitted; reload the head graph")?
+            .session;
+        let convert = |ports: &[onnx_runtime_session::IoMeta]| -> anyhow::Result<Vec<onnx_genai_ort::TensorInfo>> {
+            ports.iter().map(|port| Ok(onnx_genai_ort::TensorInfo {
+                name: port.name.clone(),
+                dtype: ort_dtype_from_ir("mtp_head", &port.name, port.dtype)?,
+                shape: port.shape.iter().map(|dim| match dim {
+                    onnx_runtime_ir::Dim::Static(n) => i64::try_from(*n).with_context(|| format!("native MTP port '{}' has a dimension beyond i64; reduce the graph dimension", port.name)),
+                    onnx_runtime_ir::Dim::Symbolic(_) => Ok(-1),
+                }).collect::<anyhow::Result<_>>()?,
+            })).collect()
+        };
+        let io = onnx_genai_ort::GraphIoMetadata::new(
+            convert(compiled.inputs())?,
+            convert(compiled.outputs())?,
+        );
+        Ok(Arc::new(Self {
+            cuda_ordinal: components.cuda_ordinal(),
+            components: std::sync::Mutex::new(components),
+            io,
+        }))
+    }
+    pub(crate) fn executor(self: &Arc<Self>) -> Box<dyn onnx_genai_ort::MtpHeadExecution> {
+        Box::new(NativeMtpExecution {
+            head: Arc::clone(self),
+        })
+    }
+}
+struct NativeMtpExecution {
+    head: Arc<NativeMtpHead>,
+}
+impl onnx_genai_ort::GraphIo for NativeMtpExecution {
+    fn inputs(&self) -> &[onnx_genai_ort::TensorInfo] {
+        onnx_genai_ort::GraphIo::inputs(&self.head.io)
+    }
+    fn outputs(&self) -> &[onnx_genai_ort::TensorInfo] {
+        onnx_genai_ort::GraphIo::outputs(&self.head.io)
+    }
+    fn input_names(&self) -> &[String] {
+        onnx_genai_ort::GraphIo::input_names(&self.head.io)
+    }
+    fn output_names(&self) -> &[String] {
+        onnx_genai_ort::GraphIo::output_names(&self.head.io)
+    }
+}
+fn mtp_backend_error(operation: &str, error: anyhow::Error) -> onnx_genai_ort::OrtError {
+    onnx_genai_ort::OrtError::BackendExecution {
+        backend: "Native",
+        operation: operation.into(),
+        source: error.into_boxed_dyn_error(),
+    }
+}
+impl onnx_genai_ort::MtpHeadExecution for NativeMtpExecution {
+    fn run(&mut self, inputs: &[(&str, &Value)]) -> onnx_genai_ort::Result<Vec<Value>> {
+        use onnx_genai_ort::GraphIo;
+        let mut components = self.head.components.lock().map_err(|_| {
+            onnx_genai_ort::OrtError::InvalidArgument(
+                "native MTP workspace lock was poisoned; rebuild the head session".into(),
+            )
+        })?;
+        let produced = components
+            .run_component("mtp_head", inputs, &BTreeMap::new(), &BTreeMap::new())
+            .map_err(|error| mtp_backend_error("MTP head execution", error))?;
+        let mut by_name: HashMap<_, _> = produced.into_iter().collect();
+        self.output_names().iter().map(|name| by_name.remove(name).ok_or_else(|| onnx_genai_ort::OrtError::InvalidArgument(format!("native MTP head did not produce declared output '{name}'; repair the graph output mapping")))).collect()
+    }
+    fn materialize_f32_on_host(&self, value: &Value) -> onnx_genai_ort::Result<Vec<f32>> {
+        if value.is_host_resident()? {
+            return value.to_vec_f32_lossy();
+        }
+        #[cfg(feature = "native-cuda")]
+        if let Some(ordinal) = self.head.cuda_ordinal {
+            let device = i32::try_from(ordinal).map_err(|_| {
+                onnx_genai_ort::OrtError::InvalidArgument(format!(
+                    "MTP CUDA ordinal {ordinal} exceeds i32; select a valid device"
+                ))
+            })?;
+            return value.to_host_from_cuda(device)?.to_vec_f32_lossy();
+        }
+        Err(onnx_genai_ort::OrtError::InvalidArgument(format!(
+            "MTP requested a host hidden/state vector from a device tensor on {:?}, but no matching host-transfer adapter is available; use the declared native device",
+            self.head.cuda_ordinal
+        )))
+    }
+}
+
+#[cfg(test)]
+mod mtp_execution_tests {
+    use super::*;
+    use onnx_genai_ort::{
+        Environment, MtpDecodeOptions, MtpDecodeSession, Session, SessionOptions,
+    };
+
+    #[test]
+    fn native_mtp_head_matches_reference_and_runs_without_ort() -> anyhow::Result<()> {
+        const CHILD: &str = "NXRT_NATIVE_MTP_HEAD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "pipeline::native_component::mtp_execution_tests::native_mtp_head_matches_reference_and_runs_without_ort", "--nocapture"])
+                .env(CHILD, "1").env("ONNX_GENAI_ORT_LIB", "/missing/nxrt-native-mtp-head/onnxruntime")
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            anyhow::ensure!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "missing-library subprocess did not select its MTP test"
+            );
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (path, options) in [
+            (
+                root.join("../../tests/fixtures/tiny-qwen35-mtp/model.onnx.textproto"),
+                MtpDecodeOptions::default(),
+            ),
+            (
+                root.join("tests/fixtures/tiny-hc-mtp/model.onnx.textproto"),
+                MtpDecodeOptions {
+                    hc_mult: 2,
+                    hidden_state_rank4: true,
+                    state_output: Some("mtp_state".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                root.join("tests/fixtures/tiny-growing-mtp/model.onnx.textproto"),
+                MtpDecodeOptions {
+                    kv_mode: onnx_genai_ort::MtpDraftKvMode::GrowCache,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let head = NativeMtpHead::load(
+                &path,
+                &NativeDecodeDevice::Cpu,
+                onnx_runtime_ep_cpu::CpuMemoryResources::default(),
+            )?;
+            let mut native = MtpDecodeSession::from_executor(head.executor(), options.clone())?;
+            let h = native.signature().hidden_size;
+            let mut state = vec![0.1; h * options.hc_mult];
+            let embeds = vec![0.25; h];
+            let environment = if std::env::var_os(CHILD).is_none() {
+                Some(Environment::new("mtp-native-reference-test")?)
+            } else {
+                None
+            };
+            let mut reference = None;
+            let mut reference_state = state.clone();
+            if let Some(environment) = &environment {
+                let session = Arc::new(Session::new(
+                    environment,
+                    &path,
+                    SessionOptions::default().with_intra_op_threads(1),
+                )?);
+                reference = Some(MtpDecodeSession::new_owned(session, options.clone())?);
+            }
+            for position in 0..3 {
+                let actual = native.step_with_state(&embeds, &state, position)?;
+                anyhow::ensure!(
+                    actual.hidden.len() == h && actual.hidden.iter().all(|n| n.is_finite()),
+                    "native MTP hidden output is not a finite width-{h} vector"
+                );
+                if let Some(reference) = &mut reference {
+                    let expected =
+                        reference.step_with_state(&embeds, &reference_state, position)?;
+                    for (a, b) in actual.hidden.iter().zip(&expected.hidden) {
+                        anyhow::ensure!(
+                            (a - b).abs() <= 1e-4,
+                            "native MTP/reference mismatch at step {position}: {a} vs {b}"
+                        );
+                    }
+                    anyhow::ensure!(
+                        actual.state.len() == expected.state.len(),
+                        "native MTP recurrent state width differs from reference"
+                    );
+                    for (a, b) in actual.state.iter().zip(&expected.state) {
+                        anyhow::ensure!(
+                            (a - b).abs() <= 1e-4,
+                            "native MTP recurrent state mismatch at step {position}: {a} vs {b}"
+                        );
+                    }
+                    reference_state = expected.state;
+                }
+                state = actual.state;
+            }
+            let count = head
+                .components
+                .lock()
+                .map_err(|_| anyhow::anyhow!("native MTP test workspace poisoned"))?
+                .run_count();
+            anyhow::ensure!(
+                count == 3,
+                "expected three actual native head graph runs, got {count}"
+            );
+            if options.kv_mode == onnx_genai_ort::MtpDraftKvMode::GrowCache {
+                anyhow::ensure!(native.past_len() == 3, "native MTP cache did not grow");
+                native.rewind(2)?;
+                anyhow::ensure!(
+                    native.past_len() == 2,
+                    "native MTP rewind did not retain prefix"
+                );
+                let replay = native.step_with_state(&embeds, &state, 2)?;
+                anyhow::ensure!(
+                    replay.hidden.len() == h,
+                    "native MTP replay lost hidden output"
+                );
+                native.reset();
+                anyhow::ensure!(native.past_len() == 0, "native MTP reset retained cache");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_mtp_engine_uses_declared_head_without_ort() -> anyhow::Result<()> {
+        const CHILD: &str = "NXRT_NATIVE_MTP_ENGINE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "pipeline::native_component::mtp_execution_tests::native_mtp_engine_uses_declared_head_without_ort", "--nocapture"])
+                .env(CHILD, "1").env_remove("ONNX_GENAI_BACKEND").env("ONNX_GENAI_ORT_LIB", "/missing/nxrt-native-mtp-engine/onnxruntime")
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            anyhow::ensure!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "missing-library subprocess did not select its MTP engine test"
+            );
+            return Ok(());
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-mtp-full");
+        let metadata = onnx_genai_metadata::load_metadata(&root.join("inference_metadata.yaml"))?;
+        let resolved = crate::config::ResolvedMtpConfig::from_canonical_metadata(
+            &metadata,
+            &root,
+            metadata.model.as_ref().unwrap().vocab_size.unwrap(),
+            3,
+        )?;
+        let mut engine = crate::Engine::from_dir(
+            &root,
+            crate::EngineConfig {
+                speculative_mode: crate::SpeculativeMode::Mtp(resolved.public_config),
+                num_speculative_tokens: 3,
+                ..Default::default()
+            },
+        )?;
+        anyhow::ensure!(
+            engine._environment.is_none(),
+            "Native MTP created an ORT environment"
+        );
+        let request = crate::GenerateRequest {
+            prompt: crate::GeneratePrompt::TokenIds(vec![2, 5]),
+            options: crate::GenerateOptions {
+                greedy: true,
+                max_new_tokens: 6,
+                stop_on_eos: false,
+                ..Default::default()
+            },
+        };
+        let result = engine.generate(request.clone())?;
+        let mut baseline = crate::Engine::from_dir(&root, crate::EngineConfig::default())?;
+        let ordinary = baseline.generate(request)?;
+        anyhow::ensure!(
+            result.token_ids == ordinary.token_ids,
+            "Native MTP changed greedy target tokens: {:?} vs {:?}",
+            result.token_ids,
+            ordinary.token_ids
+        );
+        anyhow::ensure!(
+            result.token_ids.len() == 6,
+            "Native MTP did not produce the requested token budget"
+        );
+        let stats = engine.last_speculative_stats();
+        anyhow::ensure!(
+            stats.proposed_tokens > 0 && stats.verification_steps > 0,
+            "Native MTP did not actually propose and verify: {stats:?}"
+        );
+        Ok(())
+    }
 }

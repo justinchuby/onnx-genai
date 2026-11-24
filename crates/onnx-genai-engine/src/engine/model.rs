@@ -244,15 +244,58 @@ pub(crate) struct NativeSessionState {
     pub(crate) poison: Option<String>,
 }
 
+pub(crate) enum MtpHeadModel {
+    Ort(Arc<Session>),
+    #[cfg(feature = "native-backend")]
+    Native(Arc<crate::pipeline::NativeMtpHead>),
+}
+impl MtpHeadModel {
+    pub(crate) fn decode(
+        &self,
+        options: onnx_genai_ort::MtpDecodeOptions,
+    ) -> anyhow::Result<onnx_genai_ort::MtpDecodeSession<'static>> {
+        Ok(match self {
+            Self::Ort(session) => {
+                onnx_genai_ort::MtpDecodeSession::new_owned(Arc::clone(session), options)?
+            }
+            #[cfg(feature = "native-backend")]
+            Self::Native(head) => {
+                onnx_genai_ort::MtpDecodeSession::from_executor(head.executor(), options)?
+            }
+        })
+    }
+}
+
 pub(crate) struct MtpModel {
     pub(crate) config: MtpConfig,
     pub(crate) runtime_config: ResolvedMtpConfig,
-    pub(crate) session: Arc<Session>,
+    pub(crate) session: MtpHeadModel,
     pub(crate) embedder: MtpEmbedder,
     pub(crate) lm_head: MtpLmHead,
     pub(crate) hidden_output: String,
     pub(crate) kv_mode: onnx_genai_ort::MtpDraftKvMode,
     pub(crate) num_speculative_tokens: usize,
+}
+
+impl MtpModel {
+    pub(crate) fn proposer(
+        &self,
+    ) -> anyhow::Result<crate::speculative::MtpProposer<'static, MtpEmbedder, MtpLmHead>> {
+        crate::speculative::MtpProposer::from_decode_session(
+            self.session.decode(onnx_genai_ort::MtpDecodeOptions {
+                kv_mode: self.kv_mode,
+                batch_size: 1,
+                hc_mult: self.runtime_config.hc_mult,
+                hidden_state_rank4: self.runtime_config.target_hidden_layout
+                    == MtpHiddenLayout::Bshc,
+                hidden_output: self.runtime_config.mtp_hidden_output.clone(),
+                state_output: self.runtime_config.mtp_state_output.clone(),
+            })?,
+            self.embedder.clone(),
+            self.lm_head.clone(),
+            self.runtime_config.cache_scope,
+        )
+    }
 }
 
 pub(crate) struct Eagle3Model {
@@ -281,7 +324,11 @@ mod ownership_tests {
             assert_arc_session(session);
         }
         assert_arc_session(&draft.session);
-        assert_arc_session(&mtp.session);
+        match &mtp.session {
+            MtpHeadModel::Ort(session) => assert_arc_session(session),
+            #[cfg(feature = "native-backend")]
+            MtpHeadModel::Native(_) => {}
+        }
         assert_arc_session(&eagle3.session);
     }
 

@@ -1721,3 +1721,24 @@ commits restacked unchanged onto current main; both CLI subprocesses, HTTP 38
 and strict checks passed again on that restack. PR #2529 proceeds after local
 self-review without waiting for blocked CI, as explicitly requested. GPU
 execution/performance and the Python/MTP isolation work remain unproven here.
+
+### Native MTP execution isolation (#2531)
+
+Metadata-declared MTP heads now use the selected Native graph executor instead
+of creating an ORT environment/session. One backend-neutral runner owns draft
+KV and HC recurrent state for both Native and explicit reference adapters.
+Native head metadata comes from the admitted native session; each proposer
+keeps independent cache state while head execution shares the session workspace.
+Hidden/state projection explicitly materializes host values. KV output owners
+remain on their execution device. Failed hidden/state validation leaves the
+previous cache unchanged, and backend errors retain their typed causes.
+
+CPU subprocesses with a nonexistent ORT library run attention, rank-4 HC and
+growing-cache heads, plus actual Native MTP proposal/verification generation.
+Three head steps compare hidden and recurrent state against ORT, growing caches
+exercise rewind/replay/reset, and greedy generated tokens match ordinary Native
+decode. Local storage (192), MTP reference integration (2) and engine (981 plus
+one inherited ignore) suites passed on the restack onto main. Remaining local
+surface and feature checks are recorded on the PR before merge. CUDA feature
+compilation is not CUDA execution evidence. Accepted-prefix correction/cache
+alignment and Python launcher/package isolation remain open.

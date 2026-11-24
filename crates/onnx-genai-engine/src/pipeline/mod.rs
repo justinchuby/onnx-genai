@@ -53,6 +53,8 @@ pub use batching::{
 pub(crate) use execution_admission::WorkflowExecutionAdmission;
 pub(crate) use generation::validate_generation_workflow;
 pub use islands::ExecutionIslandDiagnostic;
+#[cfg(feature = "native-backend")]
+pub(crate) use native_component::NativeMtpHead;
 pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use output::{
     OutputFinality, OutputLineage, OutputRevision, OutputSequence, OutputStreamId,

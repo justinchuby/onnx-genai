@@ -1,4 +1,4 @@
-//! Low-level Multi-Token Prediction (MTP) head execution built on ORT.
+//! Backend-neutral Multi-Token Prediction head state and explicit execution adapters.
 //!
 //! An MTP head is a small decoder module distinct from the target model. It
 //! consumes a hidden state plus an embedded token and produces the next hidden
@@ -32,7 +32,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::session_owner::OrtSessionOwner;
-use crate::{DataType, IoBinding, MemoryInfo, OrtError, Result, Session, TensorInfo, Value};
+use crate::{
+    DataType, GraphIo, IoBinding, MemoryInfo, OrtError, Result, Session, TensorInfo, Value,
+};
 
 /// Introspected MTP-head graph signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,13 +116,73 @@ struct MtpKvPair {
     seq_axis: usize,
 }
 
+/// Execute the declared head graph. KV and recurrent state remain owned by
+/// the decode session, independently of the selected graph backend.
+pub trait MtpHeadExecution: GraphIo {
+    fn run(&mut self, inputs: &[(&str, &Value)]) -> Result<Vec<Value>>;
+    /// Explicit host boundary required by the public proposal/projection API.
+    /// Device executors materialize only requested hidden/state outputs here;
+    /// KV values remain opaque and can stay on their original device.
+    fn materialize_f32_on_host(&self, value: &Value) -> Result<Vec<f32>> {
+        value.to_vec_f32_lossy()
+    }
+}
+
+struct OrtMtpExecution<'a> {
+    // The binding releases before its session owner.
+    binding: IoBinding<'a>,
+    session: OrtSessionOwner<'a>,
+}
+impl GraphIo for OrtMtpExecution<'_> {
+    fn inputs(&self) -> &[TensorInfo] {
+        self.session.inputs()
+    }
+    fn outputs(&self) -> &[TensorInfo] {
+        self.session.outputs()
+    }
+    fn input_names(&self) -> &[String] {
+        self.session.input_names()
+    }
+    fn output_names(&self) -> &[String] {
+        self.session.output_names()
+    }
+}
+impl MtpHeadExecution for OrtMtpExecution<'_> {
+    fn run(&mut self, inputs: &[(&str, &Value)]) -> Result<Vec<Value>> {
+        self.binding.clear()?;
+        let result = (|| {
+            for (name, value) in inputs {
+                self.binding.bind_input(name, value)?;
+            }
+            for name in self.session.output_names() {
+                self.binding
+                    .bind_output_to_device(name, &MemoryInfo::cpu()?)?;
+            }
+            self.session.run_with_binding(&self.binding)?;
+            self.binding.output_values()
+        })();
+        // Release references before the caller's temporary input storage drops,
+        // including on errors. Returned output owners survive binding clear.
+        let cleanup = self.binding.clear();
+        match (result, cleanup) {
+            (Ok(outputs), Ok(())) => Ok(outputs),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(source), Err(cleanup)) => Err(OrtError::Context {
+                operation: format!(
+                    "MTP execution failed and clearing its reference binding also failed: {cleanup}; rebuild the head runner"
+                ),
+                source: Box::new(source),
+            }),
+        }
+    }
+}
+
 /// Stateful runner for an MTP-head ONNX graph.
 ///
 /// Holds the head's own single-layer KV state (when growing) and runs one
 /// forward step at a time. It does not select tokens or drive a proposal loop.
 pub struct MtpDecodeSession<'a> {
-    session: OrtSessionOwner<'a>,
-    binding: IoBinding<'a>,
+    session: Box<dyn MtpHeadExecution + 'a>,
     signature: MtpHeadSignature,
     mode: MtpDraftKvMode,
     batch_size: i64,
@@ -139,7 +201,7 @@ pub struct MtpDecodeSession<'a> {
 
 impl<'a> MtpDecodeSession<'a> {
     /// Detect an MTP-head signature from graph I/O, if present.
-    pub fn detect(session: &Session) -> Result<Option<MtpHeadSignature>> {
+    pub fn detect(session: &impl GraphIo) -> Result<Option<MtpHeadSignature>> {
         Ok(detect_mtp_head(session, "mtp_hidden", None)?.map(|(signature, _, _)| signature))
     }
 
@@ -160,14 +222,28 @@ impl<'a> MtpDecodeSession<'a> {
         session_owner: OrtSessionOwner<'a>,
         options: MtpDecodeOptions,
     ) -> Result<Self> {
+        let binding = session_owner.binding()?;
+        Self::from_executor(
+            Box::new(OrtMtpExecution {
+                binding,
+                session: session_owner,
+            }),
+            options,
+        )
+    }
+
+    /// Admit a backend executor against the same metadata/KV/state contract.
+    pub fn from_executor(
+        session: Box<dyn MtpHeadExecution + 'a>,
+        options: MtpDecodeOptions,
+    ) -> Result<Self> {
         if options.hc_mult == 0 {
             return Err(OrtError::InvalidArgument(
                 "MTP hc_mult must be greater than zero".into(),
             ));
         }
-        let session = &*session_owner;
         let (signature, kv_pairs, io) = detect_mtp_head(
-            session,
+            session.as_ref(),
             &options.hidden_output,
             options.state_output.as_deref(),
         )?
@@ -190,13 +266,8 @@ impl<'a> MtpDecodeSession<'a> {
                 io.hidden_rank
             )));
         }
-        // The owner decides how the binding keeps its session alive: a
-        // borrowed head is outlived by the caller's session, an owned one has
-        // to hold its own strong reference.
-        let binding = session_owner.binding()?;
         Ok(Self {
-            session: session_owner,
-            binding,
+            session,
             signature,
             mode: options.kv_mode,
             batch_size: options.batch_size,
@@ -376,24 +447,29 @@ impl<'a> MtpDecodeSession<'a> {
             None
         };
 
-        self.binding.clear()?;
-        self.binding.bind_input(&self.embeds_input, &embeds)?;
-        self.binding.bind_input(&self.hidden_input, &hidden_value)?;
+        let kv = self.kv_inputs()?;
+        let mut inputs = vec![
+            (self.embeds_input.as_str(), &embeds),
+            (self.hidden_input.as_str(), &hidden_value),
+        ];
         if let (Some(name), Some(value)) = (self.mask_input.as_ref(), mask.as_ref()) {
-            self.binding.bind_input(name, value)?;
+            inputs.push((name.as_str(), value));
         }
         if let (Some(name), Some(value)) = (self.position_input.as_ref(), positions.as_ref()) {
-            self.binding.bind_input(name, value)?;
+            inputs.push((name.as_str(), value));
         }
-        self.bind_kv_inputs()?;
-
-        for output in self.session.output_names() {
-            self.binding
-                .bind_output_to_device(output, &MemoryInfo::cpu()?)?;
+        inputs.extend(
+            kv.iter()
+                .map(|(name, value)| (name.as_str(), value.as_ref())),
+        );
+        let outputs = self.session.run(&inputs)?;
+        if outputs.len() != self.session.output_names().len() {
+            return Err(OrtError::InvalidArgument(format!(
+                "MTP executor returned {} values for {} declared outputs; repair the backend output mapping",
+                outputs.len(),
+                self.session.output_names().len()
+            )));
         }
-        self.session.run_with_binding(&self.binding)?;
-
-        let outputs = self.binding.output_values()?;
         let mut mtp_hidden = None;
         let mut mtp_state = None;
         let present_to_past = self
@@ -404,18 +480,14 @@ impl<'a> MtpDecodeSession<'a> {
         let mut next_kv = HashMap::with_capacity(self.kv_pairs.len());
         for (name, value) in self.session.output_names().iter().zip(outputs) {
             if *name == self.hidden_output {
-                mtp_hidden = Some(value.to_vec_f32_lossy()?);
+                mtp_hidden = Some(self.session.materialize_f32_on_host(&value)?);
             } else if self.state_output.as_deref() == Some(name.as_str()) {
-                mtp_state = Some(value.to_vec_f32_lossy()?);
+                mtp_state = Some(self.session.materialize_f32_on_host(&value)?);
             } else if let Some(past_name) = present_to_past.get(name.as_str()) {
                 next_kv.insert((*past_name).to_string(), Arc::new(value));
             }
         }
 
-        if self.mode == MtpDraftKvMode::GrowCache {
-            self.current_kv = next_kv;
-            self.kv_len = total;
-        }
         let hidden = mtp_hidden.ok_or_else(|| {
             OrtError::InvalidArgument(format!("MTP head did not produce '{}'", self.hidden_output))
         })?;
@@ -444,10 +516,15 @@ impl<'a> MtpDecodeSession<'a> {
                 expected_state_len
             )));
         }
+        if self.mode == MtpDraftKvMode::GrowCache {
+            self.current_kv = next_kv;
+            self.kv_len = total;
+        }
         Ok(MtpStepOutput { hidden, state })
     }
 
-    fn bind_kv_inputs(&mut self) -> Result<()> {
+    fn kv_inputs(&self) -> Result<Vec<(String, Arc<Value>)>> {
+        let mut inputs = Vec::with_capacity(self.kv_pairs.len());
         for pair in &self.kv_pairs {
             let value = if self.mode == MtpDraftKvMode::GrowCache
                 && let Some(value) = self.current_kv.get(&pair.past)
@@ -456,9 +533,9 @@ impl<'a> MtpDecodeSession<'a> {
             } else {
                 Arc::new(empty_past_value(&pair.input)?)
             };
-            self.binding.bind_input(&pair.past, &value)?;
+            inputs.push((pair.past.clone(), value));
         }
-        Ok(())
+        Ok(inputs)
     }
 }
 
@@ -472,8 +549,8 @@ struct MtpIo {
     hidden_rank: usize,
 }
 
-fn detect_mtp_head(
-    session: &Session,
+fn detect_mtp_head<T: GraphIo + ?Sized>(
+    session: &T,
     hidden_output_name: &str,
     state_output_name: Option<&str>,
 ) -> Result<Option<(MtpHeadSignature, Vec<MtpKvPair>, MtpIo)>> {
@@ -579,7 +656,7 @@ fn detect_mtp_head(
     Ok(Some((signature, kv_pairs, io)))
 }
 
-fn infer_mtp_kv_pairs(session: &Session) -> Result<Vec<MtpKvPair>> {
+fn infer_mtp_kv_pairs<T: GraphIo + ?Sized>(session: &T) -> Result<Vec<MtpKvPair>> {
     let mut pairs = Vec::new();
     for output in session.outputs() {
         if !is_present_output(&output.name) {
@@ -669,4 +746,90 @@ fn kv_suffix(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod executor_contract_tests {
+    use super::*;
+    use crate::GraphIoMetadata;
+
+    struct Head {
+        io: GraphIoMetadata,
+        runs: usize,
+    }
+    impl GraphIo for Head {
+        fn inputs(&self) -> &[TensorInfo] {
+            self.io.inputs()
+        }
+        fn outputs(&self) -> &[TensorInfo] {
+            self.io.outputs()
+        }
+        fn input_names(&self) -> &[String] {
+            self.io.input_names()
+        }
+        fn output_names(&self) -> &[String] {
+            self.io.output_names()
+        }
+    }
+    impl MtpHeadExecution for Head {
+        fn run(&mut self, inputs: &[(&str, &Value)]) -> Result<Vec<Value>> {
+            self.runs += 1;
+            let past = inputs
+                .iter()
+                .find(|(n, _)| *n == "past_key_values.0.key")
+                .unwrap()
+                .1
+                .shape()[2];
+            // The second run violates the declared hidden contract. No cache
+            // value or cursor from that failed step may become observable.
+            let width = if self.runs == 2 { 1 } else { 2 };
+            Ok(vec![
+                Value::from_slice_f32(&vec![1.0; width], &[1, 1, width as i64])?,
+                Value::from_slice_f32(&vec![1.0; (past as usize + 1) * 2], &[1, 1, past + 1, 2])?,
+            ])
+        }
+    }
+    fn head() -> Head {
+        let tensor = |name: &str, shape: &[i64]| TensorInfo {
+            name: name.into(),
+            dtype: DataType::Float32,
+            shape: shape.to_vec(),
+        };
+        Head {
+            runs: 0,
+            io: GraphIoMetadata::new(
+                vec![
+                    tensor("inputs_embeds", &[1, 1, 2]),
+                    tensor("hidden_states", &[1, 1, 2]),
+                    tensor("past_key_values.0.key", &[1, 1, -1, 2]),
+                ],
+                vec![
+                    tensor("mtp_hidden", &[1, 1, 2]),
+                    tensor("present.0.key", &[1, 1, -1, 2]),
+                ],
+            ),
+        }
+    }
+    #[test]
+    fn executor_failure_does_not_commit_draft_cache() -> Result<()> {
+        let mut decode = MtpDecodeSession::from_executor(
+            Box::new(head()),
+            MtpDecodeOptions {
+                kv_mode: MtpDraftKvMode::GrowCache,
+                ..Default::default()
+            },
+        )?;
+        decode.step(&[1.0, 2.0], &[0.0, 0.0], 0)?;
+        assert_eq!(decode.past_len(), 1);
+        let error = decode.step(&[1.0, 2.0], &[0.0, 0.0], 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("MTP hidden output length 1 != expected 2")
+        );
+        assert_eq!(decode.past_len(), 1);
+        decode.step(&[1.0, 2.0], &[0.0, 0.0], 1)?;
+        assert_eq!(decode.past_len(), 2);
+        Ok(())
+    }
 }

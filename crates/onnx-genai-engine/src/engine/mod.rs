@@ -30,8 +30,7 @@ pub(crate) use onnx_genai_kv::{
 };
 pub(crate) use onnx_genai_metadata::InferenceMetadata;
 pub(crate) use onnx_genai_ort::{
-    DataType, Eagle3DecodeSession, Environment, ModelDirectory, MtpDecodeSession, Session,
-    SessionOptions, Tokenizer,
+    DataType, Eagle3DecodeSession, Environment, ModelDirectory, Session, SessionOptions, Tokenizer,
 };
 pub(crate) use onnx_genai_scheduler::{
     CapacityProvider, CapacityProviders, FixedCapacity, GovernorReconfigureOutcome,
@@ -64,12 +63,6 @@ pub(crate) use crate::speculative::{
     LinearEmbedder, LinearLmHead, MtpEmbedder, MtpLmHead, SpeculativeStats,
     load_target_initializer_adapters,
 };
-// The MTP proposer is driven only from the native decode path; an ORT-only
-// build has no consumer for it and would see an unused import. Its only runtime
-// use is the native cold-generation path.
-#[cfg(feature = "native-backend")]
-pub(crate) use crate::speculative::MtpProposer;
-
 mod decode_backend;
 mod execution_error;
 mod governor;

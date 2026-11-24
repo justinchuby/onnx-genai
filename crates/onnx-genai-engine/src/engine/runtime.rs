@@ -1182,27 +1182,9 @@ impl Engine {
                             let mtp = self.mtp.as_ref().context(
                                 "native MTP speculation requested without a loaded MTP head",
                             )?;
-                            // Reuse the generic MtpProposer (guaranteed target token +
-                            // K speculative drafts from the ORT MTP head) through the
-                            // native driver; the head runs on the ORT CUDA EP while the
-                            // hybrid GDN target runs natively. The recurrent-state
-                            // commit-by-accepted primitive (#1633) advances the target's
-                            // GDN/conv state on accept.
-                            let proposer = MtpProposer::new_owned(
-                                std::sync::Arc::clone(&mtp.session),
-                                onnx_genai_ort::MtpDecodeOptions {
-                                    kv_mode: mtp.kv_mode,
-                                    batch_size: 1,
-                                    hc_mult: mtp.runtime_config.hc_mult,
-                                    hidden_state_rank4: mtp.runtime_config.target_hidden_layout
-                                        == MtpHiddenLayout::Bshc,
-                                    hidden_output: mtp.runtime_config.mtp_hidden_output.clone(),
-                                    state_output: mtp.runtime_config.mtp_state_output.clone(),
-                                },
-                                mtp.embedder.clone(),
-                                mtp.lm_head.clone(),
-                                mtp.runtime_config.cache_scope,
-                            )?;
+                            // The head uses the selected Native graph executor;
+                            // shared proposal/verification state stays backend-neutral.
+                            let proposer = mtp.proposer()?;
                             let hidden_size = mtp
                                 .runtime_config
                                 .hc_mult
