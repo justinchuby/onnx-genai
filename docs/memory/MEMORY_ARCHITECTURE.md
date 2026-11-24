@@ -221,6 +221,31 @@ is disabled. Host and NVRTC limits are emitted from one definition, and the
 partial/merge arguments share the same borrowed backing. No extra pool, quota
 transaction, or per-launch allocation is introduced.
 
+### CUDA quantized MatMul prefill temporary storage
+
+The portable FP16 RMSNorm, gate/up, and combined prefill paths borrow three
+checked regions from the existing prepared workspace: normalized activation,
+gate output, and the maximum reachable BLAS plan. Normalization uses `M*K*2`
+bytes when its fallback is reachable; gate output uses `M*N*2`. All region starts
+use the existing BLAS alignment. Combined RMSNorm/gate-up lifetimes overlap, so
+these sizes add rather than replace one another. Serial projections share only
+the BLAS region. BF16 staging enters the same half dispatch and uses this layout.
+
+Planning funds the portable fallback even when a Marlin/dequant fast path may
+succeed. The row-loop classifier is shared with execution; single-token, empty,
+and guaranteed looped decode do not gain prefill scratch or runtime BLAS-plan
+queries. No private allocation/free fallback remains in the three portable
+prefill helpers. A full composite borrow is validated before submitted work, and
+BLAS receives only its region. Launch-error retirement belongs to the original
+caller owner, including pending work and capture pins. Existing SessionPersistent
+capacity policy remains, with no new pool, quota interface or per-step issuer call.
+Ordinary empty half outputs now return before the single-row decode launch.
+
+The separate BF16 arena/constant conversion backing, Marlin caches and generic
+f32 dequantized weights are not migrated by this change. Portable prefill capture
+eligibility remains conservative. Host layout checks and GPU-target compilation
+do not validate device arithmetic, asynchronous failure ordering or throughput.
+
 ### CUDA quantized MatMul BF16 staging
 
 Persistent BF16-to-FP16 scale conversions require the existing positional
@@ -235,8 +260,8 @@ re-enter top-level call initialization while holding the staging arena lock:
 that would relock the same mutex and clear the arena/constant resource-use facts.
 Capture ownership enumeration must retain both owners actually used by the call.
 This corrects conversion eligibility and resource marking; the private staging
-arena, persistent conversion backing and raw prefill temporaries still need
-separate migration to governed ownership. No new cache, issuer or EP interface
+arena and persistent conversion backing still need separate migration to
+governed ownership; portable prefill temporary views now use the composite above. No new cache, issuer or EP interface
 is introduced. Device numerical, capture and throughput validation remain pending.
 
 ### CUDA variadic Sum/Mean temporary storage
